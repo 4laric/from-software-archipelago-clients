@@ -109,17 +109,13 @@ pub fn initialize<G: Game>(blocker: G::InputBlocker) {
     std::thread::spawn(move || {
         info!("Worker thread initialized.");
 
-        let mut core = G::wait_for_system_init().and_then(|_| {
-            info!("Game system initialized.");
-
-            // This mutex isn't strictly necessary since in practice we're only
-            // ever touching this on DS3's main thread. But Rust doesn't have
-            // any way of knowing that and using a Mutex is simpler than
-            // creating a newtype that implements Sync, so we do it anyway.
-            // Because there won't be any contention, it should be very
-            // inexpensive.
-            G::Core::new().map(|core| Arc::new(Mutex::new(core)))
-        });
+        // This mutex isn't strictly necessary since in practice we're only
+        // ever touching this on DS3's main thread. But Rust doesn't have
+        // any way of knowing that and using a Mutex is simpler than
+        // creating a newtype that implements Sync, so we do it anyway.
+        // Because there won't be any contention, it should be very
+        // inexpensive.
+        let mut core = G::Core::new().map(|core| Arc::new(Mutex::new(core)));
 
         if let Ok(core2) = core.as_ref() {
             let core2 = core2.clone();
@@ -137,6 +133,8 @@ pub fn initialize<G: Game>(blocker: G::InputBlocker) {
                 core = Err(err);
             }
         }
+
+        info!("Game system initialized.");
 
         if let Err(e) = Hudhook::builder()
             .with::<G::GraphicsHooks>(ErrorDisplay::<G>::new(core, blocker))

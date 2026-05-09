@@ -1,3 +1,8 @@
+## 1.0.0-alpha.8
+
+* Fix a bug where sometimes loading the game would fail with an error about
+  `SprjTask` not being available.
+
 ## 1.0.0-alpha.7
 
 * Update to the latest upstream version of the static randomizer. This should

@@ -24,14 +24,9 @@ pub trait Game: Send + Sync + 'static {
     /// Schedules `task` to be run each frame, ideally at the beginning of the
     /// frame, on the game's main thread.
     ///
-    /// ## Safety
-    ///
-    /// This must be called on the main thread when no other references exist to
-    /// the game's internal state.
-    unsafe fn run_recurring_task(task: impl FnMut() + 'static + Send) -> Result<()>;
-
-    /// Blocks until the core of the underlying game systems are initialized.
-    fn wait_for_system_init() -> Result<()>;
+    /// This blocks until the task running infrastructure is available, and so
+    /// should not be called on the game's main thread.
+    fn run_recurring_task(task: impl FnMut() + 'static + Send) -> Result<()>;
 
     /// Returns whether the game is currently showing the main menu (or earlier
     /// during the initial load process).

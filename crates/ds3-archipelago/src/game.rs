@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use darksouls3::sprj::{MapItemMan, MenuMan, SprjTaskGroupIndex, SprjTaskImp};
-use fromsoftware_shared::{FromStatic, Program, SharedTaskImpExt};
+use fromsoftware_shared::{FromStatic, SharedTaskImpExt};
 
 pub struct DarkSoulsIII;
 
@@ -13,14 +13,9 @@ impl shared::Game for DarkSoulsIII {
     const TYPE: shared::GameType = shared::GameType::DarkSoulsIII;
     const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    unsafe fn run_recurring_task(mut task: impl FnMut() + 'static + Send) -> Result<()> {
-        unsafe { SprjTaskImp::instance() }?
+    fn run_recurring_task(mut task: impl FnMut() + 'static + Send) -> Result<()> {
+        SprjTaskImp::wait_for_instance(Duration::MAX)?
             .run_recurring(move |_: &'_ usize| task(), SprjTaskGroupIndex::FrameBegin);
-        Ok(())
-    }
-
-    fn wait_for_system_init() -> Result<()> {
-        darksouls3::util::system::wait_for_system_init(&Program::current(), Duration::MAX)?;
         Ok(())
     }
 

@@ -1,3 +1,8 @@
+## 4.0.2
+
+* Fix a bug where sometimes loading the game would fail with an error about
+  `SprjTask` not being available.
+
 ## 4.0.1
 
 * Fix a bug on computers that took a long time to load the game in which

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use fromsoftware_shared::{FromStatic, Program, SharedTaskImpExt};
+use fromsoftware_shared::{FromStatic, SharedTaskImpExt};
 use sekiro::sprj::*;
 
 pub struct Sekiro;
@@ -13,14 +13,9 @@ impl shared::Game for Sekiro {
     const TYPE: shared::GameType = shared::GameType::Sekiro;
     const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    unsafe fn run_recurring_task(mut task: impl FnMut() + 'static + Send) -> Result<()> {
-        unsafe { SprjTaskImp::instance() }?
+    fn run_recurring_task(mut task: impl FnMut() + 'static + Send) -> Result<()> {
+        SprjTaskImp::wait_for_instance(Duration::MAX)?
             .run_recurring(move |_: &'_ usize| task(), SprjTaskGroupIndex::FrameBegin);
-        Ok(())
-    }
-
-    fn wait_for_system_init() -> Result<()> {
-        sekiro::util::system::wait_for_system_init(&Program::current(), Duration::MAX)?;
         Ok(())
     }
 
