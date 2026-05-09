@@ -39,6 +39,9 @@ features = [
 [patch.crates-io]
 imgui = { git = "https://github.com/imgui-rs/imgui-rs" }
 imgui-sys = { git = "https://github.com/imgui-rs/imgui-rs" }
+fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs" }
+darksouls3 = { git = "https://github.com/vswarte/fromsoftware-rs" }
+sekiro = { git = "https://github.com/vswarte/fromsoftware-rs" }
 
 # Uncomment these to use local copies of dependencies for testing
 

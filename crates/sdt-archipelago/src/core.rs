@@ -157,7 +157,7 @@ impl shared::Core for Core {
                     return true;
                 };
 
-                let Ok(events) = (unsafe { SprjEventFlagMan::instance() }) else {
+                let Ok(events) = (unsafe { SprjEventFlagMan::instance_mut() }) else {
                     self.log(RichText::Color {
                         text: "SprjEventFlagMan not loaded".into(),
                         color: ap::TextColor::Red,
@@ -238,7 +238,7 @@ impl Core {
         let Some(client) = self.client() else {
             return;
         };
-        let Ok(item_man) = (unsafe { MapItemMan::instance() }) else {
+        let Ok(item_man) = (unsafe { MapItemMan::instance_mut() }) else {
             return;
         };
         let mut save_data = SaveData::instance_mut();
@@ -296,7 +296,7 @@ impl Core {
         let Some(ref mut save_data) = SaveData::instance_mut() else {
             return Ok(());
         };
-        let Ok(game_data_man) = (unsafe { GameDataMan::instance() }) else {
+        let Ok(game_data_man) = (unsafe { GameDataMan::instance_mut() }) else {
             return Ok(());
         };
         let Ok(solo_params) = (unsafe { SoloParamRepository::instance() }) else {
@@ -375,7 +375,7 @@ impl Core {
 /// notification on screen.
 fn grant_item_without_notifying(id: ItemId, quantity: u32) -> Result<()> {
     let (old_notice_log, old_notice_dialog) = set_notice(id, false, false)?;
-    unsafe { MapItemMan::instance() }?.grant_item(ItemBufferEntry::new(id, quantity));
+    unsafe { MapItemMan::instance_mut() }?.grant_item(ItemBufferEntry::new(id, quantity));
     set_notice(id, old_notice_log, old_notice_dialog)?;
     Ok(())
 }
@@ -383,7 +383,7 @@ fn grant_item_without_notifying(id: ItemId, quantity: u32) -> Result<()> {
 /// Sets `item`'s `notice_log` and `notice_dialog` flags, which control how it's
 /// displayed, to the given values and returns the previous values.
 fn set_notice(id: ItemId, notice_log: bool, notice_dialog: bool) -> Result<(bool, bool)> {
-    let row = unsafe { SoloParamRepository::instance() }?
+    let row = unsafe { SoloParamRepository::instance_mut() }?
         .get_equip_param_mut(id)
         .unwrap_or_else(|| panic!("no row for item ID {:?}", id))
         .into_dyn();

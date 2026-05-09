@@ -32,7 +32,7 @@ impl shared::Game for DarkSoulsIII {
     }
 
     unsafe fn force_cursor_visible() {
-        if let Ok(man) = unsafe { MenuMan::instance() } {
+        if let Ok(man) = unsafe { MenuMan::instance_mut() } {
             man.set_menu_mode(true);
         }
     }

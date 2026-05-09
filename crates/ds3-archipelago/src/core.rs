@@ -183,7 +183,7 @@ impl shared::Core for Core {
                     return true;
                 };
 
-                let Ok(events) = (unsafe { SprjEventFlagMan::instance() }) else {
+                let Ok(events) = (unsafe { SprjEventFlagMan::instance_mut() }) else {
                     self.log(RichText::Color {
                         text: "SprjEventFlagMan not loaded".into(),
                         color: ap::TextColor::Red,
@@ -293,10 +293,10 @@ impl Core {
         let Some(client) = self.client() else {
             return;
         };
-        let Ok(item_man) = (unsafe { MapItemMan::instance() }) else {
+        let Ok(item_man) = (unsafe { MapItemMan::instance_mut() }) else {
             return;
         };
-        let Ok(player_game_data) = (unsafe { PlayerGameData::instance() }) else {
+        let Ok(player_game_data) = (unsafe { PlayerGameData::instance_mut() }) else {
             return;
         };
         let mut save_data = SaveData::instance_mut();
@@ -363,7 +363,7 @@ impl Core {
         let Some(ref mut save_data) = SaveData::instance_mut() else {
             return Ok(());
         };
-        let Ok(game_data_man) = (unsafe { GameDataMan::instance() }) else {
+        let Ok(game_data_man) = (unsafe { GameDataMan::instance_mut() }) else {
             return Ok(());
         };
         let Ok(regulation_manager) = (unsafe { CSRegulationManager::instance() }) else {
