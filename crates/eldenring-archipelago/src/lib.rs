@@ -91,7 +91,7 @@ mod game;
 pub unsafe extern "C" fn DllMain(_hmodule: u64, reason: u32) -> bool {
     const DLL_PROCESS_ATTACH: u32 = 1;
     if reason == DLL_PROCESS_ATTACH {
-        std::thread::spawn(|| game::init());
+        std::thread::spawn(game::init);
     }
     true
 }

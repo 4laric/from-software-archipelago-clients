@@ -144,7 +144,7 @@ fn drive_incoming_kill() {
     } else {
         // kill_player is still a RE stub: log ONCE per latch so we don't spam every frame while the
         // hole is open. The latch stays set; once the RE lands it'll succeed and clear.
-        if KILL_LOGGED.swap(true, Ordering::Relaxed) == false {
+        if !KILL_LOGGED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 "AP: DeathLink kill requested but kill_player() is an unfilled RE stub — \
                  player NOT killed (see deathlink.rs kill_player worksheet)"

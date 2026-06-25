@@ -1,3 +1,8 @@
+#![allow(
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation,
+    clippy::collapsible_match
+)]
 //! AUTO_UPGRADE + GLOBAL_SCADUTREE_BLESSING — RE holes filled via typed `eldenring` 0.14 bindings.
 //!
 //! Two slot_data features whose game-memory touchpoints were originally RE-stubbed. The RE is now
@@ -419,12 +424,7 @@ fn held_scadu_fragments() -> Option<i32> {
 fn raise_stored_blessing(level: i32) -> Option<Option<(i32, i32)>> {
     // Clamp the computed target into the valid stored range before any write.
     let mut target = level;
-    if target < 0 {
-        target = 0;
-    }
-    if target > SCADU_MAX_LEVEL {
-        target = SCADU_MAX_LEVEL;
-    }
+    target = target.clamp(0, SCADU_MAX_LEVEL);
     // SAFETY: FD4 singleton accessed MUTABLY (we may write the byte); same idiom as
     // deathlink.rs `WorldChrMan::instance_mut()`. Err/None before the player is placed -> no-op.
     let gdm = unsafe { GameDataMan::instance_mut() }.ok()?;
