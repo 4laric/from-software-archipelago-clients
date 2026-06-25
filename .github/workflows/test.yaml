@@ -23,3 +23,5 @@ jobs:
     - run: cargo clippy -- -D warnings
     - run: cargo clippy --features=profile -- -D warnings
     - run: cargo build
+    - run: cargo test -p er-codec -p er-semver -p er-logic
+    - run: cargo test -p er-codec -p er-semver -p er-logic

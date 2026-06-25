@@ -10,6 +10,8 @@ members = [
     "crates/eldenring-archipelago",
     "crates/er-codec",
     "crates/er-semver",
+    "crates/er-logic",
+    "crates/er-logic",
 ]
 
 [workspace.package]
