@@ -46,7 +46,7 @@ pub struct SlotConfig {
     pub grace_items: HashMap<String, u32>,        // grace item -> one warp flag
     pub region_open_flags: HashMap<String, u32>,  // lock item -> one physical region-open flag
     pub lock_reveal_flags: HashMap<String, Vec<u32>>, // lock item -> map-reveal/open flags
-    pub lock_notify_items: HashMap<String, i32>,  // lock item -> FullID granted as the unlock notice
+    pub lock_notify_items: HashMap<String, i32>, // lock item -> FullID granted as the unlock notice
     pub natural_key_triggers: HashMap<String, Vec<NkClause>>, // region -> clause disjunction
 
     // --- warp latches (game-state -> set a baked warp flag once) ---
@@ -64,7 +64,7 @@ pub struct SlotConfig {
     pub enable_dlc: bool,
 
     // --- check polling (acquisitions that bypass the AddItemFunc detour) ---
-    pub location_flags: HashMap<i64, u32>,  // apconfig: AP location id -> guarding event flag
+    pub location_flags: HashMap<i64, u32>, // apconfig: AP location id -> guarding event flag
     pub sweep_flags: HashMap<u32, Vec<i64>>, // apconfig: event flag -> AP location ids
     pub dungeon_sweeps: HashMap<i64, Vec<i64>>, // slot_data: trigger location -> member locations
 }
@@ -164,13 +164,25 @@ const GOODS_FULLID: i32 = 0x4000_0000u32 as i32;
 /// region map stays fogged until this separate flag is set (vanilla pickup events set both).
 /// Base ids < 2_000_000; DLC (Land of Shadow) pieces are the `2008600..` block (skipped when DLC off).
 const MAP_UNLOCK_FLAGS: &[(i32, u32)] = &[
-    (8600, 62010), (8601, 62011), (8602, 62012), // Limgrave W, Weeping, Limgrave E
-    (8603, 62020), (8604, 62021), (8605, 62022), // Liurnia E/N/W
-    (8606, 62030), (8607, 62031), (8608, 62032), // Altus, Leyndell, Gelmir
-    (8609, 62040), (8610, 62041),                // Caelid, Dragonbarrow
-    (8611, 62050), (8612, 62051), (8618, 62052), // Mountaintops W/E, Snowfield
-    (8613, 62060), (8614, 62061), (8616, 62062), // Ainsel, Lake of Rot, Mohgwyn
-    (8615, 62063), (8617, 62064),                // Siofra, Deeproot
+    (8600, 62010),
+    (8601, 62011),
+    (8602, 62012), // Limgrave W, Weeping, Limgrave E
+    (8603, 62020),
+    (8604, 62021),
+    (8605, 62022), // Liurnia E/N/W
+    (8606, 62030),
+    (8607, 62031),
+    (8608, 62032), // Altus, Leyndell, Gelmir
+    (8609, 62040),
+    (8610, 62041), // Caelid, Dragonbarrow
+    (8611, 62050),
+    (8612, 62051),
+    (8618, 62052), // Mountaintops W/E, Snowfield
+    (8613, 62060),
+    (8614, 62061),
+    (8616, 62062), // Ainsel, Lake of Rot, Mohgwyn
+    (8615, 62063),
+    (8617, 62064),    // Siofra, Deeproot
     (2008600, 62080), // Gravesite Plain  (WorldMapPieceParam 1000)
     (2008601, 62081), // Scadu Altus      (1001)
     (2008602, 62082), // Southern Shore   (1002)
@@ -224,7 +236,10 @@ pub fn enqueue_start_grace(flag: u32) {
 
 /// Net thread: parse-time helper so net.rs can push a once-per-save start item (FullID, count).
 pub fn enqueue_start_item(full_id: i32, count: i32) {
-    pending_start_items().lock().unwrap().push_back((full_id, count.max(1)));
+    pending_start_items()
+        .lock()
+        .unwrap()
+        .push_back((full_id, count.max(1)));
 }
 
 /// Net thread: dispatch ONE received item by NAME (idempotent — safe to call for the full replay on
@@ -245,7 +260,11 @@ pub fn on_item_received(name: &str) {
         for &f in fs {
             graces.push_back(f);
         }
-        tracing::info!("Region lock '{}' received: queued {} grace flag(s)", name, fs.len());
+        tracing::info!(
+            "Region lock '{}' received: queued {} grace flag(s)",
+            name,
+            fs.len()
+        );
     }
     // Grace rando: grace item -> one warp flag.
     if let Some(&f) = cfg.grace_items.get(name) {
@@ -255,14 +274,22 @@ pub fn on_item_received(name: &str) {
     // Region-open (physical fog gate): lock item -> one open flag.
     if let Some(&f) = cfg.region_open_flags.get(name) {
         graces.push_back(f);
-        tracing::info!("Region lock '{}' received: queued region-open flag {}", name, f);
+        tracing::info!(
+            "Region lock '{}' received: queued region-open flag {}",
+            name,
+            f
+        );
     }
     // Generalized reveal/open: lock item -> map-reveal + enforcement-open flags.
     if let Some(fs) = cfg.lock_reveal_flags.get(name) {
         for &f in fs {
             graces.push_back(f);
         }
-        tracing::info!("Region lock '{}' received: queued {} reveal/open flag(s)", name, fs.len());
+        tracing::info!(
+            "Region lock '{}' received: queued {} reveal/open flag(s)",
+            name,
+            fs.len()
+        );
     }
     // Unlock notification item (map fragment / token) -> once-per-save grant queue.
     if let Some(&addr) = cfg.lock_notify_items.get(name) {
@@ -274,19 +301,35 @@ pub fn on_item_received(name: &str) {
         for &f in fs {
             graces.push_back(f);
         }
-        tracing::info!("Companion item '{}' received: queued {} acquisition flag(s)", name, fs.len());
+        tracing::info!(
+            "Companion item '{}' received: queued {} acquisition flag(s)",
+            name,
+            fs.len()
+        );
     }
     // Key-item acquisition flags.
     if let Some(fs) = lookup(KEY_ITEM_ACQUIRE_FLAGS, name) {
         for &f in fs {
             graces.push_back(f);
         }
-        tracing::info!("Key item '{}' received: queued {} obtained-flag(s)", name, fs.len());
+        tracing::info!(
+            "Key item '{}' received: queued {} obtained-flag(s)",
+            name,
+            fs.len()
+        );
     }
     // Great-rune restore: ADDITIONALLY grant the "(Restored)" goods row (once per save via notify).
-    if let Some(goods) = GREAT_RUNE_RESTORE_GOODS.iter().find(|(n, _)| *n == name).map(|(_, g)| *g) {
+    if let Some(goods) = GREAT_RUNE_RESTORE_GOODS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, g)| *g)
+    {
         notify.push_back((goods as i32) | GOODS_FULLID);
-        tracing::info!("Great rune '{}' received: also granting restored goods {} (usable now)", name, goods);
+        tracing::info!(
+            "Great rune '{}' received: also granting restored goods {} (usable now)",
+            name,
+            goods
+        );
     }
 }
 
@@ -371,7 +414,10 @@ fn drain_start_items() {
     }
     if grant::start_items_granted() {
         // Connect filled the queue before the persisted flag was loaded; this save already has them.
-        tracing::info!("Start items: already granted this save; dropping {} re-queued item(s)", q.len());
+        tracing::info!(
+            "Start items: already granted this save; dropping {} re-queued item(s)",
+            q.len()
+        );
         q.clear();
         return;
     }
@@ -386,7 +432,10 @@ fn drain_start_items() {
         }
     }
     if any {
-        tracing::info!("Start items: granted {} once-per-save item(s)", snapshot.len());
+        tracing::info!(
+            "Start items: granted {} once-per-save item(s)",
+            snapshot.len()
+        );
         q.clear();
         grant::set_start_items_granted();
         grant::persist();
@@ -441,7 +490,11 @@ fn flush_grace_flags() {
     }
     *q = retry;
     if set_count > 0 {
-        tracing::info!("Region fusion: set {} grace flag(s) ({} pending)", set_count, q.len());
+        tracing::info!(
+            "Region fusion: set {} grace flag(s) ({} pending)",
+            set_count,
+            q.len()
+        );
     }
 }
 
@@ -494,7 +547,11 @@ fn evaluate_natural_key_triggers() {
         if let Some(&addr) = cfg.lock_notify_items.get(name) {
             notify.push_back(addr);
         }
-        tracing::info!("Natural-key '{}' satisfied: bloomed region ({} flag(s) queued)", name, queued);
+        tracing::info!(
+            "Natural-key '{}' satisfied: bloomed region ({} flag(s) queued)",
+            name,
+            queued
+        );
     }
 }
 
@@ -542,7 +599,11 @@ fn poll_location_flags() {
             }
         }
         if swept > 0 {
-            tracing::info!("Dungeon sweep: trigger {} cleared {} remaining check(s)", trigger, swept);
+            tracing::info!(
+                "Dungeon sweep: trigger {} cleared {} remaining check(s)",
+                trigger,
+                swept
+            );
         }
     }
 
@@ -592,17 +653,18 @@ fn warp_and_lock_latches() {
     // Normalize: overworld sub-areas report a 7-digit id (subregion*100); the major area reports the
     // 5-digit subregion. Reduce to the 5-digit subregion for the range match.
     let sub = if pr >= 1_000_000 { pr / 100 } else { pr };
-    let locked = cfg.area_lock_flags.iter().any(|e| {
-        sub >= e[0] && sub <= e[1] && !flags::get_event_flag(e[2] as u32)
-    });
+    let locked = cfg
+        .area_lock_flags
+        .iter()
+        .any(|e| sub >= e[0] && sub <= e[1] && !flags::get_event_flag(e[2] as u32));
     if !locked {
         KICK_LATCHED.store(false, Ordering::Relaxed);
     } else if !KICK_LATCHED.load(Ordering::Relaxed) {
         // Start-window guard: on a random-start seed the player transiently spawns in (locked)
         // Limgrave before the baked warp pulls them out; don't arm KICK until the random-start warp
         // has fired. Non-random seeds (done flag 0) => guard always true => unchanged.
-        let guard_ok = cfg.random_start_done_flag == 0
-            || flags::get_event_flag(cfg.random_start_done_flag);
+        let guard_ok =
+            cfg.random_start_done_flag == 0 || flags::get_event_flag(cfg.random_start_done_flag);
         if guard_ok {
             KICK_LATCHED.store(true, Ordering::Relaxed);
             flags::set_event_flag(KICK_FLAG, true);
@@ -618,7 +680,11 @@ fn warp_and_lock_latches() {
         && !DLC_LATCHED.swap(true, Ordering::Relaxed)
     {
         flags::set_event_flag(cfg.dlc_entry_warp_flag, true);
-        tracing::info!("DLC auto-entry: in start area {} -> set flag {}", pr, cfg.dlc_entry_warp_flag);
+        tracing::info!(
+            "DLC auto-entry: in start area {} -> set flag {}",
+            pr,
+            cfg.dlc_entry_warp_flag
+        );
     }
 
     // --- Random starting region: same latch, for the rolled start region ---
@@ -631,7 +697,11 @@ fn warp_and_lock_latches() {
     {
         flags::set_event_flag(cfg.random_start_done_flag, true);
         flags::set_event_flag(cfg.random_start_warp_flag, true);
-        tracing::info!("Random start: in area {} -> set flag {}", pr, cfg.random_start_warp_flag);
+        tracing::info!(
+            "Random start: in area {} -> set flag {}",
+            pr,
+            cfg.random_start_warp_flag
+        );
     }
 }
 
@@ -644,6 +714,15 @@ pub fn on_index_grant(full_id: i32) {
     let base = full_id & 0x0FFF_FFFF;
     if let Some(&(_, flag)) = MAP_UNLOCK_FLAGS.iter().find(|(id, _)| *id == base) {
         let ok = flags::try_set_event_flag(flag, true);
-        tracing::info!("Map fragment {}: reveal flag {} {}", base, flag, if ok { "SET" } else { "FAILED (holder not ready)" });
+        tracing::info!(
+            "Map fragment {}: reveal flag {} {}",
+            base,
+            flag,
+            if ok {
+                "SET"
+            } else {
+                "FAILED (holder not ready)"
+            }
+        );
     }
 }

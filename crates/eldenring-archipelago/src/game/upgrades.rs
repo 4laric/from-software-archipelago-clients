@@ -236,7 +236,11 @@ fn highest_held_level(somber: bool) -> Option<i32> {
         }
         // else: walk failed transiently but we have a cached value -> use it (no down-flicker).
     }
-    Some(if somber { targets.somber } else { targets.normal })
+    Some(if somber {
+        targets.somber
+    } else {
+        targets.normal
+    })
 }
 
 /// One full typed inventory walk: returns (highest normal +N, highest somber +N) across all held
@@ -474,8 +478,10 @@ mod tests {
         // With the feature off, apply_auto_upgrade is a pure identity (no game access).
         set_auto_upgrade(0);
         assert_eq!(apply_auto_upgrade(1_000_007), 1_000_007);
-        assert_eq!(apply_auto_upgrade((er_codec::CATEGORY_GOODS | 2_010_000) as i32),
-                   (er_codec::CATEGORY_GOODS | 2_010_000) as i32);
+        assert_eq!(
+            apply_auto_upgrade((er_codec::CATEGORY_GOODS | 2_010_000) as i32),
+            (er_codec::CATEGORY_GOODS | 2_010_000) as i32
+        );
     }
 
     #[test]

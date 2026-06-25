@@ -90,7 +90,7 @@ fn connect_and_serve(cfg: &ApConfig) {
     let slot = cfg.slot.clone().unwrap_or_default();
 
     let mut opts = ap::ConnectionOptions::new().receive_items(ap::ItemHandling::OtherWorlds {
-        own_world: true,        // echo self-found items (shop buys bypass the detour) — C++ 0b111
+        own_world: true, // echo self-found items (shop buys bypass the detour) — C++ 0b111
         starting_inventory: true,
     });
     if let Some(pw) = &cfg.password {
@@ -112,9 +112,9 @@ fn connect_and_serve(cfg: &ApConfig) {
     let mut configured = false;
     let mut pushed_through: i64 = 0; // highest received index already pushed to the GRANT queue
     let mut dispatched_through: i64 = 0; // highest index whose NAME-dispatch (flags/sets) has run.
-    // Starts at 0 EACH connect (not the persisted index): the name-keyed effects (grace flags,
-    // received-name set for natural keys) are idempotent and must replay the FULL items_received
-    // stream on reconnect, unlike the grant path which resumes at the persisted index.
+                                         // Starts at 0 EACH connect (not the persisted index): the name-keyed effects (grace flags,
+                                         // received-name set for natural keys) are idempotent and must replay the FULL items_received
+                                         // stream on reconnect, unlike the grant path which resumes at the persisted index.
     let mut goal_sent = false;
     let mut item_map: HashMap<i64, i64> = HashMap::new(); // AP item id -> ER FullID
     let mut item_counts: HashMap<i64, i64> = HashMap::new();
@@ -162,14 +162,21 @@ fn connect_and_serve(cfg: &ApConfig) {
 
                 let seed = sd.get("seed").and_then(|v| v.as_str()).unwrap_or("");
                 let sd_slot = sd.get("slot").and_then(|v| v.as_str()).unwrap_or("");
-                let slot_name = if sd_slot.is_empty() { slot.as_str() } else { sd_slot };
+                let slot_name = if sd_slot.is_empty() {
+                    slot.as_str()
+                } else {
+                    sd_slot
+                };
                 let save_path = save_path_for(seed, slot_name);
                 let start_index = load_last_index(&save_path);
                 grant::configure(save_path, start_index);
                 pushed_through = start_index;
 
                 // Goal config (ec 0/1 boss flag vs ec>=2 goalLocations). enable_dlc ships as int 0/1.
-                let ec = sd.pointer("/options/ending_condition").and_then(|v| v.as_i64()).unwrap_or(1);
+                let ec = sd
+                    .pointer("/options/ending_condition")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(1);
                 let dlc = sd
                     .pointer("/options/enable_dlc")
                     .map(|v| v.as_bool().unwrap_or_else(|| v.as_i64().unwrap_or(0) != 0))
@@ -182,11 +189,24 @@ fn connect_and_serve(cfg: &ApConfig) {
                         .unwrap_or_default();
                     goal_via_locations = !goal_locations.is_empty();
                     GOAL_FLAG.store(0, Ordering::Relaxed);
-                    tracing::info!("AP: goal = all {} goal location(s) checked (ec {})", goal_locations.len(), ec);
+                    tracing::info!(
+                        "AP: goal = all {} goal location(s) checked (ec {})",
+                        goal_locations.len(),
+                        ec
+                    );
                 } else {
-                    let flag: u32 = if ec == 0 && dlc { 20_012_802 } else { 19_000_800 };
+                    let flag: u32 = if ec == 0 && dlc {
+                        20_012_802
+                    } else {
+                        19_000_800
+                    };
                     GOAL_FLAG.store(flag, Ordering::Relaxed);
-                    tracing::info!("AP: goal = boss defeat flag {} (ec {}, dlc {})", flag, ec, dlc);
+                    tracing::info!(
+                        "AP: goal = boss defeat flag {} (ec {}, dlc {})",
+                        flag,
+                        ec,
+                        dlc
+                    );
                 }
 
                 // Phase 5: build the feature config (region-lock ecosystem, warp latches, map
@@ -199,10 +219,14 @@ fn connect_and_serve(cfg: &ApConfig) {
                 progressive::configure(progressive::parse(sd)); // Wave C tier tables
                 deathlink::configure_from_slot_data(sd); // Wave D: corrects is_enabled() from options.death_link
                 upgrades::set_auto_upgrade(
-                    sd.pointer("/options/auto_upgrade").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    sd.pointer("/options/auto_upgrade")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0) as i32,
                 );
                 upgrades::set_global_scadu_blessing(
-                    sd.pointer("/options/global_scadutree_blessing").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    sd.pointer("/options/global_scadutree_blessing")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0) as i32,
                 );
                 if let Some(arr) = sd.get("startGraces").and_then(|v| v.as_array()) {
                     let mut n = 0;
@@ -312,7 +336,10 @@ fn connect_and_serve(cfg: &ApConfig) {
         // reconnect). ec 0/1 boss-flag goals are detected on the game tick, which calls signal_goal().
         if goal_via_locations && !goal_sent {
             if let Some(client) = conn.client() {
-                if goal_locations.iter().all(|&g| client.is_local_location_checked(g)) {
+                if goal_locations
+                    .iter()
+                    .all(|&g| client.is_local_location_checked(g))
+                {
                     signal_goal();
                 }
             }
@@ -382,11 +409,26 @@ fn build_slot_config(sd: &serde_json::Value, dlc: bool, apcfg: &ApConfig) -> fea
     c.lock_notify_items = str_to_i32(sd.get("lockNotifyItems"));
     c.natural_key_triggers = parse_natural_keys(sd.get("naturalKeyTriggers"));
 
-    c.dlc_entry_warp_flag = sd.get("dlcEntryWarpFlag").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    c.dlc_start_area_id = sd.get("dlcStartAreaId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    c.random_start_warp_flag = sd.get("randomStartWarpFlag").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    c.random_start_area_id = sd.get("randomStartAreaId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    c.random_start_done_flag = sd.get("randomStartDoneFlag").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    c.dlc_entry_warp_flag = sd
+        .get("dlcEntryWarpFlag")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    c.dlc_start_area_id = sd
+        .get("dlcStartAreaId")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    c.random_start_warp_flag = sd
+        .get("randomStartWarpFlag")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    c.random_start_area_id = sd
+        .get("randomStartAreaId")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    c.random_start_done_flag = sd
+        .get("randomStartDoneFlag")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
 
     c.area_lock_flags = sd
         .get("areaLockFlags")
@@ -407,7 +449,10 @@ fn build_slot_config(sd: &serde_json::Value, dlc: bool, apcfg: &ApConfig) -> fea
         })
         .unwrap_or_default();
 
-    c.reveal_all_maps = sd.get("reveal_all_maps").and_then(|v| v.as_bool()).unwrap_or(false);
+    c.reveal_all_maps = sd
+        .get("reveal_all_maps")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // dungeonSweeps: { "<trigger location id>": [members...] } (slot_data).
     if let Some(serde_json::Value::Object(o)) = sd.get("dungeonSweeps") {
@@ -466,7 +511,12 @@ fn str_to_u32vec(v: Option<&serde_json::Value>) -> HashMap<String, Vec<u32>> {
     if let Some(serde_json::Value::Object(o)) = v {
         for (k, val) in o {
             if let Some(arr) = val.as_array() {
-                m.insert(k.clone(), arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect());
+                m.insert(
+                    k.clone(),
+                    arr.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as u32))
+                        .collect(),
+                );
             }
         }
     }
@@ -484,12 +534,20 @@ fn parse_natural_keys(v: Option<&serde_json::Value>) -> HashMap<String, Vec<feat
                     let items = c
                         .get("items")
                         .and_then(|x| x.as_array())
-                        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let flags = c
                         .get("flags")
                         .and_then(|x| x.as_array())
-                        .map(|a| a.iter().filter_map(|s| s.as_u64().map(|n| n as u32)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_u64().map(|n| n as u32))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     clauses.push(features::NkClause { items, flags });
                 }
@@ -522,7 +580,9 @@ fn load_apconfig() -> Option<ApConfig> {
                     tracing::info!("AP: loaded config from {}", path.display());
                     return Some(c);
                 }
-                Err(e) => tracing::error!("AP: found {} but failed to parse it: {e}", path.display()),
+                Err(e) => {
+                    tracing::error!("AP: found {} but failed to parse it: {e}", path.display())
+                }
             },
             Err(_) => tracing::debug!("AP: no config at {}", path.display()),
         }
@@ -530,7 +590,11 @@ fn load_apconfig() -> Option<ApConfig> {
     tracing::error!(
         "AP: no usable apconfig.json (looked at: {}). Create one next to the game exe: \
          {{\"url\":\"host:port\",\"slot\":\"Name\"}}. Networking disabled.",
-        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     None
 }
@@ -541,7 +605,13 @@ fn save_path_for(seed: &str, slot: &str) -> PathBuf {
     let _ = std::fs::create_dir_all("archipelago");
     let safe = |s: &str| -> String {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     };
     PathBuf::from("archipelago").join(format!("{}_{}.json", safe(seed), safe(slot)))

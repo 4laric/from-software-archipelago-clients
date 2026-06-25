@@ -165,13 +165,48 @@ mod tests {
     /// Frozen golden vectors auto-generated from spec-2's `vagrant_codec.py`
     /// (mirror of tests/codec_vectors_generated.h). (name, ap, low, high).
     const CODEC_VECTORS: &[(&str, i64, i32, i32)] = &[
-        ("small id", 1000, 0x0000_03E8u32 as i32, 0x0000_0000u32 as i32),
-        ("low32 bit-31 set", 2_147_483_648, 0x8000_0000u32 as i32, 0x0000_0000u32 as i32),
-        ("low32 all-ones (reads as -1)", 4_294_967_295, 0xFFFF_FFFFu32 as i32, 0x0000_0000u32 as i32),
-        ("just over 2^32 (high=1)", 4_294_967_296, 0x0000_0000u32 as i32, 0x0000_0001u32 as i32),
-        ("high bit-31 set", 4_611_686_018_427_392_564, 0x0000_1234u32 as i32, 0x4000_0000u32 as i32),
-        ("plausible AP base+index", 11_000_003_704, 0x8FA6_BC78u32 as i32, 0x0000_0002u32 as i32),
-        ("max int64", 9_223_372_036_854_775_807, 0xFFFF_FFFFu32 as i32, 0x7FFF_FFFFu32 as i32),
+        (
+            "small id",
+            1000,
+            0x0000_03E8u32 as i32,
+            0x0000_0000u32 as i32,
+        ),
+        (
+            "low32 bit-31 set",
+            2_147_483_648,
+            0x8000_0000u32 as i32,
+            0x0000_0000u32 as i32,
+        ),
+        (
+            "low32 all-ones (reads as -1)",
+            4_294_967_295,
+            0xFFFF_FFFFu32 as i32,
+            0x0000_0000u32 as i32,
+        ),
+        (
+            "just over 2^32 (high=1)",
+            4_294_967_296,
+            0x0000_0000u32 as i32,
+            0x0000_0001u32 as i32,
+        ),
+        (
+            "high bit-31 set",
+            4_611_686_018_427_392_564,
+            0x0000_1234u32 as i32,
+            0x4000_0000u32 as i32,
+        ),
+        (
+            "plausible AP base+index",
+            11_000_003_704,
+            0x8FA6_BC78u32 as i32,
+            0x0000_0002u32 as i32,
+        ),
+        (
+            "max int64",
+            9_223_372_036_854_775_807,
+            0xFFFF_FFFFu32 as i32,
+            0x7FFF_FFFFu32 as i32,
+        ),
     ];
 
     #[test]
@@ -205,7 +240,7 @@ mod tests {
         assert!(is_synthetic_goods(CATEGORY_GOODS | 3_780_001));
         assert!(!is_synthetic_goods(CATEGORY_GOODS | 3_780_000)); // strictly greater
         assert!(!is_synthetic_goods(CATEGORY_GOODS | 2_220_010)); // max real vanilla goods id
-        // goods-only payoff: other categories never misdetect regardless of magnitude
+                                                                  // goods-only payoff: other categories never misdetect regardless of magnitude
         assert!(!is_synthetic_goods(CATEGORY_WEAPON | 99_060_000));
         assert!(!is_synthetic_goods(CATEGORY_PROTECTOR | 5_330_000));
         assert!(!is_synthetic_goods(CATEGORY_ACCESSORY | 4_000_000));
@@ -253,7 +288,11 @@ mod tests {
         // Mirrors row_test.cpp: local-replacement synthetic, bit-31-set low + high=1.
         let mut row = [0u8; EQG_ROW_SIZE];
         put_i32(&mut row, EQG_OFF_VAGRANT_ITEM_LOT_ID, 0x8FA0_E6B8);
-        put_i32(&mut row, EQG_OFF_VAGRANT_BONUS_ENE_DROP_ITEM_LOT_ID, 0x0000_0001);
+        put_i32(
+            &mut row,
+            EQG_OFF_VAGRANT_BONUS_ENE_DROP_ITEM_LOT_ID,
+            0x0000_0001,
+        );
         put_i32(&mut row, EQG_OFF_BASIC_PRICE, 100_100);
         put_i32(&mut row, EQG_OFF_SELL_VALUE, 3);
 

@@ -97,7 +97,11 @@ fn compare_pre(a: &[String], b: &[String]) -> Ordering {
             }
         } else if xn != yn {
             // numeric ids rank below alphanumeric
-            return if xn { Ordering::Less } else { Ordering::Greater };
+            return if xn {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
         } else if x != y {
             return x.cmp(y);
         }
@@ -220,9 +224,8 @@ mod tests {
 
     #[test]
     fn ordering_rules() {
-        let lt = |a: &str, b: &str| {
-            compare_semver(&parse_semver(a).unwrap(), &parse_semver(b).unwrap())
-        };
+        let lt =
+            |a: &str, b: &str| compare_semver(&parse_semver(a).unwrap(), &parse_semver(b).unwrap());
         assert_eq!(lt("0.1.0-beta.1", "0.1.0"), Ordering::Less);
         assert_eq!(lt("0.1.0-beta.1", "0.1.0-beta.2"), Ordering::Less);
         assert_eq!(lt("0.1.0", "0.1.0"), Ordering::Equal);

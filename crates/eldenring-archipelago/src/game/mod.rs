@@ -69,9 +69,14 @@ fn breadcrumb(step: &str) {
             p.to_string_lossy().into_owned()
         });
         let _ = std::fs::create_dir_all(&dir);
-        std::path::Path::new(&dir).join(format!("eldenring-ap_{}.trace.log", crate::log_timestamp()))
+        std::path::Path::new(&dir)
+            .join(format!("eldenring-ap_{}.trace.log", crate::log_timestamp()))
     });
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{step}");
         let _ = f.flush();
         let _ = f.sync_all();
@@ -227,7 +232,9 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     });
     if std::fs::create_dir_all(&dir).is_err() {
         // Never panic on the loader thread: fall back to the default (stdout) subscriber.
-        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
         return None;
     }
     let filename = format!("eldenring-ap_{}.log", crate::log_timestamp());

@@ -45,7 +45,10 @@ fn channel() -> &'static GrantChannel {
     static CH: OnceLock<GrantChannel> = OnceLock::new();
     CH.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel(4096);
-        GrantChannel { tx, rx: Mutex::new(rx) }
+        GrantChannel {
+            tx,
+            rx: Mutex::new(rx),
+        }
     })
 }
 
@@ -103,7 +106,9 @@ pub fn configure(save_path: PathBuf, start_index: i64) {
     if let Ok(text) = std::fs::read_to_string(&save_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             START_ITEMS_GRANTED.store(
-                v.get("start_items_granted").and_then(|x| x.as_bool()).unwrap_or(false),
+                v.get("start_items_granted")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false),
                 Ordering::Relaxed,
             );
             if let Some(arr) = v.get("notify_granted").and_then(|x| x.as_array()) {
@@ -117,8 +122,11 @@ pub fn configure(save_path: PathBuf, start_index: i64) {
             // Phase 5 Wave C: restore the progressive tier counters + high-index (progressive.rs
             // owns the live state; the save file is grant.rs's, so it round-trips them here).
             progressive::restore(
-                v.get("progressive_counter").unwrap_or(&serde_json::Value::Null),
-                v.get("progressive_high_index").and_then(|x| x.as_i64()).unwrap_or(-1),
+                v.get("progressive_counter")
+                    .unwrap_or(&serde_json::Value::Null),
+                v.get("progressive_high_index")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(-1),
             );
         }
     }

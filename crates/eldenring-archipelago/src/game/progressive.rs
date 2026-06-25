@@ -319,7 +319,10 @@ pub fn snapshot() -> (serde_json::Value, i64) {
         .iter()
         .map(|(k, &v)| (k.clone(), serde_json::Value::from(v)))
         .collect();
-    (serde_json::Value::Object(map), HIGH_INDEX.load(Ordering::Relaxed))
+    (
+        serde_json::Value::Object(map),
+        HIGH_INDEX.load(Ordering::Relaxed),
+    )
 }
 
 /// Restore the persisted state from the per-seed save at (re)connect — called BY grant.rs's

@@ -120,7 +120,8 @@ mod tests {
     fn end_to_end_decode_through_reexport() {
         // A synthetic local-replacement goods placeholder decodes + routes to SuppressAndGrant.
         let mut row = [0u8; er_codec::EQG_ROW_SIZE];
-        row[er_codec::EQG_OFF_VAGRANT_ITEM_LOT_ID..][..4].copy_from_slice(&7_004_362i32.to_le_bytes());
+        row[er_codec::EQG_OFF_VAGRANT_ITEM_LOT_ID..][..4]
+            .copy_from_slice(&7_004_362i32.to_le_bytes());
         row[er_codec::EQG_OFF_BASIC_PRICE..][..4].copy_from_slice(&1_000_000i32.to_le_bytes());
         row[er_codec::EQG_OFF_SELL_VALUE..][..4].copy_from_slice(&1i32.to_le_bytes());
         let item = decode_synthetic_row(&row).unwrap();

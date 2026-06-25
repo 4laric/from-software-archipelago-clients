@@ -60,7 +60,9 @@ fn reader_thread() {
     let conin = match OpenOptions::new().read(true).open("CONIN$") {
         Ok(f) => f,
         Err(e) => {
-            say(&format!("console: cannot open CONIN$ ({e}); input disabled"));
+            say(&format!(
+                "console: cannot open CONIN$ ({e}); input disabled"
+            ));
             return;
         }
     };
@@ -105,13 +107,20 @@ fn exec(cmd: &str) {
                 say(&format!(
                     "setflag {flag} = {} -> {}",
                     on as u8,
-                    if ok { "ok" } else { "holder not ready (not in world?)" }
+                    if ok {
+                        "ok"
+                    } else {
+                        "holder not ready (not in world?)"
+                    }
                 ));
             }
             _ => say("usage: /setflag <id> <0|1>"),
         },
         ["/getflag", id] => match id.parse::<u32>() {
-            Ok(flag) => say(&format!("getflag {flag} = {}", flags::get_event_flag(flag) as u8)),
+            Ok(flag) => say(&format!(
+                "getflag {flag} = {}",
+                flags::get_event_flag(flag) as u8
+            )),
             Err(_) => say("usage: /getflag <id>"),
         },
         ["/region"] => match flags::play_region_id() {
@@ -122,7 +131,11 @@ fn exec(cmd: &str) {
             let ok = flags::try_set_event_flag(76996, true);
             say(&format!(
                 "/kill -> set DeathLink kill flag 76996 ({})",
-                if ok { "ok" } else { "holder not ready (not in world?)" }
+                if ok {
+                    "ok"
+                } else {
+                    "holder not ready (not in world?)"
+                }
             ));
         }
         ["/help"] => say("commands: /setflag <id> <0|1>, /getflag <id>, /region, /kill, /help"),
