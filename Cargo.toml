@@ -4,6 +4,12 @@ members = [
     "crates/ds3-archipelago",
     "crates/sdt-archipelago",
     "crates/shared",
+    # --- Elden Ring (DRAFT) -------------------------------------------------
+    # Alaric's Phase-5 ER runtime client + its two pure-logic crates.
+    # Not yet converged onto `shared`; see the PR description for the WIP list.
+    "crates/eldenring-archipelago",
+    "crates/er-codec",
+    "crates/er-semver",
 ]
 
 [workspace.package]
@@ -56,4 +62,3 @@ sekiro = { git = "https://github.com/vswarte/fromsoftware-rs" }
 # fromsoftware-extra-shared = { path = "../fromsoftware-extra/crates/shared" }
 # darksouls3-extra = { path = "../fromsoftware-extra/crates/darksouls3" }
 # sekiro-extra = { path = "../fromsoftware-extra/crates/sekiro" }
-
