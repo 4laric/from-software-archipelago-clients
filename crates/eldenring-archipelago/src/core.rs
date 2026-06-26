@@ -91,12 +91,11 @@ impl shared::Core for Core {
 
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them.
         let checks = crate::detour::take_pending_checks();
-        if !checks.is_empty() {
-            if let Some(client) = self.client_mut() {
-                if let Err(e) = client.mark_checked(checks.iter().copied()) {
-                    log::warn!("mark_checked failed for {checks:?}: {e}");
-                }
-            }
+        if !checks.is_empty()
+            && let Some(client) = self.client_mut()
+            && let Err(e) = client.mark_checked(checks.iter().copied())
+        {
+            log::warn!("mark_checked failed for {checks:?}: {e}");
         }
 
         // 2. Parse slot_data once.
@@ -225,7 +224,7 @@ impl shared::Core for Core {
                 // read-back means it was clobbered, so we log it and retry next tick.
                 if !already_flags && has_inv && crate::startgrants::apply_start_flags(sc) {
                     let sentinel = sc.start_graces.first().copied();
-                    let stuck = sentinel.map_or(true, crate::flags::get_event_flag);
+                    let stuck = sentinel.is_none_or(crate::flags::get_event_flag);
                     if stuck {
                         did_flags = true;
                     } else {
@@ -307,10 +306,10 @@ impl shared::Core for Core {
         let mut unlocked: Vec<String> = Vec::new();
         for name in &names_to_open {
             crate::keyitems::set_acquire_flags(name);
-            if let Some(cfg) = self.region.as_ref() {
-                if crate::region::open_on_received_name(cfg, name) {
-                    unlocked.push(name.trim_end_matches(" Lock").to_string());
-                }
+            if let Some(cfg) = self.region.as_ref()
+                && crate::region::open_on_received_name(cfg, name)
+            {
+                unlocked.push(name.trim_end_matches(" Lock").to_string());
             }
         }
         for region in unlocked {
@@ -360,10 +359,10 @@ impl shared::Core for Core {
                 }
                 if !to_check.is_empty() {
                     log::info!("shop/offline discovery: {} new check(s)", to_check.len());
-                    if let Some(client) = self.client_mut() {
-                        if let Err(e) = client.mark_checked(to_check.iter().copied()) {
-                            log::warn!("shop mark_checked failed: {e}");
-                        }
+                    if let Some(client) = self.client_mut()
+                        && let Err(e) = client.mark_checked(to_check.iter().copied())
+                    {
+                        log::warn!("shop mark_checked failed: {e}");
                     }
                 }
             }
@@ -373,7 +372,7 @@ impl shared::Core for Core {
         //     whose guarding event flag has fired, plus dungeon/boss sweeps. Throttled — flags don't
         //     change fast and the map can be large. Dedup via the server's checked set (reload-safe).
         self.poll_counter = self.poll_counter.wrapping_add(1);
-        if self.locations_loaded && self.poll_counter % 15 == 0 {
+        if self.locations_loaded && self.poll_counter.is_multiple_of(15) {
             let mut to_check: Vec<i64> = Vec::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
                 for (&loc, &flag) in &fp.location_flags {
@@ -385,14 +384,14 @@ impl shared::Core for Core {
                     }
                 }
                 for (trigger, members) in &self.dungeon_sweeps {
-                    if let Some(&flag) = fp.location_flags.get(trigger) {
-                        if crate::flags::get_event_flag(flag) {
-                            for &m in members {
-                                if self.valid_locations.contains(&m)
-                                    && !client.is_local_location_checked(m)
-                                {
-                                    to_check.push(m);
-                                }
+                    if let Some(&flag) = fp.location_flags.get(trigger)
+                        && crate::flags::get_event_flag(flag)
+                    {
+                        for &m in members {
+                            if self.valid_locations.contains(&m)
+                                && !client.is_local_location_checked(m)
+                            {
+                                to_check.push(m);
                             }
                         }
                     }
@@ -444,10 +443,11 @@ impl shared::Core for Core {
             }
         }
         crate::deathlink::drive_kill();
-        if crate::deathlink::is_enabled() && crate::deathlink::poll_local_death() {
-            if let Some(client) = self.client_mut() {
-                let _ = client.death_link(ap::DeathLinkOptions::default());
-            }
+        if crate::deathlink::is_enabled()
+            && crate::deathlink::poll_local_death()
+            && let Some(client) = self.client_mut()
+        {
+            let _ = client.death_link(ap::DeathLinkOptions::default());
         }
 
         // 8. Scadutree blessing writer.

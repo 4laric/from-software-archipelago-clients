@@ -267,16 +267,8 @@ fn walk_inventory_targets() -> Option<(i32, i32)> {
         // Classify the held weapon by its OWN track (a somber weapon can never reach +25, so its
         // level must not raise the normal target, and vice-versa). Mirrors C++ WeaponInfo per entry.
         match weapon_track_and_cap(base) {
-            Some((_, true)) => {
-                if level > somber {
-                    somber = level;
-                }
-            }
-            Some((_, false)) => {
-                if level > normal {
-                    normal = level;
-                }
-            }
+            Some((_, true)) => somber = somber.max(level),
+            Some((_, false)) => normal = normal.max(level),
             None => {}
         }
     }
@@ -351,10 +343,10 @@ pub fn tick_global_scadu() {
             Ok(g) => g,
             Err(_) => return,
         };
-        if let Some(t) = *last {
-            if t.elapsed() < SCADU_THROTTLE {
-                return;
-            }
+        if let Some(t) = *last
+            && t.elapsed() < SCADU_THROTTLE
+        {
+            return;
         }
         *last = Some(Instant::now());
     }
