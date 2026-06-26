@@ -10,6 +10,7 @@ use crate::{Game, utils};
 pub struct Config<G: Game> {
     url: String,
     slot: String,
+    #[serde(default)]
     seed: String,
     client_version: Option<String>,
     password: Option<String>,

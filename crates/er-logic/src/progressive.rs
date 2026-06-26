@@ -106,14 +106,8 @@ mod tests {
         m.insert(
             "progressive_stone_bell".into(),
             vec![
-                ProgTier {
-                    goods: vec![8101],
-                    flags: vec![70001],
-                },
-                ProgTier {
-                    goods: vec![8102],
-                    flags: vec![70002],
-                },
+                ProgTier { goods: vec![8101], flags: vec![70001] },
+                ProgTier { goods: vec![8102], flags: vec![70002] },
             ],
         );
         m
@@ -168,11 +162,70 @@ mod tests {
 
         // The next genuinely-new copy (idx 1) resumes at tier 1, not tier 0.
         let next = p.on_item_received("progressive_stone_bell", 1);
-        assert_eq!(
-            next.grants,
-            vec![8102 | GOODS_FULLID],
-            "resumes at tier 1 after restore"
-        );
+        assert_eq!(next.grants, vec![8102 | GOODS_FULLID], "resumes at tier 1 after restore");
         assert_eq!(p.snapshot().1, 1);
+    }
+}
+/// Parse `progressiveGrants` slot_data into the per-name tier config. Tolerant: a tier may carry
+/// `goodsList` (array) or `goods` (single), plus optional `flags`; a fully-empty tier is dropped
+/// (the deliberate fix for the C++ "key goods not found" abort). Absent key -> empty config.
+pub fn parse(slot_data: &serde_json::Value) -> HashMap<String, Vec<ProgTier>> {
+    let mut out = HashMap::new();
+    let Some(obj) = slot_data.get("progressiveGrants").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (name, tiers_v) in obj {
+        let Some(arr) = tiers_v.as_array() else { continue };
+        let mut tiers = Vec::new();
+        for t in arr {
+            let goods = t
+                .get("goodsList")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|n| n.as_u64().map(|n| n as u32)).collect::<Vec<_>>())
+                .or_else(|| t.get("goods").and_then(|v| v.as_u64()).map(|g| vec![g as u32]))
+                .unwrap_or_default();
+            let flags = t
+                .get("flags")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|n| n.as_u64().map(|n| n as u32)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if goods.is_empty() && flags.is_empty() {
+                continue; // drop empty tier
+            }
+            tiers.push(ProgTier { goods, flags });
+        }
+        if !tiers.is_empty() {
+            out.insert(name.clone(), tiers);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_is_tolerant_and_drops_empty_tiers() {
+        let sd = serde_json::json!({ "progressiveGrants": {
+            "progressive_physick": [
+                { "goodsList": [1001, 1002], "flags": [60001] },
+                { "goods": 1003 },
+                { "flags": [60002] },
+                { "junk": true }
+            ]
+        }});
+        let map = parse(&sd);
+        let tiers = &map["progressive_physick"];
+        assert_eq!(tiers.len(), 3, "the fully-empty tier is dropped, not fatal");
+        assert_eq!(tiers[0].goods, vec![1001, 1002]);
+        assert_eq!(tiers[0].flags, vec![60001]);
+        assert_eq!(tiers[1].goods, vec![1003]);
+        assert!(tiers[2].goods.is_empty() && tiers[2].flags == vec![60002]);
+    }
+
+    #[test]
+    fn parse_absent_key_is_empty() {
+        assert!(parse(&serde_json::json!({ "seed": "x" })).is_empty());
     }
 }

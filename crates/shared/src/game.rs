@@ -20,6 +20,8 @@ pub trait Game: Send + Sync + 'static {
 
     /// The version of this client.
     const CLIENT_VERSION: &str;
+    /// Echo own checks back (items_handling own_world bit); ER overrides to true.
+    const OWN_WORLD: bool = false;
 
     /// Schedules `task` to be run each frame, ideally at the beginning of the
     /// frame, on the game's main thread.
@@ -66,6 +68,7 @@ pub trait Game: Send + Sync + 'static {
 pub enum GameType {
     DarkSoulsIII,
     Sekiro,
+    EldenRing,
 }
 
 impl GameType {
@@ -74,6 +77,7 @@ impl GameType {
         match self {
             GameType::DarkSoulsIII => "DS3",
             GameType::Sekiro => "Sekiro",
+            GameType::EldenRing => "ER",
         }
     }
 
@@ -82,6 +86,7 @@ impl GameType {
         match self {
             GameType::DarkSoulsIII => "DS3Randomizer.exe",
             GameType::Sekiro => "SekiroRandomizer.exe",
+            GameType::EldenRing => "EldenRingRandomizer.exe",
         }
     }
 }

@@ -7,18 +7,9 @@ use std::ffi::c_void;
 use windows::Win32::{Foundation::HINSTANCE, System::SystemServices::DLL_PROCESS_ATTACH};
 
 mod core;
-mod deathlink;
-mod detour;
-mod flagpoll;
-mod flags;
 mod game;
-mod inventory;
-mod keyitems;
-mod params;
-mod region;
-mod startgrants;
-mod upgrades;
-// progressive logic lives in er_logic::progressive (pure, host-tested); no local module needed.
+// Added as `update_live` grows (Milestone B): mod hook; mod region; mod grants; mod inventory;
+//   + the re-homed funnels: mod flags; mod grant; mod deathlink; mod upgrades; mod params;
 
 /// DLL entry point — standard 3-arg Win32 `DllMain`. ModEngine2 loads externals via `LoadLibrary`,
 /// so the OS invokes this with DLL_PROCESS_ATTACH. (3-arg works under me2 AND me3.)
@@ -33,9 +24,8 @@ extern "system" fn DllMain(_hinst: HINSTANCE, call_reason: u32, _reserved: *mut 
     shared::handle_panics::<game::EldenRing>();
     shared::start_logger();
 
-    // The AddItemFunc detour is installed lazily from `Core::update_live` (needs the module loaded
-    // + must run off the loader lock), not here. It suppresses synthetic placeholders so they never
-    // enter inventory — no inventory scan/removal needed under shared's own_world:false model.
+    // No AddItemFunc detour: under the inventory-scan item model (own_world:false, DS3-style),
+    // self-found placeholders are converted by scanning the inventory in `update_live`.
 
     shared::initialize::<game::EldenRing>(shared::NoOpInputBlocker);
     true

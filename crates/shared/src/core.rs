@@ -78,7 +78,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
     fn new_connection(game: Ustr, config: &Config<G>) -> ap::Connection<S> {
         let mut options = ap::ConnectionOptions::new()
             .receive_items(ap::ItemHandling::OtherWorlds {
-                own_world: false,
+                own_world: G::OWN_WORLD,
                 starting_inventory: true,
             })
             .tags(vec!["DeathLink"]);

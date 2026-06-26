@@ -7,7 +7,12 @@ use imgui::*;
 use mint::Vector2;
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HMODULE, MAX_PATH};
 use windows::Win32::System::ProcessStatus::{ENUM_PROCESS_MODULES_EX_FLAGS, EnumProcessModulesEx};
-use windows::Win32::System::{LibraryLoader::GetModuleFileNameW, Threading::GetCurrentProcess};
+use windows::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    GetModuleFileNameW, GetModuleHandleExW,
+};
+use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::core::PCWSTR;
 use windows_result::Error as WindowsError;
 
 /// Returns the path to the parent directory of the mod.
@@ -28,8 +33,31 @@ pub fn mod_directory<'a>() -> Result<&'a Path> {
 }
 
 /// Loads [mod_directory] without caching.
+///
+/// Prefers the ME3-based discovery (looks for `me3_mod_host.dll` in the process). When that DLL
+/// isn't present — i.e. the client was loaded by a non-ME3 loader such as ModEngine2 — falls back
+/// to the directory containing the AP client DLL itself, so `apconfig.json` and `log/` sit beside
+/// the DLL. The fallback is inert under ME3, so this doesn't change ME3 behavior.
 fn load_mod_directory() -> Result<PathBuf> {
     println!("Locating mod directory...");
+    match locate_me3_mod_directory() {
+        Ok(path) => Ok(path),
+        Err(me3_err) => match current_module_directory() {
+            Ok(dir) => {
+                println!("  me3 not detected; using AP DLL directory: {:?}", dir);
+                Ok(dir)
+            }
+            Err(fallback_err) => {
+                println!("  fallback to AP DLL directory failed: {:?}", fallback_err);
+                Err(me3_err)
+            }
+        },
+    }
+}
+
+/// ME3-based mod-directory discovery (unchanged from upstream): finds `me3_mod_host.dll` and
+/// derives the mod directory from its path.
+fn locate_me3_mod_directory() -> Result<PathBuf> {
     match try_load_mod_directory(0x100) {
         Ok(TryLoadModDirectoryResult::Path(path)) => Ok(path),
         Ok(TryLoadModDirectoryResult::TryAgain(size)) => match try_load_mod_directory(size) {
@@ -43,6 +71,26 @@ fn load_mod_directory() -> Result<PathBuf> {
         Err(err) => Err(err),
     }
     .context("failed to locate mod directory")
+}
+
+/// Returns the directory containing the AP client DLL we're compiled into, by resolving the module
+/// that owns this function's address. Used as the non-ME3 fallback for [load_mod_directory].
+fn current_module_directory() -> Result<PathBuf> {
+    let mut module = HMODULE::default();
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            // The address of this fn identifies the module it lives in (FROM_ADDRESS treats the
+            // "module name" pointer as an address rather than a string).
+            PCWSTR(current_module_directory as *const u16),
+            &raw mut module,
+        )?;
+    }
+    let path = get_module_path(module)?;
+    Ok(path
+        .parent()
+        .context("AP client DLL path has no parent directory")?
+        .to_path_buf())
 }
 
 /// Passes an array of the given [size] to [EnumProcessModules] to attempt to

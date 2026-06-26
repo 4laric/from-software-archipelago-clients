@@ -55,9 +55,8 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "archipelago_rs"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fc307204c7c97a628a1999d8731d69b29056af4f66872122f57d7c1ceec3b99"
+version = "3.0.1"
+source = "git+https://github.com/nex3/archipelago_rs#33ddae62697d2432b2d623a667e18a67e09bf567"
 dependencies = [
  "bitflags 2.11.1",
  "log",
@@ -455,15 +454,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -639,8 +629,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "eldenring"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f98d635e24da261a5972a2f74cb453140acf31c23216d1b27744e5de0727108"
+source = "git+https://github.com/vswarte/fromsoftware-rs?branch=main#8c67a84f394bd58efdb06a5be47f988e0c1a9995"
 dependencies = [
  "bitfield",
  "bitflags 2.11.1",
@@ -659,18 +648,18 @@ dependencies = [
 name = "eldenring-archipelago"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "archipelago_rs",
  "eldenring",
  "er-codec",
- "er-semver",
+ "er-logic",
  "fromsoftware-shared 0.14.0",
+ "hudhook",
+ "log",
  "retour",
- "serde",
  "serde_json",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "windows 0.61.3",
+ "shared",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -691,6 +680,15 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "er-codec"
 version = "0.1.0"
+
+[[package]]
+name = "er-logic"
+version = "0.1.0"
+dependencies = [
+ "er-codec",
+ "er-semver",
+ "serde_json",
+]
 
 [[package]]
 name = "er-semver"
@@ -806,8 +804,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e2a3db947909eb9fff3637bc882683f0b0dadee9884ea24ceb107525ad19d96"
+source = "git+https://github.com/vswarte/fromsoftware-rs?branch=main#8c67a84f394bd58efdb06a5be47f988e0c1a9995"
 dependencies = [
  "bitflags 2.11.1",
  "from-singleton",
@@ -834,8 +831,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-macros"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e83f4050cdfb1847ee0d31385f53dc197bf414b39abc9d92483f571fb9e750b"
+source = "git+https://github.com/vswarte/fromsoftware-rs?branch=main#8c67a84f394bd58efdb06a5be47f988e0c1a9995"
 dependencies = [
  "inflections",
  "proc-macro2",
@@ -846,8 +842,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-stl"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfeff057215d7f565737d8ee24516b2a77dff92966626fe42e0f36e9a289f2c5"
+source = "git+https://github.com/vswarte/fromsoftware-rs?branch=main#8c67a84f394bd58efdb06a5be47f988e0c1a9995"
 
 [[package]]
 name = "fs_extra"
@@ -1320,15 +1315,6 @@ name = "nonmax"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "610a5acd306ec67f907abe5567859a3c693fb9886eb1f012ab8f2a47bef3db51"
-
-[[package]]
-name = "nu-ansi-term"
-version = "0.50.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
-dependencies = [
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "num-conv"
@@ -2030,15 +2016,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sharded-slab"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
-dependencies = [
- "lazy_static",
-]
-
-[[package]]
 name = "shared"
 version = "0.0.0"
 dependencies = [
@@ -2140,12 +2117,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "symlink"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
 
 [[package]]
 name = "syn"
@@ -2300,32 +2271,7 @@ checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "log",
  "pin-project-lite",
- "tracing-attributes",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-appender"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
-dependencies = [
- "crossbeam-channel",
- "symlink",
- "thiserror 2.0.18",
- "time",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tracing-attributes"
-version = "0.1.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -2335,18 +2281,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-log"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
 ]
 
 [[package]]
@@ -2356,15 +2290,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
  "matchers",
- "nu-ansi-term",
  "once_cell",
  "regex-automata",
- "sharded-slab",
- "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
- "tracing-log",
 ]
 
 [[package]]
@@ -2448,12 +2378,6 @@ dependencies = [
  "parking_lot",
  "serde",
 ]
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"

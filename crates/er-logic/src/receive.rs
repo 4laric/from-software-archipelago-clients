@@ -181,10 +181,7 @@ mod tests {
                 name: "Golden Rune [1]".into(),
             }
         );
-        assert_eq!(
-            hook.dispatched,
-            vec!["Lordsworn's Greatsword", "Golden Rune [1]"]
-        );
+        assert_eq!(hook.dispatched, vec!["Lordsworn's Greatsword", "Golden Rune [1]"]);
         assert_eq!(dispatched, 2);
         assert_eq!(pushed, 2);
     }
@@ -205,13 +202,12 @@ mod tests {
         ];
         let actions: Vec<_> = stream
             .iter()
-            .map(|ri| process_received_item(ri, &mut dispatched, &mut pushed, &im, &ic, &mut hook))
+            .map(|ri| {
+                process_received_item(ri, &mut dispatched, &mut pushed, &im, &ic, &mut hook)
+            })
             .collect();
 
-        assert_eq!(
-            hook.dispatched,
-            vec!["Lordsworn's Greatsword", "Golden Rune [1]"]
-        );
+        assert_eq!(hook.dispatched, vec!["Lordsworn's Greatsword", "Golden Rune [1]"]);
         assert_eq!(dispatched, 2);
         assert_eq!(
             actions,
@@ -227,30 +223,9 @@ mod tests {
         let mut dispatched = 0i64;
         let mut pushed = 1i64;
 
-        let a0 = process_received_item(
-            &item(0, 7777, "A"),
-            &mut dispatched,
-            &mut pushed,
-            &im,
-            &ic,
-            &mut hook,
-        );
-        let a1 = process_received_item(
-            &item(1, 8888, "B"),
-            &mut dispatched,
-            &mut pushed,
-            &im,
-            &ic,
-            &mut hook,
-        );
-        let a2 = process_received_item(
-            &item(2, 7777, "C"),
-            &mut dispatched,
-            &mut pushed,
-            &im,
-            &ic,
-            &mut hook,
-        );
+        let a0 = process_received_item(&item(0, 7777, "A"), &mut dispatched, &mut pushed, &im, &ic, &mut hook);
+        let a1 = process_received_item(&item(1, 8888, "B"), &mut dispatched, &mut pushed, &im, &ic, &mut hook);
+        let a2 = process_received_item(&item(2, 7777, "C"), &mut dispatched, &mut pushed, &im, &ic, &mut hook);
 
         assert_eq!(a0, GrantAction::AlreadyPushed);
         assert!(matches!(a1, GrantAction::Enqueue { ap_index: 1, .. }));
@@ -279,10 +254,7 @@ mod tests {
 
         assert_eq!(a, GrantAction::SkipProgressive);
         assert_eq!(hook.dispatched, vec!["Progressive Crimson Tear"]);
-        assert_eq!(
-            hook.progressed,
-            vec![("Progressive Crimson Tear".to_string(), 0)]
-        );
+        assert_eq!(hook.progressed, vec![("Progressive Crimson Tear".to_string(), 0)]);
         assert_eq!(pushed, 1);
     }
 
@@ -293,14 +265,7 @@ mod tests {
         let mut dispatched = 0i64;
         let mut pushed = 0i64;
 
-        let a = process_received_item(
-            &item(0, 9999, "Mystery"),
-            &mut dispatched,
-            &mut pushed,
-            &im,
-            &ic,
-            &mut hook,
-        );
+        let a = process_received_item(&item(0, 9999, "Mystery"), &mut dispatched, &mut pushed, &im, &ic, &mut hook);
 
         assert_eq!(a, GrantAction::SkipUnmapped { ap_item_id: 9999 });
         assert_eq!(pushed, 1);
