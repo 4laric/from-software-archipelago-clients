@@ -33,7 +33,12 @@
 //!   - detour.rs `grant_full_id` calls `apply_auto_upgrade(full_id) -> i32` on every granted item.
 //!   - mod.rs `tick()` calls `tick_global_scadu()` in the in-world `#[cfg(feature = "net")]` neighbourhood.
 
-#![allow(dead_code)]
+// doc_* allows: the module/item docs use intentional column-aligned reference tables, not markdown lists.
+#![allow(
+    dead_code,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items
+)]
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -411,12 +416,7 @@ fn held_scadu_fragments() -> Option<i32> {
 fn raise_stored_blessing(level: i32) -> Option<Option<(i32, i32)>> {
     // Clamp the computed target into the valid stored range before any write.
     let mut target = level;
-    if target < 0 {
-        target = 0;
-    }
-    if target > SCADU_MAX_LEVEL {
-        target = SCADU_MAX_LEVEL;
-    }
+    target = target.clamp(0, SCADU_MAX_LEVEL);
     // SAFETY: FD4 singleton accessed MUTABLY (we may write the byte); same idiom as
     // deathlink.rs `WorldChrMan::instance_mut()`. Err/None before the player is placed -> no-op.
     let gdm = unsafe { GameDataMan::instance_mut() }.ok()?;

@@ -7,6 +7,9 @@
 //! Enumeration is the exact path `upgrades.rs` walks for auto_upgrade (proven in-game):
 //! `GameDataMan -> main_player_game_data -> equipment.equip_inventory_data.items_data.items()`.
 
+// intentional module-doc prose wrapping, not a markdown list
+#![allow(clippy::doc_lazy_continuation)]
+
 use eldenring::cs::{GameDataMan, ItemCategory};
 use fromsoftware_shared::FromStatic;
 
