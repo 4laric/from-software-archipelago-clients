@@ -32,18 +32,29 @@ pub struct StartConfig {
 pub fn parse(sd: &Value) -> StartConfig {
     let arr_i32 = |v: Option<&Value>| {
         v.and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|n| n.as_i64().map(|n| n as i32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_i64().map(|n| n as i32))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let arr_u32 = |v: Option<&Value>| {
         v.and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|n| n.as_u64().map(|n| n as u32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_u64().map(|n| n as u32))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     StartConfig {
         start_items: arr_i32(sd.get("startItems")),
         start_graces: arr_u32(sd.get("startGraces")),
-        reveal_all_maps: sd.get("reveal_all_maps").and_then(|v| v.as_bool()).unwrap_or(false),
+        reveal_all_maps: sd
+            .get("reveal_all_maps")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         enable_dlc: sd
             .pointer("/options/enable_dlc")
             .and_then(|v| v.as_bool())

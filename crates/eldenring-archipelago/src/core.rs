@@ -173,13 +173,19 @@ impl shared::Core for Core {
                     .unwrap_or_default();
                 self.received_through = st.last_received_index.max(0) as usize;
                 self.progressive.restore(
-                    st.progressive_counter.iter().map(|(k, &v)| (k.clone(), v)).collect(),
+                    st.progressive_counter
+                        .iter()
+                        .map(|(k, &v)| (k.clone(), v))
+                        .collect(),
                     st.progressive_high_index,
                 );
                 self.start_items_granted = st.start_items_granted;
                 self.last_persisted_index = st.last_received_index;
                 self.save_path = Some(path);
-                log::info!("save loaded: resume at received index {}", self.received_through);
+                log::info!(
+                    "save loaded: resume at received index {}",
+                    self.received_through
+                );
             }
             self.save_loaded = true;
         }
@@ -231,7 +237,10 @@ impl shared::Core for Core {
                 if !already_items
                     && has_inv
                     && (sc.start_items.is_empty()
-                        || sc.start_items.iter().all(|&id| crate::detour::grant_full_id(id, 1)))
+                        || sc
+                            .start_items
+                            .iter()
+                            .all(|&id| crate::detour::grant_full_id(id, 1)))
                 {
                     did_items = true;
                 }
@@ -471,7 +480,9 @@ impl Core {
 fn save_file_path(seed: &str, name: &str) -> Option<PathBuf> {
     let dir = shared::utils::mod_directory().ok()?;
     let safe = |s: &str| -> String {
-        s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
     };
     Some(dir.join(format!("ap_save_{}_{}.json", safe(seed), safe(name))))
 }

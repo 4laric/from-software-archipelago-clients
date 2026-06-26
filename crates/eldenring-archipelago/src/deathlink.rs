@@ -74,10 +74,18 @@ fn read_local_death() -> bool {
         return false; // not in-world / no local player
     };
     let base = player as *const _ as usize;
-    let Some(p1) = read_ptr(base, 0x10) else { return false };
-    let Some(p2) = read_ptr(p1, 0x190) else { return false };
-    let Some(p3) = read_ptr(p2, 0x0) else { return false };
-    let Some(hp_addr) = plausible(p3.wrapping_add(0x138)) else { return false };
+    let Some(p1) = read_ptr(base, 0x10) else {
+        return false;
+    };
+    let Some(p2) = read_ptr(p1, 0x190) else {
+        return false;
+    };
+    let Some(p3) = read_ptr(p2, 0x0) else {
+        return false;
+    };
+    let Some(hp_addr) = plausible(p3.wrapping_add(0x138)) else {
+        return false;
+    };
     let hp = unsafe { *(hp_addr as *const i32) };
     // Guard against a wild value from a wrong offset (treat absurd HP as "not dead").
     (0..=0x000F_FFFF).contains(&hp) && hp <= 0

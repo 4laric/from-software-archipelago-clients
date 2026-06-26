@@ -5,9 +5,9 @@
 //! walk is gone — `SoloParamRepository::get::<EquipParamGoods>(id)` does the typed lookup, and the
 //! five carrier fields come off `EQUIP_PARAM_GOODS_ST` snake_case getters.
 
-use er_codec::GoodsRowFields;
 use eldenring::cs::{EquipParamGoods, SoloParamRepository};
 use eldenring::param::EQUIP_PARAM_GOODS_ST;
+use er_codec::GoodsRowFields;
 use fromsoftware_shared::FromStatic;
 
 /// Look up a goods row by its (category-stripped) row id and project the AP carrier fields.

@@ -40,8 +40,10 @@ impl shared::Game for EldenRing {
 
     /// Schedule per-frame work on CSTaskImp / FrameBegin — the same idiom the existing client uses.
     fn run_recurring_task(mut task: impl FnMut() + 'static + Send) -> Result<()> {
-        CSTaskImp::wait_for_instance(Duration::MAX)?
-            .run_recurring(move |_: &'_ FD4TaskData| task(), CSTaskGroupIndex::FrameBegin); // VERIFY closure arg type
+        CSTaskImp::wait_for_instance(Duration::MAX)?.run_recurring(
+            move |_: &'_ FD4TaskData| task(),
+            CSTaskGroupIndex::FrameBegin,
+        ); // VERIFY closure arg type
         Ok(())
     }
 

@@ -69,9 +69,18 @@ pub fn parse(sd: &Value) -> RegionConfig {
     START_LATCHED.store(false, Ordering::Relaxed);
     RegionConfig {
         area_lock_flags: parse_triples(sd.get("areaLockFlags")),
-        random_start_done_flag: sd.get("randomStartDoneFlag").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        random_start_warp_flag: sd.get("randomStartWarpFlag").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        random_start_area_id: sd.get("randomStartAreaId").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        random_start_done_flag: sd
+            .get("randomStartDoneFlag")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        random_start_warp_flag: sd
+            .get("randomStartWarpFlag")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        random_start_area_id: sd
+            .get("randomStartAreaId")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32,
         region_open_flags: str_to_u32(sd.get("regionOpenFlags")),
         lock_reveal_flags: str_to_u32vec(sd.get("lockRevealFlags")),
         region_graces: str_to_u32vec(sd.get("regionGraces")),
@@ -134,12 +143,20 @@ fn parse_natural_keys(v: Option<&Value>) -> HashMap<String, Vec<NkClause>> {
                     let items = c
                         .get("items")
                         .and_then(|x| x.as_array())
-                        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let flags = c
                         .get("flags")
                         .and_then(|x| x.as_array())
-                        .map(|a| a.iter().filter_map(|s| s.as_u64().map(|n| n as u32)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_u64().map(|n| n as u32))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     clauses.push(NkClause { items, flags });
                 }
@@ -263,7 +280,9 @@ fn str_to_u32vec(v: Option<&Value>) -> HashMap<String, Vec<u32>> {
             if let Some(arr) = val.as_array() {
                 m.insert(
                     k.clone(),
-                    arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect(),
+                    arr.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as u32))
+                        .collect(),
                 );
             }
         }

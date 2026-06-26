@@ -46,7 +46,8 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     if HOOK.get().is_some() {
         return Ok(());
     }
-    let target_addr = current_module_base().ok_or("no module base for eldenring.exe")? + ADD_ITEM_FUNC_RVA;
+    let target_addr =
+        current_module_base().ok_or("no module base for eldenring.exe")? + ADD_ITEM_FUNC_RVA;
     if !signature_matches(target_addr) {
         return Err(format!(
             "AddItemFunc signature mismatch @ {target_addr:#x} — pinned 2.6.2.0 RVA stale for this build"
@@ -138,10 +139,14 @@ unsafe extern "C" fn add_item_detour(
         let game = inventory as usize;
         match static_inventory_ptr() {
             Some(s) if s == game => {
-                log::info!("inventory-ptr CONFIRM: static == game ({game:#x}) — safe to enable USE_STATIC_INVENTORY_PRIME")
+                log::info!(
+                    "inventory-ptr CONFIRM: static == game ({game:#x}) — safe to enable USE_STATIC_INVENTORY_PRIME"
+                )
             }
             Some(s) => {
-                log::warn!("inventory-ptr MISMATCH: static {s:#x} != game {game:#x} — keep static prime OFF (wrong field)")
+                log::warn!(
+                    "inventory-ptr MISMATCH: static {s:#x} != game {game:#x} — keep static prime OFF (wrong field)"
+                )
             }
             None => log::warn!("inventory-ptr: static unresolved at first pickup (game {game:#x})"),
         }
@@ -155,7 +160,10 @@ unsafe extern "C" fn add_item_detour(
     match params::goods_row_fields(row_id_of(raw_id) as i32) {
         Some(fields) => {
             let item = decode_synthetic(&fields);
-            log::info!("AP check: synthetic {raw_id:#x} -> location {}", item.ap_location_id);
+            log::info!(
+                "AP check: synthetic {raw_id:#x} -> location {}",
+                item.ap_location_id
+            );
             PENDING_CHECKS.lock().unwrap().push(item.ap_location_id);
             // own_world:true: report the check + suppress; the server echoes the item back and the
             // received-item path grants it (running progressive / region-open / notify by name).
