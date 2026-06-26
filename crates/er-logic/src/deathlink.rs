@@ -44,7 +44,10 @@ mod tests {
         let mut g = FakeGame::new();
         g.set_in_world(true);
         g.set_hp(Some(1000)); // alive; HP must be untouched
-        let mut latch = DeathLatch { kill_pending: true, ..Default::default() };
+        let mut latch = DeathLatch {
+            kill_pending: true,
+            ..Default::default()
+        };
         drive_incoming_kill(&mut g, &mut latch);
         assert_eq!(g.set_flags(), vec![DEATHLINK_KILL_FLAG]);
         assert_eq!(g.player_hp(), Some(1000));
@@ -56,7 +59,10 @@ mod tests {
         let mut g = FakeGame::new();
         g.set_in_world(true);
         g.set_flag_holder_ready(false);
-        let mut latch = DeathLatch { kill_pending: true, ..Default::default() };
+        let mut latch = DeathLatch {
+            kill_pending: true,
+            ..Default::default()
+        };
         drive_incoming_kill(&mut g, &mut latch);
         assert!(latch.kill_pending);
         assert!(g.set_flags().is_empty());
@@ -71,7 +77,10 @@ mod tests {
     fn incoming_kill_not_attempted_off_world() {
         let mut g = FakeGame::new();
         g.set_in_world(false);
-        let mut latch = DeathLatch { kill_pending: true, ..Default::default() };
+        let mut latch = DeathLatch {
+            kill_pending: true,
+            ..Default::default()
+        };
         drive_incoming_kill(&mut g, &mut latch);
         assert!(latch.kill_pending);
         assert!(g.set_flags().is_empty());

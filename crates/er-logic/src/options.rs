@@ -58,7 +58,13 @@ mod tests {
 
     #[test]
     fn garbage_value_is_inert_not_fatal() {
-        assert!(!parse_bool_option(&json!({ "options": { "x": "yes" } }), "x"));
-        assert!(!parse_bool_option(&json!({ "options": { "x": [1, 2] } }), "x"));
+        assert!(!parse_bool_option(
+            &json!({ "options": { "x": "yes" } }),
+            "x"
+        ));
+        assert!(!parse_bool_option(
+            &json!({ "options": { "x": [1, 2] } }),
+            "x"
+        ));
     }
 }

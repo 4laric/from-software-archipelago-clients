@@ -38,12 +38,15 @@ impl SaveState {
     /// Tolerant load mirroring `configure` / `load_last_index` / `progressive::restore` defaults.
     /// A malformed or partial save never panics — it falls back to documented defaults.
     pub fn from_json(text: &str) -> Self {
-        let v: serde_json::Value =
-            serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
+        let v: serde_json::Value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
         let notify = v
             .get("notify_granted")
             .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|n| n.as_i64().map(|n| n as i32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_i64().map(|n| n as i32))
+                    .collect()
+            })
             .unwrap_or_default();
         let counter = v
             .get("progressive_counter")
@@ -73,6 +76,19 @@ impl SaveState {
     }
 }
 
+impl Default for SaveState {
+    /// Fresh save: nothing granted, high-index sentinel -1 (matches `from_json`'s absent-key default).
+    fn default() -> Self {
+        SaveState {
+            last_received_index: 0,
+            start_items_granted: false,
+            notify_granted: std::collections::BTreeSet::new(),
+            progressive_counter: std::collections::BTreeMap::new(),
+            progressive_high_index: -1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,7 +110,10 @@ mod tests {
             progressive_high_index: 16,
         };
         let after = SaveState::from_json(&before.to_json());
-        assert_eq!(before, after, "save -> JSON -> load must preserve every field");
+        assert_eq!(
+            before, after,
+            "save -> JSON -> load must preserve every field"
+        );
     }
 
     #[test]
@@ -114,17 +133,5 @@ mod tests {
         let s = SaveState::from_json("{ this is not json");
         assert_eq!(s.last_received_index, 0);
         assert_eq!(s.progressive_high_index, -1);
-    }
-}
-impl Default for SaveState {
-    /// Fresh save: nothing granted, high-index sentinel -1 (matches `from_json`'s absent-key default).
-    fn default() -> Self {
-        SaveState {
-            last_received_index: 0,
-            start_items_granted: false,
-            notify_granted: std::collections::BTreeSet::new(),
-            progressive_counter: std::collections::BTreeMap::new(),
-            progressive_high_index: -1,
-        }
     }
 }

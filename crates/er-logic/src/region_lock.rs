@@ -125,8 +125,14 @@ mod tests {
     #[test]
     fn nk_second_clause_satisfied_fires_even_if_first_isnt() {
         let clauses = vec![
-            NkClause { items: vec!["Missing".into()], flags: vec![] },
-            NkClause { items: vec![], flags: vec![71000, 71001] },
+            NkClause {
+                items: vec!["Missing".into()],
+                flags: vec![],
+            },
+            NkClause {
+                items: vec![],
+                flags: vec![71000, 71001],
+            },
         ];
         assert!(natural_key_fired(&clauses, &names(&[]), &|f| f == 71000 || f == 71001));
     }

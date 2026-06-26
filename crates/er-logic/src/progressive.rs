@@ -106,8 +106,14 @@ mod tests {
         m.insert(
             "progressive_stone_bell".into(),
             vec![
-                ProgTier { goods: vec![8101], flags: vec![70001] },
-                ProgTier { goods: vec![8102], flags: vec![70002] },
+                ProgTier {
+                    goods: vec![8101],
+                    flags: vec![70001],
+                },
+                ProgTier {
+                    goods: vec![8102],
+                    flags: vec![70002],
+                },
             ],
         );
         m
@@ -162,7 +168,11 @@ mod tests {
 
         // The next genuinely-new copy (idx 1) resumes at tier 1, not tier 0.
         let next = p.on_item_received("progressive_stone_bell", 1);
-        assert_eq!(next.grants, vec![8102 | GOODS_FULLID], "resumes at tier 1 after restore");
+        assert_eq!(
+            next.grants,
+            vec![8102 | GOODS_FULLID],
+            "resumes at tier 1 after restore"
+        );
         assert_eq!(p.snapshot().1, 1);
     }
 }
@@ -171,23 +181,40 @@ mod tests {
 /// (the deliberate fix for the C++ "key goods not found" abort). Absent key -> empty config.
 pub fn parse(slot_data: &serde_json::Value) -> HashMap<String, Vec<ProgTier>> {
     let mut out = HashMap::new();
-    let Some(obj) = slot_data.get("progressiveGrants").and_then(|v| v.as_object()) else {
+    let Some(obj) = slot_data
+        .get("progressiveGrants")
+        .and_then(|v| v.as_object())
+    else {
         return out;
     };
     for (name, tiers_v) in obj {
-        let Some(arr) = tiers_v.as_array() else { continue };
+        let Some(arr) = tiers_v.as_array() else {
+            continue;
+        };
         let mut tiers = Vec::new();
         for t in arr {
             let goods = t
                 .get("goodsList")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|n| n.as_u64().map(|n| n as u32)).collect::<Vec<_>>())
-                .or_else(|| t.get("goods").and_then(|v| v.as_u64()).map(|g| vec![g as u32]))
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_u64().map(|n| n as u32))
+                        .collect::<Vec<_>>()
+                })
+                .or_else(|| {
+                    t.get("goods")
+                        .and_then(|v| v.as_u64())
+                        .map(|g| vec![g as u32])
+                })
                 .unwrap_or_default();
             let flags = t
                 .get("flags")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|n| n.as_u64().map(|n| n as u32)).collect::<Vec<_>>())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_u64().map(|n| n as u32))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             if goods.is_empty() && flags.is_empty() {
                 continue; // drop empty tier

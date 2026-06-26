@@ -164,7 +164,10 @@ pub mod fake {
             self.flags_set.push((flag, on));
         }
         fn try_set_event_flag(&mut self, flag: u32, on: bool) -> bool {
-            let ready = self.flag_ready_script.pop_front().unwrap_or(self.flag_ready);
+            let ready = self
+                .flag_ready_script
+                .pop_front()
+                .unwrap_or(self.flag_ready);
             if !ready {
                 return false;
             }
