@@ -650,6 +650,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "archipelago_rs",
+ "chrono",
  "eldenring",
  "er-codec",
  "er-logic",

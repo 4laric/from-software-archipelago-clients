@@ -7,9 +7,11 @@
 //! `grant_full_id` stays (used by the received-item path). RVA + signature pinned to 2.6.2.0.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use eldenring::cs::GameDataMan;
+use fromsoftware_shared::FromStatic;
 use retour::GenericDetour;
 
 use er_codec::{decode_synthetic, is_synthetic_goods, row_id_of};
@@ -23,6 +25,15 @@ static HOOK: OnceLock<GenericDetour<AddItemFn>> = OnceLock::new();
 static LAST_INVENTORY: AtomicUsize = AtomicUsize::new(0);
 /// AP location ids the detour suppressed, drained by `update_live` -> `mark_checked`.
 static PENDING_CHECKS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+/// EXPERIMENTAL — resolve the inventory pointer from a game static so server/start grants don't have
+/// to wait for the player's first in-game pickup to capture it (the long-standing UX wart, inherited
+/// from the standalone). DEFAULT OFF: a WRONG pointer would crash on grant. The detour logs a
+/// one-time `inventory-ptr CONFIRM/MISMATCH` line comparing the static-resolved address to the
+/// pointer the game actually hands it; once a run shows CONFIRM, flip this to `true` and rebuild.
+const USE_STATIC_INVENTORY_PRIME: bool = false;
+/// One-time guard for the static-vs-game inventory-pointer confirmation log.
+static INV_PTR_CHECKED: AtomicBool = AtomicBool::new(false);
 
 const ADD_ITEM_FUNC_RVA: usize = 0x0056_05B0;
 const ADD_ITEM_FUNC_SIG: &[u8] = &[
@@ -62,6 +73,33 @@ pub fn has_inventory() -> bool {
     LAST_INVENTORY.load(Ordering::Relaxed) >= 0x10000
 }
 
+/// Address of `PlayerGameData.equipment.equip_inventory_data` — the structure AddItemFunc takes as
+/// its inventory arg — resolved from the GameDataMan singleton (the SAME typed path `upgrades.rs`
+/// walks in-world). `None` until the player is placed. SAFE to compute; whether it is the pointer the
+/// game hands the detour is exactly what the confirmation log verifies.
+fn static_inventory_ptr() -> Option<usize> {
+    if !crate::flags::in_world() {
+        return None;
+    }
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    let pgd = gdm.main_player_game_data.as_ref();
+    let inv = &pgd.equipment.equip_inventory_data as *const _ as usize;
+    (inv >= 0x10000).then_some(inv)
+}
+
+/// Tick helper (game thread): if no inventory pointer is captured yet, seed `LAST_INVENTORY` from the
+/// static path so grants flush WITHOUT waiting for a pickup. No-op unless `USE_STATIC_INVENTORY_PRIME`
+/// is enabled (and confirmed safe). Once a real pickup captures the game's own pointer it takes over.
+pub fn prime_inventory_if_needed() {
+    if !USE_STATIC_INVENTORY_PRIME || LAST_INVENTORY.load(Ordering::Relaxed) >= 0x10000 {
+        return;
+    }
+    if let Some(inv) = static_inventory_ptr() {
+        LAST_INVENTORY.store(inv, Ordering::Relaxed);
+        log::info!("primed inventory pointer from static @ {inv:#x} (no pickup needed)");
+    }
+}
+
 /// Grant an item (full_id = real item id | category nibble) by constructing an itembuf and calling
 /// the original AddItemFunc with the captured inventory pointer. Returns false if the hook isn't
 /// installed or no inventory pointer has been captured yet (no pickup this session) — caller retries.
@@ -94,6 +132,20 @@ unsafe extern "C" fn add_item_detour(
     r9: u64,
 ) -> u64 {
     LAST_INVENTORY.store(inventory as usize, Ordering::Relaxed);
+    // One-time: compare the pointer the game hands us against the static-resolved candidate, so we
+    // can safely enable USE_STATIC_INVENTORY_PRIME (a wrong static pointer would crash on grant).
+    if !INV_PTR_CHECKED.swap(true, Ordering::Relaxed) {
+        let game = inventory as usize;
+        match static_inventory_ptr() {
+            Some(s) if s == game => {
+                log::info!("inventory-ptr CONFIRM: static == game ({game:#x}) — safe to enable USE_STATIC_INVENTORY_PRIME")
+            }
+            Some(s) => {
+                log::warn!("inventory-ptr MISMATCH: static {s:#x} != game {game:#x} — keep static prime OFF (wrong field)")
+            }
+            None => log::warn!("inventory-ptr: static unresolved at first pickup (game {game:#x})"),
+        }
+    }
     let raw_id = unsafe { read_i32(entry, ITEMBUF_ENTRY_ID_OFF) } as u32;
 
     if !is_synthetic_goods(raw_id) {

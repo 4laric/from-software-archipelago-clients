@@ -11,6 +11,17 @@ use eldenring::cs::{CSTaskGroupIndex, CSTaskImp, WorldChrMan};
 use eldenring::fd4::FD4TaskData;
 use fromsoftware_shared::{FromStatic, SharedTaskImpExt};
 
+/// One-line build identity for the connect banner: `<pkg-version> (<sha> @ <build-time>)`.
+/// SHA + build time are stamped into the env by `build.rs`.
+pub const CLIENT_BUILD: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("ER_GIT_SHA"),
+    " @ ",
+    env!("ER_BUILD_TIME"),
+    ")"
+);
+
 pub struct EldenRing;
 
 impl shared::Game for EldenRing {

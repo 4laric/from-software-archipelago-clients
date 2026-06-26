@@ -35,5 +35,8 @@ eldenring = { git = "https://github.com/vswarte/fromsoftware-rs", branch = "main
 er-codec = { path = "../er-codec" }
 er-logic = { path = "../er-logic" }
 
+[build-dependencies]
+chrono = "0.4"   # build.rs: stamp ER_BUILD_TIME (UTC) into the binary for the connect banner
+
 [features]
 profile = ["shared/profile"]

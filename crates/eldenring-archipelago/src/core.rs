@@ -112,15 +112,38 @@ impl shared::Core for Core {
                 crate::upgrades::set_global_scadu_blessing(
                     sd.pointer("/options/global_scadutree_blessing").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 );
-                (
-                    i64_map(sd.get("apIdsToItemIds")),
-                    i64_map(sd.get("itemCounts")),
-                    crate::region::parse(sd),
-                    er_logic::progressive::parse(sd),
-                    client.this_player().alias().to_string(),
-                    crate::flagpoll::parse_dungeon_sweeps(sd),
-                    crate::startgrants::parse(sd),
-                )
+                let map = i64_map(sd.get("apIdsToItemIds"));
+                let counts = i64_map(sd.get("itemCounts"));
+                let region = crate::region::parse(sd);
+                let prog_cfg = er_logic::progressive::parse(sd);
+                let name = client.this_player().alias().to_string();
+                let sweeps = crate::flagpoll::parse_dungeon_sweeps(sd);
+                let start = crate::startgrants::parse(sd);
+
+                // Connect banner: build identity + slot_data contract version (+ gate result) so any
+                // logfile self-identifies which build / contract produced it. Then a one-line
+                // start-config summary of the exact fields we previously had to decompile the
+                // multidata to see — startRegion, startGraces count, reveal_all_maps, the random-start
+                // warp/area/done flags, and the area-lock count.
+                let versions = sd.get("versions").and_then(|v| v.as_str()).unwrap_or("(none)");
+                let gate = er_logic::version::version_gate(sd, env!("CARGO_PKG_VERSION"));
+                let start_region = sd.get("startRegion").and_then(|v| v.as_str()).unwrap_or("");
+                log::info!(
+                    "=== ER-AP client {} | contract {versions} (gate {gate:?}) | slot '{name}' ===",
+                    crate::game::CLIENT_BUILD
+                );
+                log::info!(
+                    "startcfg: start_region={start_region:?} | startGraces={} reveal_maps={} startItems={} | randomStart warp/area/done={}/{}/{} | area_locks={}",
+                    start.start_graces.len(),
+                    start.reveal_all_maps,
+                    start.start_items.len(),
+                    region.random_start_warp_flag,
+                    region.random_start_area_id,
+                    region.random_start_done_flag,
+                    region.area_lock_flags.len()
+                );
+
+                (map, counts, region, prog_cfg, name, sweeps, start)
             });
             if let Some((map, counts, region, prog_cfg, name, sweeps, start)) = parsed {
                 log::info!(
@@ -188,8 +211,22 @@ impl shared::Core for Core {
             let mut did_flags = false;
             let mut did_items = false;
             if let Some(sc) = self.start.as_ref() {
-                if !already_flags && crate::startgrants::apply_start_flags(sc) {
-                    did_flags = true;
+                // Gate start FLAGS on a loaded world (has_inventory), not just CSEventFlagMan being
+                // up: setting grace/map flags during the load screen lets the subsequent save-data
+                // load clobber them, which is the suspected cause of "no graces/maps in-game" despite
+                // correct slot_data. (The standalone gated its grace flush the same way.) After
+                // applying, read a sentinel grace back — only latch `done` once it sticks; a false
+                // read-back means it was clobbered, so we log it and retry next tick.
+                if !already_flags && has_inv && crate::startgrants::apply_start_flags(sc) {
+                    let sentinel = sc.start_graces.first().copied();
+                    let stuck = sentinel.map_or(true, crate::flags::get_event_flag);
+                    if stuck {
+                        did_flags = true;
+                    } else {
+                        log::warn!(
+                            "start graces set but sentinel flag {sentinel:?} read back FALSE (clobbered by save load?) — retrying next tick"
+                        );
+                    }
                 }
                 if !already_items
                     && has_inv
@@ -201,7 +238,13 @@ impl shared::Core for Core {
             }
             if did_flags {
                 self.start_flags_done = true;
-                log::info!("start graces + map reveal applied");
+                if let Some(sc) = self.start.as_ref() {
+                    log::info!(
+                        "start graces + map reveal applied: {} grace flag(s), reveal_maps={}",
+                        sc.start_graces.len(),
+                        sc.reveal_all_maps
+                    );
+                }
             }
             if did_items {
                 self.start_items_granted = true;
@@ -209,6 +252,11 @@ impl shared::Core for Core {
                 self.write_save();
             }
         }
+
+        // Prime the inventory pointer from a game static (if enabled+confirmed) so grants flush
+        // without waiting for the player's first in-game pickup. No-op until USE_STATIC_INVENTORY_PRIME
+        // is turned on; the detour still captures the game's own pointer on a real pickup regardless.
+        crate::detour::prime_inventory_if_needed();
 
         // 3. Collect region-open names + received-item grant candidates in one borrow. Under
         //    own_world:true this stream now ALSO carries the echoes of our own self-found checks.
@@ -218,10 +266,16 @@ impl shared::Core for Core {
         let mut names_to_open: Vec<String> = Vec::new();
         let mut candidates: Vec<(i64, String, Option<i64>, i64)> = Vec::new();
         let mut new_recv = recv;
+        // Cumulative set of ALL received item names — natural-key triggers need the full history
+        // (a clause may require an item received many ticks ago), not just this tick's new names.
+        let mut received_all: HashSet<String> = HashSet::new();
         if let Some(client) = self.client() {
             let items = client.received_items();
             if items.len() < disp {
                 disp = 0;
+            }
+            for ri in items.iter() {
+                received_all.insert(ri.item().name().to_string());
             }
             for ri in items.iter().skip(disp) {
                 names_to_open.push(ri.item().name().to_string());
@@ -356,8 +410,16 @@ impl shared::Core for Core {
             }
         }
 
-        // 6. Region-lock KICK.
+        // 6. Region-lock KICK + random-start warp trigger (order matters: the warp sets the
+        //    done-flag that KICK's start-window guard waits on, so fire it before the kick check).
         if let Some(cfg) = self.region.as_ref() {
+            crate::region::tick_random_start_warp(cfg);
+            // Natural-key regions (Raya/Mountaintops/Snowfield/...) bloom when their vanilla-key
+            // disjunction is satisfied. Gated on a loaded world (can_grant) so the flags it sets
+            // aren't clobbered by the save load — same reason the start graces are gated.
+            if can_grant {
+                crate::region::tick_natural_key_triggers(cfg, &received_all);
+            }
             crate::region::tick_kick(cfg);
         }
 
