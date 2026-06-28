@@ -1,2 +1,3 @@
 /target
 /log
+.fuse_hidden*
