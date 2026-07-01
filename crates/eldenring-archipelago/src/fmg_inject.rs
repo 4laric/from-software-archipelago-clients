@@ -14,6 +14,12 @@
 //! build mismatch aborts the swap (game untouched). The new block is VirtualAlloc'd RW and leaked for
 //! the process. Identity stage makes NO visible change if correct — that's the proof.
 
+// This module is deliberately one big raw-pointer FFI surface: every `unsafe fn` here IS the safety
+// boundary (its own doc/SAFETY notes cover the invariants), so Rust 2024's `unsafe_op_in_unsafe_fn`
+// would only add noise without adding a real check. Silence it module-wide rather than wrapping each
+// raw read/write in a redundant inner `unsafe {}`.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -485,6 +491,7 @@ fn resolve_synth_injects(ids: &[u32]) -> (Vec<(u32, Vec<u16>)>, Vec<(u32, Vec<u1
 /// Read the LIVE FMG string for a goods `(category, id)` via `SearchStringTable` — used by shop_preview
 /// to borrow an own-world reward's real GoodsName(10) / GoodsInfo(20) / GoodsCaption(24). Read-only.
 /// `None` if the table/signature isn't up yet or the id has no entry.
+#[allow(dead_code)] // kept as a ready-to-use live-FMG reader for shop_preview / future callers
 pub fn read_goods_string(category: u32, id: u32) -> Option<String> {
     let base = current_module_base()?;
     let search_addr = base + SEARCH_RVA;

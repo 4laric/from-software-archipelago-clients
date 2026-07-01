@@ -40,6 +40,17 @@ pub struct Overlay<G: Game> {
     /// The URL field in the modal connection popup.
     popup_url: String,
 
+    /// The slot (player name) field in the modal connection popup.
+    popup_slot: String,
+
+    /// The password field in the modal connection popup.
+    popup_password: String,
+
+    /// Whether we've already auto-opened the connect prompt this session. Used
+    /// to show the connect form once on a fresh (unconfigured) install without
+    /// fighting the player if they close it.
+    auto_prompted: bool,
+
     /// The text the user typed in the say input.
     say_input: String,
 
@@ -110,6 +121,9 @@ impl<G: Game> Overlay<G> {
             // require `Default`.
             viewport_size: None,
             popup_url: Default::default(),
+            popup_slot: Default::default(),
+            popup_password: Default::default(),
+            auto_prompted: false,
             say_input: Default::default(),
             say_history: Default::default(),
             log_was_scrolled_down: false,
@@ -268,8 +282,17 @@ impl<G: Game> Overlay<G> {
                         });
                     }
                 }
-                prof!(core.base_mut().profiler(), "URL modal", {
-                    self.render_url_modal_popup(ui, core);
+                // On a fresh (unconfigured) install, open the connect form once so the
+                // player is prompted for server/slot without having to hunt for a button.
+                if !self.auto_prompted
+                    && core.base().is_disconnected()
+                    && !core.base().is_configured()
+                {
+                    ui.open_popup("#connect-modal");
+                    self.auto_prompted = true;
+                }
+                prof!(core.base_mut().profiler(), "connect modal", {
+                    self.render_connect_modal(ui, core);
                 });
 
                 self.was_window_focused =
@@ -287,9 +310,9 @@ impl<G: Game> Overlay<G> {
     }
 
     /// Renders the modal popup which queries the player for connection
-    /// information.
-    fn render_url_modal_popup(&mut self, ui: &Ui, core: &mut G::Core) {
-        ui.modal_popup_config("#url-modal-popup")
+    /// information (server URL, slot, and optional password).
+    fn render_connect_modal(&mut self, ui: &Ui, core: &mut G::Core) {
+        ui.modal_popup_config("#connect-modal")
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -297,20 +320,41 @@ impl<G: Game> Overlay<G> {
             .build(|| {
                 {
                     let _item_width = ui.push_item_width(500. * self.font_scale);
-                    ui.input_text("Room URL", &mut self.popup_url)
+                    ui.input_text("Server", &mut self.popup_url)
                         .hint("archipelago.gg:12345")
                         .chars_noblank(true)
                         .build();
+                    ui.input_text("Slot", &mut self.popup_slot)
+                        .hint("Your player name")
+                        .build();
+                    ui.input_text("Password", &mut self.popup_password)
+                        .password(true)
+                        .build();
                 }
 
-                ui.disabled(self.popup_url.is_empty(), || {
+                let incomplete = self.popup_url.is_empty() || self.popup_slot.is_empty();
+                ui.disabled(incomplete, || {
                     if ui.button("Connect") {
                         ui.close_current_popup();
-                        if let Err(e) = core.base_mut().update_url(&self.popup_url) {
+                        let password = if self.popup_password.is_empty() {
+                            None
+                        } else {
+                            Some(self.popup_password.clone())
+                        };
+                        if let Err(e) = core.base_mut().update_connection_info(
+                            &self.popup_url,
+                            &self.popup_slot,
+                            password,
+                        ) {
                             error!("Failed to save config: {e}");
                         }
                     }
                 });
+
+                ui.same_line();
+                if ui.button("Cancel") {
+                    ui.close_current_popup();
+                }
             });
     }
 
@@ -371,9 +415,17 @@ impl<G: Game> Overlay<G> {
         }
 
         ui.same_line();
-        if ui.button("Change URL") {
-            ui.open_popup("#url-modal-popup");
-            core.base().config().url().clone_into(&mut self.popup_url);
+        let button_label = if core.base().is_configured() {
+            "Change connection"
+        } else {
+            "Connect"
+        };
+        if ui.button(button_label) {
+            ui.open_popup("#connect-modal");
+            let config = core.base().config();
+            config.url().clone_into(&mut self.popup_url);
+            config.slot().clone_into(&mut self.popup_slot);
+            self.popup_password = config.password().unwrap_or("").to_string();
         }
     }
 

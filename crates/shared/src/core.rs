@@ -113,17 +113,33 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.connection = Self::new_connection(self.game, &self.config);
     }
 
-    /// Updates the URL to use to connect to Archipelago and reconnects the
-    /// Archipelago session.
-    pub(crate) fn update_url(&mut self, url: impl AsRef<str>) -> Result<()> {
+    /// Updates the full set of connection info (server URL, slot, and optional
+    /// password), saves the config, and reconnects. Used by the in-game connect
+    /// overlay so a fresh install can be configured without a pre-existing
+    /// apconfig.json.
+    pub(crate) fn update_connection_info(
+        &mut self,
+        url: impl AsRef<str>,
+        slot: impl AsRef<str>,
+        password: Option<String>,
+    ) -> Result<()> {
         if self.connection_state_type() == ap::ConnectionStateType::Disconnected {
-            self.log("Reconnecting...");
+            self.log("Connecting...");
         }
 
         self.config.set_url(url);
+        self.config.set_slot(slot);
+        self.config.set_password(password);
         self.config.save()?;
         self.connection = Self::new_connection(self.game, &self.config);
         Ok(())
+    }
+
+    /// Returns whether the config has the minimum info needed to connect (a
+    /// non-empty server URL and slot). Drives the overlay's first-run connect
+    /// prompt.
+    pub(crate) fn is_configured(&self) -> bool {
+        !self.config.url().is_empty() && !self.config.slot().is_empty()
     }
 
     /// If this client has encountered a fatal error, takes ownership of it.

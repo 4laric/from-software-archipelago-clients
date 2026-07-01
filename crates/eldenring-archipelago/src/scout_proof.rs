@@ -41,6 +41,7 @@ pub struct ScoutedItem {
     pub kind: er_logic::name_override::ItemKind,
     /// True if this location's item goes to a DIFFERENT player (foreign) — i.e. checking it SENDS the
     /// item out. Computed from sender (always us, since the location is in our world) vs receiver slot.
+    #[allow(dead_code)] // populated for completeness; not yet read by any consumer
     pub foreign: bool,
     /// For an OWN-WORLD reward whose category `shop_sell` can natively sell (weapon / protector /
     /// accessory / goods), the reward's ER FullID — so the slot's ShopLineupParam.equipId can be
@@ -139,6 +140,7 @@ impl ScoutProof {
     }
 
     /// Already finished (logged once)? Lets the caller skip on reconnect.
+    #[allow(dead_code)] // reconnect-skip helper; kept for callers that poll across reconnects
     pub fn is_done(&self) -> bool {
         self.done
     }

@@ -30,16 +30,37 @@ impl<G: Game> Config<G> {
                 ))
             }),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                Err(Error::from(err).context(format!(
-                    "{} doesn't exist. Have you run randomizer\\{}?",
-                    path.to_string_lossy(),
-                    G::TYPE.static_randomizer_basename()
-                )))
+                // Elden Ring has no static randomizer to write apconfig.json. Rather than treating a
+                // missing file as fatal, start from an empty config and let the in-game connect
+                // overlay collect server/slot/password and write it on first Connect. DS3/Sekiro keep
+                // the hard error, since their static randomizer is responsible for the file.
+                if matches!(G::TYPE, crate::GameType::EldenRing) {
+                    Ok(Self::empty())
+                } else {
+                    Err(Error::from(err).context(format!(
+                        "{} doesn't exist. Have you run randomizer\\{}?",
+                        path.to_string_lossy(),
+                        G::TYPE.static_randomizer_basename()
+                    )))
+                }
             }
             Err(err) => Err(Error::from(err).context(format!(
                 "Failed to load config file {}",
                 path.to_string_lossy()
             ))),
+        }
+    }
+
+    /// An empty config with no connection info. Used as the starting point for Elden Ring, whose
+    /// `apconfig.json` is written by the in-game connect overlay rather than a static randomizer.
+    fn empty() -> Self {
+        Self {
+            url: String::new(),
+            slot: String::new(),
+            seed: String::new(),
+            client_version: None,
+            password: None,
+            _marker: PhantomData,
         }
     }
 
@@ -70,6 +91,16 @@ impl<G: Game> Config<G> {
     /// Sets the Archipelago server URL in the config file.
     pub fn set_url(&mut self, url: impl AsRef<str>) {
         self.url = url.as_ref().to_string()
+    }
+
+    /// Sets the Archipelago slot (player) name in the config file.
+    pub fn set_slot(&mut self, slot: impl AsRef<str>) {
+        self.slot = slot.as_ref().to_string()
+    }
+
+    /// Sets the Archipelago server password in the config file. `None` clears it.
+    pub fn set_password(&mut self, password: Option<String>) {
+        self.password = password;
     }
 
     /// Returns the slot that the config was created with.
