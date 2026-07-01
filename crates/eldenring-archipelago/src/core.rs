@@ -24,6 +24,8 @@ pub struct Core {
     item_map: Option<HashMap<i64, i64>>,
     item_counts: HashMap<i64, i64>,
     region: Option<crate::region::RegionConfig>,
+    /// Region-lock fog-wall visuals (cosmetic; KICK still enforces).
+    fogwall: Option<crate::fogwall::FogWallConfig>,
     progressive: ProgressiveState,
     slot_data_parsed: bool,
     my_name: Option<String>,
@@ -60,6 +62,7 @@ impl shared::Core for Core {
             item_map: None,
             item_counts: HashMap::new(),
             region: None,
+            fogwall: None,
             progressive: ProgressiveState::new(HashMap::new()),
             slot_data_parsed: false,
             my_name: None,
@@ -117,6 +120,7 @@ impl shared::Core for Core {
                 let map = i64_map(sd.get("apIdsToItemIds"));
                 let counts = i64_map(sd.get("itemCounts"));
                 let region = crate::region::parse(sd);
+                let fogwall = crate::fogwall::parse(sd);
                 let prog_cfg = er_logic::progressive::parse(sd);
                 let name = client.this_player().alias().to_string();
                 let sweeps = crate::flagpoll::parse_dungeon_sweeps(sd);
@@ -165,9 +169,9 @@ impl shared::Core for Core {
                     region.area_lock_flags.len()
                 );
 
-                (map, counts, region, prog_cfg, name, sweeps, start, scout)
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout)
             });
-            if let Some((map, counts, region, prog_cfg, name, sweeps, start, scout)) = parsed {
+            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout)) = parsed {
                 log::info!(
                     "slot_data parsed: {} item-map, {} area-lock, {} progressive; player '{name}'",
                     map.len(),
@@ -177,6 +181,7 @@ impl shared::Core for Core {
                 self.item_map = Some(map);
                 self.item_counts = counts;
                 self.region = Some(region);
+                self.fogwall = Some(fogwall);
                 self.progressive = ProgressiveState::new(prog_cfg);
                 self.my_name = Some(name);
                 self.dungeon_sweeps = sweeps;
@@ -494,6 +499,12 @@ impl shared::Core for Core {
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
             crate::scaling::tick();
+            // Region-lock fog-wall visuals (cosmetic marker at locked borders; the KICK reactor,
+            // not this, does the blocking). Runs on the game thread (FrameBegin task) so the
+            // CSWorldGeomMan::spawn_geometry call is main-thread-safe.
+            if let Some(fw) = self.fogwall.as_mut() {
+                crate::fogwall::tick(fw);
+            }
         }
 
         Ok(())

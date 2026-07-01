@@ -12,6 +12,7 @@ mod detour;
 mod flagpoll;
 mod flags;
 mod fmg_inject;
+mod fogwall;
 mod game;
 mod inventory;
 mod keyitems;
