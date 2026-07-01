@@ -74,8 +74,9 @@ fn locate_me3_mod_directory() -> Result<PathBuf> {
 }
 
 /// Returns the directory containing the AP client DLL we're compiled into, by resolving the module
-/// that owns this function's address. Used as the non-ME3 fallback for [load_mod_directory].
-fn current_module_directory() -> Result<PathBuf> {
+/// that owns this function's address. Used as the non-ME3 fallback for [load_mod_directory], and as
+/// the ER config-file directory (next to the DLL = the me3 profile's `[[natives]]` path).
+pub(crate) fn current_module_directory() -> Result<PathBuf> {
     let mut module = HMODULE::default();
     unsafe {
         GetModuleHandleExW(

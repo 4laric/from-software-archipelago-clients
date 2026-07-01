@@ -49,6 +49,35 @@ pub fn natural_key_fired(
     })
 }
 
+/// Rising-edge enforcement latch for region-lock (and reused for incoming DeathLink). `fire(active)`
+/// returns true exactly once each time `active` rises false->true, and re-arms only when `active` goes
+/// false. For region-lock, `active` = [`kick_decision`] (locked AND guard-open). This both throttles
+/// to one action per lock-entry AND is the death-loop guard under KILL enforcement: after a kill the
+/// player respawns; if they land STILL locked, `active` stays true so the latch won't re-fire — it
+/// only re-arms once they leave the locked region. Pure + host-tested; the Windows code holds one of
+/// these (per enforcement site) and calls `fire` each tick with the live decision.
+#[derive(Debug, Default, Clone)]
+pub struct EnforcementLatch {
+    armed: bool,
+}
+
+impl EnforcementLatch {
+    pub const fn new() -> Self {
+        Self { armed: false }
+    }
+
+    /// True on the rising edge of `active` (the one tick it goes false->true); re-arms when `active`
+    /// is false. Idempotent while `active` stays true (returns false after the first).
+    pub fn fire(&mut self, active: bool) -> bool {
+        if active {
+            !std::mem::replace(&mut self.armed, true)
+        } else {
+            self.armed = false;
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +170,43 @@ mod tests {
     fn nk_empty_clause_is_vacuously_true() {
         let clauses = vec![NkClause::default()];
         assert!(natural_key_fired(&clauses, &names(&[]), &|_| false));
+    }
+
+    // --- EnforcementLatch (kick/kill rising-edge throttle + death-loop guard) ---
+
+    #[test]
+    fn latch_fires_once_on_entry() {
+        let mut l = EnforcementLatch::new();
+        assert!(l.fire(true)); // rising edge -> fire
+        assert!(!l.fire(true)); // still locked -> no re-fire
+        assert!(!l.fire(true));
+    }
+
+    #[test]
+    fn latch_rearms_after_leaving_and_refires() {
+        let mut l = EnforcementLatch::new();
+        assert!(l.fire(true)); // enter locked -> fire
+        assert!(!l.fire(false)); // leave (unlocked) -> re-arm, no fire
+        assert!(l.fire(true)); // re-enter -> fire again
+    }
+
+    #[test]
+    fn latch_death_loop_guard_no_refire_while_locked() {
+        // Models a KILL whose respawn lands the player STILL in the locked region: `active` stays
+        // true across the kill+respawn, so the latch must NOT re-fire (no death loop).
+        let mut l = EnforcementLatch::new();
+        assert!(l.fire(true)); // violation -> kill
+        for _ in 0..100 {
+            assert!(!l.fire(true)); // respawned still-locked -> never re-fires
+        }
+        assert!(!l.fire(false)); // finally leaves -> re-arm
+        assert!(l.fire(true)); // a fresh violation later fires
+    }
+
+    #[test]
+    fn latch_inactive_never_fires() {
+        let mut l = EnforcementLatch::new();
+        assert!(!l.fire(false));
+        assert!(!l.fire(false));
     }
 }

@@ -15,17 +15,22 @@
 //! bake never warps and 76968 never flips, so region enforcement stays suppressed all run.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 
+use er_logic::region_lock::EnforcementLatch;
+
 use crate::flags;
 
-/// Baked common.emevd reactor flag: set while the player is in a locked region with its open-flag off.
+/// Flag the baked `common.emevd` reactor (event 6970) watches: set while the player is in a locked
+/// region -> the reactor warps them to Roundtable Hold and clears it.
 const KICK_FLAG: u32 = 76970;
 
-/// Latch so we set the KICK flag once per lock-entry, not every tick.
-static KICK_LATCHED: AtomicBool = AtomicBool::new(false);
+/// Once-per-lock-entry latch for setting KICK_FLAG (rising edge of `kick_decision`); the reactor's
+/// warp ejects the player and the latch re-arms once they're back in an open region. Pure er-logic type.
+static KICK_LATCH: Mutex<EnforcementLatch> = Mutex::new(EnforcementLatch::new());
 
 /// Latch so the random-start warp trigger fires once per session (the persistent `randomStartDoneFlag`
 /// is the cross-session guard; this is the in-session dedup, mirroring the standalone `START_LATCHED`).
@@ -167,7 +172,9 @@ fn parse_natural_keys(v: Option<&Value>) -> HashMap<String, Vec<NkClause>> {
     m
 }
 
-/// Per-tick: if the player is in a locked region, set the KICK flag once (the bake warps them out).
+/// Per-tick: when the player enters a locked region, set KICK_FLAG once — the baked `common.emevd`
+/// reactor (event 6970) warps them to Roundtable Hold and clears the flag. The rising-edge latch
+/// throttles to one set per entry; it re-arms once the warp lands them back in an open region.
 pub fn tick_kick(cfg: &RegionConfig) {
     let pr = match flags::play_region_id() {
         Some(p) => p,
@@ -179,13 +186,9 @@ pub fn tick_kick(cfg: &RegionConfig) {
         cfg.random_start_done_flag,
         &|f| flags::get_event_flag(f),
     );
-    if kick {
-        if !KICK_LATCHED.swap(true, Ordering::Relaxed) {
-            flags::set_event_flag(KICK_FLAG, true);
-            log::info!("RegionLock: area {pr} LOCKED -> set KICK flag {KICK_FLAG}");
-        }
-    } else {
-        KICK_LATCHED.store(false, Ordering::Relaxed);
+    if KICK_LATCH.lock().unwrap().fire(kick) {
+        flags::set_event_flag(KICK_FLAG, true);
+        log::info!("RegionLock: area {pr} LOCKED -> set flag {KICK_FLAG} (reactor warps to Roundtable)");
     }
 }
 

@@ -26,12 +26,12 @@ static LAST_INVENTORY: AtomicUsize = AtomicUsize::new(0);
 /// AP location ids the detour suppressed, drained by `update_live` -> `mark_checked`.
 static PENDING_CHECKS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 
-/// EXPERIMENTAL — resolve the inventory pointer from a game static so server/start grants don't have
-/// to wait for the player's first in-game pickup to capture it (the long-standing UX wart, inherited
-/// from the standalone). DEFAULT OFF: a WRONG pointer would crash on grant. The detour logs a
-/// one-time `inventory-ptr CONFIRM/MISMATCH` line comparing the static-resolved address to the
-/// pointer the game actually hands it; once a run shows CONFIRM, flip this to `true` and rebuild.
-const USE_STATIC_INVENTORY_PRIME: bool = false;
+/// Resolve the inventory pointer from a game static so server/start grants don't wait for the
+/// player's first in-game pickup (the long-standing UX wart). ENABLED: a 2026-06-30 run confirmed the
+/// C++ pointer-slot resolver (`static_inventory_ptr_rva`, RVA 0x03D67A50) equals the pointer the game
+/// hands the detour, while the typed-field `static_inventory_ptr` MISMATCHED (wrong field). The
+/// one-time `inventory-ptr` confirm log in `add_item_detour` keeps verifying both each run.
+const USE_STATIC_INVENTORY_PRIME: bool = true;
 /// One-time guard for the static-vs-game inventory-pointer confirmation log.
 static INV_PTR_CHECKED: AtomicBool = AtomicBool::new(false);
 
@@ -88,6 +88,20 @@ fn static_inventory_ptr() -> Option<usize> {
     (inv >= 0x10000).then_some(inv)
 }
 
+/// SECOND inventory-resolver candidate: the pointer stored at the pinned static slot
+/// `Inventory_PtrLoc_RVA` — the value the C++ client (`Inventory_PtrLoc_RVA = 0x03D67A50`) read and
+/// granted through successfully on 2.6.2.0. This reads a POINTER from a static location, vs
+/// `static_inventory_ptr`'s ADDRESS-of-embedded-field. The confirm log reports both so one pickup
+/// identifies which (if either) equals the pointer the game hands the detour.
+const INVENTORY_PTRLOC_RVA: usize = 0x03D6_7A50;
+fn static_inventory_ptr_rva() -> Option<usize> {
+    let slot = current_module_base()? + INVENTORY_PTRLOC_RVA;
+    // SAFETY: pinned data RVA inside the loaded eldenring.exe image; reads one pointer-sized word.
+    // Only called inside the one-time, in-world confirm block (mapped memory). Diagnostic only.
+    let inst = unsafe { (slot as *const usize).read_unaligned() };
+    (inst >= 0x10000).then_some(inst)
+}
+
 /// Tick helper (game thread): if no inventory pointer is captured yet, seed `LAST_INVENTORY` from the
 /// static path so grants flush WITHOUT waiting for a pickup. No-op unless `USE_STATIC_INVENTORY_PRIME`
 /// is enabled (and confirmed safe). Once a real pickup captures the game's own pointer it takes over.
@@ -95,9 +109,13 @@ pub fn prime_inventory_if_needed() {
     if !USE_STATIC_INVENTORY_PRIME || LAST_INVENTORY.load(Ordering::Relaxed) >= 0x10000 {
         return;
     }
-    if let Some(inv) = static_inventory_ptr() {
+    if !crate::flags::in_world() {
+        return; // the slot only holds a valid inventory instance once the player is loaded
+    }
+    // Use the RVA pointer-slot resolver (CONFIRMED 2026-06-30); the typed-field resolver MISMATCHED.
+    if let Some(inv) = static_inventory_ptr_rva() {
         LAST_INVENTORY.store(inv, Ordering::Relaxed);
-        log::info!("primed inventory pointer from static @ {inv:#x} (no pickup needed)");
+        log::info!("primed inventory pointer from rva-slot @ {inv:#x} (no pickup needed)");
     }
 }
 
@@ -150,8 +168,25 @@ unsafe extern "C" fn add_item_detour(
             }
             None => log::warn!("inventory-ptr: static unresolved at first pickup (game {game:#x})"),
         }
+        // Second candidate: the C++-client RVA pointer-SLOT (proven on 2.6.2.0). One pickup thus
+        // identifies which resolver — the typed embedded-field above, or this pointer-slot — equals
+        // the game's pointer. Point `static_inventory_ptr` at whichever CONFIRMs, then enable the prime.
+        match static_inventory_ptr_rva() {
+            Some(s) if s == game => log::info!(
+                "inventory-ptr CONFIRM (rva-slot): *(base+{INVENTORY_PTRLOC_RVA:#x}) == game ({game:#x}) — use the pointer-slot resolver"
+            ),
+            Some(s) => log::warn!("inventory-ptr rva-slot {s:#x} != game {game:#x}"),
+            None => log::warn!("inventory-ptr rva-slot unresolved at first pickup"),
+        }
     }
     let raw_id = unsafe { read_i32(entry, ITEMBUF_ENTRY_ID_OFF) } as u32;
+
+    // Shop native-sell (SHOP-SYSTEM-HANDOFF.md §5): a rewritten own-world slot sells the REAL reward
+    // (a non-synthetic id). Suppress its bag-add while the stock flag is unset so the single copy is
+    // delivered by the AP grant, not the purchase. Checked BEFORE the synthetic/vanilla decision.
+    if crate::shop_sell::should_suppress_sold(raw_id as i32, &|f| crate::flags::get_event_flag(f)) {
+        return 0;
+    }
 
     if !is_synthetic_goods(raw_id) {
         return call_original(inventory, entry, itembuf, r9);

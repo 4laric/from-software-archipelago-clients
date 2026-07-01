@@ -26,6 +26,7 @@ shared.workspace = true
 windows.workspace = true
 serde_json = "1"
 retour = "0.3"   # stable GenericDetour for the AddItemFunc pickup hook (same as the standalone client)
+oneshot = { version = "0.2.1", features = ["std"] }   # scout_proof: archipelago_rs hands back a oneshot::Receiver from scout_locations (VERIFY shape on 3.0.1)
 # ER game bindings on `main` (0.14): its rva.rs lists ER WW 2.6.2.0 / JP 2.6.2.1, so it supports the
 # current game (893cdd37 only had 2.6.1.x). Must track the SAME ref as fromsoftware-shared above so
 # they're ONE source instance (one fss copy → SharedTaskImp/SharedTaskImpExt resolve). Isolated from

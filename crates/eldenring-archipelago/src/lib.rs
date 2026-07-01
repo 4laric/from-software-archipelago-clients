@@ -11,11 +11,18 @@ mod deathlink;
 mod detour;
 mod flagpoll;
 mod flags;
+mod fmg_inject;
 mod game;
 mod inventory;
 mod keyitems;
 mod params;
 mod region;
+mod scaling;
+mod scout_proof;
+mod shop_flags;
+mod shop_icon;
+mod shop_preview;
+mod shop_sell;
 mod startgrants;
 mod upgrades;
 // progressive logic lives in er_logic::progressive (pure, host-tested); no local module needed.

@@ -43,6 +43,8 @@ pub struct Core {
     start_flags_done: bool,
     /// Persisted (SaveState): start items granted once for this save.
     start_items_granted: bool,
+    /// Pre-scout: resolves each shop reward's name/owner/ER-sell-id (pumped on the tick).
+    scout: Option<crate::scout_proof::ScoutProof>,
 }
 
 impl shared::Core for Core {
@@ -72,6 +74,7 @@ impl shared::Core for Core {
             start: None,
             start_flags_done: false,
             start_items_granted: false,
+            scout: None,
         })
     }
     fn base(&self) -> &CoreBase<Self::Game, Self::SlotData> {
@@ -119,6 +122,26 @@ impl shared::Core for Core {
                 let sweeps = crate::flagpoll::parse_dungeon_sweeps(sd);
                 let start = crate::startgrants::parse(sd);
 
+                // Shop system (SHOP-SYSTEM-HANDOFF.md §3): configure from slot_data, build the scout.
+                let loc_flags = i64_to_u32_map(sd.get("locationFlags"));
+                let preview: Vec<(i64, i32)> = i64_map(sd.get("shopPreviewGoods"))
+                    .into_iter()
+                    .map(|(l, g)| (l, g as i32))
+                    .collect();
+                crate::scout_proof::configure_item_map(map.clone());
+                crate::shop_flags::configure(
+                    i64_to_u32_map(sd.get("shopRowFlags"))
+                        .into_iter()
+                        .map(|(r, f)| (r as u32, f))
+                        .collect(),
+                );
+                crate::shop_flags::configure_check_flags(loc_flags.values().copied().collect());
+                crate::shop_sell::configure(loc_flags.clone());
+                crate::shop_preview::configure(preview.clone());
+                crate::shop_icon::configure(preview);
+                crate::scaling::configure(sd); // runtime enemy scaling (regionSphereTargets)
+                let scout = crate::scout_proof::ScoutProof::new(loc_flags.keys().copied().collect());
+
                 // Connect banner: build identity + slot_data contract version (+ gate result) so any
                 // logfile self-identifies which build / contract produced it. Then a one-line
                 // start-config summary of the exact fields we previously had to decompile the
@@ -142,9 +165,9 @@ impl shared::Core for Core {
                     region.area_lock_flags.len()
                 );
 
-                (map, counts, region, prog_cfg, name, sweeps, start)
+                (map, counts, region, prog_cfg, name, sweeps, start, scout)
             });
-            if let Some((map, counts, region, prog_cfg, name, sweeps, start)) = parsed {
+            if let Some((map, counts, region, prog_cfg, name, sweeps, start, scout)) = parsed {
                 log::info!(
                     "slot_data parsed: {} item-map, {} area-lock, {} progressive; player '{name}'",
                     map.len(),
@@ -159,6 +182,7 @@ impl shared::Core for Core {
                 self.dungeon_sweeps = sweeps;
                 self.flag_poll = Some(crate::flagpoll::load());
                 self.start = Some(start);
+                self.scout = Some(scout);
                 self.slot_data_parsed = true;
             }
         }
@@ -453,6 +477,25 @@ impl shared::Core for Core {
         // 8. Scadutree blessing writer.
         crate::upgrades::tick_global_scadu();
 
+        // 9. Shop system (SHOP-SYSTEM-HANDOFF.md tick order). Pump the scout first (needs client_mut;
+        //    take() to dodge the self double-borrow), then run each shop edit in order. Each self-gates
+        //    on cache_ready / param-repo and latches DONE after one in-world pass.
+        let mut scout = self.scout.take();
+        if let Some(sp) = scout.as_mut()
+            && let Some(client) = self.client_mut()
+        {
+            sp.pump(client);
+        }
+        self.scout = scout;
+        if crate::flags::in_world() {
+            let _ = crate::fmg_inject::run();
+            let _ = crate::shop_flags::run(&[]);
+            let _ = crate::shop_sell::run();
+            let _ = crate::shop_preview::run();
+            let _ = crate::shop_icon::run();
+            crate::scaling::tick();
+        }
+
         Ok(())
     }
 }
@@ -493,6 +536,20 @@ fn i64_map(v: Option<&Value>) -> HashMap<i64, i64> {
         for (k, val) in obj {
             if let (Ok(key), Some(value)) = (k.parse::<i64>(), val.as_i64()) {
                 m.insert(key, value);
+            }
+        }
+    }
+    m
+}
+
+/// `{ "<i64>": <u32> }` slot_data object -> `i64 -> u32`. Tolerant: skips malformed entries. Used by
+/// the shop system (locationFlags / shopRowFlags).
+fn i64_to_u32_map(v: Option<&Value>) -> HashMap<i64, u32> {
+    let mut m = HashMap::new();
+    if let Some(obj) = v.and_then(|v| v.as_object()) {
+        for (k, val) in obj {
+            if let (Ok(key), Some(value)) = (k.parse::<i64>(), val.as_u64()) {
+                m.insert(key, value as u32);
             }
         }
     }

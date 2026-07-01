@@ -1,9 +1,9 @@
 //! DeathLink (Milestone B Stage 5).
 //!
-//! INCOMING (works): a foreign DeathLink event latches a kill; the game tick sets the baked flag
-//! 76996, whose `common.emevd` reactor performs the keep-runes kill (same pattern as the region-lock
-//! KICK at 76970). Clears the latch only on a successful flag set, so a kill latched on a menu/load
-//! screen retries until in-world.
+//! INCOMING: a foreign DeathLink event latches a kill; the game tick sets flag 76996, whose baked
+//! `common.emevd` reactor (event 6996) does `ForceCharacterDeath(10000, true)` — a KEEP-RUNES death.
+//! Clears the latch only on a successful flag set, so a kill latched on a menu/load screen retries
+//! until in-world.
 //!
 //! OUTGOING (RE-hole): detecting a LOCAL death needs the player HP / death-state cell, which the
 //! standalone never resolved in the `eldenring` crate. `read_local_death` returns false for now, so
@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use eldenring::cs::WorldChrMan;
 use fromsoftware_shared::FromStatic;
 
-/// Baked common.emevd reactor flag for the DeathLink kill (keep-runes).
+/// Flag the baked `common.emevd` reactor (event 6996) watches: set on an incoming DeathLink -> the
+/// reactor does `ForceCharacterDeath(10000, true)` (keep-runes) and clears it.
 const DEATHLINK_KILL_FLAG: u32 = 76996;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -36,18 +37,18 @@ pub fn latch_incoming_kill() {
     KILL_PENDING.store(true, Ordering::Relaxed);
 }
 
-/// Per-tick: if a kill is pending and we're in-world, set the baked kill flag. The bake kills the
-/// player (keeping runes). Latch clears only on a successful set (retries across load screens).
+/// Per-tick: if a kill is pending and we're in-world, set the reactor flag (event 6996 -> keep-runes
+/// death). Latch clears only on a successful set, so a kill latched on a menu/load screen retries.
 pub fn drive_kill() {
     if KILL_PENDING.load(Ordering::Relaxed)
         && crate::flags::in_world()
         && crate::flags::try_set_event_flag(DEATHLINK_KILL_FLAG, true)
     {
         KILL_PENDING.store(false, Ordering::Relaxed);
-        // Pre-arm the outgoing edge so OUR baked kill (HP->0 next frames) isn't re-read as a fresh
-        // local death and echoed back to teammates. Cleared again when we revive (HP>0).
+        // Pre-arm the outgoing edge so the reactor's HP->0 isn't re-read as a fresh local death and
+        // echoed back to teammates. Cleared again when we revive (HP>0).
         WAS_DEAD.store(true, Ordering::Relaxed);
-        log::info!("DeathLink: incoming kill applied (flag {DEATHLINK_KILL_FLAG})");
+        log::info!("DeathLink: incoming kill applied (flag {DEATHLINK_KILL_FLAG} -> reactor)");
     }
 }
 
@@ -65,30 +66,48 @@ pub fn poll_local_death() -> bool {
 ///   main_player +0x10 -> [+0x190] -> [+0x0] -> +0x138 (current HP, i32).
 /// Each hop is range-guarded so a stale offset returns "not dead" rather than dereferencing garbage.
 /// (If the typed `ChrIns`→`CSChrDataModule.hp` field is exposed on `main`, prefer that — version-robust.)
-fn read_local_death() -> bool {
-    let wcm = match unsafe { WorldChrMan::instance() } {
-        Ok(w) => w,
-        Err(_) => return false,
-    };
-    let Some(player) = wcm.main_player.as_ref() else {
-        return false; // not in-world / no local player
-    };
+/// Resolve the address of the local player's current-HP cell via the pinned chain — shared by the
+/// death READ and the kill WRITE. None if not in-world or any hop is implausible.
+///   main_player +0x10 -> [+0x190] -> [+0x0] -> +0x138 (current HP, i32).
+fn hp_addr() -> Option<usize> {
+    let wcm = unsafe { WorldChrMan::instance() }.ok()?;
+    let player = wcm.main_player.as_ref()?;
     let base = player as *const _ as usize;
-    let Some(p1) = read_ptr(base, 0x10) else {
+    let p1 = read_ptr(base, 0x10)?;
+    let p2 = read_ptr(p1, 0x190)?;
+    let p3 = read_ptr(p2, 0x0)?;
+    plausible(p3.wrapping_add(0x138))
+}
+
+fn read_local_death() -> bool {
+    let Some(addr) = hp_addr() else {
         return false;
     };
-    let Some(p2) = read_ptr(p1, 0x190) else {
-        return false;
-    };
-    let Some(p3) = read_ptr(p2, 0x0) else {
-        return false;
-    };
-    let Some(hp_addr) = plausible(p3.wrapping_add(0x138)) else {
-        return false;
-    };
-    let hp = unsafe { *(hp_addr as *const i32) };
+    let hp = unsafe { *(addr as *const i32) };
     // Guard against a wild value from a wrong offset (treat absurd HP as "not dead").
     (0..=0x000F_FFFF).contains(&hp) && hp <= 0
+}
+
+/// PRESERVED FALLBACK — currently unused (region-lock + DeathLink now go through the baked
+/// `common.emevd` reactors on flags 76970/76996). Client-side kill: write current HP -> 0 via the same
+/// cell `read_local_death` reads. Kept for the enemy-randomizer compatibility work: if we can't ship
+/// our own `common.emevd` (two me3 packages can't both override it), re-enable this by calling it from
+/// `region::tick_kick` / `drive_kill` instead of setting the flags. NOTE: no keep-runes here (the
+/// reactor's `ForceCharacterDeath(10000, true)` provides that) — pair it with a "Should Receive Runes"
+/// write or a souls snapshot/restore before shipping this path live.
+#[allow(dead_code)]
+pub fn kill_local_player() -> bool {
+    let Some(addr) = hp_addr() else {
+        return false;
+    };
+    let hp = unsafe { *(addr as *const i32) };
+    if !(0..=0x000F_FFFF).contains(&hp) || hp <= 0 {
+        return false; // implausible cell, or already dead/dying -> don't re-kill
+    }
+    // SAFETY: `addr` is the validated HP cell resolved through the range-guarded hops in hp_addr().
+    unsafe { *(addr as *mut i32) = 0 };
+    WAS_DEAD.store(true, Ordering::Relaxed); // suppress our own kill echoing out as a local death
+    true
 }
 
 /// Plausible user-space pointer range (x64). Cheap guard so a wrong CE offset can't deref garbage.

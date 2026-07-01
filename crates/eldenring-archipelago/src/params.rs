@@ -25,3 +25,21 @@ pub fn goods_row_fields(row_id: i32) -> Option<GoodsRowFields> {
         disable_use_at_out_of_coliseum: row.disable_use_at_out_of_coliseum(),
     })
 }
+
+/// Sorted list of the SYNTHETIC goods row ids (injected AP placeholders, id > SYNTHETIC_GOODS_MIN_ID).
+/// Used by `fmg_inject` to add a GoodsName entry per synthetic id. Empty if the repo isn't up yet.
+/// MUST be called in-world (FD4 singleton populated). Iterates the goods table once.
+pub fn synthetic_goods_ids() -> Vec<u32> {
+    let repo = match unsafe { SoloParamRepository::instance() } {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut v: Vec<u32> = Vec::new();
+    for (id, _row) in repo.rows::<EquipParamGoods>() {
+        if er_codec::is_synthetic_goods(er_codec::CATEGORY_GOODS | id) {
+            v.push(id);
+        }
+    }
+    v.sort_unstable();
+    v
+}

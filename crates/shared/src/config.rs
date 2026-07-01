@@ -50,7 +50,15 @@ impl<G: Game> Config<G> {
 
     /// The path to the configuration file.
     fn path() -> Result<PathBuf> {
-        Ok(utils::mod_directory()?.join("apconfig.json"))
+        // Elden Ring (pure-runtime, no static randomizer) reads apconfig.json next to the client DLL
+        // — the dir the me3 profile's `[[natives]]` path points at — rather than me3's install root.
+        // DS3/Sekiro keep the upstream mod-directory, where their static randomizer writes the config.
+        let dir = if matches!(G::TYPE, crate::GameType::EldenRing) {
+            utils::current_module_directory()?
+        } else {
+            utils::mod_directory()?.to_path_buf()
+        };
+        Ok(dir.join("apconfig.json"))
     }
 
     /// Returns the Archipelago server URL defined in the config, or None if it

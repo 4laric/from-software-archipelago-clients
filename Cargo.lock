@@ -657,6 +657,7 @@ dependencies = [
  "fromsoftware-shared 0.14.0",
  "hudhook",
  "log",
+ "oneshot",
  "retour",
  "serde_json",
  "shared",
