@@ -12,9 +12,24 @@ pub struct DeathLatch {
     pub was_dead: bool,
 }
 
+/// A foreign DeathLink event arrived: latch a kill — but ONLY when this slot's `death_link` option
+/// is on (SWEEP H2: the DeathLink tag is advertised unconditionally for room visibility, so a slot
+/// with `death_link: 0` still RECEIVES events; they must be dropped here). Returns whether latched.
+pub fn latch_incoming(latch: &mut DeathLatch, enabled: bool) -> bool {
+    if enabled {
+        latch.kill_pending = true;
+    }
+    enabled
+}
+
 /// Apply an INCOMING DeathLink: once in-world, set the kill flag; clear the latch only on success
-/// (retry next tick while the holder isn't ready).
-pub fn drive_incoming_kill(hook: &mut dyn GameHook, latch: &mut DeathLatch) {
+/// (retry next tick while the holder isn't ready). `enabled` is the slot's `death_link` option —
+/// belt-and-braces (SWEEP H2 / R2): a stale latched kill must never fire once death_link is
+/// known-disabled, even if it was latched before the option parsed (mirrors client `drive_kill`).
+pub fn drive_incoming_kill(hook: &mut dyn GameHook, latch: &mut DeathLatch, enabled: bool) {
+    if !enabled {
+        return;
+    }
     if latch.kill_pending && hook.in_world() && hook.kill_player() {
         latch.kill_pending = false;
     }
@@ -48,7 +63,7 @@ mod tests {
             kill_pending: true,
             ..Default::default()
         };
-        drive_incoming_kill(&mut g, &mut latch);
+        drive_incoming_kill(&mut g, &mut latch, true);
         assert_eq!(g.set_flags(), vec![DEATHLINK_KILL_FLAG]);
         assert_eq!(g.player_hp(), Some(1000));
         assert!(!latch.kill_pending);
@@ -63,12 +78,12 @@ mod tests {
             kill_pending: true,
             ..Default::default()
         };
-        drive_incoming_kill(&mut g, &mut latch);
+        drive_incoming_kill(&mut g, &mut latch, true);
         assert!(latch.kill_pending);
         assert!(g.set_flags().is_empty());
 
         g.set_flag_holder_ready(true);
-        drive_incoming_kill(&mut g, &mut latch);
+        drive_incoming_kill(&mut g, &mut latch, true);
         assert!(!latch.kill_pending);
         assert_eq!(g.set_flags(), vec![DEATHLINK_KILL_FLAG]);
     }
@@ -81,9 +96,39 @@ mod tests {
             kill_pending: true,
             ..Default::default()
         };
-        drive_incoming_kill(&mut g, &mut latch);
+        drive_incoming_kill(&mut g, &mut latch, true);
         assert!(latch.kill_pending);
         assert!(g.set_flags().is_empty());
+    }
+
+    // --- SWEEP H2: death_link:0 slots must never be killed by other players' deaths ---
+
+    #[test]
+    fn disabled_slot_refuses_to_latch_incoming_death() {
+        let mut latch = DeathLatch::default();
+        assert!(!latch_incoming(&mut latch, false));
+        assert!(!latch.kill_pending);
+        assert!(latch_incoming(&mut latch, true));
+        assert!(latch.kill_pending);
+    }
+
+    #[test]
+    fn stale_latched_kill_never_fires_when_disabled() {
+        // H2 belt-and-braces: an event that slipped in before the option parsed (or a bug in the
+        // latch site) leaves kill_pending set — drive must STILL refuse to kill a death_link:0 slot.
+        let mut g = FakeGame::new();
+        g.set_in_world(true);
+        g.set_hp(Some(1000));
+        let mut latch = DeathLatch {
+            kill_pending: true,
+            ..Default::default()
+        };
+        drive_incoming_kill(&mut g, &mut latch, false);
+        assert!(g.set_flags().is_empty(), "disabled slot was killed (SWEEP H2 regression)");
+        assert_eq!(g.player_hp(), Some(1000));
+        // Latch intentionally NOT cleared: enabling later on the same session is the operator's
+        // explicit choice; the invariant here is only that nothing fires while disabled.
+        assert!(latch.kill_pending);
     }
 
     #[test]

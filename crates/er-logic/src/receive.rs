@@ -287,6 +287,62 @@ mod tests {
     }
 
     #[test]
+    fn failed_grant_rollback_replays_grants_in_order_without_redispatching_names() {
+        // SWEEP H3 contract test. The client (core.rs) verifies every Enqueue's grant_full_id and
+        // on failure rolls `pushed` back to the failed item and breaks; the tail replays next tick.
+        // This locks the two properties that rollback protocol depends on:
+        //   (1) the replayed item yields Enqueue AGAIN (not AlreadyPushed) once pushed was rolled back;
+        //   (2) name-dispatch does NOT re-fire for it (dispatched_through kept its advance), so
+        //       progressive tiers / region flags are not double-applied by the retry.
+        let (im, ic) = maps();
+        let mut hook = MockHook::default();
+        let mut dispatched = 0i64;
+        let mut pushed = 0i64;
+
+        // Tick 1: item 0 enqueues; the grant then FAILS to place (menu-time stale inventory
+        // pointer). Client rolls pushed back to the failed index and breaks before item 1.
+        let pushed_before = pushed;
+        let a = process_received_item(
+            &item(0, 7777, "A"),
+            &mut dispatched,
+            &mut pushed,
+            &im,
+            &ic,
+            &mut hook,
+        );
+        assert!(matches!(a, GrantAction::Enqueue { ap_index: 0, .. }));
+        pushed = pushed_before; // grant_full_id returned false -> hold the watermark (H3)
+
+        // Tick 2: replay the stream from the held watermark.
+        let a0 = process_received_item(
+            &item(0, 7777, "A"),
+            &mut dispatched,
+            &mut pushed,
+            &im,
+            &ic,
+            &mut hook,
+        );
+        let a1 = process_received_item(
+            &item(1, 8888, "B"),
+            &mut dispatched,
+            &mut pushed,
+            &im,
+            &ic,
+            &mut hook,
+        );
+
+        assert!(
+            matches!(a0, GrantAction::Enqueue { ap_index: 0, .. }),
+            "held item must re-enqueue on the retry tick, got {a0:?}"
+        );
+        assert!(matches!(a1, GrantAction::Enqueue { ap_index: 1, .. }));
+        // Name dispatch fired ONCE for the held item (idempotence is not required of the grant).
+        assert_eq!(hook.dispatched, vec!["A", "B"]);
+        assert_eq!(pushed, 2);
+        assert_eq!(dispatched, 2);
+    }
+
+    #[test]
     fn unmapped_item_id_is_skipped_with_watermark_advance() {
         let (im, ic) = maps();
         let mut hook = MockHook::default();

@@ -11,6 +11,8 @@
 
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 /// Which basis the apworld chose (`completionScalingBasis`). The mapping is basis-agnostic (it consumes
 /// a per-region target); the client keeps the basis for logging / option gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +108,51 @@ pub fn floor_tier_from_multiplier(floor_mult: f32) -> usize {
         .iter()
         .position(|t| t.hp >= floor_mult)
         .unwrap_or(NUM_TIERS - 1)
+}
+
+/// `{ "<i32>": <i32> }` slot_data object -> `i32 -> i32` map (`regionSphereTargets`). Tolerant:
+/// non-numeric keys / non-int values are skipped, anything else yields an empty map.
+pub fn i32_i32_map(v: Option<&Value>) -> HashMap<i32, i32> {
+    let mut m = HashMap::new();
+    if let Some(obj) = v.and_then(|v| v.as_object()) {
+        for (k, val) in obj {
+            if let (Ok(key), Some(value)) = (k.parse::<i32>(), val.as_i64()) {
+                m.insert(key, value as i32);
+            }
+        }
+    }
+    m
+}
+
+/// Parse the connect-time scaling config out of slot_data. `None` = the feature stays INERT.
+///
+/// SWEEP H4 / R6: with `completion_scaling` on but an empty/missing `regionSphereTargets`, arming
+/// would resolve EVERY region to `floor_tier` and the sweep would strip baked vanilla scaling from
+/// every loaded enemy — the whole game flattens. So an empty target map REFUSES to arm (returns
+/// `None`); the caller logs the "left VANILLA" error line and enemies keep their baked scaling.
+pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
+    if !crate::options::parse_bool_option(sd, "completion_scaling") {
+        return None;
+    }
+    let region_targets = i32_i32_map(sd.get("regionSphereTargets"));
+    if region_targets.is_empty() {
+        return None; // H4: refuse to arm — see doc above.
+    }
+    let max_target = region_targets.values().copied().max().unwrap_or(0);
+    // Tolerant like the rest of the options parses: the apworld ships the Choice VALUE (int 1 =
+    // sphere, fill_slot_data "completionScalingBasis": ...basis.value); older/hand-rolled slot_data
+    // may ship the string. The old string-only match silently read int 1 as Geographic (drift
+    // caught by the slot_data fixture pipeline, 2026-07-02).
+    let basis = match sd.get("completionScalingBasis") {
+        Some(v) if v.as_str() == Some("sphere") || v.as_i64() == Some(1) => ScalingBasis::Sphere,
+        _ => ScalingBasis::Geographic,
+    };
+    let floor_mult = sd
+        .pointer("/options/completion_scaling_floor")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+    let floor_tier = floor_tier_from_multiplier(floor_mult);
+    Some(ScalingConfig { basis, floor_tier, region_targets, max_target })
 }
 
 #[cfg(test)]
@@ -223,5 +270,80 @@ mod tests {
         assert_eq!(floor_tier_from_multiplier(1.5), 2); // first hp >= 1.5 is 7030 (1.656)
         assert_eq!(floor_tier_from_multiplier(2.0), 5); // first hp >= 2.0 is 7060 (2.266)
         assert_eq!(floor_tier_from_multiplier(99.0), NUM_TIERS - 1); // above ladder -> top
+    }
+
+    // --- parse_scaling_config (connect-time slot_data parse; SWEEP H4 refuse-to-arm) ---
+
+    use serde_json::json;
+
+    #[test]
+    fn parse_disabled_option_is_none() {
+        let sd = json!({ "options": { "completion_scaling": 0 },
+                         "regionSphereTargets": { "60000": 3 } });
+        assert!(parse_scaling_config(&sd).is_none());
+    }
+
+    #[test]
+    fn parse_empty_targets_refuses_to_arm() {
+        // SWEEP H4 / R6 regression: enabled + empty/missing regionSphereTargets used to arm with
+        // every region at floor_tier, and the sweep then flattened ALL baked enemy scaling.
+        let missing = json!({ "options": { "completion_scaling": 1 } });
+        assert!(parse_scaling_config(&missing).is_none(), "missing map must stay INERT (H4)");
+        let empty = json!({ "options": { "completion_scaling": 1 },
+                            "regionSphereTargets": {} });
+        assert!(parse_scaling_config(&empty).is_none(), "empty map must stay INERT (H4)");
+        let garbage = json!({ "options": { "completion_scaling": 1 },
+                              "regionSphereTargets": { "not-a-number": 3 } });
+        assert!(parse_scaling_config(&garbage).is_none(), "all-garbage map must stay INERT (H4)");
+    }
+
+    #[test]
+    fn parse_full_config_round_trips() {
+        let sd = json!({
+            "options": { "completion_scaling": 1, "completion_scaling_floor": 1.5 },
+            "completionScalingBasis": "sphere",
+            "regionSphereTargets": { "60000": 0, "63000": 5, "76000": 9 },
+        });
+        let cfg = parse_scaling_config(&sd).expect("should arm");
+        assert_eq!(cfg.basis, ScalingBasis::Sphere);
+        assert_eq!(cfg.floor_tier, floor_tier_from_multiplier(1.5));
+        assert_eq!(cfg.max_target, 9);
+        assert_eq!(cfg.region_targets.get(&63000), Some(&5));
+        assert_eq!(cfg.region_targets.len(), 3);
+    }
+
+    #[test]
+    fn parse_basis_accepts_apworld_int_form() {
+        // fill_slot_data ships completion_scaling_basis.value (int: 0 geographic / 1 sphere);
+        // the string-only match used to silently demote sphere -> Geographic.
+        let sphere = json!({ "options": { "completion_scaling": 1 },
+                             "completionScalingBasis": 1,
+                             "regionSphereTargets": { "60000": 1 } });
+        assert_eq!(parse_scaling_config(&sphere).unwrap().basis, ScalingBasis::Sphere);
+        let geo = json!({ "options": { "completion_scaling": 1 },
+                          "completionScalingBasis": 0,
+                          "regionSphereTargets": { "60000": 1 } });
+        assert_eq!(parse_scaling_config(&geo).unwrap().basis, ScalingBasis::Geographic);
+    }
+
+    #[test]
+    fn parse_defaults_basis_geographic_and_floor_zero() {
+        let sd = json!({ "options": { "completion_scaling": true },
+                         "regionSphereTargets": { "60000": 1 } });
+        let cfg = parse_scaling_config(&sd).expect("should arm");
+        assert_eq!(cfg.basis, ScalingBasis::Geographic);
+        assert_eq!(cfg.floor_tier, 0);
+        assert_eq!(cfg.max_target, 1);
+    }
+
+    #[test]
+    fn i32_map_skips_bad_entries_keeps_good() {
+        let v = json!({ "60000": 3, "bad": 1, "61000": "nope", "62000": 7 });
+        let m = i32_i32_map(Some(&v));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&60000), Some(&3));
+        assert_eq!(m.get(&62000), Some(&7));
+        assert!(i32_i32_map(None).is_empty());
+        assert!(i32_i32_map(Some(&json!([1, 2]))).is_empty());
     }
 }

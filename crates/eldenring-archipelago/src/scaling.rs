@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use eldenring::cs::{ChrIns, ChrInsExt, WorldChrMan};
 use er_logic::scaling::{
-    ScalingBasis, ScalingConfig, floor_tier_from_multiplier, is_scaling_speffect,
-    speffect_id_for_tier, tier_for_region,
+    ScalingConfig, is_scaling_speffect, speffect_id_for_tier, tier_for_region,
 };
 use fromsoftware_shared::FromStatic;
 use serde_json::Value;
@@ -27,40 +26,31 @@ static TICK: AtomicU32 = AtomicU32::new(0);
 /// Apply the region's tier SpEffect only a few times a second (enemy stats don't need per-frame).
 const THROTTLE: u32 = 30;
 
-/// Parse slot_data at connect. No-op (and disables) unless `options.completion_scaling` is on.
+/// Parse slot_data at connect. The parse itself — including the SWEEP H4 / R6 refuse-to-arm on an
+/// empty/missing `regionSphereTargets` — lives in `er_logic::scaling::parse_scaling_config`
+/// (host-tested); this wrapper only owns the logging and the CONFIG swap.
 pub fn configure(sd: &Value) {
-    // int-or-bool tolerant, unified onto er_logic::options (apworld ships options as ints).
-    let enabled = er_logic::options::parse_bool_option(sd, "completion_scaling");
-    if !enabled {
-        *CONFIG.lock().unwrap() = None;
-        return;
+    let requested = er_logic::options::parse_bool_option(sd, "completion_scaling");
+    let cfg = er_logic::scaling::parse_scaling_config(sd);
+    match (&cfg, requested) {
+        (Some(c), _) => log::info!(
+            "enemy-scaling: enabled ({:?}), {} region targets, max {}, floor tier {}",
+            c.basis,
+            c.region_targets.len(),
+            c.max_target,
+            c.floor_tier
+        ),
+        (None, true) => {
+            // R6 (SWEEP H4): with an empty/missing map, arming would resolve every region to
+            // floor_tier and the sweep would strip baked vanilla scaling from EVERY loaded enemy
+            // (the whole game flattens). The parse returned None: feature INERT, enemies vanilla.
+            log::error!(
+                "completion_scaling requested but regionSphereTargets is empty -- enemy scaling left VANILLA"
+            );
+        }
+        (None, false) => {}
     }
-    let region_targets = i32_i32_map(sd.get("regionSphereTargets"));
-    if region_targets.is_empty() {
-        // R6 (SWEEP H4): with an empty/missing map, every region resolves to floor_tier and the
-        // sweep strips baked vanilla scaling from EVERY loaded enemy (the whole game flattens).
-        // Refuse to arm instead: the feature goes INERT and enemies keep their baked scaling.
-        log::error!(
-            "completion_scaling requested but regionSphereTargets is empty -- enemy scaling left VANILLA"
-        );
-        *CONFIG.lock().unwrap() = None;
-        return;
-    }
-    let max_target = region_targets.values().copied().max().unwrap_or(0);
-    let basis = match sd.get("completionScalingBasis").and_then(|v| v.as_str()) {
-        Some("sphere") => ScalingBasis::Sphere,
-        _ => ScalingBasis::Geographic,
-    };
-    let floor_mult = sd
-        .pointer("/options/completion_scaling_floor")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0) as f32;
-    let floor_tier = floor_tier_from_multiplier(floor_mult);
-    let n = region_targets.len();
-    *CONFIG.lock().unwrap() = Some(ScalingConfig { basis, floor_tier, region_targets, max_target });
-    log::info!(
-        "enemy-scaling: enabled ({basis:?}), {n} region targets, max {max_target}, floor tier {floor_tier}"
-    );
+    *CONFIG.lock().unwrap() = cfg;
 }
 
 /// Per-tick sweep (call from `update_live`, in-world). Throttled; no-op unless configured.
@@ -130,17 +120,4 @@ fn scale_one(chr: &mut ChrIns, target: i32, player_handle: &eldenring::cs::Field
     }
     chr.apply_speffect(target, false);
     1
-}
-
-/// `{ "<i32>": <i32> }` slot_data object -> `i32 -> i32` map (regionSphereTargets). Tolerant.
-fn i32_i32_map(v: Option<&Value>) -> std::collections::HashMap<i32, i32> {
-    let mut m = std::collections::HashMap::new();
-    if let Some(obj) = v.and_then(|v| v.as_object()) {
-        for (k, val) in obj {
-            if let (Ok(key), Some(value)) = (k.parse::<i32>(), val.as_i64()) {
-                m.insert(key, value as i32);
-            }
-        }
-    }
-    m
 }

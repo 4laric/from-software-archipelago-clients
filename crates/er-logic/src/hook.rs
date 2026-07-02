@@ -155,6 +155,45 @@ pub mod fake {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        //! Direct tests for the GameHook DEFAULT methods (production logic that every impl
+        //! inherits) and the FakeGame semantics the other test modules lean on.
+        use super::*;
+
+        #[test]
+        fn read_local_death_false_when_hp_unresolvable_in_world() {
+            // In-world but HP cell unreadable (None) must read as ALIVE, not dead — a transient
+            // resolve failure must never fire an outgoing DeathLink.
+            let mut g = FakeGame::new();
+            g.set_in_world(true);
+            g.set_hp(None);
+            assert!(!g.read_local_death());
+        }
+
+        #[test]
+        fn default_kill_player_places_the_dedicated_flag_and_reports_retry() {
+            let mut g = FakeGame::new();
+            g.set_flag_holder_ready(false);
+            assert!(!g.kill_player(), "holder not ready -> must report failure for retry");
+            assert!(g.set_flags().is_empty());
+            g.set_flag_holder_ready(true);
+            assert!(g.kill_player());
+            assert_eq!(g.set_flags(), vec![DEATHLINK_KILL_FLAG]);
+        }
+
+        #[test]
+        fn fake_readiness_script_is_consumed_in_order_then_falls_back() {
+            let mut g = FakeGame::new();
+            g.set_flag_holder_ready(true); // steady-state fallback
+            g.script_flag_holder_ready(vec![false, false]);
+            assert!(!g.try_set_event_flag(1, true));
+            assert!(!g.try_set_event_flag(1, true));
+            assert!(g.try_set_event_flag(1, true), "script drained -> steady-state applies");
+            assert_eq!(g.set_flags(), vec![1]);
+        }
+    }
+
     impl GameHook for FakeGame {
         fn get_event_flag(&self, flag: u32) -> bool {
             self.flags.get(&flag).copied().unwrap_or(false)
