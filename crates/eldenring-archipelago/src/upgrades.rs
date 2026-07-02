@@ -199,7 +199,7 @@ fn decode_weapon_id(full_id: i32) -> Option<(i32, i32)> {
 /// `repo.get::<EquipParamWeapon>(base).reinforce_type_id() -> i16`; then cap = max k in [0,25] s.t.
 /// `repo.get::<ReinforceParamWeapon>(rt + k)` exists. somber = cap <= 10. Mirrors C++ `CapForRT` /
 /// `WeaponInfo`. None (no upgrade) if the repo isn't up, the row is absent, or cap <= 0.
-fn weapon_track_and_cap(base: i32) -> Option<(i32, bool)> {
+pub(crate) fn weapon_track_and_cap(base: i32) -> Option<(i32, bool)> {
     // SAFETY: FD4 singleton; on the game thread, gated in-world by the caller. Err until built.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
     let weapon = repo.get::<EquipParamWeapon>(base as u32)?;
@@ -224,7 +224,7 @@ fn weapon_track_and_cap(base: i32) -> Option<(i32, bool)> {
 /// 1500ms throttle so a reconnect replay burst doesn't re-walk the bag per grant (mirrors C++
 /// `RefreshAutoUpgradeTargets`). Returns None only if the bag can't be resolved AND nothing is
 /// cached yet (so the caller leaves the weapon unchanged rather than guessing).
-fn highest_held_level(somber: bool) -> Option<i32> {
+pub(crate) fn highest_held_level(somber: bool) -> Option<i32> {
     let mut targets = UPGRADE_TARGETS.lock().ok()?;
     let stale = match targets.last_refresh {
         Some(t) => t.elapsed() >= REFRESH_THROTTLE,
@@ -427,6 +427,27 @@ fn raise_stored_blessing(level: i32) -> Option<Option<(i32, i32)>> {
     }
     pgd.scadutree_blessing = target as u8;
     Some(Some((cur, target)))
+}
+
+/// GameHook seam (hook_impl.rs `EldenRingHook::scadutree_blessing`): read the stored
+/// combat-blessing byte. None = PlayerGameData unreachable this tick. Read-only.
+pub(crate) fn stored_blessing() -> Option<i32> {
+    // SAFETY: FD4 singleton (read-only); Err before the player is placed.
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    let pgd = gdm.main_player_game_data.as_ref();
+    Some(pgd.scadutree_blessing as i32)
+}
+
+/// GameHook seam (hook_impl.rs `EldenRingHook::set_scadutree_blessing`): raw stored-blessing
+/// write. The er-logic caller has already clamped/compared per the trait contract; we re-clamp
+/// defensively to the valid stored range. No-op if PlayerGameData is unreachable.
+pub(crate) fn write_stored_blessing(level: i32) {
+    // SAFETY: FD4 singleton accessed mutably; same idiom as `raise_stored_blessing`.
+    let Ok(gdm) = (unsafe { GameDataMan::instance_mut() }) else {
+        return;
+    };
+    let pgd = gdm.main_player_game_data.as_mut();
+    pgd.scadutree_blessing = level.clamp(0, SCADU_MAX_LEVEL) as u8;
 }
 
 #[cfg(test)]

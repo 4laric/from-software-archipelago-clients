@@ -11,10 +11,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use archipelago_rs as ap;
+use er_logic::hook::GameHook;
 use er_logic::progressive::ProgressiveState;
+use er_logic::receive::{GrantAction, RecvItem};
 use er_logic::save_state::SaveState;
 use serde_json::Value;
 use shared::CoreBase;
+
+use crate::hook_impl::{EldenRingHook, ReceiveDispatch};
 
 pub struct Core {
     base: CoreBase<crate::game::EldenRing, Value>,
@@ -45,13 +49,116 @@ pub struct Core {
     start_flags_done: bool,
     /// Persisted (SaveState): start items granted once for this save.
     start_items_granted: bool,
+    /// Session-scoped (R11, SWEEP): indices into start_items that verifiably granted -- only the
+    /// failed ones re-attempt; `start_items_granted` latches once ALL have landed.
+    start_items_ok: HashSet<usize>,
     /// Pre-scout: resolves each shop reward's name/owner/ER-sell-id (pumped on the tick).
     scout: Option<crate::scout_proof::ScoutProof>,
+    /// Goal-send (SPEC-goal-send-20260701.md): goalLocations split flag/checked at parse.
+    goal: Option<crate::goal::GoalConfig>,
+    /// Session latch: Goal sent once per connect (NOT persisted -- re-send is idempotent).
+    sent_goal: bool,
 }
 
 impl shared::Core for Core {
     type SlotData = Value;
     type Game = crate::game::EldenRing;
+
+    /// Debug console commands, typed into the overlay's say input (2026-07-01, playtest tooling).
+    /// Unrecognized "!" commands fall through to server chat.
+    fn handle_command(&mut self, command: &str, arg: Option<&str>) -> bool {
+        match command {
+            "!flag" => {
+                match arg.and_then(|a| a.trim().parse::<u32>().ok()) {
+                    Some(f) => {
+                        let v = crate::flags::get_event_flag(f);
+                        self.log(ap::Print::message(format!("flag {f} = {v}")));
+                    }
+                    None => self.log(ap::Print::message("usage: !flag <id>".to_string())),
+                }
+                true
+            }
+            "!setflag" => {
+                let parts: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+                match parts.first().and_then(|s| s.parse::<u32>().ok()) {
+                    Some(f) => {
+                        let on = parts.get(1).map(|s| *s != "0").unwrap_or(true);
+                        let ok = crate::flags::try_set_event_flag(f, on);
+                        self.log(ap::Print::message(format!(
+                            "setflag {f} {on} -> {}",
+                            if ok { "OK" } else { "NOT READY" }
+                        )));
+                    }
+                    None => self.log(ap::Print::message("usage: !setflag <id> [0|1]".to_string())),
+                }
+                true
+            }
+            "!region" => {
+                let pr = crate::flags::play_region_id();
+                self.log(ap::Print::message(format!("play_region = {pr:?}")));
+                true
+            }
+            "!warp" => {
+                // Playtest tooling for the pure-runtime warp primitive (also unblocks a
+                // random-start seed by hand if the auto-warp misfires). Full grace ENTITY id,
+                // e.g. `!warp 11102950` = Table of Lost Grace (Roundtable Hold).
+                match arg.and_then(|a| a.trim().parse::<u32>().ok()) {
+                    Some(g) => {
+                        let msg = match crate::warp::warp_to_grace(g) {
+                            Ok(()) => format!("warp requested -> grace {g}"),
+                            Err(e) => format!("warp FAILED: {e}"),
+                        };
+                        self.log(ap::Print::message(msg));
+                    }
+                    None => self.log(ap::Print::message(
+                        "usage: !warp <grace entity id> (11102950 = Roundtable)".to_string(),
+                    )),
+                }
+                true
+            }
+            "!grace" => {
+                let Some(q) = arg.map(|s| s.to_lowercase()) else {
+                    self.log(ap::Print::message("usage: !grace <name substring>".to_string()));
+                    return true;
+                };
+                let mut lines: Vec<String> = Vec::new();
+                if let Some(cfg) = self.region.as_ref() {
+                    for (name, &f) in &cfg.grace_items {
+                        if name.to_lowercase().contains(&q) {
+                            lines.push(format!(
+                                "{name}: flag {f} = {}",
+                                crate::flags::get_event_flag(f)
+                            ));
+                        }
+                    }
+                    for (name, fs) in &cfg.region_graces {
+                        if name.to_lowercase().contains(&q) {
+                            for &f in fs {
+                                lines.push(format!(
+                                    "{name} bundle: flag {f} = {}",
+                                    crate::flags::get_event_flag(f)
+                                ));
+                            }
+                        }
+                    }
+                }
+                if lines.is_empty() {
+                    lines.push(format!("no grace/lock matching '{q}'"));
+                }
+                for l in lines {
+                    self.log(ap::Print::message(l));
+                }
+                true
+            }
+            "!help" => {
+                self.log(ap::Print::message(
+                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring>".to_string(),
+                ));
+                true
+            }
+            _ => false,
+        }
+    }
 
     fn new() -> Result<Self> {
         Ok(Self {
@@ -77,7 +184,10 @@ impl shared::Core for Core {
             start: None,
             start_flags_done: false,
             start_items_granted: false,
+            start_items_ok: HashSet::new(),
             scout: None,
+            goal: None,
+            sent_goal: false,
         })
     }
     fn base(&self) -> &CoreBase<Self::Game, Self::SlotData> {
@@ -108,9 +218,13 @@ impl shared::Core for Core {
         if !self.slot_data_parsed {
             let parsed = self.client().map(|client| {
                 let sd = client.slot_data();
-                crate::deathlink::set_enabled(
-                    sd.pointer("/options/death_link").and_then(|v| v.as_bool()).unwrap_or(false),
-                );
+                // int-or-bool tolerant (er_logic::options): the apworld serializes options
+                // as ints (death_link: 1), which .as_bool() silently read as false.
+                crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
+                crate::no_weapon_reqs::set_enabled(er_logic::options::parse_bool_option(
+                    sd,
+                    "no_weapon_requirements",
+                ));
                 crate::upgrades::set_auto_upgrade(
                     sd.pointer("/options/auto_upgrade").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 );
@@ -144,7 +258,29 @@ impl shared::Core for Core {
                 crate::shop_preview::configure(preview.clone());
                 crate::shop_icon::configure(preview);
                 crate::scaling::configure(sd); // runtime enemy scaling (regionSphereTargets)
+                // checkItemFlags: full raw item id -> check acquisition flags (the PORT-GAP
+                // vanilla-suppress table; LIVE in the detour since 2026-07-01).
+                let check_flags: std::collections::HashMap<u32, Vec<u32>> = sd
+                    .get("checkItemFlags")
+                    .and_then(|v| v.as_object())
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| {
+                                let id: u32 = k.parse().ok()?;
+                                let fl = v.as_array()?
+                                    .iter()
+                                    .filter_map(|f| f.as_u64().map(|x| x as u32))
+                                    .collect();
+                                Some((id, fl))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                crate::detour::configure_check_item_flags(check_flags);
                 let scout = crate::scout_proof::ScoutProof::new(loc_flags.keys().copied().collect());
+                // Goal-send: split goalLocations into flag-detected / checked-fallback buckets
+                // against loc_flags (SPEC-goal-send-20260701.md; do NOT route through flagpoll).
+                let goal_cfg = crate::goal::parse(sd, &loc_flags);
 
                 // Connect banner: build identity + slot_data contract version (+ gate result) so any
                 // logfile self-identifies which build / contract produced it. Then a one-line
@@ -153,6 +289,16 @@ impl shared::Core for Core {
                 // warp/area/done flags, and the area-lock count.
                 let versions = sd.get("versions").and_then(|v| v.as_str()).unwrap_or("(none)");
                 let gate = er_logic::version::version_gate(sd, env!("CARGO_PKG_VERSION"));
+                // Warn-only contract (er_logic::version): Some(false) must NOT tear the
+                // connection down, but it must be user-visible. Build the message here; it is
+                // pushed to the persistent overlay console (same channel as "Region unlocked")
+                // after this client borrow ends.
+                let gate_warn = (gate == Some(false)).then(|| {
+                    format!(
+                        "apworld/client version mismatch: seed wants {versions}, client is {} — update the client",
+                        env!("CARGO_PKG_VERSION")
+                    )
+                });
                 let start_region = sd.get("startRegion").and_then(|v| v.as_str()).unwrap_or("");
                 log::info!(
                     "=== ER-AP client {} | contract {versions} (gate {gate:?}) | slot '{name}' ===",
@@ -169,9 +315,11 @@ impl shared::Core for Core {
                     region.area_lock_flags.len()
                 );
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout)
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg)
             });
-            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout)) = parsed {
+            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg)) =
+                parsed
+            {
                 log::info!(
                     "slot_data parsed: {} item-map, {} area-lock, {} progressive; player '{name}'",
                     map.len(),
@@ -185,20 +333,66 @@ impl shared::Core for Core {
                 self.progressive = ProgressiveState::new(prog_cfg);
                 self.my_name = Some(name);
                 self.dungeon_sweeps = sweeps;
-                self.flag_poll = Some(crate::flagpoll::load());
+                // F2 fix (2026-07-01): the flag-poll table travels in slot_data ("locationFlags")
+                // now; baker-era apconfig.json no longer carries location_flags, so fresh installs
+                // polled an EMPTY map (world pickups never sent checks -- seed looked vanilla).
+                // slot_data wins; a legacy apconfig table still contributes sweep_flags / extras.
+                let mut fp = crate::flagpoll::load();
+                for (loc, flag) in loc_flags {
+                    fp.location_flags.insert(loc, flag);
+                }
+                log::info!(
+                    "flag-poll table: {} location flags ({} sweep groups)",
+                    fp.location_flags.len(),
+                    fp.sweep_flags.len()
+                );
+                self.flag_poll = Some(fp);
                 self.start = Some(start);
                 self.scout = Some(scout);
+                self.goal = Some(goal_cfg);
                 self.slot_data_parsed = true;
+                if let Some(warning) = gate_warn {
+                    log::error!("{warning}");
+                    self.log(ap::Print::message(warning));
+                }
             }
         }
 
         // 2b. Load the persisted save once (resume watermark + progressive tiers).
         if self.slot_data_parsed && !self.save_loaded {
-            if let Some(path) = save_file_path(self.seed(), self.my_name.as_deref().unwrap_or("")) {
-                let st = std::fs::read_to_string(&path)
-                    .ok()
-                    .map(|t| SaveState::from_json(&t))
-                    .unwrap_or_default();
+            // SAVE-KEY FIX (2026-07-02): key the save by the ROOM's seed_name (RoomInfo ground
+            // truth), not the apconfig seed. The staged apconfig ships "seed":"", so every seed
+            // shared ONE file (ap_save__<slot>.json) and a fresh world resumed at the previous
+            // world's watermark -- seen live on the ER+HK seed: "resume at received index 134"
+            // on a brand-new multiworld, so the first 134 receives (start items included) were
+            // treated as already-granted and never placed. Region opens self-healed via the
+            // reconcile ticks, which masked everything except the missing bag items.
+            let room_seed = self
+                .client()
+                .map(|c| c.seed_name().to_string())
+                .unwrap_or_default();
+            let seed_key = if room_seed.is_empty() {
+                // No RoomInfo seed (shouldn't happen once slot_data parsed) -- fall back to the
+                // apconfig seed rather than never arming persistence.
+                self.seed().to_string()
+            } else {
+                room_seed
+            };
+            if let Some(path) = save_file_path(&seed_key, self.my_name.as_deref().unwrap_or("")) {
+                let st = match std::fs::read_to_string(&path) {
+                    Ok(saved_text) => {
+                        // R7 (SWEEP): from_json is tolerant -- a present-but-corrupt save would
+                        // silently reset every watermark (duplicate start items + regrant burst).
+                        if serde_json::from_str::<Value>(&saved_text).is_err() {
+                            log::error!(
+                                "save file {} is CORRUPT (not valid JSON) -- watermarks reset to defaults",
+                                path.display()
+                            );
+                        }
+                        SaveState::from_json(&saved_text)
+                    }
+                    Err(_) => SaveState::default(), // absent = fresh save (normal first run)
+                };
                 self.received_through = st.last_received_index.max(0) as usize;
                 self.progressive.restore(
                     st.progressive_counter
@@ -209,6 +403,7 @@ impl shared::Core for Core {
                 );
                 self.start_items_granted = st.start_items_granted;
                 self.last_persisted_index = st.last_received_index;
+                log::info!("save persistence armed at {}", path.display());
                 self.save_path = Some(path);
                 log::info!(
                     "save loaded: resume at received index {}",
@@ -241,7 +436,9 @@ impl shared::Core for Core {
         if self.slot_data_parsed {
             let already_flags = self.start_flags_done;
             let already_items = self.start_items_granted;
-            let has_inv = crate::detour::has_inventory();
+            // Same in_world tightening as can_grant (SWEEP H3): the inventory pointer never
+            // resets on quit-to-menu, so menu-time start grants would write through a stale one.
+            let has_inv = crate::detour::has_inventory() && crate::flags::in_world();
             let mut did_flags = false;
             let mut did_items = false;
             if let Some(sc) = self.start.as_ref() {
@@ -262,15 +459,24 @@ impl shared::Core for Core {
                         );
                     }
                 }
-                if !already_items
-                    && has_inv
-                    && (sc.start_items.is_empty()
-                        || sc
-                            .start_items
-                            .iter()
-                            .all(|&id| crate::detour::grant_full_id(id, 1)))
-                {
-                    did_items = true;
+                // R11 (SWEEP): `.all(grant_full_id)` re-granted already-succeeded items on a
+                // partial failure next tick (duplicates). Track per-item success (by index,
+                // session-scoped) so only the FAILED ones re-attempt; latch once all landed.
+                if !already_items && has_inv {
+                    let mut all_ok = true;
+                    for (i, &id) in sc.start_items.iter().enumerate() {
+                        if self.start_items_ok.contains(&i) {
+                            continue;
+                        }
+                        if crate::detour::grant_full_id(id, 1) {
+                            self.start_items_ok.insert(i);
+                        } else {
+                            all_ok = false;
+                        }
+                    }
+                    if all_ok {
+                        did_items = true;
+                    }
                 }
             }
             if did_flags {
@@ -295,75 +501,116 @@ impl shared::Core for Core {
         // is turned on; the detour still captures the game's own pointer on a real pickup regardless.
         crate::detour::prime_inventory_if_needed();
 
-        // 3. Collect region-open names + received-item grant candidates in one borrow. Under
-        //    own_world:true this stream now ALSO carries the echoes of our own self-found checks.
+        // 3. Snapshot the received-item stream in one client borrow (RecvItem mirrors for the
+        //    seam, plus the cumulative name set the reconcile ticks need). Under own_world:true
+        //    this stream ALSO carries the echoes of our own self-found checks.
         let mut disp = self.dispatched_through;
-        let recv = self.received_through;
-        let can_grant = crate::detour::has_inventory();
-        let mut names_to_open: Vec<String> = Vec::new();
-        let mut candidates: Vec<(i64, String, Option<i64>, i64)> = Vec::new();
-        let mut new_recv = recv;
+        // SWEEP H3 (verified watermark, via er_logic::receive below): both name-dispatch and
+        // grants only run with a loaded world + live inventory pointer — menu-time writes go
+        // through a stale pointer / get discarded, and used to advance the watermark on faith.
+        let can_grant = crate::detour::has_inventory() && crate::flags::in_world();
         // Cumulative set of ALL received item names — natural-key triggers need the full history
         // (a clause may require an item received many ticks ago), not just this tick's new names.
         let mut received_all: HashSet<String> = HashSet::new();
+        let mut snapshot: Vec<RecvItem> = Vec::new();
         if let Some(client) = self.client() {
             let items = client.received_items();
             if items.len() < disp {
-                disp = 0;
+                disp = 0; // reconnect shrank the stream -> replay name dispatch from index 0
             }
-            for ri in items.iter() {
-                received_all.insert(ri.item().name().to_string());
-            }
-            for ri in items.iter().skip(disp) {
-                names_to_open.push(ri.item().name().to_string());
-            }
-            disp = items.len();
-            if can_grant {
-                for (idx, ri) in items.iter().enumerate().skip(recv) {
-                    let name = ri.item().name().to_string();
-                    let ap_id = ri.item().id();
-                    let full = self.item_map.as_ref().and_then(|m| m.get(&ap_id).copied());
-                    let qty = self.item_counts.get(&ap_id).copied().unwrap_or(1).max(1);
-                    candidates.push((idx as i64, name, full, qty));
+            // Items below BOTH watermarks are AlreadyPushed no-ops; skip snapshotting them.
+            let floor = disp.min(self.received_through);
+            for (idx, ri) in items.iter().enumerate() {
+                let name = ri.item().name().to_string();
+                if can_grant && idx >= floor {
+                    snapshot.push(RecvItem {
+                        index: idx as i64,
+                        ap_item_id: ri.item().id(),
+                        name: name.clone(),
+                    });
                 }
-                new_recv = items.len();
+                received_all.insert(name);
             }
         }
 
-        // 4a. Per received name: set vanilla obtained flags (spirit bell / whetblades / Rold / …),
-        //     open regions, and collect region-unlock notifications for the overlay console.
+        // 4. The receive seam (er_logic::receive, host-tested): per item, name-dispatch when
+        //    idx >= dispatched_through (keyitems fast path / region open / progressive routing,
+        //    via ReceiveDispatch), then grant when idx >= received_through. received_through only
+        //    advances past items whose grant VERIFIABLY placed (SWEEP H3): on a failed placement
+        //    it is rolled back to the failed item and the tail retries in order next tick.
+        //    dispatched_through keeps its advance regardless — name effects are idempotent and
+        //    the section-6 reconcile ticks self-heal any lost flag write.
+        let mut dispatched = disp as i64;
+        let mut pushed = self.received_through as i64;
         let mut unlocked: Vec<String> = Vec::new();
-        for name in &names_to_open {
-            crate::keyitems::set_acquire_flags(name);
-            if let Some(cfg) = self.region.as_ref()
-                && crate::region::open_on_received_name(cfg, name)
-            {
-                unlocked.push(name.trim_end_matches(" Lock").to_string());
+        if can_grant && !snapshot.is_empty() {
+            let empty_map = HashMap::new();
+            let item_map = self.item_map.as_ref().unwrap_or(&empty_map);
+            let mut game = EldenRingHook;
+            let mut dispatch = ReceiveDispatch {
+                region: self.region.as_ref(),
+                progressive: &mut self.progressive,
+                hook: &mut game,
+                unlocked: Vec::new(),
+            };
+            for ri in &snapshot {
+                let pushed_before = pushed;
+                let action = er_logic::receive::process_received_item(
+                    ri,
+                    &mut dispatched,
+                    &mut pushed,
+                    item_map,
+                    &self.item_counts,
+                    &mut dispatch,
+                );
+                match action {
+                    GrantAction::Enqueue { full_id, qty, name, .. } => {
+                        if dispatch.hook.grant_full_id(full_id, qty) {
+                            // Great runes additionally grant their "(Restored)" goods row
+                            // (equippable immediately). Idempotent: restored rows dedup in-game.
+                            if let Some(restored) = crate::keyitems::restored_great_rune_goods(&name)
+                            {
+                                let _ = dispatch.hook.grant_full_id(restored, 1);
+                            }
+                        } else {
+                            // H3: the grant did NOT place — hold received_through at this item
+                            // and stop so the tail replays in order next tick (never advance the
+                            // watermark past an unverified grant).
+                            pushed = pushed_before;
+                            log::warn!(
+                                "grant '{name}' (idx {}) failed to place -- receive watermark held for retry",
+                                ri.index
+                            );
+                            break;
+                        }
+                    }
+                    GrantAction::SkipProgressive => {
+                        // Tier effects already applied in the dispatch (ReceiveDispatch). Mirror
+                        // the old loop's unconditional rune-restore for every candidate branch.
+                        if let Some(restored) = crate::keyitems::restored_great_rune_goods(&ri.name)
+                        {
+                            let _ = dispatch.hook.grant_full_id(restored, 1);
+                        }
+                    }
+                    GrantAction::SkipUnmapped { ap_item_id } => {
+                        // R5 (SWEEP): AP id absent from apIdsToItemIds and progressive didn't
+                        // handle it — nothing granted; without this the item vanishes traceless.
+                        warn_unmapped_once(&ri.name, ap_item_id);
+                        if let Some(restored) = crate::keyitems::restored_great_rune_goods(&ri.name)
+                        {
+                            let _ = dispatch.hook.grant_full_id(restored, 1);
+                        }
+                    }
+                    GrantAction::AlreadyPushed => {}
+                }
             }
+            unlocked = dispatch.unlocked;
         }
+        self.dispatched_through = dispatched.max(0) as usize;
+        self.received_through = pushed.max(0) as usize;
         for region in unlocked {
             self.log(ap::Print::message(format!("Region unlocked: {region}")));
         }
-        // 4b. Grant received items (progressive routes through tiers; everything else its mapped item).
-        for (idx, name, full, qty) in candidates {
-            let eff = self.progressive.on_item_received(&name, idx);
-            if eff.handled {
-                for f in &eff.flags {
-                    crate::flags::set_event_flag(*f, true);
-                }
-                for g in &eff.grants {
-                    crate::detour::grant_full_id(*g, 1);
-                }
-            } else if let Some(f) = full {
-                crate::detour::grant_full_id(f as i32, qty as i32);
-            }
-            // Great runes additionally grant their "(Restored)" goods row (equippable immediately).
-            if let Some(restored) = crate::keyitems::restored_great_rune_goods(&name) {
-                crate::detour::grant_full_id(restored, 1);
-            }
-        }
-        self.dispatched_through = disp;
-        self.received_through = new_recv;
 
         // 4c. Persist on watermark advance.
         if self.received_through as i64 != self.last_persisted_index {
@@ -441,23 +688,88 @@ impl shared::Core for Core {
                 to_check.sort_unstable();
                 to_check.dedup();
                 log::info!("flag-poll: {} new check(s)", to_check.len());
-                if let Some(client) = self.client_mut() {
-                    let _ = client.mark_checked(to_check.iter().copied());
+                if let Some(client) = self.client_mut()
+                    && let Err(e) = client.mark_checked(to_check.iter().copied())
+                {
+                    log::warn!("flag-poll mark_checked failed: {e}");
+                }
+            }
+        }
+
+        // 5c. Goal-send (SPEC-goal-send-20260701.md): once EVERY goalLocations entry is done —
+        //     local DefeatFlag first (immune to another slot's !collect), checked-set fallback
+        //     for detection-table stragglers — send ClientStatus::Goal. Same throttle as the
+        //     flag poll; gated on a loaded world so flags are never read during a load screen.
+        //     Session latch only: a re-send after reconnect is idempotent server-side.
+        if !self.sent_goal
+            && can_grant
+            && self.locations_loaded
+            && self.poll_counter.is_multiple_of(15)
+        {
+            let met = match (self.goal.as_ref(), self.client()) {
+                (Some(cfg), Some(client)) => crate::goal::is_met(
+                    cfg,
+                    crate::flags::get_event_flag,
+                    // Pre-filter against valid_locations: is_local_location_checked PANICS on
+                    // ids the datapackage doesn't know (archipelago_rs client.rs).
+                    |l| self.valid_locations.contains(&l) && client.is_local_location_checked(l),
+                ),
+                _ => false,
+            };
+            if met {
+                let sent = match self.client_mut() {
+                    Some(client) => match client.set_status(ap::ClientStatus::Goal) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            log::warn!("goal: set_status(Goal) failed (will retry next poll): {e}");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if sent {
+                    self.sent_goal = true;
+                    log::info!("goal: all goal locations complete -> ClientStatus::Goal sent");
+                    self.log(ap::Print::message(
+                        "GOAL COMPLETE! Victory sent to Archipelago.".to_string(),
+                    ));
                 }
             }
         }
 
         // 6. Region-lock KICK + random-start warp trigger (order matters: the warp sets the
         //    done-flag that KICK's start-window guard waits on, so fire it before the kick check).
+        let mut graces_lit: Vec<String> = Vec::new();
+        // Player-facing overlay messages from the region ticks (warp requested / arrival /
+        // kick) -- collected here because cfg borrows self, logged after the borrow ends.
+        let mut region_msgs: Vec<String> = Vec::new();
         if let Some(cfg) = self.region.as_ref() {
-            crate::region::tick_random_start_warp(cfg);
+            if let Some(m) = crate::region::tick_random_start_warp(cfg) {
+                region_msgs.push(m);
+            }
             // Natural-key regions (Raya/Mountaintops/Snowfield/...) bloom when their vanilla-key
             // disjunction is satisfied. Gated on a loaded world (can_grant) so the flags it sets
             // aren't clobbered by the save load — same reason the start graces are gated.
             if can_grant {
                 crate::region::tick_natural_key_triggers(cfg, &received_all);
+                // Re-apply lock unlocks whose one-shot receive was discarded at menu/load
+                // (lost graces/open flags -- 2026-07-01 playtest). Latched on the open flag.
+                crate::region::tick_reconcile_received_locks(cfg, &received_all);
+                // R3 (SWEEP): key-item obtained flags, same reconcile family -- the one-shot
+                // write in 4a is lost at menu/load; this re-applies with the flag as the latch.
+                crate::keyitems::tick_keyitem_flags(&received_all);
+                // grace_rando: light received "Grace: ..." items (graceItems port-gap, 2026-07-01).
+                graces_lit = crate::region::tick_grace_items(cfg, &received_all);
             }
-            crate::region::tick_kick(cfg);
+            if let Some(m) = crate::region::tick_kick(cfg) {
+                region_msgs.push(m);
+            }
+        }
+        for g in graces_lit {
+            self.log(ap::Print::message(format!("{g} unlocked")));
+        }
+        for m in region_msgs {
+            self.log(ap::Print::message(m));
         }
 
         // 7. DeathLink.
@@ -466,8 +778,16 @@ impl shared::Core for Core {
             if let ap::Event::DeathLink { source, .. } = ev {
                 let foreign = my_name.as_deref().map(|n| n != source).unwrap_or(true);
                 if foreign {
-                    log::info!("DeathLink received from '{source}'");
-                    crate::deathlink::latch_incoming_kill();
+                    // R2 (SWEEP H2): honor the slot's death_link option on the INCOMING side too
+                    // (the tag is advertised unconditionally; only the outgoing send was gated).
+                    if crate::deathlink::is_enabled() {
+                        log::info!("DeathLink received from '{source}'");
+                        crate::deathlink::latch_incoming_kill();
+                    } else {
+                        log::info!(
+                            "DeathLink received from '{source}' but disabled for this slot -- ignored"
+                        );
+                    }
                 }
             }
         }
@@ -476,11 +796,22 @@ impl shared::Core for Core {
             && crate::deathlink::poll_local_death()
             && let Some(client) = self.client_mut()
         {
-            let _ = client.death_link(ap::DeathLinkOptions::default());
+            log::info!("DeathLink: local death detected -> broadcasting");
+            if let Err(e) = client.death_link(ap::DeathLinkOptions::default()) {
+                log::warn!("DeathLink: broadcast failed: {e}");
+            }
         }
 
         // 8. Scadutree blessing writer.
         crate::upgrades::tick_global_scadu();
+
+        // 8b. no_weapon_requirements runtime param zeroing (latched once applied).
+        crate::no_weapon_reqs::tick();
+
+        // 8c. Ticker-only pickup notifs: set showDialogCondType=0 game-wide so AP grants show the
+        //     native right-side ticker, not the blocking "NEW Y:OK" modal (was a retired-baker
+        //     regulation edit; ported to runtime, latched once applied).
+        crate::notif_ticker::tick();
 
         // 9. Shop system (SHOP-SYSTEM-HANDOFF.md tick order). Pump the scout first (needs client_mut;
         //    take() to dodge the self double-borrow), then run each shop edit in order. Each self-gates
@@ -525,14 +856,47 @@ impl Core {
             progressive_high_index: high,
         };
         let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, st.to_json()).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+        // R7 (SWEEP): surface write/rename failures -- a silently-lost save resets the
+        // watermarks next session (duplicate start items + regrant burst).
+        match std::fs::write(&tmp, st.to_json()) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    log::error!(
+                        "save persistence: rename {} -> {} FAILED: {e}",
+                        tmp.display(),
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => log::error!("save persistence: write {} FAILED: {e}", tmp.display()),
         }
     }
 }
 
+/// R5 (SWEEP): one warning per unmapped AP item id -- the grant loop would otherwise drop the
+/// item with no trace, every session, on every replay.
+static UNMAPPED_LOGGED: std::sync::Mutex<Option<HashSet<i64>>> = std::sync::Mutex::new(None);
+
+fn warn_unmapped_once(name: &str, ap_id: i64) {
+    let mut guard = UNMAPPED_LOGGED.lock().unwrap();
+    if guard.get_or_insert_with(HashSet::new).insert(ap_id) {
+        log::warn!(
+            "item '{name}' (ap id {ap_id}) has no ER mapping -- NOT granted (contract drift?)"
+        );
+    }
+}
+
 fn save_file_path(seed: &str, name: &str) -> Option<PathBuf> {
-    let dir = shared::utils::mod_directory().ok()?;
+    let dir = match shared::utils::mod_directory() {
+        Ok(d) => d,
+        Err(e) => {
+            // R7 (SWEEP): was `.ok()?` -- save persistence silently never armed.
+            log::error!(
+                "save persistence UNAVAILABLE ({e}) -- watermarks will reset every session"
+            );
+            return None;
+        }
+    };
     let safe = |s: &str| -> String {
         s.chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -565,4 +929,27 @@ fn i64_to_u32_map(v: Option<&Value>) -> HashMap<i64, u32> {
         }
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    /// The slot_data "versions" contract band the apworld emits. MUST stay in lockstep with
+    /// Archipelago/worlds/eldenring/__init__.py fill_slot_data "versions" — when the apworld
+    /// bumps its band, bump this const AND `[package] version` in this crate's Cargo.toml together.
+    const EXPECTED_SLOT_DATA_VERSIONS: &str = ">=0.1.0-beta.4 <0.1.0-beta.5";
+
+    /// Connect-gate lockstep guard: the crate's own version must sit INSIDE the apworld band.
+    /// (er-semver orders a bare release 0.1.0 ABOVE every 0.1.0-beta.*, so a plain "0.1.0"
+    /// package version made version_gate return Some(false) on every connect — the exact
+    /// bug this test pins down.)
+    #[test]
+    fn client_version_is_inside_apworld_contract_band() {
+        let sd = serde_json::json!({ "versions": EXPECTED_SLOT_DATA_VERSIONS });
+        assert_eq!(
+            er_logic::version::version_gate(&sd, env!("CARGO_PKG_VERSION")),
+            Some(true),
+            "CARGO_PKG_VERSION {} is outside the apworld slot_data band {EXPECTED_SLOT_DATA_VERSIONS}",
+            env!("CARGO_PKG_VERSION"),
+        );
+    }
 }

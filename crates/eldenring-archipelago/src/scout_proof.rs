@@ -119,15 +119,22 @@ fn store(items: &[ap::LocatedItem]) {
     *CACHE.lock().unwrap() = Some(map);
 }
 
+/// R8 (SWEEP): how many times a failed scout re-arms before giving up with an EMPTY cache.
+const MAX_SCOUT_RETRIES: u32 = 3;
+
 /// State for the in-flight scout. Lives across serve-loop iterations because the result arrives on a
 /// later poll, not inline. Construct after slot_data is parsed; drive `pump()` every loop tick.
 pub struct ScoutProof {
     /// `Some` until the scout has been issued (we only scout once for the proof).
     pending_request: Option<Vec<i64>>,
+    /// The full location set, kept so a FAILED scout can re-arm `pending_request` (R8, SWEEP).
+    locations: Vec<i64>,
     /// The receiver for the scout result; `None` before issue and after the result is logged.
     rx: Option<oneshot::Receiver<Result<Vec<ap::LocatedItem>, ap::Error>>>,
     /// Latches true once we've logged (success or failure) so we don't re-scout on reconnect-replay.
     done: bool,
+    /// R8 (SWEEP): failed attempts so far; bounded by `MAX_SCOUT_RETRIES`.
+    retries: u32,
 }
 
 impl ScoutProof {
@@ -136,7 +143,13 @@ impl ScoutProof {
     /// .collect()`). The REAL feature scouts only the shop-slot locations once the apworld emits a
     /// shop-slot -> location map; the proof just needs a known-good set.
     pub fn new(locations: Vec<i64>) -> Self {
-        Self { pending_request: Some(locations), rx: None, done: false }
+        Self {
+            locations: locations.clone(),
+            pending_request: Some(locations),
+            rx: None,
+            done: false,
+            retries: 0,
+        }
     }
 
     /// Already finished (logged once)? Lets the caller skip on reconnect.
@@ -171,38 +184,59 @@ impl ScoutProof {
             return;
         };
         match rx.try_recv() {
-            Ok(result) => {
+            Ok(Ok(items)) => {
                 self.rx = None;
                 self.done = true;
-                match result {
-                    Ok(items) => {
-                        store(&items); // populate the cache fmg_inject reads (names + captions)
-                        log::info!("AP scout-proof: received info for {} location(s) ===", items.len());
-                        for li in &items {
-                            let loc_id = li.location().id();
-                            let item_name = li.item().name(); // ustr::Ustr (Display / AsRef<str>)
-                            let owner = li.receiver().alias(); // owning player's alias
-                            let line = er_logic::name_override::display_name(
-                                item_name.as_str(),
-                                Some(owner),
-                            );
-                            log::info!("AP scout-proof: location {loc_id} -> {line}");
-                        }
-                        log::info!("AP scout-proof: === data path PROVEN (names above) ===");
-                    }
-                    Err(e) => {
-                        log::warn!("AP scout-proof: server returned an error for the scout: {e}");
-                    }
+                store(&items); // populate the cache fmg_inject reads (names + captions)
+                log::info!("AP scout-proof: received info for {} location(s) ===", items.len());
+                for li in &items {
+                    let loc_id = li.location().id();
+                    let item_name = li.item().name(); // ustr::Ustr (Display / AsRef<str>)
+                    let owner = li.receiver().alias(); // owning player's alias
+                    let line = er_logic::name_override::display_name(
+                        item_name.as_str(),
+                        Some(owner),
+                    );
+                    log::info!("AP scout-proof: location {loc_id} -> {line}");
                 }
+                log::info!("AP scout-proof: === data path PROVEN (names above) ===");
+            }
+            Ok(Err(e)) => {
+                self.rx = None;
+                log::warn!("AP scout-proof: server returned an error for the scout: {e}");
+                self.fail_or_retry();
             }
             Err(TryRecvError::Empty) => { /* still pending; try again next tick */ }
             Err(TryRecvError::Disconnected) => {
-                // Sender dropped: the connection went away before the reply arrived. Latch done so we
-                // don't spin; the reconnect path constructs a fresh ScoutProof.
+                // Sender dropped: the connection went away before the reply arrived. NOTHING
+                // rebuilds this on reconnect (R8, SWEEP), so re-arm instead of latching done.
                 self.rx = None;
-                self.done = true;
                 log::warn!("AP scout-proof: scout receiver dropped before a reply (connection lost?)");
+                self.fail_or_retry();
             }
+        }
+    }
+
+    /// R8 (SWEEP): a failed scout used to latch `done` with CACHE=None, permanently stalling the
+    /// fmg/shop pipelines (they wait on `cache_ready`) for the whole session. Re-arm the request
+    /// a bounded number of times; after the last retry, publish an EMPTY cache (the pipelines
+    /// proceed with their AP#<id> fallbacks) and say so loudly.
+    fn fail_or_retry(&mut self) {
+        if self.retries < MAX_SCOUT_RETRIES {
+            self.retries += 1;
+            self.pending_request = Some(self.locations.clone());
+            log::warn!(
+                "AP scout-proof: re-arming scout, retry {}/{}",
+                self.retries,
+                MAX_SCOUT_RETRIES
+            );
+        } else {
+            self.done = true;
+            store(&[]);
+            log::error!(
+                "AP scout-proof: scout failed after {} retries -- shop naming/preview DEGRADED this session (AP#<id> fallbacks)",
+                MAX_SCOUT_RETRIES
+            );
         }
     }
 }

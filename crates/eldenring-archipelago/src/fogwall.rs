@@ -37,7 +37,7 @@ const DEFAULT_ASSET: &str = "AEG099_052";
 /// Flip to `true` for a capture ride when you have no way to set `fogWallDebug` in slot_data. Logs the
 /// player's current block id + local position every time the block changes, so you can read off the
 /// transform to place a wall. Leave `false` for shipped builds (it's chatty).
-const FORCE_DEBUG_CAPTURE: bool = true;
+const FORCE_DEBUG_CAPTURE: bool = false;
 
 /// Compile-time walls, merged ahead of slot_data `fogWalls`. Empty by default: fill an entry AFTER you
 /// capture a real transform (debug capture prints it). Template for the MVP Limgrave↔Caelid seam —

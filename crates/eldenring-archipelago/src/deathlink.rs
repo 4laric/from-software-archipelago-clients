@@ -40,15 +40,19 @@ pub fn latch_incoming_kill() {
 /// Per-tick: if a kill is pending and we're in-world, set the reactor flag (event 6996 -> keep-runes
 /// death). Latch clears only on a successful set, so a kill latched on a menu/load screen retries.
 pub fn drive_kill() {
-    if KILL_PENDING.load(Ordering::Relaxed)
-        && crate::flags::in_world()
-        && crate::flags::try_set_event_flag(DEATHLINK_KILL_FLAG, true)
-    {
+    // R2 (SWEEP H2): belt-and-braces -- a stale latched kill must never fire once death_link is
+    // known-disabled for this slot (the event handler gates too, but the latch can outlive it).
+    if !is_enabled() {
+        return;
+    }
+    // PURE-RUNTIME (2026-07-01): no baked common.emevd reactor exists on a vanilla game, so the
+    // kill is a direct HP write (kill_local_player pre-arms WAS_DEAD, suppressing the echo).
+    // The flag is still set best-effort for bake-compat setups. Retries until in-world & alive.
+    // NOTE: direct kill has no keep-runes (the reactor's ForceCharacterDeath(10000, true) did).
+    if KILL_PENDING.load(Ordering::Relaxed) && crate::flags::in_world() && kill_local_player() {
+        let _ = crate::flags::try_set_event_flag(DEATHLINK_KILL_FLAG, true);
         KILL_PENDING.store(false, Ordering::Relaxed);
-        // Pre-arm the outgoing edge so the reactor's HP->0 isn't re-read as a fresh local death and
-        // echoed back to teammates. Cleared again when we revive (HP>0).
-        WAS_DEAD.store(true, Ordering::Relaxed);
-        log::info!("DeathLink: incoming kill applied (flag {DEATHLINK_KILL_FLAG} -> reactor)");
+        log::info!("DeathLink: incoming kill applied (direct HP write; flag {DEATHLINK_KILL_FLAG} best-effort)");
     }
 }
 
@@ -60,68 +64,47 @@ pub fn poll_local_death() -> bool {
     dead && !was
 }
 
-/// True when local player current HP <= 0. Reads HP via the Hexinton all-in-one v6.0 CE table chain
-/// (`elden_ring_artifacts`), anchored on the crate's typed `WorldChrMan.main_player` (so we avoid a
-/// CE session). The trailing offsets are pinned to `eldenring.exe` 2.6.2.0, like the AddItemFunc RVA:
-///   main_player +0x10 -> [+0x190] -> [+0x0] -> +0x138 (current HP, i32).
-/// Each hop is range-guarded so a stale offset returns "not dead" rather than dereferencing garbage.
-/// (If the typed `ChrIns`→`CSChrDataModule.hp` field is exposed on `main`, prefer that — version-robust.)
-/// Resolve the address of the local player's current-HP cell via the pinned chain — shared by the
-/// death READ and the kill WRITE. None if not in-world or any hop is implausible.
-///   main_player +0x10 -> [+0x190] -> [+0x0] -> +0x138 (current HP, i32).
-fn hp_addr() -> Option<usize> {
+/// Typed access to the local player's current HP (fromsoftware-rs `eldenring` crate):
+/// `WorldChrMan.main_player -> PlayerIns.chr_ins.modules.data.hp` -- all public fields, same shape
+/// DS3 uses (`super_chr_ins.modules.data.hp`). REPLACES the pinned raw-offset chain
+/// (main_player +0x10 -> [+0x190] -> [0] -> +0x138), which never resolved live: the 2026-07-01
+/// playtest log shows ARMED absent across every session on the exact pinned exe version, which
+/// silently disabled outgoing deathlink, incoming kills, AND the region kick (all three shared it).
+pub(crate) fn read_local_hp() -> Option<i32> {
     let wcm = unsafe { WorldChrMan::instance() }.ok()?;
     let player = wcm.main_player.as_ref()?;
-    let base = player as *const _ as usize;
-    let p1 = read_ptr(base, 0x10)?;
-    let p2 = read_ptr(p1, 0x190)?;
-    let p3 = read_ptr(p2, 0x0)?;
-    plausible(p3.wrapping_add(0x138))
+    Some(player.chr_ins.modules.data.hp)
 }
+
+static HP_ARMED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn read_local_death() -> bool {
-    let Some(addr) = hp_addr() else {
-        return false;
+    let Some(hp) = read_local_hp() else {
+        return false; // not in-world (no main player)
     };
-    let hp = unsafe { *(addr as *const i32) };
-    // Guard against a wild value from a wrong offset (treat absurd HP as "not dead").
-    (0..=0x000F_FFFF).contains(&hp) && hp <= 0
+    if !HP_ARMED_LOGGED.swap(true, Ordering::Relaxed) {
+        log::info!("DeathLink: HP read via typed CSChrDataModule -- outgoing death detection ARMED");
+    }
+    hp <= 0
 }
 
-/// PRESERVED FALLBACK — currently unused (region-lock + DeathLink now go through the baked
-/// `common.emevd` reactors on flags 76970/76996). Client-side kill: write current HP -> 0 via the same
-/// cell `read_local_death` reads. Kept for the enemy-randomizer compatibility work: if we can't ship
-/// our own `common.emevd` (two me3 packages can't both override it), re-enable this by calling it from
-/// `region::tick_kick` / `drive_kill` instead of setting the flags. NOTE: no keep-runes here (the
-/// reactor's `ForceCharacterDeath(10000, true)` provides that) — pair it with a "Should Receive Runes"
-/// write or a souls snapshot/restore before shipping this path live.
-#[allow(dead_code)]
+/// LIVE since 2026-07-01 (pure-runtime): drive_kill + region::tick_kick call this directly (the
+/// baked `common.emevd` reactors on flags 76970/76996 are gone on a vanilla game). Writes current
+/// HP -> 0 through the typed module. NOTE: no keep-runes here (the reactor's
+/// `ForceCharacterDeath(10000, true)` provided that) -- pair with a "Should Receive Runes" write or
+/// a souls snapshot/restore when that lands.
 pub fn kill_local_player() -> bool {
-    let Some(addr) = hp_addr() else {
+    let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
         return false;
     };
-    let hp = unsafe { *(addr as *const i32) };
-    if !(0..=0x000F_FFFF).contains(&hp) || hp <= 0 {
-        return false; // implausible cell, or already dead/dying -> don't re-kill
+    let Some(player) = wcm.main_player.as_mut() else {
+        return false;
+    };
+    let data = &mut player.chr_ins.modules.data;
+    if data.hp <= 0 {
+        return false; // already dead/dying -> don't re-kill
     }
-    // SAFETY: `addr` is the validated HP cell resolved through the range-guarded hops in hp_addr().
-    unsafe { *(addr as *mut i32) = 0 };
+    data.hp = 0;
     WAS_DEAD.store(true, Ordering::Relaxed); // suppress our own kill echoing out as a local death
     true
-}
-
-/// Plausible user-space pointer range (x64). Cheap guard so a wrong CE offset can't deref garbage.
-fn plausible(addr: usize) -> Option<usize> {
-    if (0x1_0000..0x7FFF_FFFF_FFFF).contains(&addr) {
-        Some(addr)
-    } else {
-        None
-    }
-}
-
-/// Read a pointer at `base + off`, returning it only if both the source and the value are plausible.
-fn read_ptr(base: usize, off: usize) -> Option<usize> {
-    let src = plausible(base.checked_add(off)?)?;
-    let val = unsafe { *(src as *const usize) };
-    plausible(val)
 }

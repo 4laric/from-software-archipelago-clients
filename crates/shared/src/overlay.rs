@@ -288,6 +288,12 @@ impl<G: Game> Overlay<G> {
                     && core.base().is_disconnected()
                     && !core.base().is_configured()
                 {
+                    // Seed the form from whatever the config already has (e.g. a slot from a
+                    // partial apconfig.json) so the player only fills in what's missing.
+                    let config = core.base().config();
+                    config.url().clone_into(&mut self.popup_url);
+                    config.slot().clone_into(&mut self.popup_slot);
+                    self.popup_password = config.password().unwrap_or("").to_string();
                     ui.open_popup("#connect-modal");
                     self.auto_prompted = true;
                 }

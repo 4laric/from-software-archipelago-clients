@@ -29,15 +29,23 @@ const THROTTLE: u32 = 30;
 
 /// Parse slot_data at connect. No-op (and disables) unless `options.completion_scaling` is on.
 pub fn configure(sd: &Value) {
-    let enabled = sd
-        .pointer("/options/completion_scaling")
-        .map(|v| v.as_bool().unwrap_or_else(|| v.as_i64().unwrap_or(0) != 0))
-        .unwrap_or(false);
+    // int-or-bool tolerant, unified onto er_logic::options (apworld ships options as ints).
+    let enabled = er_logic::options::parse_bool_option(sd, "completion_scaling");
     if !enabled {
         *CONFIG.lock().unwrap() = None;
         return;
     }
     let region_targets = i32_i32_map(sd.get("regionSphereTargets"));
+    if region_targets.is_empty() {
+        // R6 (SWEEP H4): with an empty/missing map, every region resolves to floor_tier and the
+        // sweep strips baked vanilla scaling from EVERY loaded enemy (the whole game flattens).
+        // Refuse to arm instead: the feature goes INERT and enemies keep their baked scaling.
+        log::error!(
+            "completion_scaling requested but regionSphereTargets is empty -- enemy scaling left VANILLA"
+        );
+        *CONFIG.lock().unwrap() = None;
+        return;
+    }
     let max_target = region_targets.values().copied().max().unwrap_or(0);
     let basis = match sd.get("completionScalingBasis").and_then(|v| v.as_str()) {
         Some("sphere") => ScalingBasis::Sphere,

@@ -1,6 +1,10 @@
 [package]
 name = "eldenring-archipelago"
-version = "0.1.0"
+# LOCKSTEP with Archipelago/worlds/eldenring/__init__.py fill_slot_data "versions"
+# (">=0.1.0-beta.4 <0.1.0-beta.5"): er-semver orders a bare release 0.1.0 ABOVE every
+# 0.1.0-beta.*, so "0.1.0" fails the connect gate on every seed. Guarded by the core.rs
+# test client_version_is_inside_apworld_contract_band.
+version = "0.1.0-beta.4"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true

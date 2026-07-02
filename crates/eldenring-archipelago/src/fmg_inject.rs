@@ -597,7 +597,12 @@ pub fn run() -> bool {
     };
     let search_addr = base + SEARCH_RVA;
     if !sig_ok(search_addr) {
-        log::warn!("FMG-inject: SearchStringTable sig mismatch; abort");
+        // R10 (SWEEP): latch DONE -- without it this warned EVERY tick for the whole session
+        // (a game patch shifts the RVA; one warn then a permanent no-op is the right degrade).
+        log::warn!(
+            "FMG-inject: SearchStringTable sig mismatch; abort (latched -- synthetic naming OFF this session)"
+        );
+        DONE.store(true, Ordering::Relaxed);
         return true;
     }
     let search: SearchFn = unsafe { std::mem::transmute::<usize, SearchFn>(search_addr) };

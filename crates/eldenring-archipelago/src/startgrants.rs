@@ -55,11 +55,11 @@ pub fn parse(sd: &Value) -> StartConfig {
             .get("reveal_all_maps")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        enable_dlc: sd
-            .pointer("/options/enable_dlc")
-            .and_then(|v| v.as_bool())
-            .or_else(|| sd.get("enable_dlc").and_then(|v| v.as_bool()))
-            .unwrap_or(false),
+        // int-or-bool tolerant: the apworld ships options.enable_dlc as an int (1/0), which
+        // .as_bool() read as absent — silently skipping the DLC map-reveal flags. The
+        // top-level key stays as a bool fallback for older seeds.
+        enable_dlc: er_logic::options::parse_dlc(sd)
+            || sd.get("enable_dlc").and_then(|v| v.as_bool()).unwrap_or(false),
     }
 }
 

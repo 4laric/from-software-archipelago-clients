@@ -14,8 +14,12 @@ mod flags;
 mod fmg_inject;
 mod fogwall;
 mod game;
+mod goal;
+mod hook_impl;
 mod inventory;
 mod keyitems;
+mod no_weapon_reqs;
+mod notif_ticker;
 mod params;
 mod region;
 mod scaling;
@@ -26,6 +30,7 @@ mod shop_preview;
 mod shop_sell;
 mod startgrants;
 mod upgrades;
+mod warp;
 // progressive logic lives in er_logic::progressive (pure, host-tested); no local module needed.
 
 /// DLL entry point — standard 3-arg Win32 `DllMain`. ModEngine2 loads externals via `LoadLibrary`,

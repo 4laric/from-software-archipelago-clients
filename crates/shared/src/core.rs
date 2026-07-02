@@ -28,8 +28,9 @@ pub struct CoreBase<G: Game, S: DeserializeOwned + Send + 'static> {
     /// game.
     config: Config<G>,
 
-    /// The Archipelago client connection.
-    connection: ap::Connection<S>,
+    /// The Archipelago client connection. `None` when there's no connection info yet (empty URL or
+    /// slot), which keeps us from attempting a doomed connection to an empty URL.
+    connection: Option<ap::Connection<S>>,
 
     /// The log of prints that can be displayed in the overlay, along with the
     /// times they were received.
@@ -53,6 +54,13 @@ pub struct CoreBase<G: Game, S: DeserializeOwned + Send + 'static> {
     /// A profiler that can be used to track how long various sections of the
     /// mod take to run.
     profiler: SectionProfiler,
+
+    /// CHAT-RELAY (2026-07-02): commands queued from server chat ("@<slot> <cmd> [args]"),
+    /// dispatched through the game core's `handle_command` by [Core::update]. Exists because a
+    /// game whose InputBlocker hasn't been RE'd (ER) can't take keyboard focus in the overlay
+    /// in-world, so the say-console commands are otherwise unreachable -- any text client on
+    /// the session (or the server console) becomes the keyboard instead.
+    pending_chat_commands: Vec<(String, Option<String>)>,
 }
 
 impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
@@ -71,11 +79,21 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
             load_time: None,
             error: None,
             profiler: Default::default(),
+            pending_chat_commands: vec![],
         })
     }
 
-    /// Creates a new [ClientConnection] based on the connection information in [config].
-    fn new_connection(game: Ustr, config: &Config<G>) -> ap::Connection<S> {
+    /// Creates a new [ClientConnection] based on the connection information in [config], or `None` if
+    /// there isn't enough info to connect yet.
+    fn new_connection(game: Ustr, config: &Config<G>) -> Option<ap::Connection<S>> {
+        // Don't attempt to connect until we have both a server URL and a slot. Otherwise
+        // archipelago_rs tries to open an empty/incomplete URL and surfaces a confusing
+        // "HTTP format error: empty string". `None` lets the overlay prompt for the details and
+        // connect cleanly once they're entered.
+        if config.url().is_empty() || config.slot().is_empty() {
+            return None;
+        }
+
         let mut options = ap::ConnectionOptions::new()
             .receive_items(ap::ItemHandling::OtherWorlds {
                 own_world: G::OWN_WORLD,
@@ -86,7 +104,12 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
             options = options.password(password);
         }
 
-        ap::Connection::new(config.url(), config.slot(), Some(game), options)
+        Some(ap::Connection::new(
+            config.url(),
+            config.slot(),
+            Some(game),
+            options,
+        ))
     }
 
     /// The section profiler.
@@ -96,12 +119,14 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
 
     /// Returns the current connection type.
     pub(crate) fn connection_state_type(&self) -> ap::ConnectionStateType {
-        self.connection.state_type()
+        self.connection
+            .as_ref()
+            .map_or(ap::ConnectionStateType::Disconnected, |c| c.state_type())
     }
 
     /// Returns whether the current connection is disconnected.
     pub(crate) fn is_disconnected(&self) -> bool {
-        self.connection.is_disconnected()
+        self.connection.as_ref().is_none_or(|c| c.is_disconnected())
     }
 
     /// Retries the Archipelago connection with the same information.
@@ -170,8 +195,10 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
     /// mod has experienced a fatal error.
     fn update_always(&mut self) {
         use ap::Event::*;
-        let mut state = self.connection.state_type();
-        let mut events = self.connection.update();
+        let (mut state, mut events) = match self.connection.as_mut() {
+            Some(conn) => (conn.state_type(), conn.update()),
+            None => return,
+        };
 
         // Process events that should happen even when the player isn't in an
         // active save.
@@ -181,9 +208,9 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
                     state = ap::ConnectionStateType::Connected;
                 }
                 Error(err) if err.is_fatal() => {
-                    let err = self.connection.err();
+                    let err = self.connection.as_ref().map(|c| c.err());
                     self.log(
-                        if let ap::Error::WebSocket(tungstenite::Error::Io(io)) = err
+                        if let Some(ap::Error::WebSocket(tungstenite::Error::Io(io))) = err
                             && matches!(
                                 io.kind(),
                                 io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
@@ -204,7 +231,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
                                     text: "Connection failed: ".into(),
                                     color: ap::TextColor::Red,
                                 },
-                                err.to_string().into(),
+                                err.map(|e| e.to_string()).unwrap_or_default().into(),
                             ]
                         } else {
                             vec![
@@ -212,7 +239,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
                                     text: "Disconnected: ".into(),
                                     color: ap::TextColor::Red,
                                 },
-                                err.to_string().into(),
+                                err.map(|e| e.to_string()).unwrap_or_default().into(),
                             ]
                         },
                     );
@@ -220,6 +247,29 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
                 }
                 Error(err) => self.log(err.to_string()),
                 Print(print) => {
+                    // CHAT-RELAY: "@<slot> <cmd> [args]" in plain chat (NOT "!"/"/" -- the
+                    // server doesn't relay "!" commands and "/" is client-local) queues <cmd>
+                    // for the game core's say-console handle_command. Slot-addressed so one
+                    // client in a multi-FromSoft session executes it, self included (our own
+                    // say is echoed back by the server, so the overlay say box also works).
+                    if let ap::Print::Chat { message, .. } | ap::Print::ServerChat { message, .. } =
+                        &print
+                    {
+                        let slot = self.config.slot();
+                        if !slot.is_empty()
+                            && let Some(rest) = message
+                                .strip_prefix('@')
+                                .and_then(|m| m.strip_prefix(slot))
+                                .and_then(|m| m.strip_prefix(' '))
+                        {
+                            let mut parts = rest.trim().splitn(2, ' ');
+                            if let Some(cmd) = parts.next().filter(|c| !c.is_empty()) {
+                                let arg = parts.next().map(|s| s.trim().to_string());
+                                info!("chat-relay: queued command !{cmd} (arg {arg:?})");
+                                self.pending_chat_commands.push((format!("!{cmd}"), arg));
+                            }
+                        }
+                    }
                     info!("[APS] {print}");
                     if self.log_buffer.len() >= LOG_BUFFER_LIMIT {
                         self.log_buffer.pop_front();
@@ -302,12 +352,15 @@ pub trait Core: Send + Sized {
 
     /// Returns a reference to the Archipelago client, if it's connected.
     fn client(&self) -> Option<&ap::Client<Self::SlotData>> {
-        self.base().connection.client()
+        self.base().connection.as_ref().and_then(|c| c.client())
     }
 
     /// Returns a mutable reference to the Archipelago client, if it's connected.
     fn client_mut(&mut self) -> Option<&mut ap::Client<Self::SlotData>> {
-        self.base_mut().connection.client_mut()
+        self.base_mut()
+            .connection
+            .as_mut()
+            .and_then(|c| c.client_mut())
     }
 
     /// Returns the seed the game expects to connect to.
@@ -333,8 +386,22 @@ pub trait Core: Send + Sized {
     fn update(&mut self, is_main_menu: bool) {
         self.base_mut().update_always();
 
-        if self.base().connection.client().is_none() || self.base().error.is_some() {
+        if self.client().is_none() || self.base().error.is_some() {
             return;
+        }
+
+        // CHAT-RELAY dispatch: run commands queued from server chat through the same
+        // handle_command path as overlay say input. Before the load/grace gating so
+        // diagnostics work from the main menu too (flag writers degrade gracefully there).
+        // Unknown commands log locally only -- never echoed back to chat (no relay loops).
+        let pending: Vec<(String, Option<String>)> =
+            self.base_mut().pending_chat_commands.drain(..).collect();
+        for (cmd, arg) in pending {
+            if !self.handle_command(&cmd, arg.as_deref()) {
+                self.base_mut().log(ap::Print::message(format!(
+                    "chat-relay: unknown command {cmd}"
+                )));
+            }
         }
 
         if is_main_menu {

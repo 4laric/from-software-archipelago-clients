@@ -61,15 +61,34 @@ fn message_box<G: Game>(message: impl Into<String>) {
 /// Starts the logger which logs to both stdout and a file which users can send
 /// to the devs for debugging.
 pub fn start_logger() {
-    // If there's an error locating the mod directory, try to log to the current
-    // dir instead. Otherwise, ignore the error so we can surface it better
-    // through the UI.
-    if let Ok(dir) = utils::mod_directory() {
-        let _ = start_logger_for_dir(dir);
-        info!("Logger initialized.");
-    } else {
-        let _ = start_logger_for_dir(".");
-        info!("Failed to determine mod directory, logging to current directory instead.");
+    // R14 (SWEEP): a swallowed init error here meant file logging was silently absent for the
+    // whole session -- making every OTHER runtime problem undetectable. No logger exists yet at
+    // this point, so eprintln! is the only available channel; on failure, also try the current
+    // directory as a fallback before giving up.
+    match utils::mod_directory() {
+        Ok(dir) => {
+            if let Err(err) = start_logger_for_dir(dir) {
+                eprintln!(
+                    "AP client: logger init FAILED for mod directory ({err}); trying current directory"
+                );
+                if let Err(err2) = start_logger_for_dir(".") {
+                    eprintln!(
+                        "AP client: fallback logger init FAILED too ({err2}); file logging is OFF this session"
+                    );
+                    return;
+                }
+            }
+            info!("Logger initialized.");
+        }
+        Err(dir_err) => {
+            if let Err(err) = start_logger_for_dir(".") {
+                eprintln!(
+                    "AP client: no mod directory ({dir_err}) and logger init FAILED for current directory ({err}); file logging is OFF this session"
+                );
+                return;
+            }
+            info!("Failed to determine mod directory, logging to current directory instead.");
+        }
     }
 }
 

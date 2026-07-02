@@ -38,14 +38,37 @@ const GREAT_RUNE_RESTORE_GOODS: &[(&str, u32)] = &[
     ("Malenia's Great Rune", 196),
 ];
 
-/// Set the vanilla obtained flag(s) for a received item name, if it has any. Idempotent.
+/// Fast-path one-shot: set the vanilla obtained flag(s) for a received item name, if it has any.
+/// Idempotent, but BEST-EFFORT -- writes at menu/load are silently discarded (R3, SWEEP), so this
+/// no longer logs success; `tick_keyitem_flags` (the reconcile tick) re-applies and owns the log.
 pub fn set_acquire_flags(name: &str) {
     for (n, fs) in COMPANION_ACQUIRE_FLAGS.iter().chain(KEY_ITEM_ACQUIRE_FLAGS) {
         if *n == name {
             for &f in *fs {
                 flags::set_event_flag(f, true);
             }
-            log::info!("key item '{name}': set obtained flag(s) {fs:?}");
+        }
+    }
+}
+
+/// Per-tick reconciler (R3, SWEEP; house pattern: `region::tick_reconcile_received_locks`): for
+/// every RECEIVED key-item name with mapped obtained flags, try_set any flag that hasn't stuck.
+/// The flag itself is the latch (unset -> attempt, set -> skip), so a one-shot write lost at
+/// menu/load self-heals on the next settled tick, and once all flags read back set this is a
+/// cheap no-op. Logs on the tick a flag actually lands (once per name in the normal case).
+pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
+    for (n, fs) in COMPANION_ACQUIRE_FLAGS.iter().chain(KEY_ITEM_ACQUIRE_FLAGS) {
+        if !received.contains(*n) {
+            continue;
+        }
+        let mut applied = 0u32;
+        for &f in *fs {
+            if !flags::get_event_flag(f) && flags::try_set_event_flag(f, true) {
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            log::info!("key item '{n}': obtained flag(s) {fs:?} applied ({applied} newly set)");
         }
     }
 }

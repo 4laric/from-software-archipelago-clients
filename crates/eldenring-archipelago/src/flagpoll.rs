@@ -27,11 +27,42 @@ pub fn load() -> FlagPollConfig {
     let Ok(dir) = shared::utils::mod_directory() else {
         return cfg;
     };
-    let Ok(text) = std::fs::read_to_string(dir.join("apconfig.json")) else {
-        return cfg;
+    // Legacy baker-written apconfig.json (location_flags/sweep_flags) -- usually absent now.
+    merge_table_file(&mut cfg, &dir.join("apconfig.json"));
+    // PURE-RUNTIME BRIDGE (2026-07-01): the SEED-INDEPENDENT static detection table, if the user
+    // drops it next to the DLL, supplies the sweep groups the retired baker used to write into
+    // apconfig (overworld/castle tiers -- e.g. Castle Morne, flag 1044320800). slot_data
+    // locationFlags still wins for per-location flags (merged over this in core.rs); members not
+    // in this seed are filtered by valid_locations at poll time. Durable fix = emit sweepFlags
+    // in slot_data (contract work).
+    let static_path = dir.join("er_static_detection_table.json");
+    if static_path.exists() {
+        merge_table_file(&mut cfg, &static_path);
+    } else {
+        // R9 (SWEEP): this table is env-dependent -- say so once instead of only hinting via
+        // the count line below. (apconfig.json absence above stays silent: absent by design.)
+        log::info!(
+            "flag-poll: static detection table absent at {} -- sweep groups limited to slot_data",
+            static_path.display()
+        );
+    }
+    log::info!(
+        "flag-poll config: {} location flags, {} sweep flags",
+        cfg.location_flags.len(),
+        cfg.sweep_flags.len()
+    );
+    cfg
+}
+
+/// Merge `location_flags` + `sweep_flags` from a JSON file into [cfg]. Tolerant: missing
+/// file/keys -> no-op. Later files win per key.
+fn merge_table_file(cfg: &mut FlagPollConfig, path: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return cfg;
+        log::warn!("flag-poll: {} exists but is not valid JSON -- ignored", path.display());
+        return;
     };
     if let Some(obj) = v.get("location_flags").and_then(|x| x.as_object()) {
         for (k, val) in obj {
@@ -48,12 +79,7 @@ pub fn load() -> FlagPollConfig {
             }
         }
     }
-    log::info!(
-        "flag-poll config: {} location flags, {} sweep flags",
-        cfg.location_flags.len(),
-        cfg.sweep_flags.len()
-    );
-    cfg
+    log::info!("flag-poll: merged table {}", path.display());
 }
 
 /// Parse `dungeonSweeps` out of slot_data: trigger AP location -> member AP location ids. When the
