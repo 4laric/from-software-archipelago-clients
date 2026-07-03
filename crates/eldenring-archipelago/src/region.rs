@@ -85,6 +85,12 @@ pub struct RegionConfig {
     /// apparatus blooms WITHOUT an AP lock item being received (vanilla keys / world flags). The
     /// region's open flag doubles as the once-latch. (Ported from the standalone naturalKeyTriggers.)
     pub natural_key_triggers: HashMap<String, Vec<NkClause>>,
+    /// lock item name -> packed FullIDs to physically grant in-game on that lock's FIRST open
+    /// (slot_data `lockGrantItems`). Currently the unpooled medallions riding their locks
+    /// (Rold -> Mountaintops Lock; both Secret Medallion halves -> Snowfield Lock), so the Grand
+    /// Lift stays usable and medallion-triggered quest content (Ensha, Latenna) fires naturally.
+    /// SPEC-region-spine-surgery.md SS3.5 (grant-on-receipt rider).
+    pub lock_grant_items: HashMap<String, Vec<i32>>,
 }
 
 pub fn parse(sd: &Value) -> RegionConfig {
@@ -116,6 +122,7 @@ pub fn parse(sd: &Value) -> RegionConfig {
         region_graces: str_to_u32vec(sd.get("regionGraces")),
         grace_items: str_to_u32(sd.get("graceItems")),
         natural_key_triggers: parse_natural_keys(sd.get("naturalKeyTriggers")),
+        lock_grant_items: str_to_i32vec(sd.get("lockGrantItems")),
     }
 }
 
@@ -414,6 +421,17 @@ pub fn tick_grace_items(cfg: &RegionConfig, received: &HashSet<String>) -> Vec<S
     lit
 }
 
+/// lockGrantItems rider check: the packed FullIDs to grant for `name`, but ONLY when this is the
+/// lock's FIRST open (its open flag is still OFF -- the same once-latch the natural-key bloom
+/// uses). Call BEFORE `open_on_received_name` (which sets the flag). Reconnect replays re-run
+/// `on_item_received` for every item; the latch keeps the physical grant once-per-save.
+pub fn first_open_grants(cfg: &RegionConfig, name: &str) -> Vec<i32> {
+    match (cfg.lock_grant_items.get(name), cfg.region_open_flags.get(name)) {
+        (Some(ids), Some(&f)) if !flags::get_event_flag(f) => ids.clone(),
+        _ => Vec::new(),
+    }
+}
+
 /// On receiving an unlock item (by name): open its region + reveal/grace flags. Idempotent. Returns
 /// true if `name` is a region-lock item (so the caller can surface a console notification).
 pub fn open_on_received_name(cfg: &RegionConfig, name: &str) -> bool {
@@ -463,6 +481,24 @@ fn str_to_u32(v: Option<&Value>) -> HashMap<String, u32> {
         for (k, val) in o {
             if let Some(n) = val.as_u64() {
                 m.insert(k.clone(), n as u32);
+            }
+        }
+    }
+    m
+}
+
+fn str_to_i32vec(v: Option<&Value>) -> HashMap<String, Vec<i32>> {
+    // lockGrantItems values are GOODS-packed FullIDs (er_code | 0x40000000), all < i32::MAX.
+    let mut m = HashMap::new();
+    if let Some(Value::Object(o)) = v {
+        for (k, val) in o {
+            if let Some(arr) = val.as_array() {
+                m.insert(
+                    k.clone(),
+                    arr.iter()
+                        .filter_map(|x| x.as_i64().map(|n| n as i32))
+                        .collect(),
+                );
             }
         }
     }

@@ -76,10 +76,26 @@ impl NetHook for ReceiveDispatch<'_> {
     /// self-heal a write lost to a not-ready flag holder.
     fn on_item_received(&mut self, name: &str) {
         crate::keyitems::set_acquire_flags(name);
-        if let Some(cfg) = self.region
-            && crate::region::open_on_received_name(cfg, name)
-        {
-            self.unlocked.push(name.trim_end_matches(" Lock").to_string());
+        if let Some(cfg) = self.region {
+            // lockGrantItems rider (SPEC-region-spine-surgery.md SS3.5): physically grant this
+            // lock's rider items (unpooled medallions) on its FIRST open. Checked BEFORE
+            // open_on_received_name flips the open flag (the flag is the once-latch). Safe to
+            // grant here: ReceiveDispatch is only constructed under can_grant (in-world + live
+            // inventory pointer), the same guarantee the main item grant path relies on.
+            for full_id in crate::region::first_open_grants(cfg, name) {
+                if self.hook.grant_full_id(full_id, 1) {
+                    log::info!("lockGrantItems: '{name}' rider {full_id:#x} granted");
+                } else {
+                    log::warn!(
+                        "lockGrantItems: '{name}' rider {full_id:#x} failed to place \
+                         (in-world grant path) -- no retry; re-grantable by reloading the save \
+                         before re-receiving the lock"
+                    );
+                }
+            }
+            if crate::region::open_on_received_name(cfg, name) {
+                self.unlocked.push(name.trim_end_matches(" Lock").to_string());
+            }
         }
     }
 
