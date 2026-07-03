@@ -15,6 +15,10 @@ pub struct RecvItem {
     pub index: i64,
     pub ap_item_id: i64,
     pub name: String,
+    /// ECHO-DEDUP (shop_sell): true when this is the echo of our own check whose rewritten
+    /// shop row already sold the reward natively -- the grant is skipped (watermark still
+    /// advances). Computed by the net loop: `sender == self && shop_sell::echo_skip(location)`.
+    pub echo_skip: bool,
 }
 
 /// What the loop should do with one received item after the watermark split.
@@ -32,6 +36,9 @@ pub enum GrantAction {
     SkipProgressive,
     /// AP item id not in `apIdsToItemIds` — `net.rs` warns and skips.
     SkipUnmapped { ap_item_id: i64 },
+    /// ECHO-DEDUP: the rewritten shop row already delivered this item at purchase time; the
+    /// echo grant is skipped so the buy doesn't double. Watermark advances (it IS delivered).
+    SkipNativelySold { name: String },
     /// Below the `pushed_through` watermark — already granted on a previous connect; do nothing.
     AlreadyPushed,
 }
@@ -75,7 +82,12 @@ pub fn process_received_item(
 
     // GRANT-enqueue: resumes at the persisted index (pushed_through) — no re-grant on reconnect.
     if idx >= *pushed_through {
-        let action = if is_progressive {
+        let action = if ri.echo_skip {
+            // ECHO-DEDUP: the native shop sale already delivered this exact item at purchase.
+            GrantAction::SkipNativelySold {
+                name: ri.name.clone(),
+            }
+        } else if is_progressive {
             GrantAction::SkipProgressive
         } else {
             match item_map.get(&ri.ap_item_id) {
@@ -126,6 +138,7 @@ mod tests {
             index,
             ap_item_id,
             name: name.to_string(),
+            echo_skip: false,
         }
     }
 
@@ -361,5 +374,30 @@ mod tests {
         assert_eq!(a, GrantAction::SkipUnmapped { ap_item_id: 9999 });
         assert_eq!(pushed, 1);
         assert_eq!(hook.dispatched, vec!["Mystery"]);
+    }
+
+    #[test]
+    fn natively_sold_echo_skips_grant_but_advances_watermark() {
+        // ECHO-DEDUP contract: the buy already delivered the item via the rewritten shop row,
+        // so the echo must NOT grant -- but the watermark advances (it IS delivered) and the
+        // name dispatch still fires (region/progressive side effects stay correct).
+        let (im, ic) = maps();
+        let mut hook = MockHook::default();
+        let mut dispatched = 0i64;
+        let mut pushed = 0i64;
+
+        let mut ri = item(0, 7777, "Cerulean Crystal Tear");
+        ri.echo_skip = true;
+        let a = process_received_item(&ri, &mut dispatched, &mut pushed, &im, &ic, &mut hook);
+
+        assert_eq!(
+            a,
+            GrantAction::SkipNativelySold {
+                name: "Cerulean Crystal Tear".into()
+            }
+        );
+        assert_eq!(pushed, 1);
+        assert_eq!(dispatched, 1);
+        assert_eq!(hook.dispatched, vec!["Cerulean Crystal Tear"]);
     }
 }

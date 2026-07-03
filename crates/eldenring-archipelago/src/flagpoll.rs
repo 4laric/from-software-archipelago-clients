@@ -95,3 +95,18 @@ pub fn parse_dungeon_sweeps(sd: &Value) -> HashMap<i64, Vec<i64>> {
     }
     m
 }
+
+/// Parse `sweepLockGates` out of slot_data: sweep trigger AP location -> boss-lock item NAME
+/// that must be in the cumulative received set before that trigger's dungeon sweep fires
+/// (BOSS_LOCKS_PATCH, SPEC-boss-locks.md v0.1). Absent key / empty map = every sweep ungated.
+pub fn parse_sweep_lock_gates(sd: &Value) -> HashMap<i64, String> {
+    let mut m = HashMap::new();
+    if let Some(obj) = sd.get("sweepLockGates").and_then(|x| x.as_object()) {
+        for (k, val) in obj {
+            if let (Ok(trigger), Some(name)) = (k.parse::<i64>(), val.as_str()) {
+                m.insert(trigger, name.to_string());
+            }
+        }
+    }
+    m
+}

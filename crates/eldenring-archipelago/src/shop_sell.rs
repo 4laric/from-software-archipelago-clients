@@ -10,17 +10,20 @@
 //! 3 Goods (4 Gem, 5 CustomWeapon, not handled here). So equipId = `row_id_of(FullID)`, equipType =
 //! FullID category.
 //!
-//! Because the slot now hands the player the real reward R on purchase, R is registered for suppression
-//! gated on the slot's stock flag (`should_suppress_sold`, consulted by detour.rs): the bag-add at buy
-//! is nulled exactly like the vanilla ware was, so the AP grant delivers the single copy. Same flag +
-//! timing the vanilla suppressor already uses for the original ware. Runs once in-world after
-//! shop_flags (stock flags final) + scout-ready.
+//! Because the slot now hands the player the real reward R on purchase, the redundant AP ECHO
+//! grant for that check is skipped instead (`echo_skip`, consulted by the core receive loop) --
+//! ECHO-DEDUP, 2026-07-03. Bag-add suppression (`should_suppress_sold`) is RETIRED: weapon-slot
+//! purchases bypass the AddItemFunc detour entirely (CTD repro logs), so it could never dedup
+//! them, and nulling a shop bag-add is the crash-adjacent path. WEAPON-category slots are not
+//! rewritten cross-category at all (SHOP_CTD_GUARD in run()); they stay on the preview/foreign
+//! path (vanilla ware sold, echo delivers the reward). Runs once in-world after shop_flags
+//! (stock flags final) + scout-ready.
 
 #![allow(dead_code)]
 
 use eldenring::cs::{ShopLineupParam, SoloParamRepository};
 use fromsoftware_shared::FromStatic;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -33,6 +36,18 @@ static DONE: AtomicBool = AtomicBool::new(false);
 /// bag-add of these while the flag is unset, so the buy doesn't double with the AP grant.
 static SOLD_SUPPRESS: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
 
+/// Stock flags of rewritten own-world slots whose check was still OPEN at run() time. One-shot:
+/// should_suppress_sold consumes a flag on the reward's first native bag-add (the check
+/// purchase), so suppression does NOT depend on when eventFlag_forStock sets. Re-armed only by
+/// a fresh run().
+static ARMED_SUPPRESS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
+/// ECHO-DEDUP (2026-07-03): {AP location -> stock flag} for every rewritten row whose check
+/// was still OPEN at run() time. The receive loop skips the echo grant for these iff the stock
+/// flag is NOW SET (the native sale really happened) -- so !collect / server-sent items for
+/// un-bought checks still grant. Replaces bag-add suppression (statics above stay unpopulated).
+static ECHO_SKIP: Mutex<Option<HashMap<i64, u32>>> = Mutex::new(None);
+
 pub fn configure(location_flags: HashMap<i64, u32>) {
     log::info!("shop-sell: configured {} location flag(s)", location_flags.len());
     *CONFIGURED.lock().unwrap() = Some(location_flags);
@@ -40,12 +55,44 @@ pub fn configure(location_flags: HashMap<i64, u32>) {
 
 /// Detour hook: suppress the bag-add of `full_id` if it's a reward a rewritten slot now sells AND the
 /// slot's stock flag is still unset (check not yet completed). False until `run` populates the map.
-pub fn should_suppress_sold(full_id: i32, get_flag: &dyn Fn(u32) -> bool) -> bool {
-    let g = SOLD_SUPPRESS.lock().unwrap();
-    match g.as_ref().and_then(|m| m.get(&full_id)) {
-        Some(&flag) => !get_flag(flag),
+pub fn should_suppress_sold(full_id: i32, _get_flag: &dyn Fn(u32) -> bool) -> bool {
+    // Robust, timing-independent: suppress the FIRST native bag-add of a registered reward
+    // whose slot-check was still OPEN when run() armed it (one-shot). That first add is the
+    // check-completing purchase; the AP echo delivers the real copy (AP grants bypass this
+    // detour via the original AddItem, so they never consume the arm). NOT gated on the live
+    // stock flag -- eventFlag_forStock can already be set at buy time, which let the native
+    // sale double with the AP grant.
+    let flag = {
+        let g = SOLD_SUPPRESS.lock().unwrap();
+        match g.as_ref().and_then(|m| m.get(&full_id)) {
+            Some(&f) => f,
+            None => return false,
+        }
+    };
+    match ARMED_SUPPRESS.lock().unwrap().as_mut() {
+        Some(set) => {
+            // SHOP_FIXES_PATCH: attribute every registered bag-add so a residual double-grant
+            // is diagnosable from one session log (grep "shop-sell:").
+            let hit = set.remove(&flag); // one-shot: consume the arm; true iff it was armed
+            log::info!(
+                "shop-sell: bag-add of registered ware {full_id:#x} (stock flag {flag}) -> {}",
+                if hit { "SUPPRESSED (arm consumed)" } else { "PASSED (arm already consumed / never armed)" }
+            );
+            hit
+        }
         None => false,
     }
+}
+
+/// ECHO-DEDUP: should the echo grant for `loc` be skipped? True iff a rewritten row sells this
+/// check's reward natively AND its stock flag is now set (the purchase actually happened).
+/// The flag check keeps !collect / server-sent items for un-bought checks grantable.
+pub fn echo_skip(loc: i64) -> bool {
+    let flag = match ECHO_SKIP.lock().unwrap().as_ref().and_then(|m| m.get(&loc)) {
+        Some(&f) => f,
+        None => return false,
+    };
+    crate::flags::get_event_flag(flag)
 }
 
 /// FullID category -> ShopLineupParam `equipType`. `None` for gem/custom (not natively sellable here).
@@ -90,7 +137,8 @@ pub fn run() -> bool {
 
     // Scan immutably -> plan the rewrites, then apply (avoids holding a row borrow across get_mut).
     let mut plan: Vec<(u32, i32, u8)> = Vec::new(); // (row id, new equipId, equipType)
-    let mut sold: HashMap<i32, u32> = HashMap::new(); // reward FullID -> stock flag
+    let mut echo_skip: HashMap<i64, u32> = HashMap::new(); // AP location -> stock flag (ECHO-DEDUP)
+    let mut weapon_guarded = 0usize;
     for (id, row) in repo.rows::<ShopLineupParam>() {
         let f = row.event_flag_for_stock();
         if f == 0 {
@@ -100,11 +148,25 @@ pub fn run() -> bool {
         let Some(s) = crate::scout_proof::lookup(loc) else { continue };
         let Some(fid) = s.er_sell_id else { continue }; // own-world sellable category only
         let Some(etype) = equip_type_for(fid) else { continue };
+        // SHOP_CTD_GUARD (3x repro 2026-07-03): WEAPON-category slots rewritten to a NON-WEAPON
+        // reward crash the purchase path (Longbow->Tear, Great Arrow->Smithing Stone, Gostoc
+        // arrows->Talisman Pouch); weapon->weapon and armor->goods are fine. Keep those on the
+        // preview/foreign path -- vanilla ware sold, the echo grant delivers the reward.
+        if row.equip_type() == 0 && etype != 0 {
+            weapon_guarded += 1;
+            continue;
+        }
         let new_eid = er_codec::row_id_of(fid as u32) as i32;
         if row.equip_id() != new_eid {
             plan.push((id, new_eid, etype));
         }
-        sold.insert(fid as i32, f); // suppress the sold ware whether or not we had to rewrite
+        // ECHO-DEDUP: this row sells the exact reward natively from here on, so a FUTURE
+        // purchase must skip its echo grant. Checks already completed (flag set) are NOT
+        // recorded -- e.g. a pre-rewrite-window buy sold the VANILLA ware and still needs
+        // its echo to deliver the reward.
+        if !crate::flags::get_event_flag(f) {
+            echo_skip.insert(loc, f);
+        }
     }
     let n = plan.len();
     for (id, eid, etype) in &plan {
@@ -113,10 +175,13 @@ pub fn run() -> bool {
             row.set_equip_type(*etype);
         }
     }
-    let sold_count = sold.len();
-    *SOLD_SUPPRESS.lock().unwrap() = Some(sold);
+    let skip_count = echo_skip.len();
+    *ECHO_SKIP.lock().unwrap() = Some(echo_skip);
+    // Bag-add suppression RETIRED (ECHO-DEDUP): SOLD_SUPPRESS / ARMED_SUPPRESS stay
+    // unpopulated, so should_suppress_sold() short-circuits false and the detour never nulls
+    // a shop bag-add again. Native sale + echo-skip is the whole dedup now.
     log::info!(
-        "shop-sell: rewrote {n} own-world slot(s) to natively sell their reward ({sold_count} suppress-registered)"
+        "shop-sell: rewrote {n} own-world slot(s) to natively sell their reward ({skip_count} echo-skip, {weapon_guarded} weapon-guarded)"
     );
     DONE.store(true, Ordering::Relaxed);
     true

@@ -70,7 +70,9 @@ pub fn tick() {
     let Some(player) = wcm.main_player.as_ref() else {
         return;
     };
-    let region = player.play_region_id as i32;
+    // SCALING_WIRE: resolve in play_region/100 sub-id space -- the same bucket the
+    // region-lock kick uses and the space regionSphereTargetRanges is emitted in.
+    let region = (player.play_region_id / 100) as i32;
     let player_handle = player.field_ins_handle; // skip the player itself in the sweep
 
     let target = {

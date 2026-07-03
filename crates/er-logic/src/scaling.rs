@@ -66,6 +66,10 @@ pub struct ScalingConfig {
     pub floor_tier: usize,
     /// `regionSphereTargets`: region id → raw target (sphere depth / power).
     pub region_targets: HashMap<i32, i32>,
+    /// `regionSphereTargetRanges` (SCALING_WIRE): `(lo, hi, target)` in play_region/100 sub-id
+    /// space -- the apworld's client-parseable form (the flat map only ever carried region
+    /// NAMES). Consulted when the exact map misses.
+    pub region_ranges: Vec<(i32, i32, i32)>,
     /// Deepest target present (normalization denominator). `0` disables scaling (→ floor everywhere).
     pub max_target: i32,
 }
@@ -85,10 +89,17 @@ pub fn tier_for_target(target: i32, max_target: i32, floor_tier: usize) -> usize
 /// Region → tier. A region absent from `region_targets` falls back to the floor tier (unknown = don't
 /// scale up).
 pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> usize {
-    match cfg.region_targets.get(&region) {
-        Some(&target) => tier_for_target(target, cfg.max_target, cfg.floor_tier),
-        None => cfg.floor_tier.min(NUM_TIERS - 1),
+    if let Some(&target) = cfg.region_targets.get(&region) {
+        return tier_for_target(target, cfg.max_target, cfg.floor_tier);
     }
+    // SCALING_WIRE: range fallback -- `region` is the play_region/100 sub id; the apworld
+    // emits [lo, hi, target] buckets in the same space (a few dozen; linear scan is fine).
+    for &(lo, hi, target) in &cfg.region_ranges {
+        if (lo..=hi).contains(&region) {
+            return tier_for_target(target, cfg.max_target, cfg.floor_tier);
+        }
+    }
+    cfg.floor_tier.min(NUM_TIERS - 1)
 }
 
 /// The `SpEffectParam` id to apply for a tier (clamped to the ladder).
@@ -135,10 +146,30 @@ pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
         return None;
     }
     let region_targets = i32_i32_map(sd.get("regionSphereTargets"));
-    if region_targets.is_empty() {
+    // SCALING_WIRE (er-completion-scaling P1 wire fix): the apworld's client-parseable form is
+    // range-keyed [[lo, hi, target], ...] in play_region/100 sub-id space; the flat map only
+    // ever carried region NAMES (unparseable -> empty), so ranges are the live path now.
+    let mut region_ranges: Vec<(i32, i32, i32)> = Vec::new();
+    if let Some(arr) = sd.get("regionSphereTargetRanges").and_then(|v| v.as_array()) {
+        for row in arr {
+            let Some(r) = row.as_array() else { continue };
+            if r.len() != 3 {
+                continue;
+            }
+            if let (Some(lo), Some(hi), Some(t)) = (r[0].as_i64(), r[1].as_i64(), r[2].as_i64()) {
+                region_ranges.push((lo as i32, hi as i32, t as i32));
+            }
+        }
+    }
+    if region_targets.is_empty() && region_ranges.is_empty() {
         return None; // H4: refuse to arm — see doc above.
     }
-    let max_target = region_targets.values().copied().max().unwrap_or(0);
+    let max_target = region_targets
+        .values()
+        .copied()
+        .chain(region_ranges.iter().map(|&(_, _, t)| t))
+        .max()
+        .unwrap_or(0);
     // Tolerant like the rest of the options parses: the apworld ships the Choice VALUE (int 1 =
     // sphere, fill_slot_data "completionScalingBasis": ...basis.value); older/hand-rolled slot_data
     // may ship the string. The old string-only match silently read int 1 as Geographic (drift
@@ -152,7 +183,7 @@ pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0) as f32;
     let floor_tier = floor_tier_from_multiplier(floor_mult);
-    Some(ScalingConfig { basis, floor_tier, region_targets, max_target })
+    Some(ScalingConfig { basis, floor_tier, region_targets, region_ranges, max_target })
 }
 
 #[cfg(test)]
@@ -162,7 +193,13 @@ mod tests {
     fn cfg(pairs: &[(i32, i32)], floor: usize) -> ScalingConfig {
         let region_targets: HashMap<i32, i32> = pairs.iter().copied().collect();
         let max_target = region_targets.values().copied().max().unwrap_or(0);
-        ScalingConfig { basis: ScalingBasis::Sphere, floor_tier: floor, region_targets, max_target }
+        ScalingConfig {
+            basis: ScalingBasis::Sphere,
+            floor_tier: floor,
+            region_targets,
+            region_ranges: vec![],
+            max_target,
+        }
     }
 
     // --- ladder integrity (the vanilla 7010..7100 rows) ---
@@ -181,6 +218,33 @@ mod tests {
     fn ids_are_the_vanilla_ladder() {
         assert_eq!(SCALING_TIERS[0].speffect_id, 7010);
         assert_eq!(SCALING_TIERS[NUM_TIERS - 1].speffect_id, 7100);
+    }
+
+    // --- SCALING_WIRE: range-keyed targets (play_region/100 buckets) ---
+
+    #[test]
+    fn range_fallback_resolves_sub_id_buckets() {
+        let mut c = cfg(&[], 0);
+        c.region_ranges = vec![(10000, 10000, 2000), (62000, 62999, 10000)];
+        c.max_target = 10000;
+        // Stormveil sub 10000 -> low tier; Liurnia sub 62400 -> top tier; unmapped -> floor.
+        assert!(tier_for_region(&c, 10000) < tier_for_region(&c, 62400));
+        assert_eq!(tier_for_region(&c, 99999), 0);
+        assert_eq!(tier_for_region(&c, 62400), NUM_TIERS - 1);
+    }
+
+    #[test]
+    fn parse_arms_from_ranges_alone() {
+        // The name-keyed flat map is unparseable by design (yields empty); ranges alone arm.
+        let sd = serde_json::json!({
+            "options": { "completion_scaling": 1, "completion_scaling_floor": 0.0 },
+            "completionScalingBasis": 1,
+            "regionSphereTargets": { "Limgrave": 0.1 },
+            "regionSphereTargetRanges": [[61000, 61001, 100], [62000, 62999, 10000]],
+        });
+        let c = parse_scaling_config(&sd).expect("ranges must arm the feature");
+        assert_eq!(c.region_ranges.len(), 2);
+        assert_eq!(c.max_target, 10000);
     }
 
     #[test]

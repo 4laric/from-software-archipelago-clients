@@ -42,6 +42,9 @@ pub struct Core {
     flag_poll: Option<crate::flagpoll::FlagPollConfig>,
     /// slot_data dungeonSweeps: trigger location -> member locations.
     dungeon_sweeps: HashMap<i64, Vec<i64>>,
+    /// slot_data sweepLockGates (BOSS_LOCKS_PATCH): sweep trigger -> boss-lock item name that
+    /// must be in the received set before that group's sweep fires.
+    sweep_lock_gates: HashMap<i64, String>,
     /// Throttle the (potentially large) flag poll to a few times a second.
     poll_counter: u32,
     /// Start-of-run grants (items / graces / map reveal).
@@ -180,6 +183,7 @@ impl shared::Core for Core {
             locations_loaded: false,
             flag_poll: None,
             dungeon_sweeps: HashMap::new(),
+            sweep_lock_gates: HashMap::new(),
             poll_counter: 0,
             start: None,
             start_flags_done: false,
@@ -237,7 +241,12 @@ impl shared::Core for Core {
                 let fogwall = crate::fogwall::parse(sd);
                 let prog_cfg = er_logic::progressive::parse(sd);
                 let name = client.this_player().alias().to_string();
-                let sweeps = crate::flagpoll::parse_dungeon_sweeps(sd);
+                // BOSS_LOCKS_PATCH: sweeps + their lock gates travel together (tuple keeps
+                // the parsed-slot_data tuple arity unchanged).
+                let sweeps = (
+                    crate::flagpoll::parse_dungeon_sweeps(sd),
+                    crate::flagpoll::parse_sweep_lock_gates(sd),
+                );
                 let start = crate::startgrants::parse(sd);
 
                 // Shop system (SHOP-SYSTEM-HANDOFF.md §3): configure from slot_data, build the scout.
@@ -332,7 +341,8 @@ impl shared::Core for Core {
                 self.fogwall = Some(fogwall);
                 self.progressive = ProgressiveState::new(prog_cfg);
                 self.my_name = Some(name);
-                self.dungeon_sweeps = sweeps;
+                self.dungeon_sweeps = sweeps.0;
+                self.sweep_lock_gates = sweeps.1;
                 // F2 fix (2026-07-01): the flag-poll table travels in slot_data ("locationFlags")
                 // now; baker-era apconfig.json no longer carries location_flags, so fresh installs
                 // polled an EMPTY map (world pickups never sent checks -- seed looked vanilla).
@@ -472,6 +482,7 @@ impl shared::Core for Core {
                             self.start_items_ok.insert(i);
                         } else {
                             all_ok = false;
+                            warn_start_item_fail_once(i, id);
                         }
                     }
                     if all_ok {
@@ -520,13 +531,19 @@ impl shared::Core for Core {
             }
             // Items below BOTH watermarks are AlreadyPushed no-ops; skip snapshotting them.
             let floor = disp.min(self.received_through);
+            let my_slot = client.this_player().slot();
             for (idx, ri) in items.iter().enumerate() {
                 let name = ri.item().name().to_string();
                 if can_grant && idx >= floor {
+                    // ECHO-DEDUP: an echo of our own check whose rewritten shop row already
+                    // sold the reward natively must not grant again (shop_sell::echo_skip).
+                    let echo_skip = ri.sender().slot() == my_slot
+                        && crate::shop_sell::echo_skip(ri.location().id());
                     snapshot.push(RecvItem {
                         index: idx as i64,
                         ap_item_id: ri.item().id(),
                         name: name.clone(),
+                        echo_skip,
                     });
                 }
                 received_all.insert(name);
@@ -540,6 +557,7 @@ impl shared::Core for Core {
         //    it is rolled back to the failed item and the tail retries in order next tick.
         //    dispatched_through keeps its advance regardless — name effects are idempotent and
         //    the section-6 reconcile ticks self-heal any lost flag write.
+        let newly_dispatched_from = disp as i64; // BOSS_LOCKS_PATCH: notification window
         let mut dispatched = disp as i64;
         let mut pushed = self.received_through as i64;
         let mut unlocked: Vec<String> = Vec::new();
@@ -601,6 +619,11 @@ impl shared::Core for Core {
                             let _ = dispatch.hook.grant_full_id(restored, 1);
                         }
                     }
+                    GrantAction::SkipNativelySold { name } => {
+                        log::info!(
+                            "shop-sell: echo grant skipped -- {name} was sold natively at purchase (ECHO-DEDUP)"
+                        );
+                    }
                     GrantAction::AlreadyPushed => {}
                 }
             }
@@ -610,6 +633,27 @@ impl shared::Core for Core {
         self.received_through = pushed.max(0) as usize;
         for region in unlocked {
             self.log(ap::Print::message(format!("Region unlocked: {region}")));
+        }
+        // BOSS_LOCKS_PATCH: overlay line on boss-lock receipt -- the lock item is otherwise
+        // invisible in the console (no region apparatus, so "Region unlocked" never fires for
+        // it). Mirrors that line's semantics, including the reconnect replay (name-dispatch
+        // replays the stream). The gate itself is poll-driven, so a lock arriving after the
+        // boss kill fires the held sweep within a few seconds of this line.
+        if !self.sweep_lock_gates.is_empty() {
+            let mut announced: Vec<String> = Vec::new();
+            for ri in &snapshot {
+                if ri.index >= newly_dispatched_from
+                    && self.sweep_lock_gates.values().any(|g| g == &ri.name)
+                    && !announced.contains(&ri.name)
+                {
+                    announced.push(ri.name.clone());
+                }
+            }
+            for name in announced {
+                self.log(ap::Print::message(format!(
+                    "Boss lock received: {name} -- its dungeon sweep is armed"
+                )));
+            }
         }
 
         // 4c. Persist on watermark advance.
@@ -660,6 +704,15 @@ impl shared::Core for Core {
                     }
                 }
                 for (trigger, members) in &self.dungeon_sweeps {
+                    // BOSS_LOCKS_PATCH: hold a gated group's sweep until its boss lock is in
+                    // the received set; poll-driven, so a lock received AFTER the boss kill
+                    // fires the held sweep retroactively on a later tick.
+                    if !er_logic::sweep_gate::gate_open(
+                        self.sweep_lock_gates.get(trigger).map(String::as_str),
+                        |n| received_all.contains(n),
+                    ) {
+                        continue;
+                    }
                     if let Some(&flag) = fp.location_flags.get(trigger)
                         && crate::flags::get_event_flag(flag)
                     {
@@ -875,6 +928,21 @@ impl Core {
 
 /// R5 (SWEEP): one warning per unmapped AP item id -- the grant loop would otherwise drop the
 /// item with no trace, every session, on every replay.
+static START_ITEM_FAIL_LOGGED: std::sync::Mutex<Option<HashSet<usize>>> = std::sync::Mutex::new(None);
+
+/// Fail-loud (once per start-item index) when a start grant does not land despite a captured
+/// inventory pointer. The start-items loop retries every tick, so without this a stuck grant
+/// (Torrent / dlc_only flasks) is silent. Mirrors `warn_unmapped_once`.
+fn warn_start_item_fail_once(idx: usize, full_id: i32) {
+    let mut guard = START_ITEM_FAIL_LOGGED.lock().unwrap();
+    if guard.get_or_insert_with(HashSet::new).insert(idx) {
+        log::warn!(
+            "start item #{idx} ({full_id:#x}) failed to grant (inventory captured but AddItem \
+             rejected) -- retrying each tick; if this persists the start grant is stuck"
+        );
+    }
+}
+
 static UNMAPPED_LOGGED: std::sync::Mutex<Option<HashSet<i64>>> = std::sync::Mutex::new(None);
 
 fn warn_unmapped_once(name: &str, ap_id: i64) {
