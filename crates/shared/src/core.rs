@@ -184,7 +184,12 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
 
     /// Returns the list of all logs that have been emitted in the current
     /// session.
-    pub(crate) fn logs(&self) -> impl ExactSizeIterator<Item = &(ap::Print, Instant)> {
+    ///
+    /// Public so game crates can scan the print stream (e.g. the ER item
+    /// tracker accumulates `Print::Hint`s from it). NOTE for such scanners:
+    /// this is a bounded ring ([LOG_BUFFER_LIMIT]) — once full, old entries
+    /// pop off the front and indices shift.
+    pub fn logs(&self) -> impl ExactSizeIterator<Item = &(ap::Print, Instant)> {
         self.log_buffer.iter()
     }
 
@@ -349,6 +354,13 @@ pub trait Core: Send + Sized {
     fn handle_command(&mut self, _command: &str, _arg: Option<&str>) -> bool {
         false
     }
+
+    /// Lets a game add its own items to the overlay menu bar. Default: nothing.
+    fn render_overlay_menu_items(&mut self, _ui: &imgui::Ui) {}
+
+    /// Lets a game render its own overlay windows each frame (called at frame scope,
+    /// not nested inside another window). Default: nothing.
+    fn render_overlay_windows(&mut self, _ui: &imgui::Ui) {}
 
     /// Returns a reference to the Archipelago client, if it's connected.
     fn client(&self) -> Option<&ap::Client<Self::SlotData>> {

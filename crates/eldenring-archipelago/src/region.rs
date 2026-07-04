@@ -400,6 +400,22 @@ pub fn tick_reconcile_received_locks(cfg: &RegionConfig, received: &HashSet<Stri
         log::info!("RegionLock '{name}': received but never applied -- reconciling");
         open_on_received_name(cfg, name);
     }
+    // BUNDLE_LOCK_GRACE_RECONCILE: grace-only bundle locks (Spelunker torches) have NO region_open_flags
+    // entry, so the loop above never reconciles them -- a grant lost to a not-ready receive
+    // stays lost (2026-07-04 softlock: Ghostflame Torch was the sole sphere-0 key). Re-apply
+    // each received lock's graces directly, using every grace flag as its own try_set latch
+    // (idempotent; only the unset flags re-try). Also heals the PARTIAL-application edge for
+    // open-flag locks (open flag landed, some graces lost mid-batch) that the loop above skips.
+    for (name, fs) in &cfg.region_graces {
+        if !received.contains(name) {
+            continue;
+        }
+        for &f in fs {
+            if !flags::get_event_flag(f) {
+                let _ = flags::try_set_event_flag(f, true);
+            }
+        }
+    }
 }
 
 /// Per-tick (settled / in-world): light received grace_rando "Grace: ..." items. PORT-GAP wired

@@ -15,10 +15,21 @@ use er_logic::hook::GameHook;
 use er_logic::progressive::ProgressiveState;
 use er_logic::receive::{GrantAction, RecvItem};
 use er_logic::save_state::SaveState;
+use er_logic::tracker::{HintEntry, HintSet};
 use serde_json::Value;
 use shared::CoreBase;
+use shared::Core as _;
 
 use crate::hook_impl::{EldenRingHook, ReceiveDispatch};
+
+/// Tint for hinted lines in the tracker window (matches the overlay's YELLOW, 0xFCE94F).
+const HINT_YELLOW: [f32; 4] = [0.9882, 0.9137, 0.3098, 1.0];
+
+/// Tint for big-ticket (prominent) check lines in the tracker window (soft orange).
+const BIG_TICKET_ORANGE: [f32; 4] = [0.9882, 0.6863, 0.2431, 1.0];
+
+/// Dim gray for locked-region headers in the tracker window (mirrors imgui's TextDisabled).
+const LOCKED_GRAY: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
 
 pub struct Core {
     base: CoreBase<crate::game::EldenRing, Value>,
@@ -61,6 +72,28 @@ pub struct Core {
     goal: Option<crate::goal::GoalConfig>,
     /// Session latch: Goal sent once per connect (NOT persisted -- re-send is idempotent).
     sent_goal: bool,
+    /// Item-tracker window visibility (overlay menu "Tracker" + F6 toggle).
+    tracker_visible: bool,
+    /// Standing hint set (SPEC-item-tracker.md option (a)): fed from streamed `Print::Hint`
+    /// entries in the overlay log; dedups by location id (connect-replay re-inserts are no-ops).
+    hints: HintSet,
+    /// How many overlay-log entries have already been scanned for hints. v0.1 LIMITATION: the
+    /// log is a bounded ring (1000 entries) -- once it fills and rotates, indices shift under
+    /// this watermark and hints in the popped span are missed. DataStorage `_read_hints` is the
+    /// robust follow-up (spec option (b)).
+    hint_log_watermark: usize,
+    /// Static AP location id -> region display name (generated er_logic::tracker_regions).
+    region_table: HashMap<u64, String>,
+    /// Static AP location id -> COARSE region name (in-logic key; "" = always open).
+    coarse_table: HashMap<u64, String>,
+    /// Static big-ticket (prominent) location ids -- boss drops, progression, churches, maps.
+    big_ticket: HashSet<u64>,
+    /// Static coarse region name -> its lock item name (absent = never locked).
+    coarse_lock_items: HashMap<String, String>,
+    /// Tracker filter: show only checks whose coarse region is currently accessible.
+    tracker_in_logic_only: bool,
+    /// Tracker filter: show only big-ticket (prominent) checks.
+    tracker_big_ticket_only: bool,
 }
 
 impl shared::Core for Core {
@@ -192,6 +225,15 @@ impl shared::Core for Core {
             scout: None,
             goal: None,
             sent_goal: false,
+            tracker_visible: false,
+            hints: HintSet::new(),
+            hint_log_watermark: 0,
+            region_table: er_logic::tracker_regions::location_region_table(),
+            coarse_table: er_logic::tracker_regions::location_coarse_table(),
+            big_ticket: er_logic::tracker_regions::big_ticket_set(),
+            coarse_lock_items: er_logic::tracker_regions::coarse_lock_item_table(),
+            tracker_in_logic_only: false,
+            tracker_big_ticket_only: false,
         })
     }
     fn base(&self) -> &CoreBase<Self::Game, Self::SlotData> {
@@ -199,6 +241,28 @@ impl shared::Core for Core {
     }
     fn base_mut(&mut self) -> &mut CoreBase<Self::Game, Self::SlotData> {
         &mut self.base
+    }
+
+    /// Overlay menu-bar hook (SPEC-item-tracker.md): a "Tracker" item that toggles the window.
+    fn render_overlay_menu_items(&mut self, ui: &imgui::Ui) {
+        if ui.menu_item("Tracker") {
+            self.tracker_visible = !self.tracker_visible;
+        }
+    }
+
+    /// Overlay frame hook: hotkey toggle + hint accumulation every frame (cheap -- the watermark
+    /// skips already-scanned log entries), then the tracker window itself when visible.
+    fn render_overlay_windows(&mut self, ui: &imgui::Ui) {
+        // F6 toggles the tracker (deliberately NOT a plain letter -- those fight the say input).
+        if ui.is_key_pressed(imgui::Key::F6) {
+            self.tracker_visible = !self.tracker_visible;
+        }
+
+        self.accumulate_hints_from_log();
+
+        if self.tracker_visible {
+            self.render_tracker_window(ui);
+        }
     }
 
     fn update_live(&mut self) -> Result<()> {
@@ -234,6 +298,9 @@ impl shared::Core for Core {
                 );
                 crate::upgrades::set_global_scadu_blessing(
                     sd.pointer("/options/global_scadutree_blessing").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                );
+                crate::upgrade_cost::set_flatten(
+                    sd.pointer("/options/flatten_regular_upgrades").and_then(|v| v.as_i64()).unwrap_or(0) != 0,
                 );
                 let map = i64_map(sd.get("apIdsToItemIds"));
                 let counts = i64_map(sd.get("itemCounts"));
@@ -894,6 +961,7 @@ impl shared::Core for Core {
         if crate::flags::in_world() {
             let _ = crate::fmg_inject::run();
             let _ = crate::shop_flags::run(&[]);
+            let _ = crate::upgrade_cost::maybe_apply();
             let _ = crate::shop_sell::run();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
@@ -911,6 +979,234 @@ impl shared::Core for Core {
 }
 
 impl Core {
+    /// Scan NEW overlay-log entries for `Print::Hint`s and fold them into [Self::hints].
+    ///
+    /// Hint semantics (SPEC-item-tracker.md option (a)): the hint's `sender` is the player whose
+    /// world CONTAINS the hinted location; `receiver` is the player who gets the item. `for_us` =
+    /// we are the sender, i.e. the location is in OUR world -- that's what the checks tree marks.
+    /// Only our-world hints are inserted (`for_us`, or the id resolving in our region table as a
+    /// fallback) so cross-world location-id collisions don't mismark the tree.
+    fn accumulate_hints_from_log(&mut self) {
+        // Our slot name comes from the client; before we're connected, leave the watermark alone
+        // so any early entries still get scanned once names are resolvable.
+        let Some(our_name) = self.client().map(|c| c.this_player().name()) else {
+            return;
+        };
+        let log_len = self.base().logs().len();
+        let start = self.hint_log_watermark.min(log_len);
+        // Two-phase (collect, then insert): the log iterator immutably borrows self, so the
+        // HintSet inserts have to wait until the scan ends.
+        let mut new_hints: Vec<HintEntry> = Vec::new();
+        for (print, _) in self.base().logs().skip(start) {
+            let ap::Print::Hint { item, .. } = print else {
+                continue;
+            };
+            let location_id = item.location().id() as u64;
+            let for_us = item.sender().name() == our_name;
+            if !for_us && !self.region_table.contains_key(&location_id) {
+                continue; // another world's location -- not ours to mark
+            }
+            let other = if for_us { item.receiver() } else { item.sender() };
+            new_hints.push(HintEntry {
+                location_id,
+                item_name: item.item().name().to_string(),
+                other_player: other.name().to_string(),
+                for_us,
+            });
+        }
+        self.hint_log_watermark = log_len;
+        for entry in new_hints {
+            self.hints.insert(entry);
+        }
+    }
+
+    /// Coarse regions currently accessible: a coarse region is open iff its lock item's physical
+    /// open flag is set -- OR it has no lock at all / the lock isn't part of this seed's pool.
+    /// ("" coarse names are the always-open bucket; er-logic treats those as in-logic itself.)
+    fn open_coarse_regions(&self) -> HashSet<String> {
+        let mut open = HashSet::new();
+        let region_open = self.region.as_ref().map(|c| &c.region_open_flags);
+        for coarse in self.coarse_table.values() {
+            if coarse.is_empty() || open.contains(coarse) {
+                continue; // always-open bucket / already decided
+            }
+            let accessible = match self.coarse_lock_items.get(coarse) {
+                None => true, // no lock mapping -> open
+                Some(lock) => match region_open.and_then(|m| m.get(lock)) {
+                    None => true, // lock absent this seed -> unlocked
+                    Some(&flag) => crate::flags::get_event_flag(flag),
+                },
+            };
+            if accessible {
+                open.insert(coarse.clone());
+            }
+        }
+        open
+    }
+
+    /// Build the per-frame tracker snapshot and draw the window (SPEC-item-tracker.md Phase 1).
+    /// Everything the imgui closure touches is a local snapshot -- `self` stays out of it so the
+    /// window's close button can just write a local.
+    fn render_tracker_window(&mut self, ui: &imgui::Ui) {
+        // One client borrow: location id sets (+ id -> display name) and received-item names.
+        let mut checked: Vec<u64> = Vec::new();
+        let mut unchecked: Vec<u64> = Vec::new();
+        let mut loc_names = HashMap::new(); // id -> Ustr (Copy, interned)
+        let mut received: HashSet<String> = HashSet::new();
+        if let Some(client) = self.client() {
+            for loc in client.checked_locations() {
+                let id = loc.id() as u64;
+                loc_names.insert(id, loc.name());
+                checked.push(id);
+            }
+            for loc in client.unchecked_locations() {
+                let id = loc.id() as u64;
+                loc_names.insert(id, loc.name());
+                unchecked.push(id);
+            }
+            for ri in client.received_items() {
+                received.insert(ri.item().name().to_string());
+            }
+        }
+
+        // Region-lock accessibility snapshot (bound to a local BEFORE the model borrows &self
+        // fields -- keeps the borrows sequential).
+        let open_coarse = self.open_coarse_regions();
+        let model = er_logic::tracker::build_tracker_model(
+            &checked,
+            &unchecked,
+            &received,
+            &self.region_table,
+            &self.coarse_table,
+            &self.big_ticket,
+            &open_coarse,
+            &self.hints,
+        );
+        let mut hint_list: Vec<HintEntry> = self.hints.iter().cloned().collect();
+        hint_list.sort_by(|a, b| a.item_name.cmp(&b.item_name));
+
+        let display_loc = |id: u64| -> String {
+            loc_names
+                .get(&id)
+                .map(|n| n.as_str().to_string())
+                .unwrap_or_else(|| format!("(location {id})"))
+        };
+
+        let mut open = true;
+        // Filter state as locals (the closure stays self-free); written back to self after.
+        let mut in_logic_only = self.tracker_in_logic_only;
+        let mut big_ticket_only = self.tracker_big_ticket_only;
+        ui.window("Item Tracker###ap-tracker")
+            .size([480.0, 520.0], imgui::Condition::FirstUseEver)
+            .opened(&mut open)
+            .build(|| {
+                ui.text(format!("checks: {}/{}", model.done, model.total));
+                ui.text(format!(
+                    "in-logic: {}/{}   big-ticket: {}/{}",
+                    model.in_logic_done,
+                    model.in_logic_total,
+                    model.big_ticket_done,
+                    model.big_ticket_total
+                ));
+                ui.checkbox("in-logic only", &mut in_logic_only);
+                ui.same_line();
+                ui.checkbox("big-ticket only", &mut big_ticket_only);
+                ui.separator();
+                if model.total == 0 {
+                    ui.text_disabled("No location data yet -- connect to a session.");
+                }
+
+                // (b) Per-region rollups. The ### id is the region name alone so the header's
+                // open state survives the done/total counters changing.
+                for region in &model.regions {
+                    // Filter pass first so fully-filtered regions can be skipped outright.
+                    let shown: Vec<_> = region
+                        .unchecked
+                        .iter()
+                        .filter(|u| {
+                            (!in_logic_only || u.in_logic) && (!big_ticket_only || u.big_ticket)
+                        })
+                        .collect();
+                    if (in_logic_only || big_ticket_only) && shown.is_empty() {
+                        continue;
+                    }
+                    let lock_tag = if region.accessible { "" } else { "  [locked]" };
+                    let header = format!(
+                        "{}  {}/{}{}###trk-region-{}",
+                        region.region, region.done, region.total, lock_tag, region.region
+                    );
+                    // Dim the header text while the region's coarse region is locked. The token
+                    // pops on drop -- released right after the header so the rows keep their
+                    // own colors.
+                    let dim = (!region.accessible)
+                        .then(|| ui.push_style_color(imgui::StyleColor::Text, LOCKED_GRAY));
+                    let expanded = ui.collapsing_header(header, imgui::TreeNodeFlags::empty());
+                    drop(dim);
+                    if expanded {
+                        if shown.is_empty() {
+                            ui.text_disabled("  complete");
+                        }
+                        for u in shown {
+                            let name = display_loc(u.location_id);
+                            let star = if u.big_ticket { "* " } else { "" };
+                            let line = if u.hinted {
+                                format!("  {star}[hint] {name}")
+                            } else {
+                                format!("  {star}{name}")
+                            };
+                            if u.hinted {
+                                ui.text_colored(HINT_YELLOW, line);
+                            } else if u.big_ticket {
+                                ui.text_colored(BIG_TICKET_ORANGE, line);
+                            } else if !u.in_logic {
+                                ui.text_disabled(line);
+                            } else {
+                                ui.text(line);
+                            }
+                        }
+                    }
+                }
+
+                ui.separator();
+
+                // (c) Received items (raw cumulative names; sorted by the model).
+                if ui.collapsing_header(
+                    format!("Items received ({})###trk-items", model.received_items.len()),
+                    imgui::TreeNodeFlags::empty(),
+                ) {
+                    for item in &model.received_items {
+                        ui.text(format!("  {item}"));
+                    }
+                }
+
+                // (d) Standing hints.
+                if ui.collapsing_header(
+                    format!("Hints ({})###trk-hints", hint_list.len()),
+                    imgui::TreeNodeFlags::empty(),
+                ) {
+                    if hint_list.is_empty() {
+                        ui.text_disabled("  none yet");
+                    }
+                    for h in &hint_list {
+                        let who = if h.for_us {
+                            format!("for {}", h.other_player)
+                        } else {
+                            format!("hinted by {}", h.other_player)
+                        };
+                        ui.text_colored(
+                            HINT_YELLOW,
+                            format!("  {} @ {} ({who})", h.item_name, display_loc(h.location_id)),
+                        );
+                    }
+                }
+            });
+        if !open {
+            self.tracker_visible = false;
+        }
+        self.tracker_in_logic_only = in_logic_only;
+        self.tracker_big_ticket_only = big_ticket_only;
+    }
+
     fn write_save(&self) {
         let Some(path) = self.save_path.as_ref() else {
             return;

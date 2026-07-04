@@ -110,9 +110,47 @@ pub fn description(game: &str, owner: &str, slot: u32, kind: ItemKind) -> String
     format!("{game}\nFor: {owner} (slot {slot})\n{}", kind.label())
 }
 
+/// The GoodsName + Info/Caption a SHOP slot shows for a scouted AP item that `shop_sell` can't
+/// sell natively -- foreign items, or synthetic own-world rewards like REGION LOCKS / gems. The
+/// game-I/O `eldenring-archipelago::shop_preview` layer only UTF-16-encodes these and swaps them
+/// into the GoodsName (cat 10) / GoodsInfo (20) / GoodsCaption (24) MsgData. Kept pure + host-
+/// tested so the exact on-screen strings are pinned HERE, not buried in the FFI module.
+///
+/// `name`    = the AP item name (what the buy menu lists) -- e.g. "Stormveil Lock".
+/// `caption` = the AP routing block, one field per line (ER renders `\n` as a caption break):
+///             "AP: <item>" / "For: <owner> (<game>)" / "<kind>"
+/// so a shop check reads as a routing decision, not a blind buy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShopLabel {
+    pub name: String,
+    pub caption: String,
+}
+
+pub fn shop_label(item_name: &str, owner: &str, game: &str, kind: ItemKind) -> ShopLabel {
+    ShopLabel {
+        name: item_name.to_string(),
+        caption: format!("AP: {item_name}\nFor: {owner} ({game})\n{}", kind.label()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shop_label_progression_lock() {
+        // A region lock placed in a shop must render legibly as its own name + a Progression tag.
+        let l = shop_label("Stormveil Lock", "Alaric", "Elden Ring", ItemKind::Progression);
+        assert_eq!(l.name, "Stormveil Lock");
+        assert_eq!(l.caption, "AP: Stormveil Lock\nFor: Alaric (Elden Ring)\nProgression");
+    }
+
+    #[test]
+    fn shop_label_kind_line() {
+        assert!(shop_label("x", "o", "g", ItemKind::Filler).caption.ends_with("\nFiller"));
+        assert!(shop_label("x", "o", "g", ItemKind::Useful).caption.ends_with("\nUseful"));
+        assert!(shop_label("x", "o", "g", ItemKind::Trap).caption.ends_with("\nTrap"));
+    }
 
     #[test]
     fn resolve_hit_and_miss() {

@@ -656,6 +656,7 @@ dependencies = [
  "er-logic",
  "fromsoftware-shared 0.14.0",
  "hudhook",
+ "imgui",
  "log",
  "oneshot",
  "retour",

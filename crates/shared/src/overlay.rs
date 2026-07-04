@@ -153,6 +153,12 @@ impl<G: Game> Overlay<G> {
             prof!(core.base_mut().profiler(), "settings window", {
                 self.render_settings_window(ui);
             });
+
+            // Game-specific overlay windows (e.g. the ER item tracker). Called at
+            // frame scope — the hook opens its own `ui.window(...)`.
+            prof!(core.base_mut().profiler(), "game windows", {
+                core.render_overlay_windows(ui);
+            });
         });
 
         #[cfg(feature = "profile")]
@@ -262,7 +268,7 @@ impl<G: Game> Overlay<G> {
         let collapsed = builder
             .build(|| {
                 prof!(core.base_mut().profiler(), "menu bar", {
-                    self.render_menu_bar(ui);
+                    self.render_menu_bar(ui, core);
                 });
 
                 ui.separator();
@@ -365,12 +371,15 @@ impl<G: Game> Overlay<G> {
     }
 
     /// Renders the menu bar.
-    fn render_menu_bar(&mut self, ui: &Ui) {
+    fn render_menu_bar(&mut self, ui: &Ui, core: &mut G::Core) {
         ui.menu_bar(|| {
             if ui.menu_item("Settings") {
                 log::warn!("Click registered");
                 self.settings_window_visible = true;
             }
+
+            // Game-specific menu items (e.g. the ER item tracker toggle).
+            core.render_overlay_menu_items(ui);
         });
     }
 

@@ -3,7 +3,7 @@
 //! deps, so CI runs every test on any host (alongside `er-codec` / `er-semver`).
 //!
 //! PURE modules (no game at all): [`receive`], [`version`], [`save_state`], [`progressive`],
-//! [`region_lock`], [`options`].
+//! [`region_lock`], [`options`], [`tracker`].
 //! SEAM modules (game side effects via the [`hook::GameHook`] trait + `FakeGame` mock): [`deathlink`],
 //! [`grace`], [`grants`], [`upgrades`]. The real `EldenRingHook` impl lives in `eldenring-ap`
 //! (`#[cfg(windows)]`).
@@ -22,6 +22,8 @@ pub mod region_lock;
 pub mod save_state;
 pub mod scaling;
 pub mod sweep_gate;
+pub mod tracker;
+pub mod tracker_regions;
 pub mod upgrades;
 pub mod vanilla_suppress;
 pub mod version;

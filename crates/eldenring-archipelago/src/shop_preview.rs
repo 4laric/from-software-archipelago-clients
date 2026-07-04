@@ -59,9 +59,11 @@ pub fn run() -> bool {
         }
         overridden += 1;
         let gid = *good as u32;
-        nmap.insert(gid, s.name.encode_utf16().collect());
-        let text = format!("AP: {}\nFor: {} ({})\n{}", s.name, s.owner, s.game, s.kind.label());
-        let u: Vec<u16> = text.encode_utf16().collect();
+        // Pure, host-tested formatter (er-logic name_override::shop_label) so the exact GoodsName +
+        // routing caption a lock/foreign slot shows is pinned by unit test, not inlined here.
+        let lbl = er_logic::name_override::shop_label(&s.name, &s.owner, &s.game, s.kind);
+        nmap.insert(gid, lbl.name.encode_utf16().collect());
+        let u: Vec<u16> = lbl.caption.encode_utf16().collect();
         imap.insert(gid, u.clone());
         cmap.insert(gid, u);
     }

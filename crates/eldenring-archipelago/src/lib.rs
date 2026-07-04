@@ -29,6 +29,7 @@ mod shop_icon;
 mod shop_preview;
 mod shop_sell;
 mod startgrants;
+mod upgrade_cost;
 mod upgrades;
 mod warp;
 // progressive logic lives in er_logic::progressive (pure, host-tested); no local module needed.

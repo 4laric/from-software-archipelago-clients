@@ -25,6 +25,9 @@ archipelago_rs.workspace = true        # ensure the workspace is on 3.0.1 (try-a
 # `shared::Game` (which exposes only `impl FnMut`/`bool`/hudhook). Pin the resolved SHA after build.
 fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs", branch = "main" }
 hudhook.workspace = true
+# Item-tracker overlay window (shared::Core render_overlay_* hooks take &imgui::Ui). Same spec as
+# crates/shared so the workspace [patch.crates-io] git pin resolves both to ONE imgui instance.
+imgui = { version = "0.12", features = ["docking", "tables-api"] }
 log.workspace = true
 shared.workspace = true
 windows.workspace = true
