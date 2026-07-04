@@ -6,7 +6,7 @@
 //! self-found progressive/region/notify from working under the old `own_world:false` local-grant.
 //! `grant_full_id` stays (used by the received-item path). RVA + signature pinned to 2.6.2.0.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -25,11 +25,25 @@ static HOOK: OnceLock<GenericDetour<AddItemFn>> = OnceLock::new();
 /// Live inventory pointer captured on every pickup; reused to grant items that never pass a pickup.
 static LAST_INVENTORY: AtomicUsize = AtomicUsize::new(0);
 /// checkItemFlags from slot_data: full AddItemFunc-space item id -> acquisition flags of the check
-/// locations that vanilla-hold it. LIVE vanilla-suppressor since 2026-07-01 (probe verdict
-/// 162 false / 25 true: the check flag sets AFTER AddItem, so any unset mapped flag at pickup
-/// time = this IS the check pickup — suppress the vanilla bag-add; all-set = post-check
-/// re-pickup — pass through).
+/// locations that vanilla-hold it. LIVE vanilla-suppressor since 2026-07-01. The re-pickup
+/// discriminator is now the COLLECTED set (KNOWN_COLLECTED_FLAGS), not the live game flag —
+/// see that static for why the old live-flag heuristic leaked.
 static CHECK_ITEM_FLAGS: Mutex<Option<HashMap<u32, Vec<u32>>>> = Mutex::new(None);
+
+/// Acquisition flags of check locations the client has ALREADY reported as collected (the server
+/// checked-set, bridged loc->flag through `locationFlags`; rebuilt each flag-poll tick by
+/// `core::update_live`). This REPLACES the old "is the live game flag set at AddItem time?"
+/// re-pickup test, which leaked: for ~13% of lots (the probe's "25 true"), and systematically for
+/// the 224 shared-flag multi-item lots (605 locations — armor sets, NPC-corpse bundles, boss
+/// remembrance drops), the game sets the acquisition flag AT or BEFORE the bag-add, so the live
+/// flag already reads set at AddItem and the vanilla item passed through as a bogus "re-pickup"
+/// (e.g. Traveler's Clothes 0x100f90c4 / flag 15007980, 2026-07-03 playtest).
+///
+/// Collected-set logic is race-safe in the correct direction: a location enters this set only on a
+/// flag-poll tick STRICTLY AFTER its check was sent, so a first-time pickup (flag not yet in the
+/// set) always SUPPRESSES; a genuine re-pickup of a farmable/respawning source (flag collected on a
+/// prior, separate event) PASSES. `None` until the first poll → suppress-by-default (never leaks).
+static KNOWN_COLLECTED_FLAGS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 
 pub fn configure_check_item_flags(map: HashMap<u32, Vec<u32>>) {
     // Armed-or-inert (house rule): one line at configure time says which state the suppressor
@@ -40,6 +54,12 @@ pub fn configure_check_item_flags(map: HashMap<u32, Vec<u32>>) {
         log::info!("vanilla suppressor ARMED for {} check item ids", map.len());
     }
     *CHECK_ITEM_FLAGS.lock().unwrap() = Some(map);
+}
+
+/// Replace the collected-flag set. Called by the flag-poll each tick with the acquisition flags of
+/// every location currently in the server checked-set (loc->flag via `locationFlags`).
+pub fn set_known_collected_flags(flags: HashSet<u32>) {
+    *KNOWN_COLLECTED_FLAGS.lock().unwrap() = Some(flags);
 }
 
 fn check_item_flags_lookup(raw_id: u32) -> Option<Vec<u32>> {
@@ -212,17 +232,25 @@ unsafe extern "C" fn add_item_detour(
     }
 
     if !is_synthetic_goods(raw_id) {
-        // Vanilla-suppress (LIVE 2026-07-01, settled by the suppress-probe run): a vanilla id
-        // that belongs to a check location is the check's ORIGINAL ware. The check flag sets
-        // AFTER AddItem, so an unset mapped flag means this is the check pickup itself — suppress
-        // the bag-add (the AP grant delivers whatever the seed placed there). All flags set =
-        // post-check re-pickup (farmable/respawning source) — pass through untouched.
+        // Vanilla-suppress (LIVE 2026-07-01): a vanilla id that belongs to a check location is the
+        // check's ORIGINAL ware — suppress its bag-add so the AP grant delivers what the seed placed
+        // there. The re-pickup discriminator is the COLLECTED set, not the live game flag: any mapped
+        // flag NOT yet in KNOWN_COLLECTED_FLAGS means the check has not been reported yet, so this IS
+        // the check pickup → suppress. Only pass (farmable/respawning re-pickup) once EVERY mapped
+        // flag is collected. This fixes the shared-flag / early-flag-set leak where the game set the
+        // acquisition flag at/before AddItem and the old live-flag test mis-read it as a re-pickup.
         if let Some(flags) = check_item_flags_lookup(raw_id) {
-            if flags.iter().any(|f| !crate::flags::get_event_flag(*f)) {
-                log::info!("vanilla-suppress: pickup {raw_id:#x} suppressed (check flag(s) unset)");
+            let guard = KNOWN_COLLECTED_FLAGS.lock().unwrap();
+            // No poll yet (None) -> treat as "nothing collected" -> suppress by default (never leaks).
+            let suppress = match guard.as_ref() {
+                Some(collected) => er_logic::vanilla_suppress::should_suppress(&flags, collected),
+                None => true,
+            };
+            if suppress {
+                log::info!("vanilla-suppress: pickup {raw_id:#x} suppressed (check not yet collected)");
                 return 0;
             }
-            log::info!("vanilla-suppress: pickup {raw_id:#x} passed (all check flags set — re-pickup)");
+            log::info!("vanilla-suppress: pickup {raw_id:#x} passed (check already collected — re-pickup)");
         }
         return call_original(inventory, entry, itembuf, r9);
     }

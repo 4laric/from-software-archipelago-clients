@@ -23,4 +23,5 @@ pub mod save_state;
 pub mod scaling;
 pub mod sweep_gate;
 pub mod upgrades;
+pub mod vanilla_suppress;
 pub mod version;

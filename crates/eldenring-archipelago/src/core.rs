@@ -695,6 +695,21 @@ impl shared::Core for Core {
         if self.locations_loaded && self.poll_counter.is_multiple_of(15) {
             let mut to_check: Vec<i64> = Vec::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
+                // Refresh the vanilla-suppressor's collected-flag set: the acquisition flags of every
+                // location already in the server checked-set (loc->flag via locationFlags). A location
+                // enters this set only AFTER its check was reported, so the detour suppresses a
+                // first-time pickup and passes only a genuine re-pickup. See detour::KNOWN_COLLECTED_FLAGS.
+                // NOTE: is_local_location_checked PANICS on datapackage-unknown ids, so the
+                // valid_locations guard MUST come first (same ordering as the poll loop below).
+                let collected: std::collections::HashSet<u32> = fp
+                    .location_flags
+                    .iter()
+                    .filter(|&(&loc, _)| {
+                        self.valid_locations.contains(&loc) && client.is_local_location_checked(loc)
+                    })
+                    .map(|(_, &flag)| flag)
+                    .collect();
+                crate::detour::set_known_collected_flags(collected);
                 for (&loc, &flag) in &fp.location_flags {
                     if self.valid_locations.contains(&loc)
                         && !client.is_local_location_checked(loc)
