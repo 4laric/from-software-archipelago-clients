@@ -244,7 +244,7 @@ impl<G: Game> Overlay<G> {
             (Some(size), true, false) => {
                 let style = ui.clone_style();
                 let remove_bottom_space =
-                    ui.frame_height() + style.window_padding[1] + style.scrollbar_size;
+                    ui.frame_height() + style.window_padding[1];
 
                 builder.size(
                     [size[0], size[1] - remove_bottom_space.ceil()],
@@ -254,7 +254,7 @@ impl<G: Game> Overlay<G> {
             (Some(size), false, true) => {
                 let style = ui.clone_style();
                 let add_bottom_space =
-                    ui.frame_height() + style.window_padding[1] + style.scrollbar_size;
+                    ui.frame_height() + style.window_padding[1];
 
                 builder.size(
                     [size[0], size[1] + add_bottom_space.ceil()],
@@ -479,7 +479,9 @@ impl<G: Game> Overlay<G> {
             .size([0.0, -input_height.ceil()])
             .draw_background(false)
             .always_vertical_scrollbar(true)
-            .always_horizontal_scrollbar(!is_compact_mode)
+            // Messages now wrap to the window width (see write_message_data), so
+            // the horizontal scrollbar is no longer needed.
+            .always_horizontal_scrollbar(false)
             .build(|| {
                 if let Some((_, log_time)) = core.base().logs().last()
                     && log_time > &self.last_log_emitted
@@ -602,15 +604,27 @@ impl ImColor32Ext for ImColor32 {
     }
 }
 
-/// Writes the text in [parts] to [ui] in a single line.
+/// Writes the text in [parts] to [ui], wrapping onto new lines when a message
+/// is wider than the available space in the log window.
+///
+/// imgui's built-in text wrapping only applies to a single `text` call, but our
+/// messages are composed of several independently-colored [RichText] parts laid
+/// out with `same_line`. So we wrap manually: we split each part into words and
+/// track the running width of the current line, breaking to a new line whenever
+/// the next word wouldn't fit.
 fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
-    let mut first = true;
-    for part in parts {
-        if !first {
-            ui.same_line();
-        }
-        first = false;
+    // Width to wrap at: the space from the current cursor to the right edge of
+    // the content region (which already excludes the vertical scrollbar).
+    let wrap_width = ui.content_region_avail()[0].max(1.0);
+    // Gap between words. Using the width of a real space glyph keeps wrapped
+    // lines spaced naturally regardless of the item-spacing style.
+    let space_width = ui.calc_text_size(" ")[0];
 
+    // Pixel width of the line currently being laid out.
+    let mut line_width = 0.0f32;
+    let mut first_word = true;
+
+    for part in parts {
         // TODO: Load in fonts to support bold, maybe write a line manually for
         // underline? I'm not sure there's a reasonable way to support
         // background colors.
@@ -626,6 +640,37 @@ fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
             Color { color: Yellow, .. } => YELLOW,
             _ => WHITE,
         };
-        ui.text_colored(color.with_alpha(alpha).to_rgba_f32s(), part.to_string());
+        let rgba = color.with_alpha(alpha).to_rgba_f32s();
+
+        // `split(' ')` yields empty strings for consecutive/leading/trailing
+        // spaces; skipping them collapses runs of whitespace to a single gap.
+        for word in part.to_string().split(' ') {
+            if word.is_empty() {
+                continue;
+            }
+            let word_width = ui.calc_text_size(word)[0];
+
+            if first_word {
+                // First word of the message: render at the line start.
+                ui.text_colored(rgba, word);
+                line_width = word_width;
+                first_word = false;
+            } else if line_width + space_width + word_width > wrap_width {
+                // Doesn't fit: drop to a new line (no `same_line`).
+                ui.text_colored(rgba, word);
+                line_width = word_width;
+            } else {
+                // Fits: continue the current line.
+                ui.same_line_with_spacing(0.0, space_width);
+                ui.text_colored(rgba, word);
+                line_width += space_width + word_width;
+            }
+        }
+    }
+
+    // An empty message still needs to consume a row so the ListClipper layout
+    // stays aligned.
+    if first_word {
+        ui.new_line();
     }
 }
