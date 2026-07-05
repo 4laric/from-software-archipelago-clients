@@ -275,11 +275,24 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
                             }
                         }
                     }
+                    let is_compression_warning =
+                        format!("{print}").to_lowercase().contains("compressed websocket");
                     info!("[APS] {print}");
                     if self.log_buffer.len() >= LOG_BUFFER_LIMIT {
                         self.log_buffer.pop_front();
                     }
                     self.log_buffer.push_back((print, Instant::now()));
+                    // The AP server warns once that the client lacks compressed-websocket
+                    // support. No Rust AP lib supports permessage-deflate (tungstenite-rs#2);
+                    // it is purely cosmetic and does NOT affect Elden Ring AP. Reassure the
+                    // player so the red server warning does not read as a real error.
+                    if is_compression_warning {
+                        self.log(
+                            "Note: the \"compressed websocket\" server warning above is harmless \
+                             -- Elden Ring Archipelago works normally without it."
+                                .to_string(),
+                        );
+                    }
                 }
                 _ => {}
             }

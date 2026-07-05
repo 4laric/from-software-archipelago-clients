@@ -378,6 +378,17 @@ impl<G: Game> Overlay<G> {
                 self.settings_window_visible = true;
             }
 
+            // Reopen the connect form on demand, even while connected, so the player can
+            // switch server/slot without deleting apconfig.json. Seeds the fields from the
+            // current config; render_connect_modal runs every frame, so open_popup shows it.
+            if ui.menu_item("Connection") {
+                let config = core.base().config();
+                config.url().clone_into(&mut self.popup_url);
+                config.slot().clone_into(&mut self.popup_slot);
+                self.popup_password = config.password().unwrap_or("").to_string();
+                ui.open_popup("#connect-modal");
+            }
+
             // Game-specific menu items (e.g. the ER item tracker toggle).
             core.render_overlay_menu_items(ui);
         });
