@@ -20,6 +20,11 @@ const MAP_REVEAL_FLAGS_BASE: &[u32] = &[
 ];
 /// DLC world-map reveal flags (Land of Shadow pieces); only set when DLC is enabled.
 const MAP_REVEAL_FLAGS_DLC: &[u32] = &[62080, 62081, 62082, 62083, 62084];
+/// Underground (Underworld) map VIEW-unlock flag -- distinct from the per-region map FRAGMENT
+/// flags above: without it the underground map layer never displays even when the fragments
+/// (62060-62064) are set. (CE [[EventFlagMan]+0x28]+0xFA0 bit6; id via the offset->id formula,
+/// confirmed live 2026-07-04. Verify with a set->readback the first time you build.)
+const UNDERGROUND_MAP_VIEW_UNLOCK: u32 = 82001;
 
 #[derive(Default)]
 pub struct StartConfig {
@@ -70,6 +75,15 @@ pub fn apply_start_flags(cfg: &StartConfig) -> bool {
         if !flags::try_set_event_flag(f, true) {
             return false;
         }
+    }
+    // Underground (Underworld) map VIEW unlock. The underground map layer will NOT display
+    // even with its fragment flags (62060-62064) set unless this flag is on -- root cause of
+    // the underground-map-won't-paint bug (pinned live via CE flag-logger bisection 2026-07-04).
+    // Set unconditionally at connect: it only makes the underground map viewable (the fill still
+    // gates on the per-region fragment flags), so it covers BOTH reveal_all_maps and the
+    // progressive per-region unlock path. See memory er-underground-map-quadrant-flags.
+    if !flags::try_set_event_flag(UNDERGROUND_MAP_VIEW_UNLOCK, true) {
+        return false;
     }
     if cfg.reveal_all_maps {
         for &f in MAP_REVEAL_FLAGS_BASE {
