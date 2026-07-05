@@ -1,0 +1,263 @@
+//! Resolve AP location ids -> in-game acquisition event flags from the matt-rando slot
+//! key table `locationIdsToKeys`, replacing the legacy `locationFlags` `{loc: flag}` table.
+//!
+//! Bedrock's apworld emits (net slot_data):
+//!   locationIdsToKeys    = { "<ap_location_id>": "<a>,<b>:<flag>:<shopRows>:" }
+//!   locationIdsToTargets = { "<ap_location_id>": ["lot:NNNN", ...] }   (optional fallback)
+//!
+//! The KEY already encodes the acquisition event flag as token 1 (`key.split(':')[1]`) --
+//! verified equal to ItemLotParam getItemFlagId for ~94% of slots. So the primary path is a
+//! pure string split, no param files. Shop slots (token1 == 0, token3 = shop rows) carry no
+//! acquisition flag and are skipped/deferred here (shops: TBD), exactly like the Python
+//! reference `client_key_resolver.py::resolve_location_flags`.
+//!
+//! Output is the SAME `HashMap<i64, u32>` `{ap_location_id: flag}` shape the client already
+//! polls (see `flagpoll::FlagPollConfig::location_flags`), so it drops in where `locationFlags`
+//! was consumed. std + serde_json only; mirrors `core::i64_to_u32_map` tolerance.
+
+use std::collections::HashMap;
+
+use serde_json::Value;
+
+/// Token 1 of a matt slot key = the acquisition event flag (0 if none / shop).
+/// Mirrors the Python `_key_flag`: strip leading zeros to detect the all-zero placeholder,
+/// then parse the raw token as u32. Returns None when there is no usable flag.
+fn key_flag(key: &str) -> Option<u32> {
+    let tok1 = key.split(':').nth(1)?.trim();
+    // "0000000000" (all zeros) is the shop/no-flag placeholder -> treat as absent.
+    if tok1.trim_matches('0').is_empty() {
+        return None;
+    }
+    tok1.parse::<u32>().ok().filter(|&f| f != 0)
+}
+
+/// Read `locationIdsToKeys` -> `{ap_location_id: acquisition_flag}`.
+///
+/// Same shape/semantics as the old `i64_to_u32_map(sd.get("locationFlags"))`, so callers keep
+/// polling identically. Slots whose key carries no flag (token1 == 0 / shop rows in token3) are
+/// skipped -- deferred to the shop system, matching `resolve_location_flags`'s `shops`/`unresolved`
+/// buckets. Tolerant: malformed loc ids or keys are skipped rather than failing the parse.
+///
+/// Backward-compat is the caller's job: prefer this when `locationIdsToKeys` is present, else fall
+/// back to `locationFlags` (see core_rs_integration.md).
+pub fn location_flags_from_keys(sd: &Value) -> HashMap<i64, u32> {
+    let mut out = HashMap::new();
+    let Some(obj) = sd.get("locationIdsToKeys").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (k, v) in obj {
+        let (Ok(loc), Some(key)) = (k.parse::<i64>(), v.as_str()) else {
+            continue;
+        };
+        if let Some(flag) = key_flag(key) {
+            out.insert(loc, flag);
+        }
+        // else: shop (token1 == 0) or unresolved -> deferred, not polled by flag.
+    }
+    out
+}
+
+/// Token 3 of a matt slot key = ShopLineupParam row ids (present only for shop slots,
+/// where token1 == 0). Mirrors the Python `_key_shop_rows`: split token3 on ',',
+/// keep the all-digit entries. Empty for non-shop keys.
+fn key_shop_rows(key: &str) -> Vec<u32> {
+    match key.split(':').nth(2) {
+        Some(tok3) if !tok3.trim().is_empty() => tok3
+            .split(',')
+            .filter_map(|x| {
+                let x = x.trim();
+                if !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) {
+                    x.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve SHOP location ids -> check event flags, using `locationIdsToKeys` (from
+/// slot_data) and a loaded `{shop_row_id: eventFlag_forStock}` table (the shipped
+/// `shoplineup_flags.json`, built offline by `shoplineup_flags.py`).
+///
+/// A shop slot has key token1 == 0 (no acquisition flag) and its ShopLineupParam row
+/// ids in token 3, e.g. `"100000,0:0000000000:100200:"` -> rows [100200]. The check
+/// flag for a row is its `eventFlag_forStock` -- verified 100% (649/649) equal to
+/// matt's shop tracking flags. So a shop slot resolves to the FIRST of its token3 rows
+/// that has a flag in `row_flags`.
+///
+/// Output is the SAME `HashMap<i64, u32>` `{ap_location_id: flag}` shape as
+/// [`location_flags_from_keys`], so the two can be merged into ONE poll map (`loc_flags`)
+/// and shop purchases self-detect through the existing flag poller. Only slots whose
+/// key carries NO acquisition flag (token1 == 0) are considered here -- flagged slots
+/// are already handled by [`location_flags_from_keys`], so this never double-inserts.
+/// Rows absent from `row_flags` (stock flag 0 / not in the shipped table) are skipped;
+/// the slot stays unresolved (unpolled) rather than being polled on a bogus flag.
+///
+/// Mirrors the Python `resolve_location_flags`'s `shops` bucket + `shop_row_flags_for`
+/// composed: token3 rows -> ShopLineupParam eventFlag_forStock -> flag.
+pub fn shop_flags_from_keys(sd: &Value, row_flags: &HashMap<u32, u32>) -> HashMap<i64, u32> {
+    let mut out = HashMap::new();
+    let Some(obj) = sd.get("locationIdsToKeys").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (k, v) in obj {
+        let (Ok(loc), Some(key)) = (k.parse::<i64>(), v.as_str()) else {
+            continue;
+        };
+        // Only shop slots: token1 == 0 (no acquisition flag). Flagged slots are owned by
+        // `location_flags_from_keys`; skipping them here keeps the two maps disjoint.
+        if key_flag(key).is_some() {
+            continue;
+        }
+        // First token3 row that has a stock flag in the shipped table wins. (A shop slot
+        // maps to one check; the extra rows in token3, when present, share the same stock
+        // flag or are release-only rows -- the first flagged one is the check flag.)
+        for row in key_shop_rows(key) {
+            if let Some(&flag) = row_flags.get(&row).filter(|&&f| f != 0) {
+                out.insert(loc, flag);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Load the shipped `shoplineup_flags.json` -> `{shop_row_id: eventFlag_forStock}`.
+/// Same tolerant shape as `flagpoll::merge_table_file`: a flat JSON object of
+/// string-int-keyed integer values. Missing/invalid file -> empty map (shops simply
+/// stay unresolved, no panic). Mirror of how `er_static_detection_table.json` is read
+/// in `flagpoll.rs` (read_to_string -> serde_json -> tolerant object walk).
+pub fn load_shoplineup_flags(path: &std::path::Path) -> HashMap<u32, u32> {
+    let mut out = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    // Tolerate any null-padding a shrinking overwrite may leave (mirrors the Python loader).
+    let text = text.trim_end_matches('\u{0}').trim_end();
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return out;
+    };
+    if let Some(obj) = v.as_object() {
+        for (k, val) in obj {
+            if let (Ok(row), Some(flag)) = (k.parse::<u32>(), val.as_u64()) {
+                if flag != 0 {
+                    out.insert(row, flag as u32);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn key_token1_is_the_flag() {
+        // Real matt-key shape: token 1 (after first ':') is the acquisition flag.
+        assert_eq!(key_flag("100000,0:0000060510::"), Some(60510));
+        assert_eq!(key_flag("2,1:60110:100000,100001:"), Some(60110));
+        // Shop placeholder: token1 all-zero, token3 = shop rows -> no flag.
+        assert_eq!(key_flag("100000,0:0000000000:100000:"), None);
+        // Degenerate / missing token -> None.
+        assert_eq!(key_flag("100000,0"), None);
+        assert_eq!(key_flag(""), None);
+    }
+
+    #[test]
+    fn resolves_table_and_skips_shops() {
+        let sd = json!({
+            "locationIdsToKeys": {
+                "5001": "100000,0:0000060510::",         // flagged -> 60510
+                "5002": "2,1:60110:100000,100001:",       // flagged -> 60110
+                "5003": "100000,0:0000000000:100000:",    // shop    -> skipped
+            }
+        });
+        let m = location_flags_from_keys(&sd);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&5001), Some(&60510u32));
+        assert_eq!(m.get(&5002), Some(&60110u32));
+        assert!(!m.contains_key(&5003)); // shop deferred
+    }
+
+    #[test]
+    fn absent_table_is_empty() {
+        // No locationIdsToKeys -> empty map, so the caller falls back to locationFlags.
+        assert!(location_flags_from_keys(&json!({})).is_empty());
+        assert!(location_flags_from_keys(&json!({ "locationFlags": { "1": 60510 } })).is_empty());
+    }
+
+    // --- shop resolution -----------------------------------------------------
+
+    #[test]
+    fn key_token3_is_shop_rows() {
+        // Real shop key: token1 == 0 (all-zero placeholder), token3 = shop rows.
+        assert_eq!(key_shop_rows("100000,0:0000000000:100200:"), vec![100200]);
+        // Multiple rows, comma-separated.
+        assert_eq!(key_shop_rows("1,0:0000000000:100200,100201:"), vec![100200, 100201]);
+        // Flagged (non-shop) key: token3 present but these are ItemLot ids, not shop rows.
+        // key_shop_rows still parses them; callers gate on token1 (key_flag) first.
+        assert_eq!(key_shop_rows("2,1:60110:100000,100001:"), vec![100000, 100001]);
+        // No token3 -> empty.
+        assert!(key_shop_rows("100000,0:0000060510::").is_empty());
+        assert!(key_shop_rows("100000,0").is_empty());
+    }
+
+    #[test]
+    fn resolves_shop_slot_to_stock_flag() {
+        // The real example from the handoff: shop key -> row 100200 -> its
+        // ShopLineupParam.eventFlag_forStock. Verified from
+        // elden_ring_artifacts/vanilla_er/vanilla_er/ShopLineupParam.csv:
+        //   ID=100200 ... eventFlag_forStock=120000  (row read directly from the CSV)
+        const ROW_100200_FLAG: u32 = 120000;
+        let row_flags: HashMap<u32, u32> =
+            [(100200u32, ROW_100200_FLAG)].into_iter().collect();
+        let sd = json!({
+            "locationIdsToKeys": {
+                "7001": "100000,0:0000000000:100200:",   // shop slot -> row 100200
+                "7002": "2,1:60110:100000,100001:",       // flagged (token1!=0) -> NOT a shop, skipped here
+                "7003": "1,0:0000000000:999999:",         // shop row absent from table -> unresolved
+            }
+        });
+        let m = shop_flags_from_keys(&sd, &row_flags);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&7001), Some(&ROW_100200_FLAG)); // 120000
+        assert!(!m.contains_key(&7002)); // flagged slot owned by location_flags_from_keys
+        assert!(!m.contains_key(&7003)); // no known flag for row 999999 -> skipped
+    }
+
+    #[test]
+    fn shop_and_location_maps_are_disjoint() {
+        // location_flags_from_keys takes the flagged slots; shop_flags_from_keys takes the
+        // token1==0 shop slots. The same slot_data feeds both; no key appears in both maps.
+        let row_flags: HashMap<u32, u32> = [(100200u32, 120000u32)].into_iter().collect();
+        let sd = json!({
+            "locationIdsToKeys": {
+                "8001": "100000,0:0000060510::",          // flagged -> 60510 (location map)
+                "8002": "100000,0:0000000000:100200:",    // shop    -> 120000 (shop map)
+            }
+        });
+        let loc = location_flags_from_keys(&sd);
+        let shop = shop_flags_from_keys(&sd, &row_flags);
+        assert_eq!(loc.get(&8001), Some(&60510u32));
+        assert!(!loc.contains_key(&8002));
+        assert_eq!(shop.get(&8002), Some(&120000u32));
+        assert!(!shop.contains_key(&8001));
+        // Disjoint keysets: merging is a clean union.
+        assert!(loc.keys().all(|k| !shop.contains_key(k)));
+    }
+
+    #[test]
+    fn absent_shop_table_or_keys_is_empty() {
+        let row_flags: HashMap<u32, u32> = [(100200u32, 120000u32)].into_iter().collect();
+        // No locationIdsToKeys -> empty.
+        assert!(shop_flags_from_keys(&json!({}), &row_flags).is_empty());
+        // Keys present but empty row_flags table -> nothing resolves.
+        let sd = json!({ "locationIdsToKeys": { "1": "1,0:0000000000:100200:" } });
+        assert!(shop_flags_from_keys(&sd, &HashMap::new()).is_empty());
+    }
+}

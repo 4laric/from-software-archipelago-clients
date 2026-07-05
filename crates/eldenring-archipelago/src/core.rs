@@ -317,7 +317,34 @@ impl shared::Core for Core {
                 let start = crate::startgrants::parse(sd);
 
                 // Shop system (SHOP-SYSTEM-HANDOFF.md §3): configure from slot_data, build the scout.
-                let loc_flags = i64_to_u32_map(sd.get("locationFlags"));
+                // KEY-TABLE MIGRATION (locationIdsToKeys): token 1 of a matt slot key is the
+                // acquisition flag; prefer it, fall back to legacy `locationFlags` for old seeds.
+                let loc_flags = {
+                    let from_keys = crate::key_resolver::location_flags_from_keys(sd);
+                    if from_keys.is_empty() {
+                        i64_to_u32_map(sd.get("locationFlags"))
+                    } else {
+                        from_keys
+                    }
+                };
+                // SHOP KEY RESOLUTION: shop slots (token1==0) carry ShopLineupParam rows in token3;
+                // resolve row -> eventFlag_forStock via shipped shoplineup_flags.json and fold into
+                // loc_flags so purchases self-detect through the same poller. Disjoint union.
+                let loc_flags = {
+                    fn shop_table_path() -> std::path::PathBuf {
+                        shared::utils::mod_directory()
+                            .map(|d| d.join("shoplineup_flags.json"))
+                            .unwrap_or_else(|_| std::path::PathBuf::from("shoplineup_flags.json"))
+                    }
+                    let mut loc_flags = loc_flags;
+                    let shop_table = crate::key_resolver::load_shoplineup_flags(&shop_table_path());
+                    if !shop_table.is_empty() {
+                        for (loc, flag) in crate::key_resolver::shop_flags_from_keys(sd, &shop_table) {
+                            loc_flags.entry(loc).or_insert(flag);
+                        }
+                    }
+                    loc_flags
+                };
                 let preview: Vec<(i64, i32)> = i64_map(sd.get("shopPreviewGoods"))
                     .into_iter()
                     .map(|(l, g)| (l, g as i32))

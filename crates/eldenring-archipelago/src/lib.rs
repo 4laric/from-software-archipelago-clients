@@ -18,6 +18,7 @@ mod goal;
 mod hook_impl;
 mod inventory;
 mod keyitems;
+mod key_resolver;
 mod no_weapon_reqs;
 mod notif_ticker;
 mod params;
