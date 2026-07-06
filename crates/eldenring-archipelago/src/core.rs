@@ -66,6 +66,9 @@ pub struct Core {
     /// Session-scoped (R11, SWEEP): indices into start_items that verifiably granted -- only the
     /// failed ones re-attempt; `start_items_granted` latches once ALL have landed.
     start_items_ok: HashSet<usize>,
+    /// Session-scoped: when the player most recently entered a live world (reset on menu).
+    /// Gates the start-item grant so it fires only after the load/inventory settle (clobber fix).
+    in_world_since: Option<std::time::Instant>,
     /// Pre-scout: resolves each shop reward's name/owner/ER-sell-id (pumped on the tick).
     scout: Option<crate::scout_proof::ScoutProof>,
     /// Goal-send (SPEC-goal-send-20260701.md): goalLocations split flag/checked at parse.
@@ -198,7 +201,7 @@ impl shared::Core for Core {
 
     fn new() -> Result<Self> {
         Ok(Self {
-            base: CoreBase::new("EldenRing")?,
+            base: CoreBase::new("Elden Ring (Greenfield)")?,
             detour_installed: false,
             received_through: 0,
             dispatched_through: 0,
@@ -222,6 +225,7 @@ impl shared::Core for Core {
             start_flags_done: false,
             start_items_granted: false,
             start_items_ok: HashSet::new(),
+            in_world_since: None,
             scout: None,
             goal: None,
             sent_goal: false,
@@ -286,6 +290,14 @@ impl shared::Core for Core {
         if !self.slot_data_parsed {
             let parsed = self.client().map(|client| {
                 let sd = client.slot_data();
+                // Two-sided contract validation: warn (not reject) on any slot_data mismatch
+                // so a partially-compatible seed still boots but every problem is visible.
+                let contract_problems = crate::contract_gen::validate(sd);
+                if contract_problems.is_empty() {
+                    log::info!("contract: slot_data OK ({} keys checked)", crate::contract_gen::CONTRACT.len());
+                } else {
+                    for p in &contract_problems { log::warn!("contract: {p}"); }
+                }
                 // int-or-bool tolerant (er_logic::options): the apworld serializes options
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
@@ -313,6 +325,7 @@ impl shared::Core for Core {
                 let sweeps = (
                     crate::flagpoll::parse_dungeon_sweeps(sd),
                     crate::flagpoll::parse_sweep_lock_gates(sd),
+                    crate::flagpoll::parse_sweep_flags(sd),
                 );
                 let start = crate::startgrants::parse(sd);
 
@@ -445,6 +458,12 @@ impl shared::Core for Core {
                 for (loc, flag) in loc_flags {
                     fp.location_flags.insert(loc, flag);
                 }
+                // greenfield flag-keyed dungeon sweeps (dungeonSweepFlags, parsed above into
+                // sweeps.2): merge into the same sweep_flags table the legacy apconfig used, so the
+                // existing poll loop fires them on boss kill. slot_data wins per flag.
+                for (flag, locs) in sweeps.2 {
+                    fp.sweep_flags.insert(flag, locs);
+                }
                 log::info!(
                     "flag-poll table: {} location flags ({} sweep groups)",
                     fp.location_flags.len(),
@@ -543,6 +562,21 @@ impl shared::Core for Core {
             // Same in_world tightening as can_grant (SWEEP H3): the inventory pointer never
             // resets on quit-to-menu, so menu-time start grants would write through a stale one.
             let has_inv = crate::detour::has_inventory() && crate::flags::in_world();
+            // Start-ITEMS clobber guard (patch_greenfield_start_item_clobber.py): the static
+            // inventory prime lets grants fire during the load screen, before the save/new-game
+            // inventory finishes loading -- which then CLOBBERS the just-granted item (the Torch
+            // never appeared in-game). Defer start-item grants until the inventory is genuinely
+            // live: a real game AddItem has fired (bulk load replace done) OR we've been in-world
+            // long enough for the load to settle. Timing-independent; received grants untouched.
+            if crate::flags::in_world() {
+                self.in_world_since.get_or_insert_with(std::time::Instant::now);
+            } else {
+                self.in_world_since = None;
+            }
+            let start_items_settled = crate::detour::real_pickup_seen()
+                || self
+                    .in_world_since
+                    .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(8));
             let mut did_flags = false;
             let mut did_items = false;
             if let Some(sc) = self.start.as_ref() {
@@ -552,7 +586,7 @@ impl shared::Core for Core {
                 // correct slot_data. (The standalone gated its grace flush the same way.) After
                 // applying, read a sentinel grace back — only latch `done` once it sticks; a false
                 // read-back means it was clobbered, so we log it and retry next tick.
-                if !already_flags && has_inv && crate::startgrants::apply_start_flags(sc) {
+                if !already_flags && has_inv && start_items_settled && crate::startgrants::apply_start_flags(sc) {
                     let sentinel = sc.start_graces.first().copied();
                     let stuck = sentinel.is_none_or(crate::flags::get_event_flag);
                     if stuck {
@@ -566,7 +600,7 @@ impl shared::Core for Core {
                 // R11 (SWEEP): `.all(grant_full_id)` re-granted already-succeeded items on a
                 // partial failure next tick (duplicates). Track per-item success (by index,
                 // session-scoped) so only the FAILED ones re-attempt; latch once all landed.
-                if !already_items && has_inv {
+                if !already_items && has_inv && start_items_settled {
                     let mut all_ok = true;
                     for (i, &id) in sc.start_items.iter().enumerate() {
                         if self.start_items_ok.contains(&i) {

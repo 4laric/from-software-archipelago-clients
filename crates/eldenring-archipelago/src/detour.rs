@@ -78,6 +78,17 @@ const USE_STATIC_INVENTORY_PRIME: bool = true;
 /// One-time guard for the static-vs-game inventory-pointer confirmation log.
 static INV_PTR_CHECKED: AtomicBool = AtomicBool::new(false);
 
+/// Set the first time the GAME itself calls AddItemFunc (a real pickup / the post-load
+/// inventory being populated). Distinguishes a genuinely-live inventory from the static prime,
+/// so start-item grants can wait until AFTER the save/new-game load replace (which clobbers a
+/// grant made during the load screen). See patch_greenfield_start_item_clobber.py.
+static REAL_PICKUP_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// True once the game has driven AddItemFunc at least once this session (inventory is live).
+pub fn real_pickup_seen() -> bool {
+    REAL_PICKUP_SEEN.load(Ordering::Relaxed)
+}
+
 const ADD_ITEM_FUNC_RVA: usize = 0x0056_05B0;
 const ADD_ITEM_FUNC_SIG: &[u8] = &[
     0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24,
@@ -194,6 +205,7 @@ unsafe extern "C" fn add_item_detour(
     r9: u64,
 ) -> u64 {
     LAST_INVENTORY.store(inventory as usize, Ordering::Relaxed);
+    REAL_PICKUP_SEEN.store(true, Ordering::Relaxed);
     // One-time: compare the pointer the game hands us against the static-resolved candidate, so we
     // can safely enable USE_STATIC_INVENTORY_PRIME (a wrong static pointer would crash on grant).
     if !INV_PTR_CHECKED.swap(true, Ordering::Relaxed) {

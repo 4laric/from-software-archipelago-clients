@@ -96,6 +96,21 @@ pub fn parse_dungeon_sweeps(sd: &Value) -> HashMap<i64, Vec<i64>> {
     m
 }
 
+/// Parse `dungeonSweepFlags` out of slot_data: boss-defeat event flag -> member AP location ids.
+/// Greenfield's flag-keyed dungeon sweeps: when the flag fires (boss killed) every member is checked.
+/// Rides the same `sweep_flags` poll path the legacy apconfig table used.
+pub fn parse_sweep_flags(sd: &Value) -> HashMap<u32, Vec<i64>> {
+    let mut m = HashMap::new();
+    if let Some(obj) = sd.get("dungeonSweepFlags").and_then(|x| x.as_object()) {
+        for (k, val) in obj {
+            if let (Ok(flag), Some(arr)) = (k.parse::<u32>(), val.as_array()) {
+                m.insert(flag, arr.iter().filter_map(|x| x.as_i64()).collect());
+            }
+        }
+    }
+    m
+}
+
 /// Parse `sweepLockGates` out of slot_data: sweep trigger AP location -> boss-lock item NAME
 /// that must be in the cumulative received set before that trigger's dungeon sweep fires
 /// (BOSS_LOCKS_PATCH, SPEC-boss-locks.md v0.1). Absent key / empty map = every sweep ungated.
