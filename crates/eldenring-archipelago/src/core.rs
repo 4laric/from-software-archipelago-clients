@@ -373,6 +373,9 @@ impl shared::Core for Core {
                 crate::shop_sell::configure(loc_flags.clone());
                 crate::shop_preview::configure(preview.clone());
                 crate::shop_icon::configure(preview);
+                crate::minibaker::configure(
+                    sd.get("stoneswordVendorRow").and_then(|v| v.as_i64()).unwrap_or(0) as u32,
+                );
                 crate::scaling::configure(sd); // runtime enemy scaling (regionSphereTargets)
                 // checkItemFlags: full raw item id -> check acquisition flags (the PORT-GAP
                 // vanilla-suppress table; LIVE in the detour since 2026-07-01).
@@ -1026,6 +1029,7 @@ impl shared::Core for Core {
             let _ = crate::shop_sell::run();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
+            let _ = crate::minibaker::run();
             crate::scaling::tick();
             // Region-lock fog-wall visuals (cosmetic marker at locked borders; the KICK reactor,
             // not this, does the blocking). Runs on the game thread (FrameBegin task) so the
