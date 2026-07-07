@@ -87,6 +87,172 @@ pub fn region_bloom_settled(open_flag: u32, flags: &[u32], get_flag: &dyn Fn(u32
     get_flag(open_flag) && flags.iter().all(|&f| get_flag(f))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Countdown kick — region-gate polish (additive over the hard `kick_decision` above).
+//
+// This is PURELY ADDITIVE polish on top of the existing hard region kick: it does NOT change
+// whether a player is sealed (that stays `kick_decision`), only WHEN/HOW the kick is announced.
+// Today an out-of-sphere player is teleported out with no explanation; the jarring part is the
+// *unexplained* kick, not the kick itself (SPEC-gf-boss-lock-tracker.md "Region-gate polish — the
+// countdown kick"). `KickCountdown` keeps the hard gate but first surfaces a named warning banner
+// ("The seal of <Region> repels you... Ns", naming the missing "<Region> Lock") for a short grace
+// window, THEN kicks.
+//
+// TIME IS INJECTED for testability: `update` takes `now_ms` as an explicit input (no real clock,
+// no `std::time`), so the whole state machine replays deterministically in `region_lock_replay`.
+//
+// INTENDED GAME-FACING CALL SITE (wired separately on Windows — do NOT edit those files here):
+//   * The hard kick / teleport lives in `eldenring-ap` `region.rs::tick_kick`, at the
+//     `crate::warp::warp_to_grace(ROUNDTABLE_GRACE_ID)` call (the sealed-region warp-out). The
+//     Windows wiring holds one `KickCountdown` beside the existing `KICK_LATCH`, feeds it the live
+//     `kick_decision` result as `currently_in_sealed` plus the region/lock names, and only performs
+//     the warp when `update` returns `KickAction::Kick`.
+//   * The warning banner is shown through the same player-facing overlay channel `tick_kick`
+//     already uses: its returned `Option<String>` is pushed to `region_msgs` and logged via
+//     `self.log(ap::Print::message(..))` in `core.rs` (the persistent overlay console). This is the
+//     region-lock message path — distinct from `notif_ticker.rs`, which governs the native
+//     right-side item-gain ticker (`showDialogCondType`) for AP item pickups; the countdown banner
+//     rides the overlay-console path, not the item ticker. `KickAction::banner()` renders the text.
+
+/// Default grace window before the countdown kick fires, in milliseconds (~10s; SPEC banner shows
+/// "...10s"). Override per-instance with [`KickCountdown::with_grace_ms`].
+pub const DEFAULT_KICK_GRACE_MS: u64 = 10_000;
+
+/// What the caller should do THIS tick for the region gate. Returned by [`KickCountdown::update`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KickAction {
+    /// Not sealed (or the countdown was disarmed): do nothing.
+    None,
+    /// Inside the grace window: show the warning banner, do NOT teleport yet. `secs_left` counts
+    /// down (ceil of remaining ms, so it reads full at arm and hits 1 on the last second before the
+    /// kick). `region` / `lock_name` name the sealed region and the missing "<Region> Lock" item.
+    Warn {
+        region: String,
+        secs_left: u32,
+        lock_name: String,
+    },
+    /// Grace elapsed: teleport the player to the nearest open grace (the hard kick).
+    Kick { region: String },
+}
+
+impl KickAction {
+    /// The player-facing warning banner for a [`KickAction::Warn`] (SPEC wording); `None` otherwise.
+    /// Pure/ASCII so it round-trips through the overlay-console path unchanged.
+    pub fn banner(&self) -> Option<String> {
+        match self {
+            KickAction::Warn {
+                region, secs_left, ..
+            } => Some(format!("The seal of {region} repels you... {secs_left}s")),
+            _ => None,
+        }
+    }
+}
+
+/// Grace-window state machine for the countdown kick. Deterministic + clock-free: [`update`] takes
+/// `now_ms` as an input, so it replays exactly in tests.
+///
+/// Lifecycle per sealed-region visit:
+///  - ENTER a sealed region: the countdown arms at that tick's `now_ms` and starts warning.
+///  - each subsequent sealed tick: warns with a decreasing `secs_left` until the grace elapses.
+///  - grace elapses: emits exactly one [`KickAction::Kick`], then goes quiet (no per-tick re-kick
+///    while the player is still reported sealed — mirrors [`EnforcementLatch`]'s death-loop guard).
+///  - LEAVE the region (`currently_in_sealed == false`): disarms and clears the kicked latch, so a
+///    later RE-ENTRY re-arms and re-warns from full (kicks are never permanently suppressed).
+///
+/// [`update`]: KickCountdown::update
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KickCountdown {
+    /// Grace window length in ms before the kick fires.
+    grace_ms: u64,
+    /// `now_ms` at which the current sealed visit armed; `None` when not in a sealed region.
+    armed_at: Option<u64>,
+    /// Set once the kick has fired for the current sealed visit; cleared on leaving. Prevents the
+    /// update from re-emitting `Kick` every tick while the player is still reported sealed.
+    kicked: bool,
+}
+
+impl Default for KickCountdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KickCountdown {
+    /// A countdown with the [`DEFAULT_KICK_GRACE_MS`] grace window.
+    pub const fn new() -> Self {
+        Self::with_grace_ms(DEFAULT_KICK_GRACE_MS)
+    }
+
+    /// A countdown with an explicit grace window (ms).
+    pub const fn with_grace_ms(grace_ms: u64) -> Self {
+        Self {
+            grace_ms,
+            armed_at: None,
+            kicked: false,
+        }
+    }
+
+    /// The configured grace window (ms).
+    pub const fn grace_ms(&self) -> u64 {
+        self.grace_ms
+    }
+
+    /// True while a sealed visit is being counted down (armed and not yet kicked).
+    pub const fn is_armed(&self) -> bool {
+        self.armed_at.is_some() && !self.kicked
+    }
+
+    /// Advance the state machine one tick and decide the region-gate action.
+    ///
+    ///  - `now_ms` — a monotonic-ish tick clock in milliseconds (injected; never read from `std`).
+    ///  - `currently_in_sealed` — the hard gate's verdict for THIS tick (typically
+    ///    [`kick_decision`]): is the player in a region they should be kicked from?
+    ///  - `region_name` / `lock_name` — the sealed region and its missing "<Region> Lock" item, for
+    ///    the banner and the returned action.
+    ///
+    /// Returns [`KickAction::None`] when not sealed, [`KickAction::Warn`] during the grace window,
+    /// and exactly one [`KickAction::Kick`] once the grace elapses (then quiet until the player
+    /// leaves). A backwards `now_ms` (e.g. a clock reset on load) only re-lengthens the current
+    /// window; it never fires a spurious kick.
+    pub fn update(
+        &mut self,
+        now_ms: u64,
+        currently_in_sealed: bool,
+        region_name: &str,
+        lock_name: &str,
+    ) -> KickAction {
+        if !currently_in_sealed {
+            // Left the sealed region (or never sealed): disarm and re-arm the kicked latch.
+            self.armed_at = None;
+            self.kicked = false;
+            return KickAction::None;
+        }
+        if self.kicked {
+            // Already kicked this visit; stay quiet until they leave (guards against re-kick spam
+            // if the player is somehow reported still-sealed after the warp).
+            return KickAction::None;
+        }
+        // Sealed and not yet kicked: arm on the first sealed tick, then count down.
+        let started = *self.armed_at.get_or_insert(now_ms);
+        let elapsed = now_ms.saturating_sub(started);
+        if elapsed >= self.grace_ms {
+            self.kicked = true;
+            KickAction::Kick {
+                region: region_name.to_string(),
+            }
+        } else {
+            let remaining = self.grace_ms - elapsed;
+            // ceil to whole seconds: reads full (grace/1000) at arm, hits 1 on the final second.
+            let secs_left = ((remaining + 999) / 1000) as u32;
+            KickAction::Warn {
+                region: region_name.to_string(),
+                secs_left,
+                lock_name: lock_name.to_string(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

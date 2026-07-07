@@ -43,6 +43,12 @@ pub struct Core {
     fogwall: Option<crate::fogwall::FogWallConfig>,
     progressive: ProgressiveState,
     slot_data_parsed: bool,
+    /// The room `seed_name` the current slot_data was parsed for. Guards the one-shot parse against
+    /// a mid-session SEED CHANGE (reconnect to a DIFFERENT seed without an ER reload): when the
+    /// room's seed differs from this, every per-seed table is rebuilt via [`Self::reset_for_new_seed`]
+    /// before re-parsing. `None` until the first parse completes; set (never reset in place) at the
+    /// end of the parse block, alongside `slot_data_parsed = true`.
+    parsed_seed: Option<String>,
     my_name: Option<String>,
     save_path: Option<PathBuf>,
     save_loaded: bool,
@@ -220,6 +226,7 @@ impl shared::Core for Core {
             fogwall: None,
             progressive: ProgressiveState::new(HashMap::new()),
             slot_data_parsed: false,
+            parsed_seed: None,
             my_name: None,
             save_path: None,
             save_loaded: false,
@@ -297,7 +304,30 @@ impl shared::Core for Core {
             log::warn!("mark_checked failed for {checks:?}: {e}");
         }
 
-        // 2. Parse slot_data once.
+        // 2. Parse slot_data once -- but RE-PARSE on a genuine SEED CHANGE (reconnect to a
+        //    DIFFERENT seed without reloading the ER save). `slot_data_parsed` is a one-shot latch,
+        //    so without this `valid_locations` (and every other per-seed table) keeps seed A's data
+        //    while archipelago_rs rebuilds `local_locations_checked` for seed B -- the stale
+        //    `valid_locations` guard then passes a seed-A id absent from seed B into
+        //    `is_local_location_checked`, which panics in the no-unwind FFI frame (abort). It would
+        //    also strand seed B's own new checks (its tables were never built). Compute the room
+        //    seed the SAME way the save-key logic does (client.seed_name()); rebuild only on a real
+        //    switch (er_logic::seed_change: non-empty room seed that differs from the parsed one --
+        //    a same-seed reconnect must NOT reset, or it wipes the flag-poll baseline / save
+        //    persistence that reconnect-to-same-seed relies on).
+        let current_room_seed = self
+            .client()
+            .map(|c| c.seed_name().to_string())
+            .unwrap_or_default();
+        if self.slot_data_parsed
+            && er_logic::seed_change::is_seed_change(self.parsed_seed.as_deref(), &current_room_seed)
+        {
+            log::warn!(
+                "seed change detected (parsed {:?} -> room {current_room_seed:?}) -- rebuilding per-seed state",
+                self.parsed_seed
+            );
+            self.reset_for_new_seed();
+        }
         if !self.slot_data_parsed {
             let parsed = self.client().map(|client| {
                 let sd = client.slot_data();
@@ -511,6 +541,9 @@ impl shared::Core for Core {
                 self.scout = Some(scout);
                 self.goal = Some(goal_cfg);
                 self.slot_data_parsed = true;
+                // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
+                // (without an ER reload) is detected above and rebuilds the per-seed state.
+                self.parsed_seed = Some(current_room_seed.clone());
                 if let Some(warning) = gate_warn {
                     log::error!("{warning}");
                     self.log(ap::Print::message(warning));
@@ -863,7 +896,7 @@ impl shared::Core for Core {
                 if let Some(client) = self.client() {
                     for s in &scanned {
                         if self.valid_locations.contains(&s.location)
-                            && !client.is_local_location_checked(s.location)
+                            && client.try_is_local_location_checked(s.location) == Some(false)
                         {
                             to_check.push(s.location);
                         }
@@ -916,13 +949,16 @@ impl shared::Core for Core {
                 // location already in the server checked-set (loc->flag via locationFlags). A location
                 // enters this set only AFTER its check was reported, so the detour suppresses a
                 // first-time pickup and passes only a genuine re-pickup. See detour::KNOWN_COLLECTED_FLAGS.
-                // NOTE: is_local_location_checked PANICS on datapackage-unknown ids, so the
-                // valid_locations guard MUST come first (same ordering as the poll loop below).
+                // NOTE: the valid_locations guard comes first (same ordering as the poll loop
+                // below); try_is_local_location_checked is additionally non-panicking on a
+                // datapackage-unknown id (returns None -> treated as not-checked), so even a
+                // residual stale id can never abort the no-unwind FFI frame.
                 let collected: std::collections::HashSet<u32> = fp
                     .location_flags
                     .iter()
                     .filter(|&(&loc, _)| {
-                        self.valid_locations.contains(&loc) && client.is_local_location_checked(loc)
+                        self.valid_locations.contains(&loc)
+                            && client.try_is_local_location_checked(loc) == Some(true)
                     })
                     .map(|(_, &flag)| flag)
                     .collect();
@@ -934,7 +970,7 @@ impl shared::Core for Core {
                 // still registers via the AddItemFunc detour.
                 for (&loc, &flag) in &fp.location_flags {
                     if self.valid_locations.contains(&loc)
-                        && !client.is_local_location_checked(loc)
+                        && client.try_is_local_location_checked(loc) == Some(false)
                         && !self.flag_poll_baseline.contains(&flag)
                         && crate::flags::get_event_flag(flag)
                     {
@@ -956,7 +992,7 @@ impl shared::Core for Core {
                     {
                         for &m in members {
                             if self.valid_locations.contains(&m)
-                                && !client.is_local_location_checked(m)
+                                && client.try_is_local_location_checked(m) == Some(false)
                             {
                                 to_check.push(m);
                             }
@@ -967,7 +1003,7 @@ impl shared::Core for Core {
                     if crate::flags::get_event_flag(flag) {
                         for &loc in locs {
                             if self.valid_locations.contains(&loc)
-                                && !client.is_local_location_checked(loc)
+                                && client.try_is_local_location_checked(loc) == Some(false)
                             {
                                 to_check.push(loc);
                             }
@@ -1001,9 +1037,10 @@ impl shared::Core for Core {
                 (Some(cfg), Some(client)) => crate::goal::is_met(
                     cfg,
                     crate::flags::get_event_flag,
-                    // Pre-filter against valid_locations: is_local_location_checked PANICS on
-                    // ids the datapackage doesn't know (archipelago_rs client.rs).
-                    |l| self.valid_locations.contains(&l) && client.is_local_location_checked(l),
+                    // Pre-filter against valid_locations; try_is_local_location_checked is also
+                    // non-panicking on datapackage-unknown ids (None -> not checked).
+                    |l| self.valid_locations.contains(&l)
+                        && client.try_is_local_location_checked(l) == Some(true),
                 ),
                 _ => false,
             };
@@ -1362,6 +1399,52 @@ impl Core {
         }
         self.tracker_in_logic_only = in_logic_only;
         self.tracker_big_ticket_only = big_ticket_only;
+    }
+
+    /// Rebuild every per-seed / per-save latch and table to its `new()` default after a genuine
+    /// SEED CHANGE (reconnect to a different seed without an ER reload). Mirrors `new()` field for
+    /// field across all slot_data-derived state so the one-shot parse (+ save load + location
+    /// cache) re-runs for the new seed. The parse re-run also reconfigures the process-global
+    /// module statics (detour check-item flags, scout item map, deathlink/upgrade toggles, shop
+    /// tables, scaling), so this only has to clear `Core`'s own fields.
+    ///
+    /// Deliberately PRESERVES connection-global / user-preference state, which is NOT seed-derived:
+    /// `base` (the live connection), `detour_installed` (the detour is process-wide, installed
+    /// once), `my_name` (connection identity — re-derived on the re-parse anyway), the static
+    /// tracker tables `region_table` / `coarse_table` / `big_ticket` / `coarse_lock_items` (the
+    /// full datapackage region map, identical for every ER seed), and the tracker UI toggles
+    /// `tracker_visible` / `tracker_in_logic_only` / `tracker_big_ticket_only`. `parsed_seed` is
+    /// left as-is here and set by the caller when the re-parse completes.
+    fn reset_for_new_seed(&mut self) {
+        self.received_through = 0;
+        self.dispatched_through = 0;
+        self.item_map = None;
+        self.item_counts.clear();
+        self.region = None;
+        self.fogwall = None;
+        self.progressive = ProgressiveState::new(HashMap::new());
+        self.slot_data_parsed = false;
+        self.save_path = None;
+        self.save_loaded = false;
+        self.last_persisted_index = -1;
+        self.valid_locations.clear();
+        self.locations_loaded = false;
+        self.flag_poll = None;
+        self.dungeon_sweeps.clear();
+        self.sweep_lock_gates.clear();
+        self.poll_counter = 0;
+        self.flag_poll_baseline.clear();
+        self.flag_poll_baseline_done = false;
+        self.start = None;
+        self.start_flags_done = false;
+        self.start_items_granted = false;
+        self.start_items_ok.clear();
+        self.in_world_since = None;
+        self.scout = None;
+        self.goal = None;
+        self.sent_goal = false;
+        self.hints = HintSet::new();
+        self.hint_log_watermark = 0;
     }
 
     fn write_save(&self) {
