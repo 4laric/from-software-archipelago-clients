@@ -35,7 +35,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "regionSphereTargets", shape: Shape::ScalarIntMap, required: false, greenfield: true },
     ContractKey { name: "regionSphereTargetRanges", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "completionScalingBasis", shape: Shape::Int, required: false, greenfield: true },
-    ContractKey { name: "areaLockFlags", shape: Shape::TripleList, required: true, greenfield: true },
+    ContractKey { name: "areaLockFlags", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "lockRevealFlags", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "regionGraces", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "graceItems", shape: Shape::ScalarIntMap, required: false, greenfield: true },

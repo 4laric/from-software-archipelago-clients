@@ -36,7 +36,7 @@ pub fn configure(sd: &Value) {
         (Some(c), _) => log::info!(
             "enemy-scaling: enabled ({:?}), {} region targets, max {}, floor tier {}",
             c.basis,
-            c.region_targets.len(),
+            c.region_targets.len() + c.region_ranges.len(),
             c.max_target,
             c.floor_tier
         ),
