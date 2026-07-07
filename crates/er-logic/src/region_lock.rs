@@ -78,6 +78,15 @@ impl EnforcementLatch {
     }
 }
 
+/// A region is bloom-SETTLED only when its open flag AND every warp-unlock grace / reveal flag
+/// read back set. Replaces the Windows bloom-pass `get_event_flag(open_flag)` skip-latch
+/// (region.rs), which conflated "front door open" with "all graces applied" and stranded
+/// interior graces after a save-load (gf-region-grace-loss-frontdoor-latch). Host-tested by
+/// `region_lock_replay`.
+pub fn region_bloom_settled(open_flag: u32, flags: &[u32], get_flag: &dyn Fn(u32) -> bool) -> bool {
+    get_flag(open_flag) && flags.iter().all(|&f| get_flag(f))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

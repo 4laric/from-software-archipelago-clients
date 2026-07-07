@@ -15,17 +15,11 @@
 //! unset flags each tick (reconcile, don't dispatch). This module lifts that predicate into pure,
 //! host-tested code the Windows pass should call, and replays the save-load that strands the graces.
 
-/// A region's bloom is SETTLED only when the open flag AND every warp-unlock grace read back set.
-/// Replaces the Windows bloom pass's `get_event_flag(open_flag)` skip-latch (region.rs:143), which
-/// conflates "front door open" with "all graces applied" and strands interior graces after a
-/// save-load. See the module docs.
-pub fn region_bloom_settled(open_flag: u32, graces: &[u32], get_flag: &dyn Fn(u32) -> bool) -> bool {
-    get_flag(open_flag) && graces.iter().all(|&g| get_flag(g))
-}
 
 #[cfg(test)]
 mod replay {
     use super::*;
+    use crate::region_lock::region_bloom_settled;
     use crate::hook::GameHook;
     use std::collections::HashMap;
 

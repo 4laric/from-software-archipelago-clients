@@ -197,8 +197,20 @@ pub fn tick_natural_key_triggers(cfg: &RegionConfig, received: &HashSet<String>)
             Some(&f) => f,
             None => continue, // no apparatus to bloom
         };
-        if flags::get_event_flag(open_flag) {
-            continue; // already bloomed (latch)
+        // Reconcile-safe latch (gf-region-grace-loss-frontdoor-latch): skip only when the region
+        // is FULLY bloomed -- open flag AND every grace AND every reveal flag observed set.
+        // Latching on the open flag alone stranded interior graces after a save-load when the
+        // front-door grace doubles as the open flag (Limgrave 73100). Pure gate host-tested by
+        // region_lock_replay.
+        let mut bloom_flags: Vec<u32> = Vec::new();
+        if let Some(fs) = cfg.region_graces.get(name) {
+            bloom_flags.extend_from_slice(fs);
+        }
+        if let Some(fs) = cfg.lock_reveal_flags.get(name) {
+            bloom_flags.extend_from_slice(fs);
+        }
+        if er_logic::region_lock::region_bloom_settled(open_flag, &bloom_flags, &|f| flags::get_event_flag(f)) {
+            continue; // fully bloomed -- reconcile-safe
         }
         let fired = clauses.iter().any(|cl| {
             cl.items.iter().all(|nm| received.contains(nm))
