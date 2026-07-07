@@ -18,7 +18,6 @@
 
 #[cfg(test)]
 mod replay {
-    use super::*;
     use crate::region_lock::region_bloom_settled;
     use crate::hook::GameHook;
     use std::collections::HashMap;
