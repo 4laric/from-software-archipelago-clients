@@ -301,6 +301,29 @@ impl shared::Core for Core {
         if !self.slot_data_parsed {
             let parsed = self.client().map(|client| {
                 let sd = client.slot_data();
+                // Full slot_data dump (playtest diagnostics): every top-level key + a truncated
+                // JSON value, so a client log alone answers "what did this seed emit?" -- e.g. is
+                // regionSphereTargetRanges present/non-empty, is the seed `versions`-stamped.
+                // Mirrors the gen-side spoiler dump (greenfield core.py write_spoiler).
+                if let Some(obj) = sd.as_object() {
+                    log::info!("slot_data dump ({} keys):", obj.len());
+                    let mut items: Vec<(&String, String)> = obj
+                        .iter()
+                        .map(|(k, v)| {
+                            let s = v.to_string();
+                            let s = if s.chars().count() > 200 {
+                                format!("{} ...(truncated)", s.chars().take(200).collect::<String>())
+                            } else {
+                                s
+                            };
+                            (k, s)
+                        })
+                        .collect();
+                    items.sort_by(|a, b| a.0.cmp(b.0));
+                    for (k, rv) in items {
+                        log::info!("  {k} = {rv}");
+                    }
+                }
                 // Two-sided contract validation: warn (not reject) on any slot_data mismatch
                 // so a partially-compatible seed still boots but every problem is visible.
                 let contract_problems = crate::contract_gen::validate(sd);
