@@ -41,6 +41,24 @@ pub fn newly_set_since_baseline(
         .collect()
 }
 
+/// At CONNECT, choose the baseline the poll measures transitions against. If the save carries a
+/// PERSISTED baseline (captured once, at the first fresh-save connect), reuse it verbatim; only a
+/// save with NO persisted baseline (a genuinely fresh session) snapshots the currently-set flags.
+/// This is the reconnect fix: re-snapshotting at every connect folds mid-playthrough pickups into
+/// the baseline, making their checks inert forever ("picked it up, got nothing"). Persisting the
+/// baseline once keeps post-baseline pickups firing across reconnects. Pure home for the
+/// connect-time half of `patch_flagpoll_baseline_persist.py`.
+pub fn effective_baseline(
+    persisted: Option<&HashSet<u32>>,
+    watched: &[u32],
+    get_flag: &dyn Fn(u32) -> bool,
+) -> HashSet<u32> {
+    match persisted {
+        Some(b) => b.clone(),
+        None => snapshot_baseline(watched, get_flag),
+    }
+}
+
 #[cfg(test)]
 mod replay {
     use super::*;
@@ -237,5 +255,47 @@ mod replay {
         // Empty baseline degrades to the raw level check — every set watched flag reports.
         let empty: HashSet<u32> = HashSet::new();
         assert_eq!(newly_set_since_baseline(&WATCHED, &empty, &now_all_set), WATCHED.to_vec());
+    }
+
+    #[test]
+    fn persisted_baseline_survives_a_reconnect() {
+        // The Sacred Tear reconnect bug (gf-flagpoll-newsave-default-flags / "picked it up, got
+        // nothing"): a mid-playthrough reconnect RE-SNAPSHOTS the baseline. Because the player has
+        // since earned pickups, those now-set flags fold into the fresh baseline and their checks go
+        // inert forever. The fix persists the fresh-save baseline ONCE (SaveState.flag_poll_baseline)
+        // and reuses it on every reconnect via `effective_baseline`, so a post-baseline pickup still
+        // fires after the reconnect. Models the exact fresh-connect -> pickup -> reconnect timeline
+        // as a regression pair.
+        let mut g = FreshSaveGame::new();
+        g.fresh_save_defaults(); // 60000 / 60020 up on the fresh save
+
+        // FIRST connect (no persisted baseline yet): snapshot the fresh-save defaults; this is what
+        // the fixed client persists into SaveState.flag_poll_baseline.
+        let persisted = effective_baseline(None, &WATCHED, &|f| g.get_event_flag(f));
+        assert!(
+            persisted.contains(&FLASK_OF_CRIMSON_TEARS) && persisted.contains(&WONDROUS_PHYSICK),
+            "the fresh-save baseline captures the default acquisition flags"
+        );
+
+        // The player genuinely earns a check mid-session (the Church of Pilgrimage Sacred Tear).
+        g.set_event_flag(GENUINE_PICKUP, true);
+
+        // RECONNECT, buggy path (persisted = None -> re-snapshot): the mid-session pickup is now set,
+        // so it folds into the baseline and can NEVER fire again — reproduces "got nothing".
+        let rebaseline_buggy = effective_baseline(None, &WATCHED, &|f| g.get_event_flag(f));
+        assert!(
+            newly_set_since_baseline(&WATCHED, &rebaseline_buggy, &|f| g.get_event_flag(f)).is_empty(),
+            "regression guard: re-snapshotting at reconnect strands the mid-session pickup (the bug)"
+        );
+
+        // RECONNECT, fixed path: reuse the PERSISTED fresh-save baseline. The pickup is a genuine
+        // post-baseline transition, so it still fires after the reconnect.
+        let rebaseline_fixed =
+            effective_baseline(Some(&persisted), &WATCHED, &|f| g.get_event_flag(f));
+        assert_eq!(
+            newly_set_since_baseline(&WATCHED, &rebaseline_fixed, &|f| g.get_event_flag(f)),
+            vec![GENUINE_PICKUP],
+            "the persisted baseline lets a post-baseline pickup fire across a reconnect"
+        );
     }
 }

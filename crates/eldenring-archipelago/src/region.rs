@@ -589,4 +589,33 @@ fn str_to_i32vec(v: Option<&Value>) -> HashMap<String, Vec<i32>> {
     // lockGrantItems values are GOODS-packed FullIDs (er_code | 0x40000000), all < i32::MAX.
     let mut m = HashMap::new();
     if let Some(Value::Object(o)) = v {
-        for (k, val) in 
+        for (k, val) in o {
+            if let Some(arr) = val.as_array() {
+                m.insert(
+                    k.clone(),
+                    arr.iter()
+                        .filter_map(|x| x.as_i64().map(|n| n as i32))
+                        .collect(),
+                );
+            }
+        }
+    }
+    m
+}
+
+fn str_to_u32vec(v: Option<&Value>) -> HashMap<String, Vec<u32>> {
+    let mut m = HashMap::new();
+    if let Some(Value::Object(o)) = v {
+        for (k, val) in o {
+            if let Some(arr) = val.as_array() {
+                m.insert(
+                    k.clone(),
+                    arr.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as u32))
+                        .collect(),
+                );
+            }
+        }
+    }
+    m
+}

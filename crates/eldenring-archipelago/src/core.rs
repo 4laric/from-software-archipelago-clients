@@ -562,6 +562,14 @@ impl shared::Core for Core {
                     st.progressive_high_index,
                 );
                 self.start_items_granted = st.start_items_granted;
+                // Reuse the once-captured fresh-save baseline ACROSS reconnects
+                // (gf-flagpoll-newsave-default-flags / "picked it up, got nothing"):
+                // re-snapshotting the progressed save would fold mid-session pickups into the
+                // baseline and strand their checks forever. Empty = fresh save, nothing
+                // persisted yet -> capture below on the first in-world poll. Mirrors the pure
+                // er_logic::flagpoll_baseline_replay::effective_baseline (host-tested).
+                self.flag_poll_baseline = st.flag_poll_baseline.iter().copied().collect();
+                self.flag_poll_baseline_done = !self.flag_poll_baseline.is_empty();
                 self.last_persisted_index = st.last_received_index;
                 log::info!("save persistence armed at {}", path.display());
                 self.save_path = Some(path);
@@ -778,7 +786,26 @@ impl shared::Core for Core {
                     GrantAction::SkipUnmapped { ap_item_id } => {
                         // R5 (SWEEP): AP id absent from apIdsToItemIds and progressive didn't
                         // handle it — nothing granted; without this the item vanishes traceless.
-                        warn_unmapped_once(&ri.name, ap_item_id);
+                        // FALSE-ALARM SILENCE (patch_silence_regionlock_grant_warn):
+                        // region-lock items are intentionally absent from apIdsToItemIds --
+                        // they are handled by the NAME-dispatch above (open_on_received_name
+                        // sets the region's open flag). They still reach this grant arm and
+                        // would otherwise trip the misleading "no ER mapping ... contract
+                        // drift?" warn. Identify them cleanly by presence in region_open_flags
+                        // (the regionOpenFlags slot_data key set, keyed by lock name -- no
+                        // hardcoded ap ids) and log at debug. Truly-unmapped ids keep the warn.
+                        let is_region_lock = dispatch
+                            .region
+                            .map(|c| c.region_open_flags.contains_key(&ri.name))
+                            .unwrap_or(false);
+                        if is_region_lock {
+                            log::debug!(
+                                "region-lock '{}' (ap id {ap_item_id}) -> handled via open flag (not an ER item grant)",
+                                ri.name
+                            );
+                        } else {
+                            warn_unmapped_once(&ri.name, ap_item_id);
+                        }
                         if let Some(restored) = crate::keyitems::restored_great_rune_goods(&ri.name)
                         {
                             let _ = dispatch.hook.grant_full_id(restored, 1);
@@ -879,6 +906,9 @@ impl shared::Core for Core {
                     "flag-poll baseline: {} guarding flags already set on connect (excluded)",
                     self.flag_poll_baseline.len()
                 );
+                // Persist the freshly-captured baseline NOW so a reconnect before the next
+                // item still loads it (persist-on-watermark-advance can lag arbitrarily).
+                self.write_save();
             }
             let mut to_check: Vec<i64> = Vec::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
@@ -1342,6 +1372,7 @@ impl Core {
         let st = SaveState {
             last_received_index: self.received_through as i64,
             start_items_granted: self.start_items_granted,
+            flag_poll_baseline: self.flag_poll_baseline.iter().copied().collect(),
             notify_granted: Default::default(),
             progressive_counter: counter.into_iter().collect::<BTreeMap<_, _>>(),
             progressive_high_index: high,

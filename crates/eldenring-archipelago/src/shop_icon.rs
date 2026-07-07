@@ -64,7 +64,19 @@ pub fn run() -> bool {
             native += 1;
             continue;
         }
-        let gid = good as u32;
+        // shopPreviewGoods carries ER FullIDs (gen_data ORs the category nibble into the
+        // equipId so the client previews the good in the right param table). The flower repaints
+        // an EquipParamGoods.iconId, so it only applies to GOODS wares: strip the nibble to the
+        // real goods row id (as shop_sell does), and skip non-goods wares (their icon lives in a
+        // different param table; reusing a weapon/armor id as a goods row id would flower the
+        // WRONG good). Without this, a GOODS FullID (0x40000000|row, ~1.07e9) never matches a
+        // real EquipParamGoods row -> get_mut misses -> the icon is never set and the slot keeps
+        // the vanilla good's icon (name/icon desync, playtest 2026-07-07).
+        let full = good as u32;
+        if er_codec::item_category_of(full) != er_codec::CATEGORY_GOODS {
+            continue;
+        }
+        let gid = er_codec::row_id_of(full);
         if !seen.insert(gid) {
             continue; // dedup
         }
