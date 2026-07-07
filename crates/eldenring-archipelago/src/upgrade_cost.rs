@@ -1,66 +1,64 @@
-//! FLATTEN_REGULAR_UPGRADES — flatten regular (non-somber) weapon reinforcement costs at
-//! runtime by editing `EquipMtrlSetParam` in memory. No baker, no RE, no code-cave.
+//! FLATTEN_REGULAR_UPGRADES — cap regular (non-somber) weapon reinforcement costs at runtime by
+//! editing `EquipMtrlSetParam` in memory. No baker, no RE, no code-cave.
 //!
-//! The baker used to flatten these counts on-disk (regulation.bin `EquipMtrlSetParam` edit).
-//! With the baker retired we do the SAME edit against the live param table, exactly the way
-//! `shop_flags.rs` rewrites `ShopLineupParam` rows: `SoloParamRepository::instance_mut()` +
-//! `rows_mut::<EquipMtrlSetParam>()` + typed `set_item_num0X()` setters.
+//! GRADUATED (2026-07-07): the slot_data option is an INT `stones/level` (0 = off; 1..4 = cap each
+//! regular-stone upgrade step at N). Was a bool (cap at 1). Lower-only: a step already costing <= N
+//! is untouched, so vanilla 2/4/6 with N=3 becomes 2/3/3 (never RAISED — reconnect-safe). N=1 is the
+//! old flatten. The apworld's per-sphere auto-ramp sizes stone supply against THIS same ladder, so
+//! keep the two in sync (tools/analyze_upgrade_curve.py models the identical cap-at-N cost).
 //!
 //! Model (Paramdex EQUIP_MTRL_SET_PARAM_ST): each reinforcement step points (via
-//! `ReinforceParamWeapon.materialSetId`) at one EquipMtrlSetParam row that lists up to 6
-//! (materialId0X, itemNum0X) pairs — the material and how many are needed for that step. We
-//! scan every row and, for any slot whose material is a REGULAR smithing stone, clamp its
-//! required count to 1. Somber material sets are left untouched (their materialIds are somber
-//! stones, which are not in REGULAR_STONE_IDS).
+//! `ReinforceParamWeapon.materialSetId`) at one EquipMtrlSetParam row listing up to 6
+//! (materialId0X, itemNum0X) pairs. We scan every row and, for any slot whose material is a REGULAR
+//! smithing stone, clamp its required count DOWN to N. Somber material sets are left untouched.
 //!
 //! WIRING (see patch_flatten_regular_upgrades.py):
 //!   - lib.rs: `mod upgrade_cost;`
-//!   - core.rs update_live() (slot_data parse, by set_auto_upgrade): `set_flatten(sd.pointer(
-//!     "/options/flatten_regular_upgrades").and_then(|v| v.as_i64()).unwrap_or(0) != 0);`
+//!   - core.rs update_live() (slot_data parse): `set_flatten(sd.pointer(
+//!     "/options/flatten_regular_upgrades").and_then(|v| v.as_i64()).unwrap_or(0));`
 //!   - core.rs in-world tick (by shop_flags::run): `crate::upgrade_cost::maybe_apply();`
 //!
 //! FALLBACK: if an in-game smithing-menu check shows the counts did NOT drop, switch to the
-//! grant-time 2x multiplier in detour.rs (see the response notes) — this module then just
-//! stays off (option default 0).
+//! grant-time multiplier in detour.rs — this module then just stays off (option default 0).
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use eldenring::cs::{EquipMtrlSetParam, SoloParamRepository};
 use eldenring::param::EQUIP_MTRL_SET_PARAM_ST;
 use fromsoftware_shared::FromStatic;
 
-/// Regular (non-somber) upgrade materials: Smithing Stone [1]-[8] (EquipParamGoods 10100-10107)
-/// + Ancient Dragon Smithing Stone (10140). Somber stones (10160-10168, 10200) are deliberately
-/// EXCLUDED so somber weapons keep their vanilla curve.
-const REGULAR_STONE_IDS: &[i32] = &[
-    10100, 10101, 10102, 10103, 10104, 10105, 10106, 10107, 10140,
-];
+// The per-slot clamp decision + cap bound + re-arm latch semantics are pure and live in er-logic
+// (`upgrade_cost`), where they are replay-tested (`upgrade_cost_replay`) against the reconnect param
+// reload. This module supplies the live-param seam; it must use the SAME decision so the test guards
+// the shipped path.
+use er_logic::upgrade_cost::{clamp_count, MAX_CAP};
 
-/// Flat required count per regular-stone upgrade step.
-const FLAT_COUNT: i8 = 1;
+/// Resolved stones-per-level cap: 0 = off, 1..MAX_CAP = cap each regular step at N. Set from
+/// slot_data at connect.
+static FLAT_N: AtomicI32 = AtomicI32::new(0);
+static APPLIED: AtomicI32 = AtomicI32::new(-1); // last-applied cap; -1 = not yet applied this arm
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-static APPLIED: AtomicBool = AtomicBool::new(false);
-
-/// Set from slot_data `/options/flatten_regular_upgrades` at connect. Re-arms the one-shot apply
-/// so a reconnect re-flattens a freshly (re)loaded param table.
-pub fn set_flatten(on: bool) {
-    ENABLED.store(on, Ordering::SeqCst);
-    APPLIED.store(false, Ordering::SeqCst);
-    log::info!("flatten_regular_upgrades: {}", if on { "ON" } else { "off" });
+/// Set from slot_data `/options/flatten_regular_upgrades` at connect. Re-arms the one-shot apply so a
+/// reconnect re-caps a freshly (re)loaded param table. 0 disables; values are clamped to [0, MAX_CAP].
+pub fn set_flatten(n: i64) {
+    let cap = n.clamp(0, MAX_CAP as i64) as i32;
+    FLAT_N.store(cap, Ordering::SeqCst);
+    APPLIED.store(-1, Ordering::SeqCst);
+    if cap > 0 {
+        log::info!("flatten_regular_upgrades: ON (cap regular steps at {cap} stone(s)/level)");
+    } else {
+        log::info!("flatten_regular_upgrades: off");
+    }
 }
 
-fn is_regular_stone(id: i32) -> bool {
-    REGULAR_STONE_IDS.contains(&id)
-}
-
-/// Idempotent in-world one-shot: clamp every regular-stone material count to FLAT_COUNT. Read-
-/// then-act and lower-only; no-op if disabled, already applied, or the repo isn't up yet (retried
-/// next tick). Returns the number of material slots changed.
+/// Idempotent in-world one-shot: clamp every regular-stone material count DOWN to the resolved cap N.
+/// Read-then-act and lower-only; no-op if disabled, already applied at this cap, or the repo isn't up
+/// yet (retried next tick). Returns the number of material slots changed.
 pub fn maybe_apply() -> u32 {
-    if !ENABLED.load(Ordering::SeqCst) || APPLIED.load(Ordering::SeqCst) {
+    let cap = FLAT_N.load(Ordering::SeqCst);
+    if cap <= 0 || APPLIED.load(Ordering::SeqCst) == cap {
         return 0;
     }
     // SAFETY: FD4 singleton; game thread, in-world (caller gates). instance_mut + rows_mut are the
@@ -71,27 +69,28 @@ pub fn maybe_apply() -> u32 {
     };
     let mut changed = 0u32;
     for (id, row) in repo.rows_mut::<EquipMtrlSetParam>() {
-        changed += flatten_row(id, row);
+        changed += flatten_row(id, row, cap);
     }
-    APPLIED.store(true, Ordering::SeqCst);
+    APPLIED.store(cap, Ordering::SeqCst);
     log::info!(
-        "flatten_regular_upgrades: === clamped {changed} regular-stone material slot(s) to {FLAT_COUNT} ==="
+        "flatten_regular_upgrades: === clamped {changed} regular-stone material slot(s) to {cap} ==="
     );
     changed
 }
 
-fn flatten_row(id: u32, row: &mut EQUIP_MTRL_SET_PARAM_ST) -> u32 {
+fn flatten_row(id: u32, row: &mut EQUIP_MTRL_SET_PARAM_ST, cap: i32) -> u32 {
     let mut n = 0u32;
     macro_rules! slot {
         ($mid:ident, $num:ident, $set:ident) => {{
             let mid = row.$mid();
             let cur = row.$num();
-            // cur == -1 means "slot unused"; only lower real counts > FLAT_COUNT.
-            if is_regular_stone(mid) && cur > FLAT_COUNT {
-                row.$set(FLAT_COUNT);
+            // Shared lower-only decision (er_logic::upgrade_cost): Some(new) only for a regular stone
+            // above the cap; None for unused (-1) / non-regular / already-low slots.
+            if let Some(nv) = clamp_count(mid, cur, cap) {
+                row.$set(nv);
                 n += 1;
                 log::info!(
-                    "flatten: mtrlset {id} {} {cur} -> {FLAT_COUNT} (stone {mid})",
+                    "flatten: mtrlset {id} {} {cur} -> {nv} (stone {mid})",
                     stringify!($num)
                 );
             }

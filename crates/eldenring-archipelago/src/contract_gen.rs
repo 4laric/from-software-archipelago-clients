@@ -70,6 +70,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "pool_builder_juice_added", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "pool_builder_intensity_floor", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "pool_builder_juice_candidates", shape: Shape::Any, required: false, greenfield: true },
+    ContractKey { name: "pool_builder_juice_pct", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "locationIdsToKeys", shape: Shape::Any, required: true, greenfield: false },
     ContractKey { name: "itemCounts", shape: Shape::Any, required: true, greenfield: false },
     ContractKey { name: "naturalKeyTriggers", shape: Shape::Any, required: true, greenfield: false },

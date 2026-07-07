@@ -130,49 +130,23 @@ const REFRESH_THROTTLE: Duration = Duration::from_millis(1500);
 /// input unchanged for non-weapons and whenever any read can't be done safely (raise-only by
 /// construction: never lowers an already-higher granted weapon).
 pub fn apply_auto_upgrade(full_id: i32) -> i32 {
-    if !auto_upgrade_on() {
-        return full_id;
-    }
-    // Only touch game memory in-world (params + inventory loaded). Mirrors the param-probe gate;
-    // before the world is up the SoloParamRepository / GameDataMan singletons fault.
-    if !crate::flags::in_world() {
-        return full_id;
-    }
-    // Decode base/level + category guard (pure). Only WEAPON-category FullIDs proceed.
-    let Some((base, level)) = decode_weapon_id(full_id) else {
-        return full_id;
-    };
-
-    // EquipParamWeapon row(base) -> reinforceTypeId, then ReinforceParamWeapon consecutive-row cap.
-    let Some((cap, somber)) = weapon_track_and_cap(base) else {
-        return full_id; // not an upgradeable weapon (no param row / cap 0) -> inert
-    };
-
-    // Highest +N held on this track. None => couldn't resolve the bag safely -> inert (no guess).
-    let Some(target_raw) = highest_held_level(somber) else {
-        return full_id;
-    };
-
-    let mut target = target_raw;
-    if target > cap {
-        target = cap;
-    }
-    if target <= level {
-        return full_id; // already at/above target — return unchanged (C++ returns false)
-    }
-    let up = base + target;
-    log::info!(
-        "auto_upgrade: weapon {:#x} (+{}) -> +{} ({} track, cap +{})",
-        base,
-        level,
-        target,
-        if somber { "somber" } else { "normal" },
-        cap
+    // Delegate to the host-tested decision (er_logic::upgrades::apply_auto_upgrade -- unit
+    // tests + the upgrades_replay reconnect-burst tier) so the client shares ONE copy instead
+    // of a drifting inline twin. The live reads still flow through EldenRingHook's
+    // weapon_track_and_cap / highest_held_level (which keep the 1500ms UPGRADE_TARGETS
+    // throttle); off / off-world / non-weapon / unresolvable / raise-only / cap-clamp all live
+    // in the shared fn. "A fix is a predicate production must call" (CONTRIBUTING).
+    let up = er_logic::upgrades::apply_auto_upgrade(
+        &crate::hook_impl::EldenRingHook,
+        auto_upgrade_on(),
+        full_id,
     );
-    // Re-attach the category nibble. WEAPON category is 0x0, so for a weapon this is a no-op, but we
-    // keep the mask symmetric with decode_weapon_id (C++ rewrites base+target with category 0).
-    (full_id & !(ROW_ID_MASK as i32)) | (up & ROW_ID_MASK as i32)
+    if up != full_id {
+        log::info!("auto_upgrade: {:#x} -> {:#x}", full_id, up);
+    }
+    up
 }
+
 
 /// ER category nibble mask / weapon-category constant (er_codec mirror; weapons are category 0x0).
 const ROW_ID_MASK: u32 = er_codec::ROW_ID_MASK;
