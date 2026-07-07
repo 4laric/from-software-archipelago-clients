@@ -490,46 +490,48 @@ impl<G: Game> Overlay<G> {
                     self.last_log_emitted = *log_time;
                 }
 
-                // Render every log row directly instead of using a ListClipper.
-                // The clipper assumes a fixed per-item height, but
-                // write_message_data wraps long messages onto a variable number
-                // of lines. That broken assumption made scroll_max_y unstable,
-                // so the bottom check below almost never held and auto-scroll
-                // silently stopped keeping the newest text in view.
-                for (message, _) in core.base().logs() {
-                    use ap::Print::*;
-                    write_message_data(
-                        ui,
-                        message.data(),
-                        // De-emphasize miscellaneous server prints.
-                        match message {
-                            Chat { .. }
-                            | ServerChat { .. }
-                            | Tutorial { .. }
-                            | CommandResult { .. }
-                            | AdminCommandResult { .. }
-                            | Unknown { .. } => 0xff,
-                            ItemSend { item, .. }
-                            | ItemCheat { item, .. }
-                            | Hint { item, .. }
-                                if core.base().config().slot() == item.receiver().name()
-                                    || core.base().config().slot() == item.sender().name() =>
-                            {
-                                0xFF
-                            }
-                            _ => 0xAA,
-                        },
-                    );
+                let clipper = ListClipper::new(core.base().logs().len().try_into().unwrap());
+                let mut clip = clipper.begin(ui);
+                while clip.step() {
+                    for (message, _) in core
+                        .base()
+                        .logs()
+                        .skip(clip.display_start().try_into().unwrap_or(0))
+                        .take(
+                            (clip.display_end() - clip.display_start())
+                                .try_into()
+                                .unwrap_or(0),
+                        )
+                    {
+                        use ap::Print::*;
+                        write_message_data(
+                            ui,
+                            message.data(),
+                            // De-emphasize miscellaneous server prints.
+                            match message {
+                                Chat { .. }
+                                | ServerChat { .. }
+                                | Tutorial { .. }
+                                | CommandResult { .. }
+                                | AdminCommandResult { .. }
+                                | Unknown { .. } => 0xff,
+                                ItemSend { item, .. }
+                                | ItemCheat { item, .. }
+                                | Hint { item, .. }
+                                    if core.base().config().slot() == item.receiver().name()
+                                        || core.base().config().slot() == item.sender().name() =>
+                                {
+                                    0xFF
+                                }
+                                _ => 0xAA,
+                            },
+                        );
+                    }
                 }
-
-                // Was the user already at the bottom? Measure BEFORE the forced
-                // set_scroll_y, and allow a 1px epsilon so sub-pixel rounding in
-                // scroll_max_y can't latch this to false and kill auto-scroll.
-                let at_bottom = ui.scroll_y() >= ui.scroll_max_y() - 1.0;
                 if self.log_was_scrolled_down && self.frames_since_new_logs < 10 {
                     ui.set_scroll_y(ui.scroll_max_y());
                 }
-                self.log_was_scrolled_down = at_bottom;
+                self.log_was_scrolled_down = ui.scroll_y() == ui.scroll_max_y();
             });
     }
 

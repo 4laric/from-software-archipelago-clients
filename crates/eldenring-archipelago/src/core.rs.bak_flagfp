@@ -58,15 +58,6 @@ pub struct Core {
     sweep_lock_gates: HashMap<i64, String>,
     /// Throttle the (potentially large) flag poll to a few times a second.
     poll_counter: u32,
-    /// Guarding flags already set the first time we polled IN-WORLD (new-save defaults: the
-    /// tutorial Flask of Crimson Tears flag 60000, physick / sacred-tear flags, etc.). The poll
-    /// fires on a flag being SET, not on an unset->set transition, so without this a location
-    /// whose flag defaults to set on a fresh save auto-checks on connect (silent) and its vanilla
-    /// ware then leaks past the suppressor. Excluding this snapshot retires the ad-hoc
-    /// FLAG_POLL_FALSE_POSITIVES denylist.
-    flag_poll_baseline: HashSet<u32>,
-    /// Whether flag_poll_baseline has been captured (once, on the first in-world poll).
-    flag_poll_baseline_done: bool,
     /// Start-of-run grants (items / graces / map reveal).
     start: Option<crate::startgrants::StartConfig>,
     start_flags_done: bool,
@@ -230,8 +221,6 @@ impl shared::Core for Core {
             dungeon_sweeps: HashMap::new(),
             sweep_lock_gates: HashMap::new(),
             poll_counter: 0,
-            flag_poll_baseline: HashSet::new(),
-            flag_poll_baseline_done: false,
             start: None,
             start_flags_done: false,
             start_items_granted: false,
@@ -835,28 +824,6 @@ impl shared::Core for Core {
         //     change fast and the map can be large. Dedup via the server's checked set (reload-safe).
         self.poll_counter = self.poll_counter.wrapping_add(1);
         if self.locations_loaded && self.poll_counter.is_multiple_of(15) {
-            // Capture the new-save baseline once, the first time we poll IN-WORLD (flags are
-            // readable only after the save loads). Any guarding flag already set at this point
-            // is a new-save default, not a pickup made this session, so it must not fire a check.
-            // Computed into an owned local first so the &self.flag_poll borrow ends before the
-            // &mut self.flag_poll_baseline assignment.
-            if !self.flag_poll_baseline_done && crate::flags::in_world() {
-                let baseline: HashSet<u32> = match self.flag_poll.as_ref() {
-                    Some(fp) => fp
-                        .location_flags
-                        .values()
-                        .copied()
-                        .filter(|&f| crate::flags::get_event_flag(f))
-                        .collect(),
-                    None => HashSet::new(),
-                };
-                self.flag_poll_baseline = baseline;
-                self.flag_poll_baseline_done = true;
-                log::info!(
-                    "flag-poll baseline: {} guarding flags already set on connect (excluded)",
-                    self.flag_poll_baseline.len()
-                );
-            }
             let mut to_check: Vec<i64> = Vec::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
                 // Refresh the vanilla-suppressor's collected-flag set: the acquisition flags of every
@@ -874,15 +841,9 @@ impl shared::Core for Core {
                     .map(|(_, &flag)| flag)
                     .collect();
                 crate::detour::set_known_collected_flags(collected);
-                // 2026-07-06: some getItemFlagId flags are SET on a brand-new save (Flask of
-                // Crimson Tears 60000, physick / sacred-tear flags, Leyndell Crimson Hood
-                // 10007452, Black Knifeprint 400357). flag_poll_baseline (captured on the first
-                // in-world poll) holds them so we never false-check them; the genuine pickup
-                // still registers via the AddItemFunc detour.
                 for (&loc, &flag) in &fp.location_flags {
                     if self.valid_locations.contains(&loc)
                         && !client.is_local_location_checked(loc)
-                        && !self.flag_poll_baseline.contains(&flag)
                         && crate::flags::get_event_flag(flag)
                     {
                         to_check.push(loc);

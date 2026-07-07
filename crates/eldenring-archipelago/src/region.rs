@@ -463,9 +463,23 @@ pub fn open_on_received_name(cfg: &RegionConfig, name: &str) -> bool {
         }
     }
     if let Some(fs) = cfg.region_graces.get(name) {
+        // INSTRUMENT (patch_log_grace_readback): set each grace flag, then read it back so the
+        // log pins whether these writes actually land in EventFlagMan.
+        let mut set = 0usize;
+        let mut failed: Vec<u32> = Vec::new();
         for &f in fs {
             flags::set_event_flag(f, true);
+            if flags::get_event_flag(f) { set += 1; } else { failed.push(f); }
         }
+        log::info!(
+            "RegionLock '{name}' graces: {} requested, {} set, {} failed{}",
+            fs.len(), set, failed.len(),
+            if failed.is_empty() { String::new() } else { format!(" = {failed:?}") }
+        );
+    } else {
+        log::warn!(
+            "RegionLock '{name}': NO region_graces entry (cfg.region_graces empty or key mismatch)"
+        );
     }
     opened
 }
