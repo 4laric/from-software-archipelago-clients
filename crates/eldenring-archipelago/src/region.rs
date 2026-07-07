@@ -106,8 +106,7 @@ static REGION_PLAY_IDS: &[(&str, &[i32])] = &[
     ("Liurnia of the Lakes", &[62000, 62001, 62002]),
     ("Altus Plateau", &[63000, 63002, 63003]),
     ("Mt. Gelmir", &[63001, 16000, 39200]),
-    ("Caelid", &[64000, 64002]),
-    ("Dragonbarrow", &[64001]),
+    ("Caelid", &[64000, 64001, 64002]),
     ("Mountaintops of the Giants", &[65000, 65001]),
     ("Consecrated Snowfield", &[65002]),
     ("Stormveil Castle", &[10000]),
@@ -590,33 +589,4 @@ fn str_to_i32vec(v: Option<&Value>) -> HashMap<String, Vec<i32>> {
     // lockGrantItems values are GOODS-packed FullIDs (er_code | 0x40000000), all < i32::MAX.
     let mut m = HashMap::new();
     if let Some(Value::Object(o)) = v {
-        for (k, val) in o {
-            if let Some(arr) = val.as_array() {
-                m.insert(
-                    k.clone(),
-                    arr.iter()
-                        .filter_map(|x| x.as_i64().map(|n| n as i32))
-                        .collect(),
-                );
-            }
-        }
-    }
-    m
-}
-
-fn str_to_u32vec(v: Option<&Value>) -> HashMap<String, Vec<u32>> {
-    let mut m = HashMap::new();
-    if let Some(Value::Object(o)) = v {
-        for (k, val) in o {
-            if let Some(arr) = val.as_array() {
-                m.insert(
-                    k.clone(),
-                    arr.iter()
-                        .filter_map(|x| x.as_u64().map(|n| n as u32))
-                        .collect(),
-                );
-            }
-        }
-    }
-    m
-}
+        for (k, val) in 
