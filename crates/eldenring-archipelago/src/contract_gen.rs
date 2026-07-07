@@ -65,6 +65,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "great_runes_required", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "great_rune_items", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "bossLocations", shape: Shape::Any, required: false, greenfield: true },
+    ContractKey { name: "bossLockItems", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "filler_foreign_localized", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "pool_builder", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "pool_builder_juice_added", shape: Shape::Any, required: false, greenfield: true },

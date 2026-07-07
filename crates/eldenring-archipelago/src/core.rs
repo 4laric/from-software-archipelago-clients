@@ -112,6 +112,16 @@ pub struct Core {
     tracker_in_logic_only: bool,
     /// Tracker filter: show only big-ticket (prominent) checks.
     tracker_big_ticket_only: bool,
+    /// slot_data bossLockItems (mode A, SPEC-boss-lock-tracker.md): parsed boss-defeat trophy defs
+    /// (flag -> name/region/boss_ap_id, gate=None for v0.2). METADATA + a defeat-flag watch only —
+    /// NOT AP items and NOT new checks; the boss's own boss_ap_id location still fires through the
+    /// locationFlags poll. Drives the one-shot "Felled: <Boss>" banner + the tracker Bosses group.
+    boss_defs: Vec<er_logic::boss_felled::BossDef>,
+    /// Per-boss PREVIOUS defeat-flag state (flags already seen SET) for the one-shot "Felled" banner
+    /// edge detector. Primed on the first in-world poll (already-dead bosses, incl. reconnect) so
+    /// their banner never re-fires; then only a THIS-session kill (unset->set) fires. Persists
+    /// across polls; reset on a genuine seed change so it re-arms.
+    boss_flag_prev: HashSet<u32>,
 }
 
 impl shared::Core for Core {
@@ -256,6 +266,8 @@ impl shared::Core for Core {
             coarse_lock_items: er_logic::tracker_regions::coarse_lock_item_table(),
             tracker_in_logic_only: false,
             tracker_big_ticket_only: false,
+            boss_defs: Vec::new(),
+            boss_flag_prev: HashSet::new(),
         })
     }
     fn base(&self) -> &CoreBase<Self::Game, Self::SlotData> {
@@ -464,6 +476,10 @@ impl shared::Core for Core {
                 // Goal-send: split goalLocations into flag-detected / checked-fallback buckets
                 // against loc_flags (SPEC-goal-send-20260701.md; do NOT route through flagpoll).
                 let goal_cfg = crate::goal::parse(sd, &loc_flags);
+                // Boss-lock mode A (SPEC-boss-lock-tracker.md): parse the bossLockItems metadata
+                // map into BossDef rows (gate=None for v0.2 — no sweepLockGates boss-key yet). This
+                // is a presentation/defeat-flag-watch layer only; it mints no AP item and no check.
+                let boss_defs = parse_boss_lock_items(sd.get("bossLockItems"));
 
                 // Connect banner: build identity + slot_data contract version (+ gate result) so any
                 // logfile self-identifies which build / contract produced it. Then a one-line
@@ -498,9 +514,9 @@ impl shared::Core for Core {
                     region.area_lock_flags.len()
                 );
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg)
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs)
             });
-            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg)) =
+            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs)) =
                 parsed
             {
                 log::info!(
@@ -540,6 +556,11 @@ impl shared::Core for Core {
                 self.start = Some(start);
                 self.scout = Some(scout);
                 self.goal = Some(goal_cfg);
+                log::info!(
+                    "slot_data parsed: {} boss-lock def(s) (mode A Felled trophies)",
+                    boss_defs.len()
+                );
+                self.boss_defs = boss_defs;
                 self.slot_data_parsed = true;
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
@@ -896,7 +917,7 @@ impl shared::Core for Core {
                 if let Some(client) = self.client() {
                     for s in &scanned {
                         if self.valid_locations.contains(&s.location)
-                            && client.try_is_local_location_checked(s.location) == Some(false)
+                            && !client.is_local_location_checked(s.location)
                         {
                             to_check.push(s.location);
                         }
@@ -935,9 +956,21 @@ impl shared::Core for Core {
                 };
                 self.flag_poll_baseline = baseline;
                 self.flag_poll_baseline_done = true;
+                // Prime the boss-defeat baseline in the same shot: any boss already dead on the
+                // first in-world poll (prior session / reconnect) seeds boss_flag_prev so its
+                // "Felled: <name>" banner never re-fires. Only a kill made THIS session (an
+                // unset->set edge after this) reaches newly_felled == true. Disjoint field access
+                // (boss_defs read / boss_flag_prev write) — no self.log call inside.
+                self.boss_flag_prev = self
+                    .boss_defs
+                    .iter()
+                    .filter(|d| crate::flags::get_event_flag(d.flag))
+                    .map(|d| d.flag)
+                    .collect();
                 log::info!(
-                    "flag-poll baseline: {} guarding flags already set on connect (excluded)",
-                    self.flag_poll_baseline.len()
+                    "flag-poll baseline: {} guarding flags already set on connect (excluded); {} boss(es) already felled (banner suppressed)",
+                    self.flag_poll_baseline.len(),
+                    self.boss_flag_prev.len()
                 );
                 // Persist the freshly-captured baseline NOW so a reconnect before the next
                 // item still loads it (persist-on-watermark-advance can lag arbitrarily).
@@ -950,15 +983,15 @@ impl shared::Core for Core {
                 // enters this set only AFTER its check was reported, so the detour suppresses a
                 // first-time pickup and passes only a genuine re-pickup. See detour::KNOWN_COLLECTED_FLAGS.
                 // NOTE: the valid_locations guard comes first (same ordering as the poll loop
-                // below); try_is_local_location_checked is additionally non-panicking on a
-                // datapackage-unknown id (returns None -> treated as not-checked), so even a
-                // residual stale id can never abort the no-unwind FFI frame.
+                // below); valid_locations is kept correct per-seed by reset_for_new_seed, so no
+                // datapackage-unknown id reaches is_local_location_checked -- its panic path is
+                // unreachable (the seed-change reset is the real fix for the reconnect panic).
                 let collected: std::collections::HashSet<u32> = fp
                     .location_flags
                     .iter()
                     .filter(|&(&loc, _)| {
                         self.valid_locations.contains(&loc)
-                            && client.try_is_local_location_checked(loc) == Some(true)
+                            && client.is_local_location_checked(loc)
                     })
                     .map(|(_, &flag)| flag)
                     .collect();
@@ -970,7 +1003,7 @@ impl shared::Core for Core {
                 // still registers via the AddItemFunc detour.
                 for (&loc, &flag) in &fp.location_flags {
                     if self.valid_locations.contains(&loc)
-                        && client.try_is_local_location_checked(loc) == Some(false)
+                        && !client.is_local_location_checked(loc)
                         && !self.flag_poll_baseline.contains(&flag)
                         && crate::flags::get_event_flag(flag)
                     {
@@ -992,7 +1025,7 @@ impl shared::Core for Core {
                     {
                         for &m in members {
                             if self.valid_locations.contains(&m)
-                                && client.try_is_local_location_checked(m) == Some(false)
+                                && !client.is_local_location_checked(m)
                             {
                                 to_check.push(m);
                             }
@@ -1003,7 +1036,7 @@ impl shared::Core for Core {
                     if crate::flags::get_event_flag(flag) {
                         for &loc in locs {
                             if self.valid_locations.contains(&loc)
-                                && client.try_is_local_location_checked(loc) == Some(false)
+                                && !client.is_local_location_checked(loc)
                             {
                                 to_check.push(loc);
                             }
@@ -1019,6 +1052,31 @@ impl shared::Core for Core {
                     && let Err(e) = client.mark_checked(to_check.iter().copied())
                 {
                     log::warn!("flag-poll mark_checked failed: {e}");
+                }
+            }
+
+            // Boss-lock mode A (SPEC-boss-lock-tracker.md): emit the one-shot "Felled: <Boss>"
+            // banner on the unset->set edge of each boss's DEFEAT flag. Presentation only — no
+            // self-send; the boss's own boss_ap_id check still fires through the locationFlags
+            // poll above. Idempotent across polls via boss_flag_prev (primed on the first
+            // in-world poll, so already-dead bosses don't re-banner; persists until seed change).
+            // Guarded on in_world so a load-screen flag read can't fire a banner. Banners are
+            // collected first (immutable &self.boss_defs borrow) then logged (&mut self.log).
+            if crate::flags::in_world() {
+                let mut felled_banners: Vec<String> = Vec::new();
+                for def in &self.boss_defs {
+                    let now = crate::flags::get_event_flag(def.flag);
+                    let prev = self.boss_flag_prev.contains(&def.flag);
+                    if er_logic::boss_felled::newly_felled(prev, now) {
+                        // def.name is already the full "Felled: <Boss>" label.
+                        felled_banners.push(def.name.clone());
+                    }
+                    if now {
+                        self.boss_flag_prev.insert(def.flag);
+                    }
+                }
+                for banner in felled_banners {
+                    self.log(ap::Print::message(banner));
                 }
             }
         }
@@ -1037,10 +1095,10 @@ impl shared::Core for Core {
                 (Some(cfg), Some(client)) => crate::goal::is_met(
                     cfg,
                     crate::flags::get_event_flag,
-                    // Pre-filter against valid_locations; try_is_local_location_checked is also
-                    // non-panicking on datapackage-unknown ids (None -> not checked).
+                    // Pre-filter against valid_locations (kept correct per-seed by reset_for_new_seed)
+                    // so no datapackage-unknown id reaches is_local_location_checked.
                     |l| self.valid_locations.contains(&l)
-                        && client.try_is_local_location_checked(l) == Some(true),
+                        && client.is_local_location_checked(l),
                 ),
                 _ => false,
             };
@@ -1279,6 +1337,15 @@ impl Core {
         let mut hint_list: Vec<HintEntry> = self.hints.iter().cloned().collect();
         hint_list.sort_by(|a, b| a.item_name.cmp(&b.item_name));
 
+        // Boss-lock mode A (SPEC-boss-lock-tracker.md): resolve the parsed defs against the live
+        // defeat flags + the cumulative received set (mode-B gate keys; None today) into a Bosses
+        // group snapshot. Captured by reference into the window closure below.
+        let boss_group = er_logic::boss_felled::build_boss_group(
+            &self.boss_defs,
+            |flag| crate::flags::get_event_flag(flag),
+            |name| received.contains(name),
+        );
+
         let display_loc = |id: u64| -> String {
             loc_names
                 .get(&id)
@@ -1356,6 +1423,43 @@ impl Core {
                                 ui.text_disabled(line);
                             } else {
                                 ui.text(line);
+                            }
+                        }
+                    }
+                }
+
+                // (b2) Bosses group (mode A Felled trophies). Only shown when the seed ships boss
+                // defs. Header carries the defeated/total count; rows are flag-sorted and tinted by
+                // state (locked = dimmed, felled = orange, released = hint-yellow).
+                if boss_group.total() > 0 {
+                    ui.separator();
+                    let header = format!(
+                        "Bosses  {}/{} felled###trk-bosses",
+                        boss_group.defeated(),
+                        boss_group.total()
+                    );
+                    if ui.collapsing_header(header, imgui::TreeNodeFlags::empty()) {
+                        for row in &boss_group.rows {
+                            // row.name is the full "Felled: <Boss>" label; strip the prefix for the
+                            // row so a Locked boss doesn't read "[locked] Felled: X".
+                            let boss_name =
+                                row.name.strip_prefix("Felled: ").unwrap_or(row.name.as_str());
+                            match row.state {
+                                er_logic::boss_felled::BossState::Locked => {
+                                    ui.text_disabled(format!("  [locked] {boss_name} ({})", row.region));
+                                }
+                                er_logic::boss_felled::BossState::Felled => {
+                                    ui.text_colored(
+                                        BIG_TICKET_ORANGE,
+                                        format!("  [felled] {boss_name} ({})", row.region),
+                                    );
+                                }
+                                er_logic::boss_felled::BossState::Released => {
+                                    ui.text_colored(
+                                        HINT_YELLOW,
+                                        format!("  [released] {boss_name} ({})", row.region),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1445,6 +1549,10 @@ impl Core {
         self.sent_goal = false;
         self.hints = HintSet::new();
         self.hint_log_watermark = 0;
+        // Boss-lock mode A: drop the parsed defs AND re-arm the felled-edge state, so the new
+        // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
+        self.boss_defs.clear();
+        self.boss_flag_prev.clear();
     }
 
     fn write_save(&self) {
@@ -1549,6 +1657,28 @@ fn i64_to_u32_map(v: Option<&Value>) -> HashMap<i64, u32> {
         }
     }
     m
+}
+
+/// `bossLockItems = { "<boss_flag u32>": {"name":<str>, "region":<str>, "boss_ap_id":<int>} }`
+/// (mode-A, base-game bosses only) -> `Vec<BossDef>`. Tolerant: skips entries with a non-u32 key
+/// or non-object value; missing string/int fields default to `""`/`0`. `gate` is always `None` for
+/// v0.2 (no `sweepLockGates` boss-key emitted yet). See `er_logic::boss_felled`.
+fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDef> {
+    let mut defs = Vec::new();
+    if let Some(obj) = v.and_then(|v| v.as_object()) {
+        for (k, val) in obj {
+            let Ok(flag) = k.parse::<u32>() else { continue };
+            let Some(o) = val.as_object() else { continue };
+            defs.push(er_logic::boss_felled::BossDef {
+                flag,
+                name: o.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                region: o.get("region").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                boss_ap_id: o.get("boss_ap_id").and_then(|v| v.as_i64()).unwrap_or(0),
+                gate: None,
+            });
+        }
+    }
+    defs
 }
 
 #[cfg(test)]

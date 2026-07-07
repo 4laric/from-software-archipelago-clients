@@ -544,7 +544,11 @@ pub fn open_on_received_name(cfg: &RegionConfig, name: &str) -> bool {
             fs.len(), set, failed.len(),
             if failed.is_empty() { String::new() } else { format!(" = {failed:?}") }
         );
-    } else {
+    } else if opened {
+        // Only a genuine region-lock (its open flag matched) that is missing its grace bundle is a
+        // real drift worth flagging. A normal non-lock item (opened == false) is silently ignored --
+        // this function is called for EVERY received item to test lock-ness, so without this guard
+        // every filler/gear pickup spammed a false "NO region_graces entry" warning (264 in one run).
         log::warn!(
             "RegionLock '{name}': NO region_graces entry (cfg.region_graces empty or key mismatch)"
         );
