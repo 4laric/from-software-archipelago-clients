@@ -31,6 +31,16 @@ const BIG_TICKET_ORANGE: [f32; 4] = [0.9882, 0.6863, 0.2431, 1.0];
 /// Dim gray for locked-region headers in the tracker window (mirrors imgui's TextDisabled).
 const LOCKED_GRAY: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
 
+/// Parsed `regionAttunement` entry (attunement_gate, SPEC-gf-boss-lock-tracker). Absent/empty
+/// slot_data => the feature is off. `members` are the region's freely-reachable in-region check AP
+/// ids (the attunement denominator); `bloom_flags` are the graces revealed on attunement.
+#[derive(Debug, Clone, Default)]
+struct RegionAttunement {
+    threshold: u32,
+    members: HashSet<i64>,
+    bloom_flags: Vec<u32>,
+}
+
 pub struct Core {
     base: CoreBase<crate::game::EldenRing, Value>,
     detour_installed: bool,
@@ -122,6 +132,26 @@ pub struct Core {
     /// their banner never re-fires; then only a THIS-session kill (unset->set) fires. Persists
     /// across polls; reset on a genuine seed change so it re-arms.
     boss_flag_prev: HashSet<u32>,
+    /// ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker): per-region gate data
+    /// {threshold, member_ap_ids, bloom_flags}. Empty => feature off. Parsed once per seed.
+    region_attunement: HashMap<String, RegionAttunement>,
+    /// Per-region DEFERRED boss-payout checks: a boss killed while its region is not yet attuned has
+    /// its checks (boss + sweep members) held here, burst-released the poll the region attunes.
+    boss_payout_pending: HashMap<String, HashSet<i64>>,
+    /// Regions whose attunement bloom has already fired this save (once-only grace-reveal latch).
+    attuned_regions: HashSet<String>,
+    /// Bloom baseline primed (first in-world poll): suppresses re-bannering already-attuned regions.
+    attunement_primed: bool,
+    /// BOSS KEYS (mode B, SPEC-gf-boss-lock-tracker "Boss Key: <Boss>"): per-boss DEFERRED own-check
+    /// latch. A boss killed while its "Boss Key: <Boss>" item is not yet received has its own
+    /// boss_ap_id check held here (keyed by defeat flag), burst-released the poll the key lands.
+    /// Session-scoped: re-derived from the SERVER checked set + received_all on reconnect
+    /// (is_local_location_checked makes re-runs idempotent). Empty gate set => unused.
+    boss_key_pending: HashMap<u32, HashSet<i64>>,
+    /// Boss-key sealed baseline primed (first in-world poll): a boss felled in a PRIOR session whose
+    /// key is still unreceived is seeded into boss_key_pending SILENTLY so a reconnect never
+    /// re-banners its seal. Mirrors boss_flag_prev / attunement_primed.
+    boss_key_primed: bool,
 }
 
 impl shared::Core for Core {
@@ -268,6 +298,12 @@ impl shared::Core for Core {
             tracker_big_ticket_only: false,
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
+            region_attunement: HashMap::new(),
+            boss_payout_pending: HashMap::new(),
+            attuned_regions: HashSet::new(),
+            attunement_primed: false,
+            boss_key_pending: HashMap::new(),
+            boss_key_primed: false,
         })
     }
     fn base(&self) -> &CoreBase<Self::Game, Self::SlotData> {
@@ -480,6 +516,9 @@ impl shared::Core for Core {
                 // map into BossDef rows (gate=None for v0.2 — no sweepLockGates boss-key yet). This
                 // is a presentation/defeat-flag-watch layer only; it mints no AP item and no check.
                 let boss_defs = parse_boss_lock_items(sd.get("bossLockItems"));
+                // ATTUNEMENT (attunement_gate): per-region {threshold, member_ap_ids, bloom_flags}.
+                // Emitted only when the option is on; absent/empty => the whole feature stays off.
+                let region_attunement = parse_region_attunement(sd.get("regionAttunement"));
 
                 // Connect banner: build identity + slot_data contract version (+ gate result) so any
                 // logfile self-identifies which build / contract produced it. Then a one-line
@@ -514,9 +553,9 @@ impl shared::Core for Core {
                     region.area_lock_flags.len()
                 );
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs)
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement)
             });
-            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs)) =
+            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement)) =
                 parsed
             {
                 log::info!(
@@ -561,6 +600,11 @@ impl shared::Core for Core {
                     boss_defs.len()
                 );
                 self.boss_defs = boss_defs;
+                self.region_attunement = region_attunement;
+                log::info!(
+                    "slot_data parsed: {} region attunement gate(s)",
+                    self.region_attunement.len()
+                );
                 self.slot_data_parsed = true;
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
@@ -976,6 +1020,81 @@ impl shared::Core for Core {
                 // item still loads it (persist-on-watermark-advance can lag arbitrarily).
                 self.write_save();
             }
+            // ATTUNEMENT (attunement_gate) -- prime the bloom baseline once, the first in-world poll.
+            // Any region already attuned on connect (prior session / reconnect: the SERVER checked
+            // set is authoritative and replayed) has its graces bloomed WITHOUT re-bannering; a
+            // crossing made THIS session banners normally. Mirrors boss_flag_prev priming. Its OWN
+            // latch (attunement_primed) -- NOT flag_poll_baseline_done, which can already be true from
+            // the persisted baseline, so keying off it would strand priming and re-banner on reconnect.
+            if !self.attunement_primed
+                && crate::flags::in_world()
+                && !self.region_attunement.is_empty()
+            {
+                let already: Vec<String> = match self.client() {
+                    Some(client) => self
+                        .region_attunement
+                        .iter()
+                        .filter_map(|(region, att)| {
+                            er_logic::attunement::attuned(&att.members, att.threshold, |m| {
+                                self.valid_locations.contains(&m)
+                                    && client.is_local_location_checked(m)
+                            })
+                            .then(|| region.clone())
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let mut bloom: Vec<u32> = Vec::new();
+                for region in &already {
+                    if let Some(att) = self.region_attunement.get(region) {
+                        bloom.extend(att.bloom_flags.iter().copied());
+                    }
+                }
+                for f in bloom {
+                    crate::flags::set_event_flag(f, true);
+                }
+                for region in already {
+                    self.attuned_regions.insert(region);
+                }
+                self.attunement_primed = true;
+                log::info!(
+                    "attunement primed: {} region(s) already attuned on connect (bloomed, banner suppressed)",
+                    self.attuned_regions.len()
+                );
+            }
+            // BOSS KEYS (mode B) -- prime the sealed baseline once, the first in-world poll. A boss
+            // felled in a PRIOR session whose "Boss Key: <Boss>" is still unreceived (its boss_ap_id
+            // check never sent, so absent from the SERVER checked set) is seeded into
+            // boss_key_pending SILENTLY, so a reconnect re-derives the seal WITHOUT re-bannering; a
+            // kill made THIS session (after priming) banners normally. Mirrors boss_flag_prev /
+            // attunement priming. received_all is the cumulative, reconnect-replayed received-name set.
+            if !self.boss_key_primed
+                && crate::flags::in_world()
+                && self.boss_defs.iter().any(|d| d.gate.is_some())
+            {
+                let mut seed: Vec<(u32, i64)> = Vec::new();
+                if let Some(client) = self.client() {
+                    for d in &self.boss_defs {
+                        if let Some(key) = d.gate.as_deref()
+                            && d.boss_ap_id != 0
+                            && crate::flags::get_event_flag(d.flag)
+                            && !received_all.contains(key)
+                            && self.valid_locations.contains(&d.boss_ap_id)
+                            && !client.is_local_location_checked(d.boss_ap_id)
+                        {
+                            seed.push((d.flag, d.boss_ap_id));
+                        }
+                    }
+                }
+                for (flag, loc) in seed {
+                    self.boss_key_pending.entry(flag).or_default().insert(loc);
+                }
+                self.boss_key_primed = true;
+                log::info!(
+                    "boss-key baseline: {} boss check(s) sealed on connect (deferred silently)",
+                    self.boss_key_pending.values().map(|s| s.len()).sum::<usize>()
+                );
+            }
             let mut to_check: Vec<i64> = Vec::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
                 // Refresh the vanilla-suppressor's collected-flag set: the acquisition flags of every
@@ -1041,6 +1160,226 @@ impl shared::Core for Core {
                                 to_check.push(loc);
                             }
                         }
+                    }
+                }
+            }
+            // ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker "Attunement-release"):
+            // gate the BOSS PAYOUT -- the boss's own check + every dungeon-sweep member -- behind the
+            // region's in-region attunement. Ordinary in-region pickups (which BUILD attunement) are
+            // never gated. `to_check` already holds this poll's candidates; partition out any payout
+            // check whose region is not yet attuned (DEFER into boss_payout_pending), then burst-
+            // release a region's held checks the poll it crosses the threshold. Attunement counts from
+            // the SERVER checked set (valid_locations pre-filter, then is_local_location_checked) so it
+            // survives save-load / reconnect / re-snapshot. Empty regionAttunement => whole block off.
+            if !self.region_attunement.is_empty() {
+                // Payout checks = boss's own check (boss_ap_id) + every dungeon-sweep member (both the
+                // location-keyed and the flag-keyed sweep tables). Cheap to rebuild at the 15-tick throttle.
+                let mut payout_locs: HashSet<i64> = HashSet::new();
+                for d in &self.boss_defs {
+                    if d.boss_ap_id != 0 {
+                        payout_locs.insert(d.boss_ap_id);
+                    }
+                }
+                for members in self.dungeon_sweeps.values() {
+                    payout_locs.extend(members.iter().copied());
+                }
+                if let Some(fp) = self.flag_poll.as_ref() {
+                    for locs in fp.sweep_flags.values() {
+                        payout_locs.extend(locs.iter().copied());
+                    }
+                }
+                // Attunement state per region + partition to_check, computed under ONE immutable client
+                // borrow into owned locals (so self can be mutated after the borrow ends).
+                let mut att_state: HashMap<String, (u32, u32, bool)> = HashMap::new(); // region -> (count, threshold, attuned)
+                let mut kept: Vec<i64> = Vec::with_capacity(to_check.len());
+                let mut deferred_new: Vec<(String, i64)> = Vec::new();
+                if let Some(client) = self.client() {
+                    let checked = |m: i64| {
+                        self.valid_locations.contains(&m) && client.is_local_location_checked(m)
+                    };
+                    for (region, att) in &self.region_attunement {
+                        let count = er_logic::attunement::attuned_count(&att.members, |m| checked(m));
+                        att_state.insert(region.clone(), (count, att.threshold, count >= att.threshold));
+                    }
+                    for &loc in &to_check {
+                        if payout_locs.contains(&loc)
+                            && let Some(region) = self.region_table.get(&(loc as u64))
+                            && let Some(&(_, _, attuned)) = att_state.get(region)
+                            && !attuned
+                        {
+                            deferred_new.push((region.clone(), loc));
+                            continue;
+                        }
+                        kept.push(loc);
+                    }
+                }
+                to_check = kept;
+
+                // Record newly-deferred payout checks (per-region debt); banner only the growth.
+                let mut newly_sealed: BTreeMap<String, usize> = BTreeMap::new();
+                for (region, loc) in deferred_new {
+                    if self.boss_payout_pending.entry(region.clone()).or_default().insert(loc) {
+                        *newly_sealed.entry(region).or_default() += 1;
+                    }
+                }
+
+                // Burst-release: a region attuned this poll drains its held checks back into to_check
+                // (the existing mark below sends them). Re-evaluation would re-produce them too, but the
+                // explicit drain gives the release banner its count and is robust to a missed re-poll.
+                let attuned_regions_now: Vec<String> = att_state
+                    .iter()
+                    .filter_map(|(r, &(_, _, a))| a.then(|| r.clone()))
+                    .collect();
+                let mut released: BTreeMap<String, usize> = BTreeMap::new();
+                for region in &attuned_regions_now {
+                    if let Some(pending) = self.boss_payout_pending.get_mut(region)
+                        && !pending.is_empty()
+                    {
+                        let n = pending.len();
+                        to_check.extend(pending.iter().copied());
+                        pending.clear();
+                        released.insert(region.clone(), n);
+                    }
+                }
+
+                // Attunement bloom: light each newly-attuned region's graces once (latch in
+                // attuned_regions, reset on seed change). Collect flags/banners first (immutable
+                // region_attunement read) so the &mut self.log calls below hold no field borrow.
+                let mut bloom_to_light: Vec<u32> = Vec::new();
+                let mut crossed: Vec<String> = Vec::new();
+                if self.attunement_primed && crate::flags::in_world() {
+                    for region in &attuned_regions_now {
+                        if !self.attuned_regions.contains(region)
+                            && let Some(att) = self.region_attunement.get(region)
+                        {
+                            bloom_to_light.extend(att.bloom_flags.iter().copied());
+                            crossed.push(region.clone());
+                        }
+                    }
+                }
+                for f in &bloom_to_light {
+                    crate::flags::set_event_flag(*f, true);
+                }
+                for region in &crossed {
+                    self.attuned_regions.insert(region.clone());
+                }
+
+                // Banners (suppressed until primed so a reconnect's already-known state stays quiet).
+                if self.attunement_primed && crate::flags::in_world() {
+                    for (region, n) in newly_sealed {
+                        let (cur, thr) = att_state
+                            .get(&region)
+                            .map(|&(c, t, _)| (c, t))
+                            .unwrap_or((0, 0));
+                        self.log(ap::Print::message(format!(
+                            "Boss felled -- {n} check(s) sealed; attune {cur}/{thr} {region}"
+                        )));
+                    }
+                    for region in &crossed {
+                        self.log(ap::Print::message(format!(
+                            "Attuned to {region} -- all graces revealed."
+                        )));
+                    }
+                    for (region, n) in released {
+                        self.log(ap::Print::message(format!(
+                            "Attunement reached -- {n} sealed check(s) released in {region}."
+                        )));
+                    }
+                }
+            }
+            // BOSS KEYS (mode B, SPEC-gf-boss-lock-tracker "Boss Key: <Boss>"): gate a felled boss's
+            // OWN check (boss_ap_id) behind its "Boss Key: <Boss>" item. The dungeon-sweep MEMBERS are
+            // already held by sweep_lock_gates via sweep_gate::gate_open in the sweep loop above; this
+            // block covers ONLY the boss's own check, which fires through the locationFlags poll and so
+            // sits in to_check the moment the boss is felled. Poll-driven: a key received AFTER the kill
+            // releases the held check on a later tick. Composes with attunement-release (a check must
+            // clear BOTH gates). Empty gate set => block off. is_local_location_checked (server-
+            // authoritative, applied in the loops above) makes a re-run idempotent.
+            if self.boss_defs.iter().any(|d| d.gate.is_some()) {
+                // boss_ap_id -> (defeat flag, "Felled: <Boss>" name, "Boss Key: <Boss>" key) and
+                // defeat flag -> (name, key), built under an immutable boss_defs borrow (owned maps,
+                // so the mutable boss_key_pending borrow below is conflict-free).
+                let by_loc: HashMap<i64, (u32, String, String)> = self
+                    .boss_defs
+                    .iter()
+                    .filter_map(|d| {
+                        d.gate.as_ref().and_then(|g| {
+                            (d.boss_ap_id != 0)
+                                .then(|| (d.boss_ap_id, (d.flag, d.name.clone(), g.clone())))
+                        })
+                    })
+                    .collect();
+                let by_flag: HashMap<u32, (String, String)> = self
+                    .boss_defs
+                    .iter()
+                    .filter_map(|d| d.gate.as_ref().map(|g| (d.flag, (d.name.clone(), g.clone()))))
+                    .collect();
+
+                // Partition to_check: DEFER any gated boss's own check whose key is not yet received.
+                let mut kept: Vec<i64> = Vec::with_capacity(to_check.len());
+                let mut newly_sealed: BTreeMap<u32, (String, String, usize)> = BTreeMap::new();
+                for &loc in &to_check {
+                    if let Some((flag, name, key)) = by_loc.get(&loc)
+                        && !er_logic::sweep_gate::gate_open(Some(key.as_str()), |n| {
+                            received_all.contains(n)
+                        })
+                    {
+                        if self.boss_key_pending.entry(*flag).or_default().insert(loc) {
+                            let e = newly_sealed
+                                .entry(*flag)
+                                .or_insert_with(|| (name.clone(), key.clone(), 0usize));
+                            e.2 += 1;
+                        }
+                        continue;
+                    }
+                    kept.push(loc);
+                }
+                to_check = kept;
+
+                // Burst-release: any held boss whose key is now in received_all drains its pending
+                // checks back into to_check (the mark below sends them); cleared so a later poll can't
+                // re-release (and the server set filters it anyway).
+                let ready_flags: Vec<u32> = self
+                    .boss_key_pending
+                    .iter()
+                    .filter(|(flag, pend)| {
+                        !pend.is_empty()
+                            && by_flag
+                                .get(*flag)
+                                .map(|(_, key)| received_all.contains(key))
+                                .unwrap_or(false)
+                    })
+                    .map(|(flag, _)| *flag)
+                    .collect();
+                let mut released: BTreeMap<u32, (String, usize)> = BTreeMap::new();
+                for flag in ready_flags {
+                    if let Some(pending) = self.boss_key_pending.get_mut(&flag)
+                        && !pending.is_empty()
+                    {
+                        let n = pending.len();
+                        to_check.extend(pending.iter().copied());
+                        pending.clear();
+                        if let Some((name, _)) = by_flag.get(&flag) {
+                            released.insert(flag, (name.clone(), n));
+                        }
+                    }
+                }
+
+                // Banners (in_world guard; the reconnect-seeded seal from priming inserted its loc
+                // already, so newly_sealed skips it -> no re-banner). name is "Felled: <Boss>"; strip
+                // the prefix for a clean boss label. key is the full "Boss Key: <Boss>".
+                if crate::flags::in_world() {
+                    for (_, (name, key, n)) in newly_sealed {
+                        let boss = name.strip_prefix("Felled: ").unwrap_or(name.as_str());
+                        self.log(ap::Print::message(format!(
+                            "{boss} felled -- {n} check(s) sealed; awaiting {key}"
+                        )));
+                    }
+                    for (_, (name, n)) in released {
+                        let boss = name.strip_prefix("Felled: ").unwrap_or(name.as_str());
+                        self.log(ap::Print::message(format!(
+                            "Unsealed: {boss} -- {n} stored check(s) released."
+                        )));
                     }
                 }
             }
@@ -1337,6 +1676,18 @@ impl Core {
         let mut hint_list: Vec<HintEntry> = self.hints.iter().cloned().collect();
         hint_list.sort_by(|a, b| a.item_name.cmp(&b.item_name));
 
+        // ATTUNEMENT (attunement_gate): per-region progress (checked members / threshold) for the
+        // tracker rollup. Counted from the checked-locations snapshot above; empty => nothing shown.
+        let att_checked: HashSet<i64> = checked.iter().map(|&c| c as i64).collect();
+        let att_progress: HashMap<String, (u32, u32)> = self
+            .region_attunement
+            .iter()
+            .map(|(r, a)| {
+                let c = er_logic::attunement::attuned_count(&a.members, |m| att_checked.contains(&m));
+                (r.clone(), (c, a.threshold))
+            })
+            .collect();
+
         // Boss-lock mode A (SPEC-boss-lock-tracker.md): resolve the parsed defs against the live
         // defeat flags + the cumulative received set (mode-B gate keys; None today) into a Bosses
         // group snapshot. Captured by reference into the window closure below.
@@ -1404,6 +1755,11 @@ impl Core {
                     let expanded = ui.collapsing_header(header, imgui::TreeNodeFlags::empty());
                     drop(dim);
                     if expanded {
+                        if let Some(&(cur, thr)) = att_progress.get(&region.region) {
+                            if thr > 0 {
+                                ui.text_disabled(format!("  attune {cur}/{thr}"));
+                            }
+                        }
                         if shown.is_empty() {
                             ui.text_disabled("  complete");
                         }
@@ -1553,6 +1909,16 @@ impl Core {
         // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
         self.boss_defs.clear();
         self.boss_flag_prev.clear();
+        // ATTUNEMENT-RELEASE: drop the parsed gate + all per-save latches so the new seed re-parses
+        // regionAttunement and re-primes / re-blooms from scratch.
+        self.region_attunement.clear();
+        self.boss_payout_pending.clear();
+        self.attuned_regions.clear();
+        self.attunement_primed = false;
+        // BOSS KEYS (mode B): drop the deferred own-check latch + its prime flag so the new seed
+        // re-parses gates and re-seeds silently on its next in-world poll.
+        self.boss_key_pending.clear();
+        self.boss_key_primed = false;
     }
 
     fn write_save(&self) {
@@ -1661,8 +2027,9 @@ fn i64_to_u32_map(v: Option<&Value>) -> HashMap<i64, u32> {
 
 /// `bossLockItems = { "<boss_flag u32>": {"name":<str>, "region":<str>, "boss_ap_id":<int>} }`
 /// (mode-A, base-game bosses only) -> `Vec<BossDef>`. Tolerant: skips entries with a non-u32 key
-/// or non-object value; missing string/int fields default to `""`/`0`. `gate` is always `None` for
-/// v0.2 (no `sweepLockGates` boss-key emitted yet). See `er_logic::boss_felled`.
+/// or non-object value; missing string/int fields default to `""`/`0`. `gate` is the mode-B
+/// "Boss Key: <Boss>" item name when `boss_keys` is on (absent / JSON null => `None`, a pure
+/// mode-A boss). See `er_logic::boss_felled` / `er_logic::boss_key_replay`.
 fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDef> {
     let mut defs = Vec::new();
     if let Some(obj) = v.and_then(|v| v.as_object()) {
@@ -1674,11 +2041,46 @@ fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDe
                 name: o.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 region: o.get("region").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 boss_ap_id: o.get("boss_ap_id").and_then(|v| v.as_i64()).unwrap_or(0),
-                gate: None,
+                // BOSS KEYS (mode B): "gate":"Boss Key: <Boss>" present only when boss_keys is
+                // on; absent / JSON null => None (pure mode-A boss). as_str() yields None for null.
+                gate: o.get("gate").and_then(|v| v.as_str()).map(|s| s.to_string()),
             });
         }
     }
     defs
+}
+
+/// `regionAttunement = { "<region>": {"threshold": <int>, "member_ap_ids": [<int>], "bloom_flags":
+/// [<int>]} }` (attunement_gate) -> `region -> RegionAttunement`. Tolerant: skips a non-object entry;
+/// missing fields default to `0` / empty. Absent/empty map => the feature is off. See
+/// `er_logic::attunement`.
+fn parse_region_attunement(v: Option<&Value>) -> HashMap<String, RegionAttunement> {
+    let mut m = HashMap::new();
+    if let Some(obj) = v.and_then(|v| v.as_object()) {
+        for (region, val) in obj {
+            let Some(o) = val.as_object() else { continue };
+            let threshold = o.get("threshold").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let members: HashSet<i64> = o
+                .get("member_ap_ids")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|e| e.as_i64()).collect())
+                .unwrap_or_default();
+            let bloom_flags: Vec<u32> = o
+                .get("bloom_flags")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|e| e.as_u64().map(|n| n as u32)).collect())
+                .unwrap_or_default();
+            m.insert(
+                region.clone(),
+                RegionAttunement {
+                    threshold,
+                    members,
+                    bloom_flags,
+                },
+            );
+        }
+    }
+    m
 }
 
 #[cfg(test)]
