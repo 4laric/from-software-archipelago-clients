@@ -912,6 +912,16 @@ impl shared::Core for Core {
                                 "region-lock '{}' (ap id {ap_item_id}) -> handled via open flag (not an ER item grant)",
                                 ri.name
                             );
+                        } else if ri.name.starts_with("Boss Key: ") {
+                            // Boss Keys (mode B) are SYNTHETIC gate tokens, intentionally absent from
+                            // apIdsToItemIds: they gate a felled boss's reward (boss_key_pending) and its
+                            // dungeon sweep (sweep_lock_gates) via the received-name set, NOT an ER item
+                            // grant. Recognize them here (like region locks) so they do not trip the
+                            // misleading "no ER mapping ... contract drift?" warn. Debug-log instead.
+                            log::debug!(
+                                "boss-key '{}' (ap id {ap_item_id}) -> mode-B gate token (not an ER item grant)",
+                                ri.name
+                            );
                         } else {
                             warn_unmapped_once(&ri.name, ap_item_id);
                         }
@@ -936,30 +946,44 @@ impl shared::Core for Core {
         // it). Mirrors that line's semantics, including the reconnect replay (name-dispatch
         // replays the stream). The gate itself is poll-driven, so a lock arriving after the
         // boss kill fires the held sweep within a few seconds of this line.
-        if !self.sweep_lock_gates.is_empty() {
-            // Draft E: match/gate on the SYNTHETIC boss-lock name (`ri.name` is the pool item's own
-            // name); SHOW the legible `display_key` when a boss def carries one. Resolved to an owned
-            // String at push time so the immutable `self.boss_defs` borrow ends before `self.log`.
+        // Announce received Boss Keys (mode B) so the SYNTHETIC gate token is visible in the console
+        // (it has no ER item grant, so no "Region unlocked" line ever fires for it). Covers BOTH
+        // sweep-gated keys AND keys that only gate a boss's own reward check (the latter are absent
+        // from sweep_lock_gates, so the old sweep-only guard skipped them -> the player saw nothing).
+        // Match on the SYNTHETIC name; SHOW the legible `display_key` when a boss def carries one, else
+        // the boss name (the "Boss Key: " prefix stripped). Owned Strings so the immutable boss_defs /
+        // sweep_lock_gates borrows end before `self.log`.
+        {
             let mut announced: Vec<String> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
             for ri in &snapshot {
-                if ri.index >= newly_dispatched_from
-                    && self.sweep_lock_gates.values().any(|g| g == &ri.name)
-                    && seen.insert(ri.name.clone())
-                {
+                if ri.index < newly_dispatched_from {
+                    continue;
+                }
+                let is_boss_key = self.sweep_lock_gates.values().any(|g| g == &ri.name)
+                    || self
+                        .boss_defs
+                        .iter()
+                        .any(|d| d.gate.as_deref() == Some(ri.name.as_str()));
+                if is_boss_key && seen.insert(ri.name.clone()) {
                     let shown = self
                         .boss_defs
                         .iter()
                         .find(|d| d.gate.as_deref() == Some(ri.name.as_str()))
                         .and_then(|d| d.gate_display())
-                        .unwrap_or(ri.name.as_str())
-                        .to_string();
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            ri.name
+                                .strip_prefix("Boss Key: ")
+                                .unwrap_or(ri.name.as_str())
+                                .to_string()
+                        });
                     announced.push(shown);
                 }
             }
             for shown in announced {
                 self.log(ap::Print::message(format!(
-                    "Boss lock received: {shown} -- its dungeon sweep is armed"
+                    "Boss Key received: {shown} -- its boss reward (and any dungeon sweep) unlocks once held."
                 )));
             }
         }
