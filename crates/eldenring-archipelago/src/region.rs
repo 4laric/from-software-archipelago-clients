@@ -116,11 +116,16 @@ static REGION_PLAY_IDS: &[(&str, &[i32])] = &[
     ("Miquella's Haligtree", &[15000, 15001]),
     ("Eternal Cities", &[12010, 12011, 12012, 12020, 12030, 12070]),
     ("Mohgwyn Palace", &[12050]),
-    ("Land of Shadow", &[6800, 6830, 6840, 20010, 22000]),
-    ("Belurat", &[6820, 20000]),
+    // DLC (REGION_ID_MAP.md joined via gen_data.py REGION_MAP): the old 'Land of Shadow' catch-all
+    // is split into Gravesite Plain + Ancient Ruins of Rauh + Enir-Ilim; Castle Ensis (6820) folds
+    // into Gravesite Plain and Rauh (6950) splits out of Scadu Altus. Mirrors area_locks.py.
+    ("Gravesite Plain", &[6800, 6820, 6830, 6840, 22000]),
+    ("Belurat", &[20000]),
+    ("Ancient Ruins of Rauh", &[6950]),
+    ("Enir-Ilim", &[20010]),
     ("Jagged Peak", &[6850, 6851]),
     ("Abyssal Woods", &[6860, 28000]),
-    ("Scadu Altus", &[6900, 6920, 6940, 6950]),
+    ("Scadu Altus", &[6900, 6920, 6940]),
     ("Shadow Keep", &[21000, 21001, 21010]),
 ];
 
