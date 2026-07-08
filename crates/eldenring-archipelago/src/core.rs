@@ -556,9 +556,21 @@ impl shared::Core for Core {
                     region.area_lock_flags.len()
                 );
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement)
+                // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): computed
+                // HERE, inside the closure where `sd` is in scope, then threaded out via the tuple
+                // and assigned below. Defaults to the static set; the seed's bigTicketLocations
+                // overrides it when present.
+                let big_ticket = {
+                    let mut bt = er_logic::tracker_regions::big_ticket_set();
+                    if let Some(arr) = sd.get("bigTicketLocations").and_then(|v| v.as_array()) {
+                        bt = arr.iter().filter_map(|x| x.as_u64()).collect();
+                    }
+                    bt
+                };
+
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, big_ticket)
             });
-            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement)) =
+            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, big_ticket)) =
                 parsed
             {
                 log::info!(
@@ -608,13 +620,9 @@ impl shared::Core for Core {
                     "slot_data parsed: {} region attunement gate(s)",
                     self.region_attunement.len()
                 );
-                // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): the apworld
-                // computed this seed's big-ticket set from big_ticket_locations and shipped the ids.
-                // Reset to the static default first (seed-change safety), then use the seed's set.
-                self.big_ticket = er_logic::tracker_regions::big_ticket_set();
-                if let Some(arr) = sd.get("bigTicketLocations").and_then(|v| v.as_array()) {
-                    self.big_ticket = arr.iter().filter_map(|x| x.as_u64()).collect();
-                }
+                // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): assign the
+                // set parsed inside the slot_data closure above (where `sd` was in scope).
+                self.big_ticket = big_ticket;
                 self.slot_data_parsed = true;
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
@@ -1593,6 +1601,61 @@ impl shared::Core for Core {
 }
 
 impl Core {
+    /// Rebuild all per-seed / per-save state when a reconnect targets a DIFFERENT seed without an
+    /// ER reload (see the `parsed_seed` guard). Clears every table that slot_data or the save file
+    /// repopulates, so the one-shot parse and save-load run fresh; static tables (region_table,
+    /// coarse_table, tracker UI prefs) and install-once globals (detour_installed) are left intact.
+    /// Recovered after commit 4bb3c95 accidentally dropped the body while leaving the call sites.
+    fn reset_for_new_seed(&mut self) {
+        self.received_through = 0;
+        self.dispatched_through = 0;
+        self.item_map = None;
+        self.item_counts.clear();
+        self.region = None;
+        self.fogwall = None;
+        self.progressive = ProgressiveState::new(HashMap::new());
+        self.slot_data_parsed = false;
+        self.save_path = None;
+        self.save_loaded = false;
+        self.last_persisted_index = -1;
+        self.valid_locations.clear();
+        self.locations_loaded = false;
+        self.flag_poll = None;
+        self.dungeon_sweeps.clear();
+        self.sweep_lock_gates.clear();
+        self.poll_counter = 0;
+        self.flag_poll_baseline.clear();
+        self.flag_poll_baseline_done = false;
+        self.start = None;
+        self.start_flags_done = false;
+        self.start_items_granted = false;
+        self.start_items_ok.clear();
+        self.in_world_since = None;
+        self.scout = None;
+        self.goal = None;
+        self.sent_goal = false;
+        self.hints = HintSet::new();
+        self.hint_log_watermark = 0;
+        // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): restore the static
+        // default so a new seed without bigTicketLocations does not inherit the prior seed's set
+        // (the parse block re-applies the seed's override).
+        self.big_ticket = er_logic::tracker_regions::big_ticket_set();
+        // Boss-lock mode A: drop the parsed defs AND re-arm the felled-edge state, so the new
+        // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
+        self.boss_defs.clear();
+        self.boss_flag_prev.clear();
+        // ATTUNEMENT-RELEASE: drop the parsed gate + all per-save latches so the new seed re-parses
+        // regionAttunement and re-primes / re-blooms from scratch.
+        self.region_attunement.clear();
+        self.boss_payout_pending.clear();
+        self.attuned_regions.clear();
+        self.attunement_primed = false;
+        // BOSS KEYS (mode B): drop the deferred own-check latch + its prime flag so the new seed
+        // re-parses gates and re-seeds silently on its next in-world poll.
+        self.boss_key_pending.clear();
+        self.boss_key_primed = false;
+    }
+
     /// Scan NEW overlay-log entries for `Print::Hint`s and fold them into [Self::hints].
     ///
     /// Hint semantics (SPEC-item-tracker.md option (a)): the hint's `sender` is the player whose
