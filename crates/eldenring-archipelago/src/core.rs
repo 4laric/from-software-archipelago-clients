@@ -605,6 +605,13 @@ impl shared::Core for Core {
                     "slot_data parsed: {} region attunement gate(s)",
                     self.region_attunement.len()
                 );
+                // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): the apworld
+                // computed this seed's big-ticket set from big_ticket_locations and shipped the ids.
+                // Reset to the static default first (seed-change safety), then use the seed's set.
+                self.big_ticket = er_logic::tracker_regions::big_ticket_set();
+                if let Some(arr) = sd.get("bigTicketLocations").and_then(|v| v.as_array()) {
+                    self.big_ticket = arr.iter().filter_map(|x| x.as_u64()).collect();
+                }
                 self.slot_data_parsed = true;
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
