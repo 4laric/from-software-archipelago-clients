@@ -69,9 +69,12 @@ pub struct Core {
     flag_poll: Option<crate::flagpoll::FlagPollConfig>,
     /// slot_data dungeonSweeps: trigger location -> member locations.
     dungeon_sweeps: HashMap<i64, Vec<i64>>,
-    /// slot_data sweepLockGates (BOSS_LOCKS_PATCH): sweep trigger -> boss-lock item name that
-    /// must be in the received set before that group's sweep fires.
-    sweep_lock_gates: HashMap<i64, String>,
+    /// slot_data sweepLockGates (BOSS_LOCKS_PATCH, Draft A): boss-defeat FLAG -> boss-lock item
+    /// name that must be in the cumulative received set before that boss's flag-keyed sweep fires.
+    /// Flag-keyed (u32) to match `sweep_flags`; the sweep loop looks it up by defeat flag.
+    /// NOTE: `flagpoll::parse_sweep_lock_gates` MUST return `HashMap<u32, String>` for the
+    /// `self.sweep_lock_gates = sweeps.1;` assignment to type-check (companion task #9 change).
+    sweep_lock_gates: HashMap<u32, String>,
     /// Throttle the (potentially large) flag poll to a few times a second.
     poll_counter: u32,
     /// Guarding flags already set the first time we polled IN-WORLD (new-save defaults: the
@@ -926,18 +929,29 @@ impl shared::Core for Core {
         // replays the stream). The gate itself is poll-driven, so a lock arriving after the
         // boss kill fires the held sweep within a few seconds of this line.
         if !self.sweep_lock_gates.is_empty() {
+            // Draft E: match/gate on the SYNTHETIC boss-lock name (`ri.name` is the pool item's own
+            // name); SHOW the legible `display_key` when a boss def carries one. Resolved to an owned
+            // String at push time so the immutable `self.boss_defs` borrow ends before `self.log`.
             let mut announced: Vec<String> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
             for ri in &snapshot {
                 if ri.index >= newly_dispatched_from
                     && self.sweep_lock_gates.values().any(|g| g == &ri.name)
-                    && !announced.contains(&ri.name)
+                    && seen.insert(ri.name.clone())
                 {
-                    announced.push(ri.name.clone());
+                    let shown = self
+                        .boss_defs
+                        .iter()
+                        .find(|d| d.gate.as_deref() == Some(ri.name.as_str()))
+                        .and_then(|d| d.gate_display())
+                        .unwrap_or(ri.name.as_str())
+                        .to_string();
+                    announced.push(shown);
                 }
             }
-            for name in announced {
+            for shown in announced {
                 self.log(ap::Print::message(format!(
-                    "Boss lock received: {name} -- its dungeon sweep is armed"
+                    "Boss lock received: {shown} -- its dungeon sweep is armed"
                 )));
             }
         }
@@ -1126,15 +1140,11 @@ impl shared::Core for Core {
                     }
                 }
                 for (trigger, members) in &self.dungeon_sweeps {
-                    // BOSS_LOCKS_PATCH: hold a gated group's sweep until its boss lock is in
-                    // the received set; poll-driven, so a lock received AFTER the boss kill
-                    // fires the held sweep retroactively on a later tick.
-                    if !er_logic::sweep_gate::gate_open(
-                        self.sweep_lock_gates.get(trigger).map(String::as_str),
-                        |n| received_all.contains(n),
-                    ) {
-                        continue;
-                    }
+                    // Draft B: the location-keyed dungeon_sweeps groups carry NO gate today --
+                    // sweepLockGates is flag-keyed and applied in the sweep_flags loop below. A
+                    // location-keyed gate table would arrive with the future ItemLotParam join;
+                    // until then these groups (minidungeons / chokepoint carves whose lock is not in
+                    // this seed's pool) are ungated. (This map is empty in current seeds.)
                     if let Some(&flag) = fp.location_flags.get(trigger)
                         && crate::flags::get_event_flag(flag)
                     {
@@ -1148,6 +1158,16 @@ impl shared::Core for Core {
                     }
                 }
                 for (&flag, locs) in &fp.sweep_flags {
+                    // Draft B: hold a gated group's sweep until its boss-lock item is in the
+                    // cumulative received set. sweepLockGates is FLAG-keyed, so look it up by this
+                    // sweep's boss-defeat flag; poll-driven, so a lock received AFTER the kill fires
+                    // the held sweep retroactively on a later tick.
+                    if !er_logic::sweep_gate::gate_open(
+                        self.sweep_lock_gates.get(&flag).map(String::as_str),
+                        |n| received_all.contains(n),
+                    ) {
+                        continue;
+                    }
                     if crate::flags::get_event_flag(flag) {
                         for &loc in locs {
                             if self.valid_locations.contains(&loc)
@@ -1295,13 +1315,17 @@ impl shared::Core for Core {
                 // boss_ap_id -> (defeat flag, "Felled: <Boss>" name, "Boss Key: <Boss>" key) and
                 // defeat flag -> (name, key), built under an immutable boss_defs borrow (owned maps,
                 // so the mutable boss_key_pending borrow below is conflict-free).
-                let by_loc: HashMap<i64, (u32, String, String)> = self
+                let by_loc: HashMap<i64, (u32, String, String, String)> = self
                     .boss_defs
                     .iter()
                     .filter_map(|d| {
                         d.gate.as_ref().and_then(|g| {
-                            (d.boss_ap_id != 0)
-                                .then(|| (d.boss_ap_id, (d.flag, d.name.clone(), g.clone())))
+                            // Draft E: carry a legible display label (display_key when present, else
+                            // the synthetic gate name) alongside the synthetic gate `key`.
+                            (d.boss_ap_id != 0).then(|| {
+                                let display = d.gate_display().unwrap_or(g.as_str()).to_string();
+                                (d.boss_ap_id, (d.flag, d.name.clone(), g.clone(), display))
+                            })
                         })
                     })
                     .collect();
@@ -1313,9 +1337,11 @@ impl shared::Core for Core {
 
                 // Partition to_check: DEFER any gated boss's own check whose key is not yet received.
                 let mut kept: Vec<i64> = Vec::with_capacity(to_check.len());
+                // Draft E: newly_sealed's 2nd field is the DISPLAY label (legible key when the
+                // apworld shipped one). Gating still keys on the synthetic `key`.
                 let mut newly_sealed: BTreeMap<u32, (String, String, usize)> = BTreeMap::new();
                 for &loc in &to_check {
-                    if let Some((flag, name, key)) = by_loc.get(&loc)
+                    if let Some((flag, name, key, display)) = by_loc.get(&loc)
                         && !er_logic::sweep_gate::gate_open(Some(key.as_str()), |n| {
                             received_all.contains(n)
                         })
@@ -1323,7 +1349,7 @@ impl shared::Core for Core {
                         if self.boss_key_pending.entry(*flag).or_default().insert(loc) {
                             let e = newly_sealed
                                 .entry(*flag)
-                                .or_insert_with(|| (name.clone(), key.clone(), 0usize));
+                                .or_insert_with(|| (name.clone(), display.clone(), 0usize));
                             e.2 += 1;
                         }
                         continue;
@@ -1365,10 +1391,11 @@ impl shared::Core for Core {
                 // already, so newly_sealed skips it -> no re-banner). name is "Felled: <Boss>"; strip
                 // the prefix for a clean boss label. key is the full "Boss Key: <Boss>".
                 if crate::flags::in_world() {
-                    for (_, (name, key, n)) in newly_sealed {
+                    for (_, (name, display, n)) in newly_sealed {
                         let boss = name.strip_prefix("Felled: ").unwrap_or(name.as_str());
+                        // Draft E: show the legible display label; gating already used the synthetic.
                         self.log(ap::Print::message(format!(
-                            "{boss} felled -- {n} check(s) sealed; awaiting {key}"
+                            "{boss} felled -- {n} check(s) sealed; awaiting {display}"
                         )));
                     }
                     for (_, (name, n)) in released {
@@ -1616,4 +1643,395 @@ impl Core {
         for coarse in self.coarse_table.values() {
             if coarse.is_empty() || open.contains(coarse) {
                 continue; // always-open bucket / already decided
- 
+            }
+            let accessible = match self.coarse_lock_items.get(coarse) {
+                None => true, // no lock mapping -> open
+                Some(lock) => match region_open.and_then(|m| m.get(lock)) {
+                    None => true, // lock absent this seed -> unlocked
+                    Some(&flag) => crate::flags::get_event_flag(flag),
+                },
+            };
+            if accessible {
+                open.insert(coarse.clone());
+            }
+        }
+        open
+    }
+
+    /// Build the per-frame tracker snapshot and draw the window (SPEC-item-tracker.md Phase 1).
+    /// Everything the imgui closure touches is a local snapshot -- `self` stays out of it so the
+    /// window's close button can just write a local.
+    fn render_tracker_window(&mut self, ui: &imgui::Ui) {
+        // One client borrow: location id sets (+ id -> display name) and received-item names.
+        let mut checked: Vec<u64> = Vec::new();
+        let mut unchecked: Vec<u64> = Vec::new();
+        let mut loc_names = HashMap::new(); // id -> Ustr (Copy, interned)
+        let mut received: HashSet<String> = HashSet::new();
+        if let Some(client) = self.client() {
+            for loc in client.checked_locations() {
+                let id = loc.id() as u64;
+                loc_names.insert(id, loc.name());
+                checked.push(id);
+            }
+            for loc in client.unchecked_locations() {
+                let id = loc.id() as u64;
+                loc_names.insert(id, loc.name());
+                unchecked.push(id);
+            }
+            for ri in client.received_items() {
+                received.insert(ri.item().name().to_string());
+            }
+        }
+
+        // Region-lock accessibility snapshot (bound to a local BEFORE the model borrows &self
+        // fields -- keeps the borrows sequential).
+        let open_coarse = self.open_coarse_regions();
+        let model = er_logic::tracker::build_tracker_model(
+            &checked,
+            &unchecked,
+            &received,
+            &self.region_table,
+            &self.coarse_table,
+            &self.big_ticket,
+            &open_coarse,
+            &self.hints,
+        );
+        let mut hint_list: Vec<HintEntry> = self.hints.iter().cloned().collect();
+        hint_list.sort_by(|a, b| a.item_name.cmp(&b.item_name));
+        // Bosses group snapshot (mode A/B, SPEC-boss-lock-tracker). Built here -- before the imgui
+        // closure -- so the closure stays self-free (mirrors `open_coarse`). flag_set reads the live
+        // event flags; received is this frame's cumulative received-name set. RE-AUTHORED (this boss
+        // tracker post-dates core.rs.bak_rlwarn; reconcile against reflog if an intact one exists).
+        let boss_group = er_logic::boss_felled::build_boss_group(
+            &self.boss_defs,
+            |f| crate::flags::get_event_flag(f),
+            |n| received.contains(n),
+        );
+
+        let display_loc = |id: u64| -> String {
+            loc_names
+                .get(&id)
+                .map(|n| n.as_str().to_string())
+                .unwrap_or_else(|| format!("(location {id})"))
+        };
+
+        let mut open = true;
+        // Filter state as locals (the closure stays self-free); written back to self after.
+        let mut in_logic_only = self.tracker_in_logic_only;
+        let mut big_ticket_only = self.tracker_big_ticket_only;
+        ui.window("Item Tracker###ap-tracker")
+            .size([480.0, 520.0], imgui::Condition::FirstUseEver)
+            .opened(&mut open)
+            .build(|| {
+                ui.text(format!("checks: {}/{}", model.done, model.total));
+                ui.text(format!(
+                    "in-logic: {}/{}   big-ticket: {}/{}",
+                    model.in_logic_done,
+                    model.in_logic_total,
+                    model.big_ticket_done,
+                    model.big_ticket_total
+                ));
+                ui.checkbox("in-logic only", &mut in_logic_only);
+                ui.same_line();
+                ui.checkbox("big-ticket only", &mut big_ticket_only);
+                ui.separator();
+                if model.total == 0 {
+                    ui.text_disabled("No location data yet -- connect to a session.");
+                }
+
+                // (b) Per-region rollups. The ### id is the region name alone so the header's
+                // open state survives the done/total counters changing.
+                for region in &model.regions {
+                    // Filter pass first so fully-filtered regions can be skipped outright.
+                    let shown: Vec<_> = region
+                        .unchecked
+                        .iter()
+                        .filter(|u| {
+                            (!in_logic_only || u.in_logic) && (!big_ticket_only || u.big_ticket)
+                        })
+                        .collect();
+                    if (in_logic_only || big_ticket_only) && shown.is_empty() {
+                        continue;
+                    }
+                    let lock_tag = if region.accessible { "" } else { "  [locked]" };
+                    let header = format!(
+                        "{}  {}/{}{}###trk-region-{}",
+                        region.region, region.done, region.total, lock_tag, region.region
+                    );
+                    // Dim the header text while the region's coarse region is locked. The token
+                    // pops on drop -- released right after the header so the rows keep their
+                    // own colors.
+                    let dim = (!region.accessible)
+                        .then(|| ui.push_style_color(imgui::StyleColor::Text, LOCKED_GRAY));
+                    let expanded = ui.collapsing_header(header, imgui::TreeNodeFlags::empty());
+                    drop(dim);
+                    if expanded {
+                        if shown.is_empty() {
+                            ui.text_disabled("  complete");
+                        }
+                        for u in shown {
+                            let name = display_loc(u.location_id);
+                            let star = if u.big_ticket { "* " } else { "" };
+                            let line = if u.hinted {
+                                format!("  {star}[hint] {name}")
+                            } else {
+                                format!("  {star}{name}")
+                            };
+                            if u.hinted {
+                                ui.text_colored(HINT_YELLOW, line);
+                            } else if u.big_ticket {
+                                ui.text_colored(BIG_TICKET_ORANGE, line);
+                            } else if !u.in_logic {
+                                ui.text_disabled(line);
+                            } else {
+                                ui.text(line);
+                            }
+                        }
+                    }
+                }
+                // (b2) Bosses group (mode A/B). RE-AUTHORED tail -- no bak_rlwarn equivalent; the
+                // boss tracker post-dates that backup. Rendered from the pure `boss_group` snapshot.
+                if !boss_group.rows.is_empty() {
+                    ui.separator();
+                    let header = format!(
+                        "Bosses  {}/{}###trk-bosses",
+                        boss_group.defeated(),
+                        boss_group.total()
+                    );
+                    if ui.collapsing_header(header, imgui::TreeNodeFlags::empty()) {
+                        for row in &boss_group.rows {
+                            // `name` is the full "Felled: <Boss>" label; strip for a clean line.
+                            let boss = row.name.strip_prefix("Felled: ").unwrap_or(row.name.as_str());
+                            match row.state {
+                                er_logic::boss_felled::BossState::Locked => {
+                                    ui.text_disabled(format!("  {boss}  [{}]", row.region));
+                                }
+                                er_logic::boss_felled::BossState::Felled => {
+                                    let line = match &row.display_key {
+                                        Some(key) => format!("  {boss}  felled -- awaiting {key}"),
+                                        None => format!("  {boss}  felled"),
+                                    };
+                                    ui.text_colored(BIG_TICKET_ORANGE, line);
+                                }
+                                er_logic::boss_felled::BossState::Released => {
+                                    ui.text_colored(HINT_YELLOW, format!("  {boss}  released"));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ui.separator();
+
+                // (c) Received items (raw cumulative names; sorted by the model).
+                if ui.collapsing_header(
+                    format!("Items received ({})###trk-items", model.received_items.len()),
+                    imgui::TreeNodeFlags::empty(),
+                ) {
+                    for item in &model.received_items {
+                        ui.text(format!("  {item}"));
+                    }
+                }
+
+                // (d) Standing hints.
+                if ui.collapsing_header(
+                    format!("Hints ({})###trk-hints", hint_list.len()),
+                    imgui::TreeNodeFlags::empty(),
+                ) {
+                    if hint_list.is_empty() {
+                        ui.text_disabled("  none yet");
+                    }
+                    for h in &hint_list {
+                        let who = if h.for_us {
+                            format!("for {}", h.other_player)
+                        } else {
+                            format!("hinted by {}", h.other_player)
+                        };
+                        ui.text_colored(
+                            HINT_YELLOW,
+                            format!("  {} @ {} ({who})", h.item_name, display_loc(h.location_id)),
+                        );
+                    }
+                }
+            });
+        if !open {
+            self.tracker_visible = false;
+        }
+        self.tracker_in_logic_only = in_logic_only;
+        self.tracker_big_ticket_only = big_ticket_only;
+    }
+
+    fn write_save(&self) {
+        let Some(path) = self.save_path.as_ref() else {
+            return;
+        };
+        let (counter, high) = self.progressive.snapshot();
+        let st = SaveState {
+            last_received_index: self.received_through as i64,
+            start_items_granted: self.start_items_granted,
+            flag_poll_baseline: self.flag_poll_baseline.iter().copied().collect(),
+            notify_granted: Default::default(),
+            progressive_counter: counter.into_iter().collect::<BTreeMap<_, _>>(),
+            progressive_high_index: high,
+        };
+        let tmp = path.with_extension("json.tmp");
+        // R7 (SWEEP): surface write/rename failures -- a silently-lost save resets the
+        // watermarks next session (duplicate start items + regrant burst).
+        match std::fs::write(&tmp, st.to_json()) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    log::error!(
+                        "save persistence: rename {} -> {} FAILED: {e}",
+                        tmp.display(),
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => log::error!("save persistence: write {} FAILED: {e}", tmp.display()),
+        }
+    }
+}
+
+/// R5 (SWEEP): one warning per unmapped AP item id -- the grant loop would otherwise drop the
+/// item with no trace, every session, on every replay.
+static START_ITEM_FAIL_LOGGED: std::sync::Mutex<Option<HashSet<usize>>> = std::sync::Mutex::new(None);
+
+/// Fail-loud (once per start-item index) when a start grant does not land despite a captured
+/// inventory pointer. The start-items loop retries every tick, so without this a stuck grant
+/// (Torrent / dlc_only flasks) is silent. Mirrors `warn_unmapped_once`.
+fn warn_start_item_fail_once(idx: usize, full_id: i32) {
+    let mut guard = START_ITEM_FAIL_LOGGED.lock().unwrap();
+    if guard.get_or_insert_with(HashSet::new).insert(idx) {
+        log::warn!(
+            "start item #{idx} ({full_id:#x}) failed to grant (inventory captured but AddItem \
+             rejected) -- retrying each tick; if this persists the start grant is stuck"
+        );
+    }
+}
+
+static UNMAPPED_LOGGED: std::sync::Mutex<Option<HashSet<i64>>> = std::sync::Mutex::new(None);
+
+fn warn_unmapped_once(name: &str, ap_id: i64) {
+    let mut guard = UNMAPPED_LOGGED.lock().unwrap();
+    if guard.get_or_insert_with(HashSet::new).insert(ap_id) {
+        log::warn!(
+            "item '{name}' (ap id {ap_id}) has no ER mapping -- NOT granted (contract drift?)"
+        );
+    }
+}
+
+fn save_file_path(seed: &str, name: &str) -> Option<PathBuf> {
+    let dir = match shared::utils::mod_directory() {
+        Ok(d) => d,
+        Err(e) => {
+            // R7 (SWEEP): was `.ok()?` -- save persistence silently never armed.
+            log::error!(
+                "save persistence UNAVAILABLE ({e}) -- watermarks will reset every session"
+            );
+            return None;
+        }
+    };
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    Some(dir.join(format!("ap_save_{}_{}.json", safe(seed), safe(name))))
+}
+
+/// Parse slot_data `bossLockItems` (mode A/B, SPEC-boss-lock-tracker) into [`BossDef`] rows.
+/// `{ "<boss_flag>": {name, region, boss_ap_id, gate?, display_key?} }`. Tolerant: skips any
+/// entry whose key is not a u32 or whose value is not an object. Absent/empty => no boss tracking.
+fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDef> {
+    let mut out = Vec::new();
+    let Some(obj) = v.and_then(|v| v.as_object()) else { return out; };
+    for (k, entry) in obj {
+        let (Ok(flag), Some(e)) = (k.parse::<u32>(), entry.as_object()) else { continue };
+        out.push(er_logic::boss_felled::BossDef {
+            flag,
+            name: e.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            region: e.get("region").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            boss_ap_id: e.get("boss_ap_id").and_then(|x| x.as_i64()).unwrap_or(0),
+            gate: e.get("gate").and_then(|x| x.as_str()).map(str::to_string),
+            display_key: e.get("display_key").and_then(|x| x.as_str()).map(str::to_string),
+        });
+    }
+    out
+}
+
+/// Parse slot_data `regionAttunement` (attunement_gate) into per-region [`RegionAttunement`].
+/// `{ "<region>": {threshold, member_ap_ids, bloom_flags} }`. Absent/empty => feature off.
+/// `members` is a HashSet<i64> (matches the struct + er_logic::attunement's `&HashSet<i64>` inputs).
+fn parse_region_attunement(v: Option<&Value>) -> HashMap<String, RegionAttunement> {
+    let mut out = HashMap::new();
+    let Some(obj) = v.and_then(|v| v.as_object()) else { return out; };
+    for (region, entry) in obj {
+        let Some(e) = entry.as_object() else { continue };
+        out.insert(
+            region.clone(),
+            RegionAttunement {
+                threshold: e.get("threshold").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                members: e
+                    .get("member_ap_ids")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                    .unwrap_or_default(),
+                bloom_flags: e
+                    .get("bloom_flags")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
+                    .unwrap_or_default(),
+            },
+        );
+    }
+    out
+}
+
+fn i64_map(v: Option<&Value>) -> HashMap<i64, i64> {
+    let mut m = HashMap::new();
+    if let Some(obj) = v.and_then(|v| v.as_object()) {
+        for (k, val) in obj {
+            if let (Ok(key), Some(value)) = (k.parse::<i64>(), val.as_i64()) {
+                m.insert(key, value);
+            }
+        }
+    }
+    m
+}
+
+/// `{ "<i64>": <u32> }` slot_data object -> `i64 -> u32`. Tolerant: skips malformed entries. Used by
+/// the shop system (locationFlags / shopRowFlags).
+fn i64_to_u32_map(v: Option<&Value>) -> HashMap<i64, u32> {
+    let mut m = HashMap::new();
+    if let Some(obj) = v.and_then(|v| v.as_object()) {
+        for (k, val) in obj {
+            if let (Ok(key), Some(value)) = (k.parse::<i64>(), val.as_u64()) {
+                m.insert(key, value as u32);
+            }
+        }
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    /// The slot_data "versions" contract band the apworld emits. MUST stay in lockstep with
+    /// Archipelago/worlds/eldenring/__init__.py fill_slot_data "versions" — when the apworld
+    /// bumps its band, bump this const AND `[package] version` in this crate's Cargo.toml together.
+    const EXPECTED_SLOT_DATA_VERSIONS: &str = ">=0.1.0-beta.4 <0.1.0-beta.5";
+
+    /// Connect-gate lockstep guard: the crate's own version must sit INSIDE the apworld band.
+    /// (er-semver orders a bare release 0.1.0 ABOVE every 0.1.0-beta.*, so a plain "0.1.0"
+    /// package version made version_gate return Some(false) on every connect — the exact
+    /// bug this test pins down.)
+    #[test]
+    fn client_version_is_inside_apworld_contract_band() {
+        let sd = serde_json::json!({ "versions": EXPECTED_SLOT_DATA_VERSIONS });
+        assert_eq!(
+            er_logic::version::version_gate(&sd, env!("CARGO_PKG_VERSION")),
+            Some(true),
+            "CARGO_PKG_VERSION {} is outside the apworld slot_data band {EXPECTED_SLOT_DATA_VERSIONS}",
+            env!("CARGO_PKG_VERSION"),
+        );
+    }
+}

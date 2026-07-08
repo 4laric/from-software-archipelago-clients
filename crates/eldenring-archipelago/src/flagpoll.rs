@@ -111,15 +111,21 @@ pub fn parse_sweep_flags(sd: &Value) -> HashMap<u32, Vec<i64>> {
     m
 }
 
-/// Parse `sweepLockGates` out of slot_data: sweep trigger AP location -> boss-lock item NAME
-/// that must be in the cumulative received set before that trigger's dungeon sweep fires
-/// (BOSS_LOCKS_PATCH, SPEC-boss-locks.md v0.1). Absent key / empty map = every sweep ungated.
-pub fn parse_sweep_lock_gates(sd: &Value) -> HashMap<i64, String> {
+/// Parse `sweepLockGates` out of slot_data: sweep-trigger EVENT FLAG (the SAME key space as
+/// `dungeonSweepFlags` — the boss-defeat flag that triggers the sweep) -> boss-lock item NAME that
+/// must be in the cumulative received set before that flag's dungeon sweep fires (BOSS_LOCKS_PATCH,
+/// SPEC-region-capstone-model §7). Absent key / empty map = every sweep ungated.
+///
+/// KEY-SPACE FIX (2026-07-08): was parsed as an i64 "AP location" and only ever consumed in the
+/// location-keyed `dungeon_sweeps` loop, which the apworld emits EMPTY (`dungeonSweeps = {}`), so
+/// the defer silently never fired. It is keyed by the sweep-trigger FLAG and must gate the
+/// flag-keyed `sweep_flags` loop (the live path fed by `dungeonSweepFlags`). See core.rs §5b.
+pub fn parse_sweep_lock_gates(sd: &Value) -> HashMap<u32, String> {
     let mut m = HashMap::new();
     if let Some(obj) = sd.get("sweepLockGates").and_then(|x| x.as_object()) {
         for (k, val) in obj {
-            if let (Ok(trigger), Some(name)) = (k.parse::<i64>(), val.as_str()) {
-                m.insert(trigger, name.to_string());
+            if let (Ok(flag), Some(name)) = (k.parse::<u32>(), val.as_str()) {
+                m.insert(flag, name.to_string());
             }
         }
     }

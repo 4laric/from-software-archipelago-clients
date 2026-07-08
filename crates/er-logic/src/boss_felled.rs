@@ -88,6 +88,20 @@ pub struct BossDef {
     pub boss_ap_id: i64,
     /// Mode-B gate item name (`"Boss Key: <Boss>"`), or `None` for a pure mode-A boss.
     pub gate: Option<String>,
+    /// Legible vanilla lock name to SHOW in notifications instead of the synthetic `gate`
+    /// (`"Academy Glintstone Key"` where `gate == Some("Boss Key: Rennala")`). Present only when a
+    /// real vanilla key exists for this lock (`bossLockItems.display_key`, boss_keys ON). Naming
+    /// only — fill and gating still key the synthetic `gate` name.
+    pub display_key: Option<String>,
+}
+
+impl BossDef {
+    /// The label to SHOW the player for this boss's mode-B gate key: the legible vanilla name
+    /// (`display_key`) when the apworld supplied one, else the raw synthetic `gate`
+    /// (`"Boss Key: <Boss>"`). `None` for a pure mode-A boss (no gate at all).
+    pub fn gate_display(&self) -> Option<&str> {
+        self.display_key.as_deref().or(self.gate.as_deref())
+    }
 }
 
 /// One rendered row in the Bosses group — a [`BossDef`] resolved to a concrete [`BossState`].
@@ -97,6 +111,8 @@ pub struct BossRow {
     pub name: String,
     pub region: String,
     pub boss_ap_id: i64,
+    /// Legible gate label for this boss (see [`BossDef::gate_display`]); `None` for a mode-A boss.
+    pub display_key: Option<String>,
     pub state: BossState,
 }
 
@@ -156,6 +172,7 @@ where
                 name: def.name.clone(),
                 region: def.region.clone(),
                 boss_ap_id: def.boss_ap_id,
+                display_key: def.display_key.clone(),
                 state,
             },
         );
@@ -195,7 +212,24 @@ mod tests {
             region: region.to_string(),
             boss_ap_id: flag as i64,
             gate: gate.map(|g| g.to_string()),
+            display_key: None,
         }
+    }
+
+    // ---- gate_display (legible key label) --------------------------------------------------
+
+    #[test]
+    fn gate_display_prefers_legible_key_then_falls_back_then_none() {
+        // display_key present -> show the vanilla key name, never the synthetic.
+        let mut d = def(5000, "Felled: Rennala", "Liurnia of the Lakes", Some("Boss Key: Rennala"));
+        d.display_key = Some("Academy Glintstone Key".to_string());
+        assert_eq!(d.gate_display(), Some("Academy Glintstone Key"));
+        // gate but no display_key -> fall back to the synthetic "Boss Key: <Boss>".
+        let d2 = def(4000, "Felled: Margit", "Limgrave", Some("Boss Key: Margit"));
+        assert_eq!(d2.gate_display(), Some("Boss Key: Margit"));
+        // pure mode-A boss (no gate) -> None.
+        let d3 = def(6000, "Felled: Godrick", "Stormveil Castle", None);
+        assert_eq!(d3.gate_display(), None);
     }
 
     // ---- boss_state ------------------------------------------------------------------------
