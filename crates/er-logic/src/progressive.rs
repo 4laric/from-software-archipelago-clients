@@ -53,6 +53,14 @@ impl ProgressiveState {
         (self.counter.clone(), self.high_index)
     }
 
+    /// The tier table configured for a progressive `name`, if any. Lets the reconciler mapper
+    /// (`reconcile_io::build_desired_inputs`) classify a received item as
+    /// [`ItemSemantics::Progressive`](crate::reconcile::ItemSemantics::Progressive) using the SAME
+    /// parsed config the live grant path uses.
+    pub fn tiers_for(&self, name: &str) -> Option<&Vec<ProgTier>> {
+        self.config.get(name)
+    }
+
     /// Mirror of `on_item_received`: returns the queued effects rather than mutating queues.
     pub fn on_item_received(&mut self, name: &str, ap_index: i64) -> ProgEffects {
         let tiers = match self.config.get(name) {
@@ -254,5 +262,21 @@ mod parse_tests {
     #[test]
     fn parse_absent_key_is_empty() {
         assert!(parse(&serde_json::json!({ "seed": "x" })).is_empty());
+    }
+
+    #[test]
+    fn tiers_for_exposes_the_parsed_config() {
+        let mut cfg = HashMap::new();
+        cfg.insert(
+            "progressive_stone_bell".to_string(),
+            vec![
+                ProgTier { goods: vec![8101], flags: vec![70001] },
+                ProgTier { goods: vec![8102], flags: vec![70002] },
+            ],
+        );
+        let p = ProgressiveState::new(cfg);
+        assert!(p.tiers_for("progressive_stone_bell").is_some());
+        assert_eq!(p.tiers_for("progressive_stone_bell").unwrap().len(), 2);
+        assert!(p.tiers_for("Crimson Tear").is_none());
     }
 }

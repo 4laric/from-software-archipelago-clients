@@ -537,6 +537,18 @@ impl Reconciler {
         }
     }
 
+    /// DRY-RUN (phase 0): compute — but do NOT apply — the actions the next [`tick`](Self::tick)
+    /// WOULD take against the current live observation. Read-only (it snapshots via `io` and diffs;
+    /// it never mutates the game or the watermark), so the client can log the real per-action diff
+    /// under `RECONCILE_DRYRUN=1` before any mutation path is switched over. Empty while unstable.
+    pub fn dry_run_actions(&self, io: &dyn GameIo) -> Vec<Action> {
+        if !io.stability().stable() {
+            return Vec::new();
+        }
+        let observed = self.snapshot(io);
+        diff(&self.desired, &observed)
+    }
+
     /// One convergence attempt. Reads stability; if not stable, does NOTHING (no read, no write) and
     /// stays dirty. Otherwise snapshots, diffs, and applies up to the per-tick budget. Flag-holder /
     /// inventory not-ready responses (and budget exhaustion) leave the remainder for the next tick.
@@ -995,6 +1007,33 @@ mod tests {
             applied_watermark: 0,
         };
         assert!(diff(r.desired(), &obs).is_empty(), "present good -> empty diff (no double-grant)");
+    }
+
+    #[test]
+    fn dry_run_actions_compute_but_never_mutate() {
+        // Phase-0 dry run: dry_run_actions reports what a tick WOULD do, but touches nothing.
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![
+                region(0, "Limgrave Lock", &[76971]),
+                great_rune(1, "Godrick's Great Rune", 191, 6901),
+                consumable(2, "Torch", 2008, 1),
+            ],
+            vec![],
+        ));
+
+        let planned = r.dry_run_actions(&g);
+        assert!(planned.iter().any(|a| matches!(a, Action::SetFlag(76971))));
+        assert!(planned.iter().any(|a| matches!(a, Action::GrantUnique(191, _))));
+        assert!(planned.iter().any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. })));
+        // Nothing was applied: no flags, no goods, no ledger entries, watermark untouched.
+        assert!(g.flags.is_empty() && g.goods.is_empty() && g.ledger_log.is_empty());
+        assert_eq!(r.applied_watermark(), 0);
+
+        // An unstable game plans nothing.
+        g.set_stable(false);
+        assert!(r.dry_run_actions(&g).is_empty(), "no plan while the world is unstable");
     }
 
     // ---- bundle-lock grace self-heal ----------------------------------------------------

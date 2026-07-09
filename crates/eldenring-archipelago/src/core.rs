@@ -155,6 +155,10 @@ pub struct Core {
     /// key is still unreceived is seeded into boss_key_pending SILENTLY so a reconnect never
     /// re-banners its seal. Mirrors boss_flag_prev / attunement_primed.
     boss_key_primed: bool,
+    /// RECONCILER DRY-RUN (additive; `RECONCILE_DRYRUN=1` only): whether `reconcile_io::init` has
+    /// run this session. Keeps init once-only, then `set_inputs` thereafter. Never touched unless
+    /// dry-run is enabled, so the live path is unaffected.
+    reconcile_inited: bool,
 }
 
 impl shared::Core for Core {
@@ -307,6 +311,7 @@ impl shared::Core for Core {
             attunement_primed: false,
             boss_key_pending: HashMap::new(),
             boss_key_primed: false,
+            reconcile_inited: false,
         })
     }
     fn base(&self) -> &CoreBase<Self::Game, Self::SlotData> {
@@ -1620,11 +1625,132 @@ impl shared::Core for Core {
             }
         }
 
+        // ---- RECONCILER DRY-RUN (additive; `RECONCILE_DRYRUN=1`). Computes + LOGS the desired-state
+        //      diff alongside the live path WITHOUT applying anything -- every handler above stays
+        //      authoritative and unchanged. This is Phase 0 of the strangler cutover (MIGRATION.md);
+        //      the whole block is a no-op unless the env var is set. ----
+        if crate::reconcile_io::dry_run_enabled() && self.slot_data_parsed {
+            // Snapshot the FULL received stream (not just the tail) -- DesiredInputs is the CUMULATIVE
+            // set, and the reconciler derives idempotency from the whole set, not per-event deltas.
+            let mut recv: Vec<(i64, String, i64)> = Vec::new();
+            if let Some(client) = self.client() {
+                for (idx, ri) in client.received_items().iter().enumerate() {
+                    recv.push((idx as i64, ri.item().name().to_string(), ri.item().id()));
+                }
+            }
+            let inputs = self.build_desired_inputs(&recv);
+            if !self.reconcile_inited {
+                let path = self
+                    .save_path
+                    .as_ref()
+                    .and_then(|p| p.parent().map(|d| d.join("reconcile.json")))
+                    .unwrap_or_else(|| std::path::PathBuf::from("reconcile.json"));
+                crate::reconcile_io::init(inputs, path);
+                self.reconcile_inited = true;
+            } else {
+                crate::reconcile_io::set_inputs(inputs);
+            }
+            // Dry-run tick: computes + logs the per-action diff; applies nothing (see reconcile_io).
+            crate::reconcile_io::tick();
+        }
+
         Ok(())
     }
 }
 
 impl Core {
+    // ---- RECONCILER DRY-RUN mapper (additive; only called under RECONCILE_DRYRUN) --------------
+    //
+    // build_desired_inputs folds the parsed slot_data tables + the server-delivered received-item
+    // stream into the pure reconciler's `DesiredInputs`. It reuses the SAME tables the live grant
+    // path uses (item_map, region_open_flags/lock_reveal_flags, the progressive config, the
+    // keyitems obtained/restored table) so the reconciler's plan can be validated against today's
+    // behavior in the dry run.
+    //
+    // SCOPE / ASSUMPTIONS (dry-run phase 0; documented in MIGRATION.md):
+    //   * Maps the RECEIVED-ITEM STREAM only. Slot-data BULK grants (start items, start graces,
+    //     reveal_all_maps map flags) stay on the old startgrants path during dry-run; folding them
+    //     in is a Phase-1/3 follow-up. This keeps the logged diff honest.
+    //   * `seal_flags` is left EMPTY on purpose: the authoritative seal set (area_lock / attunement
+    //     flags) is not yet reproduced here, and seeding it wrongly would make the dry-run diff
+    //     propose bogus ClearFlag actions. Received region LOCKS still SET their open flag.
+    //   * consumable `qty` defaults to the item_counts entry or 1 (grant multiplicity does not
+    //     affect the dry-run plan's shape).
+    fn build_desired_inputs(&self, received: &[(i64, String, i64)]) -> er_logic::reconcile::DesiredInputs {
+        use er_logic::reconcile::{DesiredInputs, ReceivedItem, SaveIdentity, SlotData};
+        let seed = self.parsed_seed.clone().unwrap_or_default();
+        let save = SaveIdentity(self.my_name.clone().unwrap_or_default());
+        let items: Vec<ReceivedItem> = received
+            .iter()
+            .map(|(index, name, ap_id)| ReceivedItem {
+                index: *index,
+                name: name.clone(),
+                semantics: self.classify_received(name, *ap_id),
+            })
+            .collect();
+        DesiredInputs {
+            seed,
+            save,
+            received: items,
+            slot_data: SlotData { seal_flags: Vec::new() },
+        }
+    }
+
+    /// Classify one received AP item into its reconciler [`ItemSemantics`], reusing the live tables.
+    /// Order matters: progressive -> region lock -> key item / great rune -> plain grant.
+    fn classify_received(&self, name: &str, ap_id: i64) -> er_logic::reconcile::ItemSemantics {
+        use er_logic::reconcile::{ItemSemantics, ProgTier};
+        // 1. Progressive item (tier goods packed to grant FullIDs, exactly like the live path).
+        if let Some(tiers) = self.progressive.tiers_for(name) {
+            let tiers = tiers
+                .iter()
+                .map(|t| ProgTier {
+                    goods: t
+                        .goods
+                        .iter()
+                        .map(|&g| (g as i32) | er_logic::progressive::GOODS_FULLID)
+                        .collect(),
+                    flags: t.flags.clone(),
+                })
+                .collect();
+            return ItemSemantics::Progressive {
+                tiers,
+                overflow_full_id: (er_logic::progressive::LORDS_RUNE_GOODS as i32)
+                    | er_logic::progressive::GOODS_FULLID,
+            };
+        }
+        // 2. Region-open lock (intentionally absent from item_map; classified by NAME). Fold in the
+        //    lock's revealed grace bundle so those graces self-heal too.
+        if let Some(cfg) = self.region.as_ref() {
+            if let Some(&open) = cfg.region_open_flags.get(name) {
+                let mut flags = vec![open];
+                if let Some(bundle) = cfg.lock_reveal_flags.get(name) {
+                    flags.extend(bundle.iter().copied());
+                }
+                return ItemSemantics::RegionFlags(flags);
+            }
+        }
+        // 3. Key item / great rune: the base grant gives the (restored) goods, plus vanilla
+        //    obtained/restored companion flags from the keyitems table. Both classes are a unique
+        //    good + set-only companion flags, so both map to KeyItem.
+        let full_id = self.item_map.as_ref().and_then(|m| m.get(&ap_id)).copied();
+        let acq = crate::keyitems::acquire_flags(name);
+        if !acq.is_empty() {
+            if let Some(fid) = full_id {
+                return ItemSemantics::KeyItem { goods: fid as i32, obtained_flags: acq };
+            }
+        }
+        // 4. Plain grant: mapped -> ledgered consumable; unmapped -> inert (region locks / boss keys
+        //    fell out at step 2 / are name-gated, so an unmapped id here is genuinely effect-less).
+        match full_id {
+            Some(fid) => {
+                let qty = self.item_counts.get(&ap_id).copied().unwrap_or(1) as i32;
+                ItemSemantics::Consumable { full_id: fid as i32, qty }
+            }
+            None => ItemSemantics::Inert,
+        }
+    }
+
     /// Rebuild all per-seed / per-save state when a reconnect targets a DIFFERENT seed without an
     /// ER reload (see the `parsed_seed` guard). Clears every table that slot_data or the save file
     /// repopulates, so the one-shot parse and save-load run fresh; static tables (region_table,

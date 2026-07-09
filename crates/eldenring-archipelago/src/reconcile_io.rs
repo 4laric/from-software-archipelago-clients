@@ -10,9 +10,10 @@
 //!
 //! * This module compiles ONLY on Windows (it depends on `eldenring` / `fromsoftware-shared`), same
 //!   as the rest of this crate. It is NOT host-testable — the LOGIC it drives is, in `er-logic`.
-//! * It is deliberately NOT wired into `core.rs` yet: `core.rs` is truncated in HEAD and must be
-//!   reconstructed on Windows first (see `MIGRATION.md`). The intended call sites are marked
-//!   `INTEGRATION:` below — a few one-line calls from the reconstructed `update_live` / net loop.
+//! * It is now wired into `core.rs`'s `update_live` behind the `RECONCILE_DRYRUN` env guard
+//!   (additive; the old handlers stay live and unchanged). `core.rs` is NOT truncated — an earlier
+//!   note claiming so was a mount read-truncation artifact; in git it is a complete 2124-line file.
+//!   The call sites are marked `INTEGRATION:` below.
 //! * Phase 0 of the migration is the READ-ONLY DRY RUN (`RECONCILE_DRYRUN=1`): compute + log the diff
 //!   every tick WITHOUT applying it, so the live diff can be validated against today's behavior
 //!   before any mutation path is switched over.
@@ -206,6 +207,12 @@ fn dry_run() -> bool {
     std::env::var("RECONCILE_DRYRUN").map(|v| v == "1").unwrap_or(false)
 }
 
+/// Public view of [`dry_run`] so `core.rs` can gate its additive dry-run wiring on the same env var
+/// (it must NOT do the reconciler snapshot/set_inputs work at all unless dry-run is on).
+pub fn dry_run_enabled() -> bool {
+    dry_run()
+}
+
 /// Initialize the driver once, after slot_data is parsed. `persist_path` is the watermark file next
 /// to the client dll.
 ///
@@ -257,17 +264,20 @@ pub fn tick() {
     let budget = TickBudget::default();
 
     if dry_run() {
-        // PHASE 0: read-only. We can't call the private snapshot/diff from here, so we run the
-        // reconciler against a NON-MUTATING shadow IO and log what it WOULD do. The simplest safe
-        // form is to log the desired-state summary + stability; the real per-action diff log lands
-        // once `core.rs` exposes the snapshot (or we add a `dry_tick` to the pure crate).
+        // PHASE 0: READ-ONLY. `dry_run_actions` snapshots the live game via our `GameIo` and diffs
+        // against desired WITHOUT applying anything (no flag write, no grant, no watermark advance),
+        // so we can validate the exact per-action plan against today's live behavior before flipping
+        // any mutation path. Nothing here mutates the game or the store.
         let stab = d.io.stability();
+        let planned = d.reconciler.dry_run_actions(&d.io);
         log::info!(
-            "[reconcile dryrun] stable={} desired: flags={} unique_goods={} ledger={}",
+            "[reconcile dryrun] stable={} desired(flags={} unique_goods={} ledger={}) would-apply {} action(s): {:?}",
             stab.stable(),
             d.reconciler.desired().flags.len(),
             d.reconciler.desired().unique_goods.len(),
             d.reconciler.desired().ledgered.len(),
+            planned.len(),
+            planned,
         );
         // Do NOT clear dirty in dry-run: keep logging until the operator switches modes.
         return;
@@ -289,9 +299,8 @@ pub fn tick() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// INTEGRATION STUB (do NOT edit the truncated core.rs to add this — reconstruct core.rs first).
-//
-// Once core.rs compiles again, the wiring is five calls:
+// INTEGRATION (now wired into core.rs::update_live behind RECONCILE_DRYRUN; core.rs is NOT
+// truncated). The wiring is five calls:
 //
 //   // 1. after slot_data parse (once):
 //   reconcile_io::init(build_desired_inputs(&slot_data, &received), client_dir.join("reconcile.json"));

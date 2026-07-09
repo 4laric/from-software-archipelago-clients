@@ -39,6 +39,21 @@ const KEY_ITEM_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Malenia's Great Rune", &[196]),
 ];
 
+/// The vanilla obtained / great-rune restored flag(s) mapped to a received item `name` (empty if
+/// none). READ-ONLY companion to [`set_acquire_flags`]: the reconciler's dry-run mapper
+/// (`reconcile_io::build_desired_inputs`) uses it to classify a received item as an
+/// `ItemSemantics::KeyItem { goods, obtained_flags }` from the SAME table the live path applies,
+/// so the two never drift.
+pub fn acquire_flags(name: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for (n, fs) in COMPANION_ACQUIRE_FLAGS.iter().chain(KEY_ITEM_ACQUIRE_FLAGS) {
+        if *n == name {
+            out.extend_from_slice(fs);
+        }
+    }
+    out
+}
+
 /// Fast-path one-shot: set the vanilla obtained/restored flag(s) for a received item name, if any.
 /// Idempotent, but BEST-EFFORT -- writes at menu/load are silently discarded (R3, SWEEP), so this
 /// no longer logs success; `tick_keyitem_flags` (the reconcile tick) re-applies and owns the log.
