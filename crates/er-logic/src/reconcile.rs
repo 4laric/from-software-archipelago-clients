@@ -1540,6 +1540,36 @@ mod tests {
     }
 
     #[test]
+    fn existing_save_watermark_seed_skips_the_already_granted_stream() {
+        // FIRST cutover on an EXISTING save: the OLD grant path already delivered the received stream
+        // up to `received_through` (and the start items). `reconcile_io::init` seeds the reconciler's
+        // watermark THERE (via from_persisted) rather than the old blind 0 -- so the ledger must NOT
+        // re-grant those consumables (the ~N-consumable over-grant), only the un-granted tail.
+        let sd = SlotData {
+            start_items: vec![StartItem { full_id: 130, qty: 1 }], // negative-band start item
+            ..Default::default()
+        };
+        let inputs = DesiredInputs {
+            seed: "A".into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![
+                consumable(0, "Flask", 1001, 1),
+                consumable(1, "Rune", 1002, 1),
+                consumable(2, "Stone", 1003, 1),
+            ],
+            slot_data: sd,
+        };
+        let mut g = MockGame::stable();
+        // received_through == 2: the old path granted indices 0 and 1 (plus the start item). Seed there.
+        let mut r = Reconciler::from_persisted(inputs, 2);
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(1001), 0, "index 0 already granted by the old path -> not re-granted");
+        assert_eq!(g.ledger_count(1002), 0, "index 1 already granted by the old path -> not re-granted");
+        assert_eq!(g.ledger_count(1003), 1, "index 2 is the still-owed tail -> granted exactly once");
+        assert_eq!(g.ledger_count(130), 0, "start item is behind the seeded watermark -> not re-granted");
+    }
+
+    #[test]
     fn bulk_grants_reach_desired_end_to_end_and_only_start_items_are_goods() {
         // One of every bulk class at once: graces + map flags + goal flag SET; start item LEDGERED.
         let sd = SlotData {

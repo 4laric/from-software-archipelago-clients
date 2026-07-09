@@ -211,8 +211,11 @@ impl WatermarkStore {
         WatermarkStore { path, map }
     }
 
-    pub fn get(&self, save: &SaveIdentity) -> i64 {
-        self.map.get(&save.0).copied().unwrap_or(0)
+    /// The persisted watermark for this save, or `None` if this save has NEVER been reconciled
+    /// (first cutover). `init` seeds a fresh-or-existing default in that case instead of the
+    /// misleading `0`, which stranded the negative-band start items and re-owed the whole stream.
+    pub fn get_opt(&self, save: &SaveIdentity) -> Option<i64> {
+        self.map.get(&save.0).copied()
     }
 
     pub fn set(&mut self, save: &SaveIdentity, watermark: i64) {
@@ -355,12 +358,25 @@ fn apply_classes() -> ApplyClasses {
 ///
 /// INTEGRATION: call this from the reconstructed `core.rs` once per session, after the per-seed
 /// `DesiredInputs` are built from parsed slot_data.
-pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf) {
+pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_through: i64) {
     log::info!("[reconcile] mode: {}", mode_desc());
     let save = inputs.save.clone();
     let store = WatermarkStore::load(persist_path);
-    let watermark = store.get(&save);
-    let reconciler = Reconciler::from_persisted(inputs, watermark);
+    // Ledger watermark seeding. The ledger governs consumables AND the negative-band start items;
+    // "index >= watermark is owed". Three cases:
+    //   * reconciled before  -> resume from the persisted watermark.
+    //   * FIRST cutover on an EXISTING save (no persisted state, but the OLD grant path already
+    //     granted `received_through` received items + the start items) -> seed the watermark THERE
+    //     so the ledger owns only the un-granted tail, NOT the whole stream (avoids the ~N-consumable
+    //     re-grant when `ledger` is first flipped on a mid-run save).
+    //   * a genuinely FRESH save -> `Reconciler::new` starts at the desired's ledger FLOOR (the
+    //     negative start-item band), so start items + the stream are all owed and grant from scratch.
+    //     A blind `0` (the old default) sat ABOVE the negative band -> start items never granted.
+    let reconciler = match store.get_opt(&save) {
+        Some(wm) => Reconciler::from_persisted(inputs, wm),
+        None if received_through > 0 => Reconciler::from_persisted(inputs, received_through),
+        None => Reconciler::new(inputs),
+    };
     let driver = Driver {
         reconciler,
         io: LiveGame::new(),
