@@ -354,23 +354,26 @@ fn apply_classes() -> ApplyClasses {
 ///
 /// INTEGRATION: call this from the reconstructed `core.rs` once per session, after the per-seed
 /// `DesiredInputs` are built from parsed slot_data.
-pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_through: i64) {
+pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf) {
     log::info!("[reconcile] mode: {}", mode_desc());
     let save = inputs.save.clone();
     let store = WatermarkStore::load(persist_path);
-    // Ledger watermark seeding. The ledger governs consumables AND the negative-band start items;
-    // "index >= watermark is owed". Three cases:
-    //   * reconciled before  -> resume from the persisted watermark.
-    //   * FIRST cutover on an EXISTING save (no persisted state, but the OLD grant path already
-    //     granted `received_through` received items + the start items) -> seed the watermark THERE
-    //     so the ledger owns only the un-granted tail, NOT the whole stream (avoids the ~N-consumable
-    //     re-grant when `ledger` is first flipped on a mid-run save).
-    //   * a genuinely FRESH save -> `Reconciler::new` starts at the desired's ledger FLOOR (the
-    //     negative start-item band), so start items + the stream are all owed and grant from scratch.
-    //     A blind `0` (the old default) sat ABOVE the negative band -> start items never granted.
+    // Ledger watermark seeding. The ledger is a SINGLE monotonic watermark over one index-sorted list
+    // where start items sit at NEGATIVE indices and received consumables at `>= 0`; "index >= watermark
+    // is owed". So:
+    //   * reconciled before (reconcile.json has this save) -> RESUME from the persisted watermark; the
+    //     watermark already sits past everything granted, so nothing re-grants.
+    //   * FIRST cutover (no persisted state) -> `Reconciler::new`, which starts at the desired's ledger
+    //     FLOOR (the negative start-item band), so start items AND the received stream are all owed and
+    //     grant from scratch. A watermark at `0` (or seeded from `received_through`) sits ABOVE the
+    //     negative band and STRANDS the start items -- one scalar can't both owe the negative band and
+    //     skip a positive prefix, so we owe everything and let idempotency handle it.
+    // NOTE: flipping `ledger` for the FIRST time on a DEEP save whose consumables were already granted
+    // by the OLD receive path (a pre-cutover-build save, no reconcile.json yet) will re-grant that
+    // stream once. The intended flow is full cutover from a FRESH save (nothing pre-granted); a proper
+    // migration would need per-band persistence (start-items-done + received watermark), deferred.
     let reconciler = match store.get_opt(&save) {
         Some(wm) => Reconciler::from_persisted(inputs, wm),
-        None if received_through > 0 => Reconciler::from_persisted(inputs, received_through),
         None => Reconciler::new(inputs),
     };
     let driver = Driver {

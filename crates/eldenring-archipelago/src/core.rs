@@ -1678,7 +1678,7 @@ impl shared::Core for Core {
                     .as_ref()
                     .and_then(|p| p.parent().map(|d| d.join("reconcile.json")))
                     .unwrap_or_else(|| std::path::PathBuf::from("reconcile.json"));
-                crate::reconcile_io::init(inputs, path, self.received_through as i64);
+                crate::reconcile_io::init(inputs, path);
                 self.reconcile_inited = true;
             } else {
                 crate::reconcile_io::set_inputs(inputs);

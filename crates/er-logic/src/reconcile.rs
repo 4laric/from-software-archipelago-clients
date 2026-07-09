@@ -1540,11 +1540,12 @@ mod tests {
     }
 
     #[test]
-    fn existing_save_watermark_seed_skips_the_already_granted_stream() {
-        // FIRST cutover on an EXISTING save: the OLD grant path already delivered the received stream
-        // up to `received_through` (and the start items). `reconcile_io::init` seeds the reconciler's
-        // watermark THERE (via from_persisted) rather than the old blind 0 -- so the ledger must NOT
-        // re-grant those consumables (the ~N-consumable over-grant), only the un-granted tail.
+    fn from_persisted_watermark_skips_the_already_granted_stream() {
+        // RESUME path: a save with a persisted reconcile.json watermark rebuilds via `from_persisted`
+        // and must NOT re-grant anything at/below that watermark -- only the still-owed tail. (This is
+        // the monotonic-frontier guarantee; a single watermark can't owe the negative-band start items
+        // while ALSO skipping a positive prefix, which is why `init` only ever seeds a persisted
+        // watermark here or the fresh ledger floor via `Reconciler::new` -- never `received_through`.)
         let sd = SlotData {
             start_items: vec![StartItem { full_id: 130, qty: 1 }], // negative-band start item
             ..Default::default()
