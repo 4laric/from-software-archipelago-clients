@@ -49,8 +49,13 @@ mod replay {
     // ---- the corpus: one item of every observability class ------------------------------
 
     const SEED: &str = "SEED-A";
-    const N: usize = 5;
+    const N: usize = 7;
 
+    /// One item of EVERY observability class the client grants: a region lock (also a seal-override),
+    /// a map piece (flags only), a key item (good + 4000xx obtained flag), a great rune (good +
+    /// restored flag), a goal flag, and two consumables. This is the corpus the permutation /
+    /// duplication / load-injection theorem is proven over. Progressive items are count-based (not a
+    /// pure set) so they get their own dedicated invariance test below.
     fn corpus() -> Vec<ReceivedItem> {
         vec![
             ReceivedItem {
@@ -86,6 +91,19 @@ mod replay {
                     full_id: 1002,
                     qty: 1,
                 },
+            },
+            ReceivedItem {
+                index: 5,
+                name: "Rold Medallion".into(),
+                semantics: ItemSemantics::KeyItem {
+                    goods: 9000,
+                    obtained_flags: vec![400001],
+                },
+            },
+            ReceivedItem {
+                index: 6,
+                name: "Goal".into(),
+                semantics: ItemSemantics::GoalFlag(9600),
             },
         ]
     }
@@ -198,7 +216,7 @@ mod replay {
             assert_eq!(run(&evs), want, "permutation {perm:?} diverged from the canonical fixpoint");
             checked += 1;
         });
-        assert_eq!(checked, 120, "expected 5! = 120 permutations");
+        assert_eq!(checked, 5040, "expected 7! = 5040 permutations");
     }
 
     #[test]
@@ -263,9 +281,13 @@ mod replay {
         // self-consistency across scrambles.
         let fp = canonical();
         let want_flags: BTreeSet<FlagId> =
-            [76971u32, 76972, 62060, 82001, 6901].into_iter().collect();
-        assert_eq!(fp.set_flags, want_flags, "all region/map/rune flags set exactly once");
-        assert_eq!(fp.goods, [191i32].into_iter().collect::<BTreeSet<_>>(), "the rune good present");
+            [76971u32, 76972, 62060, 82001, 6901, 400001, 9600].into_iter().collect();
+        assert_eq!(fp.set_flags, want_flags, "all region/map/rune/key/goal flags set exactly once");
+        assert_eq!(
+            fp.goods,
+            [191i32, 9000].into_iter().collect::<BTreeSet<_>>(),
+            "the rune good AND the key-item good present, never a map piece"
+        );
         assert_eq!(
             fp.ledger,
             vec![(1001, 3), (1002, 1)],
@@ -290,6 +312,98 @@ mod replay {
             }
         });
         let goods: Vec<GoodsId> = buckets.into_keys().collect();
-        assert_eq!(goods, vec![191], "only the great-rune good ever lands; never a map piece");
+        assert_eq!(
+            goods,
+            vec![191, 9000],
+            "only the great-rune + key-item goods ever land; never a map piece"
+        );
+    }
+
+    // ---- progressive invariance (count-based, its own corpus) ---------------------------
+
+    /// A 3-copy progressive stream over a 2-tier bell: tiers 0/1 land as unique goods 8101/8102 with
+    /// flags 70001/70002, and the 3rd copy overflows to one Lord's Rune. Because it is COUNT-based,
+    /// the corpus is a run of same-name copies; the theorem here is that its converged state is
+    /// invariant under receiving those copies in any order (and under load-screen injection).
+    fn prog_inputs(prefix_hi: i64) -> DesiredInputs {
+        let tiers = vec![
+            ProgTier { goods: vec![8101], flags: vec![70001] },
+            ProgTier { goods: vec![8102], flags: vec![70002] },
+        ];
+        let received: Vec<ReceivedItem> = (0..3i64)
+            .filter(|&k| k <= prefix_hi)
+            .map(|k| ReceivedItem {
+                index: k,
+                name: "progressive_stone_bell".into(),
+                semantics: ItemSemantics::Progressive {
+                    tiers: tiers.clone(),
+                    overflow_full_id: 2919,
+                },
+            })
+            .collect();
+        DesiredInputs {
+            seed: SEED.into(),
+            save: SaveIdentity("slot0".into()),
+            received,
+            slot_data: SlotData::default(),
+        }
+    }
+
+    fn run_prog(events: &[Ev]) -> Fixpoint {
+        let budget = TickBudget::default();
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(prog_inputs(-1));
+        let mut high: i64 = -1;
+        for &ev in events {
+            match ev {
+                Ev::Connect => {
+                    r.set_inputs(prog_inputs(high));
+                    g.set_stable(true);
+                    r.run_to_fixpoint(&mut g, budget, 16);
+                }
+                Ev::Receive(k) => {
+                    high = high.max(k);
+                    r.set_inputs(prog_inputs(high));
+                    g.set_stable(true);
+                    r.run_to_fixpoint(&mut g, budget, 16);
+                }
+                Ev::Load => {
+                    g.set_stable(false);
+                    let out = r.tick(&mut g, budget);
+                    assert!(out.skipped_unstable, "a tick during a load screen must skip");
+                    g.set_stable(true);
+                }
+            }
+        }
+        g.set_stable(true);
+        r.mark_dirty();
+        r.run_to_fixpoint(&mut g, budget, 32);
+        snapshot(&g)
+    }
+
+    #[test]
+    fn progressive_fixpoint_is_invariant_under_permutation_and_load() {
+        let want = {
+            let mut evs = vec![Ev::Connect];
+            for k in 0..3i64 {
+                evs.push(Ev::Receive(k));
+            }
+            run_prog(&evs)
+        };
+        // Pin the expected end state: both tiers present, both flags set, one overflow Lord's Rune.
+        assert_eq!(want.goods, [8101i32, 8102].into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(want.set_flags, [70001u32, 70002].into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(want.ledger, vec![(2919, 1)], "exactly one overflow, never duplicated");
+
+        let mut order: Vec<i64> = (0..3).collect();
+        permute(&mut order, 3, &mut |perm| {
+            let mut evs = vec![Ev::Load, Ev::Connect];
+            for &k in perm {
+                evs.push(Ev::Receive(k));
+                evs.push(Ev::Receive(k)); // duplicate delivery
+                evs.push(Ev::Load); // interleaved load screen
+            }
+            assert_eq!(run_prog(&evs), want, "progressive perm+dup+load {perm:?} diverged");
+        });
     }
 }

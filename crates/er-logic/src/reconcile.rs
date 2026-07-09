@@ -58,6 +58,15 @@ pub struct SaveIdentity(pub String);
 /// What one received AP item MEANS to the client. Precomputed by the client from slot_data (which
 /// knows the ER FullID / flag mapping of each AP item id) so this module needs no item database.
 ///
+/// One progressive-item tier: the unique goods to grant and the observable flags to set when that
+/// tier lands. Mirrors [`crate::progressive::ProgTier`] but with the goods pre-packed to their grant
+/// FullIDs by the client mapper (`| GOODS_FULLID`), so this module stays item-database-free.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProgTier {
+    pub goods: Vec<GoodsId>,
+    pub flags: Vec<FlagId>,
+}
+
 /// The variants are the whole point of the design: a map piece is a [`MapReveal`](Self::MapReveal)
 /// carrying ONLY flags, so "grant a map-piece good on connect" is structurally *unrepresentable*.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +93,15 @@ pub enum ItemSemantics {
     /// A CONSUMABLE (flask / rune / smithing stone): non-observable (the player spends it), so it is
     /// LEDGERED and applied exactly once by stream index. Count-diffing is wrong here.
     Consumable { full_id: GoodsId, qty: i32 },
+    /// A PROGRESSIVE item: the Nth received copy of this NAME lands tier N (that tier's unique goods
+    /// + observable flags); every copy past the last tier yields exactly ONE overflow consumable
+    /// (`overflow_full_id`, e.g. a Lord's Rune). The desired state depends only on the COUNT of
+    /// copies received (order-independent); the overflow grants are LEDGERED per stream index so a
+    /// reconnect replays none of them. All copies of one name carry the same `tiers` table.
+    Progressive {
+        tiers: Vec<ProgTier>,
+        overflow_full_id: GoodsId,
+    },
     /// A pure goal / progress flag.
     GoalFlag(FlagId),
     /// No client effect (unmapped AP id): contributes nothing to desired state.
@@ -215,7 +233,45 @@ impl DesiredState {
                 ItemSemantics::GoalFlag(f) => {
                     d.flags.insert(*f, true);
                 }
+                // Progressive is COUNT-based, so it can't be folded per-item here; it needs all of a
+                // name's copies at once. Handled in the name-grouping post-pass below.
+                ItemSemantics::Progressive { .. } => {}
                 ItemSemantics::Inert => {}
+            }
+        }
+
+        // 3) PROGRESSIVE: fold each NAME's received copies into landed tiers. Grouping by name and
+        //    sorting by stream index makes this a pure function of the received multiset: tiers
+        //    0..min(count, tiers.len()) contribute their unique goods + observable flags, and every
+        //    copy past the last tier contributes ONE ledgered overflow consumable (keyed by its own
+        //    index, so a reconnect re-grants none of them). Tier flags/goods self-heal set-only; they
+        //    are never OWNED (never cleared), like key-item obtained flags.
+        let mut prog: BTreeMap<&str, (&Vec<ProgTier>, GoodsId, Vec<ItemIndex>)> = BTreeMap::new();
+        for it in &inputs.received {
+            if let ItemSemantics::Progressive { tiers, overflow_full_id } = &it.semantics {
+                let e = prog
+                    .entry(it.name.as_str())
+                    .or_insert((tiers, *overflow_full_id, Vec::new()));
+                e.2.push(it.index);
+            }
+        }
+        for (_name, (tiers, overflow, mut idxs)) in prog {
+            idxs.sort_unstable();
+            for (pos, idx) in idxs.iter().enumerate() {
+                if let Some(t) = tiers.get(pos) {
+                    for &g in &t.goods {
+                        d.unique_goods.entry(g).or_default();
+                    }
+                    for &f in &t.flags {
+                        d.flags.insert(f, true);
+                    }
+                } else {
+                    d.ledgered.push(LedgeredGrant {
+                        index: *idx,
+                        full_id: overflow,
+                        qty: 1,
+                    });
+                }
             }
         }
 
@@ -769,6 +825,43 @@ mod tests {
         }
     }
 
+    fn key_item(index: ItemIndex, name: &str, goods: GoodsId, obtained: &[FlagId]) -> ReceivedItem {
+        ReceivedItem {
+            index,
+            name: name.into(),
+            semantics: ItemSemantics::KeyItem {
+                goods,
+                obtained_flags: obtained.to_vec(),
+            },
+        }
+    }
+    fn goal_flag(index: ItemIndex, name: &str, flag: FlagId) -> ReceivedItem {
+        ReceivedItem {
+            index,
+            name: name.into(),
+            semantics: ItemSemantics::GoalFlag(flag),
+        }
+    }
+    /// A single received copy of a progressive item. All copies of one name carry the same tiers.
+    fn progressive(index: ItemIndex, name: &str, tiers: &[(&[GoodsId], &[FlagId])], overflow: GoodsId) -> ReceivedItem {
+        ReceivedItem {
+            index,
+            name: name.into(),
+            semantics: ItemSemantics::Progressive {
+                tiers: tiers
+                    .iter()
+                    .map(|(g, f)| ProgTier { goods: g.to_vec(), flags: f.to_vec() })
+                    .collect(),
+                overflow_full_id: overflow,
+            },
+        }
+    }
+
+    /// A two-tier progressive bell used across the progressive tests.
+    fn bell_tiers() -> Vec<(&'static [GoodsId], &'static [FlagId])> {
+        vec![(&[8101][..], &[70001][..]), (&[8102][..], &[70002][..])]
+    }
+
     fn inputs(seed: &str, received: Vec<ReceivedItem>, seal_flags: Vec<FlagId>) -> DesiredInputs {
         DesiredInputs {
             seed: seed.into(),
@@ -981,5 +1074,108 @@ mod tests {
         g.flag_ready = true;
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert!(g.get_flag(76971), "the deferred flag lands once the holder is ready");
+    }
+
+    // ---- progressive items (count-based tiers) -------------------------------------------
+
+    #[test]
+    fn progressive_tiers_land_as_unique_goods_plus_flags() {
+        let tiers = bell_tiers();
+        let d = DesiredState::build(&inputs(
+            "A",
+            vec![
+                progressive(0, "progressive_stone_bell", &tiers, 2919),
+                progressive(1, "progressive_stone_bell", &tiers, 2919),
+            ],
+            vec![],
+        ));
+        assert!(d.unique_goods.contains_key(&8101) && d.unique_goods.contains_key(&8102));
+        assert_eq!(d.flags.get(&70001), Some(&true));
+        assert_eq!(d.flags.get(&70002), Some(&true));
+        assert!(d.ledgered.is_empty(), "no overflow while copies <= tier count");
+        assert!(!d.owned_flags.contains(&70001), "tier flags are set-only, never owned");
+    }
+
+    #[test]
+    fn progressive_overflow_becomes_a_ledgered_consumable() {
+        let tiers = bell_tiers();
+        let d = DesiredState::build(&inputs(
+            "A",
+            vec![
+                progressive(0, "progressive_stone_bell", &tiers, 2919),
+                progressive(1, "progressive_stone_bell", &tiers, 2919),
+                progressive(2, "progressive_stone_bell", &tiers, 2919),
+            ],
+            vec![],
+        ));
+        assert_eq!(d.unique_goods.len(), 2, "both tiers still unique goods");
+        assert_eq!(d.ledgered.len(), 1, "exactly one overflow consumable");
+        assert_eq!(d.ledgered[0].full_id, 2919);
+        assert_eq!(d.ledgered[0].qty, 1);
+    }
+
+    #[test]
+    fn progressive_desired_is_order_independent() {
+        let tiers = bell_tiers();
+        let a = DesiredState::build(&inputs(
+            "A",
+            vec![
+                progressive(0, "progressive_stone_bell", &tiers, 2919),
+                progressive(1, "progressive_stone_bell", &tiers, 2919),
+                progressive(2, "progressive_stone_bell", &tiers, 2919),
+            ],
+            vec![],
+        ));
+        let b = DesiredState::build(&inputs(
+            "A",
+            vec![
+                progressive(2, "progressive_stone_bell", &tiers, 2919),
+                progressive(0, "progressive_stone_bell", &tiers, 2919),
+                progressive(1, "progressive_stone_bell", &tiers, 2919),
+            ],
+            vec![],
+        ));
+        assert_eq!(a.unique_goods, b.unique_goods);
+        assert_eq!(a.flags, b.flags);
+        assert_eq!(a.ledgered.len(), b.ledgered.len());
+        assert_eq!(a.ledgered[0].full_id, b.ledgered[0].full_id);
+    }
+
+    #[test]
+    fn progressive_grants_each_tier_and_overflow_once_across_a_reload() {
+        let tiers = bell_tiers();
+        let items = vec![
+            progressive(0, "progressive_stone_bell", &tiers, 2919),
+            progressive(1, "progressive_stone_bell", &tiers, 2919),
+            progressive(2, "progressive_stone_bell", &tiers, 2919),
+        ];
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", items.clone(), vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert!(g.has_good(8101) && g.has_good(8102), "both bell tiers granted");
+        assert!(g.get_flag(70001) && g.get_flag(70002), "both tier flags set");
+        assert_eq!(g.ledger_count(2919), 1, "exactly one overflow Lord's Rune");
+        let wm = r.applied_watermark();
+
+        let mut r2 = Reconciler::from_persisted(inputs("A", items, vec![]), wm);
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert_eq!(g.ledger_count(2919), 1, "no second overflow grant after reload");
+    }
+
+    #[test]
+    fn key_item_and_goal_flag_reach_desired() {
+        let d = DesiredState::build(&inputs(
+            "A",
+            vec![
+                key_item(0, "Rold Medallion", 9000, &[400001]),
+                goal_flag(1, "Goal", 9600),
+            ],
+            vec![],
+        ));
+        assert!(d.unique_goods.contains_key(&9000));
+        assert_eq!(d.unique_goods[&9000].companion_flags, vec![400001]);
+        assert_eq!(d.flags.get(&400001), Some(&true), "obtained flag desired set");
+        assert_eq!(d.flags.get(&9600), Some(&true), "goal flag desired set");
+        assert!(!d.owned_flags.contains(&400001), "obtained flag not owned (never cleared)");
     }
 }

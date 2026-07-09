@@ -14,10 +14,16 @@ mutating — they only mark the reconciler dirty. The pure loop + its proof live
 
 ## Prerequisite (Windows)
 
-`core.rs` is **truncated in HEAD** and does not compile. Reconstruct it first (bak_rlwarn + reflog +
-PR #9 drafts). Nothing below can be built or wired until `cargo build -p eldenring-archipelago`
-compiles again. `reconcile_io.rs` is already added to `lib.rs` (`mod reconcile_io;`) but is not yet
-called from `core.rs`.
+**CORRECTION (2026-07-08): `core.rs` is NOT truncated.** An earlier note here claimed `core.rs` was
+truncated in HEAD and had to be reconstructed. That was a *mount read-truncation artifact* — the
+sandbox mount served a short read of the file. In git, `core.rs` is a complete, brace-balanced
+2124-line file that compiles. **Reconstruct nothing.** Read every source file with
+`git show HEAD:<path>`, never through the mount.
+
+`reconcile_io.rs` is added to `lib.rs` (`mod reconcile_io;`). The dry-run wiring
+(`reconcile_io::{init, tick, set_inputs, mark_dirty}` + `build_desired_inputs`) is now present in
+`core.rs`, guarded by `RECONCILE_DRYRUN` so it computes and LOGS only — the old handlers stay live
+and unchanged. The build prerequisite is simply `cargo build -p eldenring-archipelago` (Windows).
 
 ## Five-phase strangler
 
@@ -63,3 +69,54 @@ Each phase is independently shippable and reversible; the old path stays until i
   || dwell >= 8s)`), generalizing the Torch-clobber fix to the whole client.
 - **Seed change → atomic input swap + watermark reset**, with non-panicking `Option` lookups (the
   reconnect-new-seed panic fix).
+
+## Full grant-class coverage (host-tested in `er-logic`)
+
+Every grant/flag class the live client emits is now represented in `ItemSemantics`, so the reconciler
+can own the whole grant surface. Each class picks the idempotency rule that matches its
+observability:
+
+| Client behaviour (old path) | `ItemSemantics` variant | Idempotency rule |
+|---|---|---|
+| Start items / Torch, flasks, golden/lord's runes, smithing stones | `Consumable { full_id, qty }` | per-`SaveIdentity` ledger watermark (spent items can't be count-diffed) |
+| Key items + vanilla obtained flags `4000xx` | `KeyItem { goods, obtained_flags }` | unique good: grant iff absent; obtained flags set-only (self-heal, never cleared) |
+| Great runes + `restored` flag | `GreatRune { goods, restored_flag }` | unique good iff absent; restored flag is an independent observable flag |
+| Map pieces `62060-64` + underground view `82001` | `MapReveal(flags)` | flags only — **a map piece can never become a granted good** |
+| Region open / seal flags + grace bundles | `RegionFlags(flags)` + `SlotData.seal_flags` | observable flags; seals are OWNED (clearable), a received Lock overrides the seal to open |
+| Goal send | `GoalFlag(flag)` | observable flag |
+| Progressive items (Nth copy → tier N; overflow → Lord's Rune) | `Progressive { tiers, overflow_full_id }` | COUNT-based: tier goods/flags folded from the copy count (order-independent); overflow ledgered per stream index |
+| Unmapped AP ids | `Inert` | no effect |
+
+Proven in `reconcile.rs` unit tests and `reconciler_replay.rs` (the permutation / duplication /
+load-injection theorem now runs over a 7-item corpus covering region+seal, map, key, rune, goal, and
+two consumables; progressive has its own dedicated count-based invariance test).
+
+## Classes deliberately NOT owned by the reconciler (and why)
+
+These are **not** `flags ∪ goods ∪ ledger` desired-state, so they stay on their own code paths. The
+reconciler is a state-convergence engine for *server-delivered grants*; the following are either
+read-side predicates or global param patches, and forcing them into the desired-state model would be
+wrong:
+
+- **`auto_upgrade`** — a per-grant *transform* of the granted weapon's FullID
+  (`upgrades::apply_auto_upgrade(full_id) -> full_id`). It is not a separate grant; the client mapper
+  applies it when it computes the `goods`/`full_id` for a `KeyItem`/`Consumable`, so the reconciler
+  simply grants the already-upgraded id. No new variant needed.
+- **`flatten_regular_upgrades`** (`upgrade_cost::set_flatten`) — a one-shot **regulation param patch**
+  applied at slot_data parse. It mutates upgrade *cost* tables globally, is inherently idempotent, and
+  is not a per-item grant.
+- **`global_scadutree_blessing`** (`upgrades::set_global_scadu_blessing`) — a continuous, periodically
+  re-applied *stat effect* (`SCADU_LAST_TICK`), not a discrete grant. It has no observable
+  flag/good/ledger representation.
+- **Vanilla-drop suppression** (`er_logic::vanilla_suppress::should_suppress`, driven from the
+  `detour.rs` pickup hook against the server COLLECTED set) — a **read-side predicate** deciding
+  whether to null a native pickup. It is already a pure function in `er-logic`; it is not a mutation
+  the reconciler applies.
+- **Shop weapon-slot guard** — **retired** (`shop_sell.rs`: `should_suppress_sold` is a no-op; the
+  weapon-slot echo-dedup now lives in the rewritten shop rows). Nothing for the reconciler to own.
+- **Shop native-sold echo-dedup** (`receive.rs` `GrantAction::SkipNativelySold`) — a *known gap*. A
+  shop reward delivered at purchase time by the rewritten shop row must not be re-granted by the AP
+  echo. Unique-good shop rewards self-heal (the reconciler's `has_good` sees the natively-delivered
+  item and grants nothing), but a *consumable* shop reward would double-grant, because the ledger has
+  no signal that the shop delivered it. **Before Phase 3 flips consumables**, the shop system must
+  mark that stream index applied (advance the per-save watermark past it) — see the checklist.
