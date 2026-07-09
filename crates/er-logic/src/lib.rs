@@ -44,4 +44,6 @@ pub mod upgrade_cost;
 pub mod upgrade_cost_replay;
 pub mod upgrades;
 pub mod vanilla_suppress;
+pub mod reconcile;
+pub mod reconciler_replay;
 pub mod version;

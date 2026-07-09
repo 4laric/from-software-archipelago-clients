@@ -24,6 +24,7 @@ mod minibaker;
 mod no_weapon_reqs;
 mod notif_ticker;
 mod params;
+mod reconcile_io;
 mod region;
 mod scaling;
 mod scout_proof;
