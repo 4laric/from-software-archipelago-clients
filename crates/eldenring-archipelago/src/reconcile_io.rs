@@ -359,9 +359,9 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
     let save = inputs.save.clone();
     let store = WatermarkStore::load(persist_path);
     // Ledger watermark seeding (er-reconciler-received-grant-regression). The ledger is a SINGLE
-    // monotonic watermark over one index-sorted list where NON-goods start items sit at NEGATIVE
-    // indices and received consumables at `>= 0`; "index >= watermark is owed". The seeding decision
-    // is the PURE `Reconciler::seeded` policy (host-tested in er-logic):
+    // monotonic watermark over one index-sorted list where ALL start items sit at NEGATIVE indices and
+    // received consumables at `>= 0`; "index >= watermark is owed". The seeding decision is the PURE
+    // `Reconciler::seeded` policy (host-tested in er-logic):
     //   * persisted AND `<= received_through` (this save's `last_received_index`) -> RESUME from the
     //     persisted watermark; it sits at (or behind) what was actually placed, so nothing re-grants
     //     and any un-placed gap is re-owed.
@@ -373,9 +373,10 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
     //     start items included -- the first-cutover-on-an-existing-save case, no consumable re-grant);
     //     else `Reconciler::new`, which starts at the desired's ledger FLOOR, so the received stream
     //     (and any non-goods start items in the negative band) grant from scratch.
-    // NOTE (start items): GOODS-category start items (the whistle/flask loadout) are NOT on this
-    // watermark -- they are presence-diffed unique goods (see `DesiredState::build` step 1c), granted
-    // whenever absent from inventory, so no seed choice here can strand them.
+    // NOTE (start items): ALL start items are LEDGERED at the negative band (grant-once), so seeding
+    // governs them too -- the distrust rule above re-owes them on a fresh character. They were briefly
+    // presence-diffed to dodge stranding, but that re-granted depletable goods (flasks/pots on empty);
+    // depletion-safe ledger-once + this seeding fix is the durable answer (see build step 1c).
     let persisted = store.get_opt(&save);
     let reconciler = Reconciler::seeded(inputs, persisted, received_through);
     log::info!(

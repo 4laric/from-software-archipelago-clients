@@ -243,54 +243,26 @@ impl DesiredState {
             }
         }
 
-        // 1c) Slot-data START ITEMS, split by observability so a stale/poisoned watermark can never
-        //     strand them (er-reconciler-start-item-grant-bug):
-        //       * GOODS-category start items (Torrent whistle, flasks, wondrous physick — the whole
-        //         common loadout) are PRESENCE-DIFFED like key items / great runes: granted iff absent
-        //         from the live inventory. This is the fix for the real bug — the grant no longer rides
-        //         the single per-save ledger watermark, so a `reconcile.json` seeded at/above 0 (as the
-        //         earlier cutover builds wrote) can't leave them behind the frontier forever; an absent
-        //         whistle simply re-owes itself and self-heals on the next stable tick.
-        //       * NON-goods start items (e.g. a starting weapon) can't be observed by `has_good`
-        //         (Goods-category only), so they stay LEDGERED at the reserved negative band and grant
-        //         once per save via the watermark, exactly as before.
-        //       * STACKED goods start items (a goods full_id whose AGGREGATE start qty is > 1 — the
-        //         loadout ships stacks as repeated FullIDs, e.g. 10x Cracked Pot / 4x Ritual Pot) are
-        //         ALSO ledgered: presence-diff can only observe HAS/HASN'T, so keying them into
-        //         `unique_goods` collapsed the whole stack to a single granted copy (quantity-loss
-        //         bug, found 2026-07-09). One ledgered grant carries the aggregate qty at the stack's
-        //         FIRST slot index; the remaining copies emit nothing (their indices are simply gaps
-        //         in the negative band, which the watermark walks past harmlessly).
-        //     A goods start item with aggregate qty 1 (whistle, flasks, physick) stays on the
-        //     presence path, which grants qty 1 — losing nothing and keeping the self-heal.
-        let mut goods_start_qty: BTreeMap<GoodsId, i32> = BTreeMap::new();
-        for si in &inputs.slot_data.start_items {
-            if (si.full_id as u32) & 0xF000_0000 == crate::progressive::GOODS_FULLID as u32 {
-                *goods_start_qty.entry(si.full_id).or_insert(0) += si.qty.max(1);
-            }
-        }
-        let mut stacked_goods_emitted: BTreeSet<GoodsId> = BTreeSet::new();
+        // 1c) Slot-data START ITEMS: LEDGERED once each at the reserved negative band, granted exactly
+        //     once per save via the watermark. (A depletion-SAFE grant: the ledger owes an index, not an
+        //     inventory presence, so a flask/pot that empties never re-owes itself.)
+        //
+        //     History: an earlier fix presence-diffed GOODS-category start items into `unique_goods`
+        //     (grant iff absent) to dodge a stale-watermark stranding bug. That OVER-GRANTED depletable
+        //     goods — Crimson/Cerulean flasks (and pots) re-granted every time their charge/quantity hit
+        //     0 via DRINKING or grace REALLOCATION (`has_good` reads false at 0), and it collapsed
+        //     repeated-FullID stacks (10x Cracked Pot) to one copy. The real stranding fix lives in the
+        //     watermark SEEDING (`Reconciler::seeded` distrusts a slot-keyed `reconcile.json` watermark
+        //     that sits ahead of this save's `received_through`, re-owing the whole negative band on a
+        //     fresh character), so presence-diff was never actually needed here — ledger-once is both
+        //     correct AND depletion-safe. Reverted to the plain ledger below.
         for (i, si) in inputs.slot_data.start_items.iter().enumerate() {
-            if (si.full_id as u32) & 0xF000_0000 == crate::progressive::GOODS_FULLID as u32 {
-                let total = goods_start_qty.get(&si.full_id).copied().unwrap_or(1);
-                if total <= 1 {
-                    d.unique_goods.entry(si.full_id).or_default();
-                } else if stacked_goods_emitted.insert(si.full_id) {
-                    d.ledgered.push(LedgeredGrant {
-                        index: START_ITEM_INDEX_BASE + i as ItemIndex,
-                        full_id: si.full_id,
-                        qty: total,
-                        apply: true,
-                    });
-                }
-            } else {
-                d.ledgered.push(LedgeredGrant {
-                    index: START_ITEM_INDEX_BASE + i as ItemIndex,
-                    full_id: si.full_id,
-                    qty: si.qty,
-                    apply: true,
-                });
-            }
+            d.ledgered.push(LedgeredGrant {
+                index: START_ITEM_INDEX_BASE + i as ItemIndex,
+                full_id: si.full_id,
+                qty: si.qty,
+                apply: true,
+            });
         }
 
         // 2) Fold each received item into its observability class.
@@ -1591,118 +1563,87 @@ mod tests {
     }
 
     #[test]
-    fn goods_start_item_is_presence_diffed_not_ledgered() {
-        // A GOODS-category start item (real FullID carries the 0x4000_0000 nibble, e.g. the Spectral
-        // Steed Whistle = GOODS_FULLID | 130) must be a unique good, NOT a negative-band ledger entry.
-        let whistle = crate::progressive::GOODS_FULLID | 130;
+    fn start_items_are_ledgered_never_presence_diffed() {
+        // Start items (goods AND non-goods) ride the negative-band LEDGER, never `unique_goods`.
+        // Presence-diffing goods start items re-granted DEPLETABLE ones (flasks/pots) on empty.
+        let whistle = crate::progressive::GOODS_FULLID | 130; // goods-category
+        let longsword = 1030000; // weapon-category FullID (nibble 0)
         let d = DesiredState::build(&bulk_inputs(SlotData {
-            start_items: vec![StartItem { full_id: whistle, qty: 1 }],
+            start_items: vec![
+                StartItem { full_id: whistle, qty: 1 },
+                StartItem { full_id: longsword, qty: 1 },
+            ],
             ..Default::default()
         }));
-        assert!(d.unique_goods.contains_key(&whistle), "goods start item is a presence-diffed good");
-        assert!(
-            !d.ledgered.iter().any(|l| l.full_id == whistle),
-            "goods start item must NOT be ledgered (that is what stranded it)"
-        );
+        assert!(d.unique_goods.is_empty(), "no start item is ever a presence-diffed unique good");
+        for id in [whistle, longsword] {
+            assert!(
+                d.ledgered.iter().any(|l| l.full_id == id && l.index < 0),
+                "start item {id} is ledgered in the negative band"
+            );
+        }
     }
 
     #[test]
-    fn stacked_goods_start_items_ledger_with_aggregate_qty() {
-        // QUANTITY-LOSS BUG (2026-07-09): the loadout ships stacks as REPEATED FullIDs (10x Cracked
-        // Pot = GOODS_FULLID|9500 ten times, 4x Ritual Pot). Presence-diff keyed them into
-        // `unique_goods`, collapsing each stack to ONE granted copy. A stack must instead ride the
-        // ledger ONCE with the aggregate qty; qty-1 goods (the whistle) stay presence-diffed.
-        let whistle = crate::progressive::GOODS_FULLID | 130;
+    fn depletable_goods_start_item_is_not_re_granted_when_it_empties() {
+        // FLASK BUG (2026-07-09): presence-diffing goods start items re-granted a Crimson/Cerulean flask
+        // every time its charge count (the good's inventory quantity) reached 0 via DRINKING or grace
+        // REALLOCATION (`has_good` reads false at 0). The ledger owes an INDEX, not a presence, so once
+        // granted the flask is never re-owed — even after it leaves the inventory-presence view.
+        let crimson = crate::progressive::GOODS_FULLID | 1001;
+        let sd = SlotData { start_items: vec![StartItem { full_id: crimson, qty: 1 }], ..Default::default() };
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(bulk_inputs(sd));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(crimson), 1, "the flask grants once at start");
+
+        // Empty it (drink / reallocate to 0). Under presence-diff this re-granted; under the ledger the
+        // advanced watermark leaves the flask index behind the frontier, so nothing re-owes.
+        g.drop_good(crimson);
+        r.mark_dirty();
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(crimson), 1, "an emptied flask is NOT re-granted");
+    }
+
+    #[test]
+    fn stacked_goods_start_items_grant_the_full_quantity() {
+        // The loadout ships stacks as REPEATED FullIDs (10x Cracked Pot, 4x Ritual Pot) — each copy is
+        // its own negative-band ledger entry, so all 10/4 grant (presence-diff collapsed them to one).
+        // None re-grant on reload.
         let cracked_pot = crate::progressive::GOODS_FULLID | 9500;
         let ritual_pot = crate::progressive::GOODS_FULLID | 9501;
-        let mut start_items = vec![StartItem { full_id: whistle, qty: 1 }];
+        let mut start_items: Vec<StartItem> = Vec::new();
         start_items.extend((0..10).map(|_| StartItem { full_id: cracked_pot, qty: 1 }));
         start_items.extend((0..4).map(|_| StartItem { full_id: ritual_pot, qty: 1 }));
-        let d = DesiredState::build(&bulk_inputs(SlotData { start_items, ..Default::default() }));
+        let sd = SlotData { start_items, ..Default::default() };
 
-        assert!(d.unique_goods.contains_key(&whistle), "qty-1 goods stay presence-diffed");
-        assert!(
-            !d.unique_goods.contains_key(&cracked_pot) && !d.unique_goods.contains_key(&ritual_pot),
-            "a stacked goods start item is NOT collapsed into a presence-diffed unique good"
-        );
-        let pots: Vec<_> = d.ledgered.iter().filter(|l| l.full_id == cracked_pot).collect();
-        assert_eq!(pots.len(), 1, "the whole Cracked Pot stack is ONE ledgered grant");
-        assert_eq!(pots[0].qty, 10, "…carrying the aggregate quantity");
-        assert!(pots[0].index < 0, "…in the negative start-item band");
-        let rituals: Vec<_> = d.ledgered.iter().filter(|l| l.full_id == ritual_pot).collect();
-        assert_eq!((rituals.len(), rituals[0].qty), (1, 4));
+        let d = DesiredState::build(&bulk_inputs(sd.clone()));
+        assert_eq!(d.ledgered.iter().filter(|l| l.full_id == cracked_pot).count(), 10);
+        assert_eq!(d.ledgered.iter().filter(|l| l.full_id == ritual_pot).count(), 4);
+        assert!(d.unique_goods.is_empty());
 
-        // End-to-end: a fresh save grants the full stacks exactly once, and a reload from the
-        // persisted watermark re-grants nothing.
-        let sd = SlotData {
-            start_items: {
-                let mut v = vec![StartItem { full_id: whistle, qty: 1 }];
-                v.extend((0..10).map(|_| StartItem { full_id: cracked_pot, qty: 1 }));
-                v.extend((0..4).map(|_| StartItem { full_id: ritual_pot, qty: 1 }));
-                v
-            },
-            ..Default::default()
-        };
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(bulk_inputs(sd.clone()));
-        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
-        let granted_qty = |g: &MockGame, id: GoodsId| -> i32 {
-            g.ledger_log.iter().filter(|&&(f, _)| f == id).map(|&(_, q)| q).sum()
-        };
-        assert_eq!(g.ledger_count(cracked_pot), 1, "one grant call for the Cracked Pot stack");
-        assert_eq!(granted_qty(&g, cracked_pot), 10, "…delivering all 10 Cracked Pots");
-        assert_eq!(g.ledger_count(ritual_pot), 1, "one grant call for the Ritual Pot stack");
-        assert_eq!(granted_qty(&g, ritual_pot), 4, "…delivering all 4 Ritual Pots");
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 32);
+        assert_eq!(g.ledger_count(cracked_pot), 10, "all 10 Cracked Pots granted");
+        assert_eq!(g.ledger_count(ritual_pot), 4, "all 4 Ritual Pots granted");
         let wm = r.applied_watermark();
         let mut r2 = Reconciler::from_persisted(bulk_inputs(sd), wm);
-        r2.run_to_fixpoint(&mut g, TickBudget::default(), 16);
-        assert_eq!(granted_qty(&g, cracked_pot), 10, "no re-grant after reload");
-        assert_eq!(granted_qty(&g, ritual_pot), 4, "no re-grant after reload");
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 32);
+        assert_eq!(g.ledger_count(cracked_pot), 10, "no re-grant after reload");
+        assert_eq!(g.ledger_count(ritual_pot), 4, "no re-grant after reload");
     }
 
     #[test]
-    fn goods_start_item_self_heals_from_a_poisoned_watermark() {
-        // THE BUG: a goods start item stranded by a `reconcile.json` watermark seeded at/above 0. Under
-        // the old ledger model that positive watermark filtered out the entire negative start-item band
-        // forever. Presence-diffing grants it regardless of the watermark, so a poisoned resume heals.
+    fn seeded_grants_start_items_despite_a_stale_slot_watermark() {
+        // The stranding fix lives in SEEDING now, not presence-diff: a fresh character (received_through
+        // 0) with a stale positive slot watermark distrusts it and re-owes the negative start-item band.
         let whistle = crate::progressive::GOODS_FULLID | 130;
-        let sd = SlotData {
-            start_items: vec![StartItem { full_id: whistle, qty: 1 }],
-            ..Default::default()
-        };
+        let sd = SlotData { start_items: vec![StartItem { full_id: whistle, qty: 1 }], ..Default::default() };
         let mut g = MockGame::stable();
-        // Resume with a poisoned positive watermark (what the earlier cutover builds persisted).
-        let mut r = Reconciler::from_persisted(bulk_inputs(sd.clone()), 5);
+        let mut r = Reconciler::seeded(bulk_inputs(sd), Some(5), 0);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert!(g.has_good(whistle), "the whistle grants despite the poisoned positive watermark");
-        assert_eq!(g.ledger_count(whistle), 0, "it grants via presence-diff, not the ledger");
-
-        // Idempotent: with the whistle now present, a second pass does NOT re-grant it.
-        let mut r2 = Reconciler::from_persisted(bulk_inputs(sd), 5);
-        r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert!(g.has_good(whistle));
-
-        // Self-heal: if the good is clobbered out of inventory (bulk load), it re-owes and re-grants.
-        g.drop_good(whistle);
-        r2.mark_dirty();
-        r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert!(g.has_good(whistle), "a clobbered start-item good re-grants on the next stable tick");
-    }
-
-    #[test]
-    fn non_goods_start_item_stays_ledgered() {
-        // A NON-goods start item (e.g. a starting weapon, category nibble 0) can't be observed by
-        // `has_good`, so it must remain on the negative-band ledger (granted once per save).
-        let longsword = 0x0000_0000 | 1030000; // weapon-category FullID (nibble 0)
-        let d = DesiredState::build(&bulk_inputs(SlotData {
-            start_items: vec![StartItem { full_id: longsword, qty: 1 }],
-            ..Default::default()
-        }));
-        assert!(d.unique_goods.is_empty(), "a non-goods start item is not a presence-diffed good");
-        assert!(
-            d.ledgered.iter().any(|l| l.full_id == longsword && l.index < 0),
-            "a non-goods start item stays ledgered in the negative band"
-        );
+        assert_eq!(g.ledger_count(whistle), 1, "fresh char re-owes + grants the whistle despite persisted=5");
     }
 
     #[test]
@@ -1794,9 +1735,10 @@ mod tests {
         assert_eq!(g.ledger_count(3011), 1, "index 0 grants despite the stale positive watermark");
         assert_eq!(g.ledger_count(3012), 1, "index 1 grants");
         assert_eq!(g.ledger_count(3013), 1, "index 2 grants");
-        assert!(
-            g.has_good(crate::progressive::GOODS_FULLID | 130),
-            "the presence-diffed goods start item still grants (unaffected by seeding)"
+        assert_eq!(
+            g.ledger_count(crate::progressive::GOODS_FULLID | 130),
+            1,
+            "the ledgered goods start item is re-owed from the floor and grants too"
         );
         assert_eq!(r.applied_watermark(), 3, "the frontier ends past the granted stream");
     }
@@ -1862,7 +1804,7 @@ mod tests {
         assert_eq!(g.ledger_count(3011), 1);
         assert_eq!(g.ledger_count(3012), 1);
         assert_eq!(g.ledger_count(3013), 1);
-        assert!(g.has_good(crate::progressive::GOODS_FULLID | 130));
+        assert_eq!(g.ledger_count(crate::progressive::GOODS_FULLID | 130), 1, "the goods start item grants from the floor");
     }
 
     #[test]

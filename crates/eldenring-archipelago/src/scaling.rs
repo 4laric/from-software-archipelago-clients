@@ -11,7 +11,8 @@
 //! idempotent and re-scales correctly when the player changes region or an enemy reloads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use eldenring::cs::{ChrIns, ChrInsExt, WorldChrMan};
 use er_logic::scaling::{
@@ -25,6 +26,17 @@ static TICK: AtomicU32 = AtomicU32::new(0);
 
 /// Apply the region's tier SpEffect only a few times a second (enemy stats don't need per-frame).
 const THROTTLE: u32 = 30;
+
+/// Native-crash guard (Siofra / Eternal Cities CTD, 2026-07-09): the last play_region the sweep ran
+/// in, and when we first observed the CURRENT one. We do NOT walk the enemy `ChrIns` lists in the
+/// first `REGION_SETTLE` after a region change -- the new map's enemies are still streaming in, and
+/// iterating / mutating a chr set mid-spawn can dereference a half-constructed `ChrIns` and crash the
+/// game natively (no Rust panic; it's the game's own memory). Enemies are merely left un-scaled for a
+/// couple of seconds after a load; the very next sweep after the window scales them.
+static LAST_REGION: AtomicI32 = AtomicI32::new(i32::MIN);
+static REGION_ENTERED: Mutex<Option<Instant>> = Mutex::new(None);
+/// How long to let a freshly-entered region populate before sweeping its enemies.
+const REGION_SETTLE: Duration = Duration::from_secs(4);
 
 /// Parse slot_data at connect. The parse itself — including the SWEEP H4 / R6 refuse-to-arm on an
 /// empty/missing `regionSphereTargets` — lives in `er_logic::scaling::parse_scaling_config`
@@ -74,6 +86,19 @@ pub fn tick() {
     // region-lock kick uses and the space regionSphereTargetRanges is emitted in.
     let region = (player.play_region_id / 100) as i32;
     let player_handle = player.field_ins_handle; // skip the player itself in the sweep
+
+    // Native-crash guard: on a region change, note the entry time and SKIP this sweep; keep skipping
+    // until the region has settled (`REGION_SETTLE`). This keeps the ChrIns walk out of the mid-load
+    // window where enemies are still being constructed. (See LAST_REGION / REGION_ENTERED above.)
+    let prev_region = LAST_REGION.swap(region, Ordering::Relaxed);
+    if prev_region != region {
+        *REGION_ENTERED.lock().unwrap() = Some(Instant::now());
+        return;
+    }
+    match *REGION_ENTERED.lock().unwrap() {
+        Some(entered) if entered.elapsed() < REGION_SETTLE => return,
+        _ => {}
+    }
 
     let target = {
         let guard = CONFIG.lock().unwrap();
