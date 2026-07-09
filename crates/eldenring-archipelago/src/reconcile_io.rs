@@ -314,16 +314,12 @@ pub fn mode_desc() -> String {
 
 /// STRANGLER cutover control: which classes the reconciler is allowed to APPLY, read from
 /// `RECONCILE_APPLY` (comma list of `flags`,`goods`,`ledger`, or `all`/`none`). The DEFAULT scope
-/// when unset/empty is the current cutover phase = **`flags`** (see [`DEFAULT_APPLY`]): the plain
-/// binary builds straight into the flags test whose plan the dry-run already validated, with the old
-/// handlers still covering goods/ledger. Widen at runtime — `RECONCILE_APPLY=flags,goods`, then
-/// `=all` — to advance phases with no rebuild; `=none` or `RECONCILE_DRYRUN=1` falls back to today's
-/// baseline. Ignored under dry-run. Bump [`DEFAULT_APPLY`] once a phase passes its in-game verify.
-const DEFAULT_APPLY: ApplyClasses = ApplyClasses {
-    flags: true,
-    goods: false,
-    ledger: false,
-};
+/// when unset/empty is now **`all`** (see [`DEFAULT_APPLY`]): the plain binary builds straight into
+/// the FULL cutover — the reconciler owns flags + goods + ledger and the old grant handlers step
+/// aside. NARROW at runtime with no rebuild — `RECONCILE_APPLY=flags` or `flags,goods` to keep goods
+/// / ledger on the old path, `=none` or `RECONCILE_DRYRUN=1` to fall back to today's baseline / log-
+/// only. Ignored under dry-run.
+const DEFAULT_APPLY: ApplyClasses = ApplyClasses::ALL;
 fn apply_classes() -> ApplyClasses {
     match std::env::var("RECONCILE_APPLY") {
         Err(_) => DEFAULT_APPLY,
