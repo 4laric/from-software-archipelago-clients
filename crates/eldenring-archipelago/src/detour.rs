@@ -173,12 +173,57 @@ pub fn prime_inventory_if_needed() {
     }
 }
 
+/// Cracked Pot FullID (GOODS | goods 9500) — the item the Chapel pot-relief guard watches.
+const CRACKED_POT_FULL_ID: i32 = 0x4000_0000 | 9500;
+/// Vanilla latch flag of m10_01 event 10010792 ("shop lineup: empty-pot pre-consumption"): the
+/// event sets it when it completes (both branches), and `EndIf(EventFlag(10019200))` makes every
+/// later run of the event inert once it is on.
+const CHAPEL_POT_RELIEF_LATCH: u32 = 10_019_200;
+/// Chapel of Anticipation play_region sub-id (m10_01; the fresh-character spawn map).
+const CHAPEL_SUB_REGION: i32 = 10010;
+
+/// PHANTOM-CHECK GUARD (flags 66150/66170, found 2026-07-09): vanilla m10_01 event 10010792 is a
+/// patch save-migration — on its first run it waits up to 5s and, if the player ALREADY owns a
+/// Cracked Pot (goods 9500), assumes a pre-patch save that bought Gostoc's pots and force-sets the
+/// relocated pot-instance flags 66150/66170/66180 ("already obtained"). A fresh AP character spawns
+/// in the Chapel of Anticipation (m10_01) and the start-item loadout grants 10x Cracked Pot inside
+/// that window, so the migration misfires and the flag-poll reports the two Sainted Hero's Grave
+/// pot locations (data.py f66150/f66170) as checked at startup, every seed.
+///
+/// Returns true when granting goods 9500 is SAFE: the latch is set (the armed event already
+/// completed / can never re-run), or we are outside m10_01 — in which case we also set the latch
+/// ourselves so a later first-load of m10_01 (Four Belfries waygate) can't run the migration
+/// against pots we granted. While in the chapel pre-latch, callers get `false` and retry; the
+/// event self-latches ≤6s after map start, so the pots are merely deferred a few seconds.
+fn chapel_pot_relief_safe() -> bool {
+    if crate::flags::get_event_flag(CHAPEL_POT_RELIEF_LATCH) {
+        return true;
+    }
+    let in_chapel = crate::flags::play_region_id()
+        .map(|pr| (if pr >= 1_000_000 { pr / 100 } else { pr }) == CHAPEL_SUB_REGION)
+        // Unknown region (load screen): hold — conservative, the caller retries next tick.
+        .unwrap_or(true);
+    if in_chapel {
+        return false;
+    }
+    // Outside the chapel with the latch unset: latch it so any future m10_01 first-load EndIfs
+    // the migration instead of reading our granted pots as a pre-patch save.
+    let _ = crate::flags::try_set_event_flag(CHAPEL_POT_RELIEF_LATCH, true);
+    true
+}
+
 /// Grant an item (full_id = real item id | category nibble) by constructing an itembuf and calling
 /// the original AddItemFunc with the captured inventory pointer. Returns false if the hook isn't
 /// installed or no inventory pointer has been captured yet (no pickup this session) — caller retries.
 /// MUST run on the game thread (the FrameBegin tick / update_live).
 pub fn grant_full_id(full_id: i32, qty: i32) -> bool {
     if HOOK.get().is_none() {
+        return false;
+    }
+    // Chapel pot-relief guard: defer Cracked Pot grants that would trip m10_01's migration event
+    // (phantom checks f66150/f66170). Every caller treats `false` as retry-next-tick, so the
+    // stack simply lands a few seconds later, after the event's own latch (10019200) sets.
+    if full_id == CRACKED_POT_FULL_ID && !chapel_pot_relief_safe() {
         return false;
     }
     // Stage 6a: raise granted weapons to the player's current max reinforce tier (inert if off).

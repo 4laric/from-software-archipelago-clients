@@ -254,13 +254,35 @@ impl DesiredState {
         //       * NON-goods start items (e.g. a starting weapon) can't be observed by `has_good`
         //         (Goods-category only), so they stay LEDGERED at the reserved negative band and grant
         //         once per save via the watermark, exactly as before.
-        //     Every start item is qty 1 today (core builds `StartItem { qty: 1 }`), so the presence
-        //     path — which grants qty 1 — loses nothing. (A genuinely depletable consumable start item
-        //     would be re-granted if fully consumed, but the loadout is permanent goods, so that case
-        //     does not arise.)
+        //       * STACKED goods start items (a goods full_id whose AGGREGATE start qty is > 1 — the
+        //         loadout ships stacks as repeated FullIDs, e.g. 10x Cracked Pot / 4x Ritual Pot) are
+        //         ALSO ledgered: presence-diff can only observe HAS/HASN'T, so keying them into
+        //         `unique_goods` collapsed the whole stack to a single granted copy (quantity-loss
+        //         bug, found 2026-07-09). One ledgered grant carries the aggregate qty at the stack's
+        //         FIRST slot index; the remaining copies emit nothing (their indices are simply gaps
+        //         in the negative band, which the watermark walks past harmlessly).
+        //     A goods start item with aggregate qty 1 (whistle, flasks, physick) stays on the
+        //     presence path, which grants qty 1 — losing nothing and keeping the self-heal.
+        let mut goods_start_qty: BTreeMap<GoodsId, i32> = BTreeMap::new();
+        for si in &inputs.slot_data.start_items {
+            if (si.full_id as u32) & 0xF000_0000 == crate::progressive::GOODS_FULLID as u32 {
+                *goods_start_qty.entry(si.full_id).or_insert(0) += si.qty.max(1);
+            }
+        }
+        let mut stacked_goods_emitted: BTreeSet<GoodsId> = BTreeSet::new();
         for (i, si) in inputs.slot_data.start_items.iter().enumerate() {
             if (si.full_id as u32) & 0xF000_0000 == crate::progressive::GOODS_FULLID as u32 {
-                d.unique_goods.entry(si.full_id).or_default();
+                let total = goods_start_qty.get(&si.full_id).copied().unwrap_or(1);
+                if total <= 1 {
+                    d.unique_goods.entry(si.full_id).or_default();
+                } else if stacked_goods_emitted.insert(si.full_id) {
+                    d.ledgered.push(LedgeredGrant {
+                        index: START_ITEM_INDEX_BASE + i as ItemIndex,
+                        full_id: si.full_id,
+                        qty: total,
+                        apply: true,
+                    });
+                }
             } else {
                 d.ledgered.push(LedgeredGrant {
                     index: START_ITEM_INDEX_BASE + i as ItemIndex,
@@ -1582,6 +1604,60 @@ mod tests {
             !d.ledgered.iter().any(|l| l.full_id == whistle),
             "goods start item must NOT be ledgered (that is what stranded it)"
         );
+    }
+
+    #[test]
+    fn stacked_goods_start_items_ledger_with_aggregate_qty() {
+        // QUANTITY-LOSS BUG (2026-07-09): the loadout ships stacks as REPEATED FullIDs (10x Cracked
+        // Pot = GOODS_FULLID|9500 ten times, 4x Ritual Pot). Presence-diff keyed them into
+        // `unique_goods`, collapsing each stack to ONE granted copy. A stack must instead ride the
+        // ledger ONCE with the aggregate qty; qty-1 goods (the whistle) stay presence-diffed.
+        let whistle = crate::progressive::GOODS_FULLID | 130;
+        let cracked_pot = crate::progressive::GOODS_FULLID | 9500;
+        let ritual_pot = crate::progressive::GOODS_FULLID | 9501;
+        let mut start_items = vec![StartItem { full_id: whistle, qty: 1 }];
+        start_items.extend((0..10).map(|_| StartItem { full_id: cracked_pot, qty: 1 }));
+        start_items.extend((0..4).map(|_| StartItem { full_id: ritual_pot, qty: 1 }));
+        let d = DesiredState::build(&bulk_inputs(SlotData { start_items, ..Default::default() }));
+
+        assert!(d.unique_goods.contains_key(&whistle), "qty-1 goods stay presence-diffed");
+        assert!(
+            !d.unique_goods.contains_key(&cracked_pot) && !d.unique_goods.contains_key(&ritual_pot),
+            "a stacked goods start item is NOT collapsed into a presence-diffed unique good"
+        );
+        let pots: Vec<_> = d.ledgered.iter().filter(|l| l.full_id == cracked_pot).collect();
+        assert_eq!(pots.len(), 1, "the whole Cracked Pot stack is ONE ledgered grant");
+        assert_eq!(pots[0].qty, 10, "…carrying the aggregate quantity");
+        assert!(pots[0].index < 0, "…in the negative start-item band");
+        let rituals: Vec<_> = d.ledgered.iter().filter(|l| l.full_id == ritual_pot).collect();
+        assert_eq!((rituals.len(), rituals[0].qty), (1, 4));
+
+        // End-to-end: a fresh save grants the full stacks exactly once, and a reload from the
+        // persisted watermark re-grants nothing.
+        let sd = SlotData {
+            start_items: {
+                let mut v = vec![StartItem { full_id: whistle, qty: 1 }];
+                v.extend((0..10).map(|_| StartItem { full_id: cracked_pot, qty: 1 }));
+                v.extend((0..4).map(|_| StartItem { full_id: ritual_pot, qty: 1 }));
+                v
+            },
+            ..Default::default()
+        };
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(bulk_inputs(sd.clone()));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        let granted_qty = |g: &MockGame, id: GoodsId| -> i32 {
+            g.ledger_log.iter().filter(|&&(f, _)| f == id).map(|&(_, q)| q).sum()
+        };
+        assert_eq!(g.ledger_count(cracked_pot), 1, "one grant call for the Cracked Pot stack");
+        assert_eq!(granted_qty(&g, cracked_pot), 10, "…delivering all 10 Cracked Pots");
+        assert_eq!(g.ledger_count(ritual_pot), 1, "one grant call for the Ritual Pot stack");
+        assert_eq!(granted_qty(&g, ritual_pot), 4, "…delivering all 4 Ritual Pots");
+        let wm = r.applied_watermark();
+        let mut r2 = Reconciler::from_persisted(bulk_inputs(sd), wm);
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert_eq!(granted_qty(&g, cracked_pot), 10, "no re-grant after reload");
+        assert_eq!(granted_qty(&g, ritual_pot), 4, "no re-grant after reload");
     }
 
     #[test]
