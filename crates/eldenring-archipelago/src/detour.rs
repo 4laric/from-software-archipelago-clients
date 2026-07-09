@@ -212,6 +212,50 @@ fn chapel_pot_relief_safe() -> bool {
     true
 }
 
+/// Pot goods whose HELD count trips a vanilla relief event that force-sets EVERY pot-location flag —
+/// a mass phantom-check across the pot flag ranges (66000-66190 / 66400-66490 / 66700-66790).
+/// common.emevd counts the bare goods row and fires at an EXACT threshold: event 1460 Goods 9500 == 20
+/// -> flag 6902; 1461 Goods 9501 == 10 -> 6903; 1462 Goods 9510 == 10 -> 6904. We cap pot DELIVERIES
+/// one below each threshold so the held count can never equal it. Pots are permanent reusable
+/// containers (count only rises), and the pool ships ~16 Cracked Pot locations plus 10 in the start
+/// loadout, so 20 is otherwise very reachable. Nobody needs 19+ pots, so the cap is invisible in play.
+const POT_DELIVERY_CAPS: &[(i32, i32)] = &[
+    (0x4000_0000 | 9500, 19),    // Cracked Pot        (event 1460, threshold 20)
+    (0x4000_0000 | 9501, 9),     // Ritual Pot         (event 1461, threshold 10)
+    (0x4000_0000 | 9510, 9),     // Perfume Bottle     (event 1462, threshold 10)
+    (0x4000_0000 | 2_009_500, 9), // Hefty Cracked Pot (DLC; threshold 10, flags 669xx)
+];
+
+/// Total held quantity of a bare GOODS row (sums stacks). None if the inventory isn't reachable this
+/// tick. Same read-only walk as `upgrades::held_scadu_fragments` / `inventory`.
+fn count_held_goods_row(row: i32) -> Option<i32> {
+    use eldenring::cs::{GameDataMan, ItemCategory};
+    use fromsoftware_shared::FromStatic;
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    let pgd = gdm.main_player_game_data.as_ref();
+    let mut total: i64 = 0;
+    for entry in pgd.equipment.equip_inventory_data.items_data.items() {
+        if entry.item_id.category() == ItemCategory::Goods && entry.item_id.param_id() as i32 == row {
+            total += entry.quantity as i64;
+        }
+    }
+    Some(total.min(i32::MAX as i64) as i32)
+}
+
+/// Clamp a pot grant so the resulting held count stays strictly below the mass-phantom-check
+/// threshold. Returns the qty to actually grant (0 = at/over the cap, skip). Non-pot full_ids and an
+/// unreadable inventory pass through unchanged (a transient read miss must not drop an item; the cap
+/// re-checks on the next pot grant).
+fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
+    let Some(&(_, cap)) = POT_DELIVERY_CAPS.iter().find(|&&(id, _)| id == full_id) else {
+        return qty;
+    };
+    match count_held_goods_row(full_id & 0x0FFF_FFFF) {
+        Some(held) => qty.min((cap - held).max(0)),
+        None => qty,
+    }
+}
+
 /// Grant an item (full_id = real item id | category nibble) by constructing an itembuf and calling
 /// the original AddItemFunc with the captured inventory pointer. Returns false if the hook isn't
 /// installed or no inventory pointer has been captured yet (no pickup this session) — caller retries.
@@ -225,6 +269,13 @@ pub fn grant_full_id(full_id: i32, qty: i32) -> bool {
     // stack simply lands a few seconds later, after the event's own latch (10019200) sets.
     if full_id == CRACKED_POT_FULL_ID && !chapel_pot_relief_safe() {
         return false;
+    }
+    // Pot-delivery cap: never let a pot grant push the held count to a mass-phantom-check threshold.
+    // At/over the cap we report success (the AP item is delivered as far as the watermark cares) but
+    // add no physical pot, so the count can't reach 20/10/10 and fire relief events 6902/6903/6904.
+    let qty = pot_capped_qty(full_id, qty);
+    if qty <= 0 {
+        return true;
     }
     // Stage 6a: raise granted weapons to the player's current max reinforce tier (inert if off).
     let full_id = crate::upgrades::apply_auto_upgrade(full_id);
