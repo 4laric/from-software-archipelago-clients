@@ -351,6 +351,9 @@ pub fn tick() {
     }
 
     let classes = apply_classes();
+    // Reborrow the MutexGuard once to a plain &mut State so `reconciler` and `io`
+    // split-borrow as disjoint fields (field access through DerefMut cannot).
+    let d = &mut *d;
     let out = d.reconciler.tick_with_classes(&mut d.io, budget, classes);
 
     // Persist the (possibly advanced) ledger watermark for this save.
