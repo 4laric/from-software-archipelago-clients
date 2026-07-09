@@ -26,7 +26,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use er_logic::reconcile::{
-    DesiredInputs, GameIo, Reconciler, SaveIdentity, TickBudget, WorldStability,
+    ApplyClasses, DesiredInputs, GameIo, Reconciler, SaveIdentity, TickBudget, WorldStability,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -213,6 +213,32 @@ pub fn dry_run_enabled() -> bool {
     dry_run()
 }
 
+/// STRANGLER cutover control: which classes the reconciler is allowed to APPLY, read from
+/// `RECONCILE_APPLY` (comma list of `flags`,`goods`,`ledger`, or `all`). Unset/empty => `all`
+/// (full ownership — the end state). During the phased cutover each phase widens this set by one
+/// class while the retired old handler is deleted in the same phase. Ignored under dry-run.
+fn apply_classes() -> ApplyClasses {
+    match std::env::var("RECONCILE_APPLY") {
+        Err(_) => ApplyClasses::ALL,
+        Ok(v) => {
+            let v = v.trim();
+            if v.is_empty() || v.eq_ignore_ascii_case("all") {
+                return ApplyClasses::ALL;
+            }
+            let mut c = ApplyClasses::NONE;
+            for part in v.split(',') {
+                match part.trim().to_ascii_lowercase().as_str() {
+                    "flags" => c.flags = true,
+                    "goods" => c.goods = true,
+                    "ledger" => c.ledger = true,
+                    other => log::warn!("RECONCILE_APPLY: ignoring unknown class '{other}'"),
+                }
+            }
+            c
+        }
+    }
+}
+
 /// Initialize the driver once, after slot_data is parsed. `persist_path` is the watermark file next
 /// to the client dll.
 ///
@@ -283,7 +309,8 @@ pub fn tick() {
         return;
     }
 
-    let out = d.reconciler.tick(&mut d.io, budget);
+    let classes = apply_classes();
+    let out = d.reconciler.tick_with_classes(&mut d.io, budget, classes);
 
     // Persist the (possibly advanced) ledger watermark for this save.
     let wm = d.reconciler.applied_watermark();

@@ -408,6 +408,33 @@ pub trait GameIo {
 // The reconciler
 // ---------------------------------------------------------------------------------------------
 
+/// Which OBSERVABILITY classes this tick is allowed to APPLY. The strangler cutover flips classes
+/// on one at a time (`RECONCILE_APPLY=flags` then `flags,goods` then `flags,goods,ledger`): a
+/// disabled class's actions are simply not this reconciler's job yet — the OLD handler still owns
+/// them — so they are dropped from the action list (never applied, never block convergence).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApplyClasses {
+    pub flags: bool,
+    pub goods: bool,
+    pub ledger: bool,
+}
+
+impl ApplyClasses {
+    /// Own everything (the end state, and what plain [`Reconciler::tick`] uses).
+    pub const ALL: Self = Self { flags: true, goods: true, ledger: true };
+    /// Own nothing (equivalent to dry-run for the apply path).
+    pub const NONE: Self = Self { flags: false, goods: false, ledger: false };
+
+    /// Is `action` in an enabled class?
+    pub fn allows(&self, action: &Action) -> bool {
+        match action {
+            Action::SetFlag(_) | Action::ClearFlag(_) => self.flags,
+            Action::GrantUnique(..) => self.goods,
+            Action::GrantLedgered { .. } => self.ledger,
+        }
+    }
+}
+
 /// Per-tick mutation budget so a large reconnect backlog drains over several ticks instead of
 /// stalling the game thread. `GrantUnique` + `GrantLedgered` share the `goods` budget; `SetFlag` +
 /// `ClearFlag` share the `flags` budget.
@@ -553,6 +580,20 @@ impl Reconciler {
     /// stays dirty. Otherwise snapshots, diffs, and applies up to the per-tick budget. Flag-holder /
     /// inventory not-ready responses (and budget exhaustion) leave the remainder for the next tick.
     pub fn tick(&mut self, io: &mut dyn GameIo, budget: TickBudget) -> TickOutcome {
+        self.tick_with_classes(io, budget, ApplyClasses::ALL)
+    }
+
+    /// Like [`tick`](Self::tick) but only applies actions in the enabled [`ApplyClasses`] — the
+    /// mechanism the strangler cutover uses to hand ONE class at a time to the reconciler while the
+    /// old handlers still own the rest. Disabled-class actions are dropped from the plan (not
+    /// applied, not counted, not blocking convergence), so `converged` reflects only the classes
+    /// this reconciler currently owns.
+    pub fn tick_with_classes(
+        &mut self,
+        io: &mut dyn GameIo,
+        budget: TickBudget,
+        classes: ApplyClasses,
+    ) -> TickOutcome {
         if !io.stability().stable() {
             return TickOutcome {
                 applied: Vec::new(),
@@ -562,7 +603,8 @@ impl Reconciler {
         }
 
         let observed = self.snapshot(io);
-        let actions = diff(&self.desired, &observed);
+        let mut actions = diff(&self.desired, &observed);
+        actions.retain(|a| classes.allows(a));
         if actions.is_empty() {
             self.dirty = false;
             return TickOutcome {
@@ -1010,10 +1052,45 @@ mod tests {
     }
 
     #[test]
+    fn tick_with_classes_owns_only_enabled_classes() {
+        // Strangler phase 1 (flags only): the reconciler sets flags but leaves goods + ledger to the
+        // old handlers. Converged is reached even though goods/ledger actions still "exist".
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![
+                region(0, "Limgrave Lock", &[76971]),
+                great_rune(1, "Godrick's Great Rune", 191, 6901),
+                consumable(2, "Torch", 2008, 1),
+            ],
+            vec![],
+        ));
+
+        let flags_only = ApplyClasses { flags: true, goods: false, ledger: false };
+        let mut n = 0;
+        loop {
+            let out = r.tick_with_classes(&mut g, TickBudget::default(), flags_only);
+            n += 1;
+            if out.converged || n > 8 {
+                break;
+            }
+        }
+        assert!(g.get_flag(76971), "region flag applied under flags-only");
+        assert!(!g.has_good(191), "the rune good is NOT granted while goods is disabled");
+        assert_eq!(g.ledger_count(2008), 0, "no consumable granted while ledger is disabled");
+
+        // Phase 3: enable everything; the good + consumable now land, still exactly once.
+        r.mark_dirty();
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(g.has_good(191), "rune granted once ALL classes are enabled");
+        assert_eq!(g.ledger_count(2008), 1, "Torch granted exactly once");
+    }
+
+    #[test]
     fn dry_run_actions_compute_but_never_mutate() {
         // Phase-0 dry run: dry_run_actions reports what a tick WOULD do, but touches nothing.
         let mut g = MockGame::stable();
-        let mut r = Reconciler::new(inputs(
+        let r = Reconciler::new(inputs(
             "A",
             vec![
                 region(0, "Limgrave Lock", &[76971]),
