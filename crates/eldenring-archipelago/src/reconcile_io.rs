@@ -284,6 +284,31 @@ pub fn owns_ledger() -> bool {
     !dry_run() && apply_classes().ledger
 }
 
+/// One-line summary of the active reconcile mode for the startup log, so a test session's log states
+/// exactly what the reconciler is doing rather than leaving it to be inferred: `dry-run`, the owned
+/// apply classes (`apply=flags`, `apply=flags,goods,ledger`), or `baseline` (owns nothing).
+pub fn mode_desc() -> String {
+    if dry_run() {
+        return "dry-run (logs plan, applies nothing)".to_string();
+    }
+    let c = apply_classes();
+    let mut on = Vec::new();
+    if c.flags {
+        on.push("flags");
+    }
+    if c.goods {
+        on.push("goods");
+    }
+    if c.ledger {
+        on.push("ledger");
+    }
+    if on.is_empty() {
+        "baseline (owns no class; old handlers authoritative)".to_string()
+    } else {
+        format!("apply={}", on.join(","))
+    }
+}
+
 /// STRANGLER cutover control: which classes the reconciler is allowed to APPLY, read from
 /// `RECONCILE_APPLY` (comma list of `flags`,`goods`,`ledger`, or `all`/`none`). The DEFAULT scope
 /// when unset/empty is the current cutover phase = **`flags`** (see [`DEFAULT_APPLY`]): the plain
@@ -331,6 +356,7 @@ fn apply_classes() -> ApplyClasses {
 /// INTEGRATION: call this from the reconstructed `core.rs` once per session, after the per-seed
 /// `DesiredInputs` are built from parsed slot_data.
 pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf) {
+    log::info!("[reconcile] mode: {}", mode_desc());
     let save = inputs.save.clone();
     let store = WatermarkStore::load(persist_path);
     let watermark = store.get(&save);
@@ -410,7 +436,11 @@ pub fn tick() {
         DIRTY.store(false, Ordering::Relaxed);
     }
     if !out.applied.is_empty() {
-        log::debug!("[reconcile] applied {} action(s) this tick", out.applied.len());
+        log::info!(
+            "[reconcile] applied {} action(s) this tick (converged={})",
+            out.applied.len(),
+            out.converged
+        );
     }
 }
 
