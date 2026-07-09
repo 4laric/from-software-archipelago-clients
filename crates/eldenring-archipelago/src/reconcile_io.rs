@@ -44,6 +44,11 @@ use er_logic::reconcile::{
 /// The value is a high, deliberately-invalid event-flag id so that IF it ever reached
 /// `try_set_event_flag` it is an inert no-op (invented ids no-op; see memory er-event-flag-validity)
 /// rather than corrupting a real flag.
+///
+/// Currently unused at runtime: this cutover took option (b) — `build_desired_inputs` passes
+/// `goal_flag: None` and goal-send stays on the core.rs §5c handler. Retained (allow dead_code) as
+/// the ready-made target for option (a) if a `GameIo` goal seam is added later.
+#[allow(dead_code)]
 pub const GOAL_SENTINEL_FLAG: u32 = 0x7FFF_0001;
 
 // ---------------------------------------------------------------------------------------------
@@ -254,17 +259,56 @@ pub fn dry_run_enabled() -> bool {
     dry_run()
 }
 
+/// APPLY-mode active: NOT dry-run AND at least one class is enabled. `core.rs` widens its reconciler
+/// gate on this so the apply path is reachable when `RECONCILE_APPLY` names a class (the dry-run gate
+/// alone left `tick()` uncallable in apply mode — the wiring gap this cutover fixes).
+pub fn apply_active() -> bool {
+    if dry_run() {
+        return false;
+    }
+    let c = apply_classes();
+    c.flags || c.goods || c.ledger
+}
+
+/// Per-class ownership predicates for the strangler: a class is owned by the reconciler ONLY when
+/// not in dry-run and that class is enabled. `core.rs` skips the corresponding OLD handler when the
+/// reconciler owns the class, so the two never both mutate (no double-grant), and `RECONCILE_APPLY`
+/// (or `RECONCILE_DRYRUN=1`) is a runtime fallback to the old path with no rebuild.
+pub fn owns_flags() -> bool {
+    !dry_run() && apply_classes().flags
+}
+pub fn owns_goods() -> bool {
+    !dry_run() && apply_classes().goods
+}
+pub fn owns_ledger() -> bool {
+    !dry_run() && apply_classes().ledger
+}
+
 /// STRANGLER cutover control: which classes the reconciler is allowed to APPLY, read from
-/// `RECONCILE_APPLY` (comma list of `flags`,`goods`,`ledger`, or `all`). Unset/empty => `all`
-/// (full ownership — the end state). During the phased cutover each phase widens this set by one
-/// class while the retired old handler is deleted in the same phase. Ignored under dry-run.
+/// `RECONCILE_APPLY` (comma list of `flags`,`goods`,`ledger`, or `all`/`none`). The DEFAULT scope
+/// when unset/empty is the current cutover phase = **`flags`** (see [`DEFAULT_APPLY`]): the plain
+/// binary builds straight into the flags test whose plan the dry-run already validated, with the old
+/// handlers still covering goods/ledger. Widen at runtime — `RECONCILE_APPLY=flags,goods`, then
+/// `=all` — to advance phases with no rebuild; `=none` or `RECONCILE_DRYRUN=1` falls back to today's
+/// baseline. Ignored under dry-run. Bump [`DEFAULT_APPLY`] once a phase passes its in-game verify.
+const DEFAULT_APPLY: ApplyClasses = ApplyClasses {
+    flags: true,
+    goods: false,
+    ledger: false,
+};
 fn apply_classes() -> ApplyClasses {
     match std::env::var("RECONCILE_APPLY") {
-        Err(_) => ApplyClasses::ALL,
+        Err(_) => DEFAULT_APPLY,
         Ok(v) => {
             let v = v.trim();
-            if v.is_empty() || v.eq_ignore_ascii_case("all") {
+            if v.is_empty() {
+                return DEFAULT_APPLY;
+            }
+            if v.eq_ignore_ascii_case("all") {
                 return ApplyClasses::ALL;
+            }
+            if v.eq_ignore_ascii_case("none") {
+                return ApplyClasses::NONE;
             }
             let mut c = ApplyClasses::NONE;
             for part in v.split(',') {
@@ -272,6 +316,7 @@ fn apply_classes() -> ApplyClasses {
                     "flags" => c.flags = true,
                     "goods" => c.goods = true,
                     "ledger" => c.ledger = true,
+                    "none" => {}
                     other => log::warn!("RECONCILE_APPLY: ignoring unknown class '{other}'"),
                 }
             }

@@ -766,7 +766,15 @@ impl shared::Core for Core {
                 // R11 (SWEEP): `.all(grant_full_id)` re-granted already-succeeded items on a
                 // partial failure next tick (duplicates). Track per-item success (by index,
                 // session-scoped) so only the FAILED ones re-attempt; latch once all landed.
-                if !already_items && has_inv && start_items_settled {
+                // STRANGLER (ledger): start items are folded into `build_desired_inputs` and ledgered
+                // once per save at the negative START_ITEM_INDEX_BASE band, so the reconciler owns
+                // them when it owns `ledger` — skip this old drain then to avoid a double grant.
+                // Runtime-revertible: drop `ledger` from RECONCILE_APPLY and the drain runs again.
+                if !crate::reconcile_io::owns_ledger()
+                    && !already_items
+                    && has_inv
+                    && start_items_settled
+                {
                     let mut all_ok = true;
                     for (i, &id) in sc.start_items.iter().enumerate() {
                         if self.start_items_ok.contains(&i) {
@@ -877,20 +885,30 @@ impl shared::Core for Core {
                 );
                 match action {
                     GrantAction::Enqueue { full_id, qty, name, .. } => {
-                        if dispatch.hook.grant_full_id(full_id, qty) {
-                            // Great-rune "restored" flag is set by keyitems::set_acquire_flags
-                            // (191-196); the AP item already grants the restored goods row, so there
-                            // is no additive goods grant here (that double-granted the rune).
-                        } else {
-                            // H3: the grant did NOT place — hold received_through at this item
-                            // and stop so the tail replays in order next tick (never advance the
-                            // watermark past an unverified grant).
-                            pushed = pushed_before;
-                            log::warn!(
-                                "grant '{name}' (idx {}) failed to place -- receive watermark held for retry",
-                                ri.index
-                            );
-                            break;
+                        // STRANGLER (goods+ledger, THE ATOMIC FLIP): this ONE call grants every
+                        // received item — key items/runes (goods) AND consumables (ledger). Once the
+                        // reconciler owns BOTH classes it is the sole received-item grant path (goods
+                        // via GrantUnique, consumables via the ledger watermark), so skip this grant
+                        // to avoid double-granting consumables on reload. NAME dispatch above and the
+                        // `dispatched_through`/`pushed` advance stay; `pushed` simply advances past
+                        // this item (no H3 hold — the reconciler owns placement). Runtime-revertible:
+                        // drop `goods`/`ledger` from RECONCILE_APPLY and this path grants again.
+                        if !(crate::reconcile_io::owns_goods() && crate::reconcile_io::owns_ledger()) {
+                            if dispatch.hook.grant_full_id(full_id, qty) {
+                                // Great-rune "restored" flag is set by keyitems::set_acquire_flags
+                                // (191-196); the AP item already grants the restored goods row, so
+                                // there is no additive goods grant here (that double-granted the rune).
+                            } else {
+                                // H3: the grant did NOT place — hold received_through at this item
+                                // and stop so the tail replays in order next tick (never advance the
+                                // watermark past an unverified grant).
+                                pushed = pushed_before;
+                                log::warn!(
+                                    "grant '{name}' (idx {}) failed to place -- receive watermark held for retry",
+                                    ri.index
+                                );
+                                break;
+                            }
                         }
                     }
                     GrantAction::SkipProgressive => {
@@ -1537,12 +1555,18 @@ impl shared::Core for Core {
             // aren't clobbered by the save load — same reason the start graces are gated.
             if can_grant {
                 crate::region::tick_natural_key_triggers(cfg, &received_all);
-                // Re-apply lock unlocks whose one-shot receive was discarded at menu/load
-                // (lost graces/open flags -- 2026-07-01 playtest). Latched on the open flag.
-                crate::region::tick_reconcile_received_locks(cfg, &received_all);
-                // R3 (SWEEP): key-item obtained flags, same reconcile family -- the one-shot
-                // write in 4a is lost at menu/load; this re-applies with the flag as the latch.
-                crate::keyitems::tick_keyitem_flags(&received_all);
+                // STRANGLER (flags): the reconciler owns region-open/grace-bundle flags (RegionFlags)
+                // and key-item/great-rune obtained flags (KeyItem) and self-heals them every stable
+                // tick, so skip these two OLD re-appliers when it owns `flags`. `RECONCILE_APPLY=none`
+                // (or dry-run) re-enables them with no rebuild. Idempotent either way (flag writes).
+                if !crate::reconcile_io::owns_flags() {
+                    // Re-apply lock unlocks whose one-shot receive was discarded at menu/load
+                    // (lost graces/open flags -- 2026-07-01 playtest). Latched on the open flag.
+                    crate::region::tick_reconcile_received_locks(cfg, &received_all);
+                    // R3 (SWEEP): key-item obtained flags, same reconcile family -- the one-shot
+                    // write in 4a is lost at menu/load; this re-applies with the flag as the latch.
+                    crate::keyitems::tick_keyitem_flags(&received_all);
+                }
                 // grace_rando: light received "Grace: ..." items (graceItems port-gap, 2026-07-01).
                 graces_lit = crate::region::tick_grace_items(cfg, &received_all);
             }
@@ -1625,11 +1649,15 @@ impl shared::Core for Core {
             }
         }
 
-        // ---- RECONCILER DRY-RUN (additive; `RECONCILE_DRYRUN=1`). Computes + LOGS the desired-state
-        //      diff alongside the live path WITHOUT applying anything -- every handler above stays
-        //      authoritative and unchanged. This is Phase 0 of the strangler cutover (MIGRATION.md);
-        //      the whole block is a no-op unless the env var is set. ----
-        if crate::reconcile_io::dry_run_enabled() && self.slot_data_parsed {
+        // ---- RECONCILER (strangler). DRY-RUN (`RECONCILE_DRYRUN=1`) computes + LOGS the desired-state
+        //      diff WITHOUT applying; APPLY mode (`RECONCILE_APPLY` names a class, default `flags`)
+        //      applies the owned classes via `reconcile_io::tick`, and the OLD handlers above skip
+        //      whatever the reconciler owns (see the `owns_*` gates). Widened from the dry-run-only
+        //      gate: `tick()` was previously unreachable in apply mode (the cutover wiring gap). The
+        //      whole block is a no-op only when neither dry-run nor any apply class is active. ----
+        if (crate::reconcile_io::dry_run_enabled() || crate::reconcile_io::apply_active())
+            && self.slot_data_parsed
+        {
             // Snapshot the FULL received stream (not just the tail) -- DesiredInputs is the CUMULATIVE
             // set, and the reconciler derives idempotency from the whole set, not per-event deltas.
             let mut recv: Vec<(i64, String, i64, bool)> = Vec::new();
@@ -1714,7 +1742,10 @@ impl Core {
                         .collect()
                 })
                 .unwrap_or_default(),
-            goal_flag: Some(crate::reconcile_io::GOAL_SENTINEL_FLAG),
+            // Option (b) from the runbook: goal-send stays on the core.rs §5c `ClientStatus::Goal`
+            // handler (a network send, NOT an ER flag), so the reconciler never plans the synthetic
+            // GOAL_SENTINEL_FLAG SetFlag. `goal_met` is still surfaced for parity/logging.
+            goal_flag: None,
             goal_met: self.reconcile_goal_met(),
         };
         DesiredInputs {
