@@ -1683,7 +1683,11 @@ impl shared::Core for Core {
                     .as_ref()
                     .and_then(|p| p.parent().map(|d| d.join("reconcile.json")))
                     .unwrap_or_else(|| std::path::PathBuf::from("reconcile.json"));
-                crate::reconcile_io::init(inputs, path);
+                // `received_through` (this save's persisted `last_received_index`, loaded in 2b
+                // before this block runs) cross-checks the slot-name-keyed reconcile.json watermark
+                // inside init: a stale positive entry from another character/seed must not strand
+                // this save's received stream (er-reconciler-received-grant-regression).
+                crate::reconcile_io::init(inputs, path, self.received_through as i64);
                 self.reconcile_inited = true;
             } else {
                 crate::reconcile_io::set_inputs(inputs);

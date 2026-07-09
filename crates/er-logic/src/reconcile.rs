@@ -626,6 +626,43 @@ impl Reconciler {
         }
     }
 
+    /// The SESSION-INIT seeding policy: pick the ledger watermark from the persisted `reconcile.json`
+    /// entry AND this save's authoritative received frontier (`received_through`, the client save
+    /// state's `last_received_index`), cross-checked against each other. This is the fix for the
+    /// received-grant regression (er-reconciler-received-grant-regression): the persisted entry is
+    /// keyed by SLOT NAME only, so a FRESH character on a slot whose earlier sessions persisted a
+    /// positive watermark would inherit it and have its whole received stream (indices `0..N <
+    /// stale_wm`) filtered out of the diff -- picked up, vanilla drop suppressed, nothing granted.
+    ///
+    /// Neither value alone is sufficient:
+    ///   * `persisted` alone can be STALE-HIGH (another character/seed's frontier via the slot-name
+    ///     key) -> strands this save's received stream (the regression).
+    ///   * `received_through` alone can run AHEAD of what was actually placed: under the full
+    ///     cutover the old receive path advances it past every item WITHOUT granting (grant is the
+    ///     reconciler's job), so seeding from it blindly would skip items the reconciler never
+    ///     placed (e.g. it sat unstable through the whole prior session).
+    /// So: TRUST `persisted` only when it is `<= received_through` (a frontier can never legally sit
+    /// past what this save has received -- if it does, it belongs to someone else). Distrusted or
+    /// absent, fall back to `received_through` itself when positive (first cutover on an existing
+    /// save: the OLD path already granted that prefix + the start items) or a truly fresh
+    /// [`new`](Self::new) (ledger floor: everything owed).
+    ///
+    /// A trusted `persisted < received_through` is deliberate: it re-owes the gap the reconciler
+    /// never placed (and, in the crash-before-`reconcile.json`-flush case, replays a small tail --
+    /// the same replay-from-last-persisted semantics the old receive path always had). GOODS start
+    /// items are presence-diffed (never on this watermark), so no seed choice can strand them.
+    pub fn seeded(
+        inputs: DesiredInputs,
+        persisted: Option<ItemIndex>,
+        received_through: ItemIndex,
+    ) -> Self {
+        match persisted.filter(|&wm| wm <= received_through) {
+            Some(wm) => Self::from_persisted(inputs, wm),
+            None if received_through > 0 => Self::from_persisted(inputs, received_through),
+            None => Self::new(inputs),
+        }
+    }
+
     /// The persisted-per-save ledger watermark (the client writes this next to the save).
     pub fn applied_watermark(&self) -> ItemIndex {
         self.applied_watermark
@@ -1620,9 +1657,9 @@ mod tests {
     fn from_persisted_watermark_skips_the_already_granted_stream() {
         // RESUME path: a save with a persisted reconcile.json watermark rebuilds via `from_persisted`
         // and must NOT re-grant anything at/below that watermark -- only the still-owed tail. (This is
-        // the monotonic-frontier guarantee; a single watermark can't owe the negative-band start items
-        // while ALSO skipping a positive prefix, which is why `init` only ever seeds a persisted
-        // watermark here or the fresh ledger floor via `Reconciler::new` -- never `received_through`.)
+        // the monotonic-frontier guarantee. `init` reaches here through `Reconciler::seeded`, which
+        // trusts a persisted watermark only when it is `<= received_through` -- see the seeded_* tests
+        // below for the cross-check policy.)
         let sd = SlotData {
             start_items: vec![StartItem { full_id: 130, qty: 1 }], // negative-band start item
             ..Default::default()
@@ -1645,6 +1682,111 @@ mod tests {
         assert_eq!(g.ledger_count(1002), 0, "index 1 already granted by the old path -> not re-granted");
         assert_eq!(g.ledger_count(1003), 1, "index 2 is the still-owed tail -> granted exactly once");
         assert_eq!(g.ledger_count(130), 0, "start item is behind the seeded watermark -> not re-granted");
+    }
+
+    // ---- session-init watermark seeding (Reconciler::seeded) ----------------------------
+
+    /// The received stream + goods start item every seeded_* test below shares: three consumables at
+    /// indices 0..=2 (what a picked-up own-world weapon classifies to) plus the whistle loadout.
+    fn seeded_inputs() -> DesiredInputs {
+        let whistle = crate::progressive::GOODS_FULLID | 130;
+        DesiredInputs {
+            seed: "A".into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![
+                consumable(0, "Dragon Greatclaw", 3011, 1),
+                consumable(1, "Marika's Hammer", 3012, 1),
+                consumable(2, "Ash of War: Seppuku", 3013, 1),
+            ],
+            slot_data: SlotData {
+                start_items: vec![StartItem { full_id: whistle, qty: 1 }],
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn seeded_fresh_character_grants_the_stream_despite_a_stale_slot_watermark() {
+        // THE REGRESSION (er-reconciler-received-grant-regression): reconcile.json is keyed by SLOT
+        // NAME only, so a FRESH character (received_through = 0) inherits the previous character's
+        // persisted POSITIVE watermark. Trusting it filtered every received consumable at index
+        // 0..N < stale_wm out of the diff -- vanilla drop suppressed, item never delivered. `seeded`
+        // must DISTRUST a persisted watermark above received_through and grant the full stream.
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::seeded(seeded_inputs(), Some(5), 0); // stale wm=5, fresh character
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(3011), 1, "index 0 grants despite the stale positive watermark");
+        assert_eq!(g.ledger_count(3012), 1, "index 1 grants");
+        assert_eq!(g.ledger_count(3013), 1, "index 2 grants");
+        assert!(
+            g.has_good(crate::progressive::GOODS_FULLID | 130),
+            "the presence-diffed goods start item still grants (unaffected by seeding)"
+        );
+        assert_eq!(r.applied_watermark(), 3, "the frontier ends past the granted stream");
+    }
+
+    #[test]
+    fn seeded_genuine_resume_still_skips_the_already_granted_prefix() {
+        // A REAL resume: this character's own persisted watermark (== received_through) must still be
+        // trusted, so already-granted consumables are NOT re-granted -- only the still-owed tail.
+        let mut g = MockGame::stable();
+        g.goods.insert(crate::progressive::GOODS_FULLID | 130); // whistle already in inventory
+        let mut r = Reconciler::seeded(seeded_inputs(), Some(2), 2); // granted 0..=1 last session
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(3011), 0, "index 0 already granted -> skipped");
+        assert_eq!(g.ledger_count(3012), 0, "index 1 already granted -> skipped");
+        assert_eq!(g.ledger_count(3013), 1, "index 2 is the owed tail -> granted once");
+        assert_eq!(g.ledger_count(crate::progressive::GOODS_FULLID | 130), 0);
+    }
+
+    #[test]
+    fn seeded_trusts_a_persisted_watermark_behind_received_through() {
+        // Under the full cutover the OLD receive path advances received_through WITHOUT granting
+        // (placement is the reconciler's job), so received_through can run AHEAD of what was actually
+        // placed (e.g. the reconciler sat unstable all session). The persisted watermark is the
+        // actually-granted frontier: when it is BEHIND received_through it must win, re-owing the gap.
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::seeded(seeded_inputs(), Some(1), 3); // placed 0; saw 0..=2
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(3011), 0, "index 0 was actually placed -> skipped");
+        assert_eq!(g.ledger_count(3012), 1, "index 1 was seen but never placed -> re-owed");
+        assert_eq!(g.ledger_count(3013), 1, "index 2 was seen but never placed -> re-owed");
+    }
+
+    #[test]
+    fn seeded_first_cutover_on_an_existing_save_owes_only_the_tail() {
+        // No reconcile.json yet, but the OLD path already granted the prefix (received_through = 2)
+        // plus the start items: seed THERE so the deep-save consumable stream is NOT re-granted, and
+        // a NON-goods start item (negative band, granted via the old start_items_granted latch) stays
+        // behind the frontier.
+        let longsword = 1030000; // weapon-category FullID (nibble 0) -> negative-band ledgered
+        let mut inputs = seeded_inputs();
+        inputs.slot_data.start_items.push(StartItem { full_id: longsword, qty: 1 });
+        let mut g = MockGame::stable();
+        g.goods.insert(crate::progressive::GOODS_FULLID | 130); // old path granted the whistle too
+        let mut r = Reconciler::seeded(inputs, None, 2);
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(3011), 0, "old-path-granted prefix is not re-granted");
+        assert_eq!(g.ledger_count(3012), 0);
+        assert_eq!(g.ledger_count(3013), 1, "the un-granted tail is owed");
+        assert_eq!(g.ledger_count(longsword), 0, "non-goods start item stays behind the seed");
+    }
+
+    #[test]
+    fn seeded_fresh_save_owes_everything_from_the_floor() {
+        // Nothing persisted, nothing received before: identical to `Reconciler::new` -- the ledger
+        // floor owes the negative-band start items AND the whole received stream.
+        let longsword = 1030000;
+        let mut inputs = seeded_inputs();
+        inputs.slot_data.start_items.push(StartItem { full_id: longsword, qty: 1 });
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::seeded(inputs, None, 0);
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(longsword), 1, "fresh save: negative-band start item grants");
+        assert_eq!(g.ledger_count(3011), 1);
+        assert_eq!(g.ledger_count(3012), 1);
+        assert_eq!(g.ledger_count(3013), 1);
+        assert!(g.has_good(crate::progressive::GOODS_FULLID | 130));
     }
 
     #[test]

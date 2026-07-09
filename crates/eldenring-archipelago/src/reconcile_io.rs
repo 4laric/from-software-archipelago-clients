@@ -354,32 +354,34 @@ fn apply_classes() -> ApplyClasses {
 ///
 /// INTEGRATION: call this from the reconstructed `core.rs` once per session, after the per-seed
 /// `DesiredInputs` are built from parsed slot_data.
-pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf) {
+pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_through: i64) {
     log::info!("[reconcile] mode: {}", mode_desc());
     let save = inputs.save.clone();
     let store = WatermarkStore::load(persist_path);
-    // Ledger watermark seeding. The ledger is a SINGLE monotonic watermark over one index-sorted list
-    // where NON-goods start items sit at NEGATIVE indices and received consumables at `>= 0`;
-    // "index >= watermark is owed". So:
-    //   * reconciled before (reconcile.json has this save) -> RESUME from the persisted watermark; the
-    //     watermark already sits past everything granted, so nothing re-grants.
-    //   * FIRST cutover (no persisted state) -> `Reconciler::new`, which starts at the desired's ledger
-    //     FLOOR, so the received stream (and any non-goods start items in the negative band) grant from
-    //     scratch.
-    // NOTE (start items): GOODS-category start items (the whistle/flask loadout) are NO LONGER on this
+    // Ledger watermark seeding (er-reconciler-received-grant-regression). The ledger is a SINGLE
+    // monotonic watermark over one index-sorted list where NON-goods start items sit at NEGATIVE
+    // indices and received consumables at `>= 0`; "index >= watermark is owed". The seeding decision
+    // is the PURE `Reconciler::seeded` policy (host-tested in er-logic):
+    //   * persisted AND `<= received_through` (this save's `last_received_index`) -> RESUME from the
+    //     persisted watermark; it sits at (or behind) what was actually placed, so nothing re-grants
+    //     and any un-placed gap is re-owed.
+    //   * persisted but ABOVE `received_through` -> DISTRUSTED. `reconcile.json` is keyed by SLOT NAME
+    //     only, so this is another character/seed's stale positive frontier; trusting it filtered a
+    //     fresh character's entire received stream out of the diff (picked up, vanilla drop
+    //     suppressed, item never delivered -- the 2026-07-09 regression logs). Fall back below.
+    //   * fallback: `received_through > 0` -> seed THERE (the old path already granted that prefix,
+    //     start items included -- the first-cutover-on-an-existing-save case, no consumable re-grant);
+    //     else `Reconciler::new`, which starts at the desired's ledger FLOOR, so the received stream
+    //     (and any non-goods start items in the negative band) grant from scratch.
+    // NOTE (start items): GOODS-category start items (the whistle/flask loadout) are NOT on this
     // watermark -- they are presence-diffed unique goods (see `DesiredState::build` step 1c), granted
-    // whenever absent from inventory. That is deliberate: a persisted watermark seeded at/above 0 (as
-    // the earlier cutover builds wrote) used to strand them behind the frontier forever, because one
-    // scalar can't both owe the negative band and skip a positive prefix. Presence-diffing takes them
-    // off the scalar entirely, so they self-heal on any save regardless of its persisted watermark.
-    // NOTE (deep-save consumables): flipping `ledger` for the FIRST time on a DEEP save whose consumables
-    // were already granted by the OLD receive path (a pre-cutover-build save, no reconcile.json yet)
-    // will re-grant that stream once. The intended flow is full cutover from a FRESH save; a proper
-    // migration would need per-band persistence (received watermark), deferred.
-    let reconciler = match store.get_opt(&save) {
-        Some(wm) => Reconciler::from_persisted(inputs, wm),
-        None => Reconciler::new(inputs),
-    };
+    // whenever absent from inventory, so no seed choice here can strand them.
+    let persisted = store.get_opt(&save);
+    let reconciler = Reconciler::seeded(inputs, persisted, received_through);
+    log::info!(
+        "[reconcile] ledger seed: persisted={persisted:?} received_through={received_through} -> watermark {}",
+        reconciler.applied_watermark()
+    );
     let driver = Driver {
         reconciler,
         io: LiveGame::new(),
