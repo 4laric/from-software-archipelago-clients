@@ -359,19 +359,23 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf) {
     let save = inputs.save.clone();
     let store = WatermarkStore::load(persist_path);
     // Ledger watermark seeding. The ledger is a SINGLE monotonic watermark over one index-sorted list
-    // where start items sit at NEGATIVE indices and received consumables at `>= 0`; "index >= watermark
-    // is owed". So:
+    // where NON-goods start items sit at NEGATIVE indices and received consumables at `>= 0`;
+    // "index >= watermark is owed". So:
     //   * reconciled before (reconcile.json has this save) -> RESUME from the persisted watermark; the
     //     watermark already sits past everything granted, so nothing re-grants.
     //   * FIRST cutover (no persisted state) -> `Reconciler::new`, which starts at the desired's ledger
-    //     FLOOR (the negative start-item band), so start items AND the received stream are all owed and
-    //     grant from scratch. A watermark at `0` (or seeded from `received_through`) sits ABOVE the
-    //     negative band and STRANDS the start items -- one scalar can't both owe the negative band and
-    //     skip a positive prefix, so we owe everything and let idempotency handle it.
-    // NOTE: flipping `ledger` for the FIRST time on a DEEP save whose consumables were already granted
-    // by the OLD receive path (a pre-cutover-build save, no reconcile.json yet) will re-grant that
-    // stream once. The intended flow is full cutover from a FRESH save (nothing pre-granted); a proper
-    // migration would need per-band persistence (start-items-done + received watermark), deferred.
+    //     FLOOR, so the received stream (and any non-goods start items in the negative band) grant from
+    //     scratch.
+    // NOTE (start items): GOODS-category start items (the whistle/flask loadout) are NO LONGER on this
+    // watermark -- they are presence-diffed unique goods (see `DesiredState::build` step 1c), granted
+    // whenever absent from inventory. That is deliberate: a persisted watermark seeded at/above 0 (as
+    // the earlier cutover builds wrote) used to strand them behind the frontier forever, because one
+    // scalar can't both owe the negative band and skip a positive prefix. Presence-diffing takes them
+    // off the scalar entirely, so they self-heal on any save regardless of its persisted watermark.
+    // NOTE (deep-save consumables): flipping `ledger` for the FIRST time on a DEEP save whose consumables
+    // were already granted by the OLD receive path (a pre-cutover-build save, no reconcile.json yet)
+    // will re-grant that stream once. The intended flow is full cutover from a FRESH save; a proper
+    // migration would need per-band persistence (received watermark), deferred.
     let reconciler = match store.get_opt(&save) {
         Some(wm) => Reconciler::from_persisted(inputs, wm),
         None => Reconciler::new(inputs),

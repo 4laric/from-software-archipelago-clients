@@ -243,16 +243,32 @@ impl DesiredState {
             }
         }
 
-        // 1c) Slot-data START ITEMS: ledgered ONCE per save at the reserved negative band, so the
-        //     single per-save watermark grants them exactly once and a reload leaves them behind the
-        //     frontier. `apply=true` — a real grant (never an echo).
+        // 1c) Slot-data START ITEMS, split by observability so a stale/poisoned watermark can never
+        //     strand them (er-reconciler-start-item-grant-bug):
+        //       * GOODS-category start items (Torrent whistle, flasks, wondrous physick — the whole
+        //         common loadout) are PRESENCE-DIFFED like key items / great runes: granted iff absent
+        //         from the live inventory. This is the fix for the real bug — the grant no longer rides
+        //         the single per-save ledger watermark, so a `reconcile.json` seeded at/above 0 (as the
+        //         earlier cutover builds wrote) can't leave them behind the frontier forever; an absent
+        //         whistle simply re-owes itself and self-heals on the next stable tick.
+        //       * NON-goods start items (e.g. a starting weapon) can't be observed by `has_good`
+        //         (Goods-category only), so they stay LEDGERED at the reserved negative band and grant
+        //         once per save via the watermark, exactly as before.
+        //     Every start item is qty 1 today (core builds `StartItem { qty: 1 }`), so the presence
+        //     path — which grants qty 1 — loses nothing. (A genuinely depletable consumable start item
+        //     would be re-granted if fully consumed, but the loadout is permanent goods, so that case
+        //     does not arise.)
         for (i, si) in inputs.slot_data.start_items.iter().enumerate() {
-            d.ledgered.push(LedgeredGrant {
-                index: START_ITEM_INDEX_BASE + i as ItemIndex,
-                full_id: si.full_id,
-                qty: si.qty,
-                apply: true,
-            });
+            if (si.full_id as u32) & 0xF000_0000 == crate::progressive::GOODS_FULLID as u32 {
+                d.unique_goods.entry(si.full_id).or_default();
+            } else {
+                d.ledgered.push(LedgeredGrant {
+                    index: START_ITEM_INDEX_BASE + i as ItemIndex,
+                    full_id: si.full_id,
+                    qty: si.qty,
+                    apply: true,
+                });
+            }
         }
 
         // 2) Fold each received item into its observability class.
@@ -1513,6 +1529,67 @@ mod tests {
         r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(g.ledger_count(130), 1, "no second Torrent grant after reload");
         assert_eq!(g.ledger_count(1001), 1, "no second Flask grant after reload");
+    }
+
+    #[test]
+    fn goods_start_item_is_presence_diffed_not_ledgered() {
+        // A GOODS-category start item (real FullID carries the 0x4000_0000 nibble, e.g. the Spectral
+        // Steed Whistle = GOODS_FULLID | 130) must be a unique good, NOT a negative-band ledger entry.
+        let whistle = crate::progressive::GOODS_FULLID | 130;
+        let d = DesiredState::build(&bulk_inputs(SlotData {
+            start_items: vec![StartItem { full_id: whistle, qty: 1 }],
+            ..Default::default()
+        }));
+        assert!(d.unique_goods.contains_key(&whistle), "goods start item is a presence-diffed good");
+        assert!(
+            !d.ledgered.iter().any(|l| l.full_id == whistle),
+            "goods start item must NOT be ledgered (that is what stranded it)"
+        );
+    }
+
+    #[test]
+    fn goods_start_item_self_heals_from_a_poisoned_watermark() {
+        // THE BUG: a goods start item stranded by a `reconcile.json` watermark seeded at/above 0. Under
+        // the old ledger model that positive watermark filtered out the entire negative start-item band
+        // forever. Presence-diffing grants it regardless of the watermark, so a poisoned resume heals.
+        let whistle = crate::progressive::GOODS_FULLID | 130;
+        let sd = SlotData {
+            start_items: vec![StartItem { full_id: whistle, qty: 1 }],
+            ..Default::default()
+        };
+        let mut g = MockGame::stable();
+        // Resume with a poisoned positive watermark (what the earlier cutover builds persisted).
+        let mut r = Reconciler::from_persisted(bulk_inputs(sd.clone()), 5);
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(g.has_good(whistle), "the whistle grants despite the poisoned positive watermark");
+        assert_eq!(g.ledger_count(whistle), 0, "it grants via presence-diff, not the ledger");
+
+        // Idempotent: with the whistle now present, a second pass does NOT re-grant it.
+        let mut r2 = Reconciler::from_persisted(bulk_inputs(sd), 5);
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(g.has_good(whistle));
+
+        // Self-heal: if the good is clobbered out of inventory (bulk load), it re-owes and re-grants.
+        g.drop_good(whistle);
+        r2.mark_dirty();
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(g.has_good(whistle), "a clobbered start-item good re-grants on the next stable tick");
+    }
+
+    #[test]
+    fn non_goods_start_item_stays_ledgered() {
+        // A NON-goods start item (e.g. a starting weapon, category nibble 0) can't be observed by
+        // `has_good`, so it must remain on the negative-band ledger (granted once per save).
+        let longsword = 0x0000_0000 | 1030000; // weapon-category FullID (nibble 0)
+        let d = DesiredState::build(&bulk_inputs(SlotData {
+            start_items: vec![StartItem { full_id: longsword, qty: 1 }],
+            ..Default::default()
+        }));
+        assert!(d.unique_goods.is_empty(), "a non-goods start item is not a presence-diffed good");
+        assert!(
+            d.ledgered.iter().any(|l| l.full_id == longsword && l.index < 0),
+            "a non-goods start item stays ledgered in the negative band"
+        );
     }
 
     #[test]

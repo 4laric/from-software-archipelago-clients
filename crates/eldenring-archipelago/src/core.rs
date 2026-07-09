@@ -766,11 +766,16 @@ impl shared::Core for Core {
                 // R11 (SWEEP): `.all(grant_full_id)` re-granted already-succeeded items on a
                 // partial failure next tick (duplicates). Track per-item success (by index,
                 // session-scoped) so only the FAILED ones re-attempt; latch once all landed.
-                // STRANGLER (ledger): start items are folded into `build_desired_inputs` and ledgered
-                // once per save at the negative START_ITEM_INDEX_BASE band, so the reconciler owns
-                // them when it owns `ledger` — skip this old drain then to avoid a double grant.
-                // Runtime-revertible: drop `ledger` from RECONCILE_APPLY and the drain runs again.
-                if !crate::reconcile_io::owns_ledger()
+                // STRANGLER: start items are folded into `build_desired_inputs`, now SPLIT across two
+                // reconciler classes — GOODS-category start items are presence-diffed unique goods
+                // (owned with `goods`), non-goods ones stay ledgered at the negative
+                // START_ITEM_INDEX_BASE band (owned with `ledger`). So this old drain must stand down
+                // whenever the reconciler owns EITHER of those classes, or it would race/double-grant
+                // the class the reconciler already handles. Runtime-revertible: drop both `goods` and
+                // `ledger` from RECONCILE_APPLY (e.g. RECONCILE_APPLY=flags or =none) and the drain runs
+                // again as the sole start-item path.
+                if !crate::reconcile_io::owns_goods()
+                    && !crate::reconcile_io::owns_ledger()
                     && !already_items
                     && has_inv
                     && start_items_settled
