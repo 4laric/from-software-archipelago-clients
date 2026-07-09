@@ -82,6 +82,7 @@ mod replay {
                 semantics: ItemSemantics::Consumable {
                     full_id: 1001,
                     qty: 3,
+                    echo_skip: false,
                 },
             },
             ReceivedItem {
@@ -90,6 +91,7 @@ mod replay {
                 semantics: ItemSemantics::Consumable {
                     full_id: 1002,
                     qty: 1,
+                    echo_skip: false,
                 },
             },
             ReceivedItem {
@@ -121,6 +123,16 @@ mod replay {
             received,
             slot_data: SlotData {
                 seal_flags: vec![76971],
+                // Bulk slot-data grants (constant across every scramble): start graces, an
+                // unconditional + a reveal_all_maps map flag, one start item, and a met goal flag.
+                // They are proven invariant alongside the permuted/duplicated/load-injected stream.
+                start_graces: vec![76900],
+                always_map_flags: vec![82005],
+                reveal_all_maps: true,
+                map_reveal_flags: vec![62010],
+                start_items: vec![StartItem { full_id: 3000, qty: 1 }],
+                goal_flag: Some(9700),
+                goal_met: true,
             },
         }
     }
@@ -280,9 +292,15 @@ mod replay {
         // Pin the actual end state so a regression in the corpus semantics is caught, not just
         // self-consistency across scrambles.
         let fp = canonical();
-        let want_flags: BTreeSet<FlagId> =
-            [76971u32, 76972, 62060, 82001, 6901, 400001, 9600].into_iter().collect();
-        assert_eq!(fp.set_flags, want_flags, "all region/map/rune/key/goal flags set exactly once");
+        let want_flags: BTreeSet<FlagId> = [
+            // received-stream flags
+            76971u32, 76972, 62060, 82001, 6901, 400001, 9600,
+            // slot-data bulk flags (start grace, always+reveal map flags, met goal)
+            76900, 82005, 62010, 9700,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(fp.set_flags, want_flags, "all region/map/rune/key/goal + bulk flags set exactly once");
         assert_eq!(
             fp.goods,
             [191i32, 9000].into_iter().collect::<BTreeSet<_>>(),
@@ -290,8 +308,8 @@ mod replay {
         );
         assert_eq!(
             fp.ledger,
-            vec![(1001, 3), (1002, 1)],
-            "each consumable granted exactly once (no double-grant)"
+            vec![(1001, 3), (1002, 1), (3000, 1)],
+            "each consumable + the start item granted exactly once (no double-grant)"
         );
     }
 

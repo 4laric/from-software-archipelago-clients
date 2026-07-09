@@ -78,18 +78,51 @@ observability:
 
 | Client behaviour (old path) | `ItemSemantics` variant | Idempotency rule |
 |---|---|---|
-| Start items / Torch, flasks, golden/lord's runes, smithing stones | `Consumable { full_id, qty }` | per-`SaveIdentity` ledger watermark (spent items can't be count-diffed) |
+| Received consumables / Torch, flasks, golden/lord's runes, smithing stones | `Consumable { full_id, qty, echo_skip }` | per-`SaveIdentity` ledger watermark; `echo_skip` dedups a native-sold shop echo (advance past, no grant) |
 | Key items + vanilla obtained flags `4000xx` | `KeyItem { goods, obtained_flags }` | unique good: grant iff absent; obtained flags set-only (self-heal, never cleared) |
 | Great runes + `restored` flag | `GreatRune { goods, restored_flag }` | unique good iff absent; restored flag is an independent observable flag |
 | Map pieces `62060-64` + underground view `82001` | `MapReveal(flags)` | flags only — **a map piece can never become a granted good** |
 | Region open / seal flags + grace bundles | `RegionFlags(flags)` + `SlotData.seal_flags` | observable flags; seals are OWNED (clearable), a received Lock overrides the seal to open |
-| Goal send | `GoalFlag(flag)` | observable flag |
+| Goal send (received-item) | `GoalFlag(flag)` | observable flag |
+| Slot-data start graces + `reveal_all_maps` map flags + underground `82001` | `SlotData.start_graces / map_reveal_flags / always_map_flags` | observable flags, SET-only (self-heal, never owned/cleared) |
+| Slot-data start items (Torrent, flasks) | `SlotData.start_items` → ledgered at the `START_ITEM_INDEX_BASE` negative band | per-save watermark: granted once, a reload leaves the negative indices behind the frontier |
+| Slot-data goal-send (condition-based) | `SlotData.goal_flag` + `goal_met` | goal flag desired-SET once every goal location is done (client seam routes the sentinel to `ClientStatus::Goal`) |
 | Progressive items (Nth copy → tier N; overflow → Lord's Rune) | `Progressive { tiers, overflow_full_id }` | COUNT-based: tier goods/flags folded from the copy count (order-independent); overflow ledgered per stream index |
 | Unmapped AP ids | `Inert` | no effect |
 
 Proven in `reconcile.rs` unit tests and `reconciler_replay.rs` (the permutation / duplication /
-load-injection theorem now runs over a 7-item corpus covering region+seal, map, key, rune, goal, and
-two consumables; progressive has its own dedicated count-based invariance test).
+load-injection theorem runs over a 7-item corpus covering region+seal, map, key, rune, goal, and two
+consumables, WITH the slot-data bulk grants — start graces, both map-flag classes, a start item, and a
+met goal — folded into the corpus `SlotData` so invariance is proven with every class present;
+progressive has its own dedicated count-based invariance test).
+
+### Gap 1 — slot-data BULK grants are now first-class desired state
+
+Start graces, `reveal_all_maps` world-map flags (+ the unconditional `82001` underground view-unlock),
+start items, and goal-send are folded into `DesiredState::build` from `SlotData`, so they are no longer
+riding the scattered `startgrants` / goal handlers only:
+
+- **Start graces / map-reveal flags** → observable flags, SET-only (self-heal after a load clobber,
+  never owned so never cleared). `reveal_all_maps=false` desires ONLY the unconditional `82001`.
+- **Start items** → ledgered at a reserved NEGATIVE synthetic-index band (`START_ITEM_INDEX_BASE`)
+  BELOW the `>= 0` received stream, so the SINGLE per-save watermark grants them exactly once and a
+  reload/seed-change is handled by the same `ledger_floor()` frontier logic (a fresh save / new seed
+  starts the watermark at the band floor so they are owed; a reload leaves them behind it).
+- **Goal-send** → `SlotData.goal_flag` becomes desired-SET when `goal_met`. See the client-seam
+  `NOTE(windows-verify)` in `reconcile_io.rs` (dry-run only logs it today; the apply cutover routes the
+  sentinel to `ClientStatus::Goal` or keeps goal-send on the `core.rs` §5c handler).
+
+Host-tested: `reveal_all_maps` on ⇒ every map flag desired / off ⇒ only `82001`; start graces set &
+never owned; goal flag desired only when met; start items grant once across a reload; a seed change
+re-owes the new seed's start items.
+
+### Gap 2 — shop native-sold consumable echo-dedup
+
+A consumable whose reward the rewritten shop row already delivered at purchase carries
+`Consumable.echo_skip = true` (mirrors `receive::RecvItem::echo_skip`). In the ledger it becomes a
+`LedgeredGrant { apply: false }` → an `Action::SkipLedgered` that advances the per-save watermark PAST
+that stream index WITHOUT granting. Host-tested: a real buy + its echo → one grant, watermark past
+both; a pure echo → zero grants, watermark still advances (frontier stays contiguous, reload-safe).
 
 ## Classes deliberately NOT owned by the reconciler (and why)
 
@@ -114,9 +147,7 @@ wrong:
   the reconciler applies.
 - **Shop weapon-slot guard** — **retired** (`shop_sell.rs`: `should_suppress_sold` is a no-op; the
   weapon-slot echo-dedup now lives in the rewritten shop rows). Nothing for the reconciler to own.
-- **Shop native-sold echo-dedup** (`receive.rs` `GrantAction::SkipNativelySold`) — a *known gap*. A
-  shop reward delivered at purchase time by the rewritten shop row must not be re-granted by the AP
-  echo. Unique-good shop rewards self-heal (the reconciler's `has_good` sees the natively-delivered
-  item and grants nothing), but a *consumable* shop reward would double-grant, because the ledger has
-  no signal that the shop delivered it. **Before Phase 3 flips consumables**, the shop system must
-  mark that stream index applied (advance the per-save watermark past it) — see the checklist.
+- **Shop native-sold echo-dedup** — **now owned by the reconciler (Gap 2)**. A consumable the
+  rewritten shop row delivered at purchase carries `Consumable.echo_skip`, which the ledger turns into
+  an `Action::SkipLedgered` (advance the watermark past that index, grant nothing). Unique-good shop
+  rewards still self-heal via `has_good`. No separate shop-side watermark poke is needed anymore.

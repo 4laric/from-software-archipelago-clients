@@ -1,7 +1,7 @@
 # Windows cutover checklist — reconciler strangler
 
 Operator runbook for Alaric. The pure reconciler + its full grant-class coverage are host-tested and
-green (`cargo test -p er-logic`: 239 unit + 1 integration). Everything client-side below is written
+green (`cargo test -p er-logic`: 247 unit + 1 integration). Everything client-side below is written
 but was **NOT compile-verified** in the authoring sandbox (Windows-only deps; the cross-compile ran
 out of disk before reaching this crate). So: build first, trust the in-game verifies, revert per step.
 
@@ -68,9 +68,9 @@ it lands once; drop it, it re-grants; a great rune received twice → one copy, 
 ## 5. Phase 3 — ledger (atomic flip)  (`cutover-phases/phase-3-ledgered-consumables.md`)
 
 `set RECONCILE_APPLY=flags,goods,ledger`. In the SAME build, retire the receive-path
-`grant_full_id` placement (the reconciler becomes the sole received-item grant path). Retire the
-start-item drain ONLY if start items have been folded into `build_desired_inputs` first (see the
-coverage caveat). `cargo build`. **Verify:** tutorial-death reload grants no second flask
+`grant_full_id` placement (the reconciler becomes the sole received-item grant path). Start items are now folded into
+`build_desired_inputs` (Gap 1, ledgered at the negative band), so the old start-item drain may be
+retired in this phase too. `cargo build`. **Verify:** tutorial-death reload grants no second flask
 (`GrantLedgered` fires once); reconnect re-grants nothing. **Revert:** drop `ledger`,
 `git checkout core.rs`, **and delete `reconcile.json`** (only phase with persisted watermark state).
 
@@ -85,12 +85,24 @@ lost checks, no panics. No data footprint.
 
 - **`inventory_has_goods` goods-id mask** (step 1) — the single most important thing to sanity-check
   before any `goods`/`ledger` phase.
-- **Coverage gap:** goal-send, `reveal_all_maps` map flags, and start items/graces are slot-data
-  BULK grants NOT yet in `build_desired_inputs`; they stay on old handlers through all four phases.
-  Fold them in (extend `build_desired_inputs`) before retiring their handlers.
-- **Shop native-sold consumables** (`GrantAction::SkipNativelySold`): a shop-delivered CONSUMABLE
-  would double-grant once `ledger` is on, because the ledger has no "delivered natively" signal.
-  Unique-good shop rewards self-heal fine (has_good). Before phase 3, have the shop system advance
-  the per-save watermark past a natively-sold index (see MIGRATION.md).
+- **Slot-data bulk grants — NOW folded (Gap 1):** start graces, `reveal_all_maps` map flags (+ the
+  unconditional `82001`), and start items are in `build_desired_inputs` (host-tested in er-logic).
+  Start items ledger at the negative `START_ITEM_INDEX_BASE` band and grant once per save. On the
+  dry-run, confirm the `would-apply` plan shows those flags/start-item grants matching the old
+  startgrants path before retiring `apply_start_flags` / the start-item drain (phase 1 / phase 3).
+- **Goal-send (Gap 1) — client seam TODO before the apply cutover.** `build_desired_inputs` sets
+  `goal_flag = Some(reconcile_io::GOAL_SENTINEL_FLAG)` + live `goal_met`. Goal-send is a
+  `ClientStatus::Goal` network send, NOT an ER flag: in dry-run the `SetFlag(sentinel)` is only
+  LOGGED. Before flipping `flags` APPLY, either (a) route that sentinel action to
+  `client.set_status(ClientStatus::Goal)` via a client seam, or (b) keep goal-send on the `core.rs`
+  §5c handler and set `goal_flag: None`. See the `NOTE(windows-verify)` in `reconcile_io.rs`.
+- **Shop native-sold consumables — NOW deduped (Gap 2):** the echo carries `Consumable.echo_skip`
+  (same predicate as the live receive loop), which becomes an `Action::SkipLedgered` — the watermark
+  advances past that index, no grant. No shop-side watermark poke needed. Still smoke-test: buy a
+  shop-sold consumable AP location and confirm exactly one appears in inventory after `ledger` is on.
+- **`inventory_has_goods` goods-id mask (Gap 3)** — reviewed but STILL Windows-unverified; the mask
+  looks right for the `0x4000_0000` goods-category convention, but `ItemId::param_id()` may return the
+  full category-tagged id (then double-mask — the alternative is kept in a comment). This is the
+  single most important thing to sanity-check with a set->readback before any `goods`/`ledger` phase.
 - All client-side code here is UNVERIFIED by a compiler — the er-logic decision core is the only
   machine-checked part.

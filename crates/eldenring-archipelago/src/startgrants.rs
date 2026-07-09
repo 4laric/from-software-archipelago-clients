@@ -24,7 +24,7 @@ const MAP_REVEAL_FLAGS_DLC: &[u32] = &[62080, 62081, 62082, 62083, 62084];
 /// flags above: without it the underground map layer never displays even when the fragments
 /// (62060-62064) are set. (CE [[EventFlagMan]+0x28]+0xFA0 bit6; id via the offset->id formula,
 /// confirmed live 2026-07-04. Verify with a set->readback the first time you build.)
-const UNDERGROUND_MAP_VIEW_UNLOCK: u32 = 82001;
+pub const UNDERGROUND_MAP_VIEW_UNLOCK: u32 = 82001;
 
 #[derive(Default)]
 pub struct StartConfig {
@@ -100,4 +100,16 @@ pub fn apply_start_flags(cfg: &StartConfig) -> bool {
         }
     }
     true
+}
+
+/// The resolved world-map REVEAL flag list for `cfg` (base, plus DLC when enabled). Exposed so the
+/// pure reconciler glue (`core::build_desired_inputs`) can fold `reveal_all_maps` into the
+/// desired-state `SlotData.map_reveal_flags` from the SAME table this handler applies. Excludes the
+/// unconditional [`UNDERGROUND_MAP_VIEW_UNLOCK`] (that goes in `SlotData.always_map_flags`).
+pub fn reveal_flags_for(cfg: &StartConfig) -> Vec<u32> {
+    let mut v: Vec<u32> = MAP_REVEAL_FLAGS_BASE.to_vec();
+    if cfg.enable_dlc {
+        v.extend_from_slice(MAP_REVEAL_FLAGS_DLC);
+    }
+    v
 }

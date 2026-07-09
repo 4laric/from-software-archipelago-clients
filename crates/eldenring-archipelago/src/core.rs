@@ -1632,10 +1632,15 @@ impl shared::Core for Core {
         if crate::reconcile_io::dry_run_enabled() && self.slot_data_parsed {
             // Snapshot the FULL received stream (not just the tail) -- DesiredInputs is the CUMULATIVE
             // set, and the reconciler derives idempotency from the whole set, not per-event deltas.
-            let mut recv: Vec<(i64, String, i64)> = Vec::new();
+            let mut recv: Vec<(i64, String, i64, bool)> = Vec::new();
             if let Some(client) = self.client() {
+                let my_slot = client.this_player().slot();
                 for (idx, ri) in client.received_items().iter().enumerate() {
-                    recv.push((idx as i64, ri.item().name().to_string(), ri.item().id()));
+                    // ECHO-DEDUP (Gap 2): same predicate the live receive loop uses -- an echo of our
+                    // own check whose rewritten shop row already sold the reward natively.
+                    let echo_skip = ri.sender().slot() == my_slot
+                        && crate::shop_sell::echo_skip(ri.location().id());
+                    recv.push((idx as i64, ri.item().name().to_string(), ri.item().id(), echo_skip));
                 }
             }
             let inputs = self.build_desired_inputs(&recv);
@@ -1667,38 +1672,76 @@ impl Core {
     // keyitems obtained/restored table) so the reconciler's plan can be validated against today's
     // behavior in the dry run.
     //
-    // SCOPE / ASSUMPTIONS (dry-run phase 0; documented in MIGRATION.md):
-    //   * Maps the RECEIVED-ITEM STREAM only. Slot-data BULK grants (start items, start graces,
-    //     reveal_all_maps map flags) stay on the old startgrants path during dry-run; folding them
-    //     in is a Phase-1/3 follow-up. This keeps the logged diff honest.
+    // SCOPE / ASSUMPTIONS (documented in MIGRATION.md):
+    //   * Maps the RECEIVED-ITEM STREAM *and* (Gap 1) the slot-data BULK grants: start graces, the
+    //     unconditional + reveal_all_maps world-map flags, start items (ledgered once), and the goal.
+    //     They are folded from the SAME tables the old startgrants/goal handlers use.
     //   * `seal_flags` is left EMPTY on purpose: the authoritative seal set (area_lock / attunement
-    //     flags) is not yet reproduced here, and seeding it wrongly would make the dry-run diff
-    //     propose bogus ClearFlag actions. Received region LOCKS still SET their open flag.
-    //   * consumable `qty` defaults to the item_counts entry or 1 (grant multiplicity does not
-    //     affect the dry-run plan's shape).
-    fn build_desired_inputs(&self, received: &[(i64, String, i64)]) -> er_logic::reconcile::DesiredInputs {
-        use er_logic::reconcile::{DesiredInputs, ReceivedItem, SaveIdentity, SlotData};
+    //     flags) is not yet reproduced here, and seeding it wrongly would make the diff propose bogus
+    //     ClearFlag actions. Received region LOCKS still SET their open flag.
+    //   * consumable `qty` defaults to the item_counts entry or 1; `echo_skip` (Gap 2) dedups a
+    //     native-sold shop echo.
+    //   * NOTE(windows-verify): `goal_flag` is a SENTINEL (see `reconcile_io::GOAL_SENTINEL_FLAG`).
+    //     In dry-run this only LOGS a would-apply SetFlag. Before the ledger/goods APPLY cutover the
+    //     client must either route that sentinel action to `ClientStatus::Goal` (a client seam) OR
+    //     keep goal-send on the existing `core.rs` handler and pass `goal_flag: None` here. The pure
+    //     `SlotData.goal_flag/goal_met` fields are tested in er-logic so either wiring is glue-only.
+    fn build_desired_inputs(&self, received: &[(i64, String, i64, bool)]) -> er_logic::reconcile::DesiredInputs {
+        use er_logic::reconcile::{DesiredInputs, ReceivedItem, SaveIdentity, SlotData, StartItem};
         let seed = self.parsed_seed.clone().unwrap_or_default();
         let save = SaveIdentity(self.my_name.clone().unwrap_or_default());
         let items: Vec<ReceivedItem> = received
             .iter()
-            .map(|(index, name, ap_id)| ReceivedItem {
+            .map(|(index, name, ap_id, echo_skip)| ReceivedItem {
                 index: *index,
                 name: name.clone(),
-                semantics: self.classify_received(name, *ap_id),
+                semantics: self.classify_received(name, *ap_id, *echo_skip),
             })
             .collect();
+        // Gap 1: fold slot-data bulk grants from the SAME tables the live handlers use.
+        let sc = self.start.as_ref();
+        let slot_data = SlotData {
+            seal_flags: Vec::new(),
+            start_graces: sc.map(|s| s.start_graces.clone()).unwrap_or_default(),
+            always_map_flags: vec![crate::startgrants::UNDERGROUND_MAP_VIEW_UNLOCK],
+            reveal_all_maps: sc.map(|s| s.reveal_all_maps).unwrap_or(false),
+            map_reveal_flags: sc.map(crate::startgrants::reveal_flags_for).unwrap_or_default(),
+            start_items: sc
+                .map(|s| {
+                    s.start_items
+                        .iter()
+                        .map(|&full_id| StartItem { full_id, qty: 1 })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            goal_flag: Some(crate::reconcile_io::GOAL_SENTINEL_FLAG),
+            goal_met: self.reconcile_goal_met(),
+        };
         DesiredInputs {
             seed,
             save,
             received: items,
-            slot_data: SlotData { seal_flags: Vec::new() },
+            slot_data,
+        }
+    }
+
+    /// Mirror of the `core.rs` 5c goal-send predicate for the reconciler glue: every goal location is
+    /// done (flag goals via live event flags; checked goals via the server-truth checked set,
+    /// pre-filtered against `valid_locations` so no datapackage-unknown id reaches the checked query).
+    fn reconcile_goal_met(&self) -> bool {
+        match (self.goal.as_ref(), self.client()) {
+            (Some(cfg), Some(client)) => crate::goal::is_met(
+                cfg,
+                crate::flags::get_event_flag,
+                |l| self.valid_locations.contains(&l) && client.is_local_location_checked(l),
+            ),
+            _ => false,
         }
     }
 
     /// Classify one received AP item into its reconciler [`ItemSemantics`], reusing the live tables.
     /// Order matters: progressive -> region lock -> key item / great rune -> plain grant.
-    fn classify_received(&self, name: &str, ap_id: i64) -> er_logic::reconcile::ItemSemantics {
+    fn classify_received(&self, name: &str, ap_id: i64, echo_skip: bool) -> er_logic::reconcile::ItemSemantics {
         use er_logic::reconcile::{ItemSemantics, ProgTier};
         // 1. Progressive item (tier goods packed to grant FullIDs, exactly like the live path).
         if let Some(tiers) = self.progressive.tiers_for(name) {
@@ -1745,7 +1788,8 @@ impl Core {
         match full_id {
             Some(fid) => {
                 let qty = self.item_counts.get(&ap_id).copied().unwrap_or(1) as i32;
-                ItemSemantics::Consumable { full_id: fid as i32, qty }
+                // Gap 2: a native-sold shop echo is ledgered but NOT re-granted (watermark advances).
+                ItemSemantics::Consumable { full_id: fid as i32, qty, echo_skip }
             }
             None => ItemSemantics::Inert,
         }

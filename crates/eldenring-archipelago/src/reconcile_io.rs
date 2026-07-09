@@ -29,6 +29,23 @@ use er_logic::reconcile::{
     ApplyClasses, DesiredInputs, GameIo, Reconciler, SaveIdentity, TickBudget, WorldStability,
 };
 
+/// SENTINEL flag id used for the folded-in goal-send (Gap 1). `core::build_desired_inputs` sets
+/// `SlotData.goal_flag = Some(GOAL_SENTINEL_FLAG)` and `goal_met` from the live goal predicate, so the
+/// PURE desired state carries the goal as a first-class target (proven in `er_logic::reconcile`).
+///
+/// NOTE(windows-verify): goal-send is NOT an ER event flag — it is a `ClientStatus::Goal` network
+/// send. Today only the READ-ONLY dry-run path is wired, where a would-apply `SetFlag(sentinel)` is
+/// merely LOGGED (harmless). Before the ledger/goods APPLY cutover, one of the following must land
+/// (glue-only — er-logic already models + tests it):
+///   (a) route the `SetFlag(GOAL_SENTINEL_FLAG)` action to `client.set_status(ClientStatus::Goal)` via
+///       a client seam (the reconciler's `GameIo` would need a goal callback), OR
+///   (b) keep goal-send owned by the existing report-side handler in `core.rs` (§5c) and pass
+///       `goal_flag: None` here — the pure fields stay available for a later seam.
+/// The value is a high, deliberately-invalid event-flag id so that IF it ever reached
+/// `try_set_event_flag` it is an inert no-op (invented ids no-op; see memory er-event-flag-validity)
+/// rather than corrupting a real flag.
+pub const GOAL_SENTINEL_FLAG: u32 = 0x7FFF_0001;
+
 // ---------------------------------------------------------------------------------------------
 // GameIo against the live singletons
 // ---------------------------------------------------------------------------------------------
@@ -76,9 +93,28 @@ impl Default for LiveGame {
 /// (`GameDataMan -> main_player_game_data -> equipment.equip_inventory_data.items_data.items()`),
 /// which is proven in-game.
 ///
-/// NOTE (Windows tuning): `goods` here is the grant FullID (goods category | row). We compare the
-/// low param-id bits. If the live `ItemId` compare wants the full category-tagged id instead, adjust
-/// this single predicate — it is the only place the mask matters.
+/// NOTE(windows-verify) — GOODS-ID MASK REVIEW (Gap 3; CANNOT be host-tested — this crate is
+/// Windows-only). `goods` is the GRANT FullID `GOODS_FULLID | row` where `GOODS_FULLID = 0x4000_0000`
+/// (see `er_logic::progressive::GOODS_FULLID`). In ER an `ItemId` packs the category in the top
+/// nibble (category = id / 0x1000_0000; Goods = 4 -> 0x4000_0000) and the param ROW in the low 28
+/// bits. So the two checks below SHOULD be right:
+///   * `want_row = goods & 0x0FFF_FFFF` strips the 0x4 category nibble, leaving the bare row;
+///   * `category() == ItemCategory::Goods` confirms the 0x4 nibble independently;
+///   * `param_id()` is compared against the bare row.
+/// LOOKS RIGHT: the mask matches the `0x4000_0000` goods-category convention this client grants with,
+/// and the independent `category()` guard prevents a weapon/armor row with the same numeric row from
+/// false-matching.
+/// SUSPICIOUS / MUST CONFIRM ON WINDOWS with a set->readback (grant one known good, then re-read):
+///   1. Does `ItemId::param_id()` return the CATEGORY-STRIPPED row (assumed here), or the full
+///      category-tagged id? If the latter, this compare never matches and BOTH sides must be masked:
+///      `entry.item_id.param_id() as i32 & 0x0FFF_FFFF == want_row`.
+///   2. Great Runes / key items are granted at the SAME `0x4000_0000` goods category, so they ride
+///      this predicate correctly ONLY if their grant FullID also uses that nibble — verify the
+///      key-item / great-rune mapper packs `GOODS_FULLID`, not a raw row or a different category.
+///   3. Confirm no goods row legitimately exceeds `0x0FFF_FFFF` (rows are small, so this is safe, but
+///      pin it).
+/// DO NOT silently "fix" the mask: if a change is needed, keep the original masked compare in a
+/// comment. The proposed alternative (double-mask) is noted inline below.
 fn inventory_has_goods(goods: i32) -> bool {
     use eldenring::cs::{GameDataMan, ItemCategory};
     use fromsoftware_shared::FromStatic;
@@ -93,9 +129,14 @@ fn inventory_has_goods(goods: i32) -> bool {
         if entry.item_id.category() != ItemCategory::Goods {
             continue;
         }
+        // Current compare (assumes param_id() is the category-stripped row):
         if entry.item_id.param_id() as i32 == want_row {
             return true;
         }
+        // NOTE(windows-verify) PROPOSED ALTERNATIVE if suspicion #1 above proves true (param_id()
+        // returns the full category-tagged id). Keep BOTH until confirmed on Windows; do not delete
+        // the compare above without a set->readback proving this one is the correct form:
+        //   if (entry.item_id.param_id() as i32 & 0x0FFF_FFFF) == want_row { return true; }
     }
     false
 }

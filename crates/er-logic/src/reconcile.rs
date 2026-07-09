@@ -92,7 +92,13 @@ pub enum ItemSemantics {
     },
     /// A CONSUMABLE (flask / rune / smithing stone): non-observable (the player spends it), so it is
     /// LEDGERED and applied exactly once by stream index. Count-diffing is wrong here.
-    Consumable { full_id: GoodsId, qty: i32 },
+    ///
+    /// `echo_skip` marks a NATIVE-SOLD shop echo (mirrors [`crate::receive::RecvItem::echo_skip`]):
+    /// the rewritten shop row already delivered this exact item at purchase time, so the AP echo must
+    /// NOT be granted again. It is still ledgered — with `apply=false` — so the per-save watermark
+    /// advances PAST its index (a reload never reconsiders it). `false` = an ordinary consumable that
+    /// grants once (two Golden Runes at two indices are two grants).
+    Consumable { full_id: GoodsId, qty: i32, echo_skip: bool },
     /// A PROGRESSIVE item: the Nth received copy of this NAME lands tier N (that tier's unique goods
     /// + observable flags); every copy past the last tier yields exactly ONE overflow consumable
     /// (`overflow_full_id`, e.g. a Lord's Rune). The desired state depends only on the COUNT of
@@ -116,6 +122,20 @@ pub struct ReceivedItem {
     pub semantics: ItemSemantics,
 }
 
+/// One slot-data START ITEM (Torrent, flasks). Non-observable, granted ONCE per save.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartItem {
+    pub full_id: GoodsId,
+    pub qty: i32,
+}
+
+/// The reserved NEGATIVE synthetic-index band the slot-data start items are ledgered into. Real AP
+/// received-stream indices are always `>= 0`, so placing start items below zero lets the SINGLE
+/// per-save watermark cover both classes: a fresh save's watermark starts at the band floor (all
+/// start items owed), then advances into the `>= 0` real stream; a reload leaves the negative indices
+/// behind the frontier so they never re-grant. Start item `i` takes `START_ITEM_INDEX_BASE + i`.
+pub const START_ITEM_INDEX_BASE: ItemIndex = -1_000_000;
+
 /// The slot-data-derived, per-seed configuration the desired-state builder needs beyond the item
 /// stream. Kept tiny on purpose; the client fills it from parsed slot_data.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -123,6 +143,24 @@ pub struct SlotData {
     /// Region open-flags that start SEALED: desired `false`, and OWNED so the reconciler may clear
     /// (re-seal) them. A received `RegionFlags` for the same flag overrides it to `true` (opened).
     pub seal_flags: Vec<FlagId>,
+    /// Start-of-run GRACE flags (the Limgrave warp graces) granted from slot_data. Desired-SET
+    /// observable flags that SELF-HEAL if a load clobbers them, but are NOT owned (never cleared).
+    pub start_graces: Vec<FlagId>,
+    /// Map-reveal flags set UNCONDITIONALLY at start (e.g. the 82001 underground view-unlock, which
+    /// gates the underground map layer regardless of `reveal_all_maps`). Desired-SET, self-heal, not
+    /// owned.
+    pub always_map_flags: Vec<FlagId>,
+    /// When `reveal_all_maps` is on, these world-map reveal flags become desired-SET (self-heal, not
+    /// owned). Ignored when it is off. The client pre-resolves the base (+DLC) list.
+    pub reveal_all_maps: bool,
+    pub map_reveal_flags: Vec<FlagId>,
+    /// Slot-data START ITEMS: ledgered ONCE per save at the [`START_ITEM_INDEX_BASE`] negative band.
+    pub start_items: Vec<StartItem>,
+    /// GOAL-SEND: when `goal_met` is true this flag becomes desired-SET. The Windows glue maps the
+    /// flag write to `ClientStatus::Goal` (or a real completion flag). `None` / not-met => nothing.
+    /// Report-side, so it is never owned (never cleared).
+    pub goal_flag: Option<FlagId>,
+    pub goal_met: bool,
 }
 
 /// Everything server-authoritative the reconciler derives desired state from.
@@ -150,6 +188,9 @@ pub struct LedgeredGrant {
     pub index: ItemIndex,
     pub full_id: GoodsId,
     pub qty: i32,
+    /// `false` for a deduped shop-native echo: advance the watermark PAST this index WITHOUT granting
+    /// (the vanilla shop already delivered it). `true` for a real grant.
+    pub apply: bool,
 }
 
 /// The desired end-state, split by OBSERVABILITY so each class gets the right idempotency rule.
@@ -179,6 +220,39 @@ impl DesiredState {
         for &f in &inputs.slot_data.seal_flags {
             d.flags.entry(f).or_insert(false);
             d.owned_flags.insert(f);
+        }
+
+        // 1b) Slot-data BULK grants (start graces, unconditional + reveal_all_maps map flags, the
+        //     met goal flag): first-class desired-SET observable flags that self-heal but are NOT
+        //     owned (never cleared). These previously rode the scattered startgrants / goal handlers;
+        //     folding them here makes the reconciler the single source of the whole desired state.
+        for &f in &inputs.slot_data.start_graces {
+            d.flags.insert(f, true);
+        }
+        for &f in &inputs.slot_data.always_map_flags {
+            d.flags.insert(f, true);
+        }
+        if inputs.slot_data.reveal_all_maps {
+            for &f in &inputs.slot_data.map_reveal_flags {
+                d.flags.insert(f, true);
+            }
+        }
+        if inputs.slot_data.goal_met {
+            if let Some(f) = inputs.slot_data.goal_flag {
+                d.flags.insert(f, true);
+            }
+        }
+
+        // 1c) Slot-data START ITEMS: ledgered ONCE per save at the reserved negative band, so the
+        //     single per-save watermark grants them exactly once and a reload leaves them behind the
+        //     frontier. `apply=true` — a real grant (never an echo).
+        for (i, si) in inputs.slot_data.start_items.iter().enumerate() {
+            d.ledgered.push(LedgeredGrant {
+                index: START_ITEM_INDEX_BASE + i as ItemIndex,
+                full_id: si.full_id,
+                qty: si.qty,
+                apply: true,
+            });
         }
 
         // 2) Fold each received item into its observability class.
@@ -223,11 +297,14 @@ impl DesiredState {
                     );
                     d.flags.insert(*restored_flag, true);
                 }
-                ItemSemantics::Consumable { full_id, qty } => {
+                ItemSemantics::Consumable { full_id, qty, echo_skip } => {
                     d.ledgered.push(LedgeredGrant {
                         index: it.index,
                         full_id: *full_id,
                         qty: *qty,
+                        // A native-sold shop echo advances the watermark PAST its index but grants
+                        // nothing (the vanilla shop already delivered it at purchase).
+                        apply: !*echo_skip,
                     });
                 }
                 ItemSemantics::GoalFlag(f) => {
@@ -270,6 +347,7 @@ impl DesiredState {
                         index: *idx,
                         full_id: overflow,
                         qty: 1,
+                        apply: true,
                     });
                 }
             }
@@ -277,6 +355,15 @@ impl DesiredState {
 
         d.ledgered.sort_by_key(|l| l.index);
         d
+    }
+
+    /// The FLOOR a fresh save's watermark starts at: `0` for a normal seed, or the negative
+    /// start-item band floor when slot-data start items are present. Clamped with `.min(0)` so it is
+    /// never ABOVE 0 (real received indices are `>= 0` and are owed via the `index >= watermark`
+    /// filter regardless), while the negative start-item band still pulls it below zero so those
+    /// grants are owed on a fresh save. Empty ledger => 0.
+    pub fn ledger_floor(&self) -> ItemIndex {
+        self.ledgered.iter().map(|l| l.index).min().unwrap_or(0).min(0)
     }
 }
 
@@ -310,6 +397,9 @@ pub enum Action {
         full_id: GoodsId,
         qty: i32,
     },
+    /// Advance the watermark PAST a deduped shop-native echo index WITHOUT granting anything (the
+    /// vanilla shop already delivered the item). Costs no game call and no tick budget.
+    SkipLedgered { index: ItemIndex },
 }
 
 /// The pure DIFF: the minimal, deterministically-ordered set of actions to move `observed` toward
@@ -340,12 +430,18 @@ pub fn diff(desired: &DesiredState, observed: &ObservedState) -> Vec<Action> {
     }
 
     // Ledger: index order, only the still-owed tail. (build() already sorted; filter is stable.)
+    // A real grant emits `GrantLedgered`; a deduped shop-native echo (`apply=false`) emits
+    // `SkipLedgered`, which advances the watermark past its index without touching the game.
     for l in desired.ledgered.iter().filter(|l| l.index >= observed.applied_watermark) {
-        out.push(Action::GrantLedgered {
-            index: l.index,
-            full_id: l.full_id,
-            qty: l.qty,
-        });
+        if l.apply {
+            out.push(Action::GrantLedgered {
+                index: l.index,
+                full_id: l.full_id,
+                qty: l.qty,
+            });
+        } else {
+            out.push(Action::SkipLedgered { index: l.index });
+        }
     }
 
     out
@@ -430,7 +526,7 @@ impl ApplyClasses {
         match action {
             Action::SetFlag(_) | Action::ClearFlag(_) => self.flags,
             Action::GrantUnique(..) => self.goods,
-            Action::GrantLedgered { .. } => self.ledger,
+            Action::GrantLedgered { .. } | Action::SkipLedgered { .. } => self.ledger,
         }
     }
 }
@@ -479,11 +575,25 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
-    /// Build from fresh inputs (watermark starts at 0; use [`from_persisted`] to resume a save).
+    /// Build from fresh inputs; use [`from_persisted`] to resume a save.
+    ///
+    /// The watermark starts at the desired state's [`ledger_floor`](DesiredState::ledger_floor) — 0
+    /// when there are no start items, or the negative start-item band floor when there are — so a
+    /// fresh save still OWES its slot-data start items (a blind 0 would strand their negative indices
+    /// behind the frontier and never grant them).
     ///
     /// [`from_persisted`]: Reconciler::from_persisted
     pub fn new(inputs: DesiredInputs) -> Self {
-        Self::from_persisted(inputs, 0)
+        let desired = DesiredState::build(&inputs);
+        let floor = desired.ledger_floor();
+        let session_seed = inputs.seed.clone();
+        Reconciler {
+            inputs,
+            desired,
+            session_seed,
+            applied_watermark: floor,
+            dirty: true,
+        }
     }
 
     /// Resume a save: seed the ledger watermark from persisted per-save state so consumables already
@@ -536,11 +646,14 @@ impl Reconciler {
     /// `session_seed` and `applied_watermark` all move together, so no half-updated table is ever
     /// observed by a concurrent tick.
     pub fn set_inputs(&mut self, inputs: DesiredInputs) {
+        let desired = DesiredState::build(&inputs);
         if crate::seed_change::is_seed_change(Some(&self.session_seed), &inputs.seed) {
-            self.applied_watermark = 0; // brand-new seed: nothing applied for it yet
+            // Brand-new seed: reset to the NEW desired's band floor (not a blind 0) so the new seed's
+            // own start items are re-owed rather than stranded behind a stale frontier.
+            self.applied_watermark = desired.ledger_floor();
         }
         self.session_seed = inputs.seed.clone();
-        self.desired = DesiredState::build(&inputs);
+        self.desired = desired;
         self.inputs = inputs;
         self.dirty = true;
     }
@@ -658,7 +771,7 @@ impl Reconciler {
                         deferred = true; // inventory not ready -> retry next tick
                     }
                 }
-                Action::GrantLedgered { .. } => {} // handled in pass 2 (contiguity matters)
+                Action::GrantLedgered { .. } | Action::SkipLedgered { .. } => {} // pass 2 (contiguity)
             }
         }
 
@@ -666,24 +779,28 @@ impl Reconciler {
         // of successful grants. A budget stop or a not-ready inventory holds the watermark so the
         // tail replays next tick (mirrors receive.rs's rollback protocol).
         for a in &actions {
-            if let Action::GrantLedgered {
-                index,
-                full_id,
-                qty,
-            } = a
-            {
-                if goods_used >= budget.goods {
-                    deferred = true;
-                    break;
+            match a {
+                Action::GrantLedgered { index, full_id, qty } => {
+                    if goods_used >= budget.goods {
+                        deferred = true;
+                        break;
+                    }
+                    if io.grant_ledgered(*full_id, *qty) {
+                        goods_used += 1;
+                        self.applied_watermark = index + 1;
+                        applied.push(a.clone());
+                    } else {
+                        deferred = true;
+                        break;
+                    }
                 }
-                if io.grant_ledgered(*full_id, *qty) {
-                    goods_used += 1;
+                // Deduped shop echo: no game call, no budget cost — just advance the frontier PAST it
+                // so it stays contiguous and a reload won't reconsider it.
+                Action::SkipLedgered { index } => {
                     self.applied_watermark = index + 1;
                     applied.push(a.clone());
-                } else {
-                    deferred = true;
-                    break;
                 }
+                _ => {}
             }
         }
 
@@ -875,7 +992,15 @@ mod tests {
         ReceivedItem {
             index,
             name: name.into(),
-            semantics: ItemSemantics::Consumable { full_id, qty },
+            semantics: ItemSemantics::Consumable { full_id, qty, echo_skip: false },
+        }
+    }
+    /// A shop-native consumable: `echo_skip=true` is the echo of a natively-sold reward (dedup).
+    fn shop_consumable(index: ItemIndex, name: &str, full_id: GoodsId, qty: i32, echo_skip: bool) -> ReceivedItem {
+        ReceivedItem {
+            index,
+            name: name.into(),
+            semantics: ItemSemantics::Consumable { full_id, qty, echo_skip },
         }
     }
 
@@ -921,7 +1046,17 @@ mod tests {
             seed: seed.into(),
             save: SaveIdentity("slot0".into()),
             received,
-            slot_data: SlotData { seal_flags },
+            slot_data: SlotData { seal_flags, ..Default::default() },
+        }
+    }
+
+    /// Inputs carrying only slot-data (no received stream) for the bulk-grant tests.
+    fn bulk_inputs(sd: SlotData) -> DesiredInputs {
+        DesiredInputs {
+            seed: "A".into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![],
+            slot_data: sd,
         }
     }
 
@@ -1293,5 +1428,171 @@ mod tests {
         assert_eq!(d.flags.get(&400001), Some(&true), "obtained flag desired set");
         assert_eq!(d.flags.get(&9600), Some(&true), "goal flag desired set");
         assert!(!d.owned_flags.contains(&400001), "obtained flag not owned (never cleared)");
+    }
+
+    // ---- Gap 1: slot-data BULK grants (start graces / start items / reveal_all_maps / goal) ----
+
+    #[test]
+    fn reveal_all_maps_on_desires_every_map_flag_off_desires_only_the_unconditional_view_unlock() {
+        let on = DesiredState::build(&bulk_inputs(SlotData {
+            reveal_all_maps: true,
+            map_reveal_flags: vec![62010, 62011, 62012],
+            always_map_flags: vec![82001],
+            ..Default::default()
+        }));
+        for f in [62010u32, 62011, 62012, 82001] {
+            assert_eq!(on.flags.get(&f), Some(&true), "map flag {f} desired when reveal_all_maps on");
+            assert!(!on.owned_flags.contains(&f), "map flags self-heal but are never owned/cleared");
+        }
+
+        let off = DesiredState::build(&bulk_inputs(SlotData {
+            reveal_all_maps: false,
+            map_reveal_flags: vec![62010, 62011, 62012],
+            always_map_flags: vec![82001],
+            ..Default::default()
+        }));
+        assert_eq!(off.flags.get(&82001), Some(&true), "the unconditional view-unlock is still desired");
+        for f in [62010u32, 62011, 62012] {
+            assert!(off.flags.get(&f).is_none(), "reveal_all_maps OFF: world-map flag {f} not desired");
+        }
+    }
+
+    #[test]
+    fn start_graces_are_desired_set_and_self_heal_only() {
+        let d = DesiredState::build(&bulk_inputs(SlotData {
+            start_graces: vec![76900, 76901],
+            ..Default::default()
+        }));
+        assert_eq!(d.flags.get(&76900), Some(&true));
+        assert_eq!(d.flags.get(&76901), Some(&true));
+        assert!(!d.owned_flags.contains(&76900), "start graces are set-only, never cleared");
+    }
+
+    #[test]
+    fn goal_flag_is_desired_only_when_the_goal_is_met() {
+        let unmet = DesiredState::build(&bulk_inputs(SlotData {
+            goal_flag: Some(9990),
+            goal_met: false,
+            ..Default::default()
+        }));
+        assert!(unmet.flags.get(&9990).is_none(), "goal flag not desired until the goal is met");
+
+        let met = DesiredState::build(&bulk_inputs(SlotData {
+            goal_flag: Some(9990),
+            goal_met: true,
+            ..Default::default()
+        }));
+        assert_eq!(met.flags.get(&9990), Some(&true), "goal flag desired once the goal is met");
+        assert!(!met.owned_flags.contains(&9990), "goal flag is report-side, never cleared");
+    }
+
+    #[test]
+    fn start_items_ledger_grants_once_across_a_reload() {
+        let sd = SlotData {
+            start_items: vec![
+                StartItem { full_id: 130, qty: 1 },  // Torrent-like
+                StartItem { full_id: 1001, qty: 3 }, // Flask
+            ],
+            ..Default::default()
+        };
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(bulk_inputs(sd.clone()));
+        assert!(
+            r.applied_watermark() <= START_ITEM_INDEX_BASE,
+            "a fresh save's watermark sits at/below the negative start-item band floor"
+        );
+
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(130), 1, "the start item Torrent grants exactly once");
+        assert_eq!(g.ledger_count(1001), 1, "the start item Flask grants exactly once");
+        let wm = r.applied_watermark();
+        assert!(wm > START_ITEM_INDEX_BASE + 1, "watermark advanced past the whole start-item band");
+
+        // RELOAD from the persisted watermark: no start item re-grants (start-item double-grant fix).
+        let mut r2 = Reconciler::from_persisted(bulk_inputs(sd), wm);
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(130), 1, "no second Torrent grant after reload");
+        assert_eq!(g.ledger_count(1001), 1, "no second Flask grant after reload");
+    }
+
+    #[test]
+    fn seed_change_re_owes_the_new_seeds_start_items() {
+        // A genuine seed change re-owes the NEW seed's start items: the watermark resets to the new
+        // desired's band floor, not a blind 0 that would strand the negative-index start items.
+        let sd = SlotData { start_items: vec![StartItem { full_id: 130, qty: 1 }], ..Default::default() };
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(bulk_inputs(sd.clone()));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(130), 1);
+
+        r.set_inputs(DesiredInputs {
+            seed: "B".into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![],
+            slot_data: sd,
+        });
+        assert!(
+            r.applied_watermark() <= START_ITEM_INDEX_BASE,
+            "a genuine seed change resets the watermark to the band floor"
+        );
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(130), 2, "seed B re-grants its own start item");
+    }
+
+    #[test]
+    fn bulk_grants_reach_desired_end_to_end_and_only_start_items_are_goods() {
+        // One of every bulk class at once: graces + map flags + goal flag SET; start item LEDGERED.
+        let sd = SlotData {
+            start_graces: vec![76900],
+            always_map_flags: vec![82001],
+            reveal_all_maps: true,
+            map_reveal_flags: vec![62010],
+            start_items: vec![StartItem { full_id: 130, qty: 1 }],
+            goal_flag: Some(9700),
+            goal_met: true,
+            ..Default::default()
+        };
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(bulk_inputs(sd));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        for f in [76900u32, 82001, 62010, 9700] {
+            assert!(g.get_flag(f), "bulk flag {f} set");
+        }
+        assert!(g.goods.is_empty(), "no bulk grant becomes a unique good (start items are ledgered)");
+        assert_eq!(g.ledger_count(130), 1, "the start item lands exactly once");
+    }
+
+    // ---- Gap 2: shop native-sold consumable echo-dedup ----------------------------------
+
+    #[test]
+    fn shop_native_sold_echo_advances_watermark_without_double_granting() {
+        // The real buy delivers the item (index 0, echo_skip=false -> a grant); the SAME location
+        // then echoes it (index 1, echo_skip=true). The echo must NOT grant, but its index must be
+        // advanced-past so a reload never reconsiders it.
+        let items = vec![
+            shop_consumable(0, "Shop Golden Rune", 5001, 1, false), // real buy
+            shop_consumable(1, "Shop Golden Rune", 5001, 1, true),  // native-sold echo
+        ];
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", items.clone(), vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(5001), 1, "granted exactly once (the echo does not double-grant)");
+        assert_eq!(r.applied_watermark(), 2, "the watermark advanced PAST both the buy and its echo");
+
+        // Reload: neither grants again.
+        let mut r2 = Reconciler::from_persisted(inputs("A", items, vec![]), r.applied_watermark());
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(5001), 1, "no re-grant after reload");
+    }
+
+    #[test]
+    fn a_pure_native_sold_echo_grants_nothing_but_still_advances_the_watermark() {
+        // Only the echo is seen (the native sale already delivered the item): the reconciler grants
+        // nothing yet still advances the watermark so the frontier stays contiguous.
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", vec![shop_consumable(0, "Sold", 5002, 1, true)], vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(5002), 0, "a native-sold echo grants nothing");
+        assert_eq!(r.applied_watermark(), 1, "the watermark still advances past the echo index");
     }
 }
