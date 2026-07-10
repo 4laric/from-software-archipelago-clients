@@ -424,4 +424,157 @@ mod replay {
             assert_eq!(run_prog(&evs), want, "progressive perm+dup+load {perm:?} diverged");
         });
     }
+
+    // ---- mass-grant CTD: bug reproduced unpaced, fixed by pacing -------------------------
+    //
+    // The crash Alaric hit: a burst of received checks arrives at once and the client tries to grant
+    // them all in quick succession, overflowing the game's item-acquisition popup queue -> CTD. The
+    // pure crate can't crash a real process, so we model the fragility EXACTLY where it lives: a
+    // `GameIo` whose acquisition queue overflows if more than `SAFE_BURST` item grants land within any
+    // trailing `ABSORB_WINDOW_MS` window. Then we drive the SAME delta through the SAME reconciler
+    // twice, changing ONLY the budget:
+    //   * `min_grant_interval_ms: 0` == the PRE-FIX unpaced path (grant up to `goods` EVERY frame) ->
+    //     the fragile game CTDs mid-drain (bug reproduced).
+    //   * the PACED budget (the live default) spaces grants so no window is ever exceeded -> no CTD,
+    //     and the whole delta still drains, each item exactly once (fix demonstrated).
+
+    /// Max item grants the game can absorb within any trailing [`ABSORB_WINDOW_MS`] window before its
+    /// acquisition-notification queue overflows (the modelled CTD). Flag writes are cheap and excluded.
+    const SAFE_BURST: usize = 4;
+    const ABSORB_WINDOW_MS: u64 = 150;
+
+    /// A fragile [`GameIo`]: real flag/goods/ledger state + the injected clock come from an inner
+    /// [`MockGame`], so the reconciler drives its identical live loop — we only ADD the CTD fragility.
+    struct CrashProneGame {
+        inner: MockGame,
+        /// `now_ms` of every ITEM grant (unique good or ledgered consumable) that landed.
+        grant_times: Vec<u64>,
+        /// Set once the acquisition queue overflows — a live game would be dead (CTD) from here.
+        crashed: bool,
+    }
+
+    impl CrashProneGame {
+        fn new() -> Self {
+            CrashProneGame { inner: MockGame::stable(), grant_times: Vec::new(), crashed: false }
+        }
+        /// Record a grant at the current clock; trip `crashed` if the trailing window now exceeds the
+        /// queue's capacity (the overflow the real CTD came from).
+        fn note_grant(&mut self) {
+            let now = self.inner.stability.now_ms;
+            self.grant_times.push(now);
+            let window_lo = now.saturating_sub(ABSORB_WINDOW_MS);
+            let in_window = self.grant_times.iter().filter(|&&t| t >= window_lo).count();
+            if in_window > SAFE_BURST {
+                self.crashed = true;
+            }
+        }
+    }
+
+    impl GameIo for CrashProneGame {
+        fn stability(&self) -> WorldStability {
+            self.inner.stability()
+        }
+        fn get_flag(&self, f: FlagId) -> bool {
+            self.inner.get_flag(f)
+        }
+        fn set_flag(&mut self, f: FlagId, on: bool) -> bool {
+            self.inner.set_flag(f, on) // flag writes never touch the acquisition queue
+        }
+        fn has_good(&self, g: GoodsId) -> bool {
+            self.inner.has_good(g)
+        }
+        fn grant_good(&mut self, g: GoodsId, comp: &[FlagId]) -> bool {
+            if !self.inner.grant_good(g, comp) {
+                return false;
+            }
+            self.note_grant();
+            true
+        }
+        fn grant_ledgered(&mut self, full_id: GoodsId, qty: i32) -> bool {
+            if !self.inner.grant_ledgered(full_id, qty) {
+                return false;
+            }
+            self.note_grant();
+            true
+        }
+    }
+
+    /// A "bunch of item checks at the same time": 40 consumables plus two unique goods, all owed at
+    /// once — 42 item grants for the reconciler to place.
+    fn mass_delta() -> DesiredInputs {
+        let mut received: Vec<ReceivedItem> = (0..40i64)
+            .map(|i| ReceivedItem {
+                index: i,
+                name: format!("Consumable {i}"),
+                semantics: ItemSemantics::Consumable {
+                    full_id: 6000 + i as i32,
+                    qty: 1,
+                    echo_skip: false,
+                },
+            })
+            .collect();
+        received.push(ReceivedItem {
+            index: 40,
+            name: "Rold Medallion".into(),
+            semantics: ItemSemantics::KeyItem { goods: 9000, obtained_flags: vec![400001] },
+        });
+        received.push(ReceivedItem {
+            index: 41,
+            name: "Godrick's Great Rune".into(),
+            semantics: ItemSemantics::GreatRune { goods: 191, restored_flag: 6901 },
+        });
+        DesiredInputs {
+            seed: SEED.into(),
+            save: SaveIdentity("slot0".into()),
+            received,
+            slot_data: SlotData::default(),
+        }
+    }
+
+    /// Drive the whole delta through a 60fps poll loop with `budget`, advancing the injected clock a
+    /// frame at a time exactly as the live poll thread advances real time. Stops on CTD, on a fully
+    /// drained (converged) delta, or a generous frame cap. Returns (crashed, item grants landed).
+    fn drive_mass_delta(budget: TickBudget) -> (bool, usize) {
+        const FRAME_MS: u64 = 16; // ~60fps
+        const MAX_FRAMES: usize = 6000; // ~96s of sim time — ample for the paced drain
+        let mut game = CrashProneGame::new();
+        let mut r = Reconciler::new(mass_delta());
+        for _ in 0..MAX_FRAMES {
+            let out = r.tick_with_classes(&mut game, budget, ApplyClasses::ALL);
+            if game.crashed || out.converged {
+                break;
+            }
+            game.inner.advance_ms(FRAME_MS); // next frame: real time passes
+        }
+        (game.crashed, game.grant_times.len())
+    }
+
+    #[test]
+    fn mass_grant_delta_ctds_when_unpaced_but_survives_when_paced() {
+        // PRE-FIX: `min_grant_interval_ms == 0` IS the old unpaced path (grant up to `goods` every
+        // frame). Against the fragile game a burst of checks floods the acquisition queue -> CTD.
+        let unpaced = TickBudget { goods: 4, flags: 32, min_grant_interval_ms: 0 };
+        let (crashed_unpaced, granted_unpaced) = drive_mass_delta(unpaced);
+        assert!(
+            crashed_unpaced,
+            "UNPACED (pre-fix): a large delta must overflow the acquisition queue — the CTD is reproduced"
+        );
+        assert!(
+            granted_unpaced < 42,
+            "the crash lands MID-drain (only {granted_unpaced}/42 granted), not after everything settled"
+        );
+
+        // POST-FIX: the paced budget (the live default) spaces grants so no absorb window is ever
+        // exceeded — the identical delta now survives AND drains completely, each item exactly once.
+        let paced = TickBudget { goods: 2, flags: 32, min_grant_interval_ms: 150 };
+        let (crashed_paced, granted_paced) = drive_mass_delta(paced);
+        assert!(
+            !crashed_paced,
+            "PACED (fix): the same delta must never overflow the queue — no CTD"
+        );
+        assert_eq!(
+            granted_paced, 42,
+            "PACED (fix): all 40 consumables + 2 unique goods land, none lost or double-granted"
+        );
+    }
 }

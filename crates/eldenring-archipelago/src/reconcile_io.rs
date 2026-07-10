@@ -156,6 +156,8 @@ impl GameIo for LiveGame {
             // The generalized Torch-fix predicate: a real game-driven AddItem proves the bulk load
             // is done and the inventory is genuinely live.
             real_pickup_seen: crate::detour::real_pickup_seen(),
+            // Monotonic, load-screen-independent clock feeding the grant PACING gate.
+            now_ms: session_now_ms(),
         }
     }
 
@@ -249,6 +251,39 @@ struct Driver {
 /// Cheap and lock-free.
 pub fn mark_dirty() {
     DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// A PROCESS-monotonic clock in ms that — unlike the per-world dwell clock — never resets on a load
+/// screen. The grant PACING gate needs a steady wall-clock tick so a large received-item delta drains
+/// a burst at a time (spaced by real time) instead of flooding `AddItemFunc` in one frame.
+fn session_now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// The LIVE per-tick budget, PACED so a large delta can't grant a flood of items in one frame (the
+/// mass-grant CTD). Tunable at runtime with NO rebuild:
+///   * `RECONCILE_GRANT_BURST`       — goods/ledger grants per interval (default 2; must be > 0),
+///   * `RECONCILE_GRANT_INTERVAL_MS` — min ms between grant bursts (default 150; `0` disables pacing).
+/// Flags stay cheap and unpaced (`CSEventFlagMan` writes don't drive the acquisition popup / phantom-
+/// check machinery that the item-grant flood does), so region-open / map-reveal never stall behind a
+/// held goods class.
+fn paced_budget() -> TickBudget {
+    fn env_usize(k: &str, d: usize) -> usize {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(d)
+    }
+    fn env_u64(k: &str, d: u64) -> u64 {
+        std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(d)
+    }
+    TickBudget {
+        goods: env_usize("RECONCILE_GRANT_BURST", 2),
+        flags: 32,
+        min_grant_interval_ms: env_u64("RECONCILE_GRANT_INTERVAL_MS", 150),
+    }
 }
 
 /// Is dry-run mode on? (`RECONCILE_DRYRUN=1` — phase 0: compute + log the diff, never apply.)
@@ -356,6 +391,12 @@ fn apply_classes() -> ApplyClasses {
 /// `DesiredInputs` are built from parsed slot_data.
 pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_through: i64) {
     log::info!("[reconcile] mode: {}", mode_desc());
+    let b = paced_budget();
+    log::info!(
+        "[reconcile] grant pacing: burst={} per {}ms (0ms = unpaced); env RECONCILE_GRANT_BURST / RECONCILE_GRANT_INTERVAL_MS",
+        b.goods,
+        b.min_grant_interval_ms
+    );
     let save = inputs.save.clone();
     let store = WatermarkStore::load(persist_path);
     // Ledger watermark seeding (er-reconciler-received-grant-regression). The ledger is a SINGLE
@@ -421,7 +462,9 @@ pub fn tick() {
     let Ok(mut d) = m.lock() else { return };
 
     d.io.refresh_dwell();
-    let budget = TickBudget::default();
+    // PACED budget (env-tunable): drains a large delta a burst at a time instead of flooding
+    // AddItemFunc in one frame — the mass-grant CTD guard.
+    let budget = paced_budget();
 
     if dry_run() {
         // PHASE 0: READ-ONLY. `dry_run_actions` snapshots the live game via our `GameIo` and diffs

@@ -86,6 +86,7 @@ pub fn tick() {
     // region-lock kick uses and the space regionSphereTargetRanges is emitted in.
     let region = (player.play_region_id / 100) as i32;
     let player_handle = player.field_ins_handle; // skip the player itself in the sweep
+    let player_team = player.chr_ins.team_type; // hostiles (invader/NPC phantoms) carry a different team
 
     // Native-crash guard: on a region change, note the entry time and SKIP this sweep; keep skipping
     // until the region has settled (`REGION_SETTLE`). This keeps the ChrIns walk out of the mid-load
@@ -117,6 +118,31 @@ pub fn tick() {
     for slot in wcm.chr_sets.iter().flatten() {
         for chr in slot.characters() {
             scaled += scale_one(chr, target, &player_handle);
+        }
+    }
+    // Hostile NPC invaders / phantoms (e.g. Fia's Champions, the Deathbed Companions) are `PlayerIns`
+    // entities living in `player_chr_set`, NOT in the enemy sets above -- so the enemy sweep never
+    // reached them and they stayed at vanilla scaling (the reported bug). Scale the HOSTILE ones only:
+    // an entry whose `team_type` differs from the local player's is not on our side (an invader / a
+    // hostile NPC phantom); the local player and any friendly coop allies / summoned NPCs share the
+    // player's team and are skipped. (Spirit ashes / Torrent live in `summon_buddy_chr_set` and are
+    // never touched here.) The 70xx ladder is a plain stat multiplier, so it scales a `PlayerIns`
+    // phantom exactly as it does an enemy `ChrIns`.
+    for p in wcm.player_chr_set.characters() {
+        let team = p.chr_ins.team_type;
+        if team == player_team {
+            continue; // local player or a same-team ally
+        }
+        let ty = p.chr_ins.chr_type;
+        let applied = scale_one(&mut p.chr_ins, target, &player_handle);
+        if applied > 0 {
+            scaled += applied;
+            // Diagnostic: fires once per phantom (scale_one no-ops once it carries the tier), so a
+            // test session's log names exactly what got scaled -- confirm Fia's Champions land here.
+            log::info!(
+                "enemy-scaling: scaled hostile player_chr_set entry (chr_type={ty:?} team={team} npc_id={})",
+                p.chr_ins.npc_id
+            );
         }
     }
     if scaled > 0 {

@@ -473,6 +473,12 @@ pub struct WorldStability {
     pub dwell_ms: u64,
     /// A real game-driven `AddItem` has fired (bulk load done) — the inventory is genuinely live.
     pub real_pickup_seen: bool,
+    /// A MONOTONIC session clock in ms that — UNLIKE `dwell_ms` — never resets across a load screen.
+    /// Feeds the grant PACING gate ([`TickBudget::min_grant_interval_ms`]) so a large received-item
+    /// delta drains a few grants per interval instead of firing every `AddItemFunc` in one frame (the
+    /// mass-grant CTD). Injected (never read from `std` in this pure crate), mirroring
+    /// [`crate::region_lock`]'s `now_ms` convention. `0` in tests that don't exercise pacing.
+    pub now_ms: u64,
 }
 
 impl WorldStability {
@@ -548,13 +554,22 @@ impl ApplyClasses {
 pub struct TickBudget {
     pub goods: usize,
     pub flags: usize,
+    /// Minimum wall-clock gap (ms, measured on [`WorldStability::now_ms`]) between GRANT bursts.
+    /// While fewer than this many ms have elapsed since the last landed good/ledger grant, the
+    /// goods + ledger classes are HELD for a later tick (flags still flow) so a large delta drains a
+    /// burst-at-a-time rather than firing every `AddItemFunc` in one frame — the mass-grant CTD guard.
+    /// `0` DISABLES pacing (the historical behavior; what [`Default`] and every pre-existing test use).
+    pub min_grant_interval_ms: u64,
 }
 
 impl Default for TickBudget {
     fn default() -> Self {
+        // Pacing OFF by default so existing callers/tests keep the original drain-within-budget
+        // behavior; the LIVE client (`reconcile_io::tick`) builds a PACED budget explicitly.
         TickBudget {
             goods: 4,
             flags: 32,
+            min_grant_interval_ms: 0,
         }
     }
 }
@@ -582,6 +597,11 @@ pub struct Reconciler {
     /// Persisted-per-save contiguous frontier for the consumable ledger.
     applied_watermark: ItemIndex,
     dirty: bool,
+    /// [`WorldStability::now_ms`] of the most recent tick that LANDED a good/ledger grant, or `None`
+    /// if none has landed yet. Drives the [`TickBudget::min_grant_interval_ms`] pacing gate. NOT
+    /// persisted (a fresh session re-paces from its first grant); the ledger watermark — not this —
+    /// is what guards against re-granting an already-applied item.
+    last_grant_ms: Option<u64>,
 }
 
 impl Reconciler {
@@ -603,6 +623,7 @@ impl Reconciler {
             session_seed,
             applied_watermark: floor,
             dirty: true,
+            last_grant_ms: None,
         }
     }
 
@@ -617,6 +638,7 @@ impl Reconciler {
             session_seed,
             applied_watermark,
             dirty: true,
+            last_grant_ms: None,
         }
     }
 
@@ -754,7 +776,8 @@ impl Reconciler {
         budget: TickBudget,
         classes: ApplyClasses,
     ) -> TickOutcome {
-        if !io.stability().stable() {
+        let stab = io.stability();
+        if !stab.stable() {
             return TickOutcome {
                 applied: Vec::new(),
                 skipped_unstable: true,
@@ -774,10 +797,23 @@ impl Reconciler {
             };
         }
 
+        // PACING GATE (mass-grant CTD guard): hold the goods + ledger classes until
+        // `min_grant_interval_ms` has elapsed since the last landed grant, so a large delta drains a
+        // burst-at-a-time instead of flooding `AddItemFunc` in one frame. `interval == 0` disables it
+        // (the historical all-at-once-within-budget path). Flags are cheap `CSEventFlagMan` writes and
+        // are NEVER paced — a held goods class must not stall region-open / map-reveal.
+        let now = stab.now_ms;
+        let grants_allowed = budget.min_grant_interval_ms == 0
+            || match self.last_grant_ms {
+                None => true, // nothing granted yet -> the first burst is always allowed
+                Some(t) => now.saturating_sub(t) >= budget.min_grant_interval_ms,
+            };
+
         let mut applied = Vec::new();
         let mut flags_used = 0usize;
         let mut goods_used = 0usize;
         let mut deferred = false;
+        let mut granted_this_tick = false;
 
         // Pass 1: flags + unique goods (independent budgets; order = the diff's deterministic order).
         for a in &actions {
@@ -807,12 +843,17 @@ impl Reconciler {
                     }
                 }
                 Action::GrantUnique(g, comp) => {
+                    if !grants_allowed {
+                        deferred = true; // paced: hold this grant for a later tick
+                        continue;
+                    }
                     if goods_used >= budget.goods {
                         deferred = true;
                         continue;
                     }
                     if io.grant_good(*g, comp) {
                         goods_used += 1;
+                        granted_this_tick = true;
                         applied.push(a.clone());
                     } else {
                         deferred = true; // inventory not ready -> retry next tick
@@ -828,12 +869,17 @@ impl Reconciler {
         for a in &actions {
             match a {
                 Action::GrantLedgered { index, full_id, qty } => {
+                    if !grants_allowed {
+                        deferred = true; // paced: hold the ledger tail for a later tick
+                        break;
+                    }
                     if goods_used >= budget.goods {
                         deferred = true;
                         break;
                     }
                     if io.grant_ledgered(*full_id, *qty) {
                         goods_used += 1;
+                        granted_this_tick = true;
                         self.applied_watermark = index + 1;
                         applied.push(a.clone());
                     } else {
@@ -849,6 +895,13 @@ impl Reconciler {
                 }
                 _ => {}
             }
+        }
+
+        // Arm the pacing cooldown from THIS tick's clock if any grant landed, so the next burst waits
+        // a full `min_grant_interval_ms`. Recorded once per tick: a whole `budget.goods` burst shares
+        // one timestamp.
+        if granted_this_tick {
+            self.last_grant_ms = Some(now);
         }
 
         let converged = !deferred && applied.len() == actions.len();
@@ -915,6 +968,7 @@ impl Default for MockGame {
                 player_valid: true,
                 dwell_ms: WorldStability::SETTLE_MS,
                 real_pickup_seen: true,
+                now_ms: 0,
             },
         }
     }
@@ -934,18 +988,23 @@ impl MockGame {
                 player_valid: true,
                 dwell_ms: 0,
                 real_pickup_seen: false,
+                now_ms: 0,
             },
             ..MockGame::default()
         }
     }
 
     pub fn set_stable(&mut self, v: bool) {
+        // Preserve the injected monotonic clock across a stability toggle (a load screen must not
+        // rewind `now_ms` — the pacing cooldown is measured on it).
+        let now_ms = self.stability.now_ms;
         if v {
             self.stability = WorldStability {
                 in_game: true,
                 player_valid: true,
                 dwell_ms: WorldStability::SETTLE_MS,
                 real_pickup_seen: true,
+                now_ms,
             };
         } else {
             self.stability = WorldStability {
@@ -953,8 +1012,15 @@ impl MockGame {
                 player_valid: true,
                 dwell_ms: 0,
                 real_pickup_seen: false,
+                now_ms,
             };
         }
+    }
+
+    /// Advance the injected monotonic session clock (`now_ms`) by `dt` ms. Pacing tests use this to
+    /// let a grant cooldown elapse; a load-screen toggle (`set_stable`) preserves it.
+    pub fn advance_ms(&mut self, dt: u64) {
+        self.stability.now_ms = self.stability.now_ms.saturating_add(dt);
     }
 
     /// How many times a consumable full_id was granted (>1 == double-grant).
@@ -1349,7 +1415,7 @@ mod tests {
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(inputs("A", received, vec![]));
 
-        let budget = TickBudget { goods: 4, flags: 32 };
+        let budget = TickBudget { goods: 4, flags: 32, min_grant_interval_ms: 0 };
         let out = r.tick(&mut g, budget);
         assert_eq!(out.applied.len(), 4, "one tick applies at most `goods` ledger grants");
         assert!(!out.converged, "still more to do");
@@ -1357,6 +1423,115 @@ mod tests {
         let ticks = r.run_to_fixpoint(&mut g, budget, 50);
         assert_eq!(g.ledger_log.len(), 20, "all 20 consumables eventually land, each once");
         assert!(ticks <= 6, "20 items / 4 per tick drains in a handful of ticks, took {ticks}");
+    }
+
+    // ---- grant pacing (mass-grant CTD guard) ---------------------------------------------
+
+    /// The core guard the CTD motivated: a large consumable delta must NOT all grant in one frame.
+    /// With `min_grant_interval_ms` set, one tick grants at most a `goods`-sized burst and then HOLDS
+    /// until the injected clock advances past the interval — no matter how many ticks fire meanwhile.
+    #[test]
+    fn grant_pacing_spaces_a_large_delta_into_bursts() {
+        let received: Vec<_> = (0..12i64)
+            .map(|i| consumable(i, &format!("C{i}"), 6000 + i as i32, 1))
+            .collect();
+        let mut g = MockGame::stable(); // now_ms starts at 0
+        let mut r = Reconciler::new(inputs("A", received, vec![]));
+        let budget = TickBudget { goods: 2, flags: 32, min_grant_interval_ms: 150 };
+
+        // t=0: first burst lands (capped at `goods`), then the cooldown arms.
+        let out = r.tick(&mut g, budget);
+        assert_eq!(out.applied.len(), 2, "first burst is capped at `goods`");
+        assert!(!out.converged, "backlog remains");
+
+        // Ticking WITHOUT advancing the clock grants nothing — the cooldown has not elapsed.
+        for _ in 0..5 {
+            let out = r.tick(&mut g, budget);
+            assert!(out.applied.is_empty(), "no grant lands before the interval elapses");
+            assert!(!out.converged, "still owed, stays dirty");
+        }
+        assert_eq!(g.ledger_log.len(), 2, "clock frozen => still only the first burst landed");
+
+        // Advancing past the interval releases exactly one more burst.
+        g.advance_ms(150);
+        let out = r.tick(&mut g, budget);
+        assert_eq!(out.applied.len(), 2, "a second burst lands once the cooldown clears");
+        assert_eq!(g.ledger_log.len(), 4);
+
+        // Just short of the interval holds again (boundary check).
+        g.advance_ms(149);
+        let out = r.tick(&mut g, budget);
+        assert!(out.applied.is_empty(), "149ms < 150ms interval => still held");
+    }
+
+    /// Pacing must not LOSE or DUPLICATE anything: advancing the clock each tick eventually drains the
+    /// whole delta, every consumable exactly once (the CTD fix must keep the idempotency guarantee).
+    #[test]
+    fn grant_pacing_still_drains_everything_exactly_once() {
+        let received: Vec<_> = (0..12i64)
+            .map(|i| consumable(i, &format!("C{i}"), 6000 + i as i32, 1))
+            .collect();
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", received, vec![]));
+        let budget = TickBudget { goods: 2, flags: 32, min_grant_interval_ms: 150 };
+
+        for _ in 0..20 {
+            r.tick(&mut g, budget);
+            if g.ledger_log.len() == 12 {
+                break;
+            }
+            g.advance_ms(150); // a full interval per tick => each tick may release a burst
+        }
+        assert_eq!(g.ledger_log.len(), 12, "all consumables eventually land under pacing");
+        for i in 0..12i32 {
+            assert_eq!(g.ledger_count(6000 + i), 1, "no double-grant under pacing");
+        }
+    }
+
+    /// Flags are NEVER paced: while a good is held in cooldown, a freshly-arrived region-open flag
+    /// still lands immediately (a held goods class must not stall region access / map reveal). Also
+    /// proves the held good self-heals once the interval clears.
+    #[test]
+    fn pacing_holds_goods_but_lets_flags_through() {
+        let budget = TickBudget { goods: 4, flags: 32, min_grant_interval_ms: 150 };
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", vec![key_item(0, "K", 9000, &[])], vec![]));
+
+        // t=0: the good grants (first grant is always allowed) and arms the cooldown.
+        r.tick(&mut g, budget);
+        assert!(g.has_good(9000), "the key-item good lands at t=0");
+
+        // Same instant: a bulk-load clobbers the good AND a new region lock arrives.
+        g.drop_good(9000);
+        r.set_inputs(inputs(
+            "A",
+            vec![key_item(0, "K", 9000, &[]), region(1, "L", &[76971])],
+            vec![],
+        ));
+        let out = r.tick(&mut g, budget); // clock still 0 => the good re-grant is held
+        assert!(g.get_flag(76971), "the flag lands immediately (flags are never paced)");
+        assert!(!g.has_good(9000), "the good re-grant is HELD until the interval elapses");
+        assert!(!out.converged, "still owes the good, stays dirty");
+
+        // Once the cooldown clears, the held good self-heals.
+        g.advance_ms(150);
+        r.run_to_fixpoint(&mut g, budget, 4);
+        assert!(g.has_good(9000), "the good self-heals after the cooldown clears");
+    }
+
+    /// Pacing is OFF by default (`TickBudget::default().min_grant_interval_ms == 0`): the historical
+    /// drain-within-budget behavior is unchanged for every pre-existing caller/test.
+    #[test]
+    fn default_budget_leaves_pacing_disabled() {
+        assert_eq!(TickBudget::default().min_grant_interval_ms, 0);
+        let received: Vec<_> = (0..10i64)
+            .map(|i| consumable(i, &format!("C{i}"), 6000 + i as i32, 1))
+            .collect();
+        let mut g = MockGame::stable(); // clock never advances
+        let mut r = Reconciler::new(inputs("A", received, vec![]));
+        // With no pacing, a frozen clock still drains fully (budget is the only limiter).
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 20);
+        assert_eq!(g.ledger_log.len(), 10, "unpaced: drains without needing the clock to move");
     }
 
     #[test]
