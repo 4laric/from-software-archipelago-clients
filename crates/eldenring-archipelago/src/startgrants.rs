@@ -25,6 +25,12 @@ const MAP_REVEAL_FLAGS_DLC: &[u32] = &[62080, 62081, 62082, 62083, 62084];
 /// (62060-62064) are set. (CE [[EventFlagMan]+0x28]+0xFA0 bit6; id via the offset->id formula,
 /// confirmed live 2026-07-04. Verify with a set->readback the first time you build.)
 pub const UNDERGROUND_MAP_VIEW_UNLOCK: u32 = 82001;
+/// DLC (Realm of Shadow) map VIEW-unlock flag -- the DLC analog of [`UNDERGROUND_MAP_VIEW_UNLOCK`].
+/// Same class of bug: with only the DLC FRAGMENT flags (62080-62084) set, the Land of Shadow map
+/// layer never paints -- it also needs this view-unlock on. Entering the DLC sets it natively, which
+/// is exactly why a forced start-warp into the DLC previously masked the "DLC map not granted" bug.
+/// CE EventFlagId 82002 "Show DLC Map". Only meaningful when DLC is in play.
+pub const DLC_MAP_VIEW_UNLOCK: u32 = 82002;
 
 #[derive(Default)]
 pub struct StartConfig {
@@ -85,6 +91,14 @@ pub fn apply_start_flags(cfg: &StartConfig) -> bool {
     if !flags::try_set_event_flag(UNDERGROUND_MAP_VIEW_UNLOCK, true) {
         return false;
     }
+    // DLC (Realm of Shadow) map VIEW unlock -- same class of bug as the underground: the Land of
+    // Shadow map layer won't paint with only its fragment flags (62080-62084) set. Set whenever DLC
+    // is in play so the layer is viewable for BOTH reveal_all_maps and the progressive DLC-region
+    // unlock path. (This was the "DLC map not granted" bug -- it only ever "worked" because a forced
+    // start-warp into the DLC set 82002 natively.)
+    if cfg.enable_dlc && !flags::try_set_event_flag(DLC_MAP_VIEW_UNLOCK, true) {
+        return false;
+    }
     if cfg.reveal_all_maps {
         for &f in MAP_REVEAL_FLAGS_BASE {
             if !flags::try_set_event_flag(f, true) {
@@ -112,4 +126,47 @@ pub fn reveal_flags_for(cfg: &StartConfig) -> Vec<u32> {
         v.extend_from_slice(MAP_REVEAL_FLAGS_DLC);
     }
     v
+}
+
+/// The map VIEW-unlock flags to set UNCONDITIONALLY (regardless of `reveal_all_maps`) so the
+/// non-overworld map LAYERS actually paint once their fragments are set: always the underground
+/// view-unlock, plus the DLC view-unlock when DLC is in play. These are the `SlotData.always_map_flags`
+/// the reconciler sets unconditionally (distinct from the fragment `map_reveal_flags`, which are gated
+/// on `reveal_all_maps`). Splitting the DLC view-unlock out here is the fix for "DLC map not granted":
+/// the fragments alone (62080-62084) never paint the Land of Shadow layer without 82002.
+pub fn always_map_flags_for(cfg: &StartConfig) -> Vec<u32> {
+    let mut v = vec![UNDERGROUND_MAP_VIEW_UNLOCK];
+    if cfg.enable_dlc {
+        v.push(DLC_MAP_VIEW_UNLOCK);
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(enable_dlc: bool) -> StartConfig {
+        StartConfig { enable_dlc, ..Default::default() }
+    }
+
+    #[test]
+    fn dlc_view_unlock_rides_along_only_when_dlc_enabled() {
+        // Base game: the underground view-unlock is the only unconditional map flag.
+        assert_eq!(always_map_flags_for(&cfg(false)), vec![UNDERGROUND_MAP_VIEW_UNLOCK]);
+        // DLC in play: 82002 "Show DLC Map" is set unconditionally too, so the Land of Shadow layer
+        // paints once its fragments are set -- the fix for "DLC map not granted" (was masked by the
+        // forced start-warp into the DLC natively setting 82002).
+        assert_eq!(
+            always_map_flags_for(&cfg(true)),
+            vec![UNDERGROUND_MAP_VIEW_UNLOCK, DLC_MAP_VIEW_UNLOCK]
+        );
+        assert_eq!(DLC_MAP_VIEW_UNLOCK, 82002);
+    }
+
+    #[test]
+    fn dlc_fragments_present_only_when_dlc_enabled() {
+        assert!(!reveal_flags_for(&cfg(false)).contains(&62080));
+        assert!(reveal_flags_for(&cfg(true)).contains(&62080));
+    }
 }
