@@ -93,57 +93,14 @@ pub struct RegionConfig {
     pub lock_grant_items: HashMap<String, Vec<i32>>,
 }
 
-// --- areaLockFlags fold: static region geometry + client-side derivation ------------------------
-// Region -> physical play_region (5-digit subregion) ids. Matt-free; a mirror of the generator
-// table greenfield/eldenring_gf/features/area_locks.py REGION_PLAY_IDS. This geometry is
-// seed-invariant, so it lives in the client; the seed-specific inputs (which regions are kept +
-// the region's open flag) arrive via regionOpenFlags. A gen-side parity test (test_gf_data.py)
-// asserts this stays identical to the generator table -- keep the two in sync whenever a region
-// audit resolves a new sub-area play_region id.
-static REGION_PLAY_IDS: &[(&str, &[i32])] = &[
-    ("Limgrave", &[61000, 61001]),
-    ("Weeping Peninsula", &[61002]),
-    ("Liurnia of the Lakes", &[62000, 62001, 62002]),
-    ("Altus Plateau", &[63000, 63002, 63003]),
-    ("Mt. Gelmir", &[63001, 16000, 39200]),
-    ("Caelid", &[64000, 64001, 64002]),
-    ("Mountaintops of the Giants", &[65000, 65001]),
-    ("Consecrated Snowfield", &[65002]),
-    ("Stormveil Castle", &[10000]),
-    ("Leyndell", &[11000, 11050, 35000, 19000]),
-    ("Farum Azula", &[13000]),
-    ("Raya Lucaria Academy", &[14000]),
-    ("Miquella's Haligtree", &[15000, 15001]),
-    ("Eternal Cities", &[12010, 12011, 12012, 12020, 12030, 12070]),
-    ("Mohgwyn Palace", &[12050]),
-    // DLC (REGION_ID_MAP.md joined via gen_data.py REGION_MAP): the old 'Land of Shadow' catch-all
-    // is split into Gravesite Plain + Ancient Ruins of Rauh + Enir-Ilim; Castle Ensis (6820) folds
-    // into Gravesite Plain and Rauh (6950) splits out of Scadu Altus. Mirrors area_locks.py.
-    ("Gravesite Plain", &[6800, 6820, 6830, 6840, 22000]),
-    ("Belurat", &[20000]),
-    ("Ancient Ruins of Rauh", &[6950]),
-    ("Enir-Ilim", &[20010]),
-    ("Jagged Peak", &[6850, 6851]),
-    ("Abyssal Woods", &[6860, 28000]),
-    ("Scadu Altus", &[6900, 6920, 6940]),
-    ("Shadow Keep", &[21000, 21001, 21010]),
-];
-
-/// Build kick-watch ranges (`[lo, hi, open_flag]`, lo == hi) from `regionOpenFlags`: one range
-/// per static play_region id of each received-able "<Region> Lock", keyed to that region's open
-/// flag. Mirrors area_locks.py's former slot_data emit, moved client-side (the areaLockFlags fold).
-fn derive_area_lock_flags(region_open_flags: &HashMap<String, u32>) -> Vec<[i32; 3]> {
-    let mut out = Vec::new();
-    for (name, &flag) in region_open_flags {
-        let region = name.strip_suffix(" Lock").unwrap_or(name.as_str());
-        if let Some((_, ids)) = REGION_PLAY_IDS.iter().find(|(r, _)| *r == region) {
-            for &pid in *ids {
-                out.push([pid, pid, flag as i32]);
-            }
-        }
-    }
-    out
-}
+// --- areaLockFlags: SINGLE SOURCE OF TRUTH is the generator ---------------------------------------
+// The region -> play_region geometry lives in exactly ONE place: the generator
+// (greenfield/eldenring_gf/features/area_locks.py), which ships the fully-resolved kick-watch ranges
+// as slot_data `areaLockFlags`. The client no longer keeps a mirror of that table -- a duplicated
+// static geometry here repeatedly drifted from the generator (e.g. the Consecrated Snowfield ->
+// Mountaintops fold), so the mirror + its parity test are gone. If a region's geometry changes, only
+// the generator changes; the client just consumes what the seed sends. (A gen-side test enforces this
+// no-mirror rule so the drift can't come back.)
 
 pub fn parse(sd: &Value) -> RegionConfig {
     // Re-arm the random-start warp latch on each fresh parse (mirrors the standalone `configure`
@@ -152,14 +109,10 @@ pub fn parse(sd: &Value) -> RegionConfig {
     START_LATCHED.store(false, Ordering::Relaxed);
     *WARP_WORLD_SETTLE.lock().unwrap() = None;
     let region_open_flags = str_to_u32(sd.get("regionOpenFlags"));
-    // areaLockFlags fold (2026-07-06): the play_region geometry is static (REGION_PLAY_IDS)
-    // and every seed-specific input (kept regions + their open flag) already rides
-    // regionOpenFlags, so derive the kick-watch ranges here instead of shipping them. A legacy
-    // pre-fold seed that still sends a non-empty areaLockFlags is honored as-is.
-    let area_lock_flags = match sd.get("areaLockFlags").and_then(|v| v.as_array()) {
-        Some(a) if !a.is_empty() => parse_triples(sd.get("areaLockFlags")),
-        _ => derive_area_lock_flags(&region_open_flags),
-    };
+    // Kick-watch ranges come straight from the generator's `areaLockFlags` (single source of truth;
+    // see the note above). No client-side derivation/fallback -- a seed that ships nothing here has
+    // no kick-watch, which is the correct degrade (regenerate the seed rather than mirror the table).
+    let area_lock_flags = parse_triples(sd.get("areaLockFlags"));
     RegionConfig {
         area_lock_flags,
         random_start_done_flag: sd
