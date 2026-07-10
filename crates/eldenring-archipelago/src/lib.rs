@@ -10,6 +10,7 @@ mod contract_gen;
 mod core;
 mod deathlink;
 mod detour;
+mod fast_travel;
 mod flagpoll;
 mod flags;
 mod fmg_inject;

@@ -1646,6 +1646,9 @@ impl shared::Core for Core {
             let _ = crate::shop_icon::run();
             let _ = crate::minibaker::run();
             crate::scaling::tick();
+            // Anti-stuck: keep the FieldArea fast-travel gate open so a dungeon/catacomb can never
+            // strand the player (SELF-CALIBRATING field overwrite; see fast_travel.rs). Game-thread.
+            crate::fast_travel::tick();
             // Region-lock fog-wall visuals (cosmetic marker at locked borders; the KICK reactor,
             // not this, does the blocking). Runs on the game thread (FrameBegin task) so the
             // CSWorldGeomMan::spawn_geometry call is main-thread-safe.
