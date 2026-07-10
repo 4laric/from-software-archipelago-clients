@@ -1743,7 +1743,9 @@ impl Core {
         let slot_data = SlotData {
             seal_flags: Vec::new(),
             start_graces: sc.map(|s| s.start_graces.clone()).unwrap_or_default(),
-            always_map_flags: vec![crate::startgrants::UNDERGROUND_MAP_VIEW_UNLOCK],
+            always_map_flags: sc
+                .map(crate::startgrants::always_map_flags_for)
+                .unwrap_or_else(|| vec![crate::startgrants::UNDERGROUND_MAP_VIEW_UNLOCK]),
             reveal_all_maps: sc.map(|s| s.reveal_all_maps).unwrap_or(false),
             map_reveal_flags: sc.map(crate::startgrants::reveal_flags_for).unwrap_or_default(),
             start_items: sc
