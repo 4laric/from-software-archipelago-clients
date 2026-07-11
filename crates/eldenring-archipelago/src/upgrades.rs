@@ -60,6 +60,34 @@ static AUTO_UPGRADE: AtomicI32 = AtomicI32::new(0);
 /// (Matches the C++ `g_globalScaduBlessing` tri-state.)
 static GLOBAL_SCADU: AtomicI32 = AtomicI32::new(0);
 
+/// mode 2 (scaled) DLC Scadutree-blessing FLOOR wire: `(lo, hi, floor)` in play_region/100 sub-id
+/// space (`dlcScadutreeFloorRanges`). Set at connect; read each scadu tick to floor the player's
+/// blessing to the DLC area they're standing in. Empty = no DLC / mode != 2 -> mode 2 == mode 1.
+static DLC_SCADU_FLOORS: Mutex<Vec<(i32, i32, i32)>> = Mutex::new(Vec::new());
+
+/// core.rs (connect): `set_dlc_blessing_floors(er_logic::scaling::parse_triple_ranges(sd.get("dlcScadutreeFloorRanges")))`.
+pub fn set_dlc_blessing_floors(ranges: Vec<(i32, i32, i32)>) {
+    let n = ranges.len();
+    if let Ok(mut g) = DLC_SCADU_FLOORS.lock() {
+        *g = ranges;
+    }
+    log::info!("global_scadu_blessing: DLC blessing-floor buckets = {n}");
+}
+
+/// The DLC blessing FLOOR level for the player's current play_region (mode 2). 0 when outside a DLC
+/// bucket / no wire. Reuses the pure `er_logic::scaling::blessing_floor_for_region` (same bucket space
+/// as the enemy scaler: `play_region_id / 100`).
+fn dlc_blessing_floor_here() -> i32 {
+    let Some(pr) = crate::flags::play_region_id() else {
+        return 0;
+    };
+    let bucket = pr / 100;
+    match DLC_SCADU_FLOORS.lock() {
+        Ok(g) => er_logic::scaling::blessing_floor_for_region(&g, bucket).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
 /// net.rs: `set_auto_upgrade(sd.pointer("/options/auto_upgrade").and_then(|v| v.as_i64()).unwrap_or(0) as i32)`.
 pub fn set_auto_upgrade(level_or_flag: i32) {
     AUTO_UPGRADE.store(level_or_flag, Ordering::Relaxed);
@@ -336,7 +364,14 @@ pub fn tick_global_scadu() {
         return;
     };
 
-    let level = level_for_fragments(frag_qty);
+    // mode 1 (player_only): blessing from held fragments only. mode 2 (scaled): ALSO floor to the DLC
+    // area's expected blessing, so a DLC region unlocked without fragments still meets its enemies'
+    // assumption. Raise-only (via raise_stored_blessing) means the floor and fragments compose as max.
+    let level = if scadu_mode() == 2 {
+        level_for_fragments(frag_qty).max(dlc_blessing_floor_here())
+    } else {
+        level_for_fragments(frag_qty)
+    };
 
     // Read the current stored blessing, then ONLY raise it (never stomp a higher real DLC revere,
     // never down-flicker). The read+write share one mutable PlayerGameData borrow inside
