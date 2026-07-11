@@ -60,6 +60,34 @@ static AUTO_UPGRADE: AtomicI32 = AtomicI32::new(0);
 /// (Matches the C++ `g_globalScaduBlessing` tri-state.)
 static GLOBAL_SCADU: AtomicI32 = AtomicI32::new(0);
 
+/// mode 2 (scaled) DLC Scadutree-blessing FLOOR wire: `(lo, hi, floor)` in play_region/100 sub-id
+/// space (`dlcScadutreeFloorRanges`). Set at connect; read each scadu tick to floor the player's
+/// blessing to the DLC area they're standing in. Empty = no DLC / mode != 2 -> mode 2 == mode 1.
+static DLC_SCADU_FLOORS: Mutex<Vec<(i32, i32, i32)>> = Mutex::new(Vec::new());
+
+/// core.rs (connect): `set_dlc_blessing_floors(er_logic::scaling::parse_triple_ranges(sd.get("dlcScadutreeFloorRanges")))`.
+pub fn set_dlc_blessing_floors(ranges: Vec<(i32, i32, i32)>) {
+    let n = ranges.len();
+    if let Ok(mut g) = DLC_SCADU_FLOORS.lock() {
+        *g = ranges;
+    }
+    log::info!("global_scadu_blessing: DLC blessing-floor buckets = {n}");
+}
+
+/// The DLC blessing FLOOR level for the player's current play_region (mode 2). 0 when outside a DLC
+/// bucket / no wire. Reuses the pure `er_logic::scaling::blessing_floor_for_region` (same bucket space
+/// as the enemy scaler: `play_region_id / 100`).
+fn dlc_blessing_floor_here() -> i32 {
+    let Some(pr) = crate::flags::play_region_id() else {
+        return 0;
+    };
+    let bucket = pr / 100;
+    match DLC_SCADU_FLOORS.lock() {
+        Ok(g) => er_logic::scaling::blessing_floor_for_region(&g, bucket).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
 /// net.rs: `set_auto_upgrade(sd.pointer("/options/auto_upgrade").and_then(|v| v.as_i64()).unwrap_or(0) as i32)`.
 pub fn set_auto_upgrade(level_or_flag: i32) {
     AUTO_UPGRADE.store(level_or_flag, Ordering::Relaxed);
@@ -104,8 +132,8 @@ fn scadu_mode() -> i32 {
 // Worksheet §A.
 
 const REINFORCE_STEP: i32 = 100; // ER id stride per smithing level (base = id - id%100)
-const NORMAL_CAP: i32 = 25; // normal smithing track tops out at +25
-const SOMBER_CAP: i32 = 10; // somber smithing track tops out at +10
+const NORMAL_CAP: i32 = 25; // normal smithing track tops out at +25 (reinforce-run scan bound)
+// Somber cap + track classification live in er_logic::upgrades::classify_track (host-tested).
 
 /// Cached "highest +N held" per track, refreshed on a throttle (C++ used 1500ms + a cached
 /// container offset; the typed iterator removes the container scan, so we just cache the targets
@@ -170,26 +198,26 @@ fn decode_weapon_id(full_id: i32) -> Option<(i32, i32)> {
 }
 
 /// RE-A2 RESOLVED (typed binding): resolve a weapon base id -> (reinforce cap, is_somber).
-/// `repo.get::<EquipParamWeapon>(base).reinforce_type_id() -> i16`; then cap = max k in [0,25] s.t.
-/// `repo.get::<ReinforceParamWeapon>(rt + k)` exists. somber = cap <= 10. Mirrors C++ `CapForRT` /
-/// `WeaponInfo`. None (no upgrade) if the repo isn't up, the row is absent, or cap <= 0.
+/// Cap = length of the `ReinforceParamWeapon` run from `reinforce_type_id() -> i16`; TRACK =
+/// `er_logic::upgrades::classify_track` on `EquipParamWeapon.materialSetId` (2200 = somber). None
+/// if the repo isn't up, the row is absent, or the run is empty. Mirrors C++ `CapForRT`/`WeaponInfo`
+/// but TRACK-CORRECT: the old `cap <= 10` run-length heuristic mis-tracked the ~4 vanilla rows whose
+/// somber material rides a full 26-row run (e.g. Occult Carian Knight's Shield), leaking a +10 somber
+/// into the normal high-water mark. See classify_track (host-tested in er-logic).
 pub(crate) fn weapon_track_and_cap(base: i32) -> Option<(i32, bool)> {
     // SAFETY: FD4 singleton; on the game thread, gated in-world by the caller. Err until built.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
     let weapon = repo.get::<EquipParamWeapon>(base as u32)?;
     let rt = weapon.reinforce_type_id() as i32;
-    // Count consecutive ReinforceParamWeapon rows from rt. C++: `while (k<=25 && row(rt+k)) ++k;
-    // cap = k-1`. rt can be negative for non-upgradeable junk; get() just returns None then.
+    // Reinforce-run length = the CAP. C++: `while (k<=25 && row(rt+k)) ++k; cap = k-1`. rt can be
+    // negative for non-upgradeable junk; get() just returns None then.
     let mut k = 0;
     while k <= NORMAL_CAP && repo.get::<ReinforceParamWeapon>((rt + k) as u32).is_some() {
         k += 1;
     }
-    let cap = k - 1;
-    if cap <= 0 {
-        return None; // not upgradeable
-    }
-    let somber = cap <= SOMBER_CAP;
-    Some((cap, somber))
+    // TRACK from materialSetId, cap from the run above -- host-tested predicate (owns the somber
+    // clamp + the not-upgradeable guard).
+    er_logic::upgrades::classify_track(k - 1, weapon.material_set_id() as i32)
 }
 
 /// RE-A3 RESOLVED (typed binding): highest +N currently held on the given smithing track
@@ -336,7 +364,14 @@ pub fn tick_global_scadu() {
         return;
     };
 
-    let level = level_for_fragments(frag_qty);
+    // mode 1 (player_only): blessing from held fragments only. mode 2 (scaled): ALSO floor to the DLC
+    // area's expected blessing, so a DLC region unlocked without fragments still meets its enemies'
+    // assumption. Raise-only (via raise_stored_blessing) means the floor and fragments compose as max.
+    let level = if scadu_mode() == 2 {
+        level_for_fragments(frag_qty).max(dlc_blessing_floor_here())
+    } else {
+        level_for_fragments(frag_qty)
+    };
 
     // Read the current stored blessing, then ONLY raise it (never stomp a higher real DLC revere,
     // never down-flicker). The read+write share one mutable PlayerGameData borrow inside

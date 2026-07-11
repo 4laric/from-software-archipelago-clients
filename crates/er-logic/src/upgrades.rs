@@ -8,6 +8,33 @@ use crate::hook::GameHook;
 const REINFORCE_STEP: i32 = 100;
 /// Stored scadutree-blessing ceiling.
 pub const SCADU_MAX_LEVEL: i32 = 20;
+/// `EquipParamWeapon.materialSetId` of the somber-stone smithing track.
+pub const SOMBER_MATERIAL_SET: i32 = 2200;
+/// Somber track ceiling (its `EquipMtrlSetParam` chain only builds to +10).
+pub const SOMBER_CAP: i32 = 10;
+
+/// Classify a weapon's smithing TRACK + cap from its reinforce-run length and material set.
+///
+/// `run_cap` = the highest +N the weapon's `ReinforceParamWeapon` run supports (`<= 0` => not
+/// upgradeable). `material_set_id` = `EquipParamWeapon.materialSetId` (`2200` = somber stones,
+/// anything else = regular smithing). Returns `(cap, somber)`, or `None` when not upgradeable.
+///
+/// The track is decided by the MATERIAL the game charges, never the run length. The old
+/// `somber = run_cap <= 10` heuristic disagreed with the game on the handful of vanilla rows whose
+/// somber material rides a full-length (26-row) reinforce run -- notably the Occult Carian Knight's
+/// Shield (`materialSetId 2200`, run 26). It was read as a +25 NORMAL weapon, so a +10 of it leaked
+/// into the normal high-water mark and cross-upgraded received standard weapons to +10. The somber
+/// cap is clamped to +10 so a mislengthed run can never push a somber weapon past its real ceiling.
+pub fn classify_track(run_cap: i32, material_set_id: i32) -> Option<(i32, bool)> {
+    if run_cap <= 0 {
+        return None; // no reinforce rows -> not player-upgradeable
+    }
+    if material_set_id == SOMBER_MATERIAL_SET {
+        Some((run_cap.min(SOMBER_CAP), true))
+    } else {
+        Some((run_cap, false)) // regular smithing (materialSetId 0), or clamp-safe default
+    }
+}
 
 /// Decode a weapon FullID into `(base, reinforce_level)`. None for non-weapons or out-of-range rows.
 pub fn decode_weapon_id(full_id: i32) -> Option<(i32, i32)> {
@@ -159,5 +186,38 @@ mod tests {
         let mut g = FakeGame::new();
         g.set_stored_blessing(None);
         assert_eq!(raise_stored_blessing(&mut g, 10), None);
+    }
+
+    // ---- classify_track: TRACK from materialSetId, cap from the run (the cross-track bug fix) -----
+    #[test]
+    fn classify_somber_material_with_full_run_is_somber_capped() {
+        // The bug row: Occult Carian Knight's Shield -- somber material (2200) but a 26-row reinforce
+        // run. Must be SOMBER and clamped to +10, NOT a +25 normal weapon (that leak cross-upgraded
+        // received standard weapons to +10).
+        assert_eq!(classify_track(25, SOMBER_MATERIAL_SET), Some((SOMBER_CAP, true)));
+    }
+
+    #[test]
+    fn classify_regular_material_with_short_run_is_normal() {
+        // Reverse mismatch rows: materialSetId 0 with an 11-row run -> NORMAL (cap = run), not somber.
+        assert_eq!(classify_track(10, 0), Some((10, false)));
+    }
+
+    #[test]
+    fn classify_standard_normal_and_somber() {
+        assert_eq!(classify_track(25, 0), Some((25, false)));                    // vanilla normal weapon
+        assert_eq!(classify_track(10, SOMBER_MATERIAL_SET), Some((10, true)));   // vanilla somber weapon
+    }
+
+    #[test]
+    fn classify_not_upgradeable_is_none() {
+        assert_eq!(classify_track(0, 0), None);
+        assert_eq!(classify_track(-1, SOMBER_MATERIAL_SET), None);
+    }
+
+    #[test]
+    fn classify_unknown_material_defaults_normal_never_panics() {
+        // materialSetId -1/other with a real run -> treat as normal (never somber-leak, never crash).
+        assert_eq!(classify_track(25, -1), Some((25, false)));
     }
 }
