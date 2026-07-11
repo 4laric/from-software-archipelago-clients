@@ -48,6 +48,13 @@ pub const SCALING_TIERS: &[ScalingTier] = &[
 /// Number of tiers in the ladder.
 pub const NUM_TIERS: usize = SCALING_TIERS.len();
 
+/// Enemy-tier CAP for DLC buckets (those present in `dlc_blessing_floors`). The DLC blessing FLOOR
+/// (upgrades.rs mode 2) restores the intended player-vs-enemy balance at the area's native tuning, so
+/// stacking the deep-sphere 70xx tier on top double-counts progression and re-creates the "insane"
+/// difficulty. Index 3 = `7040` (≈1.8× HP / 1.5× attack) keeps late-sphere DLC seeds from feeling
+/// flat without the double stack. (fable consult 2026-07-11.)
+pub const DLC_ENEMY_TIER_CAP: usize = 3;
+
 /// Vanilla enemy-scaling SpEffects live in this id range. Used to CLEAR an enemy's baked scaling
 /// (remove any active `param_id` in this range) before applying our sphere tier — vanilla `70xx` are
 /// `spCategory = 0` so they'd otherwise stack (double-scale).
@@ -72,6 +79,11 @@ pub struct ScalingConfig {
     pub region_ranges: Vec<(i32, i32, i32)>,
     /// Deepest target present (normalization denominator). `0` disables scaling (→ floor everywhere).
     pub max_target: i32,
+    /// `dlcScadutreeFloorRanges` (mode 2): `(lo, hi, floor)` in play_region/100 sub-id space -> the
+    /// Scadutree-blessing FLOOR level for that DLC bucket. Consumed by upgrades.rs (the blessing
+    /// floor) AND here (any bucket present == a DLC bucket -> cap its enemy tier at `DLC_ENEMY_TIER_CAP`
+    /// so the floored player isn't ALSO fighting top-tier-scaled enemies). Empty = no DLC / mode != 2.
+    pub dlc_blessing_floors: Vec<(i32, i32, i32)>,
 }
 
 /// Map a raw target to a tier index in `[floor_tier, NUM_TIERS)`. `max_target <= 0` → the floor tier.
@@ -87,19 +99,37 @@ pub fn tier_for_target(target: i32, max_target: i32, floor_tier: usize) -> usize
 }
 
 /// Region → tier. A region absent from `region_targets` falls back to the floor tier (unknown = don't
-/// scale up).
+/// scale up). DLC buckets (present in `dlc_blessing_floors`) are CAPPED at `DLC_ENEMY_TIER_CAP` so the
+/// blessing floor and the enemy scaler don't double-count (never below `floor_tier`).
 pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> usize {
-    if let Some(&target) = cfg.region_targets.get(&region) {
-        return tier_for_target(target, cfg.max_target, cfg.floor_tier);
+    let base = if let Some(&target) = cfg.region_targets.get(&region) {
+        tier_for_target(target, cfg.max_target, cfg.floor_tier)
+    } else if let Some(&(_, _, target)) =
+        // SCALING_WIRE: range fallback -- `region` is the play_region/100 sub id; the apworld
+        // emits [lo, hi, target] buckets in the same space (a few dozen; linear scan is fine).
+        cfg.region_ranges.iter().find(|&&(lo, hi, _)| (lo..=hi).contains(&region))
+    {
+        tier_for_target(target, cfg.max_target, cfg.floor_tier)
+    } else {
+        cfg.floor_tier.min(NUM_TIERS - 1)
+    };
+    // DLC cap: a floored DLC area shouldn't ALSO run top-tier enemy scaling (double-count).
+    if blessing_floor_for_region(&cfg.dlc_blessing_floors, region).is_some() {
+        return base
+            .min(DLC_ENEMY_TIER_CAP)
+            .max(cfg.floor_tier.min(NUM_TIERS - 1));
     }
-    // SCALING_WIRE: range fallback -- `region` is the play_region/100 sub id; the apworld
-    // emits [lo, hi, target] buckets in the same space (a few dozen; linear scan is fine).
-    for &(lo, hi, target) in &cfg.region_ranges {
-        if (lo..=hi).contains(&region) {
-            return tier_for_target(target, cfg.max_target, cfg.floor_tier);
-        }
-    }
-    cfg.floor_tier.min(NUM_TIERS - 1)
+    base
+}
+
+/// The Scadutree-blessing FLOOR level for a play_region/100 `region` bucket, or `None` if the bucket
+/// isn't in the DLC floor wire (unknown = no floor). Pure; mirrors `tier_for_region`'s range scan.
+/// Shared by upgrades.rs (write max(fragment level, floor)) and the DLC enemy-tier cap above.
+pub fn blessing_floor_for_region(ranges: &[(i32, i32, i32)], region: i32) -> Option<i32> {
+    ranges
+        .iter()
+        .find(|&&(lo, hi, _)| (lo..=hi).contains(&region))
+        .map(|&(_, _, floor)| floor)
 }
 
 /// The `SpEffectParam` id to apply for a tier (clamped to the ladder).
@@ -149,18 +179,10 @@ pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
     // SCALING_WIRE (er-completion-scaling P1 wire fix): the apworld's client-parseable form is
     // range-keyed [[lo, hi, target], ...] in play_region/100 sub-id space; the flat map only
     // ever carried region NAMES (unparseable -> empty), so ranges are the live path now.
-    let mut region_ranges: Vec<(i32, i32, i32)> = Vec::new();
-    if let Some(arr) = sd.get("regionSphereTargetRanges").and_then(|v| v.as_array()) {
-        for row in arr {
-            let Some(r) = row.as_array() else { continue };
-            if r.len() != 3 {
-                continue;
-            }
-            if let (Some(lo), Some(hi), Some(t)) = (r[0].as_i64(), r[1].as_i64(), r[2].as_i64()) {
-                region_ranges.push((lo as i32, hi as i32, t as i32));
-            }
-        }
-    }
+    let region_ranges = parse_triple_ranges(sd.get("regionSphereTargetRanges"));
+    // DLC Scadutree-blessing floors (mode 2). Independent of completion_scaling, but folded into the
+    // same config so the enemy-tier CAP has the DLC-bucket set. upgrades.rs reads these floors too.
+    let dlc_blessing_floors = parse_triple_ranges(sd.get("dlcScadutreeFloorRanges"));
     if region_targets.is_empty() && region_ranges.is_empty() {
         return None; // H4: refuse to arm — see doc above.
     }
@@ -183,7 +205,33 @@ pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0) as f32;
     let floor_tier = floor_tier_from_multiplier(floor_mult);
-    Some(ScalingConfig { basis, floor_tier, region_targets, region_ranges, max_target })
+    Some(ScalingConfig {
+        basis,
+        floor_tier,
+        region_targets,
+        region_ranges,
+        max_target,
+        dlc_blessing_floors,
+    })
+}
+
+/// Parse a `[[lo, hi, v], ...]` slot_data triple-list into `(lo, hi, v)` i32 tuples. Tolerant: a row
+/// that isn't a length-3 int array is skipped. Shared by `regionSphereTargetRanges` and
+/// `dlcScadutreeFloorRanges` (both live in play_region/100 sub-id space).
+pub fn parse_triple_ranges(v: Option<&Value>) -> Vec<(i32, i32, i32)> {
+    let mut out: Vec<(i32, i32, i32)> = Vec::new();
+    if let Some(arr) = v.and_then(|v| v.as_array()) {
+        for row in arr {
+            let Some(r) = row.as_array() else { continue };
+            if r.len() != 3 {
+                continue;
+            }
+            if let (Some(lo), Some(hi), Some(t)) = (r[0].as_i64(), r[1].as_i64(), r[2].as_i64()) {
+                out.push((lo as i32, hi as i32, t as i32));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -199,7 +247,37 @@ mod tests {
             region_targets,
             region_ranges: vec![],
             max_target,
+            dlc_blessing_floors: vec![],
         }
+    }
+
+    #[test]
+    fn blessing_floor_lookup_matches_bucket_ranges() {
+        let floors = vec![(6800, 6800, 1), (20010, 20010, 15), (21000, 21010, 10)];
+        assert_eq!(blessing_floor_for_region(&floors, 6800), Some(1));
+        assert_eq!(blessing_floor_for_region(&floors, 20010), Some(15));
+        assert_eq!(blessing_floor_for_region(&floors, 21005), Some(10)); // inside an lo..=hi span
+        assert_eq!(blessing_floor_for_region(&floors, 61000), None); // base-game bucket -> no floor
+        assert_eq!(blessing_floor_for_region(&[], 6800), None);
+    }
+
+    #[test]
+    fn dlc_buckets_cap_enemy_tier_but_never_below_floor() {
+        // A deep DLC bucket would resolve to the TOP tier without the cap.
+        let mut c = cfg(&[(6850, 100)], 0);
+        c.max_target = 100;
+        c.region_ranges = vec![(6850, 6850, 100)]; // Jagged Peak bucket at max depth
+        // no floor wire -> uncapped: top tier
+        assert_eq!(tier_for_region(&c, 6850), NUM_TIERS - 1);
+        // with the DLC floor wire present for that bucket -> capped at DLC_ENEMY_TIER_CAP
+        c.dlc_blessing_floors = vec![(6850, 6850, 12)];
+        assert_eq!(tier_for_region(&c, 6850), DLC_ENEMY_TIER_CAP);
+        // a base-game bucket is unaffected by the cap
+        c.region_ranges.push((64000, 64000, 100));
+        assert_eq!(tier_for_region(&c, 64000), NUM_TIERS - 1);
+        // an explicit floor above the cap wins (user asked for it)
+        c.floor_tier = DLC_ENEMY_TIER_CAP + 2;
+        assert_eq!(tier_for_region(&c, 6850), DLC_ENEMY_TIER_CAP + 2);
     }
 
     // --- ladder integrity (the vanilla 7010..7100 rows) ---

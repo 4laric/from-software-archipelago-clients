@@ -431,6 +431,11 @@ impl shared::Core for Core {
                 crate::upgrades::set_global_scadu_blessing(
                     sd.pointer("/options/global_scadutree_blessing").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 );
+                // mode 2 (scaled): the per-DLC-region Scadutree-blessing floor wire. Absent for base
+                // game / mode != 2 -> empty -> mode 2 behaves as mode 1.
+                crate::upgrades::set_dlc_blessing_floors(
+                    er_logic::scaling::parse_triple_ranges(sd.get("dlcScadutreeFloorRanges")),
+                );
                 crate::upgrade_cost::set_flatten(
                     sd.pointer("/options/flatten_regular_upgrades").and_then(|v| v.as_i64()).unwrap_or(0),
                 );
