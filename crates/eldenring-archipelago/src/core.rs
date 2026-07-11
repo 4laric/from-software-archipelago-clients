@@ -263,7 +263,7 @@ impl shared::Core for Core {
 
     fn new() -> Result<Self> {
         Ok(Self {
-            base: CoreBase::new("Elden Ring (Greenfield)")?,
+            base: CoreBase::new("Elden Ring")?,
             detour_installed: false,
             received_through: 0,
             dispatched_through: 0,
