@@ -410,6 +410,40 @@ impl shared::Core for Core {
                         log::info!("  {k} = {rv}");
                     }
                 }
+                // ---- VERSION HANDSHAKE ------------------------------------------------------
+                // The apworld and this .dll ship as SEPARATE artifacts (apworld off-site, dll on
+                // Nexus), so a player mixing versions is the NORM, not an edge case -- and a stale
+                // .dll against a fresh apworld looks exactly like a bug in the game. `versions`
+                // carries apworld semver + the CONTRACT HASH the apworld was built from + the hash
+                // of the generated DATA the seed used. Compare the contract hash to the one THIS
+                // binary was compiled against and shout if they differ. Always log the whole string:
+                // every bug report should carry it, or it cannot be triaged.
+                let their_versions = sd.get("versions").and_then(|v| v.as_str()).unwrap_or("");
+                if their_versions.is_empty() {
+                    log::warn!(
+                        "VERSION: apworld sent no `versions` -- it predates the version handshake. \
+                         This client is contract/{} apworld/{}. Skew CANNOT be detected; if anything \
+                         behaves oddly, suspect a version mismatch first.",
+                        crate::contract_gen::CONTRACT_HASH,
+                        crate::contract_gen::APWORLD_VERSION_EXPECTED);
+                } else {
+                    let their_contract = their_versions
+                        .split_whitespace()
+                        .find_map(|t| t.strip_prefix("contract/"))
+                        .unwrap_or("?");
+                    if their_contract == crate::contract_gen::CONTRACT_HASH {
+                        log::info!("VERSION: OK -- {} (client contract/{})",
+                                   their_versions, crate::contract_gen::CONTRACT_HASH);
+                    } else {
+                        log::error!(
+                            "VERSION MISMATCH -- apworld sent [{}] but this client was BUILT against \
+                             contract/{}. The apworld and the client .dll are from different builds. \
+                             Update whichever is older; do not report bugs from this pairing -- the \
+                             slot_data shapes this client expects are not the ones it is being sent.",
+                            their_versions, crate::contract_gen::CONTRACT_HASH);
+                    }
+                }
+
                 // Two-sided contract validation: warn (not reject) on any slot_data mismatch
                 // so a partially-compatible seed still boots but every problem is visible.
                 let contract_problems = crate::contract_gen::validate(sd);

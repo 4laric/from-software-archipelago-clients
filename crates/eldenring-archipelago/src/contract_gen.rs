@@ -1,4 +1,4 @@
-// AUTO-GENERATED from eldenring_gf/contract.py -- do not edit by hand.
+// AUTO-GENERATED from eldenring/contract.py -- do not edit by hand.
 // The apworld<->client slot_data contract, mirrored so the client validates the same shapes.
 use serde_json::Value;
 
@@ -34,15 +34,18 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "options", shape: Shape::OptionsDict, required: true, greenfield: true },
     ContractKey { name: "regionSphereTargets", shape: Shape::ScalarIntMap, required: false, greenfield: true },
     ContractKey { name: "regionSphereTargetRanges", shape: Shape::TripleList, required: false, greenfield: true },
+    ContractKey { name: "dlcScadutreeFloorRanges", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "completionScalingBasis", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "areaLockFlags", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "lockRevealFlags", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "regionGraces", shape: Shape::ListvalIntMap, required: false, greenfield: true },
-    ContractKey { name: "graceItems", shape: Shape::ScalarIntMap, required: false, greenfield: true },
+    ContractKey { name: "runeGatedGraces", shape: Shape::ListvalIntMap, required: false, greenfield: true },
+    ContractKey { name: "greatRuneItemIds", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "startRegion", shape: Shape::Str, required: true, greenfield: true },
     ContractKey { name: "startGraces", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "startItems", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "reveal_all_maps", shape: Shape::Bool, required: false, greenfield: true },
+    ContractKey { name: "bigTicketLocations", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "goalLocations", shape: Shape::IntList, required: true, greenfield: true },
     ContractKey { name: "checkItemFlags", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "shopRowFlags", shape: Shape::ScalarIntMap, required: false, greenfield: true },
@@ -58,7 +61,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "completion_scaling", shape: Shape::IntOrBool, required: false, greenfield: true },
     ContractKey { name: "completion_scaling_floor", shape: Shape::Number, required: false, greenfield: true },
     ContractKey { name: "global_scadutree_blessing", shape: Shape::Int, required: false, greenfield: true },
-    ContractKey { name: "versions", shape: Shape::Str, required: false, greenfield: true },
+    ContractKey { name: "versions", shape: Shape::Str, required: true, greenfield: true },
     ContractKey { name: "world_logic", shape: Shape::Str, required: false, greenfield: true },
     ContractKey { name: "region_count", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "ending_condition", shape: Shape::Any, required: false, greenfield: true },
@@ -154,3 +157,14 @@ pub fn validate(sd: &Value) -> Vec<String> {
     }
     out
 }
+
+// ---- VERSION HANDSHAKE ----------------------------------------------------------------
+// The contract hash this client was COMPILED against. The apworld sends its own in slot_data
+// `versions` ("apworld/<semver> contract/<hash8> data/<inputs_hash16>"). If they differ, the
+// two artifacts were built from different contracts -- which is the NORM, not an edge case:
+// the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
+// Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
+// version number would.
+pub const CONTRACT_HASH: &str = "78190ef4";
+pub const APWORLD_VERSION_EXPECTED: &str = "0.2.0";
+
