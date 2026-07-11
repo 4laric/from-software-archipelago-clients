@@ -69,44 +69,62 @@ pub fn tick() {
         Err(_) => return, // FieldArea not placed yet (load screen) — retry next tick.
     };
 
-    // Is travel genuinely allowed right now? (field points at a set flag.)
-    let allowed = field > 0 && crate::flags::get_event_flag(field as u32);
-    if allowed {
-        // Cache this as our trusted "on" flag and reset the block log latch.
-        if KNOWN_GOOD_FLAG.swap(field, Ordering::Relaxed) != field {
-            log::info!("fast-travel: gate open (field flag {field}) — cached as known-good");
-        }
-        LAST_LOGGED_BLOCK.store(i32::MIN, Ordering::Relaxed);
-        return;
-    }
-
-    // Blocked. Prefer the zero-side-effect field overwrite to a known-good on-flag.
+    // THE DECISION is er_logic::fast_travel::gate_action (host-tested; see fast_travel_replay.rs).
+    //
+    // 2026-07-11, Gael Tunnel: the old code, with nothing cached, did
+    //     crate::flags::set_event_flag(field as u32, true)
+    // -- it SET whatever flag the field named. But `enable_fast_travel_event_flag` is the flag VANILLA
+    // uses to gate warping out of an area, and in a boss dungeon THAT IS THE BOSS'S DEFEAT FLAG (you
+    // cannot warp out until the boss is dead). So walking into Gael Tunnel set 32070800, the Magma
+    // Wyrm's defeat flag: the game ran `if (EventFlag(32070800)) DisableCharacter(32070800)` and the
+    // boss never spawned -- and then our own sweep watcher saw the flag flip and paid out that boss's
+    // 6-check sweep. The client killed the boss to unblock its own travel, then rewarded itself.
+    //
+    // NEVER SET A FLAG WHOSE MEANING THE GAME OWNS. There is no "set" branch any more: allow, redirect
+    // the field at a flag we have OBSERVED to be on (zero side effects), or wait -- vanilla blocks here
+    // too, and waiting is correct.
+    let field_on = field > 0 && crate::flags::get_event_flag(field as u32);
     let known_good = KNOWN_GOOD_FLAG.load(Ordering::Relaxed);
     let log_this = LAST_LOGGED_BLOCK.swap(field, Ordering::Relaxed) != field;
 
-    if known_good > 0 {
-        if let Ok(fa) = unsafe { FieldArea::instance_mut() } {
-            fa.enable_fast_travel_event_flag = known_good;
+    match er_logic::fast_travel::gate_action(field, field_on, known_good as u32) {
+        er_logic::fast_travel::GateAction::AllowAndCache(f) => {
+            if KNOWN_GOOD_FLAG.swap(f as i32, Ordering::Relaxed) != f as i32 {
+                log::info!("fast-travel: gate open (field flag {f}) — cached as known-good");
+            }
+            LAST_LOGGED_BLOCK.store(i32::MIN, Ordering::Relaxed);
+        }
+        er_logic::fast_travel::GateAction::RedirectField(f) => {
+            if let Ok(fa) = unsafe { FieldArea::instance_mut() } {
+                fa.enable_fast_travel_event_flag = f as i32;
+                if log_this {
+                    log::info!(
+                        "fast-travel: gate was blocked (field {field}); redirected to known-good flag {f}"
+                    );
+                }
+            }
+        }
+        er_logic::fast_travel::GateAction::Wait => {
             if log_this {
                 log::info!(
-                    "fast-travel: gate was blocked (field {field}); redirected to known-good flag {known_good}"
+                    "fast-travel: gate blocked (field {field}) and no known-good flag observed yet -- WAITING. \
+                     We will not set the field's flag: in a boss dungeon that flag is the boss's defeat \
+                     flag. Travel opens as soon as you reach anywhere it is legitimately allowed."
                 );
             }
         }
+    }
+}
+
+/// Seed the known-good flag from the start graces the client itself sets at spawn -- they are really
+/// on, and pointing the gate field at one is inert. This removes the only case the old destructive
+/// fallback existed for (booting straight into a dungeon with nothing cached).
+pub fn prime_known_good(start_graces: &[u32]) {
+    if KNOWN_GOOD_FLAG.load(Ordering::Relaxed) > 0 {
         return;
     }
-
-    // No known-good flag cached yet this session.
-    if field > 0 {
-        // Best effort: open the flag the field already names. (Only reached before we've ever seen an
-        // allowed state — e.g. booting straight into a dungeon.)
-        crate::flags::set_event_flag(field as u32, true);
-        if log_this {
-            log::info!("fast-travel: gate blocked, no cached flag yet — set field flag {field} on (fallback)");
-        }
-    } else if log_this {
-        log::warn!(
-            "fast-travel: gate blocked with field=0 and no known-good flag cached yet — cannot synthesize a flag; use `!warp 11102950` to escape"
-        );
+    if let Some(f) = er_logic::fast_travel::prime_known_good(start_graces) {
+        KNOWN_GOOD_FLAG.store(f as i32, Ordering::Relaxed);
+        log::info!("fast-travel: primed known-good flag {f} from startGraces (no flag is ever SET)");
     }
 }

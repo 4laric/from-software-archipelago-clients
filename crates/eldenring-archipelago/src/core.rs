@@ -600,6 +600,13 @@ impl shared::Core for Core {
                     region.area_lock_flags.len()
                 );
 
+                // Prime the fast-travel gate's known-good flag from the start graces. The client SETS
+                // these at spawn, so they are really on and pointing the gate field at one is inert.
+                // This removes the only case the old destructive fallback existed for -- booting
+                // straight into a boss dungeon with nothing cached, which used to SET the field's flag
+                // and, in a boss dungeon, that flag is the BOSS'S DEFEAT FLAG (Gael Tunnel, 2026-07-11).
+                crate::fast_travel::prime_known_good(&start.start_graces);
+
                 // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): computed
                 // HERE, inside the closure where `sd` is in scope, then threaded out via the tuple
                 // and assigned below. Defaults to the static set; the seed's bigTicketLocations
