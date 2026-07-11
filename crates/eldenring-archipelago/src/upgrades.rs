@@ -183,19 +183,11 @@ const ROW_ID_MASK: u32 = er_codec::ROW_ID_MASK;
 /// base = row - row%100; level = row%100. Category guard mirrors C++ `WeaponInfo`:
 ///   `(uint32(itemId) & CATEGORY_MASK) != CATEGORY_WEAPON` rejects non-weapons; row range
 ///   `[1_000_000, 90_000_000)` skips system/NPC ids. Weapons are er_codec::CATEGORY_WEAPON (0x0).
-fn decode_weapon_id(full_id: i32) -> Option<(i32, i32)> {
-    // RE-A1 RESOLVED: category test via er_codec constants (CATEGORY_WEAPON == 0x0, CATEGORY_MASK).
-    if er_codec::item_category_of(full_id as u32) != er_codec::CATEGORY_WEAPON {
-        return None;
-    }
-    let row = (full_id as u32 & ROW_ID_MASK) as i32;
-    if !(1_000_000..90_000_000).contains(&row) {
-        return None;
-    }
-    let base = row - (row % REINFORCE_STEP);
-    let level = row % REINFORCE_STEP;
-    Some((base, level))
-}
+// `decode_weapon_id` was a byte-for-byte copy of er_logic::upgrades::decode_weapon_id. Production never
+// called it -- apply_auto_upgrade delegates to er-logic, which uses ITS copy -- so this one existed only
+// to be unit-tested. A tested copy that production does not call is the exact test/prod drift the replay
+// tier exists to kill (CONTRIBUTING: "a green predicate with no production caller is a spec, not a fix").
+// Deleted; the tests below now exercise the one that actually runs.
 
 /// RE-A2 RESOLVED (typed binding): resolve a weapon base id -> (reinforce cap, is_somber).
 /// Cap = length of the `ReinforceParamWeapon` run from `reinforce_type_id() -> i16`; TRACK =
@@ -304,24 +296,8 @@ const SCADU_FRAGMENT_GOODS: u32 = 2_010_000;
 
 /// Cumulative Scadutree Fragments required to REACH each combat-blessing level (index = level 0..20).
 /// Verbatim from C++ `kScaduCum`. Pure data — no RE needed.
-const SCADU_CUM: [i32; 21] = [
-    0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 20, 23, 26, 29, 32, 35, 38, 41, 44, 47, 50,
-];
-
 /// Maximum stored blessing level the game's combat-blessing curve defines (caps the raise-only write).
 const SCADU_MAX_LEVEL: i32 = 20;
-
-/// Map a held-fragment count to a blessing level (0..20). Pure; highest L with frags >= SCADU_CUM[L].
-fn level_for_fragments(frag_qty: i32) -> i32 {
-    let mut level = 0;
-    for l in (0..=20).rev() {
-        if frag_qty >= SCADU_CUM[l as usize] {
-            level = l;
-            break;
-        }
-    }
-    level
-}
 
 /// Scadu writer throttle (~1s, mirrors C++ `s_lastTick`). A stored-byte watchdog doesn't need to run
 /// every frame; this also keeps the bag walk cheap.
@@ -364,13 +340,20 @@ pub fn tick_global_scadu() {
         return;
     };
 
-    // mode 1 (player_only): blessing from held fragments only. mode 2 (scaled): ALSO floor to the DLC
-    // area's expected blessing, so a DLC region unlocked without fragments still meets its enemies'
-    // assumption. Raise-only (via raise_stored_blessing) means the floor and fragments compose as max.
-    let level = if scadu_mode() == 2 {
-        level_for_fragments(frag_qty).max(dlc_blessing_floor_here())
-    } else {
-        level_for_fragments(frag_qty)
+    // THE DECISION lives in er_logic::upgrades::blessing_target (host-tested; see
+    // er-logic/src/scadu_blessing_replay.rs -- the floor over a TIMELINE: enter a DLC region with no
+    // fragments, leave it again, transient bag miss, reconnect, a real higher blessing). Do NOT
+    // re-implement it here: an inline copy is the drift this tier exists to kill.
+    //   mode 1 (player_only) = level from held fragments.
+    //   mode 2 (scaled)      = max(fragments, this region's DLC floor) -- so a DLC region unlocked
+    //                          with no fragments still meets its enemies' assumption. Composing as MAX
+    //                          means collected fragments still count above the floor.
+    let Some(level) = er_logic::upgrades::blessing_target(
+        scadu_mode(),
+        frag_qty,
+        dlc_blessing_floor_here(),
+    ) else {
+        return; // mode off -> never touch the byte
     };
 
     // Read the current stored blessing, then ONLY raise it (never stomp a higher real DLC revere,
@@ -466,31 +449,31 @@ mod tests {
     #[test]
     fn scadu_curve_matches_cpp_table() {
         // Boundary checks against kScaduCum.
-        assert_eq!(level_for_fragments(0), 0);
-        assert_eq!(level_for_fragments(1), 1);
-        assert_eq!(level_for_fragments(2), 1); // 2 frags still level 1 (next is 3)
-        assert_eq!(level_for_fragments(3), 2);
-        assert_eq!(level_for_fragments(49), 19);
-        assert_eq!(level_for_fragments(50), 20);
-        assert_eq!(level_for_fragments(999), 20); // capped at 20
+        assert_eq!(er_logic::upgrades::level_for_fragments(0), 0);
+        assert_eq!(er_logic::upgrades::level_for_fragments(1), 1);
+        assert_eq!(er_logic::upgrades::level_for_fragments(2), 1); // 2 frags still level 1 (next is 3)
+        assert_eq!(er_logic::upgrades::level_for_fragments(3), 2);
+        assert_eq!(er_logic::upgrades::level_for_fragments(49), 19);
+        assert_eq!(er_logic::upgrades::level_for_fragments(50), 20);
+        assert_eq!(er_logic::upgrades::level_for_fragments(999), 20); // capped at 20
     }
 
     #[test]
     fn weapon_id_math() {
         // base/level split for a +7 weapon row (category 0x0 weapon; row 1000007 -> base 1000000, level 7).
-        assert_eq!(decode_weapon_id(1_000_007), Some((1_000_000, 7)));
+        assert_eq!(er_logic::upgrades::decode_weapon_id(1_000_007), Some((1_000_000, 7)));
         // a weapon at +0 decodes to (base, 0).
-        assert_eq!(decode_weapon_id(2_000_000), Some((2_000_000, 0)));
+        assert_eq!(er_logic::upgrades::decode_weapon_id(2_000_000), Some((2_000_000, 0)));
         // out-of-range weapon row ids decode to None.
-        assert_eq!(decode_weapon_id(500), None);
+        assert_eq!(er_logic::upgrades::decode_weapon_id(500), None);
         // a GOODS-category id (category nibble 0x4) is NOT a weapon -> None even if row is in range.
         assert_eq!(
-            decode_weapon_id((er_codec::CATEGORY_GOODS | 2_010_000) as i32),
+            er_logic::upgrades::decode_weapon_id((er_codec::CATEGORY_GOODS | 2_010_000) as i32),
             None
         );
         // a PROTECTOR-category id (nibble 0x1) is rejected too.
         assert_eq!(
-            decode_weapon_id((er_codec::CATEGORY_PROTECTOR | 1_000_000) as i32),
+            er_logic::upgrades::decode_weapon_id((er_codec::CATEGORY_PROTECTOR | 1_000_000) as i32),
             None
         );
     }

@@ -74,6 +74,47 @@ pub fn apply_auto_upgrade(hook: &dyn GameHook, on: bool, full_id: i32) -> i32 {
     (full_id & !(er_codec::ROW_ID_MASK as i32)) | (up & er_codec::ROW_ID_MASK as i32)
 }
 
+/// Cumulative Scadutree Fragments required for each blessing level 0..=20 (vanilla curve).
+pub const SCADU_CUM: [i32; 21] = [
+    0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 20, 23, 26, 29, 32, 35, 38, 41, 44, 47, 50,
+];
+
+/// Held Scadutree Fragments -> blessing level (0..=20). Highest L with `frags >= SCADU_CUM[L]`.
+/// Pure. Was a private copy in the client (`upgrades.rs::level_for_fragments`) with no test.
+pub fn level_for_fragments(frag_qty: i32) -> i32 {
+    let mut level = 0;
+    for l in (0..=SCADU_MAX_LEVEL).rev() {
+        if frag_qty >= SCADU_CUM[l as usize] {
+            level = l;
+            break;
+        }
+    }
+    level
+}
+
+/// THE blessing decision, as one pure function.
+///
+/// `mode`: 0 = off (never write), 1 = player_only (level from held fragments), 2 = scaled (ALSO floor
+/// to the DLC area's expected blessing, so a DLC region you unlock with no fragments still meets its
+/// enemies' assumption). `floor` is the per-region floor for the player's CURRENT play_region -- 0
+/// outside a DLC bucket, so mode 2 is naturally inert in the base game.
+///
+/// Fragments and floor compose as MAX: the floor lifts you to the area's expectation, and collected
+/// fragments still count above it. The caller applies the result raise-only (`raise_stored_blessing`),
+/// so a real, higher DLC blessing is never stomped.
+///
+/// `None` = do not write at all (mode off). This is the decision that shipped ON for every DLC seed on
+/// 2026-07-11 (the option had been frozen OFF, which meant the floor wire was never even emitted and
+/// the client's floor path was dead code) -- it had no test at all until this one.
+pub fn blessing_target(mode: i32, frag_qty: i32, floor: i32) -> Option<i32> {
+    if mode != 1 && mode != 2 {
+        return None;
+    }
+    let from_frags = level_for_fragments(frag_qty);
+    let target = if mode == 2 { from_frags.max(floor) } else { from_frags };
+    Some(target.clamp(0, SCADU_MAX_LEVEL))
+}
+
 /// Raise the stored scadutree blessing to `level` (clamped to `[0, SCADU_MAX_LEVEL]`); never lowers.
 ///   None => PlayerGameData unreachable; Some(None) => already >= target; Some(Some((was, now))) => raised.
 pub fn raise_stored_blessing(hook: &mut dyn GameHook, level: i32) -> Option<Option<(i32, i32)>> {
