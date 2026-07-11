@@ -42,6 +42,8 @@ pub mod tracker;
 pub mod tracker_regions;
 pub mod upgrade_cost;
 pub mod upgrade_cost_replay;
+pub mod config_reload;
+pub mod config_reload_replay;
 pub mod fast_travel;
 pub mod fast_travel_replay;
 pub mod upgrades;

@@ -6,6 +6,7 @@ use std::ffi::c_void;
 
 use windows::Win32::{Foundation::HINSTANCE, System::SystemServices::DLL_PROCESS_ATTACH};
 
+mod config_watch;
 mod contract_gen;
 mod core;
 mod deathlink;

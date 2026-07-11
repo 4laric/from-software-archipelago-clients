@@ -142,7 +142,20 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
     /// password), saves the config, and reconnects. Used by the in-game connect
     /// overlay so a fresh install can be configured without a pre-existing
     /// apconfig.json.
-    pub(crate) fn update_connection_info(
+    /// (url, slot, password) as currently configured -- lets the ER config watcher seed itself with
+    /// what we actually connected with, so its first tick cannot fire a spurious reconnect.
+    pub fn config_snapshot(&self) -> (String, String, Option<String>) {
+        (
+            self.config.url().to_string(),
+            self.config.slot().to_string(),
+            self.config.password().map(|s| s.to_string()),
+        )
+    }
+
+    /// Also used by the ER config hot-reload watcher (eldenring-archipelago::config_watch), so a
+    /// tester can change server/slot by editing apconfig.json instead of fighting the game for input
+    /// (ER has no InputBlocker, so the overlay cannot take focus cleanly).
+    pub fn update_connection_info(
         &mut self,
         url: impl AsRef<str>,
         slot: impl AsRef<str>,

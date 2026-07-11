@@ -607,6 +607,13 @@ impl shared::Core for Core {
                 // and, in a boss dungeon, that flag is the BOSS'S DEFEAT FLAG (Gael Tunnel, 2026-07-11).
                 crate::fast_travel::prime_known_good(&start.start_graces);
 
+                // Seed the config watcher with what we actually connected WITH, so its first tick is a
+                // no-op instead of a spurious reconnect to the very file we booted from.
+                {
+                    let cfg = self.base().config_snapshot();
+                    crate::config_watch::prime(&cfg.0, &cfg.1, cfg.2);
+                }
+
                 // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): computed
                 // HERE, inside the closure where `sd` is in scope, then threaded out via the tuple
                 // and assigned below. Defaults to the static set; the seed's bigTicketLocations
@@ -1695,6 +1702,20 @@ impl shared::Core for Core {
             // Anti-stuck: keep the FieldArea fast-travel gate open so a dungeon/catacomb can never
             // strand the player (SELF-CALIBRATING field overwrite; see fast_travel.rs). Game-thread.
             crate::fast_travel::tick();
+
+            // Config hot-reload: a tester changes server/slot by editing apconfig.json and alt-tabbing
+            // back, instead of fighting the game for input in the overlay (ER has no InputBlocker, so
+            // clicking closes the ER menu and Escape closes the client's window). The decision is
+            // er_logic::config_reload::reload_action -- host-tested: one reconnect per REAL change, no
+            // storm from our own save, and a half-written file never drops a live session.
+            if let Some(next) = crate::config_watch::poll() {
+                if let Err(e) = self
+                    .base_mut()
+                    .update_connection_info(&next.url, &next.slot, next.password.clone())
+                {
+                    log::warn!("config hot-reload: reconnect failed: {e}");
+                }
+            }
             // Region-lock fog-wall visuals (cosmetic marker at locked borders; the KICK reactor,
             // not this, does the blocking). Runs on the game thread (FrameBegin task) so the
             // CSWorldGeomMan::spawn_geometry call is main-thread-safe.
