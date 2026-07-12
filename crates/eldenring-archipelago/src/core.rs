@@ -25,8 +25,8 @@ use crate::hook_impl::{EldenRingHook, ReceiveDispatch};
 /// Tint for hinted lines in the tracker window (matches the overlay's YELLOW, 0xFCE94F).
 const HINT_YELLOW: [f32; 4] = [0.9882, 0.9137, 0.3098, 1.0];
 
-/// Tint for big-ticket (prominent) check lines in the tracker window (soft orange).
-const BIG_TICKET_ORANGE: [f32; 4] = [0.9882, 0.6863, 0.2431, 1.0];
+/// Tint for progression-surface check lines in the tracker window (soft orange).
+const SURFACE_ORANGE: [f32; 4] = [0.9882, 0.6863, 0.2431, 1.0];
 
 /// Dim gray for locked-region headers in the tracker window (mirrors imgui's TextDisabled).
 const LOCKED_GRAY: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
@@ -117,14 +117,14 @@ pub struct Core {
     region_table: HashMap<u64, String>,
     /// Static AP location id -> COARSE region name (in-logic key; "" = always open).
     coarse_table: HashMap<u64, String>,
-    /// Static big-ticket (prominent) location ids -- boss drops, progression, churches, maps.
-    big_ticket: HashSet<u64>,
+    /// The PROGRESSION SURFACE: location ids this world's own progression may occupy (starred).
+    progression_surface: HashSet<u64>,
     /// Static coarse region name -> its lock item name (absent = never locked).
     coarse_lock_items: HashMap<String, String>,
     /// Tracker filter: show only checks whose coarse region is currently accessible.
     tracker_in_logic_only: bool,
-    /// Tracker filter: show only big-ticket (prominent) checks.
-    tracker_big_ticket_only: bool,
+    /// Tracker filter: show only progression-surface checks.
+    tracker_surface_only: bool,
     /// slot_data bossLockItems (mode A, SPEC-boss-lock-tracker.md): parsed boss-defeat trophy defs
     /// (flag -> name/region/boss_ap_id, gate=None for v0.2). METADATA + a defeat-flag watch only —
     /// NOT AP items and NOT new checks; the boss's own boss_ap_id location still fires through the
@@ -302,10 +302,10 @@ impl shared::Core for Core {
             hint_log_watermark: 0,
             region_table: er_logic::tracker_regions::location_region_table(),
             coarse_table: er_logic::tracker_regions::location_coarse_table(),
-            big_ticket: er_logic::tracker_regions::big_ticket_set(),
+            progression_surface: er_logic::tracker_regions::progression_surface_set(),
             coarse_lock_items: er_logic::tracker_regions::coarse_lock_item_table(),
             tracker_in_logic_only: false,
-            tracker_big_ticket_only: false,
+            tracker_surface_only: false,
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
             region_attunement: HashMap::new(),
@@ -743,25 +743,27 @@ impl shared::Core for Core {
                     crate::config_watch::prime(&cfg.0, &cfg.1, cfg.2);
                 }
 
-                // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): computed
-                // HERE, inside the closure where `sd` is in scope, then threaded out via the tuple
-                // and assigned below. Defaults to the static set; the seed's bigTicketLocations
-                // overrides it when present.
-                // THE PROGRESSION SURFACE = what the tracker stars. Big-ticket is RETIRED.
+                // THE PROGRESSION SURFACE = what the tracker stars. Computed HERE, inside the
+                // closure where `sd` is in scope, then threaded out via the tuple and assigned below.
                 //
-                // It was a SECOND list of "important checks", and it disagreed with the first:
-                // big-ticket named {MajorBoss, Remembrance, GreatRune} while the apworld's progression
-                // surface is {Remembrance, Seedtree, Church, Boss, Fragment, Revered}. Intersection:
-                // Remembrance alone. So this tracker starred MajorBoss/GreatRune checks that the
-                // apworld FORBIDS a region Lock from ever occupying -- it pointed the player at checks
-                // the locks could not be on. (Found 2026-07-12 reading a spoiler: killing Malenia paid
-                // out a Smithing Stone [4].)
+                // "Big-ticket" is RETIRED, name and all. It was a SECOND list of "important checks"
+                // that disagreed with the first: it named {MajorBoss, Remembrance, GreatRune} while
+                // the apworld's progression surface is {Remembrance, Seedtree, Church, Boss, Fragment,
+                // Revered}. Intersection: Remembrance alone. So this tracker starred MajorBoss/
+                // GreatRune checks that the apworld FORBIDS a region Lock from ever occupying -- it
+                // pointed the player at checks the locks could not be on. (Found 2026-07-12 reading a
+                // spoiler: killing Malenia paid out a Smithing Stone [4].)
                 //
-                // NOTE THE DELETED FALLBACK. This used to default to tracker_regions::big_ticket_set()
-                // -- the STATIC big-ticket table, i.e. exactly the wrong set -- so a seed missing the
-                // key quietly restored the lie. An empty star set is visibly broken; a wrong one
-                // teaches the player something false. Prefer the visible failure.
-                let big_ticket: std::collections::HashSet<u64> = {
+                // NOTE THE DELETED FALLBACK. There is deliberately NO fall back to the static table
+                // when the key is absent. The static table is the world's DEFAULT surface -- correct
+                // for a default seed, WRONG for any seed that selected a different surface -- so
+                // falling back would silently show a plausible, wrong star set. An empty star set is
+                // visibly broken; a wrong one teaches the player something false. Prefer the visible
+                // failure. (The earlier note here claimed the static table was "exactly the wrong
+                // set". That is no longer true: tools/gen_location_regions.py now bakes the surface
+                // itself, and the two are byte-identical for a default seed. The reasoning above is
+                // why the fallback still stays deleted.)
+                let progression_surface: std::collections::HashSet<u64> = {
                     match sd.get("progressionSurfaceLocations").and_then(|v| v.as_array()) {
                         Some(arr) => arr.iter().filter_map(|x| x.as_u64()).collect(),
                         None => {
@@ -775,7 +777,7 @@ impl shared::Core for Core {
                     }
                 };
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, big_ticket)
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface)
             });
             if let Some((
                 map,
@@ -792,7 +794,7 @@ impl shared::Core for Core {
                 goal_cfg,
                 boss_defs,
                 region_attunement,
-                big_ticket,
+                progression_surface,
             )) = parsed
             {
                 log::info!(
@@ -842,9 +844,9 @@ impl shared::Core for Core {
                     "slot_data parsed: {} region attunement gate(s)",
                     self.region_attunement.len()
                 );
-                // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): assign the
-                // set parsed inside the slot_data closure above (where `sd` was in scope).
-                self.big_ticket = big_ticket;
+                // Assign the progression surface parsed inside the slot_data closure above (where
+                // `sd` was in scope).
+                self.progression_surface = progression_surface;
                 self.slot_data_parsed = true;
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
@@ -2161,10 +2163,10 @@ impl Core {
         self.sent_goal = false;
         self.hints = HintSet::new();
         self.hint_log_watermark = 0;
-        // Configurable big-ticket (SPEC-gf-configurable-big-ticket-20260708): restore the static
-        // default so a new seed without bigTicketLocations does not inherit the prior seed's set
-        // (the parse block re-applies the seed's override).
-        self.big_ticket = er_logic::tracker_regions::big_ticket_set();
+        // Restore the DEFAULT progression surface so a new seed does not inherit the prior seed's
+        // set (the slot_data parse re-applies this seed's own surface, or leaves it empty and stars
+        // nothing -- see the deleted-fallback note there).
+        self.progression_surface = er_logic::tracker_regions::progression_surface_set();
         // Boss-lock mode A: drop the parsed defs AND re-arm the felled-edge state, so the new
         // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
         self.boss_defs.clear();
@@ -2284,7 +2286,7 @@ impl Core {
             &received,
             &self.region_table,
             &self.coarse_table,
-            &self.big_ticket,
+            &self.progression_surface,
             &open_coarse,
             &self.hints,
         );
@@ -2310,22 +2312,22 @@ impl Core {
         let mut open = true;
         // Filter state as locals (the closure stays self-free); written back to self after.
         let mut in_logic_only = self.tracker_in_logic_only;
-        let mut big_ticket_only = self.tracker_big_ticket_only;
+        let mut surface_only = self.tracker_surface_only;
         ui.window("Item Tracker###ap-tracker")
             .size([480.0, 520.0], imgui::Condition::FirstUseEver)
             .opened(&mut open)
             .build(|| {
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 ui.text(format!(
-                    "in-logic: {}/{}   big-ticket: {}/{}",
+                    "in-logic: {}/{}   surface: {}/{}",
                     model.in_logic_done,
                     model.in_logic_total,
-                    model.big_ticket_done,
-                    model.big_ticket_total
+                    model.surface_done,
+                    model.surface_total
                 ));
                 ui.checkbox("in-logic only", &mut in_logic_only);
                 ui.same_line();
-                ui.checkbox("big-ticket only", &mut big_ticket_only);
+                ui.checkbox("progression surface only", &mut surface_only);
                 ui.separator();
                 if model.total == 0 {
                     ui.text_disabled("No location data yet -- connect to a session.");
@@ -2339,10 +2341,10 @@ impl Core {
                         .unchecked
                         .iter()
                         .filter(|u| {
-                            (!in_logic_only || u.in_logic) && (!big_ticket_only || u.big_ticket)
+                            (!in_logic_only || u.in_logic) && (!surface_only || u.on_surface)
                         })
                         .collect();
-                    if (in_logic_only || big_ticket_only) && shown.is_empty() {
+                    if (in_logic_only || surface_only) && shown.is_empty() {
                         continue;
                     }
                     let lock_tag = if region.accessible { "" } else { "  [locked]" };
@@ -2363,7 +2365,7 @@ impl Core {
                         }
                         for u in shown {
                             let name = display_loc(u.location_id);
-                            let star = if u.big_ticket { "* " } else { "" };
+                            let star = if u.on_surface { "* " } else { "" };
                             let line = if u.hinted {
                                 format!("  {star}[hint] {name}")
                             } else {
@@ -2371,8 +2373,8 @@ impl Core {
                             };
                             if u.hinted {
                                 ui.text_colored(HINT_YELLOW, line);
-                            } else if u.big_ticket {
-                                ui.text_colored(BIG_TICKET_ORANGE, line);
+                            } else if u.on_surface {
+                                ui.text_colored(SURFACE_ORANGE, line);
                             } else if !u.in_logic {
                                 ui.text_disabled(line);
                             } else {
@@ -2406,7 +2408,7 @@ impl Core {
                                         Some(key) => format!("  {boss}  felled -- awaiting {key}"),
                                         None => format!("  {boss}  felled"),
                                     };
-                                    ui.text_colored(BIG_TICKET_ORANGE, line);
+                                    ui.text_colored(SURFACE_ORANGE, line);
                                 }
                                 er_logic::boss_felled::BossState::Released => {
                                     ui.text_colored(HINT_YELLOW, format!("  {boss}  released"));
@@ -2456,7 +2458,7 @@ impl Core {
             self.tracker_visible = false;
         }
         self.tracker_in_logic_only = in_logic_only;
-        self.tracker_big_ticket_only = big_ticket_only;
+        self.tracker_surface_only = surface_only;
     }
 
     fn write_save(&self) {

@@ -12,8 +12,8 @@
 //!    same region-lock state that gates kicks; a location's coarse region comes from the injected
 //!    `coarse_of` table (an empty string, or an unknown id, means "always accessible" — a safe
 //!    under-enforcement, matching the apworld's "under-enforce beats wrong-kick" stance).
-//!  - BIG-TICKET: prominent locations (boss drops, progression, churches, maps, seedtrees), fed in
-//!    as a set of ids (`big_ticket`).
+//!  - PROGRESSION SURFACE: the locations this world's own progression may occupy, fed in as a
+//!    set of ids (`surface`). (Was called "big-ticket": a retired concept, see contract.has_class.)
 //!
 //! Hint bookkeeping ([`HintSet`]) is the "option (a)" standing set from the spec: the client feeds
 //! each streamed `Print::Hint` in as a [`HintEntry`]; the set dedups by location id (the server
@@ -102,7 +102,7 @@ pub struct UncheckedLocation {
     /// True when a standing hint names this location (render marked in the checks tree).
     pub hinted: bool,
     /// True for prominent locations (boss drops, progression, churches, maps, seedtrees).
-    pub big_ticket: bool,
+    pub on_surface: bool,
     /// True when this location's coarse region is currently accessible.
     pub in_logic: bool,
 }
@@ -141,9 +141,9 @@ pub struct TrackerModel {
     /// in-logic. Remaining reachable checks = `in_logic_total - in_logic_done`.
     pub in_logic_done: usize,
     pub in_logic_total: usize,
-    /// Big-ticket (prominent) checks: `done` out of `total`.
-    pub big_ticket_done: usize,
-    pub big_ticket_total: usize,
+    /// Progression-surface checks: `done` out of `total`.
+    pub surface_done: usize,
+    pub surface_total: usize,
     /// Cumulative received item names, sorted for a stable items-held panel. The progressive-tier
     /// reduction stays in [`crate::progressive`]; this is the raw feed for it.
     pub received_items: Vec<String>,
@@ -158,7 +158,7 @@ pub struct TrackerModel {
 ///    [`UNKNOWN_REGION`] rather than being dropped.
 ///  - `coarse_of` — injected location->coarse-region lookup (in-logic key). Empty/absent = always
 ///    accessible.
-///  - `big_ticket` — prominent location ids.
+///  - `surface` — the progression-surface location ids (starred in the tracker).
 ///  - `open_coarse_regions` — coarse regions the client currently has open (from region-lock state).
 ///  - `hints` — the standing [`HintSet`]; unchecked locations it names come back `hinted: true`.
 #[allow(clippy::too_many_arguments)]
@@ -168,7 +168,7 @@ pub fn build_tracker_model(
     received_item_names: &HashSet<String>,
     region_of: &HashMap<u64, RegionId>,
     coarse_of: &HashMap<u64, RegionId>,
-    big_ticket: &HashSet<u64>,
+    surface: &HashSet<u64>,
     open_coarse_regions: &HashSet<RegionId>,
     hints: &HintSet,
 ) -> TrackerModel {
@@ -195,18 +195,18 @@ pub fn build_tracker_model(
 
     let mut per_region: BTreeMap<RegionId, RegionRollup> = BTreeMap::new();
     let (mut in_logic_done, mut in_logic_total) = (0usize, 0usize);
-    let (mut big_ticket_done, mut big_ticket_total) = (0usize, 0usize);
+    let (mut surface_done, mut surface_total) = (0usize, 0usize);
 
     for &id in checked_locations {
         let reachable = location_in_logic(id, coarse_of, open_coarse_regions);
-        let prominent = big_ticket.contains(&id);
+        let prominent = surface.contains(&id);
         if reachable {
             in_logic_done += 1;
             in_logic_total += 1;
         }
         if prominent {
-            big_ticket_done += 1;
-            big_ticket_total += 1;
+            surface_done += 1;
+            surface_total += 1;
         }
         let r = rollup(&mut per_region, region_of, id);
         r.done += 1;
@@ -215,12 +215,12 @@ pub fn build_tracker_model(
     }
     for &id in unchecked_locations {
         let reachable = location_in_logic(id, coarse_of, open_coarse_regions);
-        let prominent = big_ticket.contains(&id);
+        let prominent = surface.contains(&id);
         if reachable {
             in_logic_total += 1;
         }
         if prominent {
-            big_ticket_total += 1;
+            surface_total += 1;
         }
         let r = rollup(&mut per_region, region_of, id);
         r.total += 1;
@@ -228,7 +228,7 @@ pub fn build_tracker_model(
         r.unchecked.push(UncheckedLocation {
             location_id: id,
             hinted: hints.is_hinted(id),
-            big_ticket: prominent,
+            on_surface: prominent,
             in_logic: reachable,
         });
     }
@@ -246,8 +246,8 @@ pub fn build_tracker_model(
         total: checked_locations.len() + unchecked_locations.len(),
         in_logic_done,
         in_logic_total,
-        big_ticket_done,
-        big_ticket_total,
+        surface_done,
+        surface_total,
         regions,
         received_items,
     }
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn big_ticket_counts_and_marks() {
+    fn surface_counts_and_marks() {
         let region = region_table(&[(1, "Limgrave"), (2, "Limgrave"), (3, "Limgrave")]);
         let big: HashSet<u64> = [1u64, 3u64].iter().copied().collect();
         let m = build_tracker_model(
@@ -417,13 +417,13 @@ mod tests {
             &HashSet::new(),
             &HintSet::new(),
         );
-        // id 1 (checked) + id 3 (unchecked) are big-ticket => total 2, done 1.
-        assert_eq!((m.big_ticket_done, m.big_ticket_total), (1, 2));
+        // id 1 (checked) + id 3 (unchecked) are on the surface => total 2, done 1.
+        assert_eq!((m.surface_done, m.surface_total), (1, 2));
         let lim = &m.regions[0];
         let u3 = lim.unchecked.iter().find(|u| u.location_id == 3).unwrap();
-        assert!(u3.big_ticket);
+        assert!(u3.on_surface);
         let u2 = lim.unchecked.iter().find(|u| u.location_id == 2).unwrap();
-        assert!(!u2.big_ticket);
+        assert!(!u2.on_surface);
     }
 
     #[test]
@@ -452,13 +452,13 @@ mod tests {
                 UncheckedLocation {
                     location_id: 2,
                     hinted: true,
-                    big_ticket: false,
+                    on_surface: false,
                     in_logic: true
                 },
                 UncheckedLocation {
                     location_id: 3,
                     hinted: false,
-                    big_ticket: false,
+                    on_surface: false,
                     in_logic: true
                 },
             ]
