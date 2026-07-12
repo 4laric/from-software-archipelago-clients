@@ -8,6 +8,11 @@ on:
   # for free on a GitHub runner. Gate the branch people actually push to.
   push:
     branches: [main]
+  # Manual kick. Actions is DISABLED BY DEFAULT ON FORKS and this repo is a fork of
+  # fswap/from-software-archipelago-clients -- so the workflow read as `state: active` while having
+  # literally never run (total_count: 0). Enabled 2026-07-12 after it let three broken builds through
+  # to Alaric in a row. Keep a dispatch trigger so the gate can be re-proved without a dummy commit.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
