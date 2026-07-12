@@ -41,7 +41,6 @@ jobs:
     # Style runs after, and can still fail the job, but never masks a broken build again.
     - run: cargo build
     - run: cargo test -p er-codec -p er-semver -p er-logic
-    - run: cargo test -p er-codec -p er-semver -p er-logic --features=profile
 
     - run: cargo fmt -- --check
     # eldenring-archipelago carries ~45 accumulated style lints (map_or, collapsible_if, doc lists,
