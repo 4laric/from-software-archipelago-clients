@@ -14,10 +14,19 @@
 //! grant for that check is skipped instead (`echo_skip`, consulted by the core receive loop) --
 //! ECHO-DEDUP, 2026-07-03. Bag-add suppression (`should_suppress_sold`) is RETIRED: weapon-slot
 //! purchases bypass the AddItemFunc detour entirely (CTD repro logs), so it could never dedup
-//! them, and nulling a shop bag-add is the crash-adjacent path. WEAPON-category slots are not
-//! rewritten cross-category at all (SHOP_CTD_GUARD in run()); they stay on the preview/foreign
-//! path (vanilla ware sold, echo delivers the reward). Runs once in-world after shop_flags
-//! (stock flags final) + scout-ready.
+//! them, and nulling a shop bag-add is the crash-adjacent path -- and it is now DEAD CODE
+//! (SOLD_SUPPRESS is never populated, so should_suppress_sold always returns false).
+//!
+//! CROSS-TYPE IS OPEN (2026-07-11): SHOP_CTD_GUARD is REMOVED. It used to bail on weapon slots whose
+//! reward was a non-weapon, on a 3x CTD repro from 2026-07-03 -- now believed CONFOUNDED by that same
+//! bag-add nulling, which was live then and is inert now. Not proven (armor->goods also produced a
+//! non-weapon bag-add and never crashed), so this is a deliberate experiment: buy out every shop and
+//! see. If it CTDs, restore the guard in run().
+//!
+//! Because a rewritten slot sells the reward NATIVELY, the AP grant is skipped -- and `apply_auto_upgrade`
+//! lives inside that grant. So the upgrade is BAKED INTO THE SOLD ID (a weapon's reinforce level is part
+//! of its id); otherwise every weapon bought from a shop arrives at +0 with auto_upgrade ON.
+//! Runs once in-world after shop_flags (stock flags final) + scout-ready; idempotent, re-armed on tick.
 
 #![allow(dead_code)]
 
@@ -138,7 +147,6 @@ pub fn run() -> bool {
     // Scan immutably -> plan the rewrites, then apply (avoids holding a row borrow across get_mut).
     let mut plan: Vec<(u32, i32, u8)> = Vec::new(); // (row id, new equipId, equipType)
     let mut echo_skip: HashMap<i64, u32> = HashMap::new(); // AP location -> stock flag (ECHO-DEDUP)
-    let mut weapon_guarded = 0usize;
     for (id, row) in repo.rows::<ShopLineupParam>() {
         let f = row.event_flag_for_stock();
         if f == 0 {
@@ -148,15 +156,31 @@ pub fn run() -> bool {
         let Some(s) = crate::scout_proof::lookup(loc) else { continue };
         let Some(fid) = s.er_sell_id else { continue }; // own-world sellable category only
         let Some(etype) = equip_type_for(fid) else { continue };
-        // SHOP_CTD_GUARD (3x repro 2026-07-03): WEAPON-category slots rewritten to a NON-WEAPON
-        // reward crash the purchase path (Longbow->Tear, Great Arrow->Smithing Stone, Gostoc
-        // arrows->Talisman Pouch); weapon->weapon and armor->goods are fine. Keep those on the
-        // preview/foreign path -- vanilla ware sold, the echo grant delivers the reward.
-        if row.equip_type() == 0 && etype != 0 {
-            weapon_guarded += 1;
-            continue;
-        }
-        let new_eid = er_codec::row_id_of(fid as u32) as i32;
+        // SHOP_CTD_GUARD REMOVED 2026-07-11 (Alaric). It bailed on WEAPON-category slots rewritten to
+        // a NON-WEAPON reward, on a 3x CTD repro from 2026-07-03 (Longbow->Tear, Great Arrow->Smithing
+        // Stone, Gostoc arrows->Talisman Pouch). That repro is now believed CONFOUNDED by the bag-add
+        // nulling that was live at the time: `should_suppress_sold` returned 0 from the AddItemFunc
+        // detour to suppress the native ware, and nulling a shop bag-add is the crash-adjacent path.
+        // It is now DEAD CODE -- SOLD_SUPPRESS is never populated, so should_suppress_sold always
+        // returns false and detour.rs can no longer null a shop add. The crash signature fits: a weapon
+        // slot selling a NON-weapon reward is exactly the case that produces a non-weapon bag-add out of
+        // a weapon purchase, i.e. the one add that could hit the nulling. (weapon->weapon never crashed,
+        // and weapon-slot purchases bypass AddItemFunc entirely -- no add, no null, no crash.)
+        // NOT PROVEN: `armor->goods is fine` also produces a non-weapon bag-add and did not crash, so
+        // the theory has a hole. Opened anyway, deliberately, to settle it: Alaric is buying out every
+        // shop next playtest. If it CTDs, restore the two-line guard here and we have our answer.
+        // AUTO_UPGRADE (fixes the +0 weapon bug Alaric caught 2026-07-11, and opening the guard above
+        // makes it WORSE -- more weapon slots now sell natively). `apply_auto_upgrade` lives inside
+        // detour.rs `grant_full_id`, and ECHO-DEDUP deliberately SKIPS that grant for a rewritten slot
+        // (the game already handed you the item), so a weapon bought from a rewritten slot never passes
+        // through the only code that upgrades it -- it arrives at +0 even with auto_upgrade ON.
+        // A weapon's reinforce level is encoded in its id (base + level), so bake the upgrade into the
+        // id the slot SELLS. The shop then natively hands over an already-upgraded weapon and the grant
+        // path is not needed. Inert when auto_upgrade is off (apply_auto_upgrade is identity).
+        // Re-run on tier change: `run()` is idempotent and the tick re-arms it, so the stock tracks the
+        // player's max reinforce tier as it climbs.
+        let sell_fid = crate::upgrades::apply_auto_upgrade(fid as i32);
+        let new_eid = er_codec::row_id_of(sell_fid as u32) as i32;
         if row.equip_id() != new_eid {
             plan.push((id, new_eid, etype));
         }
@@ -181,7 +205,7 @@ pub fn run() -> bool {
     // unpopulated, so should_suppress_sold() short-circuits false and the detour never nulls
     // a shop bag-add again. Native sale + echo-skip is the whole dedup now.
     log::info!(
-        "shop-sell: rewrote {n} own-world slot(s) to natively sell their reward ({skip_count} echo-skip, {weapon_guarded} weapon-guarded)"
+        "shop-sell: rewrote {n} own-world slot(s) to natively sell their reward ({skip_count} echo-skip, cross-type OPEN, auto_upgrade baked)"
     );
     DONE.store(true, Ordering::Relaxed);
     true
