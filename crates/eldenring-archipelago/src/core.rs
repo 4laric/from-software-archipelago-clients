@@ -664,7 +664,7 @@ impl shared::Core for Core {
                 let gate_warn: Option<String> = None;
                 let start_region = sd.get("startRegion").and_then(|v| v.as_str()).unwrap_or("");
                 log::info!(
-                    "=== ER-AP client {} | contract {versions} (gate {gate:?}) | slot '{name}' ===",
+                    "=== ER-AP client {} | contract {versions} | slot '{name}' ===",
                     crate::game::CLIENT_BUILD
                 );
                 log::info!(
@@ -2498,9 +2498,14 @@ mod tests {
         assert_eq!(their_contract.len(), 8, "contract hash is the 8-char prefix");
 
         // And it is NOT a semver range: the old gate treated it as one and warned on every connect.
-        assert!(
-            er_semver::version_satisfies(env!("CARGO_PKG_VERSION"), real).is_err()
-                || er_logic::version::version_gate(&sd, env!("CARGO_PKG_VERSION")) != Some(true),
+        // (The old gate called er_semver::version_satisfies on `real` and got Err -- but er_semver is not
+        // even a dependency of this crate; it was only ever reachable through the gate that is now gone.
+        // Assert the contract er_logic actually implements instead: a descriptive string is NOT a semver
+        // band, so version_gate must never report a clean PASS on one. That is exactly the bug the old
+        // gate had -- it turned an unparseable input into `false` and warned on every single connect.)
+        assert_ne!(
+            er_logic::version::version_gate(&sd, env!("CARGO_PKG_VERSION")),
+            Some(true),
             "`versions` is a descriptive string, not a semver band -- nothing may gate on it as one"
         );
     }
