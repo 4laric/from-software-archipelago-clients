@@ -69,22 +69,22 @@ pub fn run() -> bool {
 
     let mut n = 0usize;
     for (lot, slots) in roll {
-        // NOTE (Windows build): `ItemLotParamEnemy` is the one symbol I could not verify -- the
-        // eldenring crate is not vendored in the sandbox. If the type/table name differs, fix it here;
-        // everything else mirrors shop_sell exactly. The row layout is 8 parallel slot arrays, and the
-        // fields we write are lotItemId01..08 -- lotItemBasePoint (drop weight) is deliberately NOT
-        // written, so drop rates stay vanilla.
+        // Param naming, settled by the Windows build 2026-07-11:
+        //   table type : eldenring::cs::ItemLotParam_enemy   (snake, not CamelCase)
+        //   row struct : eldenring::param::ITEMLOT_PARAM_ST  (shared with ItemLotParam_map)
+        //   setters    : set_lot_item_id01..08               (NO underscore before the digits)
+        // lotItemBasePoint (the drop WEIGHT) is deliberately NOT written, so drop rates stay vanilla.
         let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(lot) else { continue };
         for (slot, gid) in slots {
             match slot {
-                1 => row.set_lot_item_id_01(gid),
-                2 => row.set_lot_item_id_02(gid),
-                3 => row.set_lot_item_id_03(gid),
-                4 => row.set_lot_item_id_04(gid),
-                5 => row.set_lot_item_id_05(gid),
-                6 => row.set_lot_item_id_06(gid),
-                7 => row.set_lot_item_id_07(gid),
-                8 => row.set_lot_item_id_08(gid),
+                1 => row.set_lot_item_id01(gid),
+                2 => row.set_lot_item_id02(gid),
+                3 => row.set_lot_item_id03(gid),
+                4 => row.set_lot_item_id04(gid),
+                5 => row.set_lot_item_id05(gid),
+                6 => row.set_lot_item_id06(gid),
+                7 => row.set_lot_item_id07(gid),
+                8 => row.set_lot_item_id08(gid),
                 _ => continue,
             }
             n += 1;

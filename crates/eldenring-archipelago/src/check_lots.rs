@@ -95,10 +95,13 @@ pub fn run() -> bool {
 
     let mut n = 0usize;
     for (lot, slots) in blank {
-        // NOTE (Windows build): `ItemLotParamMap` / `ItemLotParamEnemy` and their `set_lot_item_id_0N`
-        // setters are the symbols I could not verify -- the eldenring crate is not vendored in the
-        // sandbox. Fix the names here if they differ; the logic is unaffected. Check lots live in BOTH
-        // tables (map treasure + enemy one-time drops), so we try map first and fall back to enemy.
+        // Param naming, settled by the Windows build 2026-07-11 (the crate is not vendored in the
+        // sandbox, so these were guesses and every one was wrong):
+        //   table type : eldenring::cs::ItemLotParam_map / ItemLotParam_enemy   (snake, not CamelCase)
+        //   row struct : eldenring::param::ITEMLOT_PARAM_ST  -- ONE struct shared by BOTH tables
+        //   setters    : set_lot_item_id01..08               (NO underscore before the digits)
+        // Check lots live in both tables (map treasure + enemy one-time drops); same row struct, so one
+        // setter serves both. Try map, fall back to enemy.
         // Check lots live in BOTH tables (map treasure + enemy one-time drops). Same row struct, so
         // the same setter serves both; try map, fall back to enemy.
         let mut wrote = false;
@@ -129,14 +132,14 @@ pub fn run() -> bool {
 #[inline]
 fn set_slot(row: &mut eldenring::param::ITEMLOT_PARAM_ST, slot: u8, id: i32) {
     match slot {
-        1 => row.set_lot_item_id_01(id),
-        2 => row.set_lot_item_id_02(id),
-        3 => row.set_lot_item_id_03(id),
-        4 => row.set_lot_item_id_04(id),
-        5 => row.set_lot_item_id_05(id),
-        6 => row.set_lot_item_id_06(id),
-        7 => row.set_lot_item_id_07(id),
-        8 => row.set_lot_item_id_08(id),
+        1 => row.set_lot_item_id01(id),
+        2 => row.set_lot_item_id02(id),
+        3 => row.set_lot_item_id03(id),
+        4 => row.set_lot_item_id04(id),
+        5 => row.set_lot_item_id05(id),
+        6 => row.set_lot_item_id06(id),
+        7 => row.set_lot_item_id07(id),
+        8 => row.set_lot_item_id08(id),
         _ => {}
     }
 }

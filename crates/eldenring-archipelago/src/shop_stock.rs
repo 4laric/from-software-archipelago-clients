@@ -86,10 +86,8 @@ pub fn run() -> bool {
         }
         row.set_equip_id(gid);
         row.set_equip_type(etype);
-        // If the crate has no typed `set_value`, replace this line with the raw write below --
-        // shop_flags.rs already uses that technique for eventFlag_forStock at +0x0C:
-        //     let p = ((row as *mut SHOP_LINEUP_PARAM as usize) + VALUE_OFF) as *mut i32;
-        //     unsafe { p.write_unaligned(price) };
+        // `set_value` CONFIRMED to exist by the Windows build 2026-07-11 -- the raw +0x04 write is
+        // not needed (VALUE_OFF is kept only as documentation of the row layout).
         row.set_value(price);
         // sellQuantity stays -1: infinite stock is the whole point.
         n += 1;
