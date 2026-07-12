@@ -29,6 +29,21 @@
 //! for them: a weapon is essentially never farmable, so it lives in the check-only set and cannot eat a
 //! legitimate source.
 //!
+//! ## The popup — why the placeholder is NAMED
+//!
+//! Alaric, playtest 2026-07-12: a check gave `Erdtree Greatshield x1` (the real AP item, correct) and,
+//! beside it, **`[ERROR] x1`**. That is row 8852's acquisition popup: the row was chosen *because* it has
+//! no `GoodsName` FMG entry (that is what proves nothing else references it), and ER renders a nameless
+//! goods row as the literal string `[ERROR]`.
+//!
+//! Nothing was broken — the ware was suppressed, the flag fired, AP granted the item. But `[ERROR]` in a
+//! randomizer reads as a crash, so we name it. `shop_preview.rs` already rewrites GoodsName at runtime via
+//! `fmg_inject::extend_swap_overrides`; the placeholder is one more entry in that same override map.
+//!
+//! We name it rather than ZEROING the lot slot: an empty slot would show no popup at all, but it changes
+//! what the lot *does*, and the acquisition flag firing on an empty pickup is unverified. The popup is
+//! cosmetic; check registration is not. Don't trade a known-good mechanism for a nicer toast.
+//!
 //! Idempotent; re-armed on tick like the other param passes.
 
 #![allow(dead_code)]
@@ -44,6 +59,13 @@ static BLANK: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
 /// The one goods id we hand out at checks and then unconditionally suppress. 0 = feature off.
 static PLACEHOLDER: AtomicI32 = AtomicI32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
+/// FMG naming is a separate latch: it needs the msg repo up, which lands later than the param repo.
+static NAMED: AtomicBool = AtomicBool::new(false);
+
+/// GoodsName FMG category (same constant shop_preview overrides).
+const GOODS_NAME_CAT: u32 = 10;
+/// What the check's placeholder popup says instead of `[ERROR]`.
+const PLACEHOLDER_NAME: &str = "Archipelago Item";
 
 /// The placeholder id, or 0 when the feature is off. Read by detour.rs.
 pub fn placeholder() -> i32 {
@@ -64,6 +86,7 @@ pub fn configure(blank: HashMap<u32, Vec<u8>>, placeholder_goods: i32) {
     *BLANK.lock().unwrap() = Some(blank);
     PLACEHOLDER.store(placeholder_goods, Ordering::Relaxed);
     DONE.store(false, Ordering::Relaxed);
+    NAMED.store(false, Ordering::Relaxed);
     log::info!("check-lots: configured {lots} check lot(s); placeholder goods {placeholder_goods}");
 }
 
@@ -144,7 +167,31 @@ fn set_slot(row: &mut eldenring::param::ITEMLOT_PARAM_ST, slot: u8, id: i32) {
     }
 }
 
+/// Give the placeholder a name so its pickup toast reads "Archipelago Item" and not `[ERROR]`.
+///
+/// Separate from `run()` because it depends on the MSG repo (later than the param repo) and must not
+/// hold the lot rewrite hostage — the rewrite is what makes checks work; this is only the toast.
+/// Returns false while the msg repo is still coming up, so the caller retries next tick.
+pub fn name_placeholder() -> bool {
+    if NAMED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let ph = PLACEHOLDER.load(Ordering::Relaxed);
+    if ph == 0 {
+        NAMED.store(true, Ordering::Relaxed);
+        return true; // feature off — nothing hands out the placeholder
+    }
+    let name: Vec<u16> = PLACEHOLDER_NAME.encode_utf16().collect();
+    if crate::fmg_inject::extend_swap_overrides(GOODS_NAME_CAT, &[(ph as u32, name)]) == 0 {
+        return false; // msg repo / category not up yet
+    }
+    log::info!("check-lots: placeholder goods {ph} named \"{PLACEHOLDER_NAME}\" (was the [ERROR] toast)");
+    NAMED.store(true, Ordering::Relaxed);
+    true
+}
+
 /// Re-arm after a reconnect / new seed.
 pub fn reset() {
     DONE.store(false, Ordering::Relaxed);
+    NAMED.store(false, Ordering::Relaxed);
 }

@@ -1776,6 +1776,10 @@ impl shared::Core for Core {
             let _ = crate::shop_stock::run();
             let _ = crate::enemy_drops::run();
             let _ = crate::check_lots::run();
+            // Cosmetic, and deliberately AFTER the rewrite: names the placeholder so its pickup toast
+            // reads "Archipelago Item" instead of ER's nameless-goods render, `[ERROR]`. Own latch —
+            // the MSG repo comes up later than the param repo and must not stall the rewrite.
+            let _ = crate::check_lots::name_placeholder();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
             let _ = crate::minibaker::run();
