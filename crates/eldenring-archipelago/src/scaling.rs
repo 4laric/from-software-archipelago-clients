@@ -128,6 +128,35 @@ pub fn tick() {
     // player's team and are skipped. (Spirit ashes / Torrent live in `summon_buddy_chr_set` and are
     // never touched here.) The 70xx ladder is a plain stat multiplier, so it scales a `PlayerIns`
     // phantom exactly as it does an enemy `ChrIns`.
+    // OBSERVABILITY FIRST. The hostile-phantom sweep below has never once been seen to fire (Alaric,
+    // 2026-07-12: "we still don't have scaling on npc invaders" -- and his DLL DOES contain this code:
+    // b4ad4e7 is an ancestor of the build he ran). But the only log line here fires when something is
+    // SCALED, so "no invader was present" and "an invader was present and this sweep cannot see it"
+    // produce byte-identical logs. That is why the bug has survived: it is unfalsifiable from a log.
+    //
+    // So census the set. This prints only when the population CHANGES (not per tick), and it answers
+    // the question outright: if an invader is on screen and player_chr_set is empty, they live in some
+    // other WorldChrMan set and this sweep is looking in an empty room. If they are here but skipped,
+    // the team_type test is wrong. One session with an invader now decides it.
+    let mut census: Vec<(u32, i32)> = Vec::new();
+    for p in wcm.player_chr_set.characters() {
+        census.push((p.chr_ins.npc_id, p.chr_ins.team_type as i32));
+    }
+    {
+        use std::sync::Mutex;
+        static LAST: Mutex<Option<Vec<(u32, i32)>>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap();
+        if last.as_ref() != Some(&census) {
+            log::info!(
+                "enemy-scaling: player_chr_set census = {} entr(ies) (player_team={player_team}): {:?} \
+                 -- an NPC invader on screen with an EMPTY census means invaders are NOT in this set",
+                census.len(),
+                census
+            );
+            *last = Some(census);
+        }
+    }
+
     for p in wcm.player_chr_set.characters() {
         let team = p.chr_ins.team_type;
         if team == player_team {
