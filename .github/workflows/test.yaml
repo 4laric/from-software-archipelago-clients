@@ -2,6 +2,12 @@ name: Test
 
 on:
   pull_request:
+  # PUSH GATE (2026-07-11). This used to fire on pull_request ONLY -- and agents push straight to
+  # `main`, so it never ran. Three consecutive Windows build round-trips were burned on symbol names
+  # (ItemLotParam_map, ITEMLOT_PARAM_ST, set_lot_item_id01..08) that this workflow would have caught
+  # for free on a GitHub runner. Gate the branch people actually push to.
+  push:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
