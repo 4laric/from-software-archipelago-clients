@@ -480,6 +480,20 @@ impl shared::Core for Core {
                     sd.pointer("/options/flatten_regular_upgrades").and_then(|v| v.as_i64()).unwrap_or(0),
                 );
                 let map = i64_map(sd.get("apIdsToItemIds"));
+                // The GOODS rows this seed can actually GRANT. shop_icon / shop_preview must never
+                // repaint one of these: EquipParamGoods.iconId and the GoodsName FMG entry are SHARED
+                // per good id, so flowering the vanilla ware behind a shop slot re-icons and renames
+                // EVERY copy the player will ever hold -- 11 vanilla shop rows sell smithing stones,
+                // which is why the 2026-07-12 playtest had telescope-icon stones in the world AND in
+                // the inventory. Both modules fail CLOSED until this arrives.
+                let real_goods: std::collections::HashSet<u32> = map
+                    .values()
+                    .map(|v| *v as u32)
+                    .filter(|full| er_codec::item_category_of(*full) == er_codec::CATEGORY_GOODS)
+                    .map(er_codec::row_id_of)
+                    .collect();
+                crate::shop_icon::set_real_goods(real_goods.clone());
+                crate::shop_preview::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
                 let region = crate::region::parse(sd);
                 let fogwall = crate::fogwall::parse(sd);
@@ -593,20 +607,51 @@ impl shared::Core for Core {
                 // by the FLAG POLL, not by the pickup id.
                 {
                     let ph = sd.get("apPlaceholderGoods").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                    let mut blank: std::collections::HashMap<u32, Vec<u8>> =
-                        std::collections::HashMap::new();
-                    if let Some(m) = sd.get("checkLotBlank").and_then(|v| v.as_object()) {
-                        for (k, v) in m {
-                            let (Ok(lot), Some(a)) = (k.parse::<u32>(), v.as_array()) else { continue };
-                            let slots: Vec<u8> =
-                                a.iter().filter_map(|x| x.as_i64()).map(|x| x as u8).collect();
-                            if !slots.is_empty() {
-                                blank.insert(lot, slots);
+                    // TWO tables, kept apart. ItemLotParam_map and ItemLotParam_enemy can hold the
+                    // SAME row id, so a merged dict loses the table and the client has to guess. It
+                    // guessed map-first -- and every enemy lot colliding with a map id was therefore
+                    // never blanked, so a boss that is "just an enemy" handed out its vanilla drop and
+                    // fired no check. The apworld knows which CSV each lot came from; it now says so.
+                    let parse_lots = |key: &str| -> std::collections::HashMap<u32, Vec<u8>> {
+                        let mut out = std::collections::HashMap::new();
+                        if let Some(m) = sd.get(key).and_then(|v| v.as_object()) {
+                            for (k, v) in m {
+                                let (Ok(lot), Some(a)) = (k.parse::<u32>(), v.as_array()) else {
+                                    continue;
+                                };
+                                let slots: Vec<u8> =
+                                    a.iter().filter_map(|x| x.as_i64()).map(|x| x as u8).collect();
+                                if !slots.is_empty() {
+                                    out.insert(lot, slots);
+                                }
                             }
                         }
+                        out
+                    };
+                    let mut blank_map = parse_lots("checkLotBlankMap");
+                    let mut blank_enemy = parse_lots("checkLotBlankEnemy");
+                    if blank_map.is_empty() && blank_enemy.is_empty() {
+                        // LEGACY: an apworld whose check_lots_data.py predates the map/enemy split. It
+                        // ships one merged dict keyed by lot id alone, so the table is unknown. Send it
+                        // to BOTH -- check_lots only writes a lot where the row actually EXISTS, so a
+                        // map-only id lands in map and an enemy-only id lands in enemy, reproducing the
+                        // old behaviour. A COLLIDING id gets blanked in both, which is the old bug's
+                        // blast radius inverted (it used to under-blank; now it over-blanks) -- and that
+                        // is precisely why the apworld must send the table. Loud, not silent.
+                        let legacy = parse_lots("checkLotBlank");
+                        if !legacy.is_empty() {
+                            log::warn!(
+                                "check-lots: apworld sent the LEGACY merged checkLotBlank (no map/enemy \
+                                 split). The param table each lot belongs to is unknown, so bosses that \
+                                 are 'just an enemy' may still hand out their vanilla drop. Regenerate \
+                                 the apworld (python greenfield/gen_data.py)."
+                            );
+                            blank_map = legacy.clone();
+                            blank_enemy = legacy;
+                        }
                     }
-                    if ph != 0 && !blank.is_empty() {
-                        crate::check_lots::configure(blank, ph);
+                    if ph != 0 && !(blank_map.is_empty() && blank_enemy.is_empty()) {
+                        crate::check_lots::configure(blank_map, blank_enemy, ph);
                     }
                 }
                 crate::shop_sell::configure(loc_flags.clone());
@@ -702,12 +747,32 @@ impl shared::Core for Core {
                 // HERE, inside the closure where `sd` is in scope, then threaded out via the tuple
                 // and assigned below. Defaults to the static set; the seed's bigTicketLocations
                 // overrides it when present.
-                let big_ticket = {
-                    let mut bt = er_logic::tracker_regions::big_ticket_set();
-                    if let Some(arr) = sd.get("bigTicketLocations").and_then(|v| v.as_array()) {
-                        bt = arr.iter().filter_map(|x| x.as_u64()).collect();
+                // THE PROGRESSION SURFACE = what the tracker stars. Big-ticket is RETIRED.
+                //
+                // It was a SECOND list of "important checks", and it disagreed with the first:
+                // big-ticket named {MajorBoss, Remembrance, GreatRune} while the apworld's progression
+                // surface is {Remembrance, Seedtree, Church, Boss, Fragment, Revered}. Intersection:
+                // Remembrance alone. So this tracker starred MajorBoss/GreatRune checks that the
+                // apworld FORBIDS a region Lock from ever occupying -- it pointed the player at checks
+                // the locks could not be on. (Found 2026-07-12 reading a spoiler: killing Malenia paid
+                // out a Smithing Stone [4].)
+                //
+                // NOTE THE DELETED FALLBACK. This used to default to tracker_regions::big_ticket_set()
+                // -- the STATIC big-ticket table, i.e. exactly the wrong set -- so a seed missing the
+                // key quietly restored the lie. An empty star set is visibly broken; a wrong one
+                // teaches the player something false. Prefer the visible failure.
+                let big_ticket: std::collections::HashSet<u64> = {
+                    match sd.get("progressionSurfaceLocations").and_then(|v| v.as_array()) {
+                        Some(arr) => arr.iter().filter_map(|x| x.as_u64()).collect(),
+                        None => {
+                            log::warn!(
+                                "slot_data has no progressionSurfaceLocations: the tracker will star \
+                                 NOTHING. (Old apworld? bigTicketLocations is retired -- it named a \
+                                 set progression could never reach.)"
+                            );
+                            std::collections::HashSet::new()
+                        }
                     }
-                    bt
                 };
 
                 (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, big_ticket)
@@ -1820,10 +1885,11 @@ impl shared::Core for Core {
             let _ = crate::shop_stock::run();
             let _ = crate::enemy_drops::run();
             let _ = crate::check_lots::run();
-            // Cosmetic, and deliberately AFTER the rewrite: names the placeholder so its pickup toast
-            // reads "Archipelago Item" instead of ER's nameless-goods render, `[ERROR]`. Own latch —
-            // the MSG repo comes up later than the param repo and must not stall the rewrite.
-            let _ = crate::check_lots::name_placeholder();
+            // Cosmetic, and deliberately AFTER the rewrite: dresses the placeholder (AP flower
+            // iconId + "Archipelago Item" + caption) so its pickup toast is not ER's nameless-goods
+            // render, `[ERROR]`. Own latch — the MSG repo comes up later than the param repo and
+            // must not stall the rewrite.
+            let _ = crate::check_lots::dress_placeholder();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
             let _ = crate::minibaker::run();
@@ -2011,6 +2077,7 @@ impl Core {
                         .map(|&g| (g as i32) | er_logic::progressive::GOODS_FULLID)
                         .collect(),
                     flags: t.flags.clone(),
+                    consumed: t.consumed,
                 })
                 .collect();
             return ItemSemantics::Progressive {

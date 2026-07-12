@@ -365,10 +365,12 @@ mod replay {
             ProgTier {
                 goods: vec![8101],
                 flags: vec![70001],
+                consumed: false,
             },
             ProgTier {
                 goods: vec![8102],
                 flags: vec![70002],
+                consumed: false,
             },
         ];
         let received: Vec<ReceivedItem> = (0..3i64)

@@ -22,9 +22,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// EquipParamGoods row id of the Telescope — the iconId me3's flower texture overrides. Read live.
 const TELESCOPE_GOOD_ID: u32 = 2040;
 
+/// ER GOODS row ids the seed can actually GRANT the player (derived from apIdsToItemIds).
+/// Repainting one of these is identity theft: `set_icon_id` writes the SHARED EquipParamGoods row, so
+/// flowering a shop slot whose vanilla ware is a Smithing Stone [1] re-icons EVERY Smithing Stone [1]
+/// in the game -- inventory, world pickups, other shops. 11 vanilla shop rows sell smithing stones.
+/// (Alaric, playtest 2026-07-12: "the injected smithing stones are using telescope icon" -- both in
+/// the world AND in the inventory. Both halves were this write.)
+static REAL_GOODS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
 static CONFIGURED: Mutex<Vec<(i64, i32)>> = Mutex::new(Vec::new());
 static CONFIGURED_SET: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
+
+/// The goods the seed can grant. Set from core once apIdsToItemIds is parsed; until it is, we refuse
+/// to flower anything (see `run`) rather than risk the global write.
+pub fn set_real_goods(rows: HashSet<u32>) {
+    log::info!(
+        "shop-icon: {} real goods row(s) protected from the global icon write",
+        rows.len()
+    );
+    *REAL_GOODS.lock().unwrap() = Some(rows);
+}
 
 pub fn configure(pairs: Vec<(i64, i32)>) {
     log::info!("shop-icon: configured {} shop slot(s)", pairs.len());
@@ -42,6 +60,12 @@ pub fn run() -> bool {
     if !crate::scout_proof::cache_ready() {
         return false; // need the scout cache to tell own-world from foreign
     }
+    // Fail CLOSED. Without the protected set we cannot tell a shop-only curio from a Smithing Stone,
+    // and guessing wrong corrupts a real item globally and permanently for the run. Wait instead.
+    let real: HashSet<u32> = match REAL_GOODS.lock().unwrap().clone() {
+        Some(r) => r,
+        None => return false,
+    };
     let pairs = CONFIGURED.lock().unwrap().clone();
     if pairs.is_empty() {
         DONE.store(true, Ordering::Relaxed);
@@ -56,7 +80,7 @@ pub fn run() -> bool {
         Some(row) => row.icon_id(),
         None => return false, // telescope row absent — retry
     };
-    let (mut flower, mut native) = (0u32, 0u32);
+    let (mut flower, mut native, mut protected) = (0u32, 0u32, 0u32);
     let mut seen: HashSet<u32> = HashSet::new();
     for (loc, good) in pairs {
         // Own-world sellable rewards display natively (shop_sell rewrote the slot) -> nothing to flower.
@@ -83,6 +107,16 @@ pub fn run() -> bool {
         if !seen.insert(gid) {
             continue; // dedup
         }
+        // THE GUARD. set_icon_id writes the shared EquipParamGoods row, so this is global and
+        // permanent for the run. If the player can be granted this good, flowering it repaints every
+        // copy they will ever hold. Leave the slot showing its vanilla ware instead: a shop slot that
+        // lies about ONE reward is a local, reversible annoyance; a smithing-stone economy that has
+        // been renamed and re-iconed is not. (Restoring an honest preview for these slots needs the
+        // row itself repointed at a placeholder good -- see the shop-placeholder follow-up.)
+        if real.contains(&gid) {
+            protected += 1;
+            continue;
+        }
         if let Some(row) = repo.get_mut::<EquipParamGoods>(gid) {
             if row.icon_id() != tele_icon {
                 row.set_icon_id(tele_icon);
@@ -91,7 +125,9 @@ pub fn run() -> bool {
         flower += 1;
     }
     log::info!(
-        "shop-icon: {flower} foreign/gem slot(s) flowered, {native} own-world handled by shop_sell (telescope iconId {tele_icon})"
+        "shop-icon: {flower} foreign/gem slot(s) flowered, {native} own-world handled by shop_sell, \
+         {protected} slot(s) LEFT VANILLA because their ware is a real item this seed can grant \
+         (flowering it would re-icon every copy globally) (telescope iconId {tele_icon})"
     );
     DONE.store(true, Ordering::Relaxed);
     true

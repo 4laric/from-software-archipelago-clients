@@ -64,7 +64,17 @@ pub struct SaveIdentity(pub String);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProgTier {
     pub goods: Vec<GoodsId>,
+    /// Observable rung flags: set-only + self-healing for OWNED and CONSUMED tiers alike (flags
+    /// are observable state, not inventory).
     pub flags: Vec<FlagId>,
+    /// `true` = this rung's goods are CONSUMED by the player (spent at a grace, e.g. the
+    /// flask-upgrade ladder's Golden Seeds / Sacred Tears): granted exactly ONCE via the ledger,
+    /// keyed by the copy's stream index — exactly like overflow. Presence-diffing a spendable
+    /// good re-grants it every time it leaves the inventory (upgrade -> re-grant -> upgrade ->
+    /// ... until flask potency runs past its cap and the game CTDs — the 2026-07-12 live crash).
+    /// `false` (the default) = OWNED (stone bell bearings): a `unique_goods` entry that
+    /// self-heals when lost.
+    pub consumed: bool,
 }
 
 /// The variants are the whole point of the design: a map piece is a [`MapReveal`](Self::MapReveal)
@@ -337,9 +347,11 @@ impl DesiredState {
 
         // 3) PROGRESSIVE: fold each NAME's received copies into landed tiers. Grouping by name and
         //    sorting by stream index makes this a pure function of the received multiset: tiers
-        //    0..min(count, tiers.len()) contribute their unique goods + observable flags, and every
+        //    0..min(count, tiers.len()) contribute their goods + observable flags, and every
         //    copy past the last tier contributes ONE ledgered overflow consumable (keyed by its own
-        //    index, so a reconnect re-grants none of them). Tier flags/goods self-heal set-only; they
+        //    index, so a reconnect re-grants none of them). An OWNED rung's goods self-heal via
+        //    `unique_goods`; a CONSUMED rung's goods are spendable and land in the ledger instead
+        //    (granted once by stream index, like overflow). Tier flags self-heal set-only; they
         //    are never OWNED (never cleared), like key-item obtained flags.
         let mut prog: BTreeMap<&str, (&Vec<ProgTier>, GoodsId, Vec<ItemIndex>)> = BTreeMap::new();
         for it in &inputs.received {
@@ -358,9 +370,28 @@ impl DesiredState {
             idxs.sort_unstable();
             for (pos, idx) in idxs.iter().enumerate() {
                 if let Some(t) = tiers.get(pos) {
-                    for &g in &t.goods {
-                        d.unique_goods.entry(g).or_default();
+                    if t.consumed {
+                        // CONSUMED rung: the player SPENDS these goods, so a `unique_goods`
+                        // presence-diff would resurrect them after every spend (the flask-CTD
+                        // loop). Ledgered instead — granted exactly once, keyed by this copy's
+                        // stream index, exactly like overflow below. NOTE: the ledger watermark
+                        // protocol assumes at most one entry per index; the slot_data contract
+                        // carries ONE goods id per consumed rung, which preserves that.
+                        for &g in &t.goods {
+                            d.ledgered.push(LedgeredGrant {
+                                index: *idx,
+                                full_id: g,
+                                qty: 1,
+                                apply: true,
+                            });
+                        }
+                    } else {
+                        for &g in &t.goods {
+                            d.unique_goods.entry(g).or_default();
+                        }
                     }
+                    // Rung flags are observable state (not inventory): set-only + self-healing
+                    // for BOTH owned and consumed rungs.
                     for &f in &t.flags {
                         d.flags.insert(f, true);
                     }
@@ -1201,11 +1232,46 @@ mod tests {
                     .map(|(g, f)| ProgTier {
                         goods: g.to_vec(),
                         flags: f.to_vec(),
+                        consumed: false,
                     })
                     .collect(),
                 overflow_full_id: overflow,
             },
         }
+    }
+
+    /// A received copy of a progressive item whose ladder mixes OWNED and CONSUMED rungs
+    /// (per-rung `consumed` in the third tuple slot).
+    fn progressive_mixed(
+        index: ItemIndex,
+        name: &str,
+        tiers: &[(&[GoodsId], &[FlagId], bool)],
+        overflow: GoodsId,
+    ) -> ReceivedItem {
+        ReceivedItem {
+            index,
+            name: name.into(),
+            semantics: ItemSemantics::Progressive {
+                tiers: tiers
+                    .iter()
+                    .map(|(g, f, c)| ProgTier {
+                        goods: g.to_vec(),
+                        flags: f.to_vec(),
+                        consumed: *c,
+                    })
+                    .collect(),
+                overflow_full_id: overflow,
+            },
+        }
+    }
+
+    /// The flask-upgrade ladder shape from the live CTD: every rung a CONSUMED good (Golden
+    /// Seed / Sacred Tear) plus an observable rung flag.
+    fn flask_tiers() -> Vec<(&'static [GoodsId], &'static [FlagId], bool)> {
+        vec![
+            (&[10010][..], &[71001][..], true),
+            (&[10020][..], &[71002][..], true),
+        ]
     }
 
     /// A two-tier progressive bell used across the progressive tests.
@@ -1872,6 +1938,244 @@ mod tests {
             g.ledger_count(2919),
             1,
             "no second overflow grant after reload"
+        );
+    }
+
+    // ---- CONSUMED progressive tiers (the flask-upgrade CTD, 2026-07-12) -------------------
+    //
+    // A rung with `consumed: true` grants goods the player SPENDS (Golden Seed / Sacred Tear at
+    // a Site of Grace). Presence-diffing them (`unique_goods`) re-granted them the instant they
+    // left the inventory: upgrade -> re-grant -> upgrade -> ... until flask potency ran past its
+    // cap and the game crashed. Consumed rungs are LEDGERED (granted exactly once, keyed by the
+    // copy's stream index) exactly like overflow; OWNED rungs (no `consumed`) keep self-healing.
+
+    #[test]
+    fn consumed_tier_is_ledgered_never_a_unique_good() {
+        let tiers = flask_tiers();
+        let d = DesiredState::build(&inputs(
+            "A",
+            vec![
+                progressive_mixed(3, "Progressive Flask Upgrade", &tiers, 2919),
+                progressive_mixed(7, "Progressive Flask Upgrade", &tiers, 2919),
+            ],
+            vec![],
+        ));
+        assert!(
+            d.unique_goods.is_empty(),
+            "a consumed rung must NEVER become a self-healing unique good"
+        );
+        let got: Vec<_> = d
+            .ledgered
+            .iter()
+            .map(|l| (l.index, l.full_id, l.qty, l.apply))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(3, 10010, 1, true), (7, 10020, 1, true)],
+            "each consumed rung is ledgered once, keyed by ITS copy's stream index"
+        );
+        assert_eq!(
+            d.flags.get(&71001),
+            Some(&true),
+            "rung flags stay observable + self-healing"
+        );
+        assert_eq!(d.flags.get(&71002), Some(&true));
+        assert!(
+            !d.owned_flags.contains(&71001),
+            "rung flags set-only, never owned"
+        );
+    }
+
+    #[test]
+    fn consumed_tier_grants_once_and_stays_spent_after_consumption() {
+        // THE CTD, expressed as a test. Pre-fix, the rung goods sat in `unique_goods`, so every
+        // spend was "healed" back -- this test fails on that code (ledger_count is 0 there, and
+        // the spent good resurrects).
+        let tiers = flask_tiers();
+        let items = vec![
+            progressive_mixed(0, "Progressive Flask Upgrade", &tiers, 2919),
+            progressive_mixed(1, "Progressive Flask Upgrade", &tiers, 2919),
+        ];
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", items, vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert_eq!(
+            g.ledger_count(10010),
+            1,
+            "rung 0 granted exactly once, via the ledger"
+        );
+        assert_eq!(
+            g.ledger_count(10020),
+            1,
+            "rung 1 granted exactly once, via the ledger"
+        );
+        assert!(g.get_flag(71001) && g.get_flag(71002), "rung flags set");
+
+        // The player spends both at a grace. (Under the fix the goods are never presence-tracked;
+        // under the bug they were unique_goods, so dropping models the upgrade spend.)
+        g.drop_good(10010);
+        g.drop_good(10020);
+        for _ in 0..3 {
+            r.mark_dirty();
+            r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+            assert!(
+                !g.has_good(10010) && !g.has_good(10020),
+                "a SPENT consumed rung good must STAY spent -- re-granting it is the flask-CTD loop"
+            );
+        }
+        assert_eq!(g.ledger_count(10010), 1, "no re-grant after the spend");
+        assert_eq!(g.ledger_count(10020), 1, "no re-grant after the spend");
+    }
+
+    #[test]
+    fn consumed_tier_not_regranted_on_reconnect_or_resnapshot() {
+        let tiers = flask_tiers();
+        let items = vec![
+            progressive_mixed(0, "Progressive Flask Upgrade", &tiers, 2919),
+            progressive_mixed(1, "Progressive Flask Upgrade", &tiers, 2919),
+        ];
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", items.clone(), vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert_eq!(g.ledger_count(10010), 1);
+        assert_eq!(g.ledger_count(10020), 1);
+
+        // Same-seed re-snapshot (a reconnect replaying the stream): the watermark is kept, so
+        // nothing re-grants.
+        r.set_inputs(inputs("A", items.clone(), vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert_eq!(
+            g.ledger_count(10010),
+            1,
+            "re-snapshot must not re-grant a consumed rung"
+        );
+        assert_eq!(g.ledger_count(10020), 1);
+
+        // Full reload: a NEW reconciler resumed from the persisted watermark re-grants none.
+        let wm = r.applied_watermark();
+        let mut r2 = Reconciler::from_persisted(inputs("A", items, vec![]), wm);
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert_eq!(
+            g.ledger_count(10010),
+            1,
+            "reload must not re-grant a consumed rung"
+        );
+        assert_eq!(g.ledger_count(10020), 1);
+    }
+
+    #[test]
+    fn owned_tier_still_self_heals_after_loss() {
+        // Regression guard for the stone bell bearings: a ladder WITHOUT `consumed` keeps
+        // today's `unique_goods` semantics exactly -- a bearing lost to a save-scum comes back.
+        let tiers = bell_tiers();
+        let items = vec![
+            progressive(0, "progressive_stone_bell", &tiers, 2919),
+            progressive(1, "progressive_stone_bell", &tiers, 2919),
+        ];
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", items, vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert!(g.has_good(8101) && g.has_good(8102));
+
+        g.drop_good(8101);
+        r.mark_dirty();
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert!(
+            g.has_good(8101),
+            "an OWNED tier good must self-heal when lost (bell bearings)"
+        );
+        assert!(
+            g.ledger_log.is_empty(),
+            "owned rungs never touch the ledger"
+        );
+    }
+
+    #[test]
+    fn mixed_ladder_routes_each_rung_by_its_own_consumed_flag() {
+        // rung 0 OWNED bell bearing, rung 1 CONSUMED golden seed, copy 2 overflows.
+        let tiers: Vec<(&[GoodsId], &[FlagId], bool)> = vec![
+            (&[8101][..], &[70001][..], false),
+            (&[10010][..], &[71001][..], true),
+        ];
+        let items = vec![
+            progressive_mixed(0, "Progressive Mixed", &tiers, 2919),
+            progressive_mixed(1, "Progressive Mixed", &tiers, 2919),
+            progressive_mixed(2, "Progressive Mixed", &tiers, 2919),
+        ];
+        let d = DesiredState::build(&inputs("A", items.clone(), vec![]));
+        assert_eq!(
+            d.unique_goods.len(),
+            1,
+            "only the OWNED rung is a unique good"
+        );
+        assert!(d.unique_goods.contains_key(&8101));
+        assert_eq!(
+            d.ledgered
+                .iter()
+                .map(|l| (l.index, l.full_id))
+                .collect::<Vec<_>>(),
+            vec![(1, 10010), (2, 2919)],
+            "consumed rung + overflow both ledgered at their own stream indices"
+        );
+
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", items.clone(), vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert!(g.has_good(8101));
+        assert_eq!(g.ledger_count(10010), 1);
+        assert_eq!(
+            g.ledger_count(2919),
+            1,
+            "overflow unchanged alongside consumed rungs"
+        );
+
+        // Per-rung semantics: the bearing self-heals; the spent seed stays spent.
+        g.drop_good(8101);
+        g.drop_good(10010); // no-op under the fix (never presence-tracked); the BUG resurrected it
+        r.mark_dirty();
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert!(g.has_good(8101), "owned rung self-heals");
+        assert!(!g.has_good(10010), "consumed rung stays spent");
+        assert_eq!(g.ledger_count(10010), 1);
+
+        // Reload from the persisted watermark: neither the seed nor the overflow re-grants.
+        let wm = r.applied_watermark();
+        let mut r2 = Reconciler::from_persisted(inputs("A", items, vec![]), wm);
+        r2.run_to_fixpoint(&mut g, TickBudget::default(), 16);
+        assert_eq!(g.ledger_count(10010), 1);
+        assert_eq!(g.ledger_count(2919), 1);
+    }
+
+    #[test]
+    fn consumed_ladder_desired_is_order_independent() {
+        // Same invariant the owned ladder pins: desired is a pure function of the received
+        // multiset, so consumed rungs land at the same (index, full_id) pairs in any order.
+        let tiers = flask_tiers();
+        let a = DesiredState::build(&inputs(
+            "A",
+            vec![
+                progressive_mixed(0, "Progressive Flask Upgrade", &tiers, 2919),
+                progressive_mixed(1, "Progressive Flask Upgrade", &tiers, 2919),
+                progressive_mixed(2, "Progressive Flask Upgrade", &tiers, 2919),
+            ],
+            vec![],
+        ));
+        let b = DesiredState::build(&inputs(
+            "A",
+            vec![
+                progressive_mixed(2, "Progressive Flask Upgrade", &tiers, 2919),
+                progressive_mixed(0, "Progressive Flask Upgrade", &tiers, 2919),
+                progressive_mixed(1, "Progressive Flask Upgrade", &tiers, 2919),
+            ],
+            vec![],
+        ));
+        assert_eq!(a, b, "consumed-ladder desired state is order-independent");
+        assert_eq!(
+            a.ledgered
+                .iter()
+                .map(|l| (l.index, l.full_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 10010), (1, 10020), (2, 2919)]
         );
     }
 
