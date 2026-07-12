@@ -529,6 +529,29 @@ impl shared::Core for Core {
                         .collect(),
                 );
                 crate::shop_flags::configure_check_flags(loc_flags.values().copied().collect());
+
+                // shopInfiniteStock: {"<row id>": [goodsId, equipType, price]} -- the per-seed reroll of
+                // the 455 UNLIMITED rows (no stock flag => never checks). The PRICE rides along because
+                // those rows inherit the old ware's cost (gem slots = 1 rune, 166 armor rows FREE);
+                // without it every seed is a free-consumable dispenser.
+                {
+                    let mut roll: std::collections::HashMap<u32, (i32, u8, i32)> =
+                        std::collections::HashMap::new();
+                    if let Some(m) = sd.get("shopInfiniteStock").and_then(|v| v.as_object()) {
+                        for (k, v) in m {
+                            let (Ok(row), Some(a)) = (k.parse::<u32>(), v.as_array()) else { continue };
+                            if a.len() < 3 {
+                                continue;
+                            }
+                            let (Some(gid), Some(et), Some(pr)) =
+                                (a[0].as_i64(), a[1].as_i64(), a[2].as_i64()) else { continue };
+                            roll.insert(row, (gid as i32, et as u8, pr as i32));
+                        }
+                    }
+                    if !roll.is_empty() {
+                        crate::shop_stock::configure(roll);
+                    }
+                }
                 crate::shop_sell::configure(loc_flags.clone());
                 crate::shop_preview::configure(preview.clone());
                 crate::shop_icon::configure(preview);
@@ -1695,6 +1718,7 @@ impl shared::Core for Core {
             let _ = crate::shop_flags::run(&[]);
             let _ = crate::upgrade_cost::maybe_apply();
             let _ = crate::shop_sell::run();
+            let _ = crate::shop_stock::run();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
             let _ = crate::minibaker::run();

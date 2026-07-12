@@ -34,6 +34,7 @@ mod shop_flags;
 mod shop_icon;
 mod shop_preview;
 mod shop_sell;
+mod shop_stock;
 mod startgrants;
 mod upgrade_cost;
 mod upgrades;
