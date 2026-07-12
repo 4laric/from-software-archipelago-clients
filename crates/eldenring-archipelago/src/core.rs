@@ -1504,7 +1504,7 @@ impl shared::Core for Core {
                         self.valid_locations.contains(&m) && client.is_local_location_checked(m)
                     };
                     for (region, att) in &self.region_attunement {
-                        let count = er_logic::attunement::attuned_count(&att.members, &mut checked);
+                        let count = er_logic::attunement::attuned_count(&att.members, &checked);
                         att_state.insert(
                             region.clone(),
                             (count, att.threshold, count >= att.threshold),
