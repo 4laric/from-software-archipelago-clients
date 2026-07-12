@@ -152,6 +152,8 @@ pub fn run() -> bool {
     };
 
     let mut n = 0usize;
+    let (mut hit_map, mut hit_enemy) = (0usize, 0usize);
+    let (mut suspect, mut missed): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     for (lot, slots) in blank {
         // Param naming, settled by the Windows build 2026-07-11 (the crate is not vendored in the
         // sandbox, so these were guesses and every one was wrong):
@@ -162,6 +164,22 @@ pub fn run() -> bool {
         // setter serves both. Try map, fall back to enemy.
         // Check lots live in BOTH tables (map treasure + enemy one-time drops). Same row struct, so
         // the same setter serves both; try map, fall back to enemy.
+        // ⚠️ "try map, FALL BACK to enemy" is a suspected bug, and this is the probe that decides it.
+        //
+        // ItemLotParam_map and ItemLotParam_enemy are two DIFFERENT tables, and nothing stops the same
+        // row id existing in both. If it does, the map lookup wins, `wrote` latches, and the ENEMY row
+        // -- the boss's one-time drop -- is never blanked, so the boss hands out its vanilla ware and
+        // no check fires. 338 of the blanked lots are short-form enemy ids (300, 310, 2020, 30120 ...),
+        // exactly the range where a map row can plausibly collide.
+        //
+        // Alaric, playtest 2026-07-12: killed the Unsightly Catacombs duo (m30_12, enemy lot 30120 --
+        // which IS in this table) and was handed the vanilla Perfumer Tricia ash, while all FIVE of
+        // that map's treasure checks randomised correctly. That is this bug's exact signature.
+        //
+        // So: record which table each lot actually resolved to. If a short enemy-form id resolves to
+        // MAP, the collision is real and the fix is to carry the table per lot from gen (the apworld
+        // knows which CSV each lot came from) instead of guessing here. Measure, then fix -- do not
+        // "helpfully" blank both tables, which would gut an unrelated map lot's goods slot.
         let mut wrote = false;
         if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(lot) {
             for &sl in &slots {
@@ -169,6 +187,11 @@ pub fn run() -> bool {
                 n += 1;
             }
             wrote = true;
+            hit_map += 1;
+            if lot < 1_000_000 {
+                // Short id = enemy-form. Resolving in the MAP table is the collision we are hunting.
+                suspect.push(lot);
+            }
         }
         if !wrote {
             if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(lot) {
@@ -176,10 +199,34 @@ pub fn run() -> bool {
                     set_slot(row, sl, ph);
                     n += 1;
                 }
+                hit_enemy += 1;
+            } else {
+                missed.push(lot);
             }
         }
     }
     log::info!("check-lots: blanked {n} check goods slot(s) -> placeholder {ph} (vanilla ware never handed out at a check)");
+    log::info!(
+        "check-lots: table resolution -- {hit_map} lot(s) found in ItemLotParam_MAP, {hit_enemy} in \
+         ItemLotParam_ENEMY, {} found in NEITHER",
+        missed.len()
+    );
+    if !suspect.is_empty() {
+        log::warn!(
+            "check-lots: {} SHORT (enemy-form) lot id(s) resolved in the MAP table and so their ENEMY \
+             row was NEVER blanked -- these bosses will hand out their vanilla drop and fire no check: \
+             {:?}",
+            suspect.len(),
+            &suspect[..suspect.len().min(40)]
+        );
+    }
+    if !missed.is_empty() {
+        log::warn!(
+            "check-lots: {} lot(s) exist in NEITHER param table (stale gen data?): {:?}",
+            missed.len(),
+            &missed[..missed.len().min(20)]
+        );
+    }
     DONE.store(true, Ordering::Relaxed);
     true
 }
