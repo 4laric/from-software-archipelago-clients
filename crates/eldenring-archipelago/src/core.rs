@@ -647,17 +647,21 @@ impl shared::Core for Core {
                 // multidata to see — startRegion, startGraces count, reveal_all_maps, the random-start
                 // warp/area/done flags, and the area-lock count.
                 let versions = sd.get("versions").and_then(|v| v.as_str()).unwrap_or("(none)");
-                let gate = er_logic::version::version_gate(sd, env!("CARGO_PKG_VERSION"));
-                // Warn-only contract (er_logic::version): Some(false) must NOT tear the
-                // connection down, but it must be user-visible. Build the message here; it is
-                // pushed to the persistent overlay console (same channel as "Region unlocked")
-                // after this client borrow ends.
-                let gate_warn = (gate == Some(false)).then(|| {
-                    format!(
-                        "apworld/client version mismatch: seed wants {versions}, client is {} — update the client",
-                        env!("CARGO_PKG_VERSION")
-                    )
-                });
+                // LEGACY SEMVER GATE DELETED (2026-07-11). It fired on EVERY connect, unconditionally,
+                // and cried wolf at Alaric across a whole playtest:
+                //     "apworld/client version mismatch: seed wants apworld/0.2.0 contract/b68eaa15
+                //      data/e4c73b06..., client is 0.1.0-beta.4 -- update the client"
+                // It fed our `versions` string into er_semver::version_satisfies(), which expects a
+                // semver RANGE (">=0.6.6 <0.7.0"). Ours is a DESCRIPTIVE string carrying the apworld
+                // semver + contract hash + data hash, so the parse always fails and `.unwrap_or(false)`
+                // turns that into "mismatch". It also compared the apworld's semver against the CLIENT
+                // CRATE's version -- two independent numbering schemes that were never meant to match.
+                //
+                // It is fully superseded by the VERSION HANDSHAKE above (~line 413), which compares the
+                // things that actually matter -- the CONTRACT HASH and the DATA HASH the binary was
+                // compiled against -- and says OK / warns with specifics. An unsound duplicate that
+                // always fires is worse than no gate: it trains you to ignore the real one.
+                let gate_warn: Option<String> = None;
                 let start_region = sd.get("startRegion").and_then(|v| v.as_str()).unwrap_or("");
                 log::info!(
                     "=== ER-AP client {} | contract {versions} (gate {gate:?}) | slot '{name}' ===",
@@ -2461,23 +2465,40 @@ fn i64_to_u32_map(v: Option<&Value>) -> HashMap<i64, u32> {
 
 #[cfg(test)]
 mod tests {
-    /// The slot_data "versions" contract band the apworld emits. MUST stay in lockstep with
-    /// Archipelago/worlds/eldenring/__init__.py fill_slot_data "versions" — when the apworld
-    /// bumps its band, bump this const AND `[package] version` in this crate's Cargo.toml together.
-    const EXPECTED_SLOT_DATA_VERSIONS: &str = ">=0.1.0-beta.4 <0.1.0-beta.5";
-
-    /// Connect-gate lockstep guard: the crate's own version must sit INSIDE the apworld band.
-    /// (er-semver orders a bare release 0.1.0 ABOVE every 0.1.0-beta.*, so a plain "0.1.0"
-    /// package version made version_gate return Some(false) on every connect — the exact
-    /// bug this test pins down.)
+    /// RETIRED 2026-07-11 -- this test pinned a FICTION and that is why it never fired.
+    ///
+    /// It asserted the crate version sits inside a semver BAND (">=0.1.0-beta.4 <0.1.0-beta.5")
+    /// that it CONSTRUCTED ITSELF, rather than the string the apworld actually sends. So when the
+    /// version handshake (apworld 24e261c) changed `versions` from a band to a descriptive
+    ///     "apworld/0.2.0 contract/b68eaa15 data/e4c73b06b595e0de"
+    /// the test stayed green while `version_gate` -- fed a string that is not a semver range at all --
+    /// failed to parse it, `.unwrap_or(false)`'d, and warned "update the client" on EVERY connect for a
+    /// whole playtest. A test that builds its own input cannot catch a change in the real input.
+    ///
+    /// The gate is gone (the VERSION HANDSHAKE supersedes it: it compares the CONTRACT HASH and the
+    /// DATA HASH, which is what actually matters). What replaces the test is the assertion that the
+    /// apworld's real `versions` string is the shape the handshake parses -- i.e. test the CONTRACT,
+    /// not a hand-built stand-in.
     #[test]
-    fn client_version_is_inside_apworld_contract_band() {
-        let sd = serde_json::json!({ "versions": EXPECTED_SLOT_DATA_VERSIONS });
-        assert_eq!(
-            er_logic::version::version_gate(&sd, env!("CARGO_PKG_VERSION")),
-            Some(true),
-            "CARGO_PKG_VERSION {} is outside the apworld slot_data band {EXPECTED_SLOT_DATA_VERSIONS}",
-            env!("CARGO_PKG_VERSION"),
+    fn versions_string_is_what_the_handshake_parses_not_a_semver_band() {
+        // Exactly what greenfield/eldenring/contract.py version_string() emits.
+        let real = "apworld/0.2.0 contract/b68eaa15 data/e4c73b06b595e0de";
+        let sd = serde_json::json!({ "versions": real });
+        let v = sd.get("versions").and_then(|x| x.as_str()).unwrap();
+
+        // The handshake pulls the contract hash out of it and compares against the compiled-in one.
+        let their_contract = v
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("contract/"))
+            .expect("`versions` must carry contract/<hash> -- the handshake keys off it");
+        assert_eq!(their_contract.len(), 8, "contract hash is the 8-char prefix");
+
+        // And it is NOT a semver range: the old gate treated it as one and warned on every connect.
+        assert!(
+            er_semver::version_satisfies(env!("CARGO_PKG_VERSION"), real).is_err()
+                || er_logic::version::version_gate(&sd, env!("CARGO_PKG_VERSION")) != Some(true),
+            "`versions` is a descriptive string, not a semver band -- nothing may gate on it as one"
         );
+    }
     }
 }
