@@ -3,13 +3,13 @@
 // Regenerate: python tools/gen_location_regions.py   (AP-env-free, pure greenfield data)
 //
 // Per AP location: fine region (grouping), coarse region (open-flag key for in-logic;
-// "" = always accessible), on_surface (the progression surface), missable. See SPEC-item-tracker.md.
+// "" = always accessible), big_ticket (Boss/Remembrance), missable. See SPEC-item-tracker.md.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::tracker::RegionId;
 
-/// (id, fine_region, coarse_region, on_surface, missable), sorted by id.
+/// (id, fine_region, coarse_region, big_ticket, missable), sorted by id.
 pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7770000, "Liurnia of the Lakes", "Liurnia of the Lakes", false, false),
     (7770001, "Stormveil Castle", "Stormveil Castle", true, false),
@@ -4906,9 +4906,8 @@ pub fn location_coarse_table() -> HashMap<u64, RegionId> {
     LOCATION_META.iter().map(|(id, _, c, _, _)| (*id, (*c).to_string())).collect()
 }
 
-/// The DEFAULT progression surface: location ids this world's own progression may occupy.
-/// A seed may override it via slot_data `progressionSurfaceLocations`; this is the fallback.
-pub fn progression_surface_set() -> HashSet<u64> {
+/// Big-ticket (prominent) location ids.
+pub fn big_ticket_set() -> HashSet<u64> {
     LOCATION_META.iter().filter(|(_, _, _, b, _)| *b).map(|(id, ..)| *id).collect()
 }
 
