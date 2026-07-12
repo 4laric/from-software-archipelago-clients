@@ -98,7 +98,15 @@ pub fn dress_placeholder() -> bool {
 }
 
 /// lot id -> goods slot indices (1..=8) to repoint at the placeholder.
-static BLANK: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+/// lot id -> goods slot indices, PER TABLE. The table travels with the lot now: ItemLotParam_map and
+/// ItemLotParam_enemy are two different tables that can hold the SAME row id, so a merged map loses the
+/// table and forces a guess. The old code guessed map-first and fell back to enemy -- which meant every
+/// enemy lot colliding with a map id was NEVER blanked, and a boss that is "just an enemy" handed out
+/// its vanilla drop and fired no check. (Alaric, playtest 2026-07-12: the Unsightly Catacombs duo,
+/// enemy lot 30120, paid the vanilla Perfumer Tricia ash while all five of that map's treasure checks
+/// randomised correctly.) The apworld knows which CSV each lot came from; it just used to throw it away.
+static BLANK_MAP: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+static BLANK_ENEMY: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
 /// The one goods id we hand out at checks and then unconditionally suppress. 0 = feature off.
 static PLACEHOLDER: AtomicI32 = AtomicI32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -117,12 +125,17 @@ pub fn is_placeholder(raw_id: i32) -> bool {
 }
 
 /// Called from net.rs at connect.
-pub fn configure(blank: HashMap<u32, Vec<u8>>, placeholder_goods: i32) {
-    let lots = blank.len();
-    *BLANK.lock().unwrap() = Some(blank);
+pub fn configure(
+    blank_map: HashMap<u32, Vec<u8>>,
+    blank_enemy: HashMap<u32, Vec<u8>>,
+    placeholder_goods: i32,
+) {
+    let (nm, ne) = (blank_map.len(), blank_enemy.len());
+    *BLANK_MAP.lock().unwrap() = Some(blank_map);
+    *BLANK_ENEMY.lock().unwrap() = Some(blank_enemy);
     PLACEHOLDER.store(placeholder_goods, Ordering::Relaxed);
     DONE.store(false, Ordering::Relaxed);
-    log::info!("check-lots: configured {lots} check lot(s); placeholder goods {placeholder_goods}");
+    log::info!("check-lots: configured {nm} MAP + {ne} ENEMY check lot(s); placeholder goods {placeholder_goods}");
 }
 
 /// Apply. Returns false if the param repo isn't up yet (caller retries next tick).
@@ -135,14 +148,17 @@ pub fn run() -> bool {
         DONE.store(true, Ordering::Relaxed);
         return true; // feature off
     }
-    let blank: Vec<(u32, Vec<u8>)> = match BLANK.lock().unwrap().as_ref() {
-        Some(m) if !m.is_empty() => m.iter().map(|(k, v)| (*k, v.clone())).collect(),
-        Some(_) => {
-            DONE.store(true, Ordering::Relaxed);
-            return true;
-        }
-        None => return true, // not configured (non-greenfield seed)
+    let grab = |m: &Mutex<Option<HashMap<u32, Vec<u8>>>>| -> Option<Vec<(u32, Vec<u8>)>> {
+        m.lock().unwrap().as_ref().map(|h| h.iter().map(|(k, v)| (*k, v.clone())).collect())
     };
+    let (blank_map, blank_enemy) = match (grab(&BLANK_MAP), grab(&BLANK_ENEMY)) {
+        (None, None) => return true, // not configured (non-greenfield seed)
+        (a, b) => (a.unwrap_or_default(), b.unwrap_or_default()),
+    };
+    if blank_map.is_empty() && blank_enemy.is_empty() {
+        DONE.store(true, Ordering::Relaxed);
+        return true;
+    }
 
     // SAFETY: FD4 singleton; game thread, in-world (caller gates). Same sanctioned mutable param access
     // shop_sell / shop_flags / enemy_drops use on the live RW table.
@@ -152,81 +168,55 @@ pub fn run() -> bool {
     };
 
     let mut n = 0usize;
-    let (mut hit_map, mut hit_enemy) = (0usize, 0usize);
-    let (mut suspect, mut missed): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-    for (lot, slots) in blank {
-        // Param naming, settled by the Windows build 2026-07-11 (the crate is not vendored in the
-        // sandbox, so these were guesses and every one was wrong):
-        //   table type : eldenring::cs::ItemLotParam_map / ItemLotParam_enemy   (snake, not CamelCase)
-        //   row struct : eldenring::param::ITEMLOT_PARAM_ST  -- ONE struct shared by BOTH tables
-        //   setters    : set_lot_item_id01..08               (NO underscore before the digits)
-        // Check lots live in both tables (map treasure + enemy one-time drops); same row struct, so one
-        // setter serves both. Try map, fall back to enemy.
-        // Check lots live in BOTH tables (map treasure + enemy one-time drops). Same row struct, so
-        // the same setter serves both; try map, fall back to enemy.
-        // ⚠️ "try map, FALL BACK to enemy" is a suspected bug, and this is the probe that decides it.
-        //
-        // ItemLotParam_map and ItemLotParam_enemy are two DIFFERENT tables, and nothing stops the same
-        // row id existing in both. If it does, the map lookup wins, `wrote` latches, and the ENEMY row
-        // -- the boss's one-time drop -- is never blanked, so the boss hands out its vanilla ware and
-        // no check fires. 338 of the blanked lots are short-form enemy ids (300, 310, 2020, 30120 ...),
-        // exactly the range where a map row can plausibly collide.
-        //
-        // Alaric, playtest 2026-07-12: killed the Unsightly Catacombs duo (m30_12, enemy lot 30120 --
-        // which IS in this table) and was handed the vanilla Perfumer Tricia ash, while all FIVE of
-        // that map's treasure checks randomised correctly. That is this bug's exact signature.
-        //
-        // So: record which table each lot actually resolved to. If a short enemy-form id resolves to
-        // MAP, the collision is real and the fix is to carry the table per lot from gen (the apworld
-        // knows which CSV each lot came from) instead of guessing here. Measure, then fix -- do not
-        // "helpfully" blank both tables, which would gut an unrelated map lot's goods slot.
-        let mut wrote = false;
-        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(lot) {
-            for &sl in &slots {
+    let mut missed: Vec<u32> = Vec::new();
+
+    // NO FALLBACK, NO GUESSING. Each lot is written to the table the apworld SAID it came from.
+    //
+    // The old code did `if map.get_mut(lot) { ...; wrote = true } if !wrote { enemy.get_mut(lot) }`.
+    // But map and enemy are two DIFFERENT tables that can hold the same row id -- so on a collision the
+    // map lookup won, `wrote` latched, and the ENEMY row was never blanked. A boss that is "just an
+    // enemy" (its drop is an ItemLotParam_enemy row) then handed out its vanilla drop and fired no
+    // check. Alaric, playtest 2026-07-12: the Unsightly Catacombs duo -- enemy lot 30120, present in
+    // this very table -- paid the vanilla Perfumer Tricia ash, while all five of that map's TREASURE
+    // checks randomised correctly. That contrast is the whole diagnosis.
+    //
+    // Note we deliberately do NOT blank both tables "to be safe": that would gut an unrelated map lot's
+    // goods slot at the same id. The table is a FACT the apworld already has; it just used to throw it
+    // away. Now it travels with the lot.
+    for (lot, slots) in &blank_map {
+        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
+            for &sl in slots {
                 set_slot(row, sl, ph);
                 n += 1;
             }
-            wrote = true;
-            hit_map += 1;
-            if lot < 1_000_000 {
-                // Short id = enemy-form. Resolving in the MAP table is the collision we are hunting.
-                suspect.push(lot);
-            }
-        }
-        if !wrote {
-            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(lot) {
-                for &sl in &slots {
-                    set_slot(row, sl, ph);
-                    n += 1;
-                }
-                hit_enemy += 1;
-            } else {
-                missed.push(lot);
-            }
+        } else {
+            missed.push(*lot);
         }
     }
-    log::info!("check-lots: blanked {n} check goods slot(s) -> placeholder {ph} (vanilla ware never handed out at a check)");
-    log::info!(
-        "check-lots: table resolution -- {hit_map} lot(s) found in ItemLotParam_MAP, {hit_enemy} in \
-         ItemLotParam_ENEMY, {} found in NEITHER",
-        missed.len()
-    );
-    if !suspect.is_empty() {
-        log::warn!(
-            "check-lots: {} SHORT (enemy-form) lot id(s) resolved in the MAP table and so their ENEMY \
-             row was NEVER blanked -- these bosses will hand out their vanilla drop and fire no check: \
-             {:?}",
-            suspect.len(),
-            &suspect[..suspect.len().min(40)]
-        );
+    for (lot, slots) in &blank_enemy {
+        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
+            for &sl in slots {
+                set_slot(row, sl, ph);
+                n += 1;
+            }
+        } else {
+            missed.push(*lot);
+        }
     }
     if !missed.is_empty() {
         log::warn!(
-            "check-lots: {} lot(s) exist in NEITHER param table (stale gen data?): {:?}",
+            "check-lots: {} lot(s) were not found in the table the apworld named (stale gen data?): {:?}",
             missed.len(),
             &missed[..missed.len().min(20)]
         );
     }
+    log::info!(
+        "check-lots: wrote {} MAP lot(s) + {} ENEMY lot(s) ({} missing from the named table)",
+        blank_map.len(),
+        blank_enemy.len(),
+        missed.len()
+    );
+    log::info!("check-lots: blanked {n} check goods slot(s) -> placeholder {ph} (vanilla ware never handed out at a check)");
     DONE.store(true, Ordering::Relaxed);
     true
 }

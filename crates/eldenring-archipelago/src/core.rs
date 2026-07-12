@@ -601,20 +601,51 @@ impl shared::Core for Core {
                 // by the FLAG POLL, not by the pickup id.
                 {
                     let ph = sd.get("apPlaceholderGoods").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                    let mut blank: std::collections::HashMap<u32, Vec<u8>> =
-                        std::collections::HashMap::new();
-                    if let Some(m) = sd.get("checkLotBlank").and_then(|v| v.as_object()) {
-                        for (k, v) in m {
-                            let (Ok(lot), Some(a)) = (k.parse::<u32>(), v.as_array()) else { continue };
-                            let slots: Vec<u8> =
-                                a.iter().filter_map(|x| x.as_i64()).map(|x| x as u8).collect();
-                            if !slots.is_empty() {
-                                blank.insert(lot, slots);
+                    // TWO tables, kept apart. ItemLotParam_map and ItemLotParam_enemy can hold the
+                    // SAME row id, so a merged dict loses the table and the client has to guess. It
+                    // guessed map-first -- and every enemy lot colliding with a map id was therefore
+                    // never blanked, so a boss that is "just an enemy" handed out its vanilla drop and
+                    // fired no check. The apworld knows which CSV each lot came from; it now says so.
+                    let parse_lots = |key: &str| -> std::collections::HashMap<u32, Vec<u8>> {
+                        let mut out = std::collections::HashMap::new();
+                        if let Some(m) = sd.get(key).and_then(|v| v.as_object()) {
+                            for (k, v) in m {
+                                let (Ok(lot), Some(a)) = (k.parse::<u32>(), v.as_array()) else {
+                                    continue;
+                                };
+                                let slots: Vec<u8> =
+                                    a.iter().filter_map(|x| x.as_i64()).map(|x| x as u8).collect();
+                                if !slots.is_empty() {
+                                    out.insert(lot, slots);
+                                }
                             }
                         }
+                        out
+                    };
+                    let mut blank_map = parse_lots("checkLotBlankMap");
+                    let mut blank_enemy = parse_lots("checkLotBlankEnemy");
+                    if blank_map.is_empty() && blank_enemy.is_empty() {
+                        // LEGACY: an apworld whose check_lots_data.py predates the map/enemy split. It
+                        // ships one merged dict keyed by lot id alone, so the table is unknown. Send it
+                        // to BOTH -- check_lots only writes a lot where the row actually EXISTS, so a
+                        // map-only id lands in map and an enemy-only id lands in enemy, reproducing the
+                        // old behaviour. A COLLIDING id gets blanked in both, which is the old bug's
+                        // blast radius inverted (it used to under-blank; now it over-blanks) -- and that
+                        // is precisely why the apworld must send the table. Loud, not silent.
+                        let legacy = parse_lots("checkLotBlank");
+                        if !legacy.is_empty() {
+                            log::warn!(
+                                "check-lots: apworld sent the LEGACY merged checkLotBlank (no map/enemy \
+                                 split). The param table each lot belongs to is unknown, so bosses that \
+                                 are 'just an enemy' may still hand out their vanilla drop. Regenerate \
+                                 the apworld (python greenfield/gen_data.py)."
+                            );
+                            blank_map = legacy.clone();
+                            blank_enemy = legacy;
+                        }
                     }
-                    if ph != 0 && !blank.is_empty() {
-                        crate::check_lots::configure(blank, ph);
+                    if ph != 0 && !(blank_map.is_empty() && blank_enemy.is_empty()) {
+                        crate::check_lots::configure(blank_map, blank_enemy, ph);
                     }
                 }
                 crate::shop_sell::configure(loc_flags.clone());
