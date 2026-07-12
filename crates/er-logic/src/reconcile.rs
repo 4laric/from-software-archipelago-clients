@@ -103,8 +103,8 @@ pub enum ItemSemantics {
         qty: i32,
         echo_skip: bool,
     },
-    /// A PROGRESSIVE item: the Nth received copy of this NAME lands tier N (that tier's unique goods
-    /// + observable flags); every copy past the last tier yields exactly ONE overflow consumable
+    /// A PROGRESSIVE item: the Nth received copy of this NAME lands tier N (that tier's unique
+    /// goods plus its observable flags); every copy past the last tier yields ONE overflow consumable
     /// (`overflow_full_id`, e.g. a Lord's Rune). The desired state depends only on the COUNT of
     /// copies received (order-independent); the overflow grants are LEDGERED per stream index so a
     /// reconnect replays none of them. All copies of one name carry the same `tiers` table.
@@ -686,6 +686,7 @@ impl Reconciler {
     ///     cutover the old receive path advances it past every item WITHOUT granting (grant is the
     ///     reconciler's job), so seeding from it blindly would skip items the reconciler never
     ///     placed (e.g. it sat unstable through the whole prior session).
+    ///
     /// So: TRUST `persisted` only when it is `<= received_through` (a frontier can never legally sit
     /// past what this save has received -- if it does, it belongs to someone else). Distrusted or
     /// absent, fall back to `received_through` itself when positive (first cutover on an existing

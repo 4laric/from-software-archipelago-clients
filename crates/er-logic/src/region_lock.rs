@@ -243,7 +243,7 @@ impl KickCountdown {
         } else {
             let remaining = self.grace_ms - elapsed;
             // ceil to whole seconds: reads full (grace/1000) at arm, hits 1 on the final second.
-            let secs_left = ((remaining + 999) / 1000) as u32;
+            let secs_left = remaining.div_ceil(1000) as u32;
             KickAction::Warn {
                 region: region_name.to_string(),
                 secs_left,

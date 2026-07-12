@@ -24,7 +24,7 @@
 /// - `(Some("A"), "B")` -> `true`   (switched to a different seed)
 /// - `(Some("A"), "")` -> `false`  (no RoomInfo seed yet — ignore, don't reset)
 pub fn is_seed_change(parsed: Option<&str>, room: &str) -> bool {
-    !room.is_empty() && parsed.map_or(false, |p| p != room)
+    !room.is_empty() && parsed.is_some_and(|p| p != room)
 }
 
 #[cfg(test)]
