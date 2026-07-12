@@ -552,6 +552,32 @@ impl shared::Core for Core {
                         crate::shop_stock::configure(roll);
                     }
                 }
+
+                // enemyDropRoll: {"<lot id>": [slot, goodsId, slot, goodsId, ...]} -- flat pairs.
+                // UNFLAGGED ItemLotParam_enemy lots only (a flagged lot IS a check and is never sent).
+                {
+                    let mut roll: std::collections::HashMap<u32, Vec<(u8, i32)>> =
+                        std::collections::HashMap::new();
+                    if let Some(m) = sd.get("enemyDropRoll").and_then(|v| v.as_object()) {
+                        for (k, v) in m {
+                            let (Ok(lot), Some(a)) = (k.parse::<u32>(), v.as_array()) else { continue };
+                            let mut pairs = Vec::with_capacity(a.len() / 2);
+                            for ch in a.chunks(2) {
+                                if ch.len() < 2 {
+                                    break;
+                                }
+                                let (Some(sl), Some(gid)) = (ch[0].as_i64(), ch[1].as_i64()) else { continue };
+                                pairs.push((sl as u8, gid as i32));
+                            }
+                            if !pairs.is_empty() {
+                                roll.insert(lot, pairs);
+                            }
+                        }
+                    }
+                    if !roll.is_empty() {
+                        crate::enemy_drops::configure(roll);
+                    }
+                }
                 crate::shop_sell::configure(loc_flags.clone());
                 crate::shop_preview::configure(preview.clone());
                 crate::shop_icon::configure(preview);
@@ -1719,6 +1745,7 @@ impl shared::Core for Core {
             let _ = crate::upgrade_cost::maybe_apply();
             let _ = crate::shop_sell::run();
             let _ = crate::shop_stock::run();
+            let _ = crate::enemy_drops::run();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
             let _ = crate::minibaker::run();
