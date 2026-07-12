@@ -13,10 +13,17 @@ pub const GOODS_FULLID: i32 = 0x4000_0000u32 as i32;
 pub const LORDS_RUNE_GOODS: u32 = 2919;
 
 /// One progressive tier: the goods to grant and the flags to set when this tier lands.
+///
+/// `consumed` marks the tier's goods as SPENT by the player (the flask-upgrade ladder's Golden
+/// Seeds / Sacred Tears, used up at a Site of Grace): the reconciler grants them exactly ONCE via
+/// the ledger instead of presence-diffing them back forever. `false` — the default when the
+/// slot_data rung carries no `consumed` key — keeps today's OWNED semantics (stone bell bearings),
+/// which self-heal when lost.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgTier {
     pub goods: Vec<u32>,
     pub flags: Vec<u32>,
+    pub consumed: bool,
 }
 
 /// The effects of receiving one progressive item. `handled` => caller skips the normal grant.
@@ -117,10 +124,12 @@ mod tests {
                 ProgTier {
                     goods: vec![8101],
                     flags: vec![70001],
+                    consumed: false,
                 },
                 ProgTier {
                     goods: vec![8102],
                     flags: vec![70002],
+                    consumed: false,
                 },
             ],
         );
@@ -185,7 +194,9 @@ mod tests {
     }
 }
 /// Parse `progressiveGrants` slot_data into the per-name tier config. Tolerant: a tier may carry
-/// `goodsList` (array) or `goods` (single), plus optional `flags`; a fully-empty tier is dropped
+/// `goodsList` (array) or `goods` (single), plus optional `flags` and an optional boolean
+/// `consumed` (absent/false = OWNED, self-healing; true = spendable, granted once via the ledger —
+/// see [`ProgTier::consumed`]); a fully-empty tier is dropped
 /// (the deliberate fix for the C++ "key goods not found" abort). Absent key -> empty config.
 pub fn parse(slot_data: &serde_json::Value) -> HashMap<String, Vec<ProgTier>> {
     let mut out = HashMap::new();
@@ -224,10 +235,14 @@ pub fn parse(slot_data: &serde_json::Value) -> HashMap<String, Vec<ProgTier>> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let consumed = t
+                .get("consumed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if goods.is_empty() && flags.is_empty() {
                 continue; // drop empty tier
             }
-            tiers.push(ProgTier { goods, flags });
+            tiers.push(ProgTier { goods, flags, consumed });
         }
         if !tiers.is_empty() {
             out.insert(name.clone(), tiers);
@@ -260,6 +275,25 @@ mod parse_tests {
     }
 
     #[test]
+    fn parse_reads_consumed_flag_and_defaults_to_owned() {
+        // Contract: each rung may carry an optional boolean `consumed`. Absent MUST stay OWNED
+        // (backwards compatible -- the stone bell bearings depend on self-healing).
+        let sd = serde_json::json!({ "progressiveGrants": {
+            "Progressive Flask Upgrade": [
+                { "goods": 10010, "consumed": true },
+                { "goods": 10020, "flags": [60003], "consumed": false },
+                { "goods": 8101 }
+            ]
+        }});
+        let map = parse(&sd);
+        let tiers = &map["Progressive Flask Upgrade"];
+        assert_eq!(tiers.len(), 3);
+        assert!(tiers[0].consumed, "consumed: true must parse through");
+        assert!(!tiers[1].consumed, "explicit consumed: false stays owned");
+        assert!(!tiers[2].consumed, "ABSENT consumed defaults to owned (today's ladders unchanged)");
+    }
+
+    #[test]
     fn parse_absent_key_is_empty() {
         assert!(parse(&serde_json::json!({ "seed": "x" })).is_empty());
     }
@@ -270,8 +304,8 @@ mod parse_tests {
         cfg.insert(
             "progressive_stone_bell".to_string(),
             vec![
-                ProgTier { goods: vec![8101], flags: vec![70001] },
-                ProgTier { goods: vec![8102], flags: vec![70002] },
+                ProgTier { goods: vec![8101], flags: vec![70001], consumed: false },
+                ProgTier { goods: vec![8102], flags: vec![70002], consumed: false },
             ],
         );
         let p = ProgressiveState::new(cfg);

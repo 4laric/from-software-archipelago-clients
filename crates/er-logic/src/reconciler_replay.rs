@@ -345,8 +345,8 @@ mod replay {
     /// invariant under receiving those copies in any order (and under load-screen injection).
     fn prog_inputs(prefix_hi: i64) -> DesiredInputs {
         let tiers = vec![
-            ProgTier { goods: vec![8101], flags: vec![70001] },
-            ProgTier { goods: vec![8102], flags: vec![70002] },
+            ProgTier { goods: vec![8101], flags: vec![70001], consumed: false },
+            ProgTier { goods: vec![8102], flags: vec![70002], consumed: false },
         ];
         let received: Vec<ReceivedItem> = (0..3i64)
             .filter(|&k| k <= prefix_hi)

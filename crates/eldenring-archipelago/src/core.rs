@@ -1947,6 +1947,7 @@ impl Core {
                         .map(|&g| (g as i32) | er_logic::progressive::GOODS_FULLID)
                         .collect(),
                     flags: t.flags.clone(),
+                    consumed: t.consumed,
                 })
                 .collect();
             return ItemSemantics::Progressive {

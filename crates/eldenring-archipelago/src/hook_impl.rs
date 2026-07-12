@@ -110,11 +110,20 @@ impl NetHook for ReceiveDispatch<'_> {
             for &f in &eff.flags {
                 self.hook.set_event_flag(f, true);
             }
-            for &g in &eff.grants {
-                if !self.hook.grant_full_id(g, 1) {
-                    log::warn!(
-                        "progressive '{name}' (idx {ap_index}): tier grant {g:#x} failed to place -- tier already advanced"
-                    );
+            // STRANGLER (mirror of the `GrantAction::Enqueue` gate in core.rs): once the
+            // reconciler owns goods+ledger it is the sole progressive grant path too -- OWNED
+            // rungs land as presence-diffed unique goods, CONSUMED rungs and overflow copies as
+            // once-only ledger grants keyed by stream index. Granting here as well would add a
+            // duplicate copy on receive (harmless for owned rungs, which presence-diff away, but
+            // a real extra item for consumed/overflow ledger entries). Runtime-revertible: drop
+            // `goods`/`ledger` from RECONCILE_APPLY and this path grants again.
+            if !(crate::reconcile_io::owns_goods() && crate::reconcile_io::owns_ledger()) {
+                for &g in &eff.grants {
+                    if !self.hook.grant_full_id(g, 1) {
+                        log::warn!(
+                            "progressive '{name}' (idx {ap_index}): tier grant {g:#x} failed to place -- tier already advanced"
+                        );
+                    }
                 }
             }
         }
