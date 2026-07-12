@@ -61,7 +61,10 @@ fn merge_table_file(cfg: &mut FlagPollConfig, path: &std::path::Path) {
         return;
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        log::warn!("flag-poll: {} exists but is not valid JSON -- ignored", path.display());
+        log::warn!(
+            "flag-poll: {} exists but is not valid JSON -- ignored",
+            path.display()
+        );
         return;
     };
     if let Some(obj) = v.get("location_flags").and_then(|x| x.as_object()) {

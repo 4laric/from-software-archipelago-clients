@@ -33,7 +33,10 @@ mod replay {
 
     impl Sim {
         fn new() -> Self {
-            Sim { table: vanilla_table(), latch: FlattenLatch::new() }
+            Sim {
+                table: vanilla_table(),
+                latch: FlattenLatch::new(),
+            }
         }
         /// Fresh connect: arm the latch at `cap`.
         fn connect(&mut self, cap: i32) {
@@ -61,10 +64,18 @@ mod replay {
             changed
         }
         fn regular(&self) -> Vec<i8> {
-            self.table.iter().filter(|(id, _)| *id == REG).map(|(_, c)| *c).collect()
+            self.table
+                .iter()
+                .filter(|(id, _)| *id == REG)
+                .map(|(_, c)| *c)
+                .collect()
         }
         fn somber(&self) -> Vec<i8> {
-            self.table.iter().filter(|(id, _)| *id == SOMBER).map(|(_, c)| *c).collect()
+            self.table
+                .iter()
+                .filter(|(id, _)| *id == SOMBER)
+                .map(|(_, c)| *c)
+                .collect()
         }
     }
 
@@ -80,9 +91,17 @@ mod replay {
 
         // RECONNECT: the game reloaded regulation -> params are VANILLA again.
         s.reconnect(3);
-        assert_eq!(s.regular(), vec![2, 4, 6], "reload reverts the live params to vanilla");
+        assert_eq!(
+            s.regular(),
+            vec![2, 4, 6],
+            "reload reverts the live params to vanilla"
+        );
         // THE SHIP RISK: the re-arm must re-clamp the freshly reloaded table on the next tick.
-        assert_eq!(s.tick(), 2, "flatten MUST re-apply after reconnect (re-arm latch)");
+        assert_eq!(
+            s.tick(),
+            2,
+            "flatten MUST re-apply after reconnect (re-arm latch)"
+        );
         assert_eq!(s.regular(), vec![2, 3, 3]);
     }
 

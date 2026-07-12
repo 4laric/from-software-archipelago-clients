@@ -94,7 +94,8 @@ impl NetHook for ReceiveDispatch<'_> {
                 }
             }
             if crate::region::open_on_received_name(cfg, name) {
-                self.unlocked.push(name.trim_end_matches(" Lock").to_string());
+                self.unlocked
+                    .push(name.trim_end_matches(" Lock").to_string());
             }
         }
     }

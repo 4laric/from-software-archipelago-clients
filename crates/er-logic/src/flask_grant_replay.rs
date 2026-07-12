@@ -181,10 +181,10 @@ mod replay {
         // reload resets the latch and the next tick fires it AGAIN -> 6 heal + 2 FP from a 3 + 1
         // start. Reproduces er-flask-double-grant-reconnect.
         let timeline = [
-            Ev::ReceiveStartItems,      // first grant: 3 heal + 1 FP
-            Ev::Tick,                   // persisted latch would dedup here...
-            Ev::TutorialDeathReload,    // ...but the session latch is reset
-            Ev::Tick,                   // second grant: another 3 heal + 1 FP
+            Ev::ReceiveStartItems,   // first grant: 3 heal + 1 FP
+            Ev::Tick,                // persisted latch would dedup here...
+            Ev::TutorialDeathReload, // ...but the session latch is reset
+            Ev::Tick,                // second grant: another 3 heal + 1 FP
         ];
         let g = replay(&timeline, false);
         assert_eq!(
@@ -237,8 +237,16 @@ mod replay {
             Ev::Tick, // now it lands, in full
         ];
         let g = replay(&timeline, true);
-        assert_eq!(g.qty_of(HEAL_FLASK_FULL_ID), HEAL_START_QTY, "must grant in full once ready");
-        assert_eq!(g.qty_of(FP_FLASK_FULL_ID), FP_START_QTY, "must grant in full once ready");
+        assert_eq!(
+            g.qty_of(HEAL_FLASK_FULL_ID),
+            HEAL_START_QTY,
+            "must grant in full once ready"
+        );
+        assert_eq!(
+            g.qty_of(FP_FLASK_FULL_ID),
+            FP_START_QTY,
+            "must grant in full once ready"
+        );
     }
 
     #[test]
@@ -255,13 +263,27 @@ mod replay {
             Ev::Tick,
         ];
         let g = replay(&timeline, true);
-        assert_eq!(g.qty_of(HEAL_FLASK_FULL_ID), HEAL_START_QTY, "no re-grant across repeated reloads");
-        assert_eq!(g.qty_of(FP_FLASK_FULL_ID), FP_START_QTY, "no re-grant across repeated reloads");
+        assert_eq!(
+            g.qty_of(HEAL_FLASK_FULL_ID),
+            HEAL_START_QTY,
+            "no re-grant across repeated reloads"
+        );
+        assert_eq!(
+            g.qty_of(FP_FLASK_FULL_ID),
+            FP_START_QTY,
+            "no re-grant across repeated reloads"
+        );
     }
 
     #[test]
     fn pure_policy_semantics() {
-        assert!(!start_guard_survives_reload(false), "session latch does not survive a reload");
-        assert!(start_guard_survives_reload(true), "persisted save-state guard survives a reload");
+        assert!(
+            !start_guard_survives_reload(false),
+            "session latch does not survive a reload"
+        );
+        assert!(
+            start_guard_survives_reload(true),
+            "persisted save-state guard survives a reload"
+        );
     }
 }

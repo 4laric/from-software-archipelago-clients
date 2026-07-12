@@ -52,7 +52,9 @@ pub fn drive_kill() {
     if KILL_PENDING.load(Ordering::Relaxed) && crate::flags::in_world() && kill_local_player() {
         let _ = crate::flags::try_set_event_flag(DEATHLINK_KILL_FLAG, true);
         KILL_PENDING.store(false, Ordering::Relaxed);
-        log::info!("DeathLink: incoming kill applied (direct HP write; flag {DEATHLINK_KILL_FLAG} best-effort)");
+        log::info!(
+            "DeathLink: incoming kill applied (direct HP write; flag {DEATHLINK_KILL_FLAG} best-effort)"
+        );
     }
 }
 
@@ -83,7 +85,9 @@ fn read_local_death() -> bool {
         return false; // not in-world (no main player)
     };
     if !HP_ARMED_LOGGED.swap(true, Ordering::Relaxed) {
-        log::info!("DeathLink: HP read via typed CSChrDataModule -- outgoing death detection ARMED");
+        log::info!(
+            "DeathLink: HP read via typed CSChrDataModule -- outgoing death detection ARMED"
+        );
     }
     hp <= 0
 }

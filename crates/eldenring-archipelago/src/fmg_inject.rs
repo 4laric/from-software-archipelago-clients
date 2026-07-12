@@ -130,11 +130,7 @@ unsafe fn goods_msgdata(base: usize) -> Option<usize> {
         return None;
     }
     let md = read_usize(sub + GOODS_CATEGORY as usize * 8);
-    if plausible(md) {
-        Some(md)
-    } else {
-        None
-    }
+    if plausible(md) { Some(md) } else { None }
 }
 
 unsafe fn parse(md: usize) -> Option<(Vec<Group>, Vec<u64>)> {
@@ -152,7 +148,11 @@ unsafe fn parse(md: usize) -> Option<(Vec<Group>, Vec<u64>)> {
         if li < fi || li.saturating_sub(fi) > 0x10_0000 {
             return None;
         }
-        groups.push(Group { string_index_base: sib, first_id: fi, last_id: li });
+        groups.push(Group {
+            string_index_base: sib,
+            first_id: fi,
+            last_id: li,
+        });
         num_strings = num_strings.max(sib.saturating_add(li - fi).saturating_add(1));
     }
     if num_strings == 0 || num_strings > 0x20_0000 {
@@ -170,7 +170,9 @@ unsafe fn parse(md: usize) -> Option<(Vec<Group>, Vec<u64>)> {
 }
 
 fn my_lookup(md: usize, groups: &[Group], offsets: &[u64], id: u32) -> Option<String> {
-    let g = groups.iter().find(|g| id >= g.first_id && id <= g.last_id)?;
+    let g = groups
+        .iter()
+        .find(|g| id >= g.first_id && id <= g.last_id)?;
     let si = (id - g.first_id + g.string_index_base) as usize;
     let off = *offsets.get(si)?;
     if off == 0 {
@@ -180,7 +182,7 @@ fn my_lookup(md: usize, groups: &[Group], offsets: &[u64], id: u32) -> Option<St
 }
 
 unsafe fn valloc(size: usize) -> Option<usize> {
-    use windows::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+    use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
     let p = VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if p.is_null() {
         None
@@ -211,7 +213,10 @@ unsafe fn build_block(
     // override string happen below. (si -> new units)
     let mut ovr: Vec<(usize, &Vec<u16>)> = Vec::new();
     for (id, s) in overrides {
-        if let Some(g) = groups.iter().find(|g| *id >= g.first_id && *id <= g.last_id) {
+        if let Some(g) = groups
+            .iter()
+            .find(|g| *id >= g.first_id && *id <= g.last_id)
+        {
             ovr.push(((*id - g.first_id + g.string_index_base) as usize, s));
         }
     }
@@ -229,7 +234,11 @@ unsafe fn build_block(
             j += 1;
             end = injects[j].0;
         }
-        inj_groups.push(Group { string_index_base: base_idx, first_id: start, last_id: end });
+        inj_groups.push(Group {
+            string_index_base: base_idx,
+            first_id: start,
+            last_id: end,
+        });
         k = j + 1;
     }
     let count = groups.len() + inj_groups.len();
@@ -352,11 +361,7 @@ unsafe fn category_msgdata(base: usize, category: u32) -> Option<usize> {
         return None;
     }
     let md = read_usize(sub + category as usize * 8);
-    if plausible(md) {
-        Some(md)
-    } else {
-        None
-    }
+    if plausible(md) { Some(md) } else { None }
 }
 
 /// Atomically point `base_array[0][category]` at a freshly-built block. Generalization of `swap_goods`.
@@ -551,7 +556,9 @@ pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> us
     let (g2, o2) = match unsafe { parse(block) } {
         Some(p) => p,
         None => {
-            log::warn!("FMG extend-swap(cat {category}): rebuilt block failed re-parse; NOT swapping");
+            log::warn!(
+                "FMG extend-swap(cat {category}): rebuilt block failed re-parse; NOT swapping"
+            );
             return 0;
         }
     };
@@ -579,7 +586,10 @@ pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> us
         return 0;
     }
     unsafe { swap_category(base, category, block) };
-    log::info!("FMG extend-swap(cat {category}): swapped (+{} overrides)", resolvable.len());
+    log::info!(
+        "FMG extend-swap(cat {category}): swapped (+{} overrides)",
+        resolvable.len()
+    );
     resolvable.len()
 }
 
@@ -626,7 +636,12 @@ pub fn run() -> bool {
         for &id in CHECK_IDS {
             let mine = my_lookup(md, &groups, &offsets, id);
             let theirs = read_string(unsafe { search(repo, 0, GOODS_CATEGORY, id) as usize });
-            let m = if mine == theirs { ok += 1; "MATCH" } else { "MISMATCH" };
+            let m = if mine == theirs {
+                ok += 1;
+                "MATCH"
+            } else {
+                "MISMATCH"
+            };
             log::info!("FMG-inject:   id={id} mine={mine:?} game={theirs:?} [{m}]");
         }
         log::info!("FMG-inject: === parse {ok}/{} match ===", CHECK_IDS.len());
@@ -683,7 +698,10 @@ pub fn run() -> bool {
         let want = String::from_utf16_lossy(name);
         let got = my_lookup(block, &g2, &o2, *id);
         let good = got.as_deref() == Some(want.as_str());
-        log::info!("FMG-inject:   synth-check id={id} want={want:?} got={got:?} [{}]", if good { "OK" } else { "BAD" });
+        log::info!(
+            "FMG-inject:   synth-check id={id} want={want:?} got={got:?} [{}]",
+            if good { "OK" } else { "BAD" }
+        );
         if !good {
             mismatch += 1;
         }
@@ -693,7 +711,10 @@ pub fn run() -> bool {
         DONE.store(true, Ordering::Relaxed);
         return true;
     }
-    log::info!("FMG-inject: block validated (+{} injected); swapping GoodsName -> {block:#x}", injects.len());
+    log::info!(
+        "FMG-inject: block validated (+{} injected); swapping GoodsName -> {block:#x}",
+        injects.len()
+    );
     if unsafe { swap_goods(base, block) } {
         for &id in CHECK_IDS {
             let theirs = read_string(unsafe { search(repo, 0, GOODS_CATEGORY, id) as usize });

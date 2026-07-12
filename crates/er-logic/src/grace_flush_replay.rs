@@ -197,12 +197,7 @@ mod replay {
     fn observed_reconcile_recovers_dropped_grace() {
         // Same timeline, reconcile on observed flags: the post-load flush reads the volatile grace
         // back false and re-queues + re-sets it. Recovers.
-        let timeline = [
-            Ev::QueueGraces,
-            Ev::Tick,
-            Ev::SaveLoad,
-            Ev::Tick,
-        ];
+        let timeline = [Ev::QueueGraces, Ev::Tick, Ev::SaveLoad, Ev::Tick];
         let g = replay(&timeline, true);
         assert!(
             all_graces_set(&g),
@@ -223,7 +218,7 @@ mod replay {
                 Ev::SaveLoad,           // ...so the post-load reconcile can't re-heal yet
                 Ev::Tick,               // reconcile re-queues but holder not ready -> stays unset
                 Ev::HolderReady(true),
-                Ev::Tick,               // now it lands
+                Ev::Tick, // now it lands
             ],
             true,
         );
@@ -234,7 +229,12 @@ mod replay {
 
         // And it was genuinely still unset while the holder was down.
         let mid = replay(
-            &[Ev::QueueGraces, Ev::HolderReady(false), Ev::SaveLoad, Ev::Tick],
+            &[
+                Ev::QueueGraces,
+                Ev::HolderReady(false),
+                Ev::SaveLoad,
+                Ev::Tick,
+            ],
             true,
         );
         assert!(

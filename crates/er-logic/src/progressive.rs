@@ -270,8 +270,14 @@ mod parse_tests {
         cfg.insert(
             "progressive_stone_bell".to_string(),
             vec![
-                ProgTier { goods: vec![8101], flags: vec![70001] },
-                ProgTier { goods: vec![8102], flags: vec![70002] },
+                ProgTier {
+                    goods: vec![8101],
+                    flags: vec![70001],
+                },
+                ProgTier {
+                    goods: vec![8102],
+                    flags: vec![70002],
+                },
             ],
         );
         let p = ProgressiveState::new(cfg);

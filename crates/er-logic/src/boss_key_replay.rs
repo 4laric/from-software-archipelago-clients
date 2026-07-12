@@ -116,7 +116,10 @@ mod replay {
         b.poll(); // killed THIS session, key not held -> sealed
         assert!(!b.gate_now());
         assert!(b.pending.contains(&900), "own check held pending the key");
-        assert!(!b.server_checked.contains(&900), "nothing sent while sealed");
+        assert!(
+            !b.server_checked.contains(&900),
+            "nothing sent while sealed"
+        );
         assert_eq!(b.seal_banners, 1);
         assert_eq!(b.release_banners, 0);
         // A further poll must NOT re-seal (once per boss, not every poll).
@@ -134,13 +137,19 @@ mod replay {
         assert_eq!(b.pending.len(), 1);
         b.receive("Boss Key: Godrick");
         b.poll(); // key held -> burst release
-        assert!(b.server_checked.contains(&900), "check released to the server set");
+        assert!(
+            b.server_checked.contains(&900),
+            "check released to the server set"
+        );
         assert!(b.pending.is_empty());
         assert_eq!(b.release_banners, 1);
         // No second release / no re-send on the next poll.
         let released_before = b.release_banners;
         b.poll();
-        assert_eq!(b.release_banners, released_before, "no second release banner");
+        assert_eq!(
+            b.release_banners, released_before,
+            "no second release banner"
+        );
         assert!(b.server_checked.contains(&900));
     }
 
@@ -178,7 +187,10 @@ mod replay {
         b.poll(); // prime re-seeds pending silently; candidate already pending -> no new banner
         assert!(b.pending.contains(&900), "seal re-derived on reconnect");
         assert!(!b.server_checked.contains(&900));
-        assert_eq!(b.seal_banners, 0, "reconnect-seeded seal does not re-banner");
+        assert_eq!(
+            b.seal_banners, 0,
+            "reconnect-seeded seal does not re-banner"
+        );
         // Key arrives post-reconnect -> burst release fires exactly once.
         b.receive("Boss Key: Godrick");
         b.poll();
@@ -194,7 +206,10 @@ mod replay {
         b.kill();
         b.poll();
         assert!(b.gate_now());
-        assert!(b.server_checked.contains(&900), "ungated check sent at once");
+        assert!(
+            b.server_checked.contains(&900),
+            "ungated check sent at once"
+        );
         assert!(b.pending.is_empty());
         assert_eq!(b.seal_banners, 0);
         assert_eq!(b.release_banners, 0);

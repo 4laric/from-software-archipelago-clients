@@ -125,6 +125,8 @@ pub fn prime_known_good(start_graces: &[u32]) {
     }
     if let Some(f) = er_logic::fast_travel::prime_known_good(start_graces) {
         KNOWN_GOOD_FLAG.store(f as i32, Ordering::Relaxed);
-        log::info!("fast-travel: primed known-good flag {f} from startGraces (no flag is ever SET)");
+        log::info!(
+            "fast-travel: primed known-good flag {f} from startGraces (no flag is ever SET)"
+        );
     }
 }

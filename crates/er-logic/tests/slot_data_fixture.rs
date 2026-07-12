@@ -53,16 +53,21 @@ fn real_generated_slot_data_parses_through_every_er_logic_consumer() {
         .expect("apIdsToItemIds missing / not an object");
     assert!(!map.is_empty(), "apIdsToItemIds empty");
     for (k, v) in map {
-        k.parse::<i64>().unwrap_or_else(|_| panic!("apIdsToItemIds key '{k}' not an int"));
-        v.as_i64().unwrap_or_else(|| panic!("apIdsToItemIds['{k}'] not an int"));
+        k.parse::<i64>()
+            .unwrap_or_else(|_| panic!("apIdsToItemIds key '{k}' not an int"));
+        v.as_i64()
+            .unwrap_or_else(|| panic!("apIdsToItemIds['{k}'] not an int"));
     }
 
     // --- itemCounts: same key shape, values >= 1 (core.rs clamps with .max(1) -- a 0 here
     //     would be silently corrected; catch it at the contract instead) ---
     if let Some(counts) = sd.get("itemCounts").and_then(|v| v.as_object()) {
         for (k, v) in counts {
-            k.parse::<i64>().unwrap_or_else(|_| panic!("itemCounts key '{k}' not an int"));
-            let n = v.as_i64().unwrap_or_else(|| panic!("itemCounts['{k}'] not an int"));
+            k.parse::<i64>()
+                .unwrap_or_else(|_| panic!("itemCounts key '{k}' not an int"));
+            let n = v
+                .as_i64()
+                .unwrap_or_else(|| panic!("itemCounts['{k}'] not an int"));
             assert!(n >= 1, "itemCounts['{k}'] = {n} (< 1)");
         }
     }
@@ -81,7 +86,11 @@ fn real_generated_slot_data_parses_through_every_er_logic_consumer() {
     if let Some(rows) = sd.get("areaLockFlags").and_then(|v| v.as_array()) {
         for row in rows {
             let r = row.as_array().expect("areaLockFlags row not an array");
-            assert_eq!(r.len(), 3, "areaLockFlags row not a [lo, hi, flag] triple: {row}");
+            assert_eq!(
+                r.len(),
+                3,
+                "areaLockFlags row not a [lo, hi, flag] triple: {row}"
+            );
             for x in r {
                 x.as_i64().expect("areaLockFlags entry not an int");
             }

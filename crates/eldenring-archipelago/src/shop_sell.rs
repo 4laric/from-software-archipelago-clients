@@ -33,8 +33,8 @@
 use eldenring::cs::{ShopLineupParam, SoloParamRepository};
 use fromsoftware_shared::FromStatic;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// slot_data `locationFlags` (AP location id -> guarding event flag). Inverted at run to map a row's
 /// `eventFlag_forStock` back to its AP location (-> scout reward). Set by net.rs.
@@ -58,7 +58,10 @@ static ARMED_SUPPRESS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 static ECHO_SKIP: Mutex<Option<HashMap<i64, u32>>> = Mutex::new(None);
 
 pub fn configure(location_flags: HashMap<i64, u32>) {
-    log::info!("shop-sell: configured {} location flag(s)", location_flags.len());
+    log::info!(
+        "shop-sell: configured {} location flag(s)",
+        location_flags.len()
+    );
     *CONFIGURED.lock().unwrap() = Some(location_flags);
 }
 
@@ -85,7 +88,11 @@ pub fn should_suppress_sold(full_id: i32, _get_flag: &dyn Fn(u32) -> bool) -> bo
             let hit = set.remove(&flag); // one-shot: consume the arm; true iff it was armed
             log::info!(
                 "shop-sell: bag-add of registered ware {full_id:#x} (stock flag {flag}) -> {}",
-                if hit { "SUPPRESSED (arm consumed)" } else { "PASSED (arm already consumed / never armed)" }
+                if hit {
+                    "SUPPRESSED (arm consumed)"
+                } else {
+                    "PASSED (arm already consumed / never armed)"
+                }
             );
             hit
         }
@@ -152,10 +159,16 @@ pub fn run() -> bool {
         if f == 0 {
             continue;
         }
-        let Some(&loc) = flag_to_loc.get(&f) else { continue };
-        let Some(s) = crate::scout_proof::lookup(loc) else { continue };
+        let Some(&loc) = flag_to_loc.get(&f) else {
+            continue;
+        };
+        let Some(s) = crate::scout_proof::lookup(loc) else {
+            continue;
+        };
         let Some(fid) = s.er_sell_id else { continue }; // own-world sellable category only
-        let Some(etype) = equip_type_for(fid) else { continue };
+        let Some(etype) = equip_type_for(fid) else {
+            continue;
+        };
         // SHOP_CTD_GUARD REMOVED 2026-07-11 (Alaric). It bailed on WEAPON-category slots rewritten to
         // a NON-WEAPON reward, on a 3x CTD repro from 2026-07-03 (Longbow->Tear, Great Arrow->Smithing
         // Stone, Gostoc arrows->Talisman Pouch). That repro is now believed CONFOUNDED by the bag-add

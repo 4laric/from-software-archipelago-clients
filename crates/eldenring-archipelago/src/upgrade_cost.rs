@@ -33,7 +33,7 @@ use fromsoftware_shared::FromStatic;
 // (`upgrade_cost`), where they are replay-tested (`upgrade_cost_replay`) against the reconnect param
 // reload. This module supplies the live-param seam; it must use the SAME decision so the test guards
 // the shipped path.
-use er_logic::upgrade_cost::{clamp_count, MAX_CAP};
+use er_logic::upgrade_cost::{MAX_CAP, clamp_count};
 
 /// Resolved stones-per-level cap: 0 = off, 1..MAX_CAP = cap each regular step at N. Set from
 /// slot_data at connect.

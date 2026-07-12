@@ -52,7 +52,10 @@ pub struct FlattenLatch {
 
 impl Default for FlattenLatch {
     fn default() -> Self {
-        FlattenLatch { cap: 0, applied_at: SENTINEL }
+        FlattenLatch {
+            cap: 0,
+            applied_at: SENTINEL,
+        }
     }
 }
 

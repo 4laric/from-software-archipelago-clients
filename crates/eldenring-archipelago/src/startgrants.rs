@@ -70,7 +70,10 @@ pub fn parse(sd: &Value) -> StartConfig {
         // .as_bool() read as absent — silently skipping the DLC map-reveal flags. The
         // top-level key stays as a bool fallback for older seeds.
         enable_dlc: er_logic::options::parse_dlc(sd)
-            || sd.get("enable_dlc").and_then(|v| v.as_bool()).unwrap_or(false),
+            || sd
+                .get("enable_dlc")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
     }
 }
 
@@ -147,13 +150,19 @@ mod tests {
     use super::*;
 
     fn cfg(enable_dlc: bool) -> StartConfig {
-        StartConfig { enable_dlc, ..Default::default() }
+        StartConfig {
+            enable_dlc,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn dlc_view_unlock_rides_along_only_when_dlc_enabled() {
         // Base game: the underground view-unlock is the only unconditional map flag.
-        assert_eq!(always_map_flags_for(&cfg(false)), vec![UNDERGROUND_MAP_VIEW_UNLOCK]);
+        assert_eq!(
+            always_map_flags_for(&cfg(false)),
+            vec![UNDERGROUND_MAP_VIEW_UNLOCK]
+        );
         // DLC in play: 82002 "Show DLC Map" is set unconditionally too, so the Land of Shadow layer
         // paints once its fragments are set -- the fix for "DLC map not granted" (was masked by the
         // forced start-warp into the DLC natively setting 82002).

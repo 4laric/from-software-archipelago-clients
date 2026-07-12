@@ -83,7 +83,9 @@ mod replay {
 
     impl FreshSaveGame {
         fn new() -> Self {
-            FreshSaveGame { flags: HashMap::new() }
+            FreshSaveGame {
+                flags: HashMap::new(),
+            }
         }
         fn is_set(&self, flag: u32) -> bool {
             self.flags.get(&flag).copied().unwrap_or(false)
@@ -172,7 +174,11 @@ mod replay {
                         newly_set_since_baseline(&WATCHED, &baseline, &|f| g.get_event_flag(f))
                     } else {
                         // Today's poll: raw level check — set == check (the bug).
-                        WATCHED.iter().copied().filter(|&f| g.get_event_flag(f)).collect()
+                        WATCHED
+                            .iter()
+                            .copied()
+                            .filter(|&f| g.get_event_flag(f))
+                            .collect()
                     };
                     for f in candidates {
                         if !fired.contains(&f) {
@@ -202,7 +208,13 @@ mod replay {
     fn baseline_snapshot_suppresses_fresh_save_defaults() {
         // Fixed: the Connect snapshot captures 60000/60020 as baseline; polls — first and later —
         // must never fire them.
-        let timeline = [Ev::FreshSaveDefaults, Ev::Connect, Ev::Poll, Ev::Poll, Ev::Poll];
+        let timeline = [
+            Ev::FreshSaveDefaults,
+            Ev::Connect,
+            Ev::Poll,
+            Ev::Poll,
+            Ev::Poll,
+        ];
         let fired = replay(&timeline, true);
         assert!(
             fired.is_empty(),
@@ -254,7 +266,10 @@ mod replay {
 
         // Empty baseline degrades to the raw level check — every set watched flag reports.
         let empty: HashSet<u32> = HashSet::new();
-        assert_eq!(newly_set_since_baseline(&WATCHED, &empty, &now_all_set), WATCHED.to_vec());
+        assert_eq!(
+            newly_set_since_baseline(&WATCHED, &empty, &now_all_set),
+            WATCHED.to_vec()
+        );
     }
 
     #[test]

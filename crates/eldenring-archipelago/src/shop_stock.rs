@@ -34,10 +34,10 @@
 #![allow(dead_code)]
 
 use eldenring::cs::{ShopLineupParam, SoloParamRepository};
-use fromsoftware_shared::FromStatic;   // brings SoloParamRepository::instance_mut into scope
+use fromsoftware_shared::FromStatic; // brings SoloParamRepository::instance_mut into scope
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// row id -> (goods row id, equipType, price). From slot_data `shopInfiniteStock`.
 static ROLL: Mutex<Option<HashMap<u32, (i32, u8, i32)>>> = Mutex::new(None);
@@ -79,7 +79,9 @@ pub fn run() -> bool {
 
     let mut n = 0usize;
     for (row_id, (gid, etype, price)) in roll {
-        let Some(row) = repo.get_mut::<ShopLineupParam>(row_id) else { continue };
+        let Some(row) = repo.get_mut::<ShopLineupParam>(row_id) else {
+            continue;
+        };
         // Idempotent: skip rows already rerolled (run() is re-armed on tick).
         if row.equip_id() == gid && row.equip_type() == etype && row.value() == price {
             continue;
@@ -92,7 +94,9 @@ pub fn run() -> bool {
         // sellQuantity stays -1: infinite stock is the whole point.
         n += 1;
     }
-    log::info!("shop-stock: rerolled {n} infinite-stock slot(s) to consumables (priced from the item)");
+    log::info!(
+        "shop-stock: rerolled {n} infinite-stock slot(s) to consumables (priced from the item)"
+    );
     DONE.store(true, Ordering::Relaxed);
     true
 }

@@ -23,8 +23,8 @@
 //!   LocatedItem::item()     -> Item     ; .name() -> ustr::Ustr (Display / AsRef<str>)
 //!   LocatedItem::receiver() -> &Player  ; .alias() -> &str  (the owning player)
 
-use archipelago_rs as ap;
 use ap::CreateAsHint; // re-exported at crate root via `pub use protocol::*`.
+use archipelago_rs as ap;
 use oneshot::TryRecvError;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -174,7 +174,10 @@ impl ScoutProof {
                 self.done = true;
                 return;
             }
-            log::info!("AP scout-proof: scouting {} location(s) (CreateAsHint::No)", locations.len());
+            log::info!(
+                "AP scout-proof: scouting {} location(s) (CreateAsHint::No)",
+                locations.len()
+            );
             self.rx = Some(client.scout_locations(locations, CreateAsHint::No));
             return; // the reply can't be here yet; poll on the next tick.
         }
@@ -188,15 +191,16 @@ impl ScoutProof {
                 self.rx = None;
                 self.done = true;
                 store(&items); // populate the cache fmg_inject reads (names + captions)
-                log::info!("AP scout-proof: received info for {} location(s) ===", items.len());
+                log::info!(
+                    "AP scout-proof: received info for {} location(s) ===",
+                    items.len()
+                );
                 for li in &items {
                     let loc_id = li.location().id();
                     let item_name = li.item().name(); // ustr::Ustr (Display / AsRef<str>)
                     let owner = li.receiver().alias(); // owning player's alias
-                    let line = er_logic::name_override::display_name(
-                        item_name.as_str(),
-                        Some(owner),
-                    );
+                    let line =
+                        er_logic::name_override::display_name(item_name.as_str(), Some(owner));
                     log::info!("AP scout-proof: location {loc_id} -> {line}");
                 }
                 log::info!("AP scout-proof: === data path PROVEN (names above) ===");
@@ -211,7 +215,9 @@ impl ScoutProof {
                 // Sender dropped: the connection went away before the reply arrived. NOTHING
                 // rebuilds this on reconnect (R8, SWEEP), so re-arm instead of latching done.
                 self.rx = None;
-                log::warn!("AP scout-proof: scout receiver dropped before a reply (connection lost?)");
+                log::warn!(
+                    "AP scout-proof: scout receiver dropped before a reply (connection lost?)"
+                );
                 self.fail_or_retry();
             }
         }

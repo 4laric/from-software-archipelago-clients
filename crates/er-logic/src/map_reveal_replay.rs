@@ -192,7 +192,10 @@ mod replay {
             !g.holds_map_piece(),
             "fixed path must grant NO map-piece item (set reveal flags only)"
         );
-        assert!(g.grants.is_empty(), "fixed path must grant nothing at all on a region unlock");
+        assert!(
+            g.grants.is_empty(),
+            "fixed path must grant nothing at all on a region unlock"
+        );
     }
 
     #[test]
@@ -207,7 +210,10 @@ mod replay {
         for f in [62060, 62061, 62062, 62063, 62064] {
             assert!(g.is_set(f), "underground unlock must set fragment flag {f}");
         }
-        assert!(!g.holds_map_piece(), "underground unlock must still grant no item");
+        assert!(
+            !g.holds_map_piece(),
+            "underground unlock must still grant no item"
+        );
     }
 
     #[test]
@@ -217,7 +223,14 @@ mod replay {
         // Underground = fragments + 82001, appended last.
         assert_eq!(
             map_reveal_flags("Underground"),
-            vec![62060, 62061, 62062, 62063, 62064, UNDERGROUND_MAP_VIEW_UNLOCK]
+            vec![
+                62060,
+                62061,
+                62062,
+                62063,
+                62064,
+                UNDERGROUND_MAP_VIEW_UNLOCK
+            ]
         );
         assert!(
             map_reveal_flags("Underground").contains(&82001),

@@ -98,7 +98,11 @@ pub enum ItemSemantics {
     /// NOT be granted again. It is still ledgered — with `apply=false` — so the per-save watermark
     /// advances PAST its index (a reload never reconsiders it). `false` = an ordinary consumable that
     /// grants once (two Golden Runes at two indices are two grants).
-    Consumable { full_id: GoodsId, qty: i32, echo_skip: bool },
+    Consumable {
+        full_id: GoodsId,
+        qty: i32,
+        echo_skip: bool,
+    },
     /// A PROGRESSIVE item: the Nth received copy of this NAME lands tier N (that tier's unique goods
     /// + observable flags); every copy past the last tier yields exactly ONE overflow consumable
     /// (`overflow_full_id`, e.g. a Lord's Rune). The desired state depends only on the COUNT of
@@ -307,7 +311,11 @@ impl DesiredState {
                     );
                     d.flags.insert(*restored_flag, true);
                 }
-                ItemSemantics::Consumable { full_id, qty, echo_skip } => {
+                ItemSemantics::Consumable {
+                    full_id,
+                    qty,
+                    echo_skip,
+                } => {
                     d.ledgered.push(LedgeredGrant {
                         index: it.index,
                         full_id: *full_id,
@@ -335,10 +343,14 @@ impl DesiredState {
         //    are never OWNED (never cleared), like key-item obtained flags.
         let mut prog: BTreeMap<&str, (&Vec<ProgTier>, GoodsId, Vec<ItemIndex>)> = BTreeMap::new();
         for it in &inputs.received {
-            if let ItemSemantics::Progressive { tiers, overflow_full_id } = &it.semantics {
-                let e = prog
-                    .entry(it.name.as_str())
-                    .or_insert((tiers, *overflow_full_id, Vec::new()));
+            if let ItemSemantics::Progressive {
+                tiers,
+                overflow_full_id,
+            } = &it.semantics
+            {
+                let e =
+                    prog.entry(it.name.as_str())
+                        .or_insert((tiers, *overflow_full_id, Vec::new()));
                 e.2.push(it.index);
             }
         }
@@ -373,7 +385,12 @@ impl DesiredState {
     /// filter regardless), while the negative start-item band still pulls it below zero so those
     /// grants are owed on a fresh save. Empty ledger => 0.
     pub fn ledger_floor(&self) -> ItemIndex {
-        self.ledgered.iter().map(|l| l.index).min().unwrap_or(0).min(0)
+        self.ledgered
+            .iter()
+            .map(|l| l.index)
+            .min()
+            .unwrap_or(0)
+            .min(0)
     }
 }
 
@@ -442,7 +459,11 @@ pub fn diff(desired: &DesiredState, observed: &ObservedState) -> Vec<Action> {
     // Ledger: index order, only the still-owed tail. (build() already sorted; filter is stable.)
     // A real grant emits `GrantLedgered`; a deduped shop-native echo (`apply=false`) emits
     // `SkipLedgered`, which advances the watermark past its index without touching the game.
-    for l in desired.ledgered.iter().filter(|l| l.index >= observed.applied_watermark) {
+    for l in desired
+        .ledgered
+        .iter()
+        .filter(|l| l.index >= observed.applied_watermark)
+    {
         if l.apply {
             out.push(Action::GrantLedgered {
                 index: l.index,
@@ -533,9 +554,17 @@ pub struct ApplyClasses {
 
 impl ApplyClasses {
     /// Own everything (the end state, and what plain [`Reconciler::tick`] uses).
-    pub const ALL: Self = Self { flags: true, goods: true, ledger: true };
+    pub const ALL: Self = Self {
+        flags: true,
+        goods: true,
+        ledger: true,
+    };
     /// Own nothing (equivalent to dry-run for the apply path).
-    pub const NONE: Self = Self { flags: false, goods: false, ledger: false };
+    pub const NONE: Self = Self {
+        flags: false,
+        goods: false,
+        ledger: false,
+    };
 
     /// Is `action` in an enabled class?
     pub fn allows(&self, action: &Action) -> bool {
@@ -868,7 +897,11 @@ impl Reconciler {
         // tail replays next tick (mirrors receive.rs's rollback protocol).
         for a in &actions {
             match a {
-                Action::GrantLedgered { index, full_id, qty } => {
+                Action::GrantLedgered {
+                    index,
+                    full_id,
+                    qty,
+                } => {
                     if !grants_allowed {
                         deferred = true; // paced: hold the ledger tail for a later tick
                         break;
@@ -1025,7 +1058,10 @@ impl MockGame {
 
     /// How many times a consumable full_id was granted (>1 == double-grant).
     pub fn ledger_count(&self, full_id: GoodsId) -> usize {
-        self.ledger_log.iter().filter(|&&(id, _)| id == full_id).count()
+        self.ledger_log
+            .iter()
+            .filter(|&&(id, _)| id == full_id)
+            .count()
     }
 
     /// Force a good OUT of inventory (models a bulk-load clobber / a lost item), so the next tick's
@@ -1105,15 +1141,29 @@ mod tests {
         ReceivedItem {
             index,
             name: name.into(),
-            semantics: ItemSemantics::Consumable { full_id, qty, echo_skip: false },
+            semantics: ItemSemantics::Consumable {
+                full_id,
+                qty,
+                echo_skip: false,
+            },
         }
     }
     /// A shop-native consumable: `echo_skip=true` is the echo of a natively-sold reward (dedup).
-    fn shop_consumable(index: ItemIndex, name: &str, full_id: GoodsId, qty: i32, echo_skip: bool) -> ReceivedItem {
+    fn shop_consumable(
+        index: ItemIndex,
+        name: &str,
+        full_id: GoodsId,
+        qty: i32,
+        echo_skip: bool,
+    ) -> ReceivedItem {
         ReceivedItem {
             index,
             name: name.into(),
-            semantics: ItemSemantics::Consumable { full_id, qty, echo_skip },
+            semantics: ItemSemantics::Consumable {
+                full_id,
+                qty,
+                echo_skip,
+            },
         }
     }
 
@@ -1135,14 +1185,22 @@ mod tests {
         }
     }
     /// A single received copy of a progressive item. All copies of one name carry the same tiers.
-    fn progressive(index: ItemIndex, name: &str, tiers: &[(&[GoodsId], &[FlagId])], overflow: GoodsId) -> ReceivedItem {
+    fn progressive(
+        index: ItemIndex,
+        name: &str,
+        tiers: &[(&[GoodsId], &[FlagId])],
+        overflow: GoodsId,
+    ) -> ReceivedItem {
         ReceivedItem {
             index,
             name: name.into(),
             semantics: ItemSemantics::Progressive {
                 tiers: tiers
                     .iter()
-                    .map(|(g, f)| ProgTier { goods: g.to_vec(), flags: f.to_vec() })
+                    .map(|(g, f)| ProgTier {
+                        goods: g.to_vec(),
+                        flags: f.to_vec(),
+                    })
                     .collect(),
                 overflow_full_id: overflow,
             },
@@ -1159,7 +1217,10 @@ mod tests {
             seed: seed.into(),
             save: SaveIdentity("slot0".into()),
             received,
-            slot_data: SlotData { seal_flags, ..Default::default() },
+            slot_data: SlotData {
+                seal_flags,
+                ..Default::default()
+            },
         }
     }
 
@@ -1184,8 +1245,15 @@ mod tests {
             vec![map_piece(0, "Underground Map", &[62060, 62061, 82001])],
             vec![],
         ));
-        assert!(d.unique_goods.is_empty(), "map pieces must produce no unique goods");
-        assert_eq!(d.flags.get(&82001), Some(&true), "the 82001 view-unlock must be desired");
+        assert!(
+            d.unique_goods.is_empty(),
+            "map pieces must produce no unique goods"
+        );
+        assert_eq!(
+            d.flags.get(&82001),
+            Some(&true),
+            "the 82001 view-unlock must be desired"
+        );
         assert_eq!(d.flags.get(&62060), Some(&true));
         let obs = ObservedState::default();
         let actions = diff(&d, &obs);
@@ -1197,20 +1265,39 @@ mod tests {
 
     #[test]
     fn great_rune_is_good_plus_restored_flag() {
-        let d = DesiredState::build(&inputs("A", vec![great_rune(0, "Godrick's Great Rune", 191, 6901)], vec![]));
+        let d = DesiredState::build(&inputs(
+            "A",
+            vec![great_rune(0, "Godrick's Great Rune", 191, 6901)],
+            vec![],
+        ));
         assert!(d.unique_goods.contains_key(&191));
         assert_eq!(d.unique_goods[&191].companion_flags, vec![6901]);
-        assert_eq!(d.flags.get(&6901), Some(&true), "restored flag is an independent observable flag");
+        assert_eq!(
+            d.flags.get(&6901),
+            Some(&true),
+            "restored flag is an independent observable flag"
+        );
     }
 
     #[test]
     fn region_seal_default_overridden_by_received_lock() {
         let sealed = DesiredState::build(&inputs("A", vec![], vec![76980]));
         assert_eq!(sealed.flags.get(&76980), Some(&false));
-        assert!(sealed.owned_flags.contains(&76980), "seal flags are owned (clearable)");
+        assert!(
+            sealed.owned_flags.contains(&76980),
+            "seal flags are owned (clearable)"
+        );
 
-        let opened = DesiredState::build(&inputs("A", vec![region(0, "Caelid Lock", &[76980])], vec![76980]));
-        assert_eq!(opened.flags.get(&76980), Some(&true), "the Lock opens the region");
+        let opened = DesiredState::build(&inputs(
+            "A",
+            vec![region(0, "Caelid Lock", &[76980])],
+            vec![76980],
+        ));
+        assert_eq!(
+            opened.flags.get(&76980),
+            Some(&true),
+            "the Lock opens the region"
+        );
     }
 
     // ---- diff semantics ------------------------------------------------------------------
@@ -1244,12 +1331,23 @@ mod tests {
 
         let out = r.tick(&mut g, TickBudget::default());
         assert!(out.skipped_unstable, "an unstable tick must skip");
-        assert!(g.ledger_log.is_empty(), "no grant may land while unstable (no clobber race)");
-        assert_eq!(r.applied_watermark(), 0, "watermark must not advance on an unstable tick");
+        assert!(
+            g.ledger_log.is_empty(),
+            "no grant may land while unstable (no clobber race)"
+        );
+        assert_eq!(
+            r.applied_watermark(),
+            0,
+            "watermark must not advance on an unstable tick"
+        );
 
         g.set_stable(true);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(2008), 1, "the Torch grants exactly once once stable");
+        assert_eq!(
+            g.ledger_count(2008),
+            1,
+            "the Torch grants exactly once once stable"
+        );
     }
 
     // ---- flask double-grant (ledger watermark) ------------------------------------------
@@ -1274,7 +1372,11 @@ mod tests {
         // RELOAD: rebuild the reconciler FROM PERSISTED watermark and the full stream.
         let mut r2 = Reconciler::from_persisted(inputs("A", items, vec![]), wm);
         r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(1001), 1, "no second grant after reload (flask double-grant fix)");
+        assert_eq!(
+            g.ledger_count(1001),
+            1,
+            "no second grant after reload (flask double-grant fix)"
+        );
         assert_eq!(g.ledger_count(1002), 1);
     }
 
@@ -1285,7 +1387,11 @@ mod tests {
         // gf-great-rune-double-grant: once the good is present the diff for it is empty, so a second
         // convergence pass (reconnect) re-grants NOTHING.
         let mut g = MockGame::stable();
-        let mut r = Reconciler::new(inputs("A", vec![great_rune(0, "Godrick's Great Rune", 191, 6901)], vec![]));
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![great_rune(0, "Godrick's Great Rune", 191, 6901)],
+            vec![],
+        ));
 
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert!(g.has_good(191), "the rune good is granted once");
@@ -1296,7 +1402,10 @@ mod tests {
             unique_goods: [191i32].into_iter().collect(),
             applied_watermark: 0,
         };
-        assert!(diff(r.desired(), &obs).is_empty(), "present good -> empty diff (no double-grant)");
+        assert!(
+            diff(r.desired(), &obs).is_empty(),
+            "present good -> empty diff (no double-grant)"
+        );
     }
 
     #[test]
@@ -1314,7 +1423,11 @@ mod tests {
             vec![],
         ));
 
-        let flags_only = ApplyClasses { flags: true, goods: false, ledger: false };
+        let flags_only = ApplyClasses {
+            flags: true,
+            goods: false,
+            ledger: false,
+        };
         let mut n = 0;
         loop {
             let out = r.tick_with_classes(&mut g, TickBudget::default(), flags_only);
@@ -1324,8 +1437,15 @@ mod tests {
             }
         }
         assert!(g.get_flag(76971), "region flag applied under flags-only");
-        assert!(!g.has_good(191), "the rune good is NOT granted while goods is disabled");
-        assert_eq!(g.ledger_count(2008), 0, "no consumable granted while ledger is disabled");
+        assert!(
+            !g.has_good(191),
+            "the rune good is NOT granted while goods is disabled"
+        );
+        assert_eq!(
+            g.ledger_count(2008),
+            0,
+            "no consumable granted while ledger is disabled"
+        );
 
         // Phase 3: enable everything; the good + consumable now land, still exactly once.
         r.mark_dirty();
@@ -1350,15 +1470,22 @@ mod tests {
 
         let planned = r.dry_run_actions(&g);
         assert!(planned.iter().any(|a| matches!(a, Action::SetFlag(76971))));
-        assert!(planned.iter().any(|a| matches!(a, Action::GrantUnique(191, _))));
-        assert!(planned.iter().any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. })));
+        assert!(planned
+            .iter()
+            .any(|a| matches!(a, Action::GrantUnique(191, _))));
+        assert!(planned
+            .iter()
+            .any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. })));
         // Nothing was applied: no flags, no goods, no ledger entries, watermark untouched.
         assert!(g.flags.is_empty() && g.goods.is_empty() && g.ledger_log.is_empty());
         assert_eq!(r.applied_watermark(), 0);
 
         // An unstable game plans nothing.
         g.set_stable(false);
-        assert!(r.dry_run_actions(&g).is_empty(), "no plan while the world is unstable");
+        assert!(
+            r.dry_run_actions(&g).is_empty(),
+            "no plan while the world is unstable"
+        );
     }
 
     // ---- bundle-lock grace self-heal ----------------------------------------------------
@@ -1368,7 +1495,11 @@ mod tests {
         // er-bundle-lock-grace-reconcile-gap: a region grace bundle flag DESIRED set but reading
         // clear (lost after a save-load) must be re-set on the next stable tick — repeatedly.
         let mut g = MockGame::stable();
-        let mut r = Reconciler::new(inputs("A", vec![region(0, "Limgrave Lock", &[76971, 76972])], vec![]));
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![region(0, "Limgrave Lock", &[76971, 76972])],
+            vec![],
+        ));
 
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert!(g.get_flag(76971) && g.get_flag(76972), "grace bundle set");
@@ -1376,7 +1507,10 @@ mod tests {
         g.flags.insert(76971, false); // the game loses a bundle flag
         r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert!(g.get_flag(76971), "the lost grace flag self-heals on the next reconcile");
+        assert!(
+            g.get_flag(76971),
+            "the lost grace flag self-heals on the next reconcile"
+        );
     }
 
     // ---- reconnect-new-seed swap --------------------------------------------------------
@@ -1387,21 +1521,46 @@ mod tests {
         // rebuilds the per-seed desired state, and resets the ledger watermark so seed B's own
         // consumables grant fresh. No indexing, no stale table survives.
         let mut g = MockGame::stable();
-        let mut r = Reconciler::new(inputs("A", vec![consumable(0, "Golden Rune", 5001, 1)], vec![]));
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![consumable(0, "Golden Rune", 5001, 1)],
+            vec![],
+        ));
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(r.applied_watermark(), 1);
 
-        r.set_inputs(inputs("B", vec![consumable(0, "Golden Rune", 5002, 1)], vec![]));
-        assert_eq!(r.applied_watermark(), 0, "a genuine seed change resets the ledger watermark");
+        r.set_inputs(inputs(
+            "B",
+            vec![consumable(0, "Golden Rune", 5002, 1)],
+            vec![],
+        ));
+        assert_eq!(
+            r.applied_watermark(),
+            0,
+            "a genuine seed change resets the ledger watermark"
+        );
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(5002), 1, "seed B's consumable grants fresh after the swap");
+        assert_eq!(
+            g.ledger_count(5002),
+            1,
+            "seed B's consumable grants fresh after the swap"
+        );
     }
 
     #[test]
     fn same_seed_reconnect_keeps_watermark() {
-        let mut r = Reconciler::from_persisted(inputs("A", vec![consumable(0, "X", 42, 1)], vec![]), 1);
-        r.set_inputs(inputs("A", vec![consumable(0, "X", 42, 1), consumable(1, "Y", 43, 1)], vec![]));
-        assert_eq!(r.applied_watermark(), 1, "same-seed reconnect preserves the watermark");
+        let mut r =
+            Reconciler::from_persisted(inputs("A", vec![consumable(0, "X", 42, 1)], vec![]), 1);
+        r.set_inputs(inputs(
+            "A",
+            vec![consumable(0, "X", 42, 1), consumable(1, "Y", 43, 1)],
+            vec![],
+        ));
+        assert_eq!(
+            r.applied_watermark(),
+            1,
+            "same-seed reconnect preserves the watermark"
+        );
     }
 
     // ---- budget draining -----------------------------------------------------------------
@@ -1415,14 +1574,29 @@ mod tests {
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(inputs("A", received, vec![]));
 
-        let budget = TickBudget { goods: 4, flags: 32, min_grant_interval_ms: 0 };
+        let budget = TickBudget {
+            goods: 4,
+            flags: 32,
+            min_grant_interval_ms: 0,
+        };
         let out = r.tick(&mut g, budget);
-        assert_eq!(out.applied.len(), 4, "one tick applies at most `goods` ledger grants");
+        assert_eq!(
+            out.applied.len(),
+            4,
+            "one tick applies at most `goods` ledger grants"
+        );
         assert!(!out.converged, "still more to do");
 
         let ticks = r.run_to_fixpoint(&mut g, budget, 50);
-        assert_eq!(g.ledger_log.len(), 20, "all 20 consumables eventually land, each once");
-        assert!(ticks <= 6, "20 items / 4 per tick drains in a handful of ticks, took {ticks}");
+        assert_eq!(
+            g.ledger_log.len(),
+            20,
+            "all 20 consumables eventually land, each once"
+        );
+        assert!(
+            ticks <= 6,
+            "20 items / 4 per tick drains in a handful of ticks, took {ticks}"
+        );
     }
 
     // ---- grant pacing (mass-grant CTD guard) ---------------------------------------------
@@ -1437,7 +1611,11 @@ mod tests {
             .collect();
         let mut g = MockGame::stable(); // now_ms starts at 0
         let mut r = Reconciler::new(inputs("A", received, vec![]));
-        let budget = TickBudget { goods: 2, flags: 32, min_grant_interval_ms: 150 };
+        let budget = TickBudget {
+            goods: 2,
+            flags: 32,
+            min_grant_interval_ms: 150,
+        };
 
         // t=0: first burst lands (capped at `goods`), then the cooldown arms.
         let out = r.tick(&mut g, budget);
@@ -1447,21 +1625,35 @@ mod tests {
         // Ticking WITHOUT advancing the clock grants nothing — the cooldown has not elapsed.
         for _ in 0..5 {
             let out = r.tick(&mut g, budget);
-            assert!(out.applied.is_empty(), "no grant lands before the interval elapses");
+            assert!(
+                out.applied.is_empty(),
+                "no grant lands before the interval elapses"
+            );
             assert!(!out.converged, "still owed, stays dirty");
         }
-        assert_eq!(g.ledger_log.len(), 2, "clock frozen => still only the first burst landed");
+        assert_eq!(
+            g.ledger_log.len(),
+            2,
+            "clock frozen => still only the first burst landed"
+        );
 
         // Advancing past the interval releases exactly one more burst.
         g.advance_ms(150);
         let out = r.tick(&mut g, budget);
-        assert_eq!(out.applied.len(), 2, "a second burst lands once the cooldown clears");
+        assert_eq!(
+            out.applied.len(),
+            2,
+            "a second burst lands once the cooldown clears"
+        );
         assert_eq!(g.ledger_log.len(), 4);
 
         // Just short of the interval holds again (boundary check).
         g.advance_ms(149);
         let out = r.tick(&mut g, budget);
-        assert!(out.applied.is_empty(), "149ms < 150ms interval => still held");
+        assert!(
+            out.applied.is_empty(),
+            "149ms < 150ms interval => still held"
+        );
     }
 
     /// Pacing must not LOSE or DUPLICATE anything: advancing the clock each tick eventually drains the
@@ -1473,7 +1665,11 @@ mod tests {
             .collect();
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(inputs("A", received, vec![]));
-        let budget = TickBudget { goods: 2, flags: 32, min_grant_interval_ms: 150 };
+        let budget = TickBudget {
+            goods: 2,
+            flags: 32,
+            min_grant_interval_ms: 150,
+        };
 
         for _ in 0..20 {
             r.tick(&mut g, budget);
@@ -1482,7 +1678,11 @@ mod tests {
             }
             g.advance_ms(150); // a full interval per tick => each tick may release a burst
         }
-        assert_eq!(g.ledger_log.len(), 12, "all consumables eventually land under pacing");
+        assert_eq!(
+            g.ledger_log.len(),
+            12,
+            "all consumables eventually land under pacing"
+        );
         for i in 0..12i32 {
             assert_eq!(g.ledger_count(6000 + i), 1, "no double-grant under pacing");
         }
@@ -1493,7 +1693,11 @@ mod tests {
     /// proves the held good self-heals once the interval clears.
     #[test]
     fn pacing_holds_goods_but_lets_flags_through() {
-        let budget = TickBudget { goods: 4, flags: 32, min_grant_interval_ms: 150 };
+        let budget = TickBudget {
+            goods: 4,
+            flags: 32,
+            min_grant_interval_ms: 150,
+        };
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(inputs("A", vec![key_item(0, "K", 9000, &[])], vec![]));
 
@@ -1509,14 +1713,23 @@ mod tests {
             vec![],
         ));
         let out = r.tick(&mut g, budget); // clock still 0 => the good re-grant is held
-        assert!(g.get_flag(76971), "the flag lands immediately (flags are never paced)");
-        assert!(!g.has_good(9000), "the good re-grant is HELD until the interval elapses");
+        assert!(
+            g.get_flag(76971),
+            "the flag lands immediately (flags are never paced)"
+        );
+        assert!(
+            !g.has_good(9000),
+            "the good re-grant is HELD until the interval elapses"
+        );
         assert!(!out.converged, "still owes the good, stays dirty");
 
         // Once the cooldown clears, the held good self-heals.
         g.advance_ms(150);
         r.run_to_fixpoint(&mut g, budget, 4);
-        assert!(g.has_good(9000), "the good self-heals after the cooldown clears");
+        assert!(
+            g.has_good(9000),
+            "the good self-heals after the cooldown clears"
+        );
     }
 
     /// Pacing is OFF by default (`TickBudget::default().min_grant_interval_ms == 0`): the historical
@@ -1531,7 +1744,11 @@ mod tests {
         let mut r = Reconciler::new(inputs("A", received, vec![]));
         // With no pacing, a frozen clock still drains fully (budget is the only limiter).
         r.run_to_fixpoint(&mut g, TickBudget::default(), 20);
-        assert_eq!(g.ledger_log.len(), 10, "unpaced: drains without needing the clock to move");
+        assert_eq!(
+            g.ledger_log.len(),
+            10,
+            "unpaced: drains without needing the clock to move"
+        );
     }
 
     #[test]
@@ -1542,11 +1759,17 @@ mod tests {
 
         let out = r.tick(&mut g, TickBudget::default());
         assert!(!out.converged, "holder-not-ready must defer");
-        assert!(!g.get_flag(76971), "nothing set while the holder is not ready");
+        assert!(
+            !g.get_flag(76971),
+            "nothing set while the holder is not ready"
+        );
 
         g.flag_ready = true;
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert!(g.get_flag(76971), "the deferred flag lands once the holder is ready");
+        assert!(
+            g.get_flag(76971),
+            "the deferred flag lands once the holder is ready"
+        );
     }
 
     // ---- progressive items (count-based tiers) -------------------------------------------
@@ -1565,8 +1788,14 @@ mod tests {
         assert!(d.unique_goods.contains_key(&8101) && d.unique_goods.contains_key(&8102));
         assert_eq!(d.flags.get(&70001), Some(&true));
         assert_eq!(d.flags.get(&70002), Some(&true));
-        assert!(d.ledgered.is_empty(), "no overflow while copies <= tier count");
-        assert!(!d.owned_flags.contains(&70001), "tier flags are set-only, never owned");
+        assert!(
+            d.ledgered.is_empty(),
+            "no overflow while copies <= tier count"
+        );
+        assert!(
+            !d.owned_flags.contains(&70001),
+            "tier flags are set-only, never owned"
+        );
     }
 
     #[test]
@@ -1625,14 +1854,24 @@ mod tests {
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(inputs("A", items.clone(), vec![]));
         r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
-        assert!(g.has_good(8101) && g.has_good(8102), "both bell tiers granted");
-        assert!(g.get_flag(70001) && g.get_flag(70002), "both tier flags set");
+        assert!(
+            g.has_good(8101) && g.has_good(8102),
+            "both bell tiers granted"
+        );
+        assert!(
+            g.get_flag(70001) && g.get_flag(70002),
+            "both tier flags set"
+        );
         assert_eq!(g.ledger_count(2919), 1, "exactly one overflow Lord's Rune");
         let wm = r.applied_watermark();
 
         let mut r2 = Reconciler::from_persisted(inputs("A", items, vec![]), wm);
         r2.run_to_fixpoint(&mut g, TickBudget::default(), 16);
-        assert_eq!(g.ledger_count(2919), 1, "no second overflow grant after reload");
+        assert_eq!(
+            g.ledger_count(2919),
+            1,
+            "no second overflow grant after reload"
+        );
     }
 
     #[test]
@@ -1647,9 +1886,16 @@ mod tests {
         ));
         assert!(d.unique_goods.contains_key(&9000));
         assert_eq!(d.unique_goods[&9000].companion_flags, vec![400001]);
-        assert_eq!(d.flags.get(&400001), Some(&true), "obtained flag desired set");
+        assert_eq!(
+            d.flags.get(&400001),
+            Some(&true),
+            "obtained flag desired set"
+        );
         assert_eq!(d.flags.get(&9600), Some(&true), "goal flag desired set");
-        assert!(!d.owned_flags.contains(&400001), "obtained flag not owned (never cleared)");
+        assert!(
+            !d.owned_flags.contains(&400001),
+            "obtained flag not owned (never cleared)"
+        );
     }
 
     // ---- Gap 1: slot-data BULK grants (start graces / start items / reveal_all_maps / goal) ----
@@ -1663,8 +1909,15 @@ mod tests {
             ..Default::default()
         }));
         for f in [62010u32, 62011, 62012, 82001] {
-            assert_eq!(on.flags.get(&f), Some(&true), "map flag {f} desired when reveal_all_maps on");
-            assert!(!on.owned_flags.contains(&f), "map flags self-heal but are never owned/cleared");
+            assert_eq!(
+                on.flags.get(&f),
+                Some(&true),
+                "map flag {f} desired when reveal_all_maps on"
+            );
+            assert!(
+                !on.owned_flags.contains(&f),
+                "map flags self-heal but are never owned/cleared"
+            );
         }
 
         let off = DesiredState::build(&bulk_inputs(SlotData {
@@ -1673,9 +1926,16 @@ mod tests {
             always_map_flags: vec![82001],
             ..Default::default()
         }));
-        assert_eq!(off.flags.get(&82001), Some(&true), "the unconditional view-unlock is still desired");
+        assert_eq!(
+            off.flags.get(&82001),
+            Some(&true),
+            "the unconditional view-unlock is still desired"
+        );
         for f in [62010u32, 62011, 62012] {
-            assert!(off.flags.get(&f).is_none(), "reveal_all_maps OFF: world-map flag {f} not desired");
+            assert!(
+                off.flags.get(&f).is_none(),
+                "reveal_all_maps OFF: world-map flag {f} not desired"
+            );
         }
     }
 
@@ -1687,7 +1947,10 @@ mod tests {
         }));
         assert_eq!(d.flags.get(&76900), Some(&true));
         assert_eq!(d.flags.get(&76901), Some(&true));
-        assert!(!d.owned_flags.contains(&76900), "start graces are set-only, never cleared");
+        assert!(
+            !d.owned_flags.contains(&76900),
+            "start graces are set-only, never cleared"
+        );
     }
 
     #[test]
@@ -1697,23 +1960,39 @@ mod tests {
             goal_met: false,
             ..Default::default()
         }));
-        assert!(unmet.flags.get(&9990).is_none(), "goal flag not desired until the goal is met");
+        assert!(
+            unmet.flags.get(&9990).is_none(),
+            "goal flag not desired until the goal is met"
+        );
 
         let met = DesiredState::build(&bulk_inputs(SlotData {
             goal_flag: Some(9990),
             goal_met: true,
             ..Default::default()
         }));
-        assert_eq!(met.flags.get(&9990), Some(&true), "goal flag desired once the goal is met");
-        assert!(!met.owned_flags.contains(&9990), "goal flag is report-side, never cleared");
+        assert_eq!(
+            met.flags.get(&9990),
+            Some(&true),
+            "goal flag desired once the goal is met"
+        );
+        assert!(
+            !met.owned_flags.contains(&9990),
+            "goal flag is report-side, never cleared"
+        );
     }
 
     #[test]
     fn start_items_ledger_grants_once_across_a_reload() {
         let sd = SlotData {
             start_items: vec![
-                StartItem { full_id: 130, qty: 1 },  // Torrent-like
-                StartItem { full_id: 1001, qty: 3 }, // Flask
+                StartItem {
+                    full_id: 130,
+                    qty: 1,
+                }, // Torrent-like
+                StartItem {
+                    full_id: 1001,
+                    qty: 3,
+                }, // Flask
             ],
             ..Default::default()
         };
@@ -1725,16 +2004,35 @@ mod tests {
         );
 
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(130), 1, "the start item Torrent grants exactly once");
-        assert_eq!(g.ledger_count(1001), 1, "the start item Flask grants exactly once");
+        assert_eq!(
+            g.ledger_count(130),
+            1,
+            "the start item Torrent grants exactly once"
+        );
+        assert_eq!(
+            g.ledger_count(1001),
+            1,
+            "the start item Flask grants exactly once"
+        );
         let wm = r.applied_watermark();
-        assert!(wm > START_ITEM_INDEX_BASE + 1, "watermark advanced past the whole start-item band");
+        assert!(
+            wm > START_ITEM_INDEX_BASE + 1,
+            "watermark advanced past the whole start-item band"
+        );
 
         // RELOAD from the persisted watermark: no start item re-grants (start-item double-grant fix).
         let mut r2 = Reconciler::from_persisted(bulk_inputs(sd), wm);
         r2.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(130), 1, "no second Torrent grant after reload");
-        assert_eq!(g.ledger_count(1001), 1, "no second Flask grant after reload");
+        assert_eq!(
+            g.ledger_count(130),
+            1,
+            "no second Torrent grant after reload"
+        );
+        assert_eq!(
+            g.ledger_count(1001),
+            1,
+            "no second Flask grant after reload"
+        );
     }
 
     #[test]
@@ -1745,12 +2043,21 @@ mod tests {
         let longsword = 1030000; // weapon-category FullID (nibble 0)
         let d = DesiredState::build(&bulk_inputs(SlotData {
             start_items: vec![
-                StartItem { full_id: whistle, qty: 1 },
-                StartItem { full_id: longsword, qty: 1 },
+                StartItem {
+                    full_id: whistle,
+                    qty: 1,
+                },
+                StartItem {
+                    full_id: longsword,
+                    qty: 1,
+                },
             ],
             ..Default::default()
         }));
-        assert!(d.unique_goods.is_empty(), "no start item is ever a presence-diffed unique good");
+        assert!(
+            d.unique_goods.is_empty(),
+            "no start item is ever a presence-diffed unique good"
+        );
         for id in [whistle, longsword] {
             assert!(
                 d.ledgered.iter().any(|l| l.full_id == id && l.index < 0),
@@ -1766,7 +2073,13 @@ mod tests {
         // REALLOCATION (`has_good` reads false at 0). The ledger owes an INDEX, not a presence, so once
         // granted the flask is never re-owed — even after it leaves the inventory-presence view.
         let crimson = crate::progressive::GOODS_FULLID | 1001;
-        let sd = SlotData { start_items: vec![StartItem { full_id: crimson, qty: 1 }], ..Default::default() };
+        let sd = SlotData {
+            start_items: vec![StartItem {
+                full_id: crimson,
+                qty: 1,
+            }],
+            ..Default::default()
+        };
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(bulk_inputs(sd));
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
@@ -1777,7 +2090,11 @@ mod tests {
         g.drop_good(crimson);
         r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(crimson), 1, "an emptied flask is NOT re-granted");
+        assert_eq!(
+            g.ledger_count(crimson),
+            1,
+            "an emptied flask is NOT re-granted"
+        );
     }
 
     #[test]
@@ -1788,19 +2105,44 @@ mod tests {
         let cracked_pot = crate::progressive::GOODS_FULLID | 9500;
         let ritual_pot = crate::progressive::GOODS_FULLID | 9501;
         let mut start_items: Vec<StartItem> = Vec::new();
-        start_items.extend((0..10).map(|_| StartItem { full_id: cracked_pot, qty: 1 }));
-        start_items.extend((0..4).map(|_| StartItem { full_id: ritual_pot, qty: 1 }));
-        let sd = SlotData { start_items, ..Default::default() };
+        start_items.extend((0..10).map(|_| StartItem {
+            full_id: cracked_pot,
+            qty: 1,
+        }));
+        start_items.extend((0..4).map(|_| StartItem {
+            full_id: ritual_pot,
+            qty: 1,
+        }));
+        let sd = SlotData {
+            start_items,
+            ..Default::default()
+        };
 
         let d = DesiredState::build(&bulk_inputs(sd.clone()));
-        assert_eq!(d.ledgered.iter().filter(|l| l.full_id == cracked_pot).count(), 10);
-        assert_eq!(d.ledgered.iter().filter(|l| l.full_id == ritual_pot).count(), 4);
+        assert_eq!(
+            d.ledgered
+                .iter()
+                .filter(|l| l.full_id == cracked_pot)
+                .count(),
+            10
+        );
+        assert_eq!(
+            d.ledgered
+                .iter()
+                .filter(|l| l.full_id == ritual_pot)
+                .count(),
+            4
+        );
         assert!(d.unique_goods.is_empty());
 
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(bulk_inputs(sd.clone()));
         r.run_to_fixpoint(&mut g, TickBudget::default(), 32);
-        assert_eq!(g.ledger_count(cracked_pot), 10, "all 10 Cracked Pots granted");
+        assert_eq!(
+            g.ledger_count(cracked_pot),
+            10,
+            "all 10 Cracked Pots granted"
+        );
         assert_eq!(g.ledger_count(ritual_pot), 4, "all 4 Ritual Pots granted");
         let wm = r.applied_watermark();
         let mut r2 = Reconciler::from_persisted(bulk_inputs(sd), wm);
@@ -1814,18 +2156,34 @@ mod tests {
         // The stranding fix lives in SEEDING now, not presence-diff: a fresh character (received_through
         // 0) with a stale positive slot watermark distrusts it and re-owes the negative start-item band.
         let whistle = crate::progressive::GOODS_FULLID | 130;
-        let sd = SlotData { start_items: vec![StartItem { full_id: whistle, qty: 1 }], ..Default::default() };
+        let sd = SlotData {
+            start_items: vec![StartItem {
+                full_id: whistle,
+                qty: 1,
+            }],
+            ..Default::default()
+        };
         let mut g = MockGame::stable();
         let mut r = Reconciler::seeded(bulk_inputs(sd), Some(5), 0);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(whistle), 1, "fresh char re-owes + grants the whistle despite persisted=5");
+        assert_eq!(
+            g.ledger_count(whistle),
+            1,
+            "fresh char re-owes + grants the whistle despite persisted=5"
+        );
     }
 
     #[test]
     fn seed_change_re_owes_the_new_seeds_start_items() {
         // A genuine seed change re-owes the NEW seed's start items: the watermark resets to the new
         // desired's band floor, not a blind 0 that would strand the negative-index start items.
-        let sd = SlotData { start_items: vec![StartItem { full_id: 130, qty: 1 }], ..Default::default() };
+        let sd = SlotData {
+            start_items: vec![StartItem {
+                full_id: 130,
+                qty: 1,
+            }],
+            ..Default::default()
+        };
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(bulk_inputs(sd.clone()));
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
@@ -1842,7 +2200,11 @@ mod tests {
             "a genuine seed change resets the watermark to the band floor"
         );
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(130), 2, "seed B re-grants its own start item");
+        assert_eq!(
+            g.ledger_count(130),
+            2,
+            "seed B re-grants its own start item"
+        );
     }
 
     #[test]
@@ -1853,7 +2215,10 @@ mod tests {
         // trusts a persisted watermark only when it is `<= received_through` -- see the seeded_* tests
         // below for the cross-check policy.)
         let sd = SlotData {
-            start_items: vec![StartItem { full_id: 130, qty: 1 }], // negative-band start item
+            start_items: vec![StartItem {
+                full_id: 130,
+                qty: 1,
+            }], // negative-band start item
             ..Default::default()
         };
         let inputs = DesiredInputs {
@@ -1870,10 +2235,26 @@ mod tests {
         // received_through == 2: the old path granted indices 0 and 1 (plus the start item). Seed there.
         let mut r = Reconciler::from_persisted(inputs, 2);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(1001), 0, "index 0 already granted by the old path -> not re-granted");
-        assert_eq!(g.ledger_count(1002), 0, "index 1 already granted by the old path -> not re-granted");
-        assert_eq!(g.ledger_count(1003), 1, "index 2 is the still-owed tail -> granted exactly once");
-        assert_eq!(g.ledger_count(130), 0, "start item is behind the seeded watermark -> not re-granted");
+        assert_eq!(
+            g.ledger_count(1001),
+            0,
+            "index 0 already granted by the old path -> not re-granted"
+        );
+        assert_eq!(
+            g.ledger_count(1002),
+            0,
+            "index 1 already granted by the old path -> not re-granted"
+        );
+        assert_eq!(
+            g.ledger_count(1003),
+            1,
+            "index 2 is the still-owed tail -> granted exactly once"
+        );
+        assert_eq!(
+            g.ledger_count(130),
+            0,
+            "start item is behind the seeded watermark -> not re-granted"
+        );
     }
 
     // ---- session-init watermark seeding (Reconciler::seeded) ----------------------------
@@ -1891,7 +2272,10 @@ mod tests {
                 consumable(2, "Ash of War: Seppuku", 3013, 1),
             ],
             slot_data: SlotData {
-                start_items: vec![StartItem { full_id: whistle, qty: 1 }],
+                start_items: vec![StartItem {
+                    full_id: whistle,
+                    qty: 1,
+                }],
                 ..Default::default()
             },
         }
@@ -1907,7 +2291,11 @@ mod tests {
         let mut g = MockGame::stable();
         let mut r = Reconciler::seeded(seeded_inputs(), Some(5), 0); // stale wm=5, fresh character
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(3011), 1, "index 0 grants despite the stale positive watermark");
+        assert_eq!(
+            g.ledger_count(3011),
+            1,
+            "index 0 grants despite the stale positive watermark"
+        );
         assert_eq!(g.ledger_count(3012), 1, "index 1 grants");
         assert_eq!(g.ledger_count(3013), 1, "index 2 grants");
         assert_eq!(
@@ -1915,7 +2303,11 @@ mod tests {
             1,
             "the ledgered goods start item is re-owed from the floor and grants too"
         );
-        assert_eq!(r.applied_watermark(), 3, "the frontier ends past the granted stream");
+        assert_eq!(
+            r.applied_watermark(),
+            3,
+            "the frontier ends past the granted stream"
+        );
     }
 
     #[test]
@@ -1926,9 +2318,21 @@ mod tests {
         g.goods.insert(crate::progressive::GOODS_FULLID | 130); // whistle already in inventory
         let mut r = Reconciler::seeded(seeded_inputs(), Some(2), 2); // granted 0..=1 last session
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(3011), 0, "index 0 already granted -> skipped");
-        assert_eq!(g.ledger_count(3012), 0, "index 1 already granted -> skipped");
-        assert_eq!(g.ledger_count(3013), 1, "index 2 is the owed tail -> granted once");
+        assert_eq!(
+            g.ledger_count(3011),
+            0,
+            "index 0 already granted -> skipped"
+        );
+        assert_eq!(
+            g.ledger_count(3012),
+            0,
+            "index 1 already granted -> skipped"
+        );
+        assert_eq!(
+            g.ledger_count(3013),
+            1,
+            "index 2 is the owed tail -> granted once"
+        );
         assert_eq!(g.ledger_count(crate::progressive::GOODS_FULLID | 130), 0);
     }
 
@@ -1941,9 +2345,21 @@ mod tests {
         let mut g = MockGame::stable();
         let mut r = Reconciler::seeded(seeded_inputs(), Some(1), 3); // placed 0; saw 0..=2
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(3011), 0, "index 0 was actually placed -> skipped");
-        assert_eq!(g.ledger_count(3012), 1, "index 1 was seen but never placed -> re-owed");
-        assert_eq!(g.ledger_count(3013), 1, "index 2 was seen but never placed -> re-owed");
+        assert_eq!(
+            g.ledger_count(3011),
+            0,
+            "index 0 was actually placed -> skipped"
+        );
+        assert_eq!(
+            g.ledger_count(3012),
+            1,
+            "index 1 was seen but never placed -> re-owed"
+        );
+        assert_eq!(
+            g.ledger_count(3013),
+            1,
+            "index 2 was seen but never placed -> re-owed"
+        );
     }
 
     #[test]
@@ -1954,15 +2370,26 @@ mod tests {
         // behind the frontier.
         let longsword = 1030000; // weapon-category FullID (nibble 0) -> negative-band ledgered
         let mut inputs = seeded_inputs();
-        inputs.slot_data.start_items.push(StartItem { full_id: longsword, qty: 1 });
+        inputs.slot_data.start_items.push(StartItem {
+            full_id: longsword,
+            qty: 1,
+        });
         let mut g = MockGame::stable();
         g.goods.insert(crate::progressive::GOODS_FULLID | 130); // old path granted the whistle too
         let mut r = Reconciler::seeded(inputs, None, 2);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(3011), 0, "old-path-granted prefix is not re-granted");
+        assert_eq!(
+            g.ledger_count(3011),
+            0,
+            "old-path-granted prefix is not re-granted"
+        );
         assert_eq!(g.ledger_count(3012), 0);
         assert_eq!(g.ledger_count(3013), 1, "the un-granted tail is owed");
-        assert_eq!(g.ledger_count(longsword), 0, "non-goods start item stays behind the seed");
+        assert_eq!(
+            g.ledger_count(longsword),
+            0,
+            "non-goods start item stays behind the seed"
+        );
     }
 
     #[test]
@@ -1971,15 +2398,26 @@ mod tests {
         // floor owes the negative-band start items AND the whole received stream.
         let longsword = 1030000;
         let mut inputs = seeded_inputs();
-        inputs.slot_data.start_items.push(StartItem { full_id: longsword, qty: 1 });
+        inputs.slot_data.start_items.push(StartItem {
+            full_id: longsword,
+            qty: 1,
+        });
         let mut g = MockGame::stable();
         let mut r = Reconciler::seeded(inputs, None, 0);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(longsword), 1, "fresh save: negative-band start item grants");
+        assert_eq!(
+            g.ledger_count(longsword),
+            1,
+            "fresh save: negative-band start item grants"
+        );
         assert_eq!(g.ledger_count(3011), 1);
         assert_eq!(g.ledger_count(3012), 1);
         assert_eq!(g.ledger_count(3013), 1);
-        assert_eq!(g.ledger_count(crate::progressive::GOODS_FULLID | 130), 1, "the goods start item grants from the floor");
+        assert_eq!(
+            g.ledger_count(crate::progressive::GOODS_FULLID | 130),
+            1,
+            "the goods start item grants from the floor"
+        );
     }
 
     #[test]
@@ -1990,7 +2428,10 @@ mod tests {
             always_map_flags: vec![82001],
             reveal_all_maps: true,
             map_reveal_flags: vec![62010],
-            start_items: vec![StartItem { full_id: 130, qty: 1 }],
+            start_items: vec![StartItem {
+                full_id: 130,
+                qty: 1,
+            }],
             goal_flag: Some(9700),
             goal_met: true,
             ..Default::default()
@@ -2001,7 +2442,10 @@ mod tests {
         for f in [76900u32, 82001, 62010, 9700] {
             assert!(g.get_flag(f), "bulk flag {f} set");
         }
-        assert!(g.goods.is_empty(), "no bulk grant becomes a unique good (start items are ledgered)");
+        assert!(
+            g.goods.is_empty(),
+            "no bulk grant becomes a unique good (start items are ledgered)"
+        );
         assert_eq!(g.ledger_count(130), 1, "the start item lands exactly once");
     }
 
@@ -2019,8 +2463,16 @@ mod tests {
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(inputs("A", items.clone(), vec![]));
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert_eq!(g.ledger_count(5001), 1, "granted exactly once (the echo does not double-grant)");
-        assert_eq!(r.applied_watermark(), 2, "the watermark advanced PAST both the buy and its echo");
+        assert_eq!(
+            g.ledger_count(5001),
+            1,
+            "granted exactly once (the echo does not double-grant)"
+        );
+        assert_eq!(
+            r.applied_watermark(),
+            2,
+            "the watermark advanced PAST both the buy and its echo"
+        );
 
         // Reload: neither grants again.
         let mut r2 = Reconciler::from_persisted(inputs("A", items, vec![]), r.applied_watermark());
@@ -2033,9 +2485,17 @@ mod tests {
         // Only the echo is seen (the native sale already delivered the item): the reconciler grants
         // nothing yet still advances the watermark so the frontier stays contiguous.
         let mut g = MockGame::stable();
-        let mut r = Reconciler::new(inputs("A", vec![shop_consumable(0, "Sold", 5002, 1, true)], vec![]));
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![shop_consumable(0, "Sold", 5002, 1, true)],
+            vec![],
+        ));
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(g.ledger_count(5002), 0, "a native-sold echo grants nothing");
-        assert_eq!(r.applied_watermark(), 1, "the watermark still advances past the echo index");
+        assert_eq!(
+            r.applied_watermark(),
+            1,
+            "the watermark still advances past the echo index"
+        );
     }
 }

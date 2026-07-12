@@ -32,7 +32,9 @@ pub struct NameTable {
 
 impl NameTable {
     pub fn new() -> Self {
-        Self { map: HashMap::new() }
+        Self {
+            map: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, lookup_id: i32, ov: Override) {
@@ -140,16 +142,30 @@ mod tests {
     #[test]
     fn shop_label_progression_lock() {
         // A region lock placed in a shop must render legibly as its own name + a Progression tag.
-        let l = shop_label("Stormveil Lock", "Alaric", "Elden Ring", ItemKind::Progression);
+        let l = shop_label(
+            "Stormveil Lock",
+            "Alaric",
+            "Elden Ring",
+            ItemKind::Progression,
+        );
         assert_eq!(l.name, "Stormveil Lock");
-        assert_eq!(l.caption, "AP: Stormveil Lock\nFor: Alaric (Elden Ring)\nProgression");
+        assert_eq!(
+            l.caption,
+            "AP: Stormveil Lock\nFor: Alaric (Elden Ring)\nProgression"
+        );
     }
 
     #[test]
     fn shop_label_kind_line() {
-        assert!(shop_label("x", "o", "g", ItemKind::Filler).caption.ends_with("\nFiller"));
-        assert!(shop_label("x", "o", "g", ItemKind::Useful).caption.ends_with("\nUseful"));
-        assert!(shop_label("x", "o", "g", ItemKind::Trap).caption.ends_with("\nTrap"));
+        assert!(shop_label("x", "o", "g", ItemKind::Filler)
+            .caption
+            .ends_with("\nFiller"));
+        assert!(shop_label("x", "o", "g", ItemKind::Useful)
+            .caption
+            .ends_with("\nUseful"));
+        assert!(shop_label("x", "o", "g", ItemKind::Trap)
+            .caption
+            .ends_with("\nTrap"));
     }
 
     #[test]
@@ -158,14 +174,20 @@ mod tests {
         t.insert(9_000_001, Override::Redirect(110000)); // -> a real WeaponName id
         t.insert(9_000_002, Override::Custom("Moonveil (Yenix4)".into()));
         assert_eq!(t.resolve(9_000_001), Some(&Override::Redirect(110000)));
-        assert_eq!(t.resolve(9_000_002), Some(&Override::Custom("Moonveil (Yenix4)".into())));
+        assert_eq!(
+            t.resolve(9_000_002),
+            Some(&Override::Custom("Moonveil (Yenix4)".into()))
+        );
         assert_eq!(t.resolve(123), None); // not an override -> hook passes through
         assert_eq!(t.len(), 2);
     }
 
     #[test]
     fn display_name_with_owner() {
-        assert_eq!(display_name("Moonveil", Some("Yenix4")), "Moonveil (Yenix4)");
+        assert_eq!(
+            display_name("Moonveil", Some("Yenix4")),
+            "Moonveil (Yenix4)"
+        );
     }
 
     #[test]
@@ -184,13 +206,19 @@ mod tests {
     #[test]
     fn item_kind_precedence() {
         // pure classes
-        assert_eq!(ItemKind::from_flags(true, false, false), ItemKind::Progression);
+        assert_eq!(
+            ItemKind::from_flags(true, false, false),
+            ItemKind::Progression
+        );
         assert_eq!(ItemKind::from_flags(false, true, false), ItemKind::Useful);
         assert_eq!(ItemKind::from_flags(false, false, false), ItemKind::Filler);
         assert_eq!(ItemKind::from_flags(false, false, true), ItemKind::Trap);
         // precedence: Trap > Progression > Useful
         assert_eq!(ItemKind::from_flags(true, true, true), ItemKind::Trap);
-        assert_eq!(ItemKind::from_flags(true, true, false), ItemKind::Progression);
+        assert_eq!(
+            ItemKind::from_flags(true, true, false),
+            ItemKind::Progression
+        );
     }
 
     #[test]

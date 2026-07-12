@@ -148,7 +148,10 @@ mod tests {
         assert_eq!(s.last_received_index, 5);
         assert!(!s.start_items_granted);
         assert!(s.notify_granted.is_empty());
-        assert!(s.flag_poll_baseline.is_empty(), "absent flag_poll_baseline -> empty default");
+        assert!(
+            s.flag_poll_baseline.is_empty(),
+            "absent flag_poll_baseline -> empty default"
+        );
         assert!(s.progressive_counter.is_empty());
         assert_eq!(s.progressive_high_index, -1, "default high-index is -1");
     }

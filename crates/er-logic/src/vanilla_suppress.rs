@@ -50,11 +50,17 @@ mod tests {
         // The exact 2026-07-03 leak: item 0x100f90c4 -> flag 15007980, uncollected at pickup.
         // Old live-flag test PASSED (flag set at/before AddItem); collected-set SUPPRESSES.
         let collected = set(&[]);
-        assert!(should_suppress(&[15007980], &collected), "uncollected check must suppress");
+        assert!(
+            should_suppress(&[15007980], &collected),
+            "uncollected check must suppress"
+        );
 
         // After the poll reports it, the same flag is collected -> a re-pickup passes.
         let collected = set(&[15007980]);
-        assert!(!should_suppress(&[15007980], &collected), "collected check must pass on re-pickup");
+        assert!(
+            !should_suppress(&[15007980], &collected),
+            "collected check must pass on re-pickup"
+        );
     }
 
     #[test]

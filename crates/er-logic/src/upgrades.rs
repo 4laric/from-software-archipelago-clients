@@ -111,7 +111,11 @@ pub fn blessing_target(mode: i32, frag_qty: i32, floor: i32) -> Option<i32> {
         return None;
     }
     let from_frags = level_for_fragments(frag_qty);
-    let target = if mode == 2 { from_frags.max(floor) } else { from_frags };
+    let target = if mode == 2 {
+        from_frags.max(floor)
+    } else {
+        from_frags
+    };
     Some(target.clamp(0, SCADU_MAX_LEVEL))
 }
 
@@ -235,7 +239,10 @@ mod tests {
         // The bug row: Occult Carian Knight's Shield -- somber material (2200) but a 26-row reinforce
         // run. Must be SOMBER and clamped to +10, NOT a +25 normal weapon (that leak cross-upgraded
         // received standard weapons to +10).
-        assert_eq!(classify_track(25, SOMBER_MATERIAL_SET), Some((SOMBER_CAP, true)));
+        assert_eq!(
+            classify_track(25, SOMBER_MATERIAL_SET),
+            Some((SOMBER_CAP, true))
+        );
     }
 
     #[test]
@@ -246,8 +253,8 @@ mod tests {
 
     #[test]
     fn classify_standard_normal_and_somber() {
-        assert_eq!(classify_track(25, 0), Some((25, false)));                    // vanilla normal weapon
-        assert_eq!(classify_track(10, SOMBER_MATERIAL_SET), Some((10, true)));   // vanilla somber weapon
+        assert_eq!(classify_track(25, 0), Some((25, false))); // vanilla normal weapon
+        assert_eq!(classify_track(10, SOMBER_MATERIAL_SET), Some((10, true))); // vanilla somber weapon
     }
 
     #[test]

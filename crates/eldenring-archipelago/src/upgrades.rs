@@ -175,7 +175,6 @@ pub fn apply_auto_upgrade(full_id: i32) -> i32 {
     up
 }
 
-
 /// ER category nibble mask / weapon-category constant (er_codec mirror; weapons are category 0x0).
 const ROW_ID_MASK: u32 = er_codec::ROW_ID_MASK;
 
@@ -348,11 +347,9 @@ pub fn tick_global_scadu() {
     //   mode 2 (scaled)      = max(fragments, this region's DLC floor) -- so a DLC region unlocked
     //                          with no fragments still meets its enemies' assumption. Composing as MAX
     //                          means collected fragments still count above the floor.
-    let Some(level) = er_logic::upgrades::blessing_target(
-        scadu_mode(),
-        frag_qty,
-        dlc_blessing_floor_here(),
-    ) else {
+    let Some(level) =
+        er_logic::upgrades::blessing_target(scadu_mode(), frag_qty, dlc_blessing_floor_here())
+    else {
         return; // mode off -> never touch the byte
     };
 
@@ -461,9 +458,15 @@ mod tests {
     #[test]
     fn weapon_id_math() {
         // base/level split for a +7 weapon row (category 0x0 weapon; row 1000007 -> base 1000000, level 7).
-        assert_eq!(er_logic::upgrades::decode_weapon_id(1_000_007), Some((1_000_000, 7)));
+        assert_eq!(
+            er_logic::upgrades::decode_weapon_id(1_000_007),
+            Some((1_000_000, 7))
+        );
         // a weapon at +0 decodes to (base, 0).
-        assert_eq!(er_logic::upgrades::decode_weapon_id(2_000_000), Some((2_000_000, 0)));
+        assert_eq!(
+            er_logic::upgrades::decode_weapon_id(2_000_000),
+            Some((2_000_000, 0))
+        );
         // out-of-range weapon row ids decode to None.
         assert_eq!(er_logic::upgrades::decode_weapon_id(500), None);
         // a GOODS-category id (category nibble 0x4) is NOT a weapon -> None even if row is in range.

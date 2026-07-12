@@ -49,7 +49,11 @@ pub enum BossState {
 ///
 /// Rules: `!flag_set => Locked`; `flag_set && gate.is_none() => Felled`;
 /// `flag_set && gate == Some(key) => if received(key) { Released } else { Felled }`.
-pub fn boss_state<F: Fn(&str) -> bool>(flag_set: bool, gate: Option<&str>, received: F) -> BossState {
+pub fn boss_state<F: Fn(&str) -> bool>(
+    flag_set: bool,
+    gate: Option<&str>,
+    received: F,
+) -> BossState {
     if !flag_set {
         return BossState::Locked;
     }
@@ -221,7 +225,12 @@ mod tests {
     #[test]
     fn gate_display_prefers_legible_key_then_falls_back_then_none() {
         // display_key present -> show the vanilla key name, never the synthetic.
-        let mut d = def(5000, "Felled: Rennala", "Liurnia of the Lakes", Some("Boss Key: Rennala"));
+        let mut d = def(
+            5000,
+            "Felled: Rennala",
+            "Liurnia of the Lakes",
+            Some("Boss Key: Rennala"),
+        );
         d.display_key = Some("Academy Glintstone Key".to_string());
         assert_eq!(d.gate_display(), Some("Academy Glintstone Key"));
         // gate but no display_key -> fall back to the synthetic "Boss Key: <Boss>".
@@ -238,7 +247,10 @@ mod tests {
     fn locked_when_flag_unset() {
         let r = set(&[]);
         // Even with a gate key already held, an unset flag is Locked — the kill gates everything.
-        assert_eq!(boss_state(false, None, |n| r.contains(n)), BossState::Locked);
+        assert_eq!(
+            boss_state(false, None, |n| r.contains(n)),
+            BossState::Locked
+        );
         assert_eq!(
             boss_state(false, Some("Boss Key: Godrick"), |n| r.contains(n)),
             BossState::Locked
@@ -283,9 +295,19 @@ mod tests {
     #[test]
     fn group_counts_and_sorts_rows_by_flag() {
         let defs = vec![
-            def(6000, "Felled: Godrick the Grafted", "Stormveil Castle", None),
+            def(
+                6000,
+                "Felled: Godrick the Grafted",
+                "Stormveil Castle",
+                None,
+            ),
             def(4000, "Felled: Margit", "Limgrave", None),
-            def(5000, "Felled: Rennala", "Raya Lucaria Academy", Some("Boss Key: Rennala")),
+            def(
+                5000,
+                "Felled: Rennala",
+                "Raya Lucaria Academy",
+                Some("Boss Key: Rennala"),
+            ),
         ];
         // Godrick (6000) and Margit (4000) are dead; Rennala (5000) is alive.
         let dead: HashSet<u32> = [6000u32, 4000u32].iter().copied().collect();
@@ -339,7 +361,12 @@ mod tests {
     fn all_felled_group_is_complete() {
         let defs = vec![
             def(4000, "Felled: Margit", "Limgrave", None),
-            def(6000, "Felled: Godrick the Grafted", "Stormveil Castle", None),
+            def(
+                6000,
+                "Felled: Godrick the Grafted",
+                "Stormveil Castle",
+                None,
+            ),
         ];
         let g = build_boss_group(&defs, |_| true, |_| false);
         assert_eq!((g.locked, g.felled, g.released), (0, 2, 0));

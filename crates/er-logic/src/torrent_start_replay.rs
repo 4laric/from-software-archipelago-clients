@@ -73,7 +73,10 @@ mod replay {
         }
         /// How many times the mount was granted (to catch double-grants).
         fn mount_grant_count(&self) -> usize {
-            self.granted.iter().filter(|&&(id, _)| id == TORRENT_FULL_ID).count()
+            self.granted
+                .iter()
+                .filter(|&&(id, _)| id == TORRENT_FULL_ID)
+                .count()
         }
         /// The vanilla Melina hand-off reactor: sets its flag and delivers Torrent. Only runs on a
         /// NORMAL start (the region-lock warp skips the Chapel scene entirely).
@@ -223,7 +226,10 @@ mod replay {
             Ev::Tick,
         ];
         let g = replay(&timeline, true);
-        assert!(g.holds_mount(), "a normal start must still receive the mount from Melina");
+        assert!(
+            g.holds_mount(),
+            "a normal start must still receive the mount from Melina"
+        );
         assert_eq!(
             g.mount_grant_count(),
             1,

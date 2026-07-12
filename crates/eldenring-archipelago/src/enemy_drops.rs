@@ -28,10 +28,10 @@
 #![allow(dead_code)]
 
 use eldenring::cs::SoloParamRepository;
-use fromsoftware_shared::FromStatic;   // brings SoloParamRepository::instance_mut into scope
+use fromsoftware_shared::FromStatic; // brings SoloParamRepository::instance_mut into scope
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// lot id -> [(slot index 1..=8, goods row id)]
 static ROLL: Mutex<Option<HashMap<u32, Vec<(u8, i32)>>>> = Mutex::new(None);
@@ -74,7 +74,9 @@ pub fn run() -> bool {
         //   row struct : eldenring::param::ITEMLOT_PARAM_ST  (shared with ItemLotParam_map)
         //   setters    : set_lot_item_id01..08               (NO underscore before the digits)
         // lotItemBasePoint (the drop WEIGHT) is deliberately NOT written, so drop rates stay vanilla.
-        let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(lot) else { continue };
+        let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(lot) else {
+            continue;
+        };
         for (slot, gid) in slots {
             match slot {
                 1 => row.set_lot_item_id01(gid),

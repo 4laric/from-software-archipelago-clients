@@ -166,7 +166,9 @@ pub fn tick_natural_key_triggers(cfg: &RegionConfig, received: &HashSet<String>)
         if let Some(fs) = cfg.lock_reveal_flags.get(name) {
             bloom_flags.extend_from_slice(fs);
         }
-        if er_logic::region_lock::region_bloom_settled(open_flag, &bloom_flags, &|f| flags::get_event_flag(f)) {
+        if er_logic::region_lock::region_bloom_settled(open_flag, &bloom_flags, &|f| {
+            flags::get_event_flag(f)
+        }) {
             continue; // fully bloomed -- reconcile-safe
         }
         let fired = clauses.iter().any(|cl| {
@@ -264,7 +266,9 @@ pub fn tick_kick(cfg: &RegionConfig) -> Option<String> {
             match hit {
                 Some(e) => log::info!(
                     "kick-watch: play_region {last} -> {pr} (sub {sub}); range [{},{}] flag {} = {} | start-gate open = {gate_open} | kick = {kick}",
-                    e[0], e[1], e[2],
+                    e[0],
+                    e[1],
+                    e[2],
                     flags::get_event_flag(e[2] as u32)
                 ),
                 None => log::info!(
@@ -468,7 +472,10 @@ pub fn tick_grace_items(cfg: &RegionConfig, received: &HashSet<String>) -> Vec<S
 /// uses). Call BEFORE `open_on_received_name` (which sets the flag). Reconnect replays re-run
 /// `on_item_received` for every item; the latch keeps the physical grant once-per-save.
 pub fn first_open_grants(cfg: &RegionConfig, name: &str) -> Vec<i32> {
-    match (cfg.lock_grant_items.get(name), cfg.region_open_flags.get(name)) {
+    match (
+        cfg.lock_grant_items.get(name),
+        cfg.region_open_flags.get(name),
+    ) {
         (Some(ids), Some(&f)) if !flags::get_event_flag(f) => ids.clone(),
         _ => Vec::new(),
     }
@@ -495,12 +502,22 @@ pub fn open_on_received_name(cfg: &RegionConfig, name: &str) -> bool {
         let mut failed: Vec<u32> = Vec::new();
         for &f in fs {
             flags::set_event_flag(f, true);
-            if flags::get_event_flag(f) { set += 1; } else { failed.push(f); }
+            if flags::get_event_flag(f) {
+                set += 1;
+            } else {
+                failed.push(f);
+            }
         }
         log::info!(
             "RegionLock '{name}' graces: {} requested, {} set, {} failed{}",
-            fs.len(), set, failed.len(),
-            if failed.is_empty() { String::new() } else { format!(" = {failed:?}") }
+            fs.len(),
+            set,
+            failed.len(),
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!(" = {failed:?}")
+            }
         );
     } else if opened {
         // Only a genuine region-lock (its open flag matched) that is missing its grace bundle is a

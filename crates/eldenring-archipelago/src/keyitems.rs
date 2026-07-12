@@ -84,7 +84,9 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
             }
         }
         if applied > 0 {
-            log::info!("key item '{n}': obtained/restored flag(s) {fs:?} applied ({applied} newly set)");
+            log::info!(
+                "key item '{n}': obtained/restored flag(s) {fs:?} applied ({applied} newly set)"
+            );
         }
     }
 }

@@ -26,8 +26,7 @@ const LUA_WARP_FUNC_RVA: usize = 0x0059_9C10;
 /// First 16 bytes at the entry (standard prologue), read from the pinned exe. A mismatch means
 /// the RVA is stale for the running build — refuse to call.
 const LUA_WARP_FUNC_SIG: &[u8] = &[
-    0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xFA, 0x44, 0x89,
-    0x41,
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xFA, 0x44, 0x89, 0x41,
 ];
 /// CSLuaEventManager static-slot candidates (see module docs). Probe order = CE scan order.
 const CSLEM_CANDIDATE_RVAS: [usize; 2] = [0x03D6_7E48, 0x03D5_AFE0];
@@ -80,8 +79,7 @@ fn resolve_lua_event_manager(base: usize) -> Option<(*mut c_void, *mut c_void)> 
 fn warp_fn(base: usize) -> Option<LuaWarpFn> {
     let addr = base + LUA_WARP_FUNC_RVA;
     // SAFETY: reads LUA_WARP_FUNC_SIG.len() bytes inside the loaded image.
-    let actual =
-        unsafe { std::slice::from_raw_parts(addr as *const u8, LUA_WARP_FUNC_SIG.len()) };
+    let actual = unsafe { std::slice::from_raw_parts(addr as *const u8, LUA_WARP_FUNC_SIG.len()) };
     if actual != LUA_WARP_FUNC_SIG {
         return None;
     }
@@ -99,8 +97,8 @@ pub fn warp_to_grace(grace_entity_id: u32) -> Result<(), &'static str> {
     let base = current_module_base().ok_or("no module base for eldenring.exe")?;
     let f = warp_fn(base)
         .ok_or("LuaWarp signature mismatch -- pinned 2.6.2.0 RVA stale for this build")?;
-    let (rcx, rdx) =
-        resolve_lua_event_manager(base).ok_or("CSLuaEventManager not resolvable (both candidates dead)")?;
+    let (rcx, rdx) = resolve_lua_event_manager(base)
+        .ok_or("CSLuaEventManager not resolvable (both candidates dead)")?;
     let arg = grace_entity_id
         .checked_sub(GRACE_TO_WARP_ARG_DELTA)
         .ok_or("grace id underflow (expected a full grace entity id like 11102950)")?;

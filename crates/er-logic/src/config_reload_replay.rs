@@ -11,7 +11,11 @@
 use crate::config_reload::{reload_action, ConnInfo, ReloadAction};
 
 fn conn(url: &str, slot: &str) -> ConnInfo {
-    ConnInfo { url: url.into(), slot: slot.into(), password: None }
+    ConnInfo {
+        url: url.into(),
+        slot: slot.into(),
+        password: None,
+    }
 }
 
 /// What the client is holding, and how many times it reconnected.
@@ -22,7 +26,10 @@ struct Sim {
 
 impl Sim {
     fn new(applied: ConnInfo) -> Self {
-        Sim { applied, reconnects: vec![] }
+        Sim {
+            applied,
+            reconnects: vec![],
+        }
     }
 
     /// One watcher tick against whatever the file currently says.
@@ -45,12 +52,16 @@ fn editing_the_url_reconnects_exactly_once() {
     let mut s = Sim::new(conn("localhost:38281", "Tester_A2"));
     let edited = conn("archipelago.gg:12345", "Tester_A2");
 
-    s.tick(&edited);          // the save lands
-    s.tick(&edited);          // watcher ticks again (our own saved file)
-    s.tick(&edited);          // ...and again
+    s.tick(&edited); // the save lands
+    s.tick(&edited); // watcher ticks again (our own saved file)
+    s.tick(&edited); // ...and again
     s.tick(&edited);
 
-    assert_eq!(s.reconnects, vec![edited], "one edit must produce ONE reconnect, not a storm");
+    assert_eq!(
+        s.reconnects,
+        vec![edited],
+        "one edit must produce ONE reconnect, not a storm"
+    );
 }
 
 /// A torn read (editor mid-save) must never drop a live connection.
@@ -59,9 +70,9 @@ fn a_half_written_file_is_ignored_not_connected_to() {
     let live = conn("localhost:38281", "Tester_A2");
     let mut s = Sim::new(live.clone());
 
-    s.tick(&ConnInfo::default());                 // file truncated to {} mid-save
-    s.tick(&conn("", "Tester_A2"));               // url written after slot
-    s.tick(&conn("archipelago.gg:12345", ""));    // slot not written yet
+    s.tick(&ConnInfo::default()); // file truncated to {} mid-save
+    s.tick(&conn("", "Tester_A2")); // url written after slot
+    s.tick(&conn("archipelago.gg:12345", "")); // slot not written yet
 
     assert!(s.reconnects.is_empty(), "a torn read must NOT reconnect");
     assert_eq!(s.applied, live, "and must not disturb the live connection");
@@ -85,7 +96,10 @@ fn changing_the_slot_reconnects() {
 #[test]
 fn a_password_change_reconnects() {
     let mut s = Sim::new(conn("localhost:38281", "Tester_A2"));
-    let with_pw = ConnInfo { password: Some("hunter2".into()), ..conn("localhost:38281", "Tester_A2") };
+    let with_pw = ConnInfo {
+        password: Some("hunter2".into()),
+        ..conn("localhost:38281", "Tester_A2")
+    };
     s.tick(&with_pw);
     assert_eq!(s.reconnects.len(), 1);
     assert_eq!(s.applied.password.as_deref(), Some("hunter2"));
@@ -99,7 +113,10 @@ fn saving_without_changing_anything_does_nothing() {
     for _ in 0..5 {
         s.tick(&live);
     }
-    assert!(s.reconnects.is_empty(), "an idempotent save must not reconnect");
+    assert!(
+        s.reconnects.is_empty(),
+        "an idempotent save must not reconnect"
+    );
 }
 
 /// A whole realistic session: connect, mis-type, fix it, switch slot. One reconnect per real change.
@@ -112,12 +129,15 @@ fn a_realistic_editing_session_reconnects_once_per_real_change() {
 
     s.tick(&ConnInfo::default()); // torn
     s.tick(&typo);
-    s.tick(&typo);                // our own save echoes back
+    s.tick(&typo); // our own save echoes back
     s.tick(&fixed);
     s.tick(&fixed);
     s.tick(&slot2);
     s.tick(&slot2);
 
-    assert_eq!(s.reconnects, vec![typo, fixed, slot2],
-               "exactly one reconnect per REAL change -- no storm, no torn-read reconnect");
+    assert_eq!(
+        s.reconnects,
+        vec![typo, fixed, slot2],
+        "exactly one reconnect per REAL change -- no storm, no torn-read reconnect"
+    );
 }

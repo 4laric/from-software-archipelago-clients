@@ -134,7 +134,9 @@ mod replay {
                 // Pre-fix live-flag test: suppress only while NO mapped flag is already live-set.
                 // For a shared-flag lot, a neighbour's earlier pickup has already set the flag, so
                 // this returns false and leaks. Empty mapped-flags -> not a check -> never suppress.
-                SuppressKeying::LiveFlag => !flags.is_empty() && !flags.iter().any(|&f| self.flag_set(f)),
+                SuppressKeying::LiveFlag => {
+                    !flags.is_empty() && !flags.iter().any(|&f| self.flag_set(f))
+                }
                 // Fixed path: the REAL decision against the server checked-set.
                 SuppressKeying::CollectedSet => should_suppress(&flags, &self.collected),
             };
@@ -274,7 +276,10 @@ mod replay {
             ],
             SuppressKeying::CollectedSet,
         );
-        assert!(!g.leaked(LOC_A), "re-pickup before the poll must still suppress");
+        assert!(
+            !g.leaked(LOC_A),
+            "re-pickup before the poll must still suppress"
+        );
 
         let g = replay(
             &[
@@ -285,8 +290,14 @@ mod replay {
             ],
             SuppressKeying::CollectedSet,
         );
-        assert!(g.leaked(LOC_A), "after its own check is collected, a re-pickup of A must pass");
-        assert!(!g.leaked(LOC_B), "B was never collected -> must keep suppressing");
+        assert!(
+            g.leaked(LOC_A),
+            "after its own check is collected, a re-pickup of A must pass"
+        );
+        assert!(
+            !g.leaked(LOC_B),
+            "B was never collected -> must keep suppressing"
+        );
     }
 
     #[test]
@@ -298,14 +309,17 @@ mod replay {
         let g = replay(
             &[
                 Ev::PickUpSharedFlagLoc(LOC_A),
-                Ev::Poll,       // A now in the collected-set
-                Ev::Reconnect,  // live flags wiped; collected-set (A's flag) persists
+                Ev::Poll,                       // A now in the collected-set
+                Ev::Reconnect, // live flags wiped; collected-set (A's flag) persists
                 Ev::PickUpSharedFlagLoc(LOC_B), // uncollected neighbour -> suppress
                 Ev::PickUpSharedFlagLoc(LOC_A), // collected -> pass
             ],
             SuppressKeying::CollectedSet,
         );
-        assert!(!g.leaked(LOC_B), "an uncollected loc must suppress across a reconnect");
+        assert!(
+            !g.leaked(LOC_B),
+            "an uncollected loc must suppress across a reconnect"
+        );
         assert!(
             g.leaked(LOC_A),
             "a collected loc's re-pickup passes across a reconnect (collected-set persists)",
@@ -335,9 +349,21 @@ mod replay {
         // A non-check id (no mapped flags) is not a check under EITHER policy -> its ware always
         // passes. Guards the degenerate branch of both keyings.
         let non_check = 0xDEAD_BEEFu32;
-        let g = replay(&[Ev::PickUpSharedFlagLoc(non_check)], SuppressKeying::CollectedSet);
-        assert!(g.leaked(non_check), "a non-check id must pass under collected-set keying");
-        let g = replay(&[Ev::PickUpSharedFlagLoc(non_check)], SuppressKeying::LiveFlag);
-        assert!(g.leaked(non_check), "a non-check id must pass under live-flag keying");
+        let g = replay(
+            &[Ev::PickUpSharedFlagLoc(non_check)],
+            SuppressKeying::CollectedSet,
+        );
+        assert!(
+            g.leaked(non_check),
+            "a non-check id must pass under collected-set keying"
+        );
+        let g = replay(
+            &[Ev::PickUpSharedFlagLoc(non_check)],
+            SuppressKeying::LiveFlag,
+        );
+        assert!(
+            g.leaked(non_check),
+            "a non-check id must pass under live-flag keying"
+        );
     }
 }

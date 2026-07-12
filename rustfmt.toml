@@ -1,0 +1,6 @@
+# Generated files are NOT hand-formatted -- their generator owns their bytes.
+# tracker_regions.rs (tools/gen_location_regions.py) and contract_gen.rs (eldenring/contract.py) both
+# carry a `// @generated` marker. Without this, `cargo fmt` rewrites them (rustfmt exploded
+# tracker_regions.rs by +9644 lines), the next regen emits the unformatted form again, and CI goes red
+# on a file nobody edited. Let the generator be the source of truth for its own output.
+format_generated_files = false

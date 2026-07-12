@@ -17,8 +17,8 @@ use er_logic::receive::{GrantAction, RecvItem};
 use er_logic::save_state::SaveState;
 use er_logic::tracker::{HintEntry, HintSet};
 use serde_json::Value;
-use shared::CoreBase;
 use shared::Core as _;
+use shared::CoreBase;
 
 use crate::hook_impl::{EldenRingHook, ReceiveDispatch};
 
@@ -219,7 +219,9 @@ impl shared::Core for Core {
             }
             "!grace" => {
                 let Some(q) = arg.map(|s| s.to_lowercase()) else {
-                    self.log(ap::Print::message("usage: !grace <name substring>".to_string()));
+                    self.log(ap::Print::message(
+                        "usage: !grace <name substring>".to_string(),
+                    ));
                     return true;
                 };
                 let mut lines: Vec<String> = Vec::new();
@@ -253,7 +255,8 @@ impl shared::Core for Core {
             }
             "!help" => {
                 self.log(ap::Print::message(
-                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring>".to_string(),
+                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring>"
+                        .to_string(),
                 ));
                 true
             }
@@ -376,7 +379,10 @@ impl shared::Core for Core {
             .map(|c| c.seed_name().to_string())
             .unwrap_or_default();
         if self.slot_data_parsed
-            && er_logic::seed_change::is_seed_change(self.parsed_seed.as_deref(), &current_room_seed)
+            && er_logic::seed_change::is_seed_change(
+                self.parsed_seed.as_deref(),
+                &current_room_seed,
+            )
         {
             log::warn!(
                 "seed change detected (parsed {:?} -> room {current_room_seed:?}) -- rebuilding per-seed state",
@@ -706,8 +712,23 @@ impl shared::Core for Core {
 
                 (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, big_ticket)
             });
-            if let Some((map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, big_ticket)) =
-                parsed
+            if let Some((
+                map,
+                counts,
+                region,
+                fogwall,
+                prog_cfg,
+                name,
+                sweeps,
+                start,
+                scout,
+                gate_warn,
+                loc_flags,
+                goal_cfg,
+                boss_defs,
+                region_attunement,
+                big_ticket,
+            )) = parsed
             {
                 log::info!(
                     "slot_data parsed: {} item-map, {} area-lock, {} progressive; player '{name}'",
@@ -866,7 +887,8 @@ impl shared::Core for Core {
             // live: a real game AddItem has fired (bulk load replace done) OR we've been in-world
             // long enough for the load to settle. Timing-independent; received grants untouched.
             if crate::flags::in_world() {
-                self.in_world_since.get_or_insert_with(std::time::Instant::now);
+                self.in_world_since
+                    .get_or_insert_with(std::time::Instant::now);
             } else {
                 self.in_world_since = None;
             }
@@ -883,7 +905,11 @@ impl shared::Core for Core {
                 // correct slot_data. (The standalone gated its grace flush the same way.) After
                 // applying, read a sentinel grace back — only latch `done` once it sticks; a false
                 // read-back means it was clobbered, so we log it and retry next tick.
-                if !already_flags && has_inv && start_items_settled && crate::startgrants::apply_start_flags(sc) {
+                if !already_flags
+                    && has_inv
+                    && start_items_settled
+                    && crate::startgrants::apply_start_flags(sc)
+                {
                     let sentinel = sc.start_graces.first().copied();
                     let stuck = sentinel.is_none_or(crate::flags::get_event_flag);
                     if stuck {
@@ -1020,7 +1046,9 @@ impl shared::Core for Core {
                     &mut dispatch,
                 );
                 match action {
-                    GrantAction::Enqueue { full_id, qty, name, .. } => {
+                    GrantAction::Enqueue {
+                        full_id, qty, name, ..
+                    } => {
                         // STRANGLER (goods+ledger, THE ATOMIC FLIP): this ONE call grants every
                         // received item — key items/runes (goods) AND consumables (ledger). Once the
                         // reconciler owns BOTH classes it is the sole received-item grant path (goods
@@ -1029,7 +1057,9 @@ impl shared::Core for Core {
                         // `dispatched_through`/`pushed` advance stay; `pushed` simply advances past
                         // this item (no H3 hold — the reconciler owns placement). Runtime-revertible:
                         // drop `goods`/`ledger` from RECONCILE_APPLY and this path grants again.
-                        if !(crate::reconcile_io::owns_goods() && crate::reconcile_io::owns_ledger()) {
+                        if !(crate::reconcile_io::owns_goods()
+                            && crate::reconcile_io::owns_ledger())
+                        {
                             if dispatch.hook.grant_full_id(full_id, qty) {
                                 // Great-rune "restored" flag is set by keyitems::set_acquire_flags
                                 // (191-196); the AP item already grants the restored goods row, so
@@ -1293,7 +1323,10 @@ impl shared::Core for Core {
                 self.boss_key_primed = true;
                 log::info!(
                     "boss-key baseline: {} boss check(s) sealed on connect (deferred silently)",
-                    self.boss_key_pending.values().map(|s| s.len()).sum::<usize>()
+                    self.boss_key_pending
+                        .values()
+                        .map(|s| s.len())
+                        .sum::<usize>()
                 );
             }
             let mut to_check: Vec<i64> = Vec::new();
@@ -1310,8 +1343,7 @@ impl shared::Core for Core {
                     .location_flags
                     .iter()
                     .filter(|&(&loc, _)| {
-                        self.valid_locations.contains(&loc)
-                            && client.is_local_location_checked(loc)
+                        self.valid_locations.contains(&loc) && client.is_local_location_checked(loc)
                     })
                     .map(|(_, &flag)| flag)
                     .collect();
@@ -1405,8 +1437,12 @@ impl shared::Core for Core {
                         self.valid_locations.contains(&m) && client.is_local_location_checked(m)
                     };
                     for (region, att) in &self.region_attunement {
-                        let count = er_logic::attunement::attuned_count(&att.members, |m| checked(m));
-                        att_state.insert(region.clone(), (count, att.threshold, count >= att.threshold));
+                        let count =
+                            er_logic::attunement::attuned_count(&att.members, |m| checked(m));
+                        att_state.insert(
+                            region.clone(),
+                            (count, att.threshold, count >= att.threshold),
+                        );
                     }
                     for &loc in &to_check {
                         if payout_locs.contains(&loc)
@@ -1425,7 +1461,12 @@ impl shared::Core for Core {
                 // Record newly-deferred payout checks (per-region debt); banner only the growth.
                 let mut newly_sealed: BTreeMap<String, usize> = BTreeMap::new();
                 for (region, loc) in deferred_new {
-                    if self.boss_payout_pending.entry(region.clone()).or_default().insert(loc) {
+                    if self
+                        .boss_payout_pending
+                        .entry(region.clone())
+                        .or_default()
+                        .insert(loc)
+                    {
                         *newly_sealed.entry(region).or_default() += 1;
                     }
                 }
@@ -1523,7 +1564,11 @@ impl shared::Core for Core {
                 let by_flag: HashMap<u32, (String, String)> = self
                     .boss_defs
                     .iter()
-                    .filter_map(|d| d.gate.as_ref().map(|g| (d.flag, (d.name.clone(), g.clone()))))
+                    .filter_map(|d| {
+                        d.gate
+                            .as_ref()
+                            .map(|g| (d.flag, (d.name.clone(), g.clone())))
+                    })
                     .collect();
 
                 // Partition to_check: DEFER any gated boss's own check whose key is not yet received.
@@ -1650,8 +1695,7 @@ impl shared::Core for Core {
                     crate::flags::get_event_flag,
                     // Pre-filter against valid_locations (kept correct per-seed by reset_for_new_seed)
                     // so no datapackage-unknown id reaches is_local_location_checked.
-                    |l| self.valid_locations.contains(&l)
-                        && client.is_local_location_checked(l),
+                    |l| self.valid_locations.contains(&l) && client.is_local_location_checked(l),
                 ),
                 _ => false,
             };
@@ -1794,10 +1838,11 @@ impl shared::Core for Core {
             // er_logic::config_reload::reload_action -- host-tested: one reconnect per REAL change, no
             // storm from our own save, and a half-written file never drops a live session.
             if let Some(next) = crate::config_watch::poll() {
-                if let Err(e) = self
-                    .base_mut()
-                    .update_connection_info(&next.url, &next.slot, next.password.clone())
-                {
+                if let Err(e) = self.base_mut().update_connection_info(
+                    &next.url,
+                    &next.slot,
+                    next.password.clone(),
+                ) {
                     log::warn!("config hot-reload: reconnect failed: {e}");
                 }
             }
@@ -1828,7 +1873,12 @@ impl shared::Core for Core {
                     // own check whose rewritten shop row already sold the reward natively.
                     let echo_skip = ri.sender().slot() == my_slot
                         && crate::shop_sell::echo_skip(ri.location().id());
-                    recv.push((idx as i64, ri.item().name().to_string(), ri.item().id(), echo_skip));
+                    recv.push((
+                        idx as i64,
+                        ri.item().name().to_string(),
+                        ri.item().id(),
+                        echo_skip,
+                    ));
                 }
             }
             let inputs = self.build_desired_inputs(&recv);
@@ -1878,7 +1928,10 @@ impl Core {
     //     client must either route that sentinel action to `ClientStatus::Goal` (a client seam) OR
     //     keep goal-send on the existing `core.rs` handler and pass `goal_flag: None` here. The pure
     //     `SlotData.goal_flag/goal_met` fields are tested in er-logic so either wiring is glue-only.
-    fn build_desired_inputs(&self, received: &[(i64, String, i64, bool)]) -> er_logic::reconcile::DesiredInputs {
+    fn build_desired_inputs(
+        &self,
+        received: &[(i64, String, i64, bool)],
+    ) -> er_logic::reconcile::DesiredInputs {
         use er_logic::reconcile::{DesiredInputs, ReceivedItem, SaveIdentity, SlotData, StartItem};
         let seed = self.parsed_seed.clone().unwrap_or_default();
         let save = SaveIdentity(self.my_name.clone().unwrap_or_default());
@@ -1899,7 +1952,9 @@ impl Core {
                 .map(crate::startgrants::always_map_flags_for)
                 .unwrap_or_else(|| vec![crate::startgrants::UNDERGROUND_MAP_VIEW_UNLOCK]),
             reveal_all_maps: sc.map(|s| s.reveal_all_maps).unwrap_or(false),
-            map_reveal_flags: sc.map(crate::startgrants::reveal_flags_for).unwrap_or_default(),
+            map_reveal_flags: sc
+                .map(crate::startgrants::reveal_flags_for)
+                .unwrap_or_default(),
             start_items: sc
                 .map(|s| {
                     s.start_items
@@ -1927,18 +1982,23 @@ impl Core {
     /// pre-filtered against `valid_locations` so no datapackage-unknown id reaches the checked query).
     fn reconcile_goal_met(&self) -> bool {
         match (self.goal.as_ref(), self.client()) {
-            (Some(cfg), Some(client)) => crate::goal::is_met(
-                cfg,
-                crate::flags::get_event_flag,
-                |l| self.valid_locations.contains(&l) && client.is_local_location_checked(l),
-            ),
+            (Some(cfg), Some(client)) => {
+                crate::goal::is_met(cfg, crate::flags::get_event_flag, |l| {
+                    self.valid_locations.contains(&l) && client.is_local_location_checked(l)
+                })
+            }
             _ => false,
         }
     }
 
     /// Classify one received AP item into its reconciler [`ItemSemantics`], reusing the live tables.
     /// Order matters: progressive -> region lock -> key item / great rune -> plain grant.
-    fn classify_received(&self, name: &str, ap_id: i64, echo_skip: bool) -> er_logic::reconcile::ItemSemantics {
+    fn classify_received(
+        &self,
+        name: &str,
+        ap_id: i64,
+        echo_skip: bool,
+    ) -> er_logic::reconcile::ItemSemantics {
         use er_logic::reconcile::{ItemSemantics, ProgTier};
         // 1. Progressive item (tier goods packed to grant FullIDs, exactly like the live path).
         if let Some(tiers) = self.progressive.tiers_for(name) {
@@ -1977,7 +2037,10 @@ impl Core {
         let acq = crate::keyitems::acquire_flags(name);
         if !acq.is_empty() {
             if let Some(fid) = full_id {
-                return ItemSemantics::KeyItem { goods: fid as i32, obtained_flags: acq };
+                return ItemSemantics::KeyItem {
+                    goods: fid as i32,
+                    obtained_flags: acq,
+                };
             }
         }
         // 4. Plain grant: mapped -> ledgered consumable; unmapped -> inert (region locks / boss keys
@@ -1986,7 +2049,11 @@ impl Core {
             Some(fid) => {
                 let qty = self.item_counts.get(&ap_id).copied().unwrap_or(1) as i32;
                 // Gap 2: a native-sold shop echo is ledgered but NOT re-granted (watermark advances).
-                ItemSemantics::Consumable { full_id: fid as i32, qty, echo_skip }
+                ItemSemantics::Consumable {
+                    full_id: fid as i32,
+                    qty,
+                    echo_skip,
+                }
             }
             None => ItemSemantics::Inert,
         }
@@ -2074,7 +2141,11 @@ impl Core {
             if !for_us && !self.region_table.contains_key(&location_id) {
                 continue; // another world's location -- not ours to mark
             }
-            let other = if for_us { item.receiver() } else { item.sender() };
+            let other = if for_us {
+                item.receiver()
+            } else {
+                item.sender()
+            };
             new_hints.push(HintEntry {
                 location_id,
                 item_name: item.item().name().to_string(),
@@ -2255,7 +2326,10 @@ impl Core {
                     if ui.collapsing_header(header, imgui::TreeNodeFlags::empty()) {
                         for row in &boss_group.rows {
                             // `name` is the full "Felled: <Boss>" label; strip for a clean line.
-                            let boss = row.name.strip_prefix("Felled: ").unwrap_or(row.name.as_str());
+                            let boss = row
+                                .name
+                                .strip_prefix("Felled: ")
+                                .unwrap_or(row.name.as_str());
                             match row.state {
                                 er_logic::boss_felled::BossState::Locked => {
                                     ui.text_disabled(format!("  {boss}  [{}]", row.region));
@@ -2279,7 +2353,10 @@ impl Core {
 
                 // (c) Received items (raw cumulative names; sorted by the model).
                 if ui.collapsing_header(
-                    format!("Items received ({})###trk-items", model.received_items.len()),
+                    format!(
+                        "Items received ({})###trk-items",
+                        model.received_items.len()
+                    ),
                     imgui::TreeNodeFlags::empty(),
                 ) {
                     for item in &model.received_items {
@@ -2348,7 +2425,8 @@ impl Core {
 
 /// R5 (SWEEP): one warning per unmapped AP item id -- the grant loop would otherwise drop the
 /// item with no trace, every session, on every replay.
-static START_ITEM_FAIL_LOGGED: std::sync::Mutex<Option<HashSet<usize>>> = std::sync::Mutex::new(None);
+static START_ITEM_FAIL_LOGGED: std::sync::Mutex<Option<HashSet<usize>>> =
+    std::sync::Mutex::new(None);
 
 /// Fail-loud (once per start-item index) when a start grant does not land despite a captured
 /// inventory pointer. The start-items loop retries every tick, so without this a stuck grant
@@ -2398,16 +2476,31 @@ fn save_file_path(seed: &str, name: &str) -> Option<PathBuf> {
 /// entry whose key is not a u32 or whose value is not an object. Absent/empty => no boss tracking.
 fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDef> {
     let mut out = Vec::new();
-    let Some(obj) = v.and_then(|v| v.as_object()) else { return out; };
+    let Some(obj) = v.and_then(|v| v.as_object()) else {
+        return out;
+    };
     for (k, entry) in obj {
-        let (Ok(flag), Some(e)) = (k.parse::<u32>(), entry.as_object()) else { continue };
+        let (Ok(flag), Some(e)) = (k.parse::<u32>(), entry.as_object()) else {
+            continue;
+        };
         out.push(er_logic::boss_felled::BossDef {
             flag,
-            name: e.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            region: e.get("region").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            name: e
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            region: e
+                .get("region")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
             boss_ap_id: e.get("boss_ap_id").and_then(|x| x.as_i64()).unwrap_or(0),
             gate: e.get("gate").and_then(|x| x.as_str()).map(str::to_string),
-            display_key: e.get("display_key").and_then(|x| x.as_str()).map(str::to_string),
+            display_key: e
+                .get("display_key")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
         });
     }
     out
@@ -2418,7 +2511,9 @@ fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDe
 /// `members` is a HashSet<i64> (matches the struct + er_logic::attunement's `&HashSet<i64>` inputs).
 fn parse_region_attunement(v: Option<&Value>) -> HashMap<String, RegionAttunement> {
     let mut out = HashMap::new();
-    let Some(obj) = v.and_then(|v| v.as_object()) else { return out; };
+    let Some(obj) = v.and_then(|v| v.as_object()) else {
+        return out;
+    };
     for (region, entry) in obj {
         let Some(e) = entry.as_object() else { continue };
         out.insert(
@@ -2433,7 +2528,11 @@ fn parse_region_attunement(v: Option<&Value>) -> HashMap<String, RegionAttunemen
                 bloom_flags: e
                     .get("bloom_flags")
                     .and_then(|x| x.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_u64().map(|n| n as u32))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             },
         );
@@ -2495,7 +2594,11 @@ mod tests {
             .split_whitespace()
             .find_map(|t| t.strip_prefix("contract/"))
             .expect("`versions` must carry contract/<hash> -- the handshake keys off it");
-        assert_eq!(their_contract.len(), 8, "contract hash is the 8-char prefix");
+        assert_eq!(
+            their_contract.len(),
+            8,
+            "contract hash is the 8-char prefix"
+        );
 
         // And it is NOT a semver range: the old gate treated it as one and warned on every connect.
         // (The old gate called er_semver::version_satisfies on `real` and got Err -- but er_semver is not

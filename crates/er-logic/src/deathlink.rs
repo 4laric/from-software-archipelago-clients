@@ -124,7 +124,10 @@ mod tests {
             ..Default::default()
         };
         drive_incoming_kill(&mut g, &mut latch, false);
-        assert!(g.set_flags().is_empty(), "disabled slot was killed (SWEEP H2 regression)");
+        assert!(
+            g.set_flags().is_empty(),
+            "disabled slot was killed (SWEEP H2 regression)"
+        );
         assert_eq!(g.player_hp(), Some(1000));
         // Latch intentionally NOT cleared: enabling later on the same session is the operator's
         // explicit choice; the invariant here is only that nothing fires while disabled.

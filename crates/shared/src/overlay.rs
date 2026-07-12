@@ -243,8 +243,7 @@ impl<G: Game> Overlay<G> {
         builder = match (self.previous_size, is_compact_mode, self.was_compact_mode) {
             (Some(size), true, false) => {
                 let style = ui.clone_style();
-                let remove_bottom_space =
-                    ui.frame_height() + style.window_padding[1];
+                let remove_bottom_space = ui.frame_height() + style.window_padding[1];
 
                 builder.size(
                     [size[0], size[1] - remove_bottom_space.ceil()],
@@ -253,8 +252,7 @@ impl<G: Game> Overlay<G> {
             }
             (Some(size), false, true) => {
                 let style = ui.clone_style();
-                let add_bottom_space =
-                    ui.frame_height() + style.window_padding[1];
+                let add_bottom_space = ui.frame_height() + style.window_padding[1];
 
                 builder.size(
                     [size[0], size[1] + add_bottom_space.ceil()],
@@ -509,9 +507,7 @@ impl<G: Game> Overlay<G> {
                             | CommandResult { .. }
                             | AdminCommandResult { .. }
                             | Unknown { .. } => 0xff,
-                            ItemSend { item, .. }
-                            | ItemCheat { item, .. }
-                            | Hint { item, .. }
+                            ItemSend { item, .. } | ItemCheat { item, .. } | Hint { item, .. }
                                 if core.base().config().slot() == item.receiver().name()
                                     || core.base().config().slot() == item.sender().name() =>
                             {

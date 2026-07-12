@@ -42,15 +42,51 @@ const MODE: u8 = MODE_WRITE;
 /// active-seed subset via slot_data `shopRowFlags` (so non-shop-check seeds are untouched). The 20
 /// `need_fresh_flag` slots are NOT here — they need an allocated flag (next step).
 const REUSE_ROW_FLAGS: &[(u32, u32)] = &[
-    (100576, 150960), (100585, 150970), (100575, 150980), (100501, 150060), (100500, 150080),
-    (100514, 150210), (100502, 150090), (100503, 150120), (100504, 150140), (100506, 150220),
-    (100539, 150480), (100525, 150490), (100540, 150500), (100551, 150550), (101800, 280060),
-    (101801, 280590), (101859, 250540), (100625, 160350), (100700, 170070), (100751, 170550),
-    (100752, 170560), (100750, 170570), (100950, 190540), (100951, 190550), (100925, 190290),
-    (100926, 190300), (100696, 170080), (100686, 160960), (100687, 160970), (100675, 160770),
-    (100837, 180460), (100825, 180270), (100827, 180470), (100101, 110060), (100650, 160530),
-    (100605, 160250), (100606, 160260), (100340, 130790), (100325, 130310), (100326, 130320),
-    (100743, 170540), (100725, 170500), (100875, 180790), (100886, 180940), (100876, 180810),
+    (100576, 150960),
+    (100585, 150970),
+    (100575, 150980),
+    (100501, 150060),
+    (100500, 150080),
+    (100514, 150210),
+    (100502, 150090),
+    (100503, 150120),
+    (100504, 150140),
+    (100506, 150220),
+    (100539, 150480),
+    (100525, 150490),
+    (100540, 150500),
+    (100551, 150550),
+    (101800, 280060),
+    (101801, 280590),
+    (101859, 250540),
+    (100625, 160350),
+    (100700, 170070),
+    (100751, 170550),
+    (100752, 170560),
+    (100750, 170570),
+    (100950, 190540),
+    (100951, 190550),
+    (100925, 190290),
+    (100926, 190300),
+    (100696, 170080),
+    (100686, 160960),
+    (100687, 160970),
+    (100675, 160770),
+    (100837, 180460),
+    (100825, 180270),
+    (100827, 180470),
+    (100101, 110060),
+    (100650, 160530),
+    (100605, 160250),
+    (100606, 160260),
+    (100340, 130790),
+    (100325, 130310),
+    (100326, 130320),
+    (100743, 170540),
+    (100725, 170500),
+    (100875, 180790),
+    (100886, 180940),
+    (100876, 180810),
 ];
 
 /// (row_id, expected vanilla eventFlag_forStock) — read straight from the vanilla ShopLineupParam.csv.
@@ -59,8 +95,8 @@ const REUSE_ROW_FLAGS: &[(u32, u32)] = &[
 /// 150960 / 150080). If these read back as expected, the +0x0C offset and row access are correct.
 const PROBE_ROWS: &[(u32, u32)] = &[(100053, 100530), (100576, 69630), (100500, 69620)];
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Seed-accurate row->flag map from slot_data `shopRowFlags` (set by net.rs at connect). `SET` flips
@@ -77,7 +113,10 @@ static CHECK_FLAGS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Called by net.rs once slot_data is parsed. `rows` = (ShopLineupParam row id, AP tracking flag).
 pub fn configure(rows: Vec<(u32, u32)>) {
-    log::info!("shop-flags: configured {} row(s) from slot_data shopRowFlags", rows.len());
+    log::info!(
+        "shop-flags: configured {} row(s) from slot_data shopRowFlags",
+        rows.len()
+    );
     *CONFIGURED.lock().unwrap() = rows;
     CONFIGURED_SET.store(true, Ordering::Relaxed);
 }
@@ -85,7 +124,10 @@ pub fn configure(rows: Vec<(u32, u32)>) {
 /// Called by net.rs with the poller's check-flag set (slot_data `locationFlags` values), so the stock
 /// clamp can reach every shop check by `eventFlag_forStock` match (no per-row id list needed).
 pub fn configure_check_flags(flags: Vec<u32>) {
-    log::info!("shop-flags: configured {} check flag(s) for stock clamp", flags.len());
+    log::info!(
+        "shop-flags: configured {} check flag(s) for stock clamp",
+        flags.len()
+    );
     *CHECK_FLAGS.lock().unwrap() = flags;
 }
 
@@ -177,7 +219,9 @@ fn probe() -> bool {
                 } else {
                     "MISMATCH"
                 };
-                log::info!("shop-flags PROBE: row {row} eventFlag_forStock={got} (expect {expect}) [{m}]");
+                log::info!(
+                    "shop-flags PROBE: row {row} eventFlag_forStock={got} (expect {expect}) [{m}]"
+                );
             }
             None => log::warn!("shop-flags PROBE: row {row} not present in ShopLineupParam"),
         }
@@ -185,7 +229,11 @@ fn probe() -> bool {
     log::info!(
         "shop-flags PROBE: === {ok}/{} match; +0x{STOCK_FLAG_OFF:X} offset {} ===",
         PROBE_ROWS.len(),
-        if ok == PROBE_ROWS.len() { "CONFIRMED -> safe to flip MODE_WRITE" } else { "WRONG -> do not write" }
+        if ok == PROBE_ROWS.len() {
+            "CONFIRMED -> safe to flip MODE_WRITE"
+        } else {
+            "WRONG -> do not write"
+        }
     );
     true
 }

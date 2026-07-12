@@ -175,7 +175,11 @@ mod replay {
         // flag untouched end to end.
         let timeline = [Ev::IncomingDeath, Ev::Tick, Ev::Tick];
         let g = replay(&timeline, false);
-        assert_eq!(g.kills(), 0, "death_link:0 slot must never be killed by a foreign death");
+        assert_eq!(
+            g.kills(),
+            0,
+            "death_link:0 slot must never be killed by a foreign death"
+        );
         assert!(!g.flag(DEATHLINK_KILL_FLAG));
 
         // What SWEEP H2 looked like: the ungated pre-fix delivery kills the opted-out player.
@@ -191,7 +195,10 @@ mod replay {
     fn incoming_kills_when_death_link_on() {
         // Opted-in slot: the bounce must land exactly one kill via the dedicated flag (76996).
         let g = replay(&[Ev::IncomingDeath, Ev::Tick], true);
-        assert!(g.flag(DEATHLINK_KILL_FLAG), "opted-in kill must place DEATHLINK_KILL_FLAG");
+        assert!(
+            g.flag(DEATHLINK_KILL_FLAG),
+            "opted-in kill must place DEATHLINK_KILL_FLAG"
+        );
         assert_eq!(g.kills(), 1);
     }
 
@@ -199,21 +206,46 @@ mod replay {
     fn reconnect_does_not_reapply_incoming_death() {
         // The kill lands, then the connection bounces and the same death is re-delivered: the
         // once-only dedup must hold the count at one.
-        let timeline = [Ev::IncomingDeath, Ev::Tick, Ev::Reconnect, Ev::Tick, Ev::Tick];
+        let timeline = [
+            Ev::IncomingDeath,
+            Ev::Tick,
+            Ev::Reconnect,
+            Ev::Tick,
+            Ev::Tick,
+        ];
         let g = replay(&timeline, true);
-        assert_eq!(g.kills(), 1, "a reconnect re-delivery must not kill the player twice");
+        assert_eq!(
+            g.kills(),
+            1,
+            "a reconnect re-delivery must not kill the player twice"
+        );
 
         // Without the dedup (pre-fix shape) the re-delivery kills again.
         let buggy = replay_with(&timeline, true, false);
-        assert_eq!(buggy.kills(), 2, "documents the double-kill a reconnect used to cause");
+        assert_eq!(
+            buggy.kills(),
+            2,
+            "documents the double-kill a reconnect used to cause"
+        );
 
         // A genuinely NEW death after the reconnect must still kill (dedup is per-death, not
         // a session-wide fuse)...
         let fresh = replay(
-            &[Ev::IncomingDeath, Ev::Tick, Ev::Reconnect, Ev::Tick, Ev::IncomingDeath, Ev::Tick],
+            &[
+                Ev::IncomingDeath,
+                Ev::Tick,
+                Ev::Reconnect,
+                Ev::Tick,
+                Ev::IncomingDeath,
+                Ev::Tick,
+            ],
             true,
         );
-        assert_eq!(fresh.kills(), 2, "a new death after reconnect must still be applied");
+        assert_eq!(
+            fresh.kills(),
+            2,
+            "a new death after reconnect must still be applied"
+        );
 
         // ...and a reconnect with no prior death delivers nothing.
         assert_eq!(replay(&[Ev::Reconnect, Ev::Tick], true).kills(), 0);
@@ -222,8 +254,14 @@ mod replay {
     #[test]
     fn pure_gate_semantics() {
         assert!(should_apply_incoming_deathlink(true, false));
-        assert!(!should_apply_incoming_deathlink(true, true), "already applied -> never re-kill");
-        assert!(!should_apply_incoming_deathlink(false, false), "death_link off -> drop (SWEEP H2)");
+        assert!(
+            !should_apply_incoming_deathlink(true, true),
+            "already applied -> never re-kill"
+        );
+        assert!(
+            !should_apply_incoming_deathlink(false, false),
+            "death_link off -> drop (SWEEP H2)"
+        );
         assert!(!should_apply_incoming_deathlink(false, true));
     }
 

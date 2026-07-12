@@ -33,16 +33,66 @@ pub struct ScalingTier {
 
 /// The tier ladder — vanilla `7010..7100`, ascending. Index 0 = shallowest sphere, last = deepest.
 pub const SCALING_TIERS: &[ScalingTier] = &[
-    ScalingTier { speffect_id: 7010, hp: 1.141, attack: 1.097, defense: 1.013 },
-    ScalingTier { speffect_id: 7020, hp: 1.281, attack: 1.202, defense: 1.026 },
-    ScalingTier { speffect_id: 7030, hp: 1.656, attack: 1.495, defense: 1.039 },
-    ScalingTier { speffect_id: 7040, hp: 1.813, attack: 1.495, defense: 1.053 },
-    ScalingTier { speffect_id: 7050, hp: 1.953, attack: 1.690, defense: 1.066 },
-    ScalingTier { speffect_id: 7060, hp: 2.266, attack: 1.758, defense: 1.079 },
-    ScalingTier { speffect_id: 7070, hp: 2.406, attack: 1.831, defense: 1.093 },
-    ScalingTier { speffect_id: 7080, hp: 2.688, attack: 2.000, defense: 1.106 },
-    ScalingTier { speffect_id: 7090, hp: 3.250, attack: 2.279, defense: 1.119 },
-    ScalingTier { speffect_id: 7100, hp: 3.703, attack: 2.473, defense: 1.133 },
+    ScalingTier {
+        speffect_id: 7010,
+        hp: 1.141,
+        attack: 1.097,
+        defense: 1.013,
+    },
+    ScalingTier {
+        speffect_id: 7020,
+        hp: 1.281,
+        attack: 1.202,
+        defense: 1.026,
+    },
+    ScalingTier {
+        speffect_id: 7030,
+        hp: 1.656,
+        attack: 1.495,
+        defense: 1.039,
+    },
+    ScalingTier {
+        speffect_id: 7040,
+        hp: 1.813,
+        attack: 1.495,
+        defense: 1.053,
+    },
+    ScalingTier {
+        speffect_id: 7050,
+        hp: 1.953,
+        attack: 1.690,
+        defense: 1.066,
+    },
+    ScalingTier {
+        speffect_id: 7060,
+        hp: 2.266,
+        attack: 1.758,
+        defense: 1.079,
+    },
+    ScalingTier {
+        speffect_id: 7070,
+        hp: 2.406,
+        attack: 1.831,
+        defense: 1.093,
+    },
+    ScalingTier {
+        speffect_id: 7080,
+        hp: 2.688,
+        attack: 2.000,
+        defense: 1.106,
+    },
+    ScalingTier {
+        speffect_id: 7090,
+        hp: 3.250,
+        attack: 2.279,
+        defense: 1.119,
+    },
+    ScalingTier {
+        speffect_id: 7100,
+        hp: 3.703,
+        attack: 2.473,
+        defense: 1.133,
+    },
 ];
 
 /// Number of tiers in the ladder.
@@ -107,7 +157,10 @@ pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> usize {
     } else if let Some(&(_, _, target)) =
         // SCALING_WIRE: range fallback -- `region` is the play_region/100 sub id; the apworld
         // emits [lo, hi, target] buckets in the same space (a few dozen; linear scan is fine).
-        cfg.region_ranges.iter().find(|&&(lo, hi, _)| (lo..=hi).contains(&region))
+        cfg
+            .region_ranges
+            .iter()
+            .find(|&&(lo, hi, _)| (lo..=hi).contains(&region))
     {
         tier_for_target(target, cfg.max_target, cfg.floor_tier)
     } else {
@@ -267,7 +320,7 @@ mod tests {
         let mut c = cfg(&[(6850, 100)], 0);
         c.max_target = 100;
         c.region_ranges = vec![(6850, 6850, 100)]; // Jagged Peak bucket at max depth
-        // no floor wire -> uncapped: top tier
+                                                   // no floor wire -> uncapped: top tier
         assert_eq!(tier_for_region(&c, 6850), NUM_TIERS - 1);
         // with the DLC floor wire present for that bucket -> capped at DLC_ENEMY_TIER_CAP
         c.dlc_blessing_floors = vec![(6850, 6850, 12)];
@@ -430,13 +483,22 @@ mod tests {
         // SWEEP H4 / R6 regression: enabled + empty/missing regionSphereTargets used to arm with
         // every region at floor_tier, and the sweep then flattened ALL baked enemy scaling.
         let missing = json!({ "options": { "completion_scaling": 1 } });
-        assert!(parse_scaling_config(&missing).is_none(), "missing map must stay INERT (H4)");
+        assert!(
+            parse_scaling_config(&missing).is_none(),
+            "missing map must stay INERT (H4)"
+        );
         let empty = json!({ "options": { "completion_scaling": 1 },
                             "regionSphereTargets": {} });
-        assert!(parse_scaling_config(&empty).is_none(), "empty map must stay INERT (H4)");
+        assert!(
+            parse_scaling_config(&empty).is_none(),
+            "empty map must stay INERT (H4)"
+        );
         let garbage = json!({ "options": { "completion_scaling": 1 },
                               "regionSphereTargets": { "not-a-number": 3 } });
-        assert!(parse_scaling_config(&garbage).is_none(), "all-garbage map must stay INERT (H4)");
+        assert!(
+            parse_scaling_config(&garbage).is_none(),
+            "all-garbage map must stay INERT (H4)"
+        );
     }
 
     #[test]
@@ -461,11 +523,17 @@ mod tests {
         let sphere = json!({ "options": { "completion_scaling": 1 },
                              "completionScalingBasis": 1,
                              "regionSphereTargets": { "60000": 1 } });
-        assert_eq!(parse_scaling_config(&sphere).unwrap().basis, ScalingBasis::Sphere);
+        assert_eq!(
+            parse_scaling_config(&sphere).unwrap().basis,
+            ScalingBasis::Sphere
+        );
         let geo = json!({ "options": { "completion_scaling": 1 },
                           "completionScalingBasis": 0,
                           "regionSphereTargets": { "60000": 1 } });
-        assert_eq!(parse_scaling_config(&geo).unwrap().basis, ScalingBasis::Geographic);
+        assert_eq!(
+            parse_scaling_config(&geo).unwrap().basis,
+            ScalingBasis::Geographic
+        );
     }
 
     #[test]

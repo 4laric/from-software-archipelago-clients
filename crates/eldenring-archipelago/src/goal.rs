@@ -101,7 +101,10 @@ mod tests {
 
     #[test]
     fn flag_goals_require_all_flags() {
-        let cfg = parse(&json!({"goalLocations": [10, 20]}), &lf(&[(10, 800), (20, 850)]));
+        let cfg = parse(
+            &json!({"goalLocations": [10, 20]}),
+            &lf(&[(10, 800), (20, 850)]),
+        );
         assert_eq!(cfg.flag_goals, vec![800, 850]);
         assert!(cfg.checked_goals.is_empty());
         assert!(!is_met(&cfg, |f| f == 800, |_| false)); // one boss down, one to go
@@ -121,7 +124,10 @@ mod tests {
     fn malformed_slot_data_is_tolerated() {
         let cfg = parse(&json!({"goalLocations": "oops"}), &lf(&[(10, 800)]));
         assert!(cfg.is_empty());
-        let cfg = parse(&json!({"goalLocations": [10, "bad", null]}), &lf(&[(10, 800)]));
+        let cfg = parse(
+            &json!({"goalLocations": [10, "bad", null]}),
+            &lf(&[(10, 800)]),
+        );
         assert_eq!(cfg.flag_goals, vec![800]); // non-int members skipped, not fatal
     }
 }

@@ -198,10 +198,16 @@ mod tests {
         // Real shop key: token1 == 0 (all-zero placeholder), token3 = shop rows.
         assert_eq!(key_shop_rows("100000,0:0000000000:100200:"), vec![100200]);
         // Multiple rows, comma-separated.
-        assert_eq!(key_shop_rows("1,0:0000000000:100200,100201:"), vec![100200, 100201]);
+        assert_eq!(
+            key_shop_rows("1,0:0000000000:100200,100201:"),
+            vec![100200, 100201]
+        );
         // Flagged (non-shop) key: token3 present but these are ItemLot ids, not shop rows.
         // key_shop_rows still parses them; callers gate on token1 (key_flag) first.
-        assert_eq!(key_shop_rows("2,1:60110:100000,100001:"), vec![100000, 100001]);
+        assert_eq!(
+            key_shop_rows("2,1:60110:100000,100001:"),
+            vec![100000, 100001]
+        );
         // No token3 -> empty.
         assert!(key_shop_rows("100000,0:0000060510::").is_empty());
         assert!(key_shop_rows("100000,0").is_empty());
@@ -214,8 +220,7 @@ mod tests {
         // elden_ring_artifacts/vanilla_er/vanilla_er/ShopLineupParam.csv:
         //   ID=100200 ... eventFlag_forStock=120000  (row read directly from the CSV)
         const ROW_100200_FLAG: u32 = 120000;
-        let row_flags: HashMap<u32, u32> =
-            [(100200u32, ROW_100200_FLAG)].into_iter().collect();
+        let row_flags: HashMap<u32, u32> = [(100200u32, ROW_100200_FLAG)].into_iter().collect();
         let sd = json!({
             "locationIdsToKeys": {
                 "7001": "100000,0:0000000000:100200:",   // shop slot -> row 100200

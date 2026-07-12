@@ -81,7 +81,11 @@ mod replay {
     enum Ev {
         /// An item arrives on the wire this connect (server re-streams the whole history on connect,
         /// so `Receive`s are re-emitted after every `Connect`).
-        Receive { index: i64, ap_item_id: i64, name: String },
+        Receive {
+            index: i64,
+            ap_item_id: i64,
+            name: String,
+        },
         /// A (re)connect. `dispatched_through` ALWAYS resets to 0 (name-dispatch replays the full
         /// stream — the idempotent side). `pushed_through` is set from PERSISTENCE:
         ///   - `persist_index = true`  -> resume at the persisted `last_received_index` (correct).
@@ -90,7 +94,11 @@ mod replay {
     }
 
     fn receive(index: i64, ap_item_id: i64, name: &str) -> Ev {
-        Ev::Receive { index, ap_item_id, name: name.to_string() }
+        Ev::Receive {
+            index,
+            ap_item_id,
+            name: name.to_string(),
+        }
     }
 
     /// A grant the replay observed (an `Enqueue`). Tallying these across the timeline is how we detect
@@ -120,7 +128,10 @@ mod replay {
         /// How many times a given ap_index was ENQUEUED across the whole session. 1 = correct;
         /// >1 = the reconnect double-grant this tier exists to catch.
         fn grant_count(&self, ap_index: i64) -> usize {
-            self.grants.iter().filter(|g| g.ap_index == ap_index).count()
+            self.grants
+                .iter()
+                .filter(|g| g.ap_index == ap_index)
+                .count()
         }
     }
 
@@ -150,7 +161,11 @@ mod replay {
                     // Grant watermark is restored from persistence — or lost.
                     pushed_through = if *persist_index { persisted_index } else { 0 };
                 }
-                Ev::Receive { index, ap_item_id, name } => {
+                Ev::Receive {
+                    index,
+                    ap_item_id,
+                    name,
+                } => {
                     let ri = item(*index, *ap_item_id, name);
                     let action = process_received_item(
                         &ri,
@@ -161,7 +176,12 @@ mod replay {
                         hook,
                     );
                     match &action {
-                        GrantAction::Enqueue { full_id, qty, ap_index, .. } => {
+                        GrantAction::Enqueue {
+                            full_id,
+                            qty,
+                            ap_index,
+                            ..
+                        } => {
                             grants.push(Granted {
                                 ap_index: *ap_index,
                                 full_id: *full_id,
@@ -202,18 +222,34 @@ mod replay {
         // re-dispatch (idempotent side) while each item is granted exactly ONCE (pushed_through
         // resumed at 2 -> the replay is all AlreadyPushed).
         let mut hook = RecordingNetHook::default();
-        let mut timeline = vec![Ev::Connect { persist_index: true }];
+        let mut timeline = vec![Ev::Connect {
+            persist_index: true,
+        }];
         timeline.extend(base_stream());
         // Reconnect — resume the persisted watermark, then the server re-streams from index 0.
-        timeline.push(Ev::Connect { persist_index: true });
+        timeline.push(Ev::Connect {
+            persist_index: true,
+        });
         timeline.extend(base_stream());
 
         let out = replay(&timeline, &mut hook);
 
         // Each item granted exactly once despite being streamed across two connects.
-        assert_eq!(out.grant_count(0), 1, "weapon must grant exactly once across the reconnect");
-        assert_eq!(out.grant_count(1), 1, "rune must grant exactly once across the reconnect");
-        assert_eq!(out.grants.len(), 2, "no re-grants — the resumed watermark suppresses the replay");
+        assert_eq!(
+            out.grant_count(0),
+            1,
+            "weapon must grant exactly once across the reconnect"
+        );
+        assert_eq!(
+            out.grant_count(1),
+            1,
+            "rune must grant exactly once across the reconnect"
+        );
+        assert_eq!(
+            out.grants.len(),
+            2,
+            "no re-grants — the resumed watermark suppresses the replay"
+        );
         // ...but the NAME dispatch re-ran the full stream on BOTH connects (idempotent side effects).
         assert_eq!(
             out.dispatched,
@@ -234,9 +270,13 @@ mod replay {
         // index (persist_index:false) -> pushed_through resets to 0 -> the re-streamed history is
         // enqueued a SECOND time. This is the flask/consumable reconnect double-grant class.
         let mut hook = RecordingNetHook::default();
-        let mut timeline = vec![Ev::Connect { persist_index: true }];
+        let mut timeline = vec![Ev::Connect {
+            persist_index: true,
+        }];
         timeline.extend(base_stream());
-        timeline.push(Ev::Connect { persist_index: false }); // watermark lost
+        timeline.push(Ev::Connect {
+            persist_index: false,
+        }); // watermark lost
         timeline.extend(base_stream());
 
         let out = replay(&timeline, &mut hook);
@@ -246,7 +286,11 @@ mod replay {
             "regression guard: a lost watermark re-grants the weapon on reconnect (documents the bug)"
         );
         assert_eq!(out.grant_count(1), 2, "the rune is double-granted too");
-        assert_eq!(out.grants.len(), 4, "the whole two-item stream was granted twice");
+        assert_eq!(
+            out.grants.len(),
+            4,
+            "the whole two-item stream was granted twice"
+        );
     }
 
     #[test]
@@ -254,9 +298,13 @@ mod replay {
         // A resumed reconnect that then receives NEW items must grant only the new tail — the resumed
         // watermark short-circuits the replayed prefix, the fresh index enqueues once.
         let mut hook = RecordingNetHook::default();
-        let mut timeline = vec![Ev::Connect { persist_index: true }];
+        let mut timeline = vec![Ev::Connect {
+            persist_index: true,
+        }];
         timeline.extend(base_stream());
-        timeline.push(Ev::Connect { persist_index: true });
+        timeline.push(Ev::Connect {
+            persist_index: true,
+        });
         timeline.extend(base_stream()); // replayed prefix -> AlreadyPushed
         timeline.push(receive(2, AP_WEAPON, "Uchigatana")); // genuinely new tail
 
@@ -264,7 +312,11 @@ mod replay {
 
         assert_eq!(out.grant_count(0), 1);
         assert_eq!(out.grant_count(1), 1);
-        assert_eq!(out.grant_count(2), 1, "the new tail item grants exactly once");
+        assert_eq!(
+            out.grant_count(2),
+            1,
+            "the new tail item grants exactly once"
+        );
         assert_eq!(out.grants.len(), 3);
         // Name dispatch ran the prefix twice + the tail once.
         assert_eq!(
@@ -286,19 +338,36 @@ mod replay {
         // every connect and its watermark still advances — so a resumed reconnect must not somehow
         // "recover" it into a grant, and the persisted index still moves past it.
         let mut hook = RecordingNetHook::default();
-        hook.progressive_names.insert("Progressive Flask of Crimson Tears".to_string());
+        hook.progressive_names
+            .insert("Progressive Flask of Crimson Tears".to_string());
 
-        let mut timeline = vec![Ev::Connect { persist_index: true }];
-        timeline.push(receive(0, AP_PROGRESSIVE, "Progressive Flask of Crimson Tears"));
+        let mut timeline = vec![Ev::Connect {
+            persist_index: true,
+        }];
+        timeline.push(receive(
+            0,
+            AP_PROGRESSIVE,
+            "Progressive Flask of Crimson Tears",
+        ));
         timeline.push(receive(1, AP_RUNE, "Golden Rune [1]"));
         // Resume + re-stream: the progressive still dispatches, still never grants.
-        timeline.push(Ev::Connect { persist_index: true });
-        timeline.push(receive(0, AP_PROGRESSIVE, "Progressive Flask of Crimson Tears"));
+        timeline.push(Ev::Connect {
+            persist_index: true,
+        });
+        timeline.push(receive(
+            0,
+            AP_PROGRESSIVE,
+            "Progressive Flask of Crimson Tears",
+        ));
         timeline.push(receive(1, AP_RUNE, "Golden Rune [1]"));
 
         let out = replay(&timeline, &mut hook);
 
-        assert_eq!(out.grant_count(0), 0, "a progressive item never enqueues (skipped both connects)");
+        assert_eq!(
+            out.grant_count(0),
+            0,
+            "a progressive item never enqueues (skipped both connects)"
+        );
         assert_eq!(out.grant_count(1), 1, "the mapped rune grants exactly once");
         // SkipProgressive fires only on the FIRST connect: on the resumed reconnect the item sits
         // below `pushed_through`, so `process_received_item` returns AlreadyPushed before the
@@ -308,7 +377,10 @@ mod replay {
             .iter()
             .filter(|a| matches!(a, GrantAction::SkipProgressive))
             .count();
-        assert_eq!(skips, 1, "SkipProgressive fires once; the replay is AlreadyPushed, not a re-skip");
+        assert_eq!(
+            skips, 1,
+            "SkipProgressive fires once; the replay is AlreadyPushed, not a re-skip"
+        );
         // The progressive's watermark still advanced, so the mapped item past it isn't stuck.
         assert_eq!(out.final_pushed, 2);
         // `progressed` logs EVERY dispatched item (progressive_on_item_received is called for all of
@@ -320,7 +392,10 @@ mod replay {
             .iter()
             .filter(|(name, _)| name == "Progressive Flask of Crimson Tears")
             .count();
-        assert_eq!(prog_dispatches, 2, "progressive name re-dispatches once per connect");
+        assert_eq!(
+            prog_dispatches, 2,
+            "progressive name re-dispatches once per connect"
+        );
     }
 
     #[test]
@@ -328,9 +403,13 @@ mod replay {
         // The mechanism, isolated: on a resumed reconnect, the replayed prefix returns AlreadyPushed
         // for every item below the watermark — the single fact that keeps the grant idempotent.
         let mut hook = RecordingNetHook::default();
-        let mut timeline = vec![Ev::Connect { persist_index: true }];
+        let mut timeline = vec![Ev::Connect {
+            persist_index: true,
+        }];
         timeline.extend(base_stream());
-        timeline.push(Ev::Connect { persist_index: true });
+        timeline.push(Ev::Connect {
+            persist_index: true,
+        });
         timeline.extend(base_stream());
 
         // Instrument by replaying and confirming zero *new* grants after the reconnect: total grants

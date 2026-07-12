@@ -130,7 +130,10 @@ mod replay {
                 always_map_flags: vec![82005],
                 reveal_all_maps: true,
                 map_reveal_flags: vec![62010],
-                start_items: vec![StartItem { full_id: 3000, qty: 1 }],
+                start_items: vec![StartItem {
+                    full_id: 3000,
+                    qty: 1,
+                }],
                 goal_flag: Some(9700),
                 goal_met: true,
             },
@@ -174,7 +177,10 @@ mod replay {
                     // A load screen: the world goes unstable; a tick here must not mutate anything.
                     g.set_stable(false);
                     let out = r.tick(&mut g, budget);
-                    assert!(out.skipped_unstable, "a tick during a load screen must skip");
+                    assert!(
+                        out.skipped_unstable,
+                        "a tick during a load screen must skip"
+                    );
                     g.set_stable(true);
                 }
             }
@@ -225,7 +231,11 @@ mod replay {
             for &k in perm {
                 evs.push(Ev::Receive(k));
             }
-            assert_eq!(run(&evs), want, "permutation {perm:?} diverged from the canonical fixpoint");
+            assert_eq!(
+                run(&evs),
+                want,
+                "permutation {perm:?} diverged from the canonical fixpoint"
+            );
             checked += 1;
         });
         assert_eq!(checked, 5040, "expected 7! = 5040 permutations");
@@ -261,7 +271,11 @@ mod replay {
             evs.push(Ev::Receive(k));
             evs.push(Ev::Load); // a reload between every delivery
         }
-        assert_eq!(run(&evs), want, "injected load screens changed the fixpoint");
+        assert_eq!(
+            run(&evs),
+            want,
+            "injected load screens changed the fixpoint"
+        );
     }
 
     #[test]
@@ -300,7 +314,10 @@ mod replay {
         ]
         .into_iter()
         .collect();
-        assert_eq!(fp.set_flags, want_flags, "all region/map/rune/key/goal + bulk flags set exactly once");
+        assert_eq!(
+            fp.set_flags, want_flags,
+            "all region/map/rune/key/goal + bulk flags set exactly once"
+        );
         assert_eq!(
             fp.goods,
             [191i32, 9000].into_iter().collect::<BTreeSet<_>>(),
@@ -345,8 +362,14 @@ mod replay {
     /// invariant under receiving those copies in any order (and under load-screen injection).
     fn prog_inputs(prefix_hi: i64) -> DesiredInputs {
         let tiers = vec![
-            ProgTier { goods: vec![8101], flags: vec![70001] },
-            ProgTier { goods: vec![8102], flags: vec![70002] },
+            ProgTier {
+                goods: vec![8101],
+                flags: vec![70001],
+            },
+            ProgTier {
+                goods: vec![8102],
+                flags: vec![70002],
+            },
         ];
         let received: Vec<ReceivedItem> = (0..3i64)
             .filter(|&k| k <= prefix_hi)
@@ -388,7 +411,10 @@ mod replay {
                 Ev::Load => {
                     g.set_stable(false);
                     let out = r.tick(&mut g, budget);
-                    assert!(out.skipped_unstable, "a tick during a load screen must skip");
+                    assert!(
+                        out.skipped_unstable,
+                        "a tick during a load screen must skip"
+                    );
                     g.set_stable(true);
                 }
             }
@@ -409,9 +435,19 @@ mod replay {
             run_prog(&evs)
         };
         // Pin the expected end state: both tiers present, both flags set, one overflow Lord's Rune.
-        assert_eq!(want.goods, [8101i32, 8102].into_iter().collect::<BTreeSet<_>>());
-        assert_eq!(want.set_flags, [70001u32, 70002].into_iter().collect::<BTreeSet<_>>());
-        assert_eq!(want.ledger, vec![(2919, 1)], "exactly one overflow, never duplicated");
+        assert_eq!(
+            want.goods,
+            [8101i32, 8102].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            want.set_flags,
+            [70001u32, 70002].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            want.ledger,
+            vec![(2919, 1)],
+            "exactly one overflow, never duplicated"
+        );
 
         let mut order: Vec<i64> = (0..3).collect();
         permute(&mut order, 3, &mut |perm| {
@@ -421,7 +457,11 @@ mod replay {
                 evs.push(Ev::Receive(k)); // duplicate delivery
                 evs.push(Ev::Load); // interleaved load screen
             }
-            assert_eq!(run_prog(&evs), want, "progressive perm+dup+load {perm:?} diverged");
+            assert_eq!(
+                run_prog(&evs),
+                want,
+                "progressive perm+dup+load {perm:?} diverged"
+            );
         });
     }
 
@@ -455,7 +495,11 @@ mod replay {
 
     impl CrashProneGame {
         fn new() -> Self {
-            CrashProneGame { inner: MockGame::stable(), grant_times: Vec::new(), crashed: false }
+            CrashProneGame {
+                inner: MockGame::stable(),
+                grant_times: Vec::new(),
+                crashed: false,
+            }
         }
         /// Record a grant at the current clock; trip `crashed` if the trailing window now exceeds the
         /// queue's capacity (the overflow the real CTD came from).
@@ -516,12 +560,18 @@ mod replay {
         received.push(ReceivedItem {
             index: 40,
             name: "Rold Medallion".into(),
-            semantics: ItemSemantics::KeyItem { goods: 9000, obtained_flags: vec![400001] },
+            semantics: ItemSemantics::KeyItem {
+                goods: 9000,
+                obtained_flags: vec![400001],
+            },
         });
         received.push(ReceivedItem {
             index: 41,
             name: "Godrick's Great Rune".into(),
-            semantics: ItemSemantics::GreatRune { goods: 191, restored_flag: 6901 },
+            semantics: ItemSemantics::GreatRune {
+                goods: 191,
+                restored_flag: 6901,
+            },
         });
         DesiredInputs {
             seed: SEED.into(),
@@ -553,7 +603,11 @@ mod replay {
     fn mass_grant_delta_ctds_when_unpaced_but_survives_when_paced() {
         // PRE-FIX: `min_grant_interval_ms == 0` IS the old unpaced path (grant up to `goods` every
         // frame). Against the fragile game a burst of checks floods the acquisition queue -> CTD.
-        let unpaced = TickBudget { goods: 4, flags: 32, min_grant_interval_ms: 0 };
+        let unpaced = TickBudget {
+            goods: 4,
+            flags: 32,
+            min_grant_interval_ms: 0,
+        };
         let (crashed_unpaced, granted_unpaced) = drive_mass_delta(unpaced);
         assert!(
             crashed_unpaced,
@@ -566,7 +620,11 @@ mod replay {
 
         // POST-FIX: the paced budget (the live default) spaces grants so no absorb window is ever
         // exceeded — the identical delta now survives AND drains completely, each item exactly once.
-        let paced = TickBudget { goods: 2, flags: 32, min_grant_interval_ms: 150 };
+        let paced = TickBudget {
+            goods: 2,
+            flags: 32,
+            min_grant_interval_ms: 150,
+        };
         let (crashed_paced, granted_paced) = drive_mass_delta(paced);
         assert!(
             !crashed_paced,

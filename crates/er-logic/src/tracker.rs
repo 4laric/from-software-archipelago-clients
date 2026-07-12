@@ -182,13 +182,15 @@ pub fn build_tracker_model(
             .get(&id)
             .cloned()
             .unwrap_or_else(|| UNKNOWN_REGION.to_string());
-        per_region.entry(region.clone()).or_insert_with(|| RegionRollup {
-            region,
-            done: 0,
-            total: 0,
-            accessible: true,
-            unchecked: Vec::new(),
-        })
+        per_region
+            .entry(region.clone())
+            .or_insert_with(|| RegionRollup {
+                region,
+                done: 0,
+                total: 0,
+                accessible: true,
+                unchecked: Vec::new(),
+            })
     }
 
     let mut per_region: BTreeMap<RegionId, RegionRollup> = BTreeMap::new();
@@ -297,11 +299,17 @@ mod tests {
         assert_eq!(m.regions.len(), 2);
         // BTreeMap ordering: Caelid before Limgrave.
         let caelid = &m.regions[0];
-        assert_eq!((caelid.region.as_str(), caelid.done, caelid.total), ("Caelid", 1, 2));
+        assert_eq!(
+            (caelid.region.as_str(), caelid.done, caelid.total),
+            ("Caelid", 1, 2)
+        );
         assert_eq!(caelid.unchecked.len(), 1);
         assert_eq!(caelid.unchecked[0].location_id, 11);
         let limgrave = &m.regions[1];
-        assert_eq!((limgrave.region.as_str(), limgrave.done, limgrave.total), ("Limgrave", 2, 3));
+        assert_eq!(
+            (limgrave.region.as_str(), limgrave.done, limgrave.total),
+            ("Limgrave", 2, 3)
+        );
         assert!(!limgrave.complete());
         // Empty coarse table => everything always-accessible.
         assert_eq!((m.in_logic_done, m.in_logic_total), (3, 5));
@@ -325,7 +333,11 @@ mod tests {
         );
 
         assert_eq!((m.done, m.total), (0, 3));
-        let unknown = m.regions.iter().find(|r| r.region == UNKNOWN_REGION).unwrap();
+        let unknown = m
+            .regions
+            .iter()
+            .find(|r| r.region == UNKNOWN_REGION)
+            .unwrap();
         assert_eq!((unknown.done, unknown.total), (0, 1));
         let hali = m.regions.iter().find(|r| r.region == "Haligtree").unwrap();
         assert_eq!((hali.done, hali.total), (0, 2));
@@ -359,7 +371,11 @@ mod tests {
         // 1 (checked, Limgrave-open) + 2 (unchecked, Limgrave-open) are in-logic; 3 (Mountaintops
         // closed) is not. in_logic_done = 1 (the checked one), in_logic_total = 2.
         assert_eq!((m.in_logic_done, m.in_logic_total), (1, 2));
-        let coastal = m.regions.iter().find(|r| r.region == "Coastal Cave").unwrap();
+        let coastal = m
+            .regions
+            .iter()
+            .find(|r| r.region == "Coastal Cave")
+            .unwrap();
         assert!(coastal.accessible);
         assert!(coastal.unchecked.iter().all(|u| u.in_logic));
         let sol = m.regions.iter().find(|r| r.region == "Castle Sol").unwrap();
@@ -433,11 +449,24 @@ mod tests {
         assert_eq!(
             limgrave.unchecked,
             vec![
-                UncheckedLocation { location_id: 2, hinted: true, big_ticket: false, in_logic: true },
-                UncheckedLocation { location_id: 3, hinted: false, big_ticket: false, in_logic: true },
+                UncheckedLocation {
+                    location_id: 2,
+                    hinted: true,
+                    big_ticket: false,
+                    in_logic: true
+                },
+                UncheckedLocation {
+                    location_id: 3,
+                    hinted: false,
+                    big_ticket: false,
+                    in_logic: true
+                },
             ]
         );
-        assert!(hints.is_hinted(1), "checked-location hint stays queryable for the Hints panel");
+        assert!(
+            hints.is_hinted(1),
+            "checked-location hint stays queryable for the Hints panel"
+        );
     }
 
     #[test]
@@ -462,11 +491,14 @@ mod tests {
 
     #[test]
     fn received_items_sorted_and_empty_inputs_ok() {
-        let received: HashSet<String> =
-            ["Scadutree Fragment", "Academy Glintstone Key", "Rold Medallion"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let received: HashSet<String> = [
+            "Scadutree Fragment",
+            "Academy Glintstone Key",
+            "Rold Medallion",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let m = build_tracker_model(
             &[],
             &[],
@@ -481,7 +513,11 @@ mod tests {
         assert!(m.regions.is_empty());
         assert_eq!(
             m.received_items,
-            vec!["Academy Glintstone Key", "Rold Medallion", "Scadutree Fragment"]
+            vec![
+                "Academy Glintstone Key",
+                "Rold Medallion",
+                "Scadutree Fragment"
+            ]
         );
     }
 }

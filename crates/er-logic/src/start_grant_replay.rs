@@ -169,7 +169,7 @@ mod replay {
         // Pre-fix: the grant fires the instant the inventory pointer is captured (load screen), then
         // the bulk load wipes it and the latched grant never retries. Reproduces the 2026-07-06 bug.
         let timeline = [
-            Ev::EnterLoadScreen,   // inventory_ready -> grant fires here, far too early
+            Ev::EnterLoadScreen, // inventory_ready -> grant fires here, far too early
             Ev::Tick(3_000),
             Ev::BulkInventoryLoad, // clobbers the just-granted Torch
             Ev::Tick(5_000),
@@ -220,6 +220,9 @@ mod replay {
         assert!(!start_items_settled(false, 0));
         assert!(!start_items_settled(false, START_ITEM_SETTLE_MS - 1));
         assert!(start_items_settled(false, START_ITEM_SETTLE_MS));
-        assert!(start_items_settled(true, 0), "a real pickup settles the inventory immediately");
+        assert!(
+            start_items_settled(true, 0),
+            "a real pickup settles the inventory immediately"
+        );
     }
 }

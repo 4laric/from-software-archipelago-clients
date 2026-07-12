@@ -16,8 +16,8 @@
 use eldenring::cs::{EquipParamGoods, SoloParamRepository};
 use fromsoftware_shared::FromStatic;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// EquipParamGoods row id of the Telescope — the iconId me3's flower texture overrides. Read live.
 const TELESCOPE_GOOD_ID: u32 = 2040;
@@ -60,7 +60,10 @@ pub fn run() -> bool {
     let mut seen: HashSet<u32> = HashSet::new();
     for (loc, good) in pairs {
         // Own-world sellable rewards display natively (shop_sell rewrote the slot) -> nothing to flower.
-        if crate::scout_proof::lookup(loc).map(|s| s.er_sell_id.is_some()).unwrap_or(false) {
+        if crate::scout_proof::lookup(loc)
+            .map(|s| s.er_sell_id.is_some())
+            .unwrap_or(false)
+        {
             native += 1;
             continue;
         }

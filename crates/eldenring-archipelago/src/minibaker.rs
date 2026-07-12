@@ -22,7 +22,7 @@ const OFF_STOCK_FLAG: usize = 0x0C;
 const OFF_SELL_QTY: usize = 0x14;
 
 const STONESWORD_KEY: i32 = 8000; // goods id
-const PRICE: i32 = 4000;          // runes
+const PRICE: i32 = 4000; // runes
 
 /// Reserved ShopLineupParam row id from slot_data `stoneswordVendorRow` (0 = feature off).
 static ROW: AtomicU32 = AtomicU32::new(0);
@@ -60,7 +60,7 @@ pub fn run() -> bool {
         ((base + OFF_EQUIP) as *mut i32).write_unaligned(STONESWORD_KEY);
         ((base + OFF_VALUE) as *mut i32).write_unaligned(PRICE);
         ((base + OFF_STOCK_FLAG) as *mut u32).write_unaligned(0); // 0 = always in stock (no flag gate)
-        ((base + OFF_SELL_QTY) as *mut i16).write_unaligned(-1);   // -1 = unlimited
+        ((base + OFF_SELL_QTY) as *mut i16).write_unaligned(-1); // -1 = unlimited
     }
     if !LOGGED.swap(true, Ordering::Relaxed) {
         log::info!(

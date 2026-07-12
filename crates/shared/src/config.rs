@@ -207,7 +207,15 @@ mod tests {
 
     #[test]
     fn malformed_or_non_object_json_is_rejected() {
-        for bad in ["{", r#"{ "slot": }"#, "not json", "[]", "null", "\"a string\"", "42"] {
+        for bad in [
+            "{",
+            r#"{ "slot": }"#,
+            "not json",
+            "[]",
+            "null",
+            "\"a string\"",
+            "42",
+        ] {
             assert!(
                 resolve_config(ok(bad)).is_err(),
                 "expected {bad:?} to be rejected"

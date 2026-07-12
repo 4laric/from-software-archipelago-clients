@@ -52,7 +52,9 @@ mod replay {
         }
 
         fn is_attuned(&self) -> bool {
-            attuned(&self.members, self.threshold, |m| self.server_checked.contains(&m))
+            attuned(&self.members, self.threshold, |m| {
+                self.server_checked.contains(&m)
+            })
         }
 
         /// Collect an in-region member check (this is what BUILDS attunement).
@@ -181,7 +183,10 @@ mod replay {
             r.banners.is_empty(),
             "already-attuned region stays quiet on reconnect (no re-banner)"
         );
-        assert_eq!(r.released_total, 0, "payout already on the server set -> nothing re-released");
+        assert_eq!(
+            r.released_total, 0,
+            "payout already on the server set -> nothing re-released"
+        );
         assert!(r.pending.is_empty());
     }
 

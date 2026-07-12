@@ -65,7 +65,9 @@ pub struct LiveGame {
 
 impl LiveGame {
     pub fn new() -> Self {
-        LiveGame { in_world_since: None }
+        LiveGame {
+            in_world_since: None,
+        }
     }
 
     /// Call each tick BEFORE reading stability so the dwell clock tracks continuous in-world time
@@ -277,7 +279,10 @@ fn paced_budget() -> TickBudget {
             .unwrap_or(d)
     }
     fn env_u64(k: &str, d: u64) -> u64 {
-        std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(d)
     }
     TickBudget {
         goods: env_usize("RECONCILE_GRANT_BURST", 2),
@@ -288,7 +293,9 @@ fn paced_budget() -> TickBudget {
 
 /// Is dry-run mode on? (`RECONCILE_DRYRUN=1` — phase 0: compute + log the diff, never apply.)
 fn dry_run() -> bool {
-    std::env::var("RECONCILE_DRYRUN").map(|v| v == "1").unwrap_or(false)
+    std::env::var("RECONCILE_DRYRUN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Public view of [`dry_run`] so `core.rs` can gate its additive dry-run wiring on the same env var

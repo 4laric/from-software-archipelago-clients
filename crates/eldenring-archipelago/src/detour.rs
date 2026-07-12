@@ -63,7 +63,12 @@ pub fn set_known_collected_flags(flags: HashSet<u32>) {
 }
 
 fn check_item_flags_lookup(raw_id: u32) -> Option<Vec<u32>> {
-    CHECK_ITEM_FLAGS.lock().unwrap().as_ref()?.get(&raw_id).cloned()
+    CHECK_ITEM_FLAGS
+        .lock()
+        .unwrap()
+        .as_ref()?
+        .get(&raw_id)
+        .cloned()
 }
 
 /// AP location ids the detour suppressed, drained by `update_live` -> `mark_checked`.
@@ -220,9 +225,9 @@ fn chapel_pot_relief_safe() -> bool {
 /// containers (count only rises), and the pool ships ~16 Cracked Pot locations plus 10 in the start
 /// loadout, so 20 is otherwise very reachable. Nobody needs 19+ pots, so the cap is invisible in play.
 const POT_DELIVERY_CAPS: &[(i32, i32)] = &[
-    (0x4000_0000 | 9500, 19),    // Cracked Pot        (event 1460, threshold 20)
-    (0x4000_0000 | 9501, 9),     // Ritual Pot         (event 1461, threshold 10)
-    (0x4000_0000 | 9510, 9),     // Perfume Bottle     (event 1462, threshold 10)
+    (0x4000_0000 | 9500, 19), // Cracked Pot        (event 1460, threshold 20)
+    (0x4000_0000 | 9501, 9),  // Ritual Pot         (event 1461, threshold 10)
+    (0x4000_0000 | 9510, 9),  // Perfume Bottle     (event 1462, threshold 10)
     (0x4000_0000 | 2_009_500, 9), // Hefty Cracked Pot (DLC; threshold 10, flags 669xx)
 ];
 
@@ -235,7 +240,8 @@ fn count_held_goods_row(row: i32) -> Option<i32> {
     let pgd = gdm.main_player_game_data.as_ref();
     let mut total: i64 = 0;
     for entry in pgd.equipment.equip_inventory_data.items_data.items() {
-        if entry.item_id.category() == ItemCategory::Goods && entry.item_id.param_id() as i32 == row {
+        if entry.item_id.category() == ItemCategory::Goods && entry.item_id.param_id() as i32 == row
+        {
             total += entry.quantity as i64;
         }
     }
@@ -345,7 +351,9 @@ unsafe extern "C" fn add_item_detour(
     // lot we rewrote ourselves. The flag poll reports the check; the AP grant delivers the real item.
     // Checked FIRST, before the id-keyed vanilla suppressor below (which this is progressively retiring).
     if crate::check_lots::is_placeholder(raw_id as i32) {
-        log::debug!("check-lots: placeholder pickup {raw_id:#x} suppressed (AP grant delivers the item)");
+        log::debug!(
+            "check-lots: placeholder pickup {raw_id:#x} suppressed (AP grant delivers the item)"
+        );
         return 0;
     }
 
@@ -365,10 +373,14 @@ unsafe extern "C" fn add_item_detour(
                 None => true,
             };
             if suppress {
-                log::info!("vanilla-suppress: pickup {raw_id:#x} suppressed (check not yet collected)");
+                log::info!(
+                    "vanilla-suppress: pickup {raw_id:#x} suppressed (check not yet collected)"
+                );
                 return 0;
             }
-            log::info!("vanilla-suppress: pickup {raw_id:#x} passed (check already collected — re-pickup)");
+            log::info!(
+                "vanilla-suppress: pickup {raw_id:#x} passed (check already collected — re-pickup)"
+            );
         }
         return call_original(inventory, entry, itembuf, r9);
     }

@@ -175,7 +175,10 @@ pub mod fake {
         fn default_kill_player_places_the_dedicated_flag_and_reports_retry() {
             let mut g = FakeGame::new();
             g.set_flag_holder_ready(false);
-            assert!(!g.kill_player(), "holder not ready -> must report failure for retry");
+            assert!(
+                !g.kill_player(),
+                "holder not ready -> must report failure for retry"
+            );
             assert!(g.set_flags().is_empty());
             g.set_flag_holder_ready(true);
             assert!(g.kill_player());
@@ -189,7 +192,10 @@ pub mod fake {
             g.script_flag_holder_ready(vec![false, false]);
             assert!(!g.try_set_event_flag(1, true));
             assert!(!g.try_set_event_flag(1, true));
-            assert!(g.try_set_event_flag(1, true), "script drained -> steady-state applies");
+            assert!(
+                g.try_set_event_flag(1, true),
+                "script drained -> steady-state applies"
+            );
             assert_eq!(g.set_flags(), vec![1]);
         }
     }

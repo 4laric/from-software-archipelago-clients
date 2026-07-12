@@ -161,7 +161,10 @@ pub fn parse(sd: &Value) -> FogWallConfig {
         }
     }
     let debug = FORCE_DEBUG_CAPTURE
-        || sd.get("fogWallDebug").and_then(|v| v.as_bool()).unwrap_or(false);
+        || sd
+            .get("fogWallDebug")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     let placed = walls.iter().filter(|w| w.placed()).count();
     log::info!(
         "fogwall: {} wall(s) configured ({placed} placed, {} awaiting transform), debug_capture={debug}",
@@ -212,7 +215,12 @@ fn parse_wall(w: &Value) -> Option<FogWall> {
         _ => None,
     };
 
-    let f = |k: &str, d: f32| w.get(k).and_then(Value::as_f64).map(|v| v as f32).unwrap_or(d);
+    let f = |k: &str, d: f32| {
+        w.get(k)
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
+            .unwrap_or(d)
+    };
     let uni = f("scale", 1.0);
     let scale = (f("scaleX", uni), f("scaleY", uni), f("scaleZ", uni));
     let rot = (f("rotX", 0.0), f("rotY", 0.0), f("rotZ", 0.0));

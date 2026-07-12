@@ -288,8 +288,9 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
                             }
                         }
                     }
-                    let is_compression_warning =
-                        format!("{print}").to_lowercase().contains("compressed websocket");
+                    let is_compression_warning = format!("{print}")
+                        .to_lowercase()
+                        .contains("compressed websocket");
                     info!("[APS] {print}");
                     if self.log_buffer.len() >= LOG_BUFFER_LIMIT {
                         self.log_buffer.pop_front();

@@ -93,7 +93,11 @@ mod replay {
             if !self.bag_walkable {
                 return None; // bag mid-load -> can't resolve safely (the transient-miss window)
             }
-            Some(if somber { self.held_somber } else { self.held_normal })
+            Some(if somber {
+                self.held_somber
+            } else {
+                self.held_normal
+            })
         }
         fn scadutree_blessing(&self) -> Option<i32> {
             None
@@ -156,7 +160,10 @@ mod replay {
             );
         }
         // And a grant already at/above the target is returned unchanged (raise-only).
-        assert_eq!(apply_auto_upgrade(&g, true, WEAPON_BASE + 20), WEAPON_BASE + 20);
+        assert_eq!(
+            apply_auto_upgrade(&g, true, WEAPON_BASE + 20),
+            WEAPON_BASE + 20
+        );
     }
 
     #[test]
@@ -174,9 +181,16 @@ mod replay {
             true,
         );
         let levels: Vec<i32> = out.iter().map(|&id| id - WEAPON_BASE).collect();
-        assert_eq!(levels, vec![8, 8, 25, 25], "monotone, capped at +25, no over-raise");
+        assert_eq!(
+            levels,
+            vec![8, 8, 25, 25],
+            "monotone, capped at +25, no over-raise"
+        );
         assert!(levels.iter().all(|&l| l <= NORMAL_CAP));
-        assert!(levels.windows(2).all(|w| w[1] >= w[0]), "never lowers across the burst");
+        assert!(
+            levels.windows(2).all(|w| w[1] >= w[0]),
+            "never lowers across the burst"
+        );
     }
 
     #[test]
@@ -187,12 +201,12 @@ mod replay {
         // walkable again. This is the down-flicker guard in pure form.
         let out = replay(
             &[
-                Ev::Grant(WEAPON_BASE + 12),   // held -> 12
-                Ev::BagWalkable(false),        // load in flight
-                Ev::Grant(WEAPON_BASE + 12),   // re-grant: bag unreadable -> identity (+12), NOT lowered
-                Ev::Grant(WEAPON_BASE),        // a fresh +0 during the miss -> identity (+0), NOT guessed
-                Ev::BagWalkable(true),         // bag back
-                Ev::Grant(WEAPON_BASE),        // now resolves to the held +12 again
+                Ev::Grant(WEAPON_BASE + 12), // held -> 12
+                Ev::BagWalkable(false),      // load in flight
+                Ev::Grant(WEAPON_BASE + 12), // re-grant: bag unreadable -> identity (+12), NOT lowered
+                Ev::Grant(WEAPON_BASE), // a fresh +0 during the miss -> identity (+0), NOT guessed
+                Ev::BagWalkable(true),  // bag back
+                Ev::Grant(WEAPON_BASE), // now resolves to the held +12 again
             ],
             true,
         );
@@ -208,7 +222,11 @@ mod replay {
     fn off_burst_is_identity() {
         // With the feature off, no grant in the burst is ever touched, regardless of the bag.
         let out = replay(
-            &[Ev::Grant(WEAPON_BASE), Ev::Grant(WEAPON_BASE + 3), Ev::Grant(WEAPON_BASE)],
+            &[
+                Ev::Grant(WEAPON_BASE),
+                Ev::Grant(WEAPON_BASE + 3),
+                Ev::Grant(WEAPON_BASE),
+            ],
             false,
         );
         assert_eq!(out, vec![WEAPON_BASE, WEAPON_BASE + 3, WEAPON_BASE]);

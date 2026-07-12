@@ -49,10 +49,10 @@
 #![allow(dead_code)]
 
 use eldenring::cs::SoloParamRepository;
-use fromsoftware_shared::FromStatic;   // brings SoloParamRepository::instance_mut into scope
+use fromsoftware_shared::FromStatic; // brings SoloParamRepository::instance_mut into scope
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// lot id -> goods slot indices (1..=8) to repoint at the placeholder.
 static BLANK: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
@@ -144,7 +144,9 @@ pub fn run() -> bool {
             }
         }
     }
-    log::info!("check-lots: blanked {n} check goods slot(s) -> placeholder {ph} (vanilla ware never handed out at a check)");
+    log::info!(
+        "check-lots: blanked {n} check goods slot(s) -> placeholder {ph} (vanilla ware never handed out at a check)"
+    );
     DONE.store(true, Ordering::Relaxed);
     true
 }
@@ -185,7 +187,9 @@ pub fn name_placeholder() -> bool {
     if crate::fmg_inject::extend_swap_overrides(GOODS_NAME_CAT, &[(ph as u32, name)]) == 0 {
         return false; // msg repo / category not up yet
     }
-    log::info!("check-lots: placeholder goods {ph} named \"{PLACEHOLDER_NAME}\" (was the [ERROR] toast)");
+    log::info!(
+        "check-lots: placeholder goods {ph} named \"{PLACEHOLDER_NAME}\" (was the [ERROR] toast)"
+    );
     NAMED.store(true, Ordering::Relaxed);
     true
 }

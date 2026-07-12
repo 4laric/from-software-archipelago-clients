@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use er_logic::config_reload::{reload_action, ConnInfo, ReloadAction};
+use er_logic::config_reload::{ConnInfo, ReloadAction, reload_action};
 
 /// What we last applied. `None` until the first successful read (which seeds it, so a fresh boot does
 /// not immediately "reconnect" to the file it just loaded from).
@@ -33,8 +33,16 @@ fn read_on_disk() -> Option<ConnInfo> {
     let raw = std::fs::read_to_string(config_path()?).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?; // torn write -> parse fails -> ignore
     Some(ConnInfo {
-        url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        slot: v.get("slot").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        url: v
+            .get("url")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        slot: v
+            .get("slot")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         password: v
             .get("password")
             .and_then(|x| x.as_str())
@@ -46,7 +54,11 @@ fn read_on_disk() -> Option<ConnInfo> {
 /// no-op rather than a spurious reconnect.
 pub fn prime(url: &str, slot: &str, password: Option<String>) {
     if let Ok(mut g) = APPLIED.lock() {
-        *g = Some(ConnInfo { url: url.to_string(), slot: slot.to_string(), password });
+        *g = Some(ConnInfo {
+            url: url.to_string(),
+            slot: slot.to_string(),
+            password,
+        });
     }
 }
 

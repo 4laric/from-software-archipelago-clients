@@ -15,11 +15,10 @@
 //! unset flags each tick (reconcile, don't dispatch). This module lifts that predicate into pure,
 //! host-tested code the Windows pass should call, and replays the save-load that strands the graces.
 
-
 #[cfg(test)]
 mod replay {
-    use crate::region_lock::region_bloom_settled;
     use crate::hook::GameHook;
+    use crate::region_lock::region_bloom_settled;
     use std::collections::HashMap;
 
     // Limgrave, faithful to the pinned bug: the front-door grace IS the open flag (73100 = both),
@@ -162,7 +161,10 @@ mod replay {
             Ev::Tick,
         ];
         let g = replay(&timeline, false);
-        assert!(g.is_set(OPEN_FLAG), "the front-door / open flag persists across the load");
+        assert!(
+            g.is_set(OPEN_FLAG),
+            "the front-door / open flag persists across the load"
+        );
         assert!(
             !all_graces_set(&g),
             "regression guard: the open-flag latch strands the interior graces (documents the bug)"
@@ -173,12 +175,7 @@ mod replay {
     fn all_graces_recover_when_latching_on_observed_state() {
         // Same timeline, latch on observed state: the post-load bloom sees interior graces unset and
         // re-applies them.
-        let timeline = [
-            Ev::ReceiveRegionLock,
-            Ev::Tick,
-            Ev::SaveLoad,
-            Ev::Tick,
-        ];
+        let timeline = [Ev::ReceiveRegionLock, Ev::Tick, Ev::SaveLoad, Ev::Tick];
         let g = replay(&timeline, true);
         assert!(
             all_graces_set(&g),
@@ -197,20 +194,31 @@ mod replay {
                 Ev::ReceiveRegionLock,
                 Ev::HolderReady(false), // holder down first...
                 Ev::SaveLoad,           // ...so the post-load bloom can't re-heal yet
-                Ev::Tick,               // reconcile attempted but holder not ready -> graces stay unset
+                Ev::Tick, // reconcile attempted but holder not ready -> graces stay unset
                 Ev::HolderReady(true),
-                Ev::Tick,               // now it lands
+                Ev::Tick, // now it lands
             ],
             true,
         );
-        assert!(all_graces_set(&recovered), "reconcile must recover once the flag holder is ready");
+        assert!(
+            all_graces_set(&recovered),
+            "reconcile must recover once the flag holder is ready"
+        );
 
         // And it was genuinely still unset while the holder was down.
         let mid = replay(
-            &[Ev::ReceiveRegionLock, Ev::HolderReady(false), Ev::SaveLoad, Ev::Tick],
+            &[
+                Ev::ReceiveRegionLock,
+                Ev::HolderReady(false),
+                Ev::SaveLoad,
+                Ev::Tick,
+            ],
             true,
         );
-        assert!(!all_graces_set(&mid), "graces must not appear set while the holder is not ready");
+        assert!(
+            !all_graces_set(&mid),
+            "graces must not appear set while the holder is not ready"
+        );
     }
 
     #[test]
@@ -249,10 +257,16 @@ mod countdown_replay {
     }
 
     const fn sealed(now_ms: u64) -> Frame {
-        Frame { now_ms, sealed: true }
+        Frame {
+            now_ms,
+            sealed: true,
+        }
     }
     const fn open(now_ms: u64) -> Frame {
-        Frame { now_ms, sealed: false }
+        Frame {
+            now_ms,
+            sealed: false,
+        }
     }
 
     /// Replay a whole timeline through one `KickCountdown`, returning the per-frame actions.
@@ -292,10 +306,16 @@ mod countdown_replay {
         let out = replay(&[sealed(0), sealed(5_000), sealed(9_999), sealed(10_000)]);
         assert_eq!(secs_of(&out[0]), Some(10));
         assert_eq!(secs_of(&out[1]), Some(5));
-        assert_eq!(secs_of(&out[2]), Some(1), "last whole second before the kick still warns");
+        assert_eq!(
+            secs_of(&out[2]),
+            Some(1),
+            "last whole second before the kick still warns"
+        );
         assert_eq!(
             out[3],
-            KickAction::Kick { region: REGION.to_string() },
+            KickAction::Kick {
+                region: REGION.to_string()
+            },
             "the kick fires once the grace has fully elapsed"
         );
     }
@@ -305,11 +325,11 @@ mod countdown_replay {
         // Enter (warn 10s), leave before the grace elapses (None + disarm), then re-enter LATER:
         // the countdown restarts from full — the pre-leave elapsed must NOT carry over.
         let out = replay(&[
-            sealed(0),     // arm at t=0, warn 10s
-            open(8_000),   // left the region -> disarm, None
-            sealed(8_000), // re-enter -> re-arm at t=8_000, warn 10s again (not a kick)
-            sealed(17_999),// 9_999 ms into the SECOND visit -> still warning (1s)
-            sealed(18_000),// 10_000 ms into the second visit -> kick
+            sealed(0),      // arm at t=0, warn 10s
+            open(8_000),    // left the region -> disarm, None
+            sealed(8_000),  // re-enter -> re-arm at t=8_000, warn 10s again (not a kick)
+            sealed(17_999), // 9_999 ms into the SECOND visit -> still warning (1s)
+            sealed(18_000), // 10_000 ms into the second visit -> kick
         ]);
         assert_eq!(secs_of(&out[0]), Some(10));
         assert_eq!(out[1], KickAction::None, "leaving disarms the countdown");
@@ -319,14 +339,22 @@ mod countdown_replay {
             "re-entry restarts from full grace (elapsed does not carry across a leave)"
         );
         assert_eq!(secs_of(&out[3]), Some(1));
-        assert_eq!(out[4], KickAction::Kick { region: REGION.to_string() });
+        assert_eq!(
+            out[4],
+            KickAction::Kick {
+                region: REGION.to_string()
+            }
+        );
     }
 
     #[test]
     fn secs_left_counts_down_each_second() {
         // A sealed tick every second yields a strictly decreasing 10..=1 banner countdown.
         let frames: Vec<Frame> = (0..10).map(|s| sealed(s * 1_000)).collect();
-        let got: Vec<u32> = replay(&frames).iter().map(|a| secs_of(a).unwrap()).collect();
+        let got: Vec<u32> = replay(&frames)
+            .iter()
+            .map(|a| secs_of(a).unwrap())
+            .collect();
         assert_eq!(got, vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
     }
 
@@ -334,9 +362,14 @@ mod countdown_replay {
     fn region_and_lock_name_propagate_into_the_action_and_banner() {
         let out = replay(&[sealed(0), sealed(10_000)]);
         match &out[0] {
-            KickAction::Warn { region, lock_name, .. } => {
+            KickAction::Warn {
+                region, lock_name, ..
+            } => {
                 assert_eq!(region, REGION);
-                assert_eq!(lock_name, LOCK, "the missing <Region> Lock name is carried for the banner");
+                assert_eq!(
+                    lock_name, LOCK,
+                    "the missing <Region> Lock name is carried for the banner"
+                );
             }
             other => panic!("expected Warn, got {other:?}"),
         }
@@ -345,7 +378,12 @@ mod countdown_replay {
             Some("The seal of Caelid repels you... 10s"),
             "the warning banner matches the SPEC wording"
         );
-        assert_eq!(out[1], KickAction::Kick { region: REGION.to_string() });
+        assert_eq!(
+            out[1],
+            KickAction::Kick {
+                region: REGION.to_string()
+            }
+        );
         assert_eq!(out[1].banner(), None, "a Kick has no warning banner");
     }
 
@@ -363,11 +401,28 @@ mod countdown_replay {
             sealed(21_000), // re-enter -> re-warn from full
         ]);
         assert!(matches!(out[0], KickAction::Warn { .. }));
-        assert_eq!(out[1], KickAction::Kick { region: REGION.to_string() });
-        assert_eq!(out[2], KickAction::None, "no re-kick while still reported sealed");
+        assert_eq!(
+            out[1],
+            KickAction::Kick {
+                region: REGION.to_string()
+            }
+        );
+        assert_eq!(
+            out[2],
+            KickAction::None,
+            "no re-kick while still reported sealed"
+        );
         assert_eq!(out[3], KickAction::None, "still no re-kick");
-        assert_eq!(out[4], KickAction::None, "leaving is a no-op action but disarms");
-        assert_eq!(secs_of(&out[5]), Some(10), "re-entry re-warns from full (not suppressed)");
+        assert_eq!(
+            out[4],
+            KickAction::None,
+            "leaving is a no-op action but disarms"
+        );
+        assert_eq!(
+            secs_of(&out[5]),
+            Some(10),
+            "re-entry re-warns from full (not suppressed)"
+        );
     }
 
     #[test]
@@ -378,7 +433,11 @@ mod countdown_replay {
         let out = replay(&[sealed(0), sealed(9_000), sealed(0)]);
         assert_eq!(secs_of(&out[0]), Some(10), "arm on enter -> full window");
         assert_eq!(secs_of(&out[1]), Some(1), "9s in -> 1s left");
-        assert_eq!(secs_of(&out[2]), Some(10), "a backwards clock re-warns full, never kicks early");
+        assert_eq!(
+            secs_of(&out[2]),
+            Some(10),
+            "a backwards clock re-warns full, never kicks early"
+        );
     }
 
     #[test]
@@ -390,7 +449,9 @@ mod countdown_replay {
         assert_eq!(secs_of(&kc.update(2_999, true, REGION, LOCK)), Some(1));
         assert_eq!(
             kc.update(3_000, true, REGION, LOCK),
-            KickAction::Kick { region: REGION.to_string() }
+            KickAction::Kick {
+                region: REGION.to_string()
+            }
         );
     }
 }

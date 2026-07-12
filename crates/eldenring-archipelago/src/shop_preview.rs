@@ -12,8 +12,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const GOODS_NAME_CAT: u32 = 10;
 const GOODS_INFO_CAT: u32 = 20; // the "Item Effect" line the buy menu renders
@@ -52,7 +52,9 @@ pub fn run() -> bool {
     let mut cmap: HashMap<u32, Vec<u16>> = HashMap::new();
     let (mut overridden, mut native) = (0u32, 0u32);
     for (loc, good) in &pairs {
-        let Some(s) = crate::scout_proof::lookup(*loc) else { continue };
+        let Some(s) = crate::scout_proof::lookup(*loc) else {
+            continue;
+        };
         if s.er_sell_id.is_some() {
             native += 1;
             continue; // own-world: shop_sell sells it natively
