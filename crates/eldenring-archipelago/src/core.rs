@@ -710,12 +710,32 @@ impl shared::Core for Core {
                 // HERE, inside the closure where `sd` is in scope, then threaded out via the tuple
                 // and assigned below. Defaults to the static set; the seed's bigTicketLocations
                 // overrides it when present.
-                let big_ticket = {
-                    let mut bt = er_logic::tracker_regions::big_ticket_set();
-                    if let Some(arr) = sd.get("bigTicketLocations").and_then(|v| v.as_array()) {
-                        bt = arr.iter().filter_map(|x| x.as_u64()).collect();
+                // THE PROGRESSION SURFACE = what the tracker stars. Big-ticket is RETIRED.
+                //
+                // It was a SECOND list of "important checks", and it disagreed with the first:
+                // big-ticket named {MajorBoss, Remembrance, GreatRune} while the apworld's progression
+                // surface is {Remembrance, Seedtree, Church, Boss, Fragment, Revered}. Intersection:
+                // Remembrance alone. So this tracker starred MajorBoss/GreatRune checks that the
+                // apworld FORBIDS a region Lock from ever occupying -- it pointed the player at checks
+                // the locks could not be on. (Found 2026-07-12 reading a spoiler: killing Malenia paid
+                // out a Smithing Stone [4].)
+                //
+                // NOTE THE DELETED FALLBACK. This used to default to tracker_regions::big_ticket_set()
+                // -- the STATIC big-ticket table, i.e. exactly the wrong set -- so a seed missing the
+                // key quietly restored the lie. An empty star set is visibly broken; a wrong one
+                // teaches the player something false. Prefer the visible failure.
+                let big_ticket: std::collections::HashSet<u64> = {
+                    match sd.get("progressionSurfaceLocations").and_then(|v| v.as_array()) {
+                        Some(arr) => arr.iter().filter_map(|x| x.as_u64()).collect(),
+                        None => {
+                            log::warn!(
+                                "slot_data has no progressionSurfaceLocations: the tracker will star \
+                                 NOTHING. (Old apworld? bigTicketLocations is retired -- it named a \
+                                 set progression could never reach.)"
+                            );
+                            std::collections::HashSet::new()
+                        }
                     }
-                    bt
                 };
 
                 (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, big_ticket)
