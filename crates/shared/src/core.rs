@@ -433,8 +433,11 @@ pub trait Core: Send + Sized {
         // handle_command path as overlay say input. Before the load/grace gating so
         // diagnostics work from the main menu too (flag writers degrade gracefully there).
         // Unknown commands log locally only -- never echoed back to chat (no relay loops).
+        // `mem::take` rather than `drain(..).collect()`: draining EVERY element into a fresh Vec of the
+        // same type allocates a second Vec for no reason (clippy::drain_collect). Same semantics --
+        // pending_chat_commands is left empty either way.
         let pending: Vec<(String, Option<String>)> =
-            self.base_mut().pending_chat_commands.drain(..).collect();
+            std::mem::take(&mut self.base_mut().pending_chat_commands);
         for (cmd, arg) in pending {
             if !self.handle_command(&cmd, arg.as_deref()) {
                 self.base_mut().log(ap::Print::message(format!(
