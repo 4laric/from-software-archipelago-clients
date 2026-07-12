@@ -474,6 +474,20 @@ impl shared::Core for Core {
                     sd.pointer("/options/flatten_regular_upgrades").and_then(|v| v.as_i64()).unwrap_or(0),
                 );
                 let map = i64_map(sd.get("apIdsToItemIds"));
+                // The GOODS rows this seed can actually GRANT. shop_icon / shop_preview must never
+                // repaint one of these: EquipParamGoods.iconId and the GoodsName FMG entry are SHARED
+                // per good id, so flowering the vanilla ware behind a shop slot re-icons and renames
+                // EVERY copy the player will ever hold -- 11 vanilla shop rows sell smithing stones,
+                // which is why the 2026-07-12 playtest had telescope-icon stones in the world AND in
+                // the inventory. Both modules fail CLOSED until this arrives.
+                let real_goods: std::collections::HashSet<u32> = map
+                    .values()
+                    .map(|v| *v as u32)
+                    .filter(|full| er_codec::item_category_of(*full) == er_codec::CATEGORY_GOODS)
+                    .map(er_codec::row_id_of)
+                    .collect();
+                crate::shop_icon::set_real_goods(real_goods.clone());
+                crate::shop_preview::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
                 let region = crate::region::parse(sd);
                 let fogwall = crate::fogwall::parse(sd);
@@ -1776,6 +1790,10 @@ impl shared::Core for Core {
             let _ = crate::shop_stock::run();
             let _ = crate::enemy_drops::run();
             let _ = crate::check_lots::run();
+            // Give the check placeholder a face (AP flower + "Archipelago Item"). Without it every
+            // check pickup is a nameless telescope, and the pickup toast is the only feedback the
+            // player gets that a check even fired.
+            let _ = crate::check_lots::dress_placeholder();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
             let _ = crate::minibaker::run();

@@ -33,11 +33,69 @@
 
 #![allow(dead_code)]
 
-use eldenring::cs::SoloParamRepository;
+use eldenring::cs::{EquipParamGoods, SoloParamRepository};
 use fromsoftware_shared::FromStatic;   // brings SoloParamRepository::instance_mut into scope
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
+
+/// EquipParamGoods row id of the Telescope -- its iconId is the one me3's VFS menu override repaints
+/// into the AP flower (see shop_icon.rs / er-ap-icon-override). Read live, never written.
+const TELESCOPE_GOOD_ID: u32 = 2040;
+/// FMG category ids for GoodsName / GoodsInfo / GoodsCaption (mirrors shop_preview).
+const GOODS_NAME_CAT: u32 = 10;
+const GOODS_INFO_CAT: u32 = 20;
+const GOODS_CAPTION_CAT: u32 = 24;
+
+static DRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Give the placeholder a FACE.
+///
+/// Every check's goods slot now hands out row 8852, which ships with "no GoodsName entry" and whatever
+/// icon it happened to inherit -- so a check pickup read as a nameless telescope. That is not a
+/// cosmetic detail: the pickup toast is the ONLY feedback that a check fired, and an anonymous
+/// telescope is indistinguishable from a bug. (Alaric, playtest 2026-07-12.)
+///
+/// So: point it at the Telescope's iconId, which me3's override repaints to the AP flower, and inject
+/// a real name. Safe to write GLOBALLY -- unlike a vanilla ware, row 8852 is referenced by no lot, shop
+/// or recipe and can never be granted as a real item, so nothing else in the game wears this identity.
+/// That asymmetry is exactly what makes the same write UNSAFE in shop_icon/shop_preview.
+pub fn dress_placeholder() -> bool {
+    if DRESSED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let ph = PLACEHOLDER.load(Ordering::Relaxed);
+    if ph == 0 {
+        return true; // feature off -- nothing to dress
+    }
+    // SAFETY: FD4 singleton; game thread, in-world (caller gates).
+    let repo = match unsafe { SoloParamRepository::instance_mut() } {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let tele_icon = match repo.get::<EquipParamGoods>(TELESCOPE_GOOD_ID) {
+        Some(row) => row.icon_id(),
+        None => return false, // telescope row not up yet -- retry next tick
+    };
+    if let Some(row) = repo.get_mut::<EquipParamGoods>(ph as u32) {
+        if row.icon_id() != tele_icon {
+            row.set_icon_id(tele_icon);
+        }
+    } else {
+        return false;
+    }
+    let name: Vec<u16> = "Archipelago Item".encode_utf16().collect();
+    let caption: Vec<u16> =
+        "A check. What it really holds is decided by the multiworld -- it is on its way to you."
+            .encode_utf16()
+            .collect();
+    crate::fmg_inject::extend_swap_overrides(GOODS_NAME_CAT, &[(ph as u32, name)]);
+    crate::fmg_inject::extend_swap_overrides(GOODS_INFO_CAT, &[(ph as u32, caption.clone())]);
+    crate::fmg_inject::extend_swap_overrides(GOODS_CAPTION_CAT, &[(ph as u32, caption)]);
+    log::info!("check-lots: placeholder {ph} dressed (AP flower iconId {tele_icon} + GoodsName)");
+    DRESSED.store(true, Ordering::Relaxed);
+    true
+}
 
 /// lot id -> goods slot indices (1..=8) to repoint at the placeholder.
 static BLANK: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
