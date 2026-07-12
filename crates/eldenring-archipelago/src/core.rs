@@ -1542,7 +1542,7 @@ impl shared::Core for Core {
                 // explicit drain gives the release banner its count and is robust to a missed re-poll.
                 let attuned_regions_now: Vec<String> = att_state
                     .iter()
-                    .filter(|(_, &(_, _, a))| a)
+                    .filter(|(_, v)| v.2)
                     .map(|(r, _)| r.clone())
                     .collect();
                 let mut released: BTreeMap<String, usize> = BTreeMap::new();
