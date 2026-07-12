@@ -29,23 +29,15 @@ pub fn load() -> FlagPollConfig {
     };
     // Legacy baker-written apconfig.json (location_flags/sweep_flags) -- usually absent now.
     merge_table_file(&mut cfg, &dir.join("apconfig.json"));
-    // PURE-RUNTIME BRIDGE (2026-07-01): the SEED-INDEPENDENT static detection table, if the user
-    // drops it next to the DLL, supplies the sweep groups the retired baker used to write into
-    // apconfig (overworld/castle tiers -- e.g. Castle Morne, flag 1044320800). slot_data
-    // locationFlags still wins for per-location flags (merged over this in core.rs); members not
-    // in this seed are filtered by valid_locations at poll time. Durable fix = emit sweepFlags
-    // in slot_data (contract work).
-    let static_path = dir.join("er_static_detection_table.json");
-    if static_path.exists() {
-        merge_table_file(&mut cfg, &static_path);
-    } else {
-        // R9 (SWEEP): this table is env-dependent -- say so once instead of only hinting via
-        // the count line below. (apconfig.json absence above stays silent: absent by design.)
-        log::info!(
-            "flag-poll: static detection table absent at {} -- sweep groups limited to slot_data",
-            static_path.display()
-        );
-    }
+    // er_static_detection_table.json is GONE (2026-07-12). It was a v0.1 bridge that fed the retired
+    // BAKER's extra sweep groups into flagpoll, and it was a dev-box-only file: gen_data never emitted
+    // one, nothing in the repo could rebuild one (regenerate_detection_table.py AUGMENTS an existing
+    // table and exits if it cannot find it), and the release never shipped one. So no player has ever
+    // had it -- but Alaric's box did, which meant every playtest ran a configuration nobody else could
+    // reproduce: +4886 location flags and +76 sweep groups that do not exist for anyone else.
+    //
+    // A dev/prod divergence that only the maintainer can see is how "cannot reproduce" gets written.
+    // The live path is slot_data: locationFlags + dungeonSweepFlags (merged in core.rs).
     log::info!(
         "flag-poll config: {} location flags, {} sweep flags",
         cfg.location_flags.len(),

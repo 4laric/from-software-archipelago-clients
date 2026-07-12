@@ -127,7 +127,7 @@ pub fn shop_flags_from_keys(sd: &Value, row_flags: &HashMap<u32, u32>) -> HashMa
 /// Load the shipped `shoplineup_flags.json` -> `{shop_row_id: eventFlag_forStock}`.
 /// Same tolerant shape as `flagpoll::merge_table_file`: a flat JSON object of
 /// string-int-keyed integer values. Missing/invalid file -> empty map (shops simply
-/// stay unresolved, no panic). Mirror of how `er_static_detection_table.json` is read
+/// stay unresolved, no panic). Same tolerant-merge shape flagpoll uses for its own tables
 /// in `flagpoll.rs` (read_to_string -> serde_json -> tolerant object walk).
 pub fn load_shoplineup_flags(path: &std::path::Path) -> HashMap<u32, u32> {
     let mut out = HashMap::new();
