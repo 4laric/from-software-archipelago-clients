@@ -2504,5 +2504,4 @@ mod tests {
             "`versions` is a descriptive string, not a semver band -- nothing may gate on it as one"
         );
     }
-    }
 }
