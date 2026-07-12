@@ -578,6 +578,31 @@ impl shared::Core for Core {
                         crate::enemy_drops::configure(roll);
                     }
                 }
+
+                // checkLotBlank {"<lot id>": [goods slot idx, ...]} + apPlaceholderGoods.
+                // Repoints each CHECK lot's goods slot at ONE placeholder id, which detour.rs then
+                // suppresses UNCONDITIONALLY -- so the vanilla ware is never handed out at a check, and
+                // NOTHING else has to be watched by item id (mined ore / farmed drops / bought / crafted
+                // goods all pass through untouched). One placeholder suffices because checks are detected
+                // by the FLAG POLL, not by the pickup id.
+                {
+                    let ph = sd.get("apPlaceholderGoods").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let mut blank: std::collections::HashMap<u32, Vec<u8>> =
+                        std::collections::HashMap::new();
+                    if let Some(m) = sd.get("checkLotBlank").and_then(|v| v.as_object()) {
+                        for (k, v) in m {
+                            let (Ok(lot), Some(a)) = (k.parse::<u32>(), v.as_array()) else { continue };
+                            let slots: Vec<u8> =
+                                a.iter().filter_map(|x| x.as_i64()).map(|x| x as u8).collect();
+                            if !slots.is_empty() {
+                                blank.insert(lot, slots);
+                            }
+                        }
+                    }
+                    if ph != 0 && !blank.is_empty() {
+                        crate::check_lots::configure(blank, ph);
+                    }
+                }
                 crate::shop_sell::configure(loc_flags.clone());
                 crate::shop_preview::configure(preview.clone());
                 crate::shop_icon::configure(preview);
@@ -1746,6 +1771,7 @@ impl shared::Core for Core {
             let _ = crate::shop_sell::run();
             let _ = crate::shop_stock::run();
             let _ = crate::enemy_drops::run();
+            let _ = crate::check_lots::run();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
             let _ = crate::minibaker::run();

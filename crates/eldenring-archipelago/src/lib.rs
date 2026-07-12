@@ -36,6 +36,7 @@ mod shop_preview;
 mod shop_sell;
 mod shop_stock;
 mod enemy_drops;
+mod check_lots;
 mod startgrants;
 mod upgrade_cost;
 mod upgrades;

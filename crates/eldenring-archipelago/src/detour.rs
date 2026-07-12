@@ -339,6 +339,16 @@ unsafe extern "C" fn add_item_detour(
         return 0;
     }
 
+    // AP PLACEHOLDER (SPEC-runtime-minibake): check lots have been repointed at ONE spare goods row, so
+    // a check now hands out the placeholder instead of its vanilla ware. Suppress it UNCONDITIONALLY --
+    // the row is referenced by no vanilla lot/shop/recipe, so the ONLY way to receive it is from a check
+    // lot we rewrote ourselves. The flag poll reports the check; the AP grant delivers the real item.
+    // Checked FIRST, before the id-keyed vanilla suppressor below (which this is progressively retiring).
+    if crate::check_lots::is_placeholder(raw_id as i32) {
+        log::debug!("check-lots: placeholder pickup {raw_id:#x} suppressed (AP grant delivers the item)");
+        return 0;
+    }
+
     if !is_synthetic_goods(raw_id) {
         // Vanilla-suppress (LIVE 2026-07-01): a vanilla id that belongs to a check location is the
         // check's ORIGINAL ware — suppress its bag-add so the AP grant delivers what the seed placed
