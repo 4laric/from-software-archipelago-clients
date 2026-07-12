@@ -592,3 +592,66 @@ fn str_to_u32vec(v: Option<&Value>) -> HashMap<String, Vec<u32>> {
     }
     m
 }
+
+#[cfg(test)]
+mod foreign_apworld_degrade {
+    //! A FOREIGN APWORLD MUST YIELD A PLAYABLE VANILLA SEED, NOT AN ERROR.
+    //!
+    //! Bedrock's apworld (fswap/archipelago@er) emits none of the region-lock keys -- it has no
+    //! region lock at all; `region lock ideas.md` is a wishlist asking someone else to build one.
+    //! Alaric promised him, in writing: "when these arguments aren't present, they fall back to
+    //! vanilla behaviour". THESE TESTS ARE THAT PROMISE. If one fails, we have silently made our
+    //! client refuse to drive anyone else's world.
+    //!
+    //! Vanilla = every region open, no kick-watch, no random start, no warp.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn empty_slot_data_yields_vanilla_region_config() {
+        let c = parse(&json!({}));
+        assert!(
+            c.region_open_flags.is_empty(),
+            "no regionOpenFlags => no locks; every region open"
+        );
+        assert!(
+            c.area_lock_flags.is_empty(),
+            "no areaLockFlags => NO kick-watch. A foreign seed must never be kicked out of a region \
+             it does not know is locked."
+        );
+        assert!(c.lock_reveal_flags.is_empty());
+        assert_eq!(c.random_start_done_flag, 0, "0 = non-random seed, no start guard");
+        assert_eq!(c.random_start_warp_flag, 0, "0 = no random start");
+        assert_eq!(c.random_start_area_id, 0);
+        assert_eq!(c.random_start_grace_id, 0);
+    }
+
+    #[test]
+    fn a_bedrock_shaped_slot_data_parses_and_stays_vanilla() {
+        // Exactly the keys Bedrock's fill_slot_data emits (his words, 2026-07-06): item map, the
+        // matt key table, and the goal. No regionOpenFlags, no startRegion, no areaLockFlags.
+        let sd = json!({
+            "apIdsToItemIds":   { "7770001": 1073750026u64 },
+            "locationIdsToKeys":{ "7770001": "301200,0:0000520110::" },
+            "goalLocations":    [7770875, 7770876],
+        });
+        let c = parse(&sd);
+        assert!(c.region_open_flags.is_empty());
+        assert!(c.area_lock_flags.is_empty());
+        assert_eq!(c.random_start_warp_flag, 0);
+    }
+
+    #[test]
+    fn a_partial_region_table_does_not_invent_kick_ranges() {
+        // regionOpenFlags present but areaLockFlags absent: we must NOT derive kick ranges
+        // client-side (see the note at parse()). No table => no enforcement, by design.
+        let sd = json!({ "regionOpenFlags": { "Caelid Lock": 73202u64 } });
+        let c = parse(&sd);
+        assert_eq!(c.region_open_flags.len(), 1);
+        assert!(
+            c.area_lock_flags.is_empty(),
+            "kick ranges are the generator's job; deriving them here would enforce a lock the \
+             apworld never asked for"
+        );
+    }
+}

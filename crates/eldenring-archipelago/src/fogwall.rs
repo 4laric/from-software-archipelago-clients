@@ -325,3 +325,21 @@ pub fn tick(cfg: &mut FogWallConfig) {
         }
     }
 }
+
+#[cfg(test)]
+mod foreign_apworld_degrade {
+    //! Absent `fogWalls` must be inert, not a panic: no foreign apworld emits it.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn empty_slot_data_adds_no_walls_beyond_builtins() {
+        let c = parse(&json!({}));
+        assert_eq!(
+            c.walls.len(),
+            BUILTIN_WALLS.len(),
+            "absent fogWalls must contribute ZERO extra walls"
+        );
+        assert!(!c.debug, "fogWallDebug absent => debug capture off");
+    }
+}

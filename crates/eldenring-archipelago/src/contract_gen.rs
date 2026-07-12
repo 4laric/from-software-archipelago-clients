@@ -82,15 +82,15 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "pool_builder_juice_candidates", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "pool_builder_juice_pct", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "locationIdsToKeys", shape: Shape::Any, required: true, greenfield: false },
-    ContractKey { name: "itemCounts", shape: Shape::Any, required: true, greenfield: true },
-    ContractKey { name: "naturalKeyTriggers", shape: Shape::Any, required: true, greenfield: false },
-    ContractKey { name: "lockGrantItems", shape: Shape::Any, required: true, greenfield: false },
-    ContractKey { name: "randomStartDoneFlag", shape: Shape::Any, required: true, greenfield: false },
-    ContractKey { name: "randomStartWarpFlag", shape: Shape::Any, required: true, greenfield: false },
-    ContractKey { name: "randomStartAreaId", shape: Shape::Any, required: true, greenfield: false },
-    ContractKey { name: "randomStartGraceId", shape: Shape::Any, required: true, greenfield: false },
-    ContractKey { name: "fogWalls", shape: Shape::Any, required: true, greenfield: false },
-    ContractKey { name: "fogWallDebug", shape: Shape::Any, required: true, greenfield: false },
+    ContractKey { name: "itemCounts", shape: Shape::Any, required: false, greenfield: true },
+    ContractKey { name: "naturalKeyTriggers", shape: Shape::Any, required: false, greenfield: false },
+    ContractKey { name: "lockGrantItems", shape: Shape::Any, required: false, greenfield: false },
+    ContractKey { name: "randomStartDoneFlag", shape: Shape::Any, required: false, greenfield: false },
+    ContractKey { name: "randomStartWarpFlag", shape: Shape::Any, required: false, greenfield: false },
+    ContractKey { name: "randomStartAreaId", shape: Shape::Any, required: false, greenfield: false },
+    ContractKey { name: "randomStartGraceId", shape: Shape::Any, required: false, greenfield: false },
+    ContractKey { name: "fogWalls", shape: Shape::Any, required: false, greenfield: false },
+    ContractKey { name: "fogWallDebug", shape: Shape::Any, required: false, greenfield: false },
 ];
 
 /// Declared sub-keys of the top-level `options` echo (validated when `options` is present).
@@ -171,6 +171,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "36013f63";
+pub const CONTRACT_HASH: &str = "1a033252";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.2.0";
 
