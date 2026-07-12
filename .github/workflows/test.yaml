@@ -43,11 +43,9 @@ jobs:
     - run: cargo test -p er-codec -p er-semver -p er-logic
 
     - run: cargo fmt -- --check
-    # eldenring-archipelago carries ~45 accumulated style lints (map_or, collapsible_if, doc lists,
-    # type_complexity) -- the backlog of a crate clippy has never once linted, since Actions was disabled
-    # on this fork from day one. None are correctness bugs. They are being cleared; until they are, they
-    # REPORT but do not block, so they cannot hide a real regression in the steps above.
+    # RE-ARMED 2026-07-12. eldenring-archipelago had 44 accumulated lints -- the whole backlog of a crate
+    # clippy had never once linted, because Actions is disabled by default on forks and this repo is one.
+    # All 44 are now cleared, so clippy blocks again. It is a HARD gate: the debt got in precisely because
+    # nothing was stopping it.
     - run: cargo clippy -- -D warnings
-      continue-on-error: true
     - run: cargo clippy --features=profile -- -D warnings
-      continue-on-error: true
