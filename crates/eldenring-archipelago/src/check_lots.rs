@@ -34,6 +34,7 @@
 #![allow(dead_code)]
 
 use eldenring::cs::SoloParamRepository;
+use fromsoftware_shared::FromStatic;   // brings SoloParamRepository::instance_mut into scope
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
@@ -98,18 +99,20 @@ pub fn run() -> bool {
         // setters are the symbols I could not verify -- the eldenring crate is not vendored in the
         // sandbox. Fix the names here if they differ; the logic is unaffected. Check lots live in BOTH
         // tables (map treasure + enemy one-time drops), so we try map first and fall back to enemy.
+        // Check lots live in BOTH tables (map treasure + enemy one-time drops). Same row struct, so
+        // the same setter serves both; try map, fall back to enemy.
         let mut wrote = false;
-        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParamMap>(lot) {
-            for &s in &slots {
-                set_slot(row_as_map(row), s, ph);
+        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(lot) {
+            for &sl in &slots {
+                set_slot(row, sl, ph);
                 n += 1;
             }
             wrote = true;
         }
         if !wrote {
-            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParamEnemy>(lot) {
-                for &s in &slots {
-                    set_slot_enemy(row, s, ph);
+            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(lot) {
+                for &sl in &slots {
+                    set_slot(row, sl, ph);
                     n += 1;
                 }
             }
@@ -120,30 +123,11 @@ pub fn run() -> bool {
     true
 }
 
-// The two tables share a layout; these shims exist only so the setter names live in ONE place when the
-// Windows build corrects them.
+// ItemLotParam_map and ItemLotParam_enemy are two different TABLES that share ONE row struct
+// (`ITEMLOT_PARAM_ST`) -- confirmed by the Windows build 2026-07-11. So one setter serves both, and the
+// row_as_map shim I'd written for "two layouts" was solving a problem that doesn't exist.
 #[inline]
-fn row_as_map(r: &mut eldenring::param::ITEM_LOT_PARAM_MAP) -> &mut eldenring::param::ITEM_LOT_PARAM_MAP {
-    r
-}
-
-#[inline]
-fn set_slot(row: &mut eldenring::param::ITEM_LOT_PARAM_MAP, slot: u8, id: i32) {
-    match slot {
-        1 => row.set_lot_item_id_01(id),
-        2 => row.set_lot_item_id_02(id),
-        3 => row.set_lot_item_id_03(id),
-        4 => row.set_lot_item_id_04(id),
-        5 => row.set_lot_item_id_05(id),
-        6 => row.set_lot_item_id_06(id),
-        7 => row.set_lot_item_id_07(id),
-        8 => row.set_lot_item_id_08(id),
-        _ => {}
-    }
-}
-
-#[inline]
-fn set_slot_enemy(row: &mut eldenring::param::ITEM_LOT_PARAM_ENEMY, slot: u8, id: i32) {
+fn set_slot(row: &mut eldenring::param::ITEMLOT_PARAM_ST, slot: u8, id: i32) {
     match slot {
         1 => row.set_lot_item_id_01(id),
         2 => row.set_lot_item_id_02(id),

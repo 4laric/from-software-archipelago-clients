@@ -34,7 +34,7 @@
 #![allow(dead_code)]
 
 use eldenring::cs::{ShopLineupParam, SoloParamRepository};
-use eldenring::param::SHOP_LINEUP_PARAM;
+use fromsoftware_shared::FromStatic;   // brings SoloParamRepository::instance_mut into scope
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;

@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 use eldenring::cs::SoloParamRepository;
+use fromsoftware_shared::FromStatic;   // brings SoloParamRepository::instance_mut into scope
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -73,7 +74,7 @@ pub fn run() -> bool {
         // everything else mirrors shop_sell exactly. The row layout is 8 parallel slot arrays, and the
         // fields we write are lotItemId01..08 -- lotItemBasePoint (drop weight) is deliberately NOT
         // written, so drop rates stay vanilla.
-        let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParamEnemy>(lot) else { continue };
+        let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(lot) else { continue };
         for (slot, gid) in slots {
             match slot {
                 1 => row.set_lot_item_id_01(gid),
