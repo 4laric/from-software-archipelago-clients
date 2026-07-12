@@ -39,8 +39,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// row id -> (goods row id, equipType, price). From slot_data `shopInfiniteStock`.
-static ROLL: Mutex<Option<HashMap<u32, (i32, u8, i32)>>> = Mutex::new(None);
+/// (goods row id, equipType, price) -- what one infinite-stock row was rerolled to.
+type StockRow = (i32, u8, i32);
+/// ShopLineupParam row id -> its rerolled ware. From slot_data `shopInfiniteStock`.
+type StockTable = HashMap<u32, StockRow>;
+
+static ROLL: Mutex<Option<StockTable>> = Mutex::new(None);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Byte offset of `value` (i32, the rune price) in a SHOP_LINEUP_PARAM row (Paramdex def):

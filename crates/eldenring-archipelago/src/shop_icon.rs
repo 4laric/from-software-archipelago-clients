@@ -117,10 +117,10 @@ pub fn run() -> bool {
             protected += 1;
             continue;
         }
-        if let Some(row) = repo.get_mut::<EquipParamGoods>(gid) {
-            if row.icon_id() != tele_icon {
-                row.set_icon_id(tele_icon);
-            }
+        if let Some(row) = repo.get_mut::<EquipParamGoods>(gid)
+            && row.icon_id() != tele_icon
+        {
+            row.set_icon_id(tele_icon);
         }
         flower += 1;
     }

@@ -109,26 +109,26 @@ fn is_int(v: &Value) -> bool { v.is_i64() || v.is_u64() }
 
 fn shape_ok(shape: Shape, v: &Value) -> bool {
     match shape {
-        Shape::ScalarIntMap => v.as_object().map_or(false, |o| o.values().all(is_int)),
-        Shape::ListvalIntMap => v.as_object().map_or(false, |o| {
-            o.values().all(|x| x.as_array().map_or(false, |a| a.iter().all(is_int)))
+        Shape::ScalarIntMap => v.as_object().is_some_and(|o| o.values().all(is_int)),
+        Shape::ListvalIntMap => v.as_object().is_some_and(|o| {
+            o.values().all(|x| x.as_array().is_some_and(|a| a.iter().all(is_int)))
         }),
-        Shape::StrMap => v.as_object().map_or(false, |o| o.values().all(|x| x.is_string())),
-        Shape::TripleList => v.as_array().map_or(false, |a| {
-            a.iter().all(|t| t.as_array().map_or(false, |t| t.len() == 3 && t.iter().all(is_int)))
+        Shape::StrMap => v.as_object().is_some_and(|o| o.values().all(|x| x.is_string())),
+        Shape::TripleList => v.as_array().is_some_and(|a| {
+            a.iter().all(|t| t.as_array().is_some_and(|t| t.len() == 3 && t.iter().all(is_int)))
         }),
-        Shape::IntList => v.as_array().map_or(false, |a| a.iter().all(is_int)),
+        Shape::IntList => v.as_array().is_some_and(|a| a.iter().all(is_int)),
         Shape::Bool => v.is_boolean(),
-        Shape::BoolOrInt => v.is_boolean() || v.as_i64().map_or(false, |n| n == 0 || n == 1),
+        Shape::BoolOrInt => v.is_boolean() || v.as_i64().is_some_and(|n| n == 0 || n == 1),
         Shape::IntOrBool => v.is_boolean() || is_int(v),
         Shape::Int => is_int(v),
         Shape::Number => v.is_number(),
         Shape::Str => v.is_string(),
-        Shape::NestedGrants => v.as_object().map_or(false, |o| {
-            o.values().all(|l| l.as_array().map_or(false, |l| l.iter().all(|e| {
-                e.get("goods").map_or(false, is_int)
+        Shape::NestedGrants => v.as_object().is_some_and(|o| {
+            o.values().all(|l| l.as_array().is_some_and(|l| l.iter().all(|e| {
+                e.get("goods").is_some_and(is_int)
                     && e.get("flags").and_then(|f| f.as_array())
-                        .map_or(false, |f| f.iter().all(is_int))
+                        .is_some_and(|f| f.iter().all(is_int))
             })))
         }),
         Shape::OptionsDict => v.is_object(),

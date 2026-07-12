@@ -108,9 +108,11 @@ impl Default for LiveGame {
 ///   * `want_row = goods & 0x0FFF_FFFF` strips the 0x4 category nibble, leaving the bare row;
 ///   * `category() == ItemCategory::Goods` confirms the 0x4 nibble independently;
 ///   * `param_id()` is compared against the bare row.
+///
 /// LOOKS RIGHT: the mask matches the `0x4000_0000` goods-category convention this client grants with,
 /// and the independent `category()` guard prevents a weapon/armor row with the same numeric row from
 /// false-matching.
+///
 /// SUSPICIOUS / MUST CONFIRM ON WINDOWS with a set->readback (grant one known good, then re-read):
 ///   1. Does `ItemId::param_id()` return the CATEGORY-STRIPPED row (assumed here), or the full
 ///      category-tagged id? If the latter, this compare never matches and BOTH sides must be masked:
@@ -120,6 +122,7 @@ impl Default for LiveGame {
 ///      key-item / great-rune mapper packs `GOODS_FULLID`, not a raw row or a different category.
 ///   3. Confirm no goods row legitimately exceeds `0x0FFF_FFFF` (rows are small, so this is safe, but
 ///      pin it).
+///
 /// DO NOT silently "fix" the mask: if a change is needed, keep the original masked compare in a
 /// comment. The proposed alternative (double-mask) is noted inline below.
 fn inventory_has_goods(goods: i32) -> bool {
@@ -267,6 +270,7 @@ fn session_now_ms() -> u64 {
 /// mass-grant CTD). Tunable at runtime with NO rebuild:
 ///   * `RECONCILE_GRANT_BURST`       — goods/ledger grants per interval (default 2; must be > 0),
 ///   * `RECONCILE_GRANT_INTERVAL_MS` — min ms between grant bursts (default 150; `0` disables pacing).
+///
 /// Flags stay cheap and unpaced (`CSEventFlagMan` writes don't drive the acquisition popup / phantom-
 /// check machinery that the item-grant flood does), so region-open / map-reveal never stall behind a
 /// held goods class.
@@ -445,11 +449,11 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
 /// reconciler (resets the ledger watermark only on a genuine seed change — the reconnect-new-seed
 /// fix). Call from the net loop when `items_received` / room seed changes.
 pub fn set_inputs(inputs: DesiredInputs) {
-    if let Some(m) = DRIVER.get() {
-        if let Ok(mut d) = m.lock() {
-            d.save = inputs.save.clone();
-            d.reconciler.set_inputs(inputs);
-        }
+    if let Some(m) = DRIVER.get()
+        && let Ok(mut d) = m.lock()
+    {
+        d.save = inputs.save.clone();
+        d.reconciler.set_inputs(inputs);
     }
     mark_dirty();
 }

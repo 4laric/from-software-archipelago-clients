@@ -1,8 +1,8 @@
 //! shop_preview.rs — name/description override for FOREIGN (and gem/custom) shop slots only.
 //!
-//! Own-world rewards are rewritten by `shop_sell` to natively sell the real item (correct name + lore
-//! + icon), so this only handles the slots shop_sell can't: FOREIGN items (no ER counterpart) and gem/
-//! custom rewards. For those the displayed vanilla good's FMG name + info + caption are overwritten with
+//! Own-world rewards are rewritten by `shop_sell` to natively sell the real item (correct name, lore
+//! and icon), so this only handles the slots shop_sell can't: FOREIGN items (no ER counterpart) and
+//! gem/custom rewards. For those the vanilla good's FMG name + info + caption are overwritten with
 //! the AP routing block ("AP: <item> / For: <owner> (<game>) / <kind>").
 //!
 //! Mechanism: EXTEND-SWAP via fmg_inject::extend_swap_overrides (rebuilds the category block from the

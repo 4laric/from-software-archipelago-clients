@@ -240,10 +240,7 @@ fn parse_natural_keys(v: Option<&Value>) -> HashMap<String, Vec<NkClause>> {
 /// KICK_FLAG still set for bake-compat. Returns a player-facing overlay message when the kick
 /// fires (the caller logs it -- players otherwise get relocated with no explanation).
 pub fn tick_kick(cfg: &RegionConfig) -> Option<String> {
-    let pr = match flags::play_region_id() {
-        Some(p) => p,
-        None => return None,
-    };
+    let pr = flags::play_region_id()?;
     let kick = er_logic::region_lock::kick_decision(
         pr,
         &cfg.area_lock_flags,
@@ -342,10 +339,7 @@ pub fn tick_random_start_warp(cfg: &RegionConfig) -> Option<String> {
     if START_LATCHED.load(Ordering::Relaxed) {
         return None; // consumed this session; the persistent flag lands with the next save-sync
     }
-    let pr = match flags::play_region_id() {
-        Some(p) => p,
-        None => return None,
-    };
+    let pr = flags::play_region_id()?;
     // Interior play regions are 7-digit (bucket*100 + sub) -- normalize to the 5-digit bucket
     // slot_data speaks, the SAME rule kick_decision applies.
     let pr = if pr >= 1_000_000 { pr / 100 } else { pr };

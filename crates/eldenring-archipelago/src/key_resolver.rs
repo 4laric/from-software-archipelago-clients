@@ -141,10 +141,10 @@ pub fn load_shoplineup_flags(path: &std::path::Path) -> HashMap<u32, u32> {
     };
     if let Some(obj) = v.as_object() {
         for (k, val) in obj {
-            if let (Ok(row), Some(flag)) = (k.parse::<u32>(), val.as_u64()) {
-                if flag != 0 {
-                    out.insert(row, flag as u32);
-                }
+            if let (Ok(row), Some(flag)) = (k.parse::<u32>(), val.as_u64())
+                && flag != 0
+            {
+                out.insert(row, flag as u32);
             }
         }
     }

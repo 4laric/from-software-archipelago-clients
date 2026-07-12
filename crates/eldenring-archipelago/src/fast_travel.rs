@@ -56,7 +56,10 @@ pub fn tick() {
     if !enabled() {
         return;
     }
-    if TICK.fetch_add(1, Ordering::Relaxed) % THROTTLE != 0 {
+    if !TICK
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(THROTTLE)
+    {
         return;
     }
     if !crate::flags::in_world() {

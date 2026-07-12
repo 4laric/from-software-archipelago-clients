@@ -73,7 +73,10 @@ pub fn tick() {
             return;
         }
     }
-    if TICK.fetch_add(1, Ordering::Relaxed) % THROTTLE != 0 {
+    if !TICK
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(THROTTLE)
+    {
         return;
     }
     let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {

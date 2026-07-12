@@ -286,11 +286,11 @@ pub fn run(row_flags: &[(u32, u32)]) -> bool {
         // Stock parity with the old baker: a shop check fires its flag on the FIRST buy, but a vanilla
         // slot with sellQuantity>1 (e.g. row 100506 = 3) lets you re-buy past the check and waste runes.
         // Force sellQuantity=1 so the slot is consumed after one purchase. Idempotent.
-        if let Some(old_qty) = set_sell_quantity_one(row) {
-            if old_qty != 1 {
-                qty_clamped += 1;
-                log::info!("shop-flags WRITE: row {row} sellQuantity {old_qty} -> 1 (one-time)");
-            }
+        if let Some(old_qty) = set_sell_quantity_one(row)
+            && old_qty != 1
+        {
+            qty_clamped += 1;
+            log::info!("shop-flags WRITE: row {row} sellQuantity {old_qty} -> 1 (one-time)");
         }
     }
     log::info!(

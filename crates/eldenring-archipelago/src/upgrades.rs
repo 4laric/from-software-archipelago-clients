@@ -178,11 +178,12 @@ pub fn apply_auto_upgrade(full_id: i32) -> i32 {
 /// ER category nibble mask / weapon-category constant (er_codec mirror; weapons are category 0x0).
 const ROW_ID_MASK: u32 = er_codec::ROW_ID_MASK;
 
-/// Pure id-math decode: returns (base_row_id, level) for an upgradeable WEAPON FullID, else None.
-/// base = row - row%100; level = row%100. Category guard mirrors C++ `WeaponInfo`:
-///   `(uint32(itemId) & CATEGORY_MASK) != CATEGORY_WEAPON` rejects non-weapons; row range
-///   `[1_000_000, 90_000_000)` skips system/NPC ids. Weapons are er_codec::CATEGORY_WEAPON (0x0).
-// `decode_weapon_id` was a byte-for-byte copy of er_logic::upgrades::decode_weapon_id. Production never
+// (Historical, kept as a note.) `decode_weapon_id` was a pure id-math decode: (base_row_id, level) for
+// an upgradeable WEAPON FullID, else None. base = row - row%100; level = row%100. Category guard mirrored
+// C++ `WeaponInfo`: `(uint32(itemId) & CATEGORY_MASK) != CATEGORY_WEAPON` rejects non-weapons; row range
+// `[1_000_000, 90_000_000)` skips system/NPC ids. Weapons are er_codec::CATEGORY_WEAPON (0x0).
+//
+// It was a byte-for-byte copy of er_logic::upgrades::decode_weapon_id. Production never
 // called it -- apply_auto_upgrade delegates to er-logic, which uses ITS copy -- so this one existed only
 // to be unit-tested. A tested copy that production does not call is the exact test/prod drift the replay
 // tier exists to kill (CONTRIBUTING: "a green predicate with no production caller is a spec, not a fix").
@@ -208,7 +209,7 @@ pub(crate) fn weapon_track_and_cap(base: i32) -> Option<(i32, bool)> {
     }
     // TRACK from materialSetId, cap from the run above -- host-tested predicate (owns the somber
     // clamp + the not-upgradeable guard).
-    er_logic::upgrades::classify_track(k - 1, weapon.material_set_id() as i32)
+    er_logic::upgrades::classify_track(k - 1, weapon.material_set_id())
 }
 
 /// RE-A3 RESOLVED (typed binding): highest +N currently held on the given smithing track

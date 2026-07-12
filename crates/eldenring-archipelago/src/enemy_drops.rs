@@ -33,8 +33,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// lot id -> [(slot index 1..=8, goods row id)]
-static ROLL: Mutex<Option<HashMap<u32, Vec<(u8, i32)>>>> = Mutex::new(None);
+/// (slot index 1..=8, goods row id) -- one rerolled drop slot.
+type DropSlot = (u8, i32);
+/// lot id -> the slots we rerolled in it.
+type RollTable = HashMap<u32, Vec<DropSlot>>;
+
+static ROLL: Mutex<Option<RollTable>> = Mutex::new(None);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Called from net.rs at connect with the parsed slot_data map.

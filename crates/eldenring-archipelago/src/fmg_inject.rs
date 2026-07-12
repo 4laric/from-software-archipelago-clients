@@ -67,7 +67,7 @@ struct Group {
 }
 
 fn plausible(p: usize) -> bool {
-    p >= 0x10000 && p < 0x7FFF_FFFF_FFFF
+    (0x10000..0x7FFF_FFFF_FFFF).contains(&p)
 }
 fn current_module_base() -> Option<usize> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -470,9 +470,12 @@ pub fn run_descriptions(descriptions: &[(u32, Vec<u16>)]) -> bool {
 }
 
 /// Resolve each synthetic goods id to (real name, optional caption) via the scout cache, joined by the
+/// (FMG entry id, UTF-16 text) pairs -- what extend_swap_overrides takes.
+type FmgInjects = Vec<(u32, Vec<u16>)>;
+
 /// row's vagrant-encoded AP location id (`er_codec::recombine_location_id`). Cache miss => "AP#<id>"
 /// name and no caption. Returns (GoodsName injects, GoodsCaption injects).
-fn resolve_synth_injects(ids: &[u32]) -> (Vec<(u32, Vec<u16>)>, Vec<(u32, Vec<u16>)>) {
+fn resolve_synth_injects(ids: &[u32]) -> (FmgInjects, FmgInjects) {
     let mut names = Vec::with_capacity(ids.len());
     let mut caps = Vec::new();
     for &id in ids {

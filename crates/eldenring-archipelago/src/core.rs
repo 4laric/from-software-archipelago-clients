@@ -1332,13 +1332,13 @@ impl shared::Core for Core {
                     Some(client) => self
                         .region_attunement
                         .iter()
-                        .filter_map(|(region, att)| {
+                        .filter(|(_, att)| {
                             er_logic::attunement::attuned(&att.members, att.threshold, |m| {
                                 self.valid_locations.contains(&m)
                                     && client.is_local_location_checked(m)
                             })
-                            .then(|| region.clone())
                         })
+                        .map(|(region, _)| region.clone())
                         .collect(),
                     None => Vec::new(),
                 };
@@ -1504,8 +1504,7 @@ impl shared::Core for Core {
                         self.valid_locations.contains(&m) && client.is_local_location_checked(m)
                     };
                     for (region, att) in &self.region_attunement {
-                        let count =
-                            er_logic::attunement::attuned_count(&att.members, |m| checked(m));
+                        let count = er_logic::attunement::attuned_count(&att.members, &mut checked);
                         att_state.insert(
                             region.clone(),
                             (count, att.threshold, count >= att.threshold),
@@ -1543,7 +1542,8 @@ impl shared::Core for Core {
                 // explicit drain gives the release banner its count and is robust to a missed re-poll.
                 let attuned_regions_now: Vec<String> = att_state
                     .iter()
-                    .filter_map(|(r, &(_, _, a))| a.then(|| r.clone()))
+                    .filter(|(_, &(_, _, a))| a)
+                    .map(|(r, _)| r.clone())
                     .collect();
                 let mut released: BTreeMap<String, usize> = BTreeMap::new();
                 for region in &attuned_regions_now {
@@ -1905,14 +1905,14 @@ impl shared::Core for Core {
             // clicking closes the ER menu and Escape closes the client's window). The decision is
             // er_logic::config_reload::reload_action -- host-tested: one reconnect per REAL change, no
             // storm from our own save, and a half-written file never drops a live session.
-            if let Some(next) = crate::config_watch::poll() {
-                if let Err(e) = self.base_mut().update_connection_info(
+            if let Some(next) = crate::config_watch::poll()
+                && let Err(e) = self.base_mut().update_connection_info(
                     &next.url,
                     &next.slot,
                     next.password.clone(),
-                ) {
-                    log::warn!("config hot-reload: reconnect failed: {e}");
-                }
+                )
+            {
+                log::warn!("config hot-reload: reconnect failed: {e}");
             }
             // Region-lock fog-wall visuals (cosmetic marker at locked borders; the KICK reactor,
             // not this, does the blocking). Runs on the game thread (FrameBegin task) so the
@@ -2090,27 +2090,27 @@ impl Core {
         }
         // 2. Region-open lock (intentionally absent from item_map; classified by NAME). Fold in the
         //    lock's revealed grace bundle so those graces self-heal too.
-        if let Some(cfg) = self.region.as_ref() {
-            if let Some(&open) = cfg.region_open_flags.get(name) {
-                let mut flags = vec![open];
-                if let Some(bundle) = cfg.lock_reveal_flags.get(name) {
-                    flags.extend(bundle.iter().copied());
-                }
-                return ItemSemantics::RegionFlags(flags);
+        if let Some(cfg) = self.region.as_ref()
+            && let Some(&open) = cfg.region_open_flags.get(name)
+        {
+            let mut flags = vec![open];
+            if let Some(bundle) = cfg.lock_reveal_flags.get(name) {
+                flags.extend(bundle.iter().copied());
             }
+            return ItemSemantics::RegionFlags(flags);
         }
         // 3. Key item / great rune: the base grant gives the (restored) goods, plus vanilla
         //    obtained/restored companion flags from the keyitems table. Both classes are a unique
         //    good + set-only companion flags, so both map to KeyItem.
         let full_id = self.item_map.as_ref().and_then(|m| m.get(&ap_id)).copied();
         let acq = crate::keyitems::acquire_flags(name);
-        if !acq.is_empty() {
-            if let Some(fid) = full_id {
-                return ItemSemantics::KeyItem {
-                    goods: fid as i32,
-                    obtained_flags: acq,
-                };
-            }
+        if !acq.is_empty()
+            && let Some(fid) = full_id
+        {
+            return ItemSemantics::KeyItem {
+                goods: fid as i32,
+                obtained_flags: acq,
+            };
         }
         // 4. Plain grant: mapped -> ledgered consumable; unmapped -> inert (region locks / boss keys
         //    fell out at step 2 / are name-gated, so an unmapped id here is genuinely effect-less).
@@ -2298,7 +2298,7 @@ impl Core {
         // tracker post-dates core.rs.bak_rlwarn; reconcile against reflog if an intact one exists).
         let boss_group = er_logic::boss_felled::build_boss_group(
             &self.boss_defs,
-            |f| crate::flags::get_event_flag(f),
+            crate::flags::get_event_flag,
             |n| received.contains(n),
         );
 
