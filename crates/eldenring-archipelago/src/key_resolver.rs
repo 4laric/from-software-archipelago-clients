@@ -324,9 +324,18 @@ mod tests {
     }
 
     #[test]
-    fn token3_stays_the_primary_path_over_targets() {
-        // When token3 already names a flagged row, the targets entry must not override it --
-        // byte-for-byte the pre-fallback behavior.
+    fn targets_win_over_the_flagged_token3_base_row() {
+        // INVERTED 2026-07-13. This test used to assert the opposite ("token3 row wins"), and its
+        // stated reason was "byte-for-byte the pre-fallback behavior" -- i.e. it pinned the status quo
+        // rather than a derived fact, and the status quo was wrong.
+        //
+        // token3 is the merchant's SHARED base row: all 72 of Enia's wares carry the identical key
+        // 111000,0:0000000000:101898:, and are distinguished ONLY by their targets. Preferring token3
+        // therefore collapsed every ware at a merchant onto one stock flag -- 410 shop locations to 78
+        // distinct flags on the 2026-07-13 Bedrock seed, leaving most shop checks undetectable.
+        //
+        // So when BOTH are flagged, the target (the slot's own row) must win. The fallback direction is
+        // covered by shop_slot_without_a_target_still_falls_back_to_the_key_row.
         let row_flags: HashMap<u32, u32> = [(600100u32, 640001u32), (600200u32, 640002u32)]
             .into_iter()
             .collect();
@@ -335,7 +344,11 @@ mod tests {
             "locationIdsToTargets ": { "9110": ["shop:600200"] },
         });
         let m = shop_flags_from_keys(&sd, &row_flags);
-        assert_eq!(m.get(&9110), Some(&640001u32), "token3 row wins");
+        assert_eq!(
+            m.get(&9110),
+            Some(&640002u32),
+            "the slot's OWN target row wins over the merchant's shared token3 base row"
+        );
     }
 
     #[test]
