@@ -49,6 +49,42 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
             None => checked_goals.push(id),
         }
     }
+
+    // FOREIGN-APWORLD GOAL (`goal`). Bedrock's apworld emits no `goalLocations` at all -- it emits
+    //
+    //     "goal": [boss.flag for boss in self.goal_bosses]
+    //
+    // i.e. the boss DEFEAT FLAGS directly, not AP location ids. Same intent, one step further along:
+    // we would have mapped ids -> flags via loc_flags anyway, and he hands us the flags. So take them
+    // as flag goals as-is.
+    //
+    // Without this a Bedrock seed can NEVER be completed -- the goal set parses empty, `is_empty()` is
+    // true forever, and the client never sends Goal. The slot is unwinnable, silently. This is the
+    // single thing standing between our client and a playable foreign seed, and it is ten lines.
+    //
+    // `goalLocations` still WINS when present: our own seeds are untouched. Only consulted as a
+    // fallback, so a world that emits both is unaffected.
+    if flag_goals.is_empty() && checked_goals.is_empty() {
+        let foreign: Vec<u32> = sd
+            .get("goal")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64())
+                    .filter(|&f| f != 0)
+                    .map(|f| f as u32)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !foreign.is_empty() {
+            log::info!(
+                "goal: no `goalLocations` -- using the foreign `goal` key ({} boss defeat flag(s)). \
+                 This is the Bedrock-apworld shape: flags, not location ids.",
+                foreign.len()
+            );
+            flag_goals = foreign;
+        }
+    }
     if flag_goals.is_empty() && checked_goals.is_empty() {
         log::warn!(
             "goal: goalLocations empty -- this slot can NEVER send Goal \
@@ -129,5 +165,52 @@ mod tests {
             &lf(&[(10, 800)]),
         );
         assert_eq!(cfg.flag_goals, vec![800]); // non-int members skipped, not fatal
+    }
+}
+
+#[cfg(test)]
+mod foreign_goal {
+    //! A FOREIGN SEED MUST BE WINNABLE.
+    //!
+    //! Bedrock's apworld emits `goal` (boss defeat FLAGS), never `goalLocations` (AP location ids).
+    //! Without the fallback below his seed parses an empty goal set, `is_empty()` is true forever,
+    //! and the client never sends Goal -- the slot is unwinnable and says nothing about it.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bedrock_goal_flags_are_taken_as_flag_goals() {
+        // His shape, hand-written from his fill_slot_data -- not copied from his data.
+        let sd = json!({ "goal": [9101u64, 9118u64], "apIdsToItemIds": {} });
+        let cfg = parse(&sd, &HashMap::new());
+        assert_eq!(cfg.flag_goals, vec![9101u32, 9118u32]);
+        assert!(cfg.checked_goals.is_empty());
+        assert!(!cfg.is_empty(), "a Bedrock seed must be COMPLETABLE");
+    }
+
+    #[test]
+    fn goal_locations_still_wins_when_present() {
+        // Our own seeds must be byte-for-byte unaffected: `goal` is a FALLBACK, never an override.
+        let mut lf = HashMap::new();
+        lf.insert(7770001i64, 60510u32);
+        let sd = json!({ "goalLocations": [7770001i64], "goal": [9999u64] });
+        let cfg = parse(&sd, &lf);
+        assert_eq!(cfg.flag_goals, vec![60510u32], "goalLocations must win; `goal` is fallback only");
+        assert!(!cfg.flag_goals.contains(&9999));
+    }
+
+    #[test]
+    fn neither_key_is_still_never_met() {
+        // The safe posture: an empty goal set is NEVER satisfied. Do not regress that into
+        // "no goal == instant victory".
+        let cfg = parse(&json!({}), &HashMap::new());
+        assert!(cfg.is_empty());
+    }
+
+    #[test]
+    fn zero_and_malformed_goal_entries_are_dropped_not_trusted() {
+        let sd = json!({ "goal": [0u64, 9101u64, "nonsense"] });
+        let cfg = parse(&sd, &HashMap::new());
+        assert_eq!(cfg.flag_goals, vec![9101u32], "flag 0 is not a flag; a string is not a flag");
     }
 }
