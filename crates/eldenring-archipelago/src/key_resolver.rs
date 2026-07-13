@@ -2,8 +2,11 @@
 //! key table `locationIdsToKeys`, replacing the legacy `locationFlags` `{loc: flag}` table.
 //!
 //! Bedrock's apworld emits (net slot_data):
-//!   locationIdsToKeys    = { "<ap_location_id>": "<a>,<b>:<flag>:<shopRows>:" }
-//!   locationIdsToTargets = { "<ap_location_id>": ["lot:NNNN", ...] }   (optional fallback)
+//!   locationIdsToKeys     = { "<ap_location_id>": "<a>,<b>:<flag>:<shopRows>:" }
+//!   "locationIdsToTargets " = { "<ap_location_id>": ["lot:NNNN"|"shop:NNNN", ...] }
+//! NB the trailing SPACE in the second key name is REAL -- measured in its fill_slot_data
+//! (fswap/Archipelago@er, worlds/eldenring/__init__.py, `"locationIdsToTargets ":`); we accept
+//! both spellings so a future typo fix over there costs nothing here.
 //!
 //! The KEY already encodes the acquisition event flag as token 1 (`key.split(':')[1]`) --
 //! verified equal to ItemLotParam getItemFlagId for ~94% of slots. So the primary path is a
@@ -97,12 +100,18 @@ fn key_shop_rows(key: &str) -> Vec<u32> {
 /// Rows absent from `row_flags` (stock flag 0 / not in the shipped table) are skipped;
 /// the slot stays unresolved (unpolled) rather than being polled on a bogus flag.
 ///
-/// KNOWN LIMIT (measured 2026-07-12 against the foreign key set): token3 can also carry a
+/// TOKEN3 NON-ROWS + THE TARGETS FALLBACK (measured 2026-07-12, static parse of the foreign
+/// world's own location table, fswap/Archipelago@er @6058820): token3 can also carry a
 /// precondition EVENT FLAG (a boss-achievement gate) or a shop-range BASE id alongside -- or
-/// instead of -- a concrete row. Non-row entries are naturally skipped (never in `row_flags`);
-/// a key whose token3 holds ONLY non-rows resolves to nothing and stays unpolled (117 of 637
-/// foreign shop slots, all one merchant's boss-armor group; 43 of them carry a concrete row in
-/// `locationIdsToTargets` as `"shop:NNNN"` -- a possible future fallback -- the rest none).
+/// instead of -- a concrete row. Non-row entries are naturally skipped (never in `row_flags`).
+/// Of 583 distinct shop slots, 476 resolve from token3; of the 107 that do not, 43 carry a
+/// concrete row in the targets table as `"shop:NNNN"` -- those now resolve through
+/// [`targets_shop_rows`], same first-flagged-row rule. The remaining 64 (one merchant's
+/// boss-armor group: token3 = achievement flag + shop-range BASE id, e.g. 101500, and NO
+/// targets entry) carry nothing that names a ShopLineupParam row, so they stay unpolled --
+/// a KNOWN LIMIT, not a bug to paper over. (In a generated seed the world also mints duplicate
+/// shop locations sharing these keys, which is how the earlier in-seed measurement read
+/// 637 total / 520 resolved: same table + 54 duplicates.)
 ///
 /// Mirrors the Python `resolve_location_flags`'s `shops` bucket + `shop_row_flags_for`
 /// composed: token3 rows -> ShopLineupParam eventFlag_forStock -> flag.
@@ -110,6 +119,15 @@ pub fn shop_flags_from_keys(sd: &Value, row_flags: &HashMap<u32, u32>) -> HashMa
     let mut out = HashMap::new();
     let Some(obj) = sd.get("locationIdsToKeys").and_then(|v| v.as_object()) else {
         return out;
+    };
+    // The targets table (see the module doc for the trailing-space key: both spellings accepted,
+    // exact name first so a future fix wins).
+    let targets = sd
+        .get("locationIdsToTargets")
+        .or_else(|| sd.get("locationIdsToTargets "));
+    let first_flagged = |rows: Vec<u32>| -> Option<u32> {
+        rows.into_iter()
+            .find_map(|row| row_flags.get(&row).copied().filter(|&f| f != 0))
     };
     for (k, v) in obj {
         let (Ok(loc), Some(key)) = (k.parse::<i64>(), v.as_str()) else {
@@ -122,15 +140,38 @@ pub fn shop_flags_from_keys(sd: &Value, row_flags: &HashMap<u32, u32>) -> HashMa
         }
         // First token3 row that has a stock flag in the shipped table wins. (A shop slot
         // maps to one check; the extra rows in token3, when present, share the same stock
-        // flag or are release-only rows -- the first flagged one is the check flag.)
-        for row in key_shop_rows(key) {
-            if let Some(&flag) = row_flags.get(&row).filter(|&&f| f != 0) {
-                out.insert(loc, flag);
-                break;
-            }
+        // flag or are release-only rows -- the first flagged one is the check flag.) When
+        // token3 names no known row (precondition flag / shop-range base only), fall back to
+        // the slot's targets `"shop:NNNN"` rows -- same rule.
+        let flag = first_flagged(key_shop_rows(key))
+            .or_else(|| first_flagged(targets_shop_rows(targets, k)));
+        if let Some(flag) = flag {
+            out.insert(loc, flag);
         }
     }
     out
+}
+
+/// The `"shop:NNNN"` ShopLineupParam rows a slot's targets entry names. Non-shop entries
+/// (`"lot:NNNN"` item lots) are skipped. Tolerates the source's shapes: an array of strings is
+/// the emitted form, a bare string is the un-normalized form its location table also contains
+/// (a one-element tuple written without the comma) -- cheap to accept, so accept it.
+fn targets_shop_rows(targets: Option<&Value>, loc_key: &str) -> Vec<u32> {
+    let Some(entry) = targets.and_then(|t| t.get(loc_key)) else {
+        return Vec::new();
+    };
+    fn parse_one(s: &str) -> Option<u32> {
+        s.trim().strip_prefix("shop:").and_then(|r| r.parse::<u32>().ok())
+    }
+    match entry {
+        Value::String(s) => parse_one(s).into_iter().collect(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(parse_one)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Load the shipped `shoplineup_flags.json` -> `{shop_row_id: eventFlag_forStock}`.
@@ -242,6 +283,60 @@ mod tests {
         assert_eq!(m.get(&7001), Some(&ROW_100200_FLAG)); // 120000
         assert!(!m.contains_key(&7002)); // flagged slot owned by location_flags_from_keys
         assert!(!m.contains_key(&7003)); // no known flag for row 999999 -> skipped
+    }
+
+    #[test]
+    fn targets_fallback_resolves_what_token3_cannot() {
+        // The measured foreign shape (synthetic ids): a boss-armor shop slot whose token3 is
+        // ONLY a precondition flag + shop-range BASE id (neither in `row_flags`), with the
+        // concrete row riding the targets table as "shop:NNNN". The fallback resolves it; a
+        // slot with NO targets entry stays unpolled (the 64-slot known limit).
+        let row_flags: HashMap<u32, u32> = [(600100u32, 640001u32)].into_iter().collect();
+        let sd = json!({
+            "locationIdsToKeys": {
+                "9101": "555000,0:0000000000:9143,101500:",  // token3: precond + range base
+                "9102": "555000,0:0000000000:9143,101500:",  // same shape, no targets entry
+            },
+            // NB the REAL emitted key carries a trailing space (module doc).
+            "locationIdsToTargets ": {
+                "9101": ["lot:12345", "shop:600100"],        // lot: skipped, shop: resolves
+            }
+        });
+        let m = shop_flags_from_keys(&sd, &row_flags);
+        assert_eq!(m.get(&9101), Some(&640001u32));
+        assert!(!m.contains_key(&9102), "nothing usable anywhere -> unpolled, not guessed");
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn token3_stays_the_primary_path_over_targets() {
+        // When token3 already names a flagged row, the targets entry must not override it --
+        // byte-for-byte the pre-fallback behavior.
+        let row_flags: HashMap<u32, u32> =
+            [(600100u32, 640001u32), (600200u32, 640002u32)].into_iter().collect();
+        let sd = json!({
+            "locationIdsToKeys":     { "9110": "555000,0:0000000000:600100:" },
+            "locationIdsToTargets ": { "9110": ["shop:600200"] },
+        });
+        let m = shop_flags_from_keys(&sd, &row_flags);
+        assert_eq!(m.get(&9110), Some(&640001u32), "token3 row wins");
+    }
+
+    #[test]
+    fn targets_tolerates_both_key_spellings_and_a_bare_string() {
+        let row_flags: HashMap<u32, u32> = [(600100u32, 640001u32)].into_iter().collect();
+        // Space-free spelling (the future typo fix) works...
+        let sd = json!({
+            "locationIdsToKeys":    { "9120": "555000,0:0000000000:9143:" },
+            "locationIdsToTargets": { "9120": ["shop:600100"] },
+        });
+        assert_eq!(shop_flags_from_keys(&sd, &row_flags).get(&9120), Some(&640001u32));
+        // ...and a bare-string targets value (the source's un-normalized one-element tuple).
+        let sd = json!({
+            "locationIdsToKeys":     { "9121": "555000,0:0000000000:9143:" },
+            "locationIdsToTargets ": { "9121": "shop:600100" },
+        });
+        assert_eq!(shop_flags_from_keys(&sd, &row_flags).get(&9121), Some(&640001u32));
     }
 
     #[test]
