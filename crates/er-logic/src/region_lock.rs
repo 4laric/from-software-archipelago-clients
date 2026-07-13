@@ -385,3 +385,215 @@ mod tests {
         assert!(!l.fire(false));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Baked-table fallback — region lock for FOREIGN apworlds (bedrock interop).
+//
+// Region geometry (play_region ids) and per-region open flags are STATIC GAME DATA, baked into
+// this crate as the GENERATED `region_locks` module (tools/gen_region_locks.py in the apworld
+// repo — never hand-edited, drift-gated in CI exactly like `tracker_regions`). The only
+// seed-specific input is which regions are in the pool, and a foreign apworld communicates that
+// simply by NAMING its lock items "<Region> Lock". slot_data always WINS: this path exists only
+// for seeds that ship NEITHER `areaLockFlags` NOR `regionOpenFlags` (the Windows glue gates on
+// key ABSENCE, region.rs).
+//
+// ARMING IS EVIDENCE-BASED, deliberately. The obvious signal — "a '<Region> Lock' name exists
+// in the seed's item table" — is UNSAFE, measured on the real foreign apworld
+// (fswap/Archipelago@er, 2026-07-12): its `apIdsToItemIds` carries the WHOLE item table
+// ("all the items the game knows about", its fill_slot_data says so) on EVERY seed, including
+// world_logic=open_world seeds whose pool contains no locks at all. Arming on table presence
+// would seal name-matching regions forever on a no-lock seed — the exact "kick the player out
+// of a region the seed never locked" failure the foreign_apworld_degrade tests forbid. So:
+//   * the item TABLE only sets the SCOPE (which regions WOULD be gated),
+//   * enforcement arms only when a scoped lock is actually RECEIVED — proof the pool placed
+//     locks this seed. Until then the watch stays cold (under-enforce, never mis-kick).
+// A region whose lock exists in scope but never arrives stays sealed once armed (= a sealed
+// region, same semantics as the generator's dead-drop ranges). Unknown "<X> Lock" names and
+// baked regions without an open flag are reported, never a panic.
+
+/// Region-lock config derived from the baked table for a foreign seed: the exact shapes
+/// region.rs::RegionConfig consumes (`open_flags` -> regionOpenFlags, `ranges` ->
+/// areaLockFlags), plus the telemetry lists the caller logs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DerivedLocks {
+    /// lock item name -> the region's open flag (sorted by name; deterministic).
+    pub open_flags: Vec<(String, u32)>,
+    /// `[pid, pid, open_flag]` kick-watch ranges, one per play_region id of each scoped region.
+    pub ranges: Vec<[i32; 3]>,
+    /// "<X> Lock"-shaped names with no baked region — a foreign granularity we cannot map
+    /// (e.g. a lock naming only part of one of our regions). Ignored + logged, never fatal.
+    pub unknown: Vec<String>,
+    /// Names that matched a baked region which has NO resolved open flag (geometry only) —
+    /// we cannot gate that region, so its lock is inert. Logged.
+    pub ungateable: Vec<String>,
+}
+
+impl DerivedLocks {
+    pub fn is_empty(&self) -> bool {
+        self.open_flags.is_empty()
+    }
+}
+
+/// Derive the fallback region-lock config from the seed's item NAMES (any iterable source —
+/// the Windows glue feeds datapackage-resolved `apIdsToItemIds` ids). Only names ending in
+/// " Lock" are considered; everything else is silently ignored (this gets called with whole
+/// item tables). Output is sorted and deduplicated, so the same name set always yields the
+/// same config regardless of source order.
+pub fn derive_region_locks<'a>(seed_item_names: impl IntoIterator<Item = &'a str>) -> DerivedLocks {
+    let mut d = DerivedLocks::default();
+    let mut names: Vec<&str> = seed_item_names
+        .into_iter()
+        .filter(|n| n.ends_with(" Lock"))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        match crate::region_locks::by_lock_item(name) {
+            Some(r) => match r.open_flag {
+                Some(flag) => {
+                    d.open_flags.push((name.to_string(), flag));
+                    for &pid in r.play_regions {
+                        d.ranges.push([pid, pid, flag as i32]);
+                    }
+                }
+                None => d.ungateable.push(name.to_string()),
+            },
+            None => d.unknown.push(name.to_string()),
+        }
+    }
+    d
+}
+
+/// The arming decision: true once ANY scoped lock item has actually been RECEIVED (see the
+/// module note above for why receipt, not table presence, is the evidence bar).
+pub fn fallback_armed(
+    derived: &DerivedLocks,
+    received: &std::collections::HashSet<String>,
+) -> bool {
+    derived.open_flags.iter().any(|(n, _)| received.contains(n))
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A baked region WITH an open flag, straight from the generated table (no hand-pinned
+    /// ids — the table is the ground truth this logic runs against).
+    fn some_flagged() -> &'static crate::region_locks::BakedRegionLock {
+        crate::region_locks::REGION_LOCKS
+            .iter()
+            .find(|r| r.open_flag.is_some())
+            .expect("baked table has flagged regions")
+    }
+
+    #[test]
+    fn empty_names_derive_nothing() {
+        let d = derive_region_locks([]);
+        assert!(d.is_empty() && d.ranges.is_empty() && d.unknown.is_empty());
+    }
+
+    #[test]
+    fn a_baked_lock_name_derives_its_flag_and_one_range_per_play_region() {
+        let r = some_flagged();
+        let d = derive_region_locks([r.lock_item]);
+        assert_eq!(
+            d.open_flags,
+            vec![(r.lock_item.to_string(), r.open_flag.unwrap())]
+        );
+        assert_eq!(d.ranges.len(), r.play_regions.len());
+        for (range, &pid) in d.ranges.iter().zip(r.play_regions) {
+            assert_eq!(*range, [pid, pid, r.open_flag.unwrap() as i32]);
+        }
+    }
+
+    #[test]
+    fn whole_item_tables_pass_through_only_locks() {
+        // Feed a realistic mixed table: gear, key items, and one real lock. Non-" Lock" names
+        // never show up anywhere — not even in `unknown`.
+        let r = some_flagged();
+        let d = derive_region_locks(["Rusty Key", "Uchigatana", r.lock_item, "Golden Seed"]);
+        assert_eq!(d.open_flags.len(), 1);
+        assert!(d.unknown.is_empty());
+    }
+
+    #[test]
+    fn foreign_granularity_is_reported_not_invented() {
+        // SYNTHETIC names of the observed foreign SHAPE (provenance: hand-written, not the
+        // foreign world's data): a "<X> Lock" whose region is not in our baked table must land
+        // in `unknown` with no flag and no range — we log it, we never guess a region for it.
+        let d = derive_region_locks(["Zzz Nonexistent Region Lock"]);
+        assert!(d.is_empty() && d.ranges.is_empty());
+        assert_eq!(d.unknown, vec!["Zzz Nonexistent Region Lock".to_string()]);
+    }
+
+    #[test]
+    fn geometry_only_regions_are_ungateable_not_sealed() {
+        // Baked regions with open_flag None (geometry known, no resolved warp-grace flag) must
+        // produce NO range: a range we could never unlock would seal the region forever.
+        let Some(r) = crate::region_locks::REGION_LOCKS
+            .iter()
+            .find(|r| r.open_flag.is_none())
+        else {
+            return; // every baked region has a flag now — nothing to test
+        };
+        let d = derive_region_locks([r.lock_item]);
+        assert!(d.is_empty() && d.ranges.is_empty());
+        assert_eq!(d.ungateable, vec![r.lock_item.to_string()]);
+    }
+
+    #[test]
+    fn duplicate_and_unordered_sources_yield_one_deterministic_config() {
+        // The glue unions apIdsToItemIds names with the received stream — same lock can arrive
+        // from both. One flag entry, one range set, source order irrelevant.
+        let r = some_flagged();
+        let a = derive_region_locks([r.lock_item, "Uchigatana", r.lock_item]);
+        let b = derive_region_locks(["Uchigatana", r.lock_item]);
+        assert_eq!(a, b);
+        assert_eq!(a.open_flags.len(), 1);
+        assert_eq!(a.ranges.len(), r.play_regions.len());
+    }
+
+    #[test]
+    fn armed_only_by_receipt_of_a_scoped_lock() {
+        // The degrade contract: table presence alone must never arm (measured hazard — the
+        // foreign apworld ships its whole item table on no-lock seeds). Receipt of a scoped
+        // lock arms; receipt of anything else does not.
+        let r = some_flagged();
+        let d = derive_region_locks([r.lock_item]);
+        let mut received: HashSet<String> = HashSet::new();
+        assert!(
+            !fallback_armed(&d, &received),
+            "cold until a lock is RECEIVED"
+        );
+        received.insert("Uchigatana".to_string());
+        assert!(!fallback_armed(&d, &received));
+        received.insert(r.lock_item.to_string());
+        assert!(fallback_armed(&d, &received));
+        // And an empty derivation can never arm, whatever arrives.
+        assert!(!fallback_armed(&DerivedLocks::default(), &received));
+    }
+
+    #[test]
+    fn derived_ranges_drive_kick_decision_like_slot_data_ranges() {
+        // End-to-end with the pure kick: a scoped region is sealed (kick) while its flag is
+        // off and open (no kick) once the lock's flag is set — same rule slot_data ranges obey.
+        let r = some_flagged();
+        let flag = r.open_flag.unwrap();
+        let d = derive_region_locks([r.lock_item]);
+        let pid = r.play_regions[0];
+        assert!(
+            kick_decision(pid, &d.ranges, 0, &|_| false),
+            "sealed -> kick"
+        );
+        assert!(
+            !kick_decision(pid, &d.ranges, 0, &|f| f == flag),
+            "lock received (flag on) -> open"
+        );
+        // A play_region NOT in any baked scope is never kicked.
+        assert!(
+            !kick_decision(11100, &d.ranges, 0, &|_| false),
+            "hub is unscoped"
+        );
+    }
+}

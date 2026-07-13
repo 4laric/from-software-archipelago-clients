@@ -495,7 +495,27 @@ impl shared::Core for Core {
                 crate::shop_icon::set_real_goods(real_goods.clone());
                 crate::shop_preview::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
-                let region = crate::region::parse(sd);
+                let mut region = crate::region::parse(sd);
+                // BAKED REGION-LOCK FALLBACK (bedrock interop): only for a seed that speaks
+                // NEITHER region key -- slot_data always wins when it speaks (region.rs). Scope
+                // = the seed's apIdsToItemIds ids resolved to NAMES through the datapackage;
+                // enforcement then stays COLD until a scoped "<Region> Lock" is actually
+                // received (tick_baked_fallback below) -- the real foreign apworld ships its
+                // whole item table even on no-lock seeds, so table presence must never arm.
+                if crate::region::foreign_seed_without_region_keys(sd) {
+                    let names: Vec<String> = client
+                        .game(client.this_player().game())
+                        .map(|g| {
+                            map.keys()
+                                .filter_map(|id| g.item(*id).map(|it| it.name().to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    crate::region::prepare_baked_fallback(
+                        &mut region,
+                        names.iter().map(|s| s.as_str()),
+                    );
+                }
                 let fogwall = crate::fogwall::parse(sd);
                 let prog_cfg = er_logic::progressive::parse(sd);
                 let name = client.this_player().alias().to_string();
@@ -1098,6 +1118,15 @@ impl shared::Core for Core {
                 }
                 received_all.insert(name);
             }
+        }
+
+        // 3b. Baked region-lock fallback arming (bedrock interop): the first received
+        //     "<Region> Lock" in the prepared scope is the proof the seed really placed locks;
+        //     merge the baked config into the live one so the name-dispatch below (and every
+        //     later tick's kick-watch/reconcile) sees it. No-op for seeds whose slot_data spoke
+        //     a region key (nothing prepared) and for foreign no-lock seeds (never armed).
+        if let Some(cfg) = self.region.as_mut() {
+            crate::region::tick_baked_fallback(cfg, &received_all);
         }
 
         // 4. The receive seam (er_logic::receive, host-tested): per item, name-dispatch when

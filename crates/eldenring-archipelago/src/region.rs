@@ -91,16 +91,22 @@ pub struct RegionConfig {
     /// Lift stays usable and medallion-triggered quest content (Ensha, Latenna) fires naturally.
     /// SPEC-region-spine-surgery.md SS3.5 (grant-on-receipt rider).
     pub lock_grant_items: HashMap<String, Vec<i32>>,
+    /// BAKED-TABLE FALLBACK (bedrock interop): prepared at connect -- from the generated
+    /// `er_logic::region_locks` table -- for seeds that ship NEITHER `areaLockFlags` NOR
+    /// `regionOpenFlags`. Holds the scoped-but-COLD derived config until `tick_baked_fallback`
+    /// merges it into the live fields on first receipt of a scoped "<Region> Lock".
+    pub baked_fallback: Option<er_logic::region_lock::DerivedLocks>,
 }
 
-// --- areaLockFlags: SINGLE SOURCE OF TRUTH is the generator ---------------------------------------
-// The region -> play_region geometry lives in exactly ONE place: the generator
-// (greenfield/eldenring_gf/features/area_locks.py), which ships the fully-resolved kick-watch ranges
-// as slot_data `areaLockFlags`. The client no longer keeps a mirror of that table -- a duplicated
-// static geometry here repeatedly drifted from the generator (e.g. the Consecrated Snowfield ->
-// Mountaintops fold), so the mirror + its parity test are gone. If a region's geometry changes, only
-// the generator changes; the client just consumes what the seed sends. (A gen-side test enforces this
-// no-mirror rule so the drift can't come back.)
+// --- areaLockFlags: SINGLE SOURCE OF TRUTH is the apworld's data ----------------------------------
+// The region -> play_region geometry lives in exactly ONE editable place: the generator's
+// features/area_locks.py, which ships the fully-resolved kick-watch ranges as slot_data
+// `areaLockFlags`, and slot_data always WINS. The client's only copy of that geometry is the
+// GENERATED `er_logic::region_locks` table (tools/gen_region_locks.py, CI drift-gated) -- it feeds
+// the FOREIGN-apworld fallback below and is never consulted while slot_data speaks. A HAND-typed
+// mirror in this file repeatedly drifted from the generator (e.g. the Consecrated Snowfield ->
+// Mountaintops fold); a gen-side test (test_gf_data.py) still forbids one here, and the generated
+// table cannot drift because CI regenerates and diffs it.
 
 pub fn parse(sd: &Value) -> RegionConfig {
     // Re-arm the random-start warp latch on each fresh parse (mirrors the standalone `configure`
@@ -110,8 +116,11 @@ pub fn parse(sd: &Value) -> RegionConfig {
     *WARP_WORLD_SETTLE.lock().unwrap() = None;
     let region_open_flags = str_to_u32(sd.get("regionOpenFlags"));
     // Kick-watch ranges come straight from the generator's `areaLockFlags` (single source of truth;
-    // see the note above). No client-side derivation/fallback -- a seed that ships nothing here has
-    // no kick-watch, which is the correct degrade (regenerate the seed rather than mirror the table).
+    // see the note above). parse() itself never derives ranges: an apworld that EMITS region keys
+    // (either of them) said what it wanted, and a seed that ships an empty/absent table keeps an
+    // empty kick-watch. The one exception lives OUTSIDE parse: for a seed that ships NEITHER
+    // region key (a region-lock-ignorant foreign apworld), core.rs may prepare the baked-table
+    // fallback -- see `prepare_baked_fallback` / `tick_baked_fallback` below.
     let area_lock_flags = parse_triples(sd.get("areaLockFlags"));
     RegionConfig {
         area_lock_flags,
@@ -137,6 +146,7 @@ pub fn parse(sd: &Value) -> RegionConfig {
         grace_items: str_to_u32(sd.get("graceItems")),
         natural_key_triggers: parse_natural_keys(sd.get("naturalKeyTriggers")),
         lock_grant_items: str_to_i32vec(sd.get("lockGrantItems")),
+        baked_fallback: None,
     }
 }
 
@@ -525,6 +535,80 @@ pub fn open_on_received_name(cfg: &RegionConfig, name: &str) -> bool {
     opened
 }
 
+// --- baked-table region-lock fallback (bedrock interop) ------------------------------------------
+// Decision logic + the WHY of the arming rule live in er_logic::region_lock (host-tested); these
+// three are the game-side glue. Flow: core.rs gates on `foreign_seed_without_region_keys`, calls
+// `prepare_baked_fallback` at connect with the datapackage-resolved names of the seed's
+// apIdsToItemIds entries, and `tick_baked_fallback` each tick with the cumulative received-name
+// set. Nothing is enforced until a scoped "<Region> Lock" is actually RECEIVED (measured on the
+// real foreign apworld: its item table carries lock NAMES even on no-lock seeds, so table
+// presence alone must never arm -- the foreign_apworld_degrade contract).
+
+/// True when slot_data speaks NEITHER region-lock key -- the apworld is region-lock-ignorant
+/// (Bedrock-shaped), so the baked fallback MAY apply. Key PRESENCE is the test, not emptiness:
+/// an apworld that emits `regionOpenFlags` without `areaLockFlags` made a choice (see the note
+/// at `parse`) and we do not second-guess it with baked geometry.
+pub fn foreign_seed_without_region_keys(sd: &Value) -> bool {
+    sd.get("areaLockFlags").is_none() && sd.get("regionOpenFlags").is_none()
+}
+
+/// Derive + stash (do NOT arm) the baked fallback from the seed's item names. Unknown
+/// "<X> Lock" granularities and geometry-only (flagless) regions are logged and dropped --
+/// never a panic, never a guessed region.
+pub fn prepare_baked_fallback<'a>(
+    cfg: &mut RegionConfig,
+    seed_item_names: impl IntoIterator<Item = &'a str>,
+) {
+    let d = er_logic::region_lock::derive_region_locks(seed_item_names);
+    if !d.unknown.is_empty() {
+        log::warn!(
+            "baked region-lock fallback: unknown lock name(s) {:?} -- a foreign region granularity this client cannot map; ignored (rename to the baked '<Region> Lock' names to enforce them)",
+            d.unknown
+        );
+    }
+    if !d.ungateable.is_empty() {
+        log::warn!(
+            "baked region-lock fallback: {:?} name baked region(s) with no resolved open flag --              cannot gate; ignored",
+            d.ungateable
+        );
+    }
+    if d.is_empty() {
+        return;
+    }
+    log::info!(
+        "baked region-lock fallback PREPARED: {} region(s), {} kick range(s) -- COLD until a scoped '<Region> Lock' is received",
+        d.open_flags.len(),
+        d.ranges.len()
+    );
+    cfg.baked_fallback = Some(d);
+}
+
+/// Arm the prepared fallback once ANY scoped lock has been RECEIVED, merging the derived config
+/// into the live fields every existing path already consumes (`open_on_received_name` opens on
+/// the merged name->flag map, `tick_kick` watches the merged ranges, the reconcile ticks
+/// self-heal lost writes). One-shot: the stash is consumed on arming. A scoped region whose lock
+/// never arrives afterwards stays sealed -- that is a sealed region, not a special case.
+pub fn tick_baked_fallback(cfg: &mut RegionConfig, received: &HashSet<String>) -> bool {
+    let armed = cfg
+        .baked_fallback
+        .as_ref()
+        .is_some_and(|d| er_logic::region_lock::fallback_armed(d, received));
+    if !armed {
+        return false;
+    }
+    let d = cfg.baked_fallback.take().expect("armed implies prepared");
+    for (name, flag) in &d.open_flags {
+        cfg.region_open_flags.entry(name.clone()).or_insert(*flag);
+    }
+    cfg.area_lock_flags.extend(d.ranges.iter().copied());
+    log::info!(
+        "baked region-lock fallback ARMED: {} region(s), {} kick range(s) (first scoped Lock          received)",
+        d.open_flags.len(),
+        d.ranges.len()
+    );
+    true
+}
+
 // --- slot_data parse helpers (shapes from the standalone net.rs) ---------------------------------
 
 fn parse_triples(v: Option<&Value>) -> Vec<[i32; 3]> {
@@ -653,5 +737,89 @@ mod foreign_apworld_degrade {
             "kick ranges are the generator's job; deriving them here would enforce a lock the \
              apworld never asked for"
         );
+        // ...and the baked fallback is out of bounds too: the seed SPOKE a region key.
+        assert!(
+            !foreign_seed_without_region_keys(&sd),
+            "a seed that emits either region key never gets baked geometry"
+        );
+    }
+
+    // --- the baked-table fallback keeps the same promise -----------------------------------
+    // (pure derivation + arming rule are host-tested in er_logic::region_lock::derive_tests;
+    // these cover the glue: gating, cold-until-receipt, and the merge.)
+
+    /// A real baked lock name + flag, read from the generated table (never hand-pinned).
+    fn baked_example() -> (&'static str, u32) {
+        let r = er_logic::region_locks::REGION_LOCKS
+            .iter()
+            .find(|r| r.open_flag.is_some())
+            .expect("baked table has flagged regions");
+        (r.lock_item, r.open_flag.unwrap())
+    }
+
+    #[test]
+    fn fallback_gate_is_key_presence_not_content() {
+        assert!(foreign_seed_without_region_keys(&json!({})));
+        assert!(foreign_seed_without_region_keys(&json!({
+            "apIdsToItemIds": { "7770001": 1073750026u64 },
+            "locationIdsToKeys": { "7770001": "301200,0:0000520110::" },
+        })));
+        // Emitted-but-empty still counts as SPOKEN.
+        assert!(!foreign_seed_without_region_keys(
+            &json!({ "areaLockFlags": [] })
+        ));
+        assert!(!foreign_seed_without_region_keys(
+            &json!({ "regionOpenFlags": {} })
+        ));
+    }
+
+    #[test]
+    fn prepared_fallback_stays_cold_until_a_scoped_lock_is_received() {
+        // The degrade promise, fallback edition: a foreign seed whose item TABLE names locks
+        // (the real one always does -- it ships its whole item table) must not kick anyone
+        // until a lock is RECEIVED. Names here: one real baked name + one synthetic foreign
+        // granularity (hand-written shape, not the foreign world's data).
+        let (lock, flag) = baked_example();
+        let mut c = parse(&json!({}));
+        prepare_baked_fallback(&mut c, [lock, "Zzz Nonexistent Region Lock", "Uchigatana"]);
+        assert!(c.baked_fallback.is_some(), "scoped");
+        assert!(
+            c.area_lock_flags.is_empty(),
+            "COLD: no kick-watch before receipt"
+        );
+        assert!(c.region_open_flags.is_empty());
+
+        let mut received: HashSet<String> = ["Uchigatana".to_string()].into();
+        assert!(
+            !tick_baked_fallback(&mut c, &received),
+            "non-lock receipts never arm"
+        );
+        assert!(c.area_lock_flags.is_empty());
+
+        received.insert(lock.to_string());
+        assert!(
+            tick_baked_fallback(&mut c, &received),
+            "first scoped lock arms"
+        );
+        assert_eq!(c.region_open_flags.get(lock), Some(&flag));
+        assert!(!c.area_lock_flags.is_empty(), "kick-watch live");
+        assert!(c.area_lock_flags.iter().all(|r| r[2] as u32 == flag));
+        assert!(
+            !tick_baked_fallback(&mut c, &received),
+            "one-shot: stash consumed"
+        );
+    }
+
+    #[test]
+    fn a_seed_with_no_lock_names_never_prepares_never_arms() {
+        let mut c = parse(&json!({}));
+        prepare_baked_fallback(&mut c, ["Uchigatana", "Golden Seed"]);
+        assert!(c.baked_fallback.is_none(), "nothing scoped");
+        let received: HashSet<String> = ["Caelid Lock".to_string()].into();
+        assert!(
+            !tick_baked_fallback(&mut c, &received),
+            "no prepared scope -> nothing to arm, whatever arrives"
+        );
+        assert!(c.area_lock_flags.is_empty() && c.region_open_flags.is_empty());
     }
 }
