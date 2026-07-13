@@ -263,6 +263,7 @@ mod tests {
         assert!(is_synthetic_goods(CATEGORY_GOODS | 3_780_001));
         assert!(!is_synthetic_goods(CATEGORY_GOODS | 3_780_000)); // strictly greater
         assert!(!is_synthetic_goods(CATEGORY_GOODS | 2_220_010)); // max real vanilla goods id
+
         // goods-only payoff: other categories never misdetect regardless of magnitude
         assert!(!is_synthetic_goods(CATEGORY_WEAPON | 99_060_000));
         assert!(!is_synthetic_goods(CATEGORY_PROTECTOR | 5_330_000));
@@ -356,7 +357,6 @@ mod tests {
         assert!(read_i32(&[0u8; 3], 0).is_none());
     }
 
-
     // --- full_id_from_equip_type: the shopPreviewGoods fallback encoding (2026-07-13) ---
 
     #[test]
@@ -370,7 +370,11 @@ mod tests {
             (3, CATEGORY_GOODS),
         ] {
             let full = full_id_from_equip_type(etype, 2050).expect("real ware") as u32;
-            assert_eq!(item_category_of(full), cat, "equipType {etype} lost its category");
+            assert_eq!(
+                item_category_of(full),
+                cat,
+                "equipType {etype} lost its category"
+            );
             assert_eq!(row_id_of(full), 2050, "equipType {etype} lost its row id");
         }
     }
@@ -379,7 +383,10 @@ mod tests {
     fn full_id_matches_the_goods_encoding_gen_data_emits() {
         // shopPreviewGoods ORs 0x4000_0000 into a goods row id; the fallback must produce the SAME
         // number, or a Bedrock seed would preview a different good than one of ours would.
-        assert_eq!(full_id_from_equip_type(3, 8852), Some(0x4000_0000u32 as i32 | 8852));
+        assert_eq!(
+            full_id_from_equip_type(3, 8852),
+            Some(0x4000_0000u32 as i32 | 8852)
+        );
     }
 
     #[test]
@@ -388,7 +395,11 @@ mod tests {
         // shop_icon cannot repaint. All must fail CLOSED rather than yield a plausible wrong id.
         assert_eq!(full_id_from_equip_type(3, -1), None);
         assert_eq!(full_id_from_equip_type(3, 0), None);
-        assert_eq!(full_id_from_equip_type(4, 2050), None, "gem must not masquerade as a goods id");
+        assert_eq!(
+            full_id_from_equip_type(4, 2050),
+            None,
+            "gem must not masquerade as a goods id"
+        );
         assert_eq!(full_id_from_equip_type(9, 2050), None);
     }
 

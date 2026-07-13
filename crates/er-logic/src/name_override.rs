@@ -157,21 +157,15 @@ mod tests {
 
     #[test]
     fn shop_label_kind_line() {
-        assert!(
-            shop_label("x", "o", "g", ItemKind::Filler)
-                .caption
-                .ends_with("\nFiller")
-        );
-        assert!(
-            shop_label("x", "o", "g", ItemKind::Useful)
-                .caption
-                .ends_with("\nUseful")
-        );
-        assert!(
-            shop_label("x", "o", "g", ItemKind::Trap)
-                .caption
-                .ends_with("\nTrap")
-        );
+        assert!(shop_label("x", "o", "g", ItemKind::Filler)
+            .caption
+            .ends_with("\nFiller"));
+        assert!(shop_label("x", "o", "g", ItemKind::Useful)
+            .caption
+            .ends_with("\nUseful"));
+        assert!(shop_label("x", "o", "g", ItemKind::Trap)
+            .caption
+            .ends_with("\nTrap"));
     }
 
     #[test]

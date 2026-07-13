@@ -7,7 +7,7 @@
 
 #![cfg(test)]
 
-use crate::fast_travel::{GateAction, gate_action, prime_known_good};
+use crate::fast_travel::{gate_action, prime_known_good, GateAction};
 
 /// A flag the game owns and we must never write. In m32_07 the fast-travel field names 32070800 --
 /// the Magma Wyrm's defeat flag.

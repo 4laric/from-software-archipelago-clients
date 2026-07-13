@@ -1537,16 +1537,12 @@ mod tests {
 
         let planned = r.dry_run_actions(&g);
         assert!(planned.iter().any(|a| matches!(a, Action::SetFlag(76971))));
-        assert!(
-            planned
-                .iter()
-                .any(|a| matches!(a, Action::GrantUnique(191, _)))
-        );
-        assert!(
-            planned
-                .iter()
-                .any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. }))
-        );
+        assert!(planned
+            .iter()
+            .any(|a| matches!(a, Action::GrantUnique(191, _))));
+        assert!(planned
+            .iter()
+            .any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. })));
         // Nothing was applied: no flags, no goods, no ledger entries, watermark untouched.
         assert!(g.flags.is_empty() && g.goods.is_empty() && g.ledger_log.is_empty());
         assert_eq!(r.applied_watermark(), 0);

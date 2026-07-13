@@ -24,7 +24,7 @@
 
 #[cfg(test)]
 mod replay {
-    use crate::receive::{GrantAction, NetHook, RecvItem, process_received_item};
+    use crate::receive::{process_received_item, GrantAction, NetHook, RecvItem};
     use std::collections::{HashMap, HashSet};
 
     /// Test double for [`NetHook`] (receive.rs:48). Records the NAME-keyed side effects so the replay

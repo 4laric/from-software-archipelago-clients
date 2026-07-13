@@ -52,7 +52,7 @@ pub fn poll_outgoing_death(hook: &mut dyn GameHook, latch: &mut DeathLatch) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hook::{DEATHLINK_KILL_FLAG, fake::FakeGame};
+    use crate::hook::{fake::FakeGame, DEATHLINK_KILL_FLAG};
 
     #[test]
     fn incoming_kill_sets_dedicated_flag_not_hp() {
