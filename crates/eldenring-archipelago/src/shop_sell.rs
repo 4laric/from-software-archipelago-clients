@@ -167,15 +167,23 @@ pub fn run() -> bool {
     // not the vanilla ware, and the fallback would preview the item onto itself.
     let mut derived_preview: Vec<(i64, i32)> = Vec::new();
     let need_preview_fallback = !crate::shop_preview::is_configured();
+    // Which configured flags actually landed on a live ShopLineupParam row. A flag in flag_to_loc with
+    // NO live row is the interesting case: the location says "this check is a shop purchase guarded by
+    // flag F", and no shop row in the game is guarded by F. Either the row is not in ShopLineupParam
+    // (recipes / a different param), or the flag never came from a shop row at all.
+    let mut matched_flags: HashSet<u32> = HashSet::new();
+    let mut live_rows_with_flag = 0u32;
     for (id, row) in repo.rows::<ShopLineupParam>() {
         let f = row.event_flag_for_stock();
         if f == 0 {
             continue;
         }
+        live_rows_with_flag += 1;
         let Some(&loc) = flag_to_loc.get(&f) else {
             continue;
         };
         check_rows += 1;
+        matched_flags.insert(f);
         let vanilla = er_codec::full_id_from_equip_type(row.equip_type(), row.equip_id());
         let Some(s) = crate::scout_proof::lookup(loc) else {
             no_scout += 1;
@@ -251,6 +259,17 @@ pub fn run() -> bool {
     log::info!(
         "shop-sell: skip tally -- {check_rows} check row(s) seen, {no_scout} no scout entry, \
          {no_sell_id} no er_sell_id (foreign/gem), {no_equip_type} unsellable category"
+    );
+    let unmatched: Vec<u32> = flag_to_loc
+        .keys()
+        .copied()
+        .filter(|f| !matched_flags.contains(f))
+        .collect();
+    log::info!(
+        "shop-sell: live ShopLineupParam rows with a stock flag = {live_rows_with_flag}; \
+         {} configured flag(s) matched a live row, {} did NOT",
+        matched_flags.len(),
+        unmatched.len()
     );
     if need_preview_fallback {
         log::info!(

@@ -559,10 +559,21 @@ impl shared::Core for Core {
                     if !shop_table.is_empty() {
                         let resolved = crate::key_resolver::shop_flags_from_keys(sd, &shop_table);
                         if foreign_keys {
+                            // DISTINCT flags, not just resolved locations. These differ when several AP
+                            // shop locations resolve to the SAME ShopLineupParam row (matt keys list the
+                            // rows that sell an item in token3, and many items share a row). That matters:
+                            // shop_sell inverts loc->flag into flag->loc to find the row to rewrite, and
+                            // an N:1 loc->flag mapping makes that inversion LOSSY -- it can only ever
+                            // rewrite one row per flag. On the 2026-07-13 Bedrock seed shop_sell saw only
+                            // 87 live check rows against 410 "resolved" locations, and this is the number
+                            // that says whether that gap is collapse (expected) or a lookup failure (bug).
+                            let distinct: std::collections::HashSet<u32> =
+                                resolved.values().copied().collect();
                             log::info!(
-                                "shoplineup_flags: armed with {} rows -- {} shop slots resolved to stock flags",
+                                "shoplineup_flags: armed with {} rows -- {} shop location(s) resolved to {} DISTINCT stock flag(s)",
                                 shop_table.len(),
-                                resolved.len()
+                                resolved.len(),
+                                distinct.len()
                             );
                         }
                         for (loc, flag) in resolved {
