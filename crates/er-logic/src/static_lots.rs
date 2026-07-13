@@ -194,8 +194,15 @@ mod tests {
         let l = parse(T);
         let (m, e) = blank_tables_for(&l, &[520110]);
         assert_eq!(m.get(&20110), Some(&vec![1u8]));
-        assert!(!m.contains_key(&30120000), "a flag this seed does NOT check must not be blanked");
-        assert_eq!(e.get(&999), Some(&vec![3u8]), "a flag in BOTH tables is blanked in both");
+        assert!(
+            !m.contains_key(&30120000),
+            "a flag this seed does NOT check must not be blanked"
+        );
+        assert_eq!(
+            e.get(&999),
+            Some(&vec![3u8]),
+            "a flag in BOTH tables is blanked in both"
+        );
     }
 
     #[test]
@@ -222,11 +229,17 @@ mod tests {
 
     #[test]
     fn malformed_rows_are_skipped_not_trusted() {
-        let l = parse(r#"{"map":{"1":{"lot":0,"slots":[1]},"2":{"lot":5,"slots":[]},
-                                 "3":{"lot":5,"slots":[9,1]},"x":{"lot":5,"slots":[1]}}}"#);
+        let l = parse(
+            r#"{"map":{"1":{"lot":0,"slots":[1]},"2":{"lot":5,"slots":[]},
+                                 "3":{"lot":5,"slots":[9,1]},"x":{"lot":5,"slots":[1]}}}"#,
+        );
         assert!(!l.map.contains_key(&1), "lot 0 is not a lot");
         assert!(!l.map.contains_key(&2), "no slots => nothing to blank");
-        assert_eq!(l.map.get(&3), Some(&(5u32, vec![1u8])), "slot 9 is out of range, dropped");
+        assert_eq!(
+            l.map.get(&3),
+            Some(&(5u32, vec![1u8])),
+            "slot 9 is out of range, dropped"
+        );
         assert_eq!(l.map.len(), 1);
     }
 }
