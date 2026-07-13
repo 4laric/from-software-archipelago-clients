@@ -161,7 +161,9 @@ fn targets_shop_rows(targets: Option<&Value>, loc_key: &str) -> Vec<u32> {
         return Vec::new();
     };
     fn parse_one(s: &str) -> Option<u32> {
-        s.trim().strip_prefix("shop:").and_then(|r| r.parse::<u32>().ok())
+        s.trim()
+            .strip_prefix("shop:")
+            .and_then(|r| r.parse::<u32>().ok())
     }
     match entry {
         Value::String(s) => parse_one(s).into_iter().collect(),
@@ -304,7 +306,10 @@ mod tests {
         });
         let m = shop_flags_from_keys(&sd, &row_flags);
         assert_eq!(m.get(&9101), Some(&640001u32));
-        assert!(!m.contains_key(&9102), "nothing usable anywhere -> unpolled, not guessed");
+        assert!(
+            !m.contains_key(&9102),
+            "nothing usable anywhere -> unpolled, not guessed"
+        );
         assert_eq!(m.len(), 1);
     }
 
@@ -312,8 +317,9 @@ mod tests {
     fn token3_stays_the_primary_path_over_targets() {
         // When token3 already names a flagged row, the targets entry must not override it --
         // byte-for-byte the pre-fallback behavior.
-        let row_flags: HashMap<u32, u32> =
-            [(600100u32, 640001u32), (600200u32, 640002u32)].into_iter().collect();
+        let row_flags: HashMap<u32, u32> = [(600100u32, 640001u32), (600200u32, 640002u32)]
+            .into_iter()
+            .collect();
         let sd = json!({
             "locationIdsToKeys":     { "9110": "555000,0:0000000000:600100:" },
             "locationIdsToTargets ": { "9110": ["shop:600200"] },
@@ -330,13 +336,19 @@ mod tests {
             "locationIdsToKeys":    { "9120": "555000,0:0000000000:9143:" },
             "locationIdsToTargets": { "9120": ["shop:600100"] },
         });
-        assert_eq!(shop_flags_from_keys(&sd, &row_flags).get(&9120), Some(&640001u32));
+        assert_eq!(
+            shop_flags_from_keys(&sd, &row_flags).get(&9120),
+            Some(&640001u32)
+        );
         // ...and a bare-string targets value (the source's un-normalized one-element tuple).
         let sd = json!({
             "locationIdsToKeys":     { "9121": "555000,0:0000000000:9143:" },
             "locationIdsToTargets ": { "9121": "shop:600100" },
         });
-        assert_eq!(shop_flags_from_keys(&sd, &row_flags).get(&9121), Some(&640001u32));
+        assert_eq!(
+            shop_flags_from_keys(&sd, &row_flags).get(&9121),
+            Some(&640001u32)
+        );
     }
 
     #[test]

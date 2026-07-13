@@ -704,7 +704,10 @@ mod foreign_apworld_degrade {
              it does not know is locked."
         );
         assert!(c.lock_reveal_flags.is_empty());
-        assert_eq!(c.random_start_done_flag, 0, "0 = non-random seed, no start guard");
+        assert_eq!(
+            c.random_start_done_flag, 0,
+            "0 = non-random seed, no start guard"
+        );
         assert_eq!(c.random_start_warp_flag, 0, "0 = no random start");
         assert_eq!(c.random_start_area_id, 0);
         assert_eq!(c.random_start_grace_id, 0);
