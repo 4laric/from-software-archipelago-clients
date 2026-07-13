@@ -45,6 +45,7 @@ pub mod start_grant_replay;
 pub mod sweep_gate;
 pub mod torrent_start_replay;
 pub mod tracker;
+pub mod static_lots;
 pub mod tracker_regions;
 pub mod upgrade_cost;
 pub mod upgrade_cost_replay;

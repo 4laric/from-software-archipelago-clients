@@ -691,6 +691,44 @@ impl shared::Core for Core {
                     }
                     if ph != 0 && !(blank_map.is_empty() && blank_enemy.is_empty()) {
                         crate::check_lots::configure(blank_map, blank_enemy, ph);
+                    } else {
+                        // STATIC FALLBACK -- vanilla suppression for a FOREIGN apworld.
+                        //
+                        // Measured in-game on the first Bedrock playtest (2026-07-13):
+                        //     "vanilla suppressor INERT: checkItemFlags empty/absent in slot_data"
+                        // -- every check paid out the VANILLA item AND the AP item, because only OUR
+                        // apworld emits checkLotBlank*/checkItemFlags.
+                        //
+                        // But the blank-list is derived from ItemLotParam (flag -> lot -> goods
+                        // slots): GAME data, not seed data, identical for every apworld. So we ship
+                        // it (check_lots_table.json) and scope it to the flags THIS seed checks.
+                        // 3018 of Bedrock's 3022 check flags (99.9%) suppressed, zero changes on his
+                        // side. Same argument as shoplineup_flags.json.
+                        //
+                        // Scoped, NOT global: blanking a lot the seed does not check would eat a
+                        // legitimate vanilla pickup.
+                        let sl = load_static_lots();
+                        if sl.is_empty() {
+                            log::warn!(
+                                "vanilla suppressor INERT: no checkLotBlank* in slot_data and no \
+                                 usable check_lots_table.json beside the DLL. Every check will hand \
+                                 out its VANILLA item as well as the AP item."
+                            );
+                        } else {
+                            let seed_flags: Vec<u32> = loc_flags.values().copied().collect();
+                            let (m, e) = er_logic::static_lots::blank_tables_for(&sl, &seed_flags);
+                            let n = m.len() + e.len();
+                            if n > 0 && sl.placeholder_goods != 0 {
+                                crate::check_lots::configure(m, e, sl.placeholder_goods);
+                                log::info!(
+                                    "check-lots STATIC fallback: {} lot(s) blanked from \
+                                     check_lots_table.json, scoped to this seed's {} check flag(s) \
+                                     (foreign apworld -- it emits no checkLotBlank*)",
+                                    n,
+                                    seed_flags.len()
+                                );
+                            }
+                        }
                     }
                 }
                 crate::shop_sell::configure(loc_flags.clone());
@@ -718,6 +756,23 @@ impl shared::Core for Core {
                             .collect()
                     })
                     .unwrap_or_default();
+                // STATIC FALLBACK for the id-keyed half (weapon/armor wares -- goods are blanked at
+                // the lot above; suppressing goods BY ID would eat every Golden Rune you ever found).
+                let check_flags = if check_flags.is_empty() {
+                    let sl = load_static_lots();
+                    let seed_flags: Vec<u32> = loc_flags.values().copied().collect();
+                    let cif = er_logic::static_lots::check_item_flags_for(&sl, &seed_flags);
+                    if !cif.is_empty() {
+                        log::info!(
+                            "checkItemFlags STATIC fallback: {} weapon/armor item id(s) suppressed \
+                             from check_lots_table.json (foreign apworld emits no checkItemFlags)",
+                            cif.len()
+                        );
+                    }
+                    cif
+                } else {
+                    check_flags
+                };
                 crate::detour::configure_check_item_flags(check_flags);
                 let scout = crate::scout_proof::ScoutProof::new(loc_flags.keys().copied().collect());
                 // Goal-send: split goalLocations into flag-detected / checked-fallback buckets
@@ -2591,6 +2646,19 @@ fn save_file_path(seed: &str, name: &str) -> Option<PathBuf> {
 /// Parse slot_data `bossLockItems` (mode A/B, SPEC-boss-lock-tracker) into [`BossDef`] rows.
 /// `{ "<boss_flag>": {name, region, boss_ap_id, gate?, display_key?} }`. Tolerant: skips any
 /// entry whose key is not a u32 or whose value is not an object. Absent/empty => no boss tracking.
+/// Load the shipped `check_lots_table.json` from the DLL/mod directory (same place as
+/// `shoplineup_flags.json`). Absent/garbage -> empty, and suppression simply stays off, which is
+/// exactly today's behaviour -- never a panic mid-connect.
+fn load_static_lots() -> er_logic::static_lots::StaticLots {
+    let path = shared::utils::mod_directory()
+        .map(|d| d.join("check_lots_table.json"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("check_lots_table.json"));
+    match std::fs::read_to_string(&path) {
+        Ok(t) => er_logic::static_lots::parse(&t),
+        Err(_) => er_logic::static_lots::StaticLots::default(),
+    }
+}
+
 fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDef> {
     let mut out = Vec::new();
     let Some(obj) = v.and_then(|v| v.as_object()) else {
