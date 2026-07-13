@@ -154,6 +154,11 @@ pub fn run() -> bool {
     // Scan immutably -> plan the rewrites, then apply (avoids holding a row borrow across get_mut).
     let mut plan: Vec<(u32, i32, u8)> = Vec::new(); // (row id, new equipId, equipType)
     let mut echo_skip: HashMap<i64, u32> = HashMap::new(); // AP location -> stock flag (ECHO-DEDUP)
+    // SKIP TALLY -- why a check row did NOT get a native rewrite. On a SOLO seed a large `no_scout` or
+    // `no_sell_id` means the scout cache / apIdsToItemIds is THINNER than the check set, not that the
+    // rewards are genuinely un-sellable. Do not reason about the rewrite count without this breakdown:
+    // the 2026-07-13 Bedrock run rewrote 84 of ~410 shop checks and nothing in the log said why.
+    let (mut check_rows, mut no_scout, mut no_sell_id, mut no_equip_type) = (0u32, 0u32, 0u32, 0u32);
     for (id, row) in repo.rows::<ShopLineupParam>() {
         let f = row.event_flag_for_stock();
         if f == 0 {
@@ -162,11 +167,19 @@ pub fn run() -> bool {
         let Some(&loc) = flag_to_loc.get(&f) else {
             continue;
         };
+        check_rows += 1;
         let Some(s) = crate::scout_proof::lookup(loc) else {
+            no_scout += 1;
             continue;
         };
-        let Some(fid) = s.er_sell_id else { continue }; // own-world sellable category only
+        let Some(fid) = s.er_sell_id else {
+            // foreign reward, or an own-world reward in a category we cannot sell as a shop ware
+            // (gem/custom). Both are meant to fall through to the shop_preview display-override.
+            no_sell_id += 1;
+            continue;
+        };
         let Some(etype) = equip_type_for(fid) else {
+            no_equip_type += 1;
             continue;
         };
         // SHOP_CTD_GUARD REMOVED 2026-07-11 (Alaric). It bailed on WEAPON-category slots rewritten to
@@ -219,6 +232,10 @@ pub fn run() -> bool {
     // a shop bag-add again. Native sale + echo-skip is the whole dedup now.
     log::info!(
         "shop-sell: rewrote {n} own-world slot(s) to natively sell their reward ({skip_count} echo-skip, cross-type OPEN, auto_upgrade baked)"
+    );
+    log::info!(
+        "shop-sell: skip tally -- {check_rows} check row(s) seen, {no_scout} no scout entry, \
+         {no_sell_id} no er_sell_id (foreign/gem), {no_equip_type} unsellable category"
     );
     DONE.store(true, Ordering::Relaxed);
     true
