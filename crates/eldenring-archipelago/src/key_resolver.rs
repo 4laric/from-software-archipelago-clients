@@ -138,13 +138,23 @@ pub fn shop_flags_from_keys(sd: &Value, row_flags: &HashMap<u32, u32>) -> HashMa
         if key_flag(key).is_some() {
             continue;
         }
-        // First token3 row that has a stock flag in the shipped table wins. (A shop slot
-        // maps to one check; the extra rows in token3, when present, share the same stock
-        // flag or are release-only rows -- the first flagged one is the check flag.) When
-        // token3 names no known row (precondition flag / shop-range base only), fall back to
-        // the slot's targets `"shop:NNNN"` rows -- same rule.
-        let flag = first_flagged(key_shop_rows(key))
-            .or_else(|| first_flagged(targets_shop_rows(targets, k)));
+        // TARGETS FIRST, key token3 second (2026-07-13). The old order was token3-first, on the
+        // written assumption that "a shop slot maps to one check; the extra rows in token3 share the
+        // same stock flag". That is FALSE, and it silently destroyed most shop checks:
+        //
+        //   ERLocationData("RH: Sacred Relic Sword - Enia ...", key="111000,0:0000000000:101898:",
+        //                  shop=True, targets=('shop:101927'))
+        //   ERLocationData("RH: Blasphemous Blade - Enia ...", key="111000,0:0000000000:101898:",
+        //                  shop=True, targets=('shop:101906'))
+        //
+        // token3 is the merchant's SHARED base row (101898 for all 72 of Enia's wares); `targets`
+        // carries the slot's OWN ShopLineupParam row. Resolving off token3 therefore mapped every ware
+        // at a merchant onto ONE stock flag: measured on the 2026-07-13 Bedrock seed, 410 shop
+        // locations collapsed to 78 DISTINCT flags, and shop_sell (which inverts loc->flag to find the
+        // row to rewrite) could only ever see 87 of the 822 live rows. Targets first fixes the
+        // collapse; token3 stays as the fallback for the slots that carry no target.
+        let flag = first_flagged(targets_shop_rows(targets, k))
+            .or_else(|| first_flagged(key_shop_rows(key)));
         if let Some(flag) = flag {
             out.insert(loc, flag);
         }
@@ -482,5 +492,69 @@ mod tests {
         // Keys present but empty row_flags table -> nothing resolves.
         let sd = json!({ "locationIdsToKeys": { "1": "1,0:0000000000:100200:" } });
         assert!(shop_flags_from_keys(&sd, &HashMap::new()).is_empty());
+    }
+
+    /// THE SHOP-COLLAPSE REGRESSION (2026-07-13). Several AP locations at one merchant share the same
+    /// key -- token3 is the merchant's BASE row -- and are told apart only by `targets`. Resolving off
+    /// token3 mapped all of them onto one stock flag (410 shop locations -> 78 distinct flags on a real
+    /// seed), so every ware but one became undetectable and shop_sell could not find the row to rewrite.
+    /// Synthetic keys in his GRAMMAR; his table is never vendored.
+    #[test]
+    fn shop_slots_sharing_a_key_resolve_by_targets_not_the_shared_base_row() {
+        let sd = json!({
+            "locationIdsToKeys": {
+                "1": "111000,0:0000000000:900:",
+                "2": "111000,0:0000000000:900:",
+                "3": "111000,0:0000000000:900:",
+            },
+            // his real spelling carries a trailing space
+            "locationIdsToTargets ": {
+                "1": ["shop:901"],
+                "2": ["shop:902"],
+                "3": ["shop:903"],
+            },
+        });
+        // base row 900 is flagged too -- the old code took it and collapsed all three onto flag 9000
+        let table: HashMap<u32, u32> = [(900, 9000), (901, 9001), (902, 9002), (903, 9003)]
+            .into_iter()
+            .collect();
+
+        let got = shop_flags_from_keys(&sd, &table);
+
+        assert_eq!(
+            got.get(&1),
+            Some(&9001),
+            "loc 1 must resolve to ITS row, not the shared base"
+        );
+        assert_eq!(got.get(&2), Some(&9002));
+        assert_eq!(got.get(&3), Some(&9003));
+        let distinct: std::collections::HashSet<u32> = got.values().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "three wares must not collapse onto one stock flag"
+        );
+    }
+
+    /// The fallback must survive: a shop slot with NO target still resolves off token3.
+    #[test]
+    fn shop_slot_without_a_target_still_falls_back_to_the_key_row() {
+        let sd = json!({
+            "locationIdsToKeys": { "7": "111000,0:0000000000:900:" },
+            "locationIdsToTargets ": { "8": ["shop:901"] },
+        });
+        let table: HashMap<u32, u32> = [(900, 9000), (901, 9001)].into_iter().collect();
+        assert_eq!(shop_flags_from_keys(&sd, &table).get(&7), Some(&9000));
+    }
+
+    /// A target naming a row we have no flag for must not silently win over a usable token3 row.
+    #[test]
+    fn unflagged_target_row_falls_through_to_the_key_row() {
+        let sd = json!({
+            "locationIdsToKeys": { "7": "111000,0:0000000000:900:" },
+            "locationIdsToTargets ": { "7": ["shop:99999"] },   // not in the table
+        });
+        let table: HashMap<u32, u32> = [(900, 9000)].into_iter().collect();
+        assert_eq!(shop_flags_from_keys(&sd, &table).get(&7), Some(&9000));
     }
 }
