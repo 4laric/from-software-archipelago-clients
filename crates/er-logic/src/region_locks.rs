@@ -81,6 +81,12 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         play_regions: &[20010],
     },
     BakedRegionLock {
+        region: "Ensis",
+        lock_item: "Ensis Lock",
+        open_flag: Some(76821),
+        play_regions: &[68200],
+    },
+    BakedRegionLock {
         region: "Farum Azula",
         lock_item: "Farum Azula Lock",
         open_flag: Some(71303),
@@ -90,13 +96,19 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Gravesite",
         lock_item: "Gravesite Lock",
         open_flag: Some(76800),
-        play_regions: &[40000, 41000, 42000, 43000, 43010, 68000, 68100, 68200, 69010],
+        play_regions: &[40000, 41000, 42000, 43000, 43010, 68000, 68100, 69010],
     },
     BakedRegionLock {
         region: "Haligtree",
         lock_item: "Haligtree Lock",
         open_flag: Some(71501),
         play_regions: &[15000],
+    },
+    BakedRegionLock {
+        region: "Jagged Peak",
+        lock_item: "Jagged Peak Lock",
+        open_flag: Some(76840),
+        play_regions: &[68500],
     },
     BakedRegionLock {
         region: "Leyndell",
@@ -151,6 +163,12 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         lock_item: "Scadu Altus Lock",
         open_flag: Some(76900),
         play_regions: &[40020, 41010, 42020, 69000, 69020, 69030],
+    },
+    BakedRegionLock {
+        region: "Scaduview",
+        lock_item: "Scaduview Lock",
+        open_flag: Some(76935),
+        play_regions: &[69300],
     },
     BakedRegionLock {
         region: "Sewer",
