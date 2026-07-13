@@ -732,8 +732,28 @@ impl shared::Core for Core {
                     }
                 }
                 crate::shop_sell::configure(loc_flags.clone());
-                crate::shop_preview::configure(preview.clone());
-                crate::shop_icon::configure(preview);
+                // SLOT_DATA WINS, PARAMS ARE THE FALLBACK. `shopPreviewGoods` is the VANILLA ware
+                // sitting in each check's shop row -- that is GAME data, not seed data, so when a
+                // foreign apworld (Bedrock) omits the key we can read it straight off the live
+                // ShopLineupParam instead. Do NOT configure an empty set here: configure() latches
+                // CONFIGURED_SET, and shop_preview/shop_icon would then latch DONE on zero pairs
+                // before shop_sell's runtime derivation ever arrives.
+                //
+                // The defect this fixes is a DISPLAY/ROUTING one, not a duplication one. On the
+                // 2026-07-13 Bedrock playtest `shop-preview: configured 0 shop slot(s)`, so every
+                // slot shop_sell could not natively rewrite (foreign, or an own-world gem/custom
+                // reward) showed its VANILLA name and icon. The check still fires and the reward
+                // still routes correctly -- the player simply has no way to see WHAT a slot holds or
+                // WHO it belongs to, which is the whole point of a multiworld shop.
+                if preview.is_empty() {
+                    log::info!(
+                        "shop-preview/icon: no shopPreviewGoods in slot_data -- deferring to the \
+                         ShopLineupParam fallback in shop_sell"
+                    );
+                } else {
+                    crate::shop_preview::configure(preview.clone());
+                    crate::shop_icon::configure(preview);
+                }
                 crate::minibaker::configure(
                     sd.get("stoneswordVendorRow").and_then(|v| v.as_i64()).unwrap_or(0) as u32,
                 );

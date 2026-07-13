@@ -158,7 +158,15 @@ pub fn run() -> bool {
     // `no_sell_id` means the scout cache / apIdsToItemIds is THINNER than the check set, not that the
     // rewards are genuinely un-sellable. Do not reason about the rewrite count without this breakdown:
     // the 2026-07-13 Bedrock run rewrote 84 of ~410 shop checks and nothing in the log said why.
-    let (mut check_rows, mut no_scout, mut no_sell_id, mut no_equip_type) = (0u32, 0u32, 0u32, 0u32);
+    let (mut check_rows, mut no_scout) = (0u32, 0u32);
+    let (mut no_sell_id, mut no_equip_type) = (0u32, 0u32);
+    // shopPreviewGoods FALLBACK (see core.rs). The pair shop_preview/shop_icon need is
+    // (AP location -> the VANILLA ware in that shop row), and the vanilla ware is right here in the
+    // row we are already reading. Capture it for every check row we do NOT rewrite. This MUST be read
+    // inside this loop, before the rewrite below lands: afterwards the row's equipId is the AP reward,
+    // not the vanilla ware, and the fallback would preview the item onto itself.
+    let mut derived_preview: Vec<(i64, i32)> = Vec::new();
+    let need_preview_fallback = !crate::shop_preview::is_configured();
     for (id, row) in repo.rows::<ShopLineupParam>() {
         let f = row.event_flag_for_stock();
         if f == 0 {
@@ -168,18 +176,25 @@ pub fn run() -> bool {
             continue;
         };
         check_rows += 1;
+        let vanilla = er_codec::full_id_from_equip_type(row.equip_type(), row.equip_id());
         let Some(s) = crate::scout_proof::lookup(loc) else {
             no_scout += 1;
             continue;
         };
         let Some(fid) = s.er_sell_id else {
             // foreign reward, or an own-world reward in a category we cannot sell as a shop ware
-            // (gem/custom). Both are meant to fall through to the shop_preview display-override.
+            // (gem/custom). Both fall through to the shop_preview display-override.
             no_sell_id += 1;
+            if let Some(v) = vanilla {
+                derived_preview.push((loc, v));
+            }
             continue;
         };
         let Some(etype) = equip_type_for(fid) else {
             no_equip_type += 1;
+            if let Some(v) = vanilla {
+                derived_preview.push((loc, v));
+            }
             continue;
         };
         // SHOP_CTD_GUARD REMOVED 2026-07-11 (Alaric). It bailed on WEAPON-category slots rewritten to
@@ -237,6 +252,15 @@ pub fn run() -> bool {
         "shop-sell: skip tally -- {check_rows} check row(s) seen, {no_scout} no scout entry, \
          {no_sell_id} no er_sell_id (foreign/gem), {no_equip_type} unsellable category"
     );
+    if need_preview_fallback {
+        log::info!(
+            "shop-preview/icon: derived {} (loc -> vanilla ware) pair(s) from live ShopLineupParam \
+             (slot_data had no shopPreviewGoods)",
+            derived_preview.len()
+        );
+        crate::shop_preview::configure(derived_preview.clone());
+        crate::shop_icon::configure(derived_preview);
+    }
     DONE.store(true, Ordering::Relaxed);
     true
 }

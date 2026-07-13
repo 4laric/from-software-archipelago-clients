@@ -51,6 +51,13 @@ pub fn set_real_goods(rows: HashSet<u32>) {
     *REAL_GOODS.lock().unwrap() = Some(rows);
 }
 
+/// Has slot_data (or the shop_sell runtime fallback) supplied the (loc -> vanilla good) pairs yet?
+/// `run()` waits on this: an apworld that emits no `shopPreviewGoods` must NOT latch DONE on an empty
+/// set, or the fallback derived from the live params arrives too late to be used.
+pub fn is_configured() -> bool {
+    CONFIGURED_SET.load(Ordering::Relaxed)
+}
+
 pub fn configure(pairs: Vec<(i64, i32)>) {
     log::info!("shop-preview: configured {} shop slot(s)", pairs.len());
     *CONFIGURED.lock().unwrap() = pairs;

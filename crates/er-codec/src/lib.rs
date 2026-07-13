@@ -43,6 +43,29 @@ pub fn is_synthetic_goods(q_item_id: u32) -> bool {
     item_category_of(q_item_id) == CATEGORY_GOODS && row_id_of(q_item_id) > SYNTHETIC_GOODS_MIN_ID
 }
 
+/// A `ShopLineupParam` row's ware as an ER FullID (`category nibble | row id`) -- the INVERSE of
+/// `item_category_of` / `row_id_of`, and the same encoding gen_data writes into `shopPreviewGoods`.
+///
+/// `equipType` is the shop row's own category enum (0 weapon / 1 protector / 2 accessory / 3 goods).
+/// Returns `None` for anything else (gem, custom, and the -1/0 empty rows): shop_preview and shop_icon
+/// repaint an `EquipParamGoods` row, so handing them a FullID for a category they cannot repaint would
+/// let them strip the nibble off, say, a WEAPON id and use it as a goods row id -- repainting the
+/// wrong good globally. Fail closed instead; the caller skips the slot.
+#[inline]
+pub fn full_id_from_equip_type(equip_type: u8, equip_id: i32) -> Option<i32> {
+    if equip_id <= 0 {
+        return None;
+    }
+    let cat = match equip_type {
+        0 => CATEGORY_WEAPON,
+        1 => CATEGORY_PROTECTOR,
+        2 => CATEGORY_ACCESSORY,
+        3 => CATEGORY_GOODS,
+        _ => return None,
+    };
+    Some((cat | (equip_id as u32)) as i32)
+}
+
 /// Recombine the `i64` AP location id from the two vagrant carrier fields.
 ///
 /// CRITICAL: `vagrantItemLotId` / `vagrantBonusEneDropItemLotId` are SIGNED `i32` in the ER
@@ -331,5 +354,49 @@ mod tests {
         // The C++ raw-pointer reader would read OOB; the Rust port returns None.
         assert!(read_goods_row(&[0u8; 16]).is_none());
         assert!(read_i32(&[0u8; 3], 0).is_none());
+    }
+
+
+    // --- full_id_from_equip_type: the shopPreviewGoods fallback encoding (2026-07-13) ---
+
+    #[test]
+    fn full_id_round_trips_through_category_and_row_id() {
+        // Every category a shop row can hold must survive encode -> decode unchanged. This is the
+        // whole contract: shop_preview strips the nibble back off with row_id_of().
+        for (etype, cat) in [
+            (0u8, CATEGORY_WEAPON),
+            (1, CATEGORY_PROTECTOR),
+            (2, CATEGORY_ACCESSORY),
+            (3, CATEGORY_GOODS),
+        ] {
+            let full = full_id_from_equip_type(etype, 2050).expect("real ware") as u32;
+            assert_eq!(item_category_of(full), cat, "equipType {etype} lost its category");
+            assert_eq!(row_id_of(full), 2050, "equipType {etype} lost its row id");
+        }
+    }
+
+    #[test]
+    fn full_id_matches_the_goods_encoding_gen_data_emits() {
+        // shopPreviewGoods ORs 0x4000_0000 into a goods row id; the fallback must produce the SAME
+        // number, or a Bedrock seed would preview a different good than one of ours would.
+        assert_eq!(full_id_from_equip_type(3, 8852), Some(0x4000_0000u32 as i32 | 8852));
+    }
+
+    #[test]
+    fn full_id_rejects_empty_and_unrepaintable_rows() {
+        // -1 / 0 are vanilla's "no ware" sentinels; equipType 4+ is gem/custom, which shop_preview and
+        // shop_icon cannot repaint. All must fail CLOSED rather than yield a plausible wrong id.
+        assert_eq!(full_id_from_equip_type(3, -1), None);
+        assert_eq!(full_id_from_equip_type(3, 0), None);
+        assert_eq!(full_id_from_equip_type(4, 2050), None, "gem must not masquerade as a goods id");
+        assert_eq!(full_id_from_equip_type(9, 2050), None);
+    }
+
+    #[test]
+    fn full_id_of_a_weapon_row_is_not_mistaken_for_goods() {
+        // The bug this guards: a foreign reward on a WEAPON shop row. If we encoded it as goods, the
+        // caller would strip the nibble and repaint EquipParamGoods[row] -- a real, unrelated good.
+        let full = full_id_from_equip_type(0, 8852).expect("weapon ware") as u32;
+        assert_ne!(item_category_of(full), CATEGORY_GOODS);
     }
 }
