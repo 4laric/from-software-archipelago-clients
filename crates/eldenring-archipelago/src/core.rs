@@ -530,10 +530,29 @@ impl shared::Core for Core {
                     }
                     let mut loc_flags = loc_flags;
                     let shop_table = crate::key_resolver::load_shoplineup_flags(&shop_table_path());
+                    // Tolerance requires telemetry: an absent/empty table degrades every foreign
+                    // shop check to "never fires", which is indistinguishable from "no shops in
+                    // this seed" without this line. Announce armed/inert once, but only on the
+                    // matt-key (foreign) path -- greenfield seeds carry no locationIdsToKeys and
+                    // resolve shops from slot_data, so the table is legitimately irrelevant there.
+                    let foreign_keys = sd.get("locationIdsToKeys").is_some();
                     if !shop_table.is_empty() {
-                        for (loc, flag) in crate::key_resolver::shop_flags_from_keys(sd, &shop_table) {
+                        let resolved = crate::key_resolver::shop_flags_from_keys(sd, &shop_table);
+                        if foreign_keys {
+                            log::info!(
+                                "shoplineup_flags: armed with {} rows -- {} shop slots resolved to stock flags",
+                                shop_table.len(),
+                                resolved.len()
+                            );
+                        }
+                        for (loc, flag) in resolved {
                             loc_flags.entry(loc).or_insert(flag);
                         }
+                    } else if foreign_keys {
+                        log::warn!(
+                            "shoplineup_flags: INERT -- no usable table at {} (foreign shop checks will never fire)",
+                            shop_table_path().display()
+                        );
                     }
                     loc_flags
                 };
