@@ -243,7 +243,7 @@ mod replay {
 
 #[cfg(test)]
 mod countdown_replay {
-    use crate::region_lock::{KickAction, KickCountdown, DEFAULT_KICK_GRACE_MS};
+    use crate::region_lock::{DEFAULT_KICK_GRACE_MS, KickAction, KickCountdown};
 
     const REGION: &str = "Caelid";
     const LOCK: &str = "Caelid Lock";

@@ -195,7 +195,11 @@ mod foreign_goal {
         lf.insert(7770001i64, 60510u32);
         let sd = json!({ "goalLocations": [7770001i64], "goal": [9999u64] });
         let cfg = parse(&sd, &lf);
-        assert_eq!(cfg.flag_goals, vec![60510u32], "goalLocations must win; `goal` is fallback only");
+        assert_eq!(
+            cfg.flag_goals,
+            vec![60510u32],
+            "goalLocations must win; `goal` is fallback only"
+        );
         assert!(!cfg.flag_goals.contains(&9999));
     }
 
@@ -211,6 +215,10 @@ mod foreign_goal {
     fn zero_and_malformed_goal_entries_are_dropped_not_trusted() {
         let sd = json!({ "goal": [0u64, 9101u64, "nonsense"] });
         let cfg = parse(&sd, &HashMap::new());
-        assert_eq!(cfg.flag_goals, vec![9101u32], "flag 0 is not a flag; a string is not a flag");
+        assert_eq!(
+            cfg.flag_goals,
+            vec![9101u32],
+            "flag 0 is not a flag; a string is not a flag"
+        );
     }
 }

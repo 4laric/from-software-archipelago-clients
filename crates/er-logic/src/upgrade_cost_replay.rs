@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 mod replay {
-    use crate::upgrade_cost::{clamp_count, FlattenLatch};
+    use crate::upgrade_cost::{FlattenLatch, clamp_count};
 
     const REG: i32 = 10100; // Smithing Stone [1] (a REGULAR stone)
     const SOMBER: i32 = 10160; // a somber stone (must never be touched)

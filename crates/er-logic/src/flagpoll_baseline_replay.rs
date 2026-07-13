@@ -299,7 +299,8 @@ mod replay {
         // so it folds into the baseline and can NEVER fire again — reproduces "got nothing".
         let rebaseline_buggy = effective_baseline(None, &WATCHED, &|f| g.get_event_flag(f));
         assert!(
-            newly_set_since_baseline(&WATCHED, &rebaseline_buggy, &|f| g.get_event_flag(f)).is_empty(),
+            newly_set_since_baseline(&WATCHED, &rebaseline_buggy, &|f| g.get_event_flag(f))
+                .is_empty(),
             "regression guard: re-snapshotting at reconnect strands the mid-session pickup (the bug)"
         );
 

@@ -30,8 +30,8 @@ pub fn should_apply_incoming_deathlink(death_link_enabled: bool, already_applied
 #[cfg(test)]
 mod replay {
     use super::*;
-    use crate::deathlink::{drive_incoming_kill, latch_incoming, DeathLatch};
-    use crate::hook::{GameHook, DEATHLINK_KILL_FLAG};
+    use crate::deathlink::{DeathLatch, drive_incoming_kill, latch_incoming};
+    use crate::hook::{DEATHLINK_KILL_FLAG, GameHook};
     use std::collections::HashMap;
 
     /// Flag-holder game model for the DeathLink surface: a flag map, holder readiness (a not-ready

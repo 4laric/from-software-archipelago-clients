@@ -240,7 +240,7 @@ mod tests {
         assert!(is_synthetic_goods(CATEGORY_GOODS | 3_780_001));
         assert!(!is_synthetic_goods(CATEGORY_GOODS | 3_780_000)); // strictly greater
         assert!(!is_synthetic_goods(CATEGORY_GOODS | 2_220_010)); // max real vanilla goods id
-                                                                  // goods-only payoff: other categories never misdetect regardless of magnitude
+        // goods-only payoff: other categories never misdetect regardless of magnitude
         assert!(!is_synthetic_goods(CATEGORY_WEAPON | 99_060_000));
         assert!(!is_synthetic_goods(CATEGORY_PROTECTOR | 5_330_000));
         assert!(!is_synthetic_goods(CATEGORY_ACCESSORY | 4_000_000));

@@ -8,7 +8,7 @@
 
 #![cfg(test)]
 
-use crate::config_reload::{reload_action, ConnInfo, ReloadAction};
+use crate::config_reload::{ConnInfo, ReloadAction, reload_action};
 
 fn conn(url: &str, slot: &str) -> ConnInfo {
     ConnInfo {

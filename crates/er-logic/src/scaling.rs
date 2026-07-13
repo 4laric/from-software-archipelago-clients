@@ -320,7 +320,7 @@ mod tests {
         let mut c = cfg(&[(6850, 100)], 0);
         c.max_target = 100;
         c.region_ranges = vec![(6850, 6850, 100)]; // Jagged Peak bucket at max depth
-                                                   // no floor wire -> uncapped: top tier
+        // no floor wire -> uncapped: top tier
         assert_eq!(tier_for_region(&c, 6850), NUM_TIERS - 1);
         // with the DLC floor wire present for that bucket -> capped at DLC_ENEMY_TIER_CAP
         c.dlc_blessing_floors = vec![(6850, 6850, 12)];

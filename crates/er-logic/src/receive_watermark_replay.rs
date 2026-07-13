@@ -24,7 +24,7 @@
 
 #[cfg(test)]
 mod replay {
-    use crate::receive::{process_received_item, GrantAction, NetHook, RecvItem};
+    use crate::receive::{GrantAction, NetHook, RecvItem, process_received_item};
     use std::collections::{HashMap, HashSet};
 
     /// Test double for [`NetHook`] (receive.rs:48). Records the NAME-keyed side effects so the replay
@@ -282,7 +282,8 @@ mod replay {
         let out = replay(&timeline, &mut hook);
 
         assert_eq!(
-            out.grant_count(0), 2,
+            out.grant_count(0),
+            2,
             "regression guard: a lost watermark re-grants the weapon on reconnect (documents the bug)"
         );
         assert_eq!(out.grant_count(1), 2, "the rune is double-granted too");

@@ -71,11 +71,15 @@ pub fn probe() -> bool {
         // fault on small/non-module heap pointers, and log the vtable so we can identify the module.
         let vtable = unsafe { (ptr as *const usize).read_unaligned() };
         if !is_code(vtable) {
-            log::info!("[scaling-probe] -- (base+{off:#x})={ptr:#018x}: vtable {vtable:#018x} not code -> skip");
+            log::info!(
+                "[scaling-probe] -- (base+{off:#x})={ptr:#018x}: vtable {vtable:#018x} not code -> skip"
+            );
             continue;
         }
         let vt_rva = vtable - 0x7FF700000000; // rough exe-relative for cross-referencing the module type
-        log::info!("[scaling-probe] -- module (base+{off:#x})={ptr:#018x} vtable={vtable:#018x} (~rva {vt_rva:#x}): +0x580..+0x5C0 --");
+        log::info!(
+            "[scaling-probe] -- module (base+{off:#x})={ptr:#018x} vtable={vtable:#018x} (~rva {vt_rva:#x}): +0x580..+0x5C0 --"
+        );
         for j in 0..0x10usize {
             let o = 0x580 + j * 4;
             let v = unsafe { ((ptr + o) as *const u32).read_unaligned() };

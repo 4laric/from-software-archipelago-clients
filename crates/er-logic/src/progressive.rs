@@ -77,7 +77,7 @@ impl ProgressiveState {
                     flags: vec![],
                     grants: vec![],
                     handled: false,
-                }
+                };
             }
         };
         if ap_index <= self.high_index {

@@ -20,7 +20,7 @@
 
 #![cfg(test)]
 
-use crate::upgrades::{blessing_target, level_for_fragments, SCADU_MAX_LEVEL};
+use crate::upgrades::{SCADU_MAX_LEVEL, blessing_target, level_for_fragments};
 
 /// What the client does each throttle window.
 #[derive(Clone, Copy, Debug, PartialEq)]
