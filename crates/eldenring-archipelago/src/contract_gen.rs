@@ -48,7 +48,6 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "reveal_all_maps", shape: Shape::Bool, required: false, greenfield: true },
     ContractKey { name: "progressionSurfaceLocations", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "goalLocations", shape: Shape::IntList, required: true, greenfield: true },
-    ContractKey { name: "goalItems", shape: Shape::StrList, required: false, greenfield: true },
     ContractKey { name: "checkItemFlags", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "shopRowFlags", shape: Shape::ScalarIntMap, required: false, greenfield: true },
     ContractKey { name: "checkLotBlankMap", shape: Shape::ListvalIntMap, required: false, greenfield: true },
@@ -74,7 +73,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "region_count", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "ending_condition", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "great_runes_required", shape: Shape::Any, required: false, greenfield: true },
-    ContractKey { name: "great_rune_items", shape: Shape::Any, required: false, greenfield: true },
+    ContractKey { name: "great_rune_items", shape: Shape::StrList, required: false, greenfield: true },
     ContractKey { name: "bossLocations", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "bossLockItems", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "filler_foreign_localized", shape: Shape::Any, required: false, greenfield: true },
@@ -174,6 +173,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "bc5519d5";
+pub const CONTRACT_HASH: &str = "8476641d";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.2.0";
 

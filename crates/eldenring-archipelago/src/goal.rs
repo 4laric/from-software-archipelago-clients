@@ -25,7 +25,7 @@ pub struct GoalConfig {
     pub flag_goals: Vec<u32>,
     /// Goal location ids with no detection-flag entry: done when the checked set has them.
     pub checked_goals: Vec<i64>,
-    /// `goalItems` -- item NAMES the player must HOLD (have RECEIVED) before Goal can fire.
+    /// `great_rune_items` -- item NAMES the player must HOLD (have RECEIVED) before Goal can fire.
     ///
     /// THE BUG THIS FIXES. The `great_runes` ending's own docstring promises "ALSO **collect** Great
     /// Runes", and AP's victory rule is exactly that: `state.has(rune)`. But the client's goal was
@@ -49,10 +49,12 @@ impl GoalConfig {
 pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
     let mut flag_goals = Vec::new();
     let mut checked_goals = Vec::new();
-    // `goalItems`: item NAMES that must have been RECEIVED. Absent on a foreign apworld and on any
-    // ending that needs no items -> empty, which adds no requirement.
+    // `great_rune_items`: item NAMES that must have been RECEIVED. It shipped for months as a
+    // NO-READ DIAGNOSTIC -- the apworld sent the answer and the client never looked, which is exactly
+    // how the bug survived. Absent on a foreign apworld and on any ending needing no items -> empty,
+    // which adds no requirement.
     let item_goals: Vec<String> = sd
-        .get("goalItems")
+        .get("great_rune_items")
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
@@ -210,7 +212,7 @@ mod foreign_goal {
     //! Bedrock's apworld emits `goal` (boss defeat FLAGS), never `goalLocations` (AP location ids).
     //! Without the fallback below his seed parses an empty goal set, `is_empty()` is true forever,
     //! and the client never sends Goal -- the slot is unwinnable and says nothing about it.
-    use super::tests::lf; // the goalItems cases below share the sibling module's flag-map helper
+    use super::tests::lf; // the great_rune_items cases below share the sibling module's flag-map helper
     use super::*;
     use serde_json::json;
 
@@ -258,11 +260,11 @@ mod foreign_goal {
         );
     }
 
-    // --- goalItems: HELD, not killed (2026-07-14) ---------------------------------------------
+    // --- great_rune_items: HELD, not killed (2026-07-14) ---------------------------------------------
 
     #[test]
     fn empty_item_goals_add_no_requirement() {
-        // Every existing seed: no `goalItems` key -> the item predicate is never consulted, so a
+        // Every existing seed: no `great_rune_items` key -> the item predicate is never consulted, so a
         // location-only goal behaves exactly as before. (has_item returns false throughout above.)
         let cfg = parse(&json!({"goalLocations": [10]}), &lf(&[(10, 800)]));
         assert!(cfg.item_goals.is_empty());
@@ -275,7 +277,7 @@ mod foreign_goal {
         // The client used to fire Goal on the boss LOCATION being checked -- but with item shuffle on,
         // Godrick's Great Rune is not at Godrick. Every location done, rune never received => NOT met.
         let cfg = parse(
-            &json!({"goalLocations": [10], "goalItems": ["Godrick's Great Rune"]}),
+            &json!({"goalLocations": [10], "great_rune_items": ["Godrick's Great Rune"]}),
             &lf(&[(10, 800)]),
         );
         assert_eq!(cfg.item_goals, vec!["Godrick's Great Rune".to_string()]);
@@ -294,7 +296,7 @@ mod foreign_goal {
     #[test]
     fn every_item_goal_is_required() {
         let cfg = parse(
-            &json!({"goalLocations": [], "goalItems": ["A", "B"]}),
+            &json!({"goalLocations": [], "great_rune_items": ["A", "B"]}),
             &lf(&[]),
         );
         assert!(
@@ -308,7 +310,7 @@ mod foreign_goal {
     fn item_goals_alone_are_a_valid_goal() {
         // is_empty() must account for item_goals, or a goal made only of items would read as EMPTY
         // and "can never be met" -- the exact fail-closed branch that would silently brick the ending.
-        let cfg = parse(&json!({"goalItems": ["A"]}), &lf(&[]));
+        let cfg = parse(&json!({"great_rune_items": ["A"]}), &lf(&[]));
         assert!(!cfg.is_empty());
         assert!(is_met(&cfg, |_| true, |_| true, |n| n == "A"));
     }
