@@ -178,17 +178,20 @@ fn set_sell_quantity_one(row_id: u32) -> Option<i16> {
 /// `eventFlag_forStock` is an AP check flag. That set IS the shop checks (419 vanilla-flag + 45
 /// rewritten, goods AND equipment), so this covers slots the 45-row loop can't see (e.g. Dex-knot tear,
 /// any qty>1 weapon/armor slot). No-op if check flags weren't configured (pre-patch seed).
-fn clamp_check_row_stock() {
+/// Returns false when it could NOT do the work (check flags not configured yet, or the param repo is
+/// not up): the caller must then RETRY rather than latch DONE. Silently latching over a clamp that
+/// never ran is how a shop check stayed re-buyable.
+fn clamp_check_row_stock() -> bool {
     let flags: std::collections::HashSet<u32> =
         CHECK_FLAGS.lock().unwrap().iter().copied().collect();
     if flags.is_empty() {
-        return;
+        return false; // slot_data not parsed yet -- retry next tick
     }
     // SAFETY: FD4 singleton; game thread, in-world (caller gates). instance_mut + rows_mut iterate the
     // live RW param table.
     let repo = match unsafe { SoloParamRepository::instance_mut() } {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return false, // repo not up -- retry next tick
     };
     let mut clamped = 0u32;
     for (id, row) in repo.rows_mut::<ShopLineupParam>() {
@@ -200,7 +203,12 @@ fn clamp_check_row_stock() {
             log::info!("shop-flags STOCK: row {id} (flag {f}) sellQuantity {old} -> 1");
         }
     }
-    log::info!("shop-flags STOCK: === scan clamped {clamped} check row(s) to sellQuantity=1 ===");
+    log::info!(
+        "shop-flags STOCK: === scan clamped {clamped} check row(s) to sellQuantity=1 (of {} check \
+         flag(s)) ===",
+        flags.len()
+    );
+    true
 }
 
 /// PROBE: read the known rows and report whether the live `eventFlag_forStock` matches the vanilla CSV.
@@ -269,7 +277,25 @@ pub fn run(row_flags: &[(u32, u32)]) -> bool {
     };
     let row_flags: &[(u32, u32)] = &owned;
     if row_flags.is_empty() {
-        DONE.store(true, Ordering::Relaxed); // shop_checks off: nothing to inject
+        // NOTHING TO INJECT != NOTHING TO DO (2026-07-14).
+        //
+        // This used to `return true` here, which skipped clamp_check_row_stock() below -- and that
+        // clamp is driven by CHECK_FLAGS, not by these row_flags. A FOREIGN apworld never emits
+        // `shopRowFlags` (Bedrock's seed: "configured 0 row(s) from slot_data shopRowFlags"), so
+        // row_flags was always empty, so the clamp never ran, even with 4892 check flags configured
+        // and waiting.
+        //
+        // What that cost: shop_sell rewrites a check row to NATIVELY SELL its AP reward, so every
+        // purchase hands the item over -- but only the FIRST fires the check. A vanilla row with
+        // sellQuantity > 1 (Beast Claw = 3) therefore let the player buy the same AP reward three
+        // times for runes. That is a duplication exploit, not merely wasted stock, and on a
+        // progression item it is a dupe of a progression item.
+        //
+        // So: skip the injection loop, run the clamp, and only then latch DONE.
+        if !clamp_check_row_stock() {
+            return false; // not ready -- retry, do NOT latch over an un-run clamp
+        }
+        DONE.store(true, Ordering::Relaxed);
         return true;
     }
     let mut wrote = 0;
@@ -297,8 +323,12 @@ pub fn run(row_flags: &[(u32, u32)]) -> bool {
         "shop-flags WRITE: === injected {wrote}/{} rows ({qty_clamped} sellQuantity clamped to 1) ===",
         row_flags.len()
     );
-    // Wider pass: clamp EVERY shop check (all 484, goods + equipment) to one-time, by check-flag match.
-    clamp_check_row_stock();
+    // Wider pass: clamp EVERY shop check (goods + equipment) to one-time, by check-flag match. Same
+    // rule as the empty path above: if the clamp could not run, RETRY -- never latch DONE over it. The
+    // injection is idempotent, so re-running it next tick costs nothing.
+    if !clamp_check_row_stock() {
+        return false;
+    }
     DONE.store(true, Ordering::Relaxed);
     true
 }
