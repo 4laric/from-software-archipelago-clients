@@ -332,3 +332,92 @@ pub fn run(row_flags: &[(u32, u32)]) -> bool {
     DONE.store(true, Ordering::Relaxed);
     true
 }
+
+// --- capital release re-key (SPEC-capital-reconciler.md; slot_data `capitalReleaseRows`) ---------
+// Four live shop checks -- Enia's Maliketh armor set, ShopLineupParam rows 101516-101519 (stock
+// flags 250160/250170/250180/250190 = checks 7770500-7770503) -- use `eventFlag_forRelease = 9116`
+// ITSELF. Vanilla keeps 9116 ON forever post-burn so they stock; the capital reconciler's
+// OFF-default (every warp home writes OFF) would de-stock them permanently. Fix: re-key those
+// rows' release flag 9116 -> 118 (the burn-done latch -- monotonic, set seconds after 9116 in the
+// burn, so the vanilla release timing is preserved and our toggling can't touch it).
+// WRITE-GUARDED: only a row whose LIVE release value equals the expected `from` (9116) is
+// rewritten; anything else is logged and left alone. The three value=0 rows that also release on
+// 9116 (101785/102710/102810 -- remembrance-dupe trades, not checks) are never in the list.
+// Same row base + documented-offset pattern as the probe-confirmed +0x0C stock writes above.
+
+/// Byte offset of `eventFlag_forRelease` (u32) within a SHOP_LINEUP_PARAM row (Paramdex def).
+const RELEASE_FLAG_OFF: usize = 0x10;
+
+/// `[row, expected release flag, replacement]` triples from slot_data `capitalReleaseRows`
+/// (region.rs::configure_capital). Empty = INERT (option off / old apworld).
+static CAPITAL_RELEASE: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+static CAPITAL_RELEASE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Called by region.rs::configure_capital once slot_data is parsed. Re-arms the once-latch so a
+/// second seed loaded in the same game process re-keys again.
+pub fn configure_capital_release(rows: Vec<(u32, u32, u32)>) {
+    log::info!(
+        "shop-flags: configured {} capital release re-key row(s)",
+        rows.len()
+    );
+    *CAPITAL_RELEASE.lock().unwrap() = rows;
+    CAPITAL_RELEASE_DONE.store(false, Ordering::Relaxed);
+}
+
+/// Address of a row's `eventFlag_forRelease` field (same row base as `stock_flag_addr`).
+fn release_flag_addr(row_id: u32) -> Option<usize> {
+    // SAFETY: FD4 singleton; on the game thread (caller gates in-world).
+    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
+    let row: &SHOP_LINEUP_PARAM = repo.get::<ShopLineupParam>(row_id)?;
+    Some((row as *const SHOP_LINEUP_PARAM as usize) + RELEASE_FLAG_OFF)
+}
+
+/// Run once in-world (core.rs tick, beside `run`). Returns false while the param repo isn't up
+/// yet (caller retries next tick); latches DONE only after a full pass over the configured rows.
+pub fn run_capital_release() -> bool {
+    if CAPITAL_RELEASE_DONE.load(Ordering::Relaxed) {
+        return true;
+    }
+    let rows: Vec<(u32, u32, u32)> = CAPITAL_RELEASE.lock().unwrap().clone();
+    if rows.is_empty() {
+        CAPITAL_RELEASE_DONE.store(true, Ordering::Relaxed);
+        return true; // INERT: nothing configured
+    }
+    if release_flag_addr(rows[0].0).is_none() {
+        return false; // param repo not ready -- retry next tick, never latch over un-run work
+    }
+    let mut rekeyed = 0u32;
+    for &(row, from, to) in &rows {
+        let Some(a) = release_flag_addr(row) else {
+            log::warn!("capital release re-key: row {row} absent from ShopLineupParam; skipped");
+            continue;
+        };
+        let p = a as *mut u32;
+        // SAFETY: field address inside the live RW param row, resolved above; unaligned like the
+        // stock writes.
+        let live = unsafe { p.read_unaligned() };
+        if live == to {
+            continue; // already re-keyed (idempotent re-run / reconnect)
+        }
+        if live != from {
+            // WRITE GUARD: this is not the row state we derived against -- a game patch or
+            // another mod moved it. Log and leave it alone; never write over the unexpected.
+            log::warn!(
+                "capital release re-key: row {row} live eventFlag_forRelease = {live}, expected {from} -- LEFT ALONE"
+            );
+            continue;
+        }
+        unsafe { p.write_unaligned(to) };
+        let back = unsafe { p.read_unaligned() };
+        rekeyed += 1;
+        log::info!(
+            "capital release re-key: row {row} eventFlag_forRelease {from} -> {to} (readback {back})"
+        );
+    }
+    log::info!(
+        "capital release re-key: === {rekeyed}/{} row(s) re-keyed ===",
+        rows.len()
+    );
+    CAPITAL_RELEASE_DONE.store(true, Ordering::Relaxed);
+    true
+}

@@ -107,5 +107,9 @@ pub fn warp_to_grace(grace_entity_id: u32) -> Result<(), &'static str> {
         f(rcx, rdx, arg);
     }
     log::info!("warp: requested grace warp to {grace_entity_id} (arg {arg})");
+    // Capital-version intercept (SPEC-capital-reconciler.md): decide 9116 from the TARGET
+    // before the load resolves. The warp is asynchronous, so writing here lands before the
+    // load screen; every client-initiated warp (kick, random start, `!warp`) gets it.
+    crate::region::capital_warp_intercept(grace_entity_id);
     Ok(())
 }
