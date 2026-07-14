@@ -159,7 +159,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn lf(pairs: &[(i64, u32)]) -> HashMap<i64, u32> {
+    pub(super) fn lf(pairs: &[(i64, u32)]) -> HashMap<i64, u32> {
         pairs.iter().copied().collect()
     }
 
@@ -211,6 +211,7 @@ mod foreign_goal {
     //! Without the fallback below his seed parses an empty goal set, `is_empty()` is true forever,
     //! and the client never sends Goal -- the slot is unwinnable and says nothing about it.
     use super::*;
+    use super::tests::lf;   // the goalItems cases below share the sibling module's flag-map helper
     use serde_json::json;
 
     #[test]
