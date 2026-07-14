@@ -1897,6 +1897,9 @@ impl shared::Core for Core {
                     // Pre-filter against valid_locations (kept correct per-seed by reset_for_new_seed)
                     // so no datapackage-unknown id reaches is_local_location_checked.
                     |l| self.valid_locations.contains(&l) && client.is_local_location_checked(l),
+                    // goalItems: the item must be HELD. `received_all` is the cumulative, reconnect-
+                    // replayed received-name set, so this survives save-load and !collect.
+                    |n| received_all.contains(n),
                 ),
                 _ => false,
             };
@@ -2185,9 +2188,20 @@ impl Core {
     fn reconcile_goal_met(&self) -> bool {
         match (self.goal.as_ref(), self.client()) {
             (Some(cfg), Some(client)) => {
-                crate::goal::is_met(cfg, crate::flags::get_event_flag, |l| {
-                    self.valid_locations.contains(&l) && client.is_local_location_checked(l)
-                })
+                // goalItems: HELD, not killed. The reconciler has no `received_all` in scope (it is a
+                // &self path), so derive the held-name set straight from the received stream -- the
+                // same source `received_all` is built from, so the two agree by construction.
+                let held: HashSet<String> = client
+                    .received_items()
+                    .iter()
+                    .map(|ri| ri.item().name().to_string())
+                    .collect();
+                crate::goal::is_met(
+                    cfg,
+                    crate::flags::get_event_flag,
+                    |l| self.valid_locations.contains(&l) && client.is_local_location_checked(l),
+                    |n| held.contains(n),
+                )
             }
             _ => false,
         }

@@ -25,11 +25,22 @@ pub struct GoalConfig {
     pub flag_goals: Vec<u32>,
     /// Goal location ids with no detection-flag entry: done when the checked set has them.
     pub checked_goals: Vec<i64>,
+    /// `goalItems` -- item NAMES the player must HOLD (have RECEIVED) before Goal can fire.
+    ///
+    /// THE BUG THIS FIXES. The `great_runes` ending's own docstring promises "ALSO **collect** Great
+    /// Runes", and AP's victory rule is exactly that: `state.has(rune)`. But the client's goal was
+    /// LOCATION-based, and the apworld expressed "collect Godrick's Great Rune" as "check the location
+    /// Godrick's boss drop" -- i.e. KILL GODRICK. With item shuffle on (frozen ON), Godrick's Great
+    /// Rune is NOT at Godrick; it is anywhere in the multiworld. So you could send Goal having killed
+    /// every rune boss and never held a single Great Rune, and the run would end.
+    ///
+    /// A kill is not a collection. Goal now requires the ITEM.
+    pub item_goals: Vec<String>,
 }
 
 impl GoalConfig {
     pub fn is_empty(&self) -> bool {
-        self.flag_goals.is_empty() && self.checked_goals.is_empty()
+        self.flag_goals.is_empty() && self.checked_goals.is_empty() && self.item_goals.is_empty()
     }
 }
 
@@ -38,6 +49,25 @@ impl GoalConfig {
 pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
     let mut flag_goals = Vec::new();
     let mut checked_goals = Vec::new();
+    // `goalItems`: item NAMES that must have been RECEIVED. Absent on a foreign apworld and on any
+    // ending that needs no items -> empty, which adds no requirement.
+    let item_goals: Vec<String> = sd
+        .get("goalItems")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !item_goals.is_empty() {
+        log::info!(
+            "goal: {} item(s) must be HELD, not merely their boss killed: {}",
+            item_goals.len(),
+            item_goals.join(", ")
+        );
+    }
     let ids: Vec<i64> = sd
         .get("goalLocations")
         .and_then(|v| v.as_array())
@@ -101,6 +131,7 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
     GoalConfig {
         flag_goals,
         checked_goals,
+        item_goals,
     }
 }
 
@@ -112,11 +143,15 @@ pub fn is_met(
     cfg: &GoalConfig,
     flag_read: impl Fn(u32) -> bool,
     is_checked: impl Fn(i64) -> bool,
+    has_item: impl Fn(&str) -> bool,
 ) -> bool {
     if cfg.is_empty() {
         return false;
     }
-    cfg.flag_goals.iter().all(|&f| flag_read(f)) && cfg.checked_goals.iter().all(|&l| is_checked(l))
+    cfg.flag_goals.iter().all(|&f| flag_read(f))
+        && cfg.checked_goals.iter().all(|&l| is_checked(l))
+        // HELD, not killed. See GoalConfig::item_goals.
+        && cfg.item_goals.iter().all(|n| has_item(n))
 }
 
 #[cfg(test)]
@@ -132,7 +167,7 @@ mod tests {
     fn empty_goal_set_is_never_met() {
         let cfg = parse(&json!({}), &lf(&[]));
         assert!(cfg.is_empty());
-        assert!(!is_met(&cfg, |_| true, |_| true));
+        assert!(!is_met(&cfg, |_| true, |_| true, |_| false));
     }
 
     #[test]
@@ -143,8 +178,8 @@ mod tests {
         );
         assert_eq!(cfg.flag_goals, vec![800, 850]);
         assert!(cfg.checked_goals.is_empty());
-        assert!(!is_met(&cfg, |f| f == 800, |_| false)); // one boss down, one to go
-        assert!(is_met(&cfg, |_| true, |_| false)); // checked set never consulted
+        assert!(!is_met(&cfg, |f| f == 800, |_| false, |_| false)); // one boss down, one to go
+        assert!(is_met(&cfg, |_| true, |_| false, |_| false)); // checked set never consulted
     }
 
     #[test]
@@ -152,8 +187,8 @@ mod tests {
         let cfg = parse(&json!({"goalLocations": [10, 99]}), &lf(&[(10, 800)]));
         assert_eq!(cfg.flag_goals, vec![800]);
         assert_eq!(cfg.checked_goals, vec![99]);
-        assert!(!is_met(&cfg, |_| true, |_| false)); // flag done, fallback not checked
-        assert!(is_met(&cfg, |_| true, |l| l == 99));
+        assert!(!is_met(&cfg, |_| true, |_| false, |_| false)); // flag done, fallback not checked
+        assert!(is_met(&cfg, |_| true, |l| l == 99, |_| false));
     }
 
     #[test]
@@ -220,5 +255,52 @@ mod foreign_goal {
             vec![9101u32],
             "flag 0 is not a flag; a string is not a flag"
         );
+    }
+
+    // --- goalItems: HELD, not killed (2026-07-14) ---------------------------------------------
+
+    #[test]
+    fn empty_item_goals_add_no_requirement() {
+        // Every existing seed: no `goalItems` key -> the item predicate is never consulted, so a
+        // location-only goal behaves exactly as before. (has_item returns false throughout above.)
+        let cfg = parse(&json!({"goalLocations": [10]}), &lf(&[(10, 800)]));
+        assert!(cfg.item_goals.is_empty());
+        assert!(is_met(&cfg, |_| true, |_| true, |_| false));
+    }
+
+    #[test]
+    fn killing_the_boss_is_not_holding_the_rune() {
+        // THE BUG. The great_runes ending promises "collect Great Runes" and AP enforces state.has().
+        // The client used to fire Goal on the boss LOCATION being checked -- but with item shuffle on,
+        // Godrick's Great Rune is not at Godrick. Every location done, rune never received => NOT met.
+        let cfg = parse(
+            &json!({"goalLocations": [10], "goalItems": ["Godrick's Great Rune"]}),
+            &lf(&[(10, 800)]),
+        );
+        assert_eq!(cfg.item_goals, vec!["Godrick's Great Rune".to_string()]);
+        assert!(
+            !is_met(&cfg, |_| true, |_| true, |_| false),
+            "boss dead and every location checked, but the rune was never RECEIVED -- Goal must not fire"
+        );
+        assert!(is_met(&cfg, |_| true, |_| true, |n| n == "Godrick's Great Rune"));
+    }
+
+    #[test]
+    fn every_item_goal_is_required() {
+        let cfg = parse(
+            &json!({"goalLocations": [], "goalItems": ["A", "B"]}),
+            &lf(&[]),
+        );
+        assert!(!is_met(&cfg, |_| true, |_| true, |n| n == "A"), "holding one of two is not done");
+        assert!(is_met(&cfg, |_| true, |_| true, |n| n == "A" || n == "B"));
+    }
+
+    #[test]
+    fn item_goals_alone_are_a_valid_goal() {
+        // is_empty() must account for item_goals, or a goal made only of items would read as EMPTY
+        // and "can never be met" -- the exact fail-closed branch that would silently brick the ending.
+        let cfg = parse(&json!({"goalItems": ["A"]}), &lf(&[]));
+        assert!(!cfg.is_empty());
+        assert!(is_met(&cfg, |_| true, |_| true, |n| n == "A"));
     }
 }
