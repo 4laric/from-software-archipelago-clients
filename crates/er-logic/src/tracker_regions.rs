@@ -758,7 +758,7 @@ pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7770744, "Shadow Keep", "Shadow Keep", false, false),
     (7770745, "Shadow Keep", "Shadow Keep", false, true),
     (7770746, "Belurat", "Belurat", false, false),
-    (7770747, "Belurat", "Belurat", true, false),
+    (7770747, "Scadu Altus", "Scadu Altus", true, false),
     (7770748, "Belurat", "Belurat", false, false),
     (7770749, "Belurat", "Belurat", false, false),
     (7770750, "Gravesite", "Gravesite", false, false),
