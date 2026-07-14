@@ -210,8 +210,8 @@ mod foreign_goal {
     //! Bedrock's apworld emits `goal` (boss defeat FLAGS), never `goalLocations` (AP location ids).
     //! Without the fallback below his seed parses an empty goal set, `is_empty()` is true forever,
     //! and the client never sends Goal -- the slot is unwinnable and says nothing about it.
+    use super::tests::lf; // the goalItems cases below share the sibling module's flag-map helper
     use super::*;
-    use super::tests::lf;   // the goalItems cases below share the sibling module's flag-map helper
     use serde_json::json;
 
     #[test]
@@ -283,7 +283,12 @@ mod foreign_goal {
             !is_met(&cfg, |_| true, |_| true, |_| false),
             "boss dead and every location checked, but the rune was never RECEIVED -- Goal must not fire"
         );
-        assert!(is_met(&cfg, |_| true, |_| true, |n| n == "Godrick's Great Rune"));
+        assert!(is_met(
+            &cfg,
+            |_| true,
+            |_| true,
+            |n| n == "Godrick's Great Rune"
+        ));
     }
 
     #[test]
@@ -292,7 +297,10 @@ mod foreign_goal {
             &json!({"goalLocations": [], "goalItems": ["A", "B"]}),
             &lf(&[]),
         );
-        assert!(!is_met(&cfg, |_| true, |_| true, |n| n == "A"), "holding one of two is not done");
+        assert!(
+            !is_met(&cfg, |_| true, |_| true, |n| n == "A"),
+            "holding one of two is not done"
+        );
         assert!(is_met(&cfg, |_| true, |_| true, |n| n == "A" || n == "B"));
     }
 
