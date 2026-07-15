@@ -677,6 +677,153 @@ fn str_to_u32vec(v: Option<&Value>) -> HashMap<String, Vec<u32>> {
     m
 }
 
+// --- capital-version reconciler (SPEC-capital-reconciler.md; apworld features/capital.py) -------
+// Leyndell is TWO mutually exclusive map versions on one save-persisted flag (9116: OFF = Royal
+// m11_00, ON = Ashen m11_05 + Elden Throne m19), and vanilla only ever SETS it (Maliketh's
+// death), so the Erdtree burn permanently strands the ~152 Royal checks. The DECISIONS are pure
+// er-logic (`er_logic::capital`, host-tested by `capital_replay`); this is the game-side glue:
+// parse the five `capital*` slot_data keys at connect, hold the per-tick latch in `tick_capital`,
+// and write 9116 from the warp TARGET in `capital_warp_intercept` (called by
+// `warp::warp_to_grace`, so kick / random-start / `!warp` all get the intercept). Everything is
+// armed on the burn-done latch (118, monotonic): the first burn stays 100% the game's own
+// sequence. Reconcile-don't-dispatch: write on readback mismatch only, re-apply per tick until
+// it sticks, never advance past an unverified write. The shop release re-key rides
+// `shop_flags::run_capital_release` (configured here so the five keys stay one parse).
+
+/// Parsed capital-reconciler config (None = INERT: option off / old apworld / malformed keys).
+static CAPITAL: Mutex<Option<er_logic::capital::CapitalConfig>> = Mutex::new(None);
+/// One-time telemetry latch: log "capital reconciler armed" the first time the burn-done flag
+/// reads set in a session (re-armed on each configure).
+static CAPITAL_ARMED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Called by core.rs once slot_data is parsed (beside `region::parse`). The five `capital*`
+/// keys travel together; absent keys are the off-wire (`capital_reconciler: false`, or an
+/// apworld that predates the feature) -- the client logs INERT and never touches 9116.
+pub fn configure_capital(sd: &Value) {
+    CAPITAL_ARMED_LOGGED.store(false, Ordering::Relaxed);
+    let cfg = er_logic::capital::parse(sd);
+    match &cfg {
+        Some(c) => log::info!(
+            "capital reconciler configured: burn flag {}, done latch {}, ashen {:?}, royal {:?}, {} release row(s)",
+            c.burn_flag,
+            c.burn_done_flag,
+            c.sets.ashen,
+            c.sets.royal,
+            c.release_rows.len()
+        ),
+        None => log::info!(
+            "capital reconciler INERT: capital* slot_data keys absent (option off or old apworld)"
+        ),
+    }
+    crate::shop_flags::configure_capital_release(
+        cfg.as_ref()
+            .map(|c| c.release_rows.clone())
+            .unwrap_or_default(),
+    );
+    *CAPITAL.lock().unwrap() = cfg;
+}
+
+/// The pending GAME-MENU fast-travel destination (bonfire ENTITY id, the space
+/// `warp_to_grace` speaks) while a menu grace warp is resolving -- i.e. between the player
+/// confirming a destination on the map and the load completing -- or None when no menu warp
+/// is in flight.
+///
+/// // NEEDS CRATE API: the queued fast-travel destination the engine's own warp machinery was
+/// // handed -- CSLuaEventManager's queued warp arg or the GameMan equivalent -- read between
+/// // map-confirm and load, converted to the BONFIRE ENTITY id space (if the crate surfaces a
+/// // BonfireWarpParam ROW id instead, read that row's `bonfireEntityId`; the two spaces
+/// // differ: row 110500 vs entity 11051950). Return Some(entity_id) while a menu warp is
+/// // resolving, None otherwise.
+///
+/// Until the seam is filled this returns None and the reconciler self-degrades gracefully:
+/// the per-tick latch corrects a menu warp one tick AFTER the load instead of before it.
+/// Client-initiated warps (kick, random start, `!warp`) already get the full before-load
+/// intercept via `warp::warp_to_grace`.
+///
+/// SUPERSEDED-BY-HOOK (pending in-game confirm; see warp_hook.rs): the LuaWarp probe detour
+/// now pushes EVERY warp target straight into `capital_warp_intercept` at the moment of warp,
+/// menu-initiated included — if Alaric's log confirms menu fast-travel routes through LuaWarp,
+/// this poll-style seam never needs filling and stays permanently `None` (kept as the
+/// documented fallback surface should the hook be refused on a stale build).
+pub fn capital_pending_warp_target() -> Option<u32> {
+    None
+}
+
+/// Per-tick 9116 latch: standing in an Ashen bucket -> hold ON; in a Royal bucket -> hold OFF;
+/// elsewhere -> leave the flag alone (the next warp's intercept restores the Royal default).
+/// Defends against anything flipping 9116 mid-session -- the map version would swap under the
+/// player on the next load. Self-configured (no RegionConfig borrow); call every update tick.
+pub fn tick_capital() {
+    let guard = CAPITAL.lock().unwrap();
+    let Some(cfg) = guard.as_ref() else { return };
+    if !crate::flags::in_world() {
+        return; // menu/load: neither play_region_id nor the flag holder is trustworthy
+    }
+    let armed = flags::get_event_flag(cfg.burn_done_flag);
+    if !armed {
+        return; // pre-burn: 9116-OFF *is* vanilla, and mid-burn a write would fight $Event(900)
+    }
+    if !CAPITAL_ARMED_LOGGED.swap(true, Ordering::Relaxed) {
+        log::info!(
+            "capital reconciler armed: burn-done flag {} is set -- {} now reconciled to the player's capital",
+            cfg.burn_done_flag,
+            cfg.burn_flag
+        );
+    }
+    // Menu fast-travel seam first (decide from the TARGET before the load when available;
+    // today the seam returns None and the latch corrects one tick after the load instead).
+    let desired = capital_pending_warp_target()
+        .and_then(|t| er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, t))
+        .or_else(|| {
+            flags::play_region_id()
+                .and_then(|pr| er_logic::capital::capital_flag_state(&cfg.sets, pr))
+        });
+    let current = flags::get_event_flag(cfg.burn_flag);
+    if let Some(w) = er_logic::capital::reconcile_write(armed, desired, current) {
+        let _ = flags::try_set_event_flag(cfg.burn_flag, w);
+        let stuck = flags::get_event_flag(cfg.burn_flag) == w;
+        log::info!(
+            "capital reconcile: flag {} -> {} (play_region {:?}); readback {}",
+            cfg.burn_flag,
+            if w { "ON" } else { "OFF" },
+            flags::play_region_id(),
+            if stuck {
+                "STUCK"
+            } else {
+                "PENDING -- re-applying next tick"
+            }
+        );
+    }
+}
+
+/// Warp-target intercept: decide 9116 from the TARGET before the load resolves, so the player
+/// always loads the correct capital version. Ashen/Throne grace -> ON; ANY other resolvable
+/// target (Royal graces, Roundtable, every overworld grace) -> OFF -- every warp anywhere
+/// except the 7 Ashen/Throne graces restores the Royal default. Called by
+/// `warp::warp_to_grace` right after the warp request (the warp is asynchronous; the write
+/// lands before the load screen resolves). No-op while INERT or pre-burn.
+pub fn capital_warp_intercept(grace_entity_id: u32) {
+    let guard = CAPITAL.lock().unwrap();
+    let Some(cfg) = guard.as_ref() else { return };
+    let armed = flags::get_event_flag(cfg.burn_done_flag);
+    let desired = er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, grace_entity_id);
+    let current = flags::get_event_flag(cfg.burn_flag);
+    if let Some(w) = er_logic::capital::reconcile_write(armed, desired, current) {
+        let _ = flags::try_set_event_flag(cfg.burn_flag, w);
+        let stuck = flags::get_event_flag(cfg.burn_flag) == w;
+        log::info!(
+            "capital warp intercept: target {grace_entity_id} -> flag {} {}; readback {}",
+            cfg.burn_flag,
+            if w { "ON" } else { "OFF" },
+            if stuck {
+                "STUCK"
+            } else {
+                "PENDING -- the per-tick latch converges after the load"
+            }
+        );
+    }
+}
+
 #[cfg(test)]
 mod foreign_apworld_degrade {
     //! A FOREIGN APWORLD MUST YIELD A PLAYABLE VANILLA SEED, NOT AN ERROR.

@@ -353,6 +353,10 @@ impl shared::Core for Core {
                 Err(e) => log::warn!("AddItemFunc detour install deferred: {e}"),
             }
         }
+        // LuaWarp probe hook (warp_hook.rs; capital-reconciler menu-warp seam): self-guarded
+        // one-shot on the game thread — a signature mismatch degrades with one log line
+        // instead of erroring, so no install latch on Core is needed.
+        crate::warp_hook::install();
 
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them.
         let checks = crate::detour::take_pending_checks();
@@ -496,6 +500,10 @@ impl shared::Core for Core {
                 crate::shop_preview::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
                 let mut region = crate::region::parse(sd);
+                // Capital-version reconciler (SPEC-capital-reconciler.md): five capital* keys,
+                // parsed together; absent = INERT (logged). Also configures the shop release
+                // re-key rows (shop_flags::run_capital_release, driven from the tick below).
+                crate::region::configure_capital(sd);
                 // BAKED REGION-LOCK FALLBACK (bedrock interop): only for a seed that speaks
                 // NEITHER region key -- slot_data always wins when it speaks (region.rs). Scope
                 // = the seed's apIdsToItemIds ids resolved to NAMES through the datapackage;
@@ -1958,6 +1966,10 @@ impl shared::Core for Core {
                 region_msgs.push(m);
             }
         }
+        // 6b. Capital-version per-tick latch (self-configured; INERT until slot_data spoke and
+        //     the burn-done flag is set). Holds 9116 matched to the capital the player is
+        //     standing in, so the Erdtree burn never permanently strands the Royal checks.
+        crate::region::tick_capital();
         for g in graces_lit {
             self.log(ap::Print::message(format!("{g} unlocked")));
         }
@@ -2019,6 +2031,10 @@ impl shared::Core for Core {
         if crate::flags::in_world() {
             let _ = crate::fmg_inject::run();
             let _ = crate::shop_flags::run(&[]);
+            // Capital release re-key: Enia's 9116-released Maliketh armor rows -> burn-done
+            // flag, write-guarded (SPEC-capital-reconciler.md). Own latch; retries until the
+            // param repo is up.
+            let _ = crate::shop_flags::run_capital_release();
             let _ = crate::upgrade_cost::maybe_apply();
             let _ = crate::shop_sell::run();
             let _ = crate::shop_stock::run();
