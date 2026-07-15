@@ -39,11 +39,6 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "completionScalingBasis", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "areaLockFlags", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "lockRevealFlags", shape: Shape::ListvalIntMap, required: false, greenfield: true },
-    ContractKey { name: "capitalBurnFlag", shape: Shape::Int, required: false, greenfield: true },
-    ContractKey { name: "capitalBurnDoneFlag", shape: Shape::Int, required: false, greenfield: true },
-    ContractKey { name: "capitalAshenPlayRegions", shape: Shape::IntList, required: false, greenfield: true },
-    ContractKey { name: "capitalRoyalPlayRegions", shape: Shape::IntList, required: false, greenfield: true },
-    ContractKey { name: "capitalReleaseRows", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "regionGraces", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "runeGatedGraces", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "greatRuneItemIds", shape: Shape::IntList, required: false, greenfield: true },
@@ -178,6 +173,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "ebcac2cc";
+pub const CONTRACT_HASH: &str = "8476641d";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.2.0";
 
