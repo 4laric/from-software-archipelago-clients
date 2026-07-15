@@ -49,6 +49,7 @@ pub mod sweep_gate;
 pub mod torrent_start_replay;
 pub mod tracker;
 pub mod tracker_regions;
+pub mod unique_grants;
 pub mod upgrade_cost;
 pub mod upgrade_cost_replay;
 pub mod upgrades;

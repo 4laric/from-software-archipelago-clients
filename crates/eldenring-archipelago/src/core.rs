@@ -94,6 +94,14 @@ pub struct Core {
     /// Session-scoped (R11, SWEEP): indices into start_items that verifiably granted -- only the
     /// failed ones re-attempt; `start_items_granted` latches once ALL have landed.
     start_items_ok: HashSet<usize>,
+    /// Session-scoped tidy-latch for `uniqueStartGrants` entries that have been DECIDED this
+    /// session (granted-or-skipped). Deliberately NOT persisted: the obtained-FLAG is the single
+    /// source of truth for "has it" (er_logic::unique_grants) -- this set only stops re-deciding
+    /// (and re-logging) every tick. Losing it (reload/reconnect) is safe by construction: the
+    /// flag read makes the re-run skip.
+    unique_grants_ok: HashSet<usize>,
+    /// Latches once every uniqueStartGrants entry is decided this session.
+    unique_grants_done: bool,
     /// Session-scoped: when the player most recently entered a live world (reset on menu).
     /// Gates the start-item grant so it fires only after the load/inventory settle (clobber fix).
     in_world_since: Option<std::time::Instant>,
@@ -293,6 +301,8 @@ impl shared::Core for Core {
             start_flags_done: false,
             start_items_granted: false,
             start_items_ok: HashSet::new(),
+            unique_grants_ok: HashSet::new(),
+            unique_grants_done: false,
             in_world_since: None,
             scout: None,
             goal: None,
@@ -535,6 +545,16 @@ impl shared::Core for Core {
                     crate::flagpoll::parse_sweep_flags(sd),
                 );
                 let start = crate::startgrants::parse(sd);
+                if start.unique_start_grants.is_empty() {
+                    log::info!("unique start grants: inert (no uniqueStartGrants in slot_data)");
+                } else {
+                    log::info!(
+                        "unique start grants armed with {} entr{}: {:?} (goods, obtained-flag)",
+                        start.unique_start_grants.len(),
+                        if start.unique_start_grants.len() == 1 { "y" } else { "ies" },
+                        start.unique_start_grants
+                    );
+                }
 
                 // Shop system (SHOP-SYSTEM-HANDOFF.md §3): configure from slot_data, build the scout.
                 // KEY-TABLE MIGRATION (locationIdsToKeys): token 1 of a matt slot key is the
@@ -1151,6 +1171,72 @@ impl shared::Core for Core {
                     }
                     if all_ok {
                         did_items = true;
+                    }
+                }
+                // UNIQUE start grants (slot_data `uniqueStartGrants`, [[fullId, obtainedFlag]]):
+                // grant the goods ONLY if the obtained-flag is unset, then set the flag WITH the
+                // grant. The flag is the single source of truth for "has it" (the game itself
+                // tracks possession with it; keyitems.rs sets the same flag on a pool receive),
+                // so a re-run -- reload, reconnect, seed reset, late connect after the player
+                // already found the pool copy -- skips by construction. Decision is the pure
+                // er_logic::unique_grants::unique_grant_action (replay-tested); this block is glue.
+                //
+                // Runs REGARDLESS of reconciler ownership (unlike the plain drain above): the
+                // reconciler never sees these ids -- they are deliberately absent from startItems,
+                // so neither its unique_goods presence-diff nor its start-item ledger handles
+                // them -- and the flag latch makes re-entry safe anyway. Gated on the start FLAGS
+                // having landed (already_flags || did_flags): that proves the flag holder is up,
+                // so the paired try_set_event_flag after a successful grant cannot miss.
+                if !self.unique_grants_done
+                    && (already_flags || did_flags)
+                    && has_inv
+                    && start_items_settled
+                {
+                    let mut all_done = true;
+                    for (i, &(full_id, flag)) in sc.unique_start_grants.iter().enumerate() {
+                        if self.unique_grants_ok.contains(&i) {
+                            continue;
+                        }
+                        let goods = full_id & 0x0FFF_FFFF;
+                        if !er_logic::unique_grants::unique_grant_action(
+                            crate::flags::get_event_flag(flag),
+                        ) {
+                            log::info!(
+                                "unique grant: goods {goods} ({full_id:#x}) -- flag {flag} already set, SKIP \
+                                 (player already has it)"
+                            );
+                            self.unique_grants_ok.insert(i);
+                            continue;
+                        }
+                        if crate::detour::grant_full_id(full_id, 1) {
+                            if crate::flags::try_set_event_flag(flag, true) {
+                                log::info!(
+                                    "unique grant: goods {goods} ({full_id:#x}) granted + flag {flag} set"
+                                );
+                            } else {
+                                // Should be unreachable behind the already_flags gate (holder is
+                                // up). NOT retried this session -- a retry would re-grant the
+                                // goods; the unset flag makes the NEXT session re-grant instead.
+                                log::warn!(
+                                    "unique grant: goods {goods} granted but flag {flag} write FAILED -- \
+                                     possession latch missing; next session will re-grant \
+                                     (fail-loud, not retried this session)"
+                                );
+                            }
+                            self.unique_grants_ok.insert(i);
+                        } else {
+                            all_done = false;
+                            warn_unique_grant_fail_once(i, full_id);
+                        }
+                    }
+                    if all_done {
+                        self.unique_grants_done = true;
+                        if !sc.unique_start_grants.is_empty() {
+                            log::info!(
+                                "unique start grants settled ({} decided)",
+                                sc.unique_start_grants.len()
+                            );
+                        }
                     }
                 }
             }
@@ -2321,6 +2407,8 @@ impl Core {
         self.start_flags_done = false;
         self.start_items_granted = false;
         self.start_items_ok.clear();
+        self.unique_grants_ok.clear();
+        self.unique_grants_done = false;
         self.in_world_since = None;
         self.scout = None;
         self.goal = None;
@@ -2670,6 +2758,21 @@ fn warn_start_item_fail_once(idx: usize, full_id: i32) {
         log::warn!(
             "start item #{idx} ({full_id:#x}) failed to grant (inventory captured but AddItem \
              rejected) -- retrying each tick; if this persists the start grant is stuck"
+        );
+    }
+}
+
+static UNIQUE_GRANT_FAIL_LOGGED: std::sync::Mutex<Option<HashSet<usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Fail-loud (once per uniqueStartGrants index) when a unique grant does not land despite a
+/// captured inventory pointer. Mirrors [`warn_start_item_fail_once`]; the block retries the
+/// FAILED entry each tick, so without this a stuck grant is silent.
+fn warn_unique_grant_fail_once(idx: usize, full_id: i32) {
+    let mut guard = UNIQUE_GRANT_FAIL_LOGGED.lock().unwrap();
+    if guard.get_or_insert_with(HashSet::new).insert(idx) {
+        log::warn!(
+            "unique grant #{idx} ({full_id:#x}) failed to grant (inventory captured but AddItem              rejected) -- retrying each tick; if this persists the grant is stuck"
         );
     }
 }

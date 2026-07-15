@@ -34,8 +34,14 @@ pub const DLC_MAP_VIEW_UNLOCK: u32 = 82002;
 
 #[derive(Default)]
 pub struct StartConfig {
-    pub start_items: Vec<i32>,  // FullIDs (Torrent = 0x40000000 | 130, etc.)
+    pub start_items: Vec<i32>, // FullIDs (Torch etc.) -- REPEATED path, duplicate-harmless
     pub start_graces: Vec<u32>, // grace flags to set at start
+    /// `uniqueStartGrants`: (FullID, obtained-flag) pairs for flag-idempotent UNIQUE key items
+    /// (whistle 60100 / bell 60110 / physick 60020). The core.rs unique-grant block grants the
+    /// goods ONLY if the flag is unset (er_logic::unique_grants::unique_grant_action), then sets
+    /// the flag with the grant -- the flag is the single source of truth for "has it", so
+    /// reload / reconnect / pool-pickup can never double-grant.
+    pub unique_start_grants: Vec<(i32, u32)>,
     pub reveal_all_maps: bool,
     pub enable_dlc: bool,
 }
@@ -59,9 +65,27 @@ pub fn parse(sd: &Value) -> StartConfig {
             })
             .unwrap_or_default()
     };
+    // [[fullId, obtainedFlag], ...] (contract PairList). Malformed entries are dropped, and the
+    // count is logged at the call site ("armed with N") so a shape drift is visible, not silent.
+    let arr_pairs = |v: Option<&Value>| -> Vec<(i32, u32)> {
+        v.and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| {
+                        let p = p.as_array()?;
+                        if p.len() != 2 {
+                            return None;
+                        }
+                        Some((p[0].as_i64()? as i32, p[1].as_u64()? as u32))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     StartConfig {
         start_items: arr_i32(sd.get("startItems")),
         start_graces: arr_u32(sd.get("startGraces")),
+        unique_start_grants: arr_pairs(sd.get("uniqueStartGrants")),
         reveal_all_maps: sd
             .get("reveal_all_maps")
             .and_then(|v| v.as_bool())
