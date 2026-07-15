@@ -98,11 +98,17 @@ pub const SCALING_TIERS: &[ScalingTier] = &[
 /// Number of tiers in the ladder.
 pub const NUM_TIERS: usize = SCALING_TIERS.len();
 
-/// Enemy-tier CAP for DLC buckets (those present in `dlc_blessing_floors`). The DLC blessing FLOOR
-/// (upgrades.rs mode 2) restores the intended player-vs-enemy balance at the area's native tuning, so
-/// stacking the deep-sphere 70xx tier on top double-counts progression and re-creates the "insane"
-/// difficulty. Index 3 = `7040` (≈1.8× HP / 1.5× attack) keeps late-sphere DLC seeds from feeling
-/// flat without the double stack. (fable consult 2026-07-11.)
+/// Enemy-tier CAP for DLC buckets (those present in `dlc_blessing_floors`). Index 3 = `7040`
+/// (≈1.8× HP / 1.5× attack).
+///
+/// HISTORY: added 2026-07-11 believing the "insane DLC difficulty" was the deep-sphere tier
+/// double-counting the blessing floor. The REAL double-count was the clear-range bug (see
+/// `DLC_SCALING_ID_RANGE`): DLC enemies kept their un-cleared 7-14× vanilla scaling, and the cap only
+/// ever limited the *added* tier, never that baked multiplier -- which is why capping "didn't help".
+/// With the clear fixed, DLC enemies are normalized to sphere depth exactly like base game, so this
+/// cap is now mostly redundant and makes DLC slightly EASIER than base at deep spheres. Retained as a
+/// conservative safety for the first post-fix release; FLAGGED FOR REMOVAL pending playtest (fable
+/// consult 2026-07-15).
 pub const DLC_ENEMY_TIER_CAP: usize = 3;
 
 /// Vanilla enemy-scaling SpEffects live in this id range. Used to CLEAR an enemy's baked scaling
@@ -110,9 +116,25 @@ pub const DLC_ENEMY_TIER_CAP: usize = 3;
 /// `spCategory = 0` so they'd otherwise stack (double-scale).
 pub const SCALING_ID_RANGE: std::ops::Range<i32> = 7000..8000;
 
-/// Whether `param_id` is a (vanilla or ours) enemy-scaling SpEffect — the ones to clear before applying.
+/// The SAME scaling ladder, re-emitted in the DLC's `+20,000,000` param block. DLC enemies carry these
+/// as their innate, always-on region scaling — and they are FAR steeper than the base ladder
+/// (param-verified: `20007010` = 7.84x HP / 3.76x atk, `20007060` = 11.5x, `20007110` = 14.1x; the
+/// whole ladder `20007000..20007310` is `spCategory 0`, `effectEndurance -1`, `haveSoulRate 1`).
+///
+/// THE BUG (2026-07-15, fable consult): the clear used to be `SCALING_ID_RANGE` only, so it stripped
+/// base-game enemies' `70xx` (normalizing them to ~1.14x) but NEVER touched DLC enemies' `20007xxx`
+/// (outside 7000..8000). DLC enemies therefore kept full vanilla SotE scaling (7-14x HP) AND had the
+/// mod's sphere tier stacked on top, while every base-game enemy around them was normalized down --
+/// the entire "DLC scaling is still crazy even with everything we're doing" report. Clearing this
+/// range too puts DLC enemies on the same sphere curve as base game. Verified sufficient + no
+/// collateral: the only `20007xxx` rows DLC enemies carry are scaling rows; their non-scaling innate
+/// speffects live in the `5xxx`/`90xxx` blocks.
+pub const DLC_SCALING_ID_RANGE: std::ops::Range<i32> = 20007000..20008000;
+
+/// Whether `param_id` is a (base-game OR DLC, vanilla or ours) enemy-scaling SpEffect — the ones to
+/// clear off an enemy before applying our sphere tier, so vanilla region scaling never stacks with it.
 pub fn is_scaling_speffect(param_id: i32) -> bool {
-    SCALING_ID_RANGE.contains(&param_id)
+    SCALING_ID_RANGE.contains(&param_id) || DLC_SCALING_ID_RANGE.contains(&param_id)
 }
 
 /// Connect-time config, parsed from slot_data by the client (`regionSphereTargets` etc.).
@@ -183,6 +205,20 @@ pub fn blessing_floor_for_region(ranges: &[(i32, i32, i32)], region: i32) -> Opt
         .iter()
         .find(|&&(lo, hi, _)| (lo..=hi).contains(&region))
         .map(|&(_, _, floor)| floor)
+}
+
+/// The raw sphere target the config resolves for `region` (exact map first, then range scan), or
+/// `None` when the region is unmapped (client then falls back to the floor tier). Diagnostic-only --
+/// mirrors the lookup order in `tier_for_region` so a log line can show the target that drove the
+/// tier alongside the applied speffect. (observability: see scaling.rs emit, 2026-07-15.)
+pub fn raw_target_for_region(cfg: &ScalingConfig, region: i32) -> Option<i32> {
+    if let Some(&t) = cfg.region_targets.get(&region) {
+        return Some(t);
+    }
+    cfg.region_ranges
+        .iter()
+        .find(|&&(lo, hi, _)| (lo..=hi).contains(&region))
+        .map(|&(_, _, t)| t)
 }
 
 /// The `SpEffectParam` id to apply for a tier (clamped to the ladder).
@@ -315,6 +351,16 @@ mod tests {
     }
 
     #[test]
+    fn raw_target_lookup_prefers_exact_then_range() {
+        let mut c = cfg(&[(60000, 42)], 0);
+        c.region_ranges = vec![(62000, 62999, 7777)];
+        c.max_target = 7777;
+        assert_eq!(raw_target_for_region(&c, 60000), Some(42)); // exact map wins
+        assert_eq!(raw_target_for_region(&c, 62500), Some(7777)); // range fallback
+        assert_eq!(raw_target_for_region(&c, 99999), None); // unmapped -> client floors
+    }
+
+    #[test]
     fn dlc_buckets_cap_enemy_tier_but_never_below_floor() {
         // A deep DLC bucket would resolve to the TOP tier without the cap.
         let mut c = cfg(&[(6850, 100)], 0);
@@ -385,6 +431,21 @@ mod tests {
         assert!(is_scaling_speffect(7999));
         assert!(!is_scaling_speffect(6999));
         assert!(!is_scaling_speffect(8000));
+    }
+
+    #[test]
+    fn dlc_scaling_range_is_cleared_too() {
+        // The DLC +20,000,000 scaling ladder DLC enemies carry innately -- must be cleared like base
+        // 70xx, or DLC enemies keep 7-14x vanilla scaling under the mod's tier (the 2026-07-15 bug).
+        assert!(is_scaling_speffect(20007010)); // 7.84x HP
+        assert!(is_scaling_speffect(20007060)); // 11.5x HP
+        assert!(is_scaling_speffect(20007110)); // 14.1x HP
+        assert!(is_scaling_speffect(20007310)); // top of the observed DLC ladder
+        assert!(!is_scaling_speffect(20006999)); // just below the DLC block
+        assert!(!is_scaling_speffect(20008000)); // just above
+                                                 // The non-scaling innate speffects DLC enemies also carry are NOT in either range.
+        assert!(!is_scaling_speffect(5400));
+        assert!(!is_scaling_speffect(90000));
     }
 
     // --- tier_for_target ---
