@@ -1,4 +1,5 @@
-//! LuaWarp probe hook — capture the pending fast-travel TARGET at the moment of warp.
+//! LuaWarp hook -- capture the pending fast-travel TARGET at the moment of warp and push it
+//! into the capital-version reconciler. Confirmed in-game 2026-07-15 (see region.rs).
 //!
 //! THE SEAM (SPEC-capital-reconciler.md): `region::capital_pending_warp_target()` has no crate
 //! API for the engine's queued MENU fast-travel destination, so a map fast-travel only gets its
@@ -14,7 +15,7 @@
 //! `warp: requested grace warp` line (that one only comes from `warp_to_grace`) — proves menu
 //! warps route through LuaWarp and the seam is filled. A menu fast-travel that produces NO
 //! `LuaWarp hook:` line means menu warps take another path, and we pivot back to a poll-style
-//! seam (see the NEEDS CRATE API note on `capital_pending_warp_target`).
+//! seam that `capital_pending_warp_target` would otherwise poll (now permanently None; see region.rs).
 //!
 //! Install: from `core::update_live` (game thread, same timing as the AddItemFunc detour in
 //! detour.rs, whose structure this module copies). Degrade, don't crash: a prologue-signature
@@ -82,7 +83,7 @@ pub fn install() {
     }
     let _ = HOOK.set(hook);
     log::info!(
-        "LuaWarp probe hook installed @ {:#x} — every warp (menu or client) will log its target",
+        "LuaWarp hook installed @ {:#x} -- every warp (menu or client) logs its target and reconciles 9116",
         base + LUA_WARP_FUNC_RVA
     );
 }

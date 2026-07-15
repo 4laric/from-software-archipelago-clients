@@ -723,28 +723,17 @@ pub fn configure_capital(sd: &Value) {
     *CAPITAL.lock().unwrap() = cfg;
 }
 
-/// The pending GAME-MENU fast-travel destination (bonfire ENTITY id, the space
-/// `warp_to_grace` speaks) while a menu grace warp is resolving -- i.e. between the player
-/// confirming a destination on the map and the load completing -- or None when no menu warp
-/// is in flight.
+/// The pending GAME-MENU fast-travel destination (bonfire ENTITY id) while a menu grace warp
+/// is resolving, or None when no menu warp is in flight.
 ///
-/// // NEEDS CRATE API: the queued fast-travel destination the engine's own warp machinery was
-/// // handed -- CSLuaEventManager's queued warp arg or the GameMan equivalent -- read between
-/// // map-confirm and load, converted to the BONFIRE ENTITY id space (if the crate surfaces a
-/// // BonfireWarpParam ROW id instead, read that row's `bonfireEntityId`; the two spaces
-/// // differ: row 110500 vs entity 11051950). Return Some(entity_id) while a menu warp is
-/// // resolving, None otherwise.
-///
-/// Until the seam is filled this returns None and the reconciler self-degrades gracefully:
-/// the per-tick latch corrects a menu warp one tick AFTER the load instead of before it.
-/// Client-initiated warps (kick, random start, `!warp`) already get the full before-load
-/// intercept via `warp::warp_to_grace`.
-///
-/// SUPERSEDED-BY-HOOK (pending in-game confirm; see warp_hook.rs): the LuaWarp probe detour
-/// now pushes EVERY warp target straight into `capital_warp_intercept` at the moment of warp,
-/// menu-initiated included — if Alaric's log confirms menu fast-travel routes through LuaWarp,
-/// this poll-style seam never needs filling and stays permanently `None` (kept as the
-/// documented fallback surface should the hook be refused on a stale build).
+/// SUPERSEDED BY THE LuaWarp HOOK (warp_hook.rs) -- CONFIRMED in-game 2026-07-15. The hook
+/// detours the warp entry and pushes EVERY warp target straight into `capital_warp_intercept`
+/// at the moment of warp, menu-initiated included: two menu fast-travels logged
+/// `LuaWarp hook: warp arg ...` with no `warp: requested` companion, proving map fast-travel
+/// routes through the same LuaWarp the client calls. So this poll-style seam is never needed
+/// and stays permanently `None`. Kept (not deleted) so `tick_capital`'s intercept-then-latch
+/// chain reads cleanly and as a documented no-op fallback surface. The per-tick play_region
+/// latch remains the standing defense against anything flipping 9116 mid-session.
 pub fn capital_pending_warp_target() -> Option<u32> {
     None
 }
