@@ -115,16 +115,12 @@ pub fn warp_to_grace(grace_entity_id: u32) -> Result<(), &'static str> {
         f(rcx, rdx, arg);
     }
     log::info!("warp: requested grace warp to {grace_entity_id} (arg {arg})");
-    // Capital-version intercept (SPEC-capital-reconciler.md): decide 9116 from the TARGET
-    // before the load resolves. The warp is asynchronous, so writing here lands before the
-    // load screen; every client-initiated warp (kick, random start, `!warp`) gets it.
-    //
-    // NOTE (warp_hook.rs): once the LuaWarp probe detour is installed, the `f(...)` call above
-    // goes through the patched entry, so the hook ALSO runs this intercept — client warps then
-    // intercept twice. Harmless: reconcile_write only writes on mismatch. Once Alaric's in-game
-    // log confirms menu fast-travel routes through LuaWarp too (the probe's whole point), this
-    // explicit call is fully redundant and can be removed; until the hook is PROVEN to cover
-    // all warps it stays, as the belt to the hook's braces.
-    crate::region::capital_warp_intercept(grace_entity_id);
+    // Capital-version intercept: handled by the LuaWarp hook (warp_hook.rs), which fires INSIDE
+    // the `f(...)` call above (the patched entry) for EVERY warp -- menu fast-travel AND every
+    // client-initiated warp (kick, random start, `!warp`). Confirmed in-game 2026-07-15: two menu
+    // fast-travels logged `LuaWarp hook: warp arg ...` with no `warp: requested` companion, proving
+    // menu travel routes through LuaWarp. So no explicit intercept is needed here -- it would only
+    // double-fire (idempotent). If the hook fails to install (signature mismatch), `warp_fn` above
+    // also refuses, so this line would never be reached anyway; there is nothing to fall back to.
     Ok(())
 }
