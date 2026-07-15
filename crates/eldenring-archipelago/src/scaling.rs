@@ -68,12 +68,12 @@ pub fn configure(sd: &Value) {
 
 /// What drove the tier for a region this sweep -- captured while `CONFIG` is locked so the emit can
 /// explain the applied speffect (raw sphere target, normalization ceiling, resolved tier + its HP/atk
-/// rates, and whether the DLC blessing-floor cap clamped it). Diagnostic only.
+/// rates, and whether this is a DLC region -- a bucket with a blessing floor). Diagnostic only.
 struct RegionScaleDbg {
     tier: usize,
     raw_target: Option<i32>,
     max_target: i32,
-    dlc_capped: bool,
+    dlc_region: bool,
     hp: f32,
     attack: f32,
 }
@@ -132,7 +132,7 @@ pub fn tick() {
             tier,
             raw_target: raw_target_for_region(cfg, region),
             max_target: cfg.max_target,
-            dlc_capped: blessing_floor_for_region(&cfg.dlc_blessing_floors, region).is_some(),
+            dlc_region: blessing_floor_for_region(&cfg.dlc_blessing_floors, region).is_some(),
             hp: rates.hp,
             attack: rates.attack,
         };
@@ -209,7 +209,7 @@ pub fn tick() {
             tier,
             raw_target,
             max_target,
-            dlc_capped,
+            dlc_region,
             hp,
             attack,
         } = dbg;
@@ -219,7 +219,7 @@ pub fn tick() {
              (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x atk{}); \
              (re)scaled {scaled} enemy(ies)",
             NUM_TIERS - 1,
-            if dlc_capped { ", DLC-capped" } else { "" },
+            if dlc_region { ", DLC region" } else { "" },
         );
     }
 }
