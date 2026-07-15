@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use eldenring::cs::{ChrIns, ChrInsExt, WorldChrMan};
 use er_logic::scaling::{
-    ScalingConfig, is_scaling_speffect, speffect_id_for_tier, tier_for_region,
+    NUM_TIERS, ScalingConfig, blessing_floor_for_region, is_scaling_speffect,
+    raw_target_for_region, speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use fromsoftware_shared::FromStatic;
 use serde_json::Value;
@@ -65,6 +66,18 @@ pub fn configure(sd: &Value) {
     *CONFIG.lock().unwrap() = cfg;
 }
 
+/// What drove the tier for a region this sweep -- captured while `CONFIG` is locked so the emit can
+/// explain the applied speffect (raw sphere target, normalization ceiling, resolved tier + its HP/atk
+/// rates, and whether the DLC blessing-floor cap clamped it). Diagnostic only.
+struct RegionScaleDbg {
+    tier: usize,
+    raw_target: Option<i32>,
+    max_target: i32,
+    dlc_capped: bool,
+    hp: f32,
+    attack: f32,
+}
+
 /// Per-tick sweep (call from `update_live`, in-world). Throttled; no-op unless configured.
 pub fn tick() {
     {
@@ -104,12 +117,26 @@ pub fn tick() {
         _ => {}
     }
 
-    let target = {
+    // Resolve the tier once, and capture the inputs that drove it so the emit below can EXPLAIN the
+    // number instead of just printing it. (Before: the log showed only `-> speffect NNNN`, which
+    // couldn't distinguish "sphere resolved this tier" from "DLC cap clamped it" from "unmapped ->
+    // floor" -- the exact ambiguity the fable consult flagged, 2026-07-15.)
+    let (target, dbg) = {
         let guard = CONFIG.lock().unwrap();
         let Some(cfg) = guard.as_ref() else {
             return;
         };
-        speffect_id_for_tier(tier_for_region(cfg, region))
+        let tier = tier_for_region(cfg, region);
+        let rates = tier_rates(tier);
+        let dbg = RegionScaleDbg {
+            tier,
+            raw_target: raw_target_for_region(cfg, region),
+            max_target: cfg.max_target,
+            dlc_capped: blessing_floor_for_region(&cfg.dlc_blessing_floors, region).is_some(),
+            hp: rates.hp,
+            attack: rates.attack,
+        };
+        (speffect_id_for_tier(tier), dbg)
     };
 
     let mut scaled = 0u32;
@@ -178,8 +205,21 @@ pub fn tick() {
         }
     }
     if scaled > 0 {
+        let RegionScaleDbg {
+            tier,
+            raw_target,
+            max_target,
+            dlc_capped,
+            hp,
+            attack,
+        } = dbg;
+        let tgt = raw_target.map_or_else(|| "unmapped".to_string(), |t| t.to_string());
         log::info!(
-            "enemy-scaling: region {region} -> speffect {target}; (re)scaled {scaled} enemy(ies)"
+            "enemy-scaling: region {region} -> speffect {target} \
+             (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x atk{}); \
+             (re)scaled {scaled} enemy(ies)",
+            NUM_TIERS - 1,
+            if dlc_capped { ", DLC-capped" } else { "" },
         );
     }
 }
