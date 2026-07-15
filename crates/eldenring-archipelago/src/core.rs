@@ -353,6 +353,10 @@ impl shared::Core for Core {
                 Err(e) => log::warn!("AddItemFunc detour install deferred: {e}"),
             }
         }
+        // LuaWarp probe hook (warp_hook.rs; capital-reconciler menu-warp seam): self-guarded
+        // one-shot on the game thread — a signature mismatch degrades with one log line
+        // instead of erroring, so no install latch on Core is needed.
+        crate::warp_hook::install();
 
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them.
         let checks = crate::detour::take_pending_checks();

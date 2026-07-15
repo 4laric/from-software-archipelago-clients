@@ -739,6 +739,12 @@ pub fn configure_capital(sd: &Value) {
 /// the per-tick latch corrects a menu warp one tick AFTER the load instead of before it.
 /// Client-initiated warps (kick, random start, `!warp`) already get the full before-load
 /// intercept via `warp::warp_to_grace`.
+///
+/// SUPERSEDED-BY-HOOK (pending in-game confirm; see warp_hook.rs): the LuaWarp probe detour
+/// now pushes EVERY warp target straight into `capital_warp_intercept` at the moment of warp,
+/// menu-initiated included — if Alaric's log confirms menu fast-travel routes through LuaWarp,
+/// this poll-style seam never needs filling and stays permanently `None` (kept as the
+/// documented fallback surface should the hook be refused on a stale build).
 pub fn capital_pending_warp_target() -> Option<u32> {
     None
 }

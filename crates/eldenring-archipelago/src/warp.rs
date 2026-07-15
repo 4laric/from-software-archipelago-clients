@@ -22,7 +22,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// `LuaWarp` entry, 2.6.2.0. Re-resolve via the module AOB above on a game update.
-const LUA_WARP_FUNC_RVA: usize = 0x0059_9C10;
+pub(crate) const LUA_WARP_FUNC_RVA: usize = 0x0059_9C10;
 /// First 16 bytes at the entry (standard prologue), read from the pinned exe. A mismatch means
 /// the RVA is stale for the running build — refuse to call.
 const LUA_WARP_FUNC_SIG: &[u8] = &[
@@ -32,16 +32,16 @@ const LUA_WARP_FUNC_SIG: &[u8] = &[
 const CSLEM_CANDIDATE_RVAS: [usize; 2] = [0x03D6_7E48, 0x03D5_AFE0];
 
 /// The CE dropdown ids are grace ENTITY ids; the warp arg is that id minus 1000.
-const GRACE_TO_WARP_ARG_DELTA: u32 = 1000;
+pub(crate) const GRACE_TO_WARP_ARG_DELTA: u32 = 1000;
 
 /// Windows-x64: rcx, rdx, r8 — matches the CE script's register setup. r8 is set from a 32-bit
 /// value (`lea r8d, [eax-3E8]`), so a `u32` third arg is exactly right.
-type LuaWarpFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u32) -> u64;
+pub(crate) type LuaWarpFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u32) -> u64;
 
 /// One-time confirm log guard: 0 = unprobed, 1 = probed (result may still be per-call).
 static PROBE_LOGGED: AtomicUsize = AtomicUsize::new(0);
 
-fn current_module_base() -> Option<usize> {
+pub(crate) fn current_module_base() -> Option<usize> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     let hmodule = unsafe { GetModuleHandleW(None) }.ok()?;
     Some(hmodule.0 as usize)
@@ -76,8 +76,16 @@ fn resolve_lua_event_manager(base: usize) -> Option<(*mut c_void, *mut c_void)> 
     None
 }
 
-fn warp_fn(base: usize) -> Option<LuaWarpFn> {
+pub(crate) fn warp_fn(base: usize) -> Option<LuaWarpFn> {
     let addr = base + LUA_WARP_FUNC_RVA;
+    // Once warp_hook's LuaWarp detour is installed, retour has PATCHED the prologue (a jmp to
+    // the detour), so the raw byte check below would false-negative and break every client
+    // warp. The hook only installs after verifying this same signature, so the address is
+    // known-good; calling the patched entry still warps (detour -> trampoline -> original).
+    if crate::warp_hook::installed() {
+        // SAFETY: signature was verified by warp_hook::install before it patched the entry.
+        return Some(unsafe { std::mem::transmute::<usize, LuaWarpFn>(addr) });
+    }
     // SAFETY: reads LUA_WARP_FUNC_SIG.len() bytes inside the loaded image.
     let actual = unsafe { std::slice::from_raw_parts(addr as *const u8, LUA_WARP_FUNC_SIG.len()) };
     if actual != LUA_WARP_FUNC_SIG {
@@ -110,6 +118,13 @@ pub fn warp_to_grace(grace_entity_id: u32) -> Result<(), &'static str> {
     // Capital-version intercept (SPEC-capital-reconciler.md): decide 9116 from the TARGET
     // before the load resolves. The warp is asynchronous, so writing here lands before the
     // load screen; every client-initiated warp (kick, random start, `!warp`) gets it.
+    //
+    // NOTE (warp_hook.rs): once the LuaWarp probe detour is installed, the `f(...)` call above
+    // goes through the patched entry, so the hook ALSO runs this intercept — client warps then
+    // intercept twice. Harmless: reconcile_write only writes on mismatch. Once Alaric's in-game
+    // log confirms menu fast-travel routes through LuaWarp too (the probe's whole point), this
+    // explicit call is fully redundant and can be removed; until the hook is PROVEN to cover
+    // all warps it stays, as the belt to the hook's braces.
     crate::region::capital_warp_intercept(grace_entity_id);
     Ok(())
 }
