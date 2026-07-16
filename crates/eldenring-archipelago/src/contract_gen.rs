@@ -14,6 +14,7 @@ pub enum Shape {
     NestedGrants,
     Number,
     OptionsDict,
+    PairList,
     ScalarIntMap,
     Str,
     StrList,
@@ -50,6 +51,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "startRegion", shape: Shape::Str, required: true, greenfield: true },
     ContractKey { name: "startGraces", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "startItems", shape: Shape::IntList, required: false, greenfield: true },
+    ContractKey { name: "uniqueStartGrants", shape: Shape::PairList, required: false, greenfield: true },
     ContractKey { name: "reveal_all_maps", shape: Shape::Bool, required: false, greenfield: true },
     ContractKey { name: "progressionSurfaceLocations", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "goalLocations", shape: Shape::IntList, required: true, greenfield: true },
@@ -123,6 +125,9 @@ fn shape_ok(shape: Shape, v: &Value) -> bool {
         Shape::TripleList => v.as_array().is_some_and(|a| {
             a.iter().all(|t| t.as_array().is_some_and(|t| t.len() == 3 && t.iter().all(is_int)))
         }),
+        Shape::PairList => v.as_array().is_some_and(|a| {
+            a.iter().all(|t| t.as_array().is_some_and(|t| t.len() == 2 && t.iter().all(is_int)))
+        }),
         Shape::IntList => v.as_array().is_some_and(|a| a.iter().all(is_int)),
         Shape::StrList => v.as_array().is_some_and(|a| a.iter().all(|x| x.is_string())),
         Shape::Bool => v.is_boolean(),
@@ -178,6 +183,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "ebcac2cc";
+pub const CONTRACT_HASH: &str = "03c58b40";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.2.0";
 

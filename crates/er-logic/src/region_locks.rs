@@ -60,13 +60,13 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Cerulean",
         lock_item: "Cerulean Lock",
         open_flag: Some(76831),
-        play_regions: &[68300, 68400],
+        play_regions: &[68300],
     },
     BakedRegionLock {
         region: "Charo's",
         lock_item: "Charo's Lock",
         open_flag: Some(76841),
-        play_regions: &[41020],
+        play_regions: &[41020, 68400],
     },
     BakedRegionLock {
         region: "Deeproot Depths",
@@ -96,7 +96,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Gravesite",
         lock_item: "Gravesite Lock",
         open_flag: Some(76800),
-        play_regions: &[40000, 41000, 42000, 43000, 43010, 68000, 68100, 69010],
+        play_regions: &[40000, 41000, 42000, 43000, 43010, 68000, 68100],
     },
     BakedRegionLock {
         region: "Haligtree",
@@ -108,7 +108,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Jagged Peak",
         lock_item: "Jagged Peak Lock",
         open_flag: Some(76840),
-        play_regions: &[68500],
+        play_regions: &[68410, 68500],
     },
     BakedRegionLock {
         region: "Leyndell",
@@ -150,7 +150,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Rauh Base",
         lock_item: "Rauh Base Lock",
         open_flag: Some(76912),
-        play_regions: &[40010, 42030],
+        play_regions: &[40010, 42030, 69010],
     },
     BakedRegionLock {
         region: "Raya Lucaria Academy",
