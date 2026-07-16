@@ -11,16 +11,34 @@ use eldenring::cs::{CSTaskGroupIndex, CSTaskImp, WorldChrMan};
 use eldenring::fd4::FD4TaskData;
 use fromsoftware_shared::{FromStatic, SharedTaskImpExt};
 
-/// One-line build identity for the connect banner: `<pkg-version> (<sha> @ <build-time>)`.
-/// SHA + build time are stamped into the env by `build.rs`.
+/// One-line build identity for the connect banner:
+/// `<pkg-version> (<sha>[-dirty], <branch> @ <build-time UTC>)`.
+/// SHA, branch and build time are stamped into the env by `build.rs`.
 pub const CLIENT_BUILD: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
     env!("ER_GIT_SHA"),
+    ", ",
+    env!("ER_GIT_BRANCH"),
     " @ ",
     env!("ER_BUILD_TIME"),
     ")"
 );
+
+/// THE build-stamp line (logged once at startup, echoed by `!version`). Settles "is my running DLL
+/// current?" in one glance: compare the sha to `git log --oneline -1` of the tree you think you
+/// built (a `-dirty` suffix means uncommitted changes were compiled in), and the UTC timestamp to
+/// when you built it. Carries the data-contract hash this binary was COMPILED against, so the one
+/// line ties code version AND contract version to the log that follows.
+pub fn build_line() -> String {
+    format!(
+        "eldenring-archipelago build: {} ({}, {}) | contract {}",
+        env!("ER_GIT_SHA"),
+        env!("ER_GIT_BRANCH"),
+        env!("ER_BUILD_TIME"),
+        crate::contract_gen::CONTRACT_HASH
+    )
+}
 
 pub struct EldenRing;
 

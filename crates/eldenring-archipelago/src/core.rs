@@ -261,9 +261,13 @@ impl shared::Core for Core {
                 }
                 true
             }
+            "!version" => {
+                self.log(ap::Print::message(crate::game::build_line()));
+                true
+            }
             "!help" => {
                 self.log(ap::Print::message(
-                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring>"
+                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring> | !version"
                         .to_string(),
                 ));
                 true
@@ -273,6 +277,9 @@ impl shared::Core for Core {
     }
 
     fn new() -> Result<Self> {
+        // BUILD STAMP -- the first ER-AP line of every session log, BEFORE any connect can happen,
+        // so "which DLL produced this log?" is never ambiguous again (see game::build_line).
+        log::info!("{}", crate::game::build_line());
         Ok(Self {
             base: CoreBase::new("Elden Ring")?,
             detour_installed: false,

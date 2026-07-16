@@ -27,6 +27,12 @@ fn main() {
     let sha = if dirty { format!("{sha}-dirty") } else { sha };
     println!("cargo:rustc-env=ER_GIT_SHA={sha}");
 
+    // Branch name, so a log can also say WHICH line of work the DLL came from ("main" vs an agent
+    // branch). Detached HEAD reports as "HEAD" -- still honest; "unknown" only when git is absent.
+    let branch =
+        git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=ER_GIT_BRANCH={branch}");
+
     let build_time = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     println!("cargo:rustc-env=ER_BUILD_TIME={build_time}");
 }
