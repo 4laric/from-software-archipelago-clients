@@ -464,7 +464,7 @@ pub fn set_inputs(inputs: DesiredInputs) {
 ///
 /// INTEGRATION: replace the scattered `drain_start_items` / `flush_grace_flags` /
 /// `open_on_received_name` / great-rune restore / map-reveal calls in `update_live` with this ONE
-/// call, per the strangler phases in `MIGRATION.md`.
+/// call, per the strangler phases in `docs/history/MIGRATION.md` (archived; cutover complete).
 pub fn tick() {
     if !DIRTY.load(Ordering::Relaxed) {
         return;
@@ -543,5 +543,6 @@ pub fn tick() {
 //   //    great-rune restore goods, the flask/rune/stone FullIDs).
 //
 // The old per-feature idempotency bools (start_items_granted, notify_granted, session grace sets,
-// region bloom latch, great-rune restore set) are then DELETED one class at a time — see MIGRATION.md.
+// region bloom latch, great-rune restore set) are then DELETED one class at a time — see
+// docs/history/MIGRATION.md (archived; cutover complete).
 // ---------------------------------------------------------------------------------------------

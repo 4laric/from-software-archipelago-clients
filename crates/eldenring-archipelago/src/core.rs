@@ -2221,7 +2221,7 @@ impl Core {
     // keyitems obtained/restored table) so the reconciler's plan can be validated against today's
     // behavior in the dry run.
     //
-    // SCOPE / ASSUMPTIONS (documented in MIGRATION.md):
+    // SCOPE / ASSUMPTIONS (documented in docs/history/MIGRATION.md, archived):
     //   * Maps the RECEIVED-ITEM STREAM *and* (Gap 1) the slot-data BULK grants: start graces, the
     //     unconditional + reveal_all_maps world-map flags, start items (ledgered once), and the goal.
     //     They are folded from the SAME tables the old startgrants/goal handlers use.
