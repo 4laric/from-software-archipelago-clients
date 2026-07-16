@@ -33,7 +33,20 @@ pub enum GateAction {
 /// `field_on`   -- is that flag actually set?
 /// `known_good` -- a flag we have previously OBSERVED to be on (0 = none yet).
 pub fn gate_action(field: i32, field_on: bool, known_good: u32) -> GateAction {
-    if field > 0 && field_on {
+    // `field <= 0` is NOT a gate to open, so there is nothing for us to do -- Wait.
+    //  * `0` is the "no gate flag" sentinel: vanilla ALREADY allows travel here (confirmed in-game
+    //    2026-07-16 -- fast travel out of caves works while the field reads 0). It is also what the
+    //    field reads mid death/respawn transition.
+    //  * a negative field is a not-placed sentinel (load screen).
+    // The old code fell through to RedirectField whenever `known_good > 0`, so in every gate-less
+    // area it OVERWROTE FieldArea::enable_fast_travel_event_flag every tick -- harmless across the
+    // stable overworld, but during the death->respawn transition (field 0) that is a write into
+    // engine map state as the map tears down and rebuilds: the standing CTD suspect (base-game
+    // death at a boss, 2026-07-16). There is nothing to redirect when there is no gate.
+    if field <= 0 {
+        return GateAction::Wait;
+    }
+    if field_on {
         return GateAction::AllowAndCache(field as u32);
     }
     if known_good > 0 {

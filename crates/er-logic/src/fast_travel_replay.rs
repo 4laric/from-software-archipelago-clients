@@ -146,3 +146,24 @@ fn gate_action_is_total() {
         "a negative field is not a flag"
     );
 }
+
+/// field == 0 (no gate: vanilla already allows travel, e.g. out of a cave) must NEVER redirect,
+/// even with a known-good flag cached. The old code fell through to RedirectField and overwrote
+/// FieldArea every tick in every gate-less area; during the death->respawn transition (field also
+/// reads 0) that write into engine map state is the standing CTD suspect. There is no gate to open.
+#[test]
+fn field_zero_never_redirects_even_with_a_cached_flag() {
+    assert_eq!(
+        gate_action(0, false, START_GRACE),
+        GateAction::Wait,
+        "no gate flag => vanilla already allows travel; we must not write the field"
+    );
+
+    // And as a timeline: primed known-good, then a field-0 tick (overworld / death transition).
+    // The field must be left untouched -- no overwrite into a tearing-down map.
+    let mut s = Sim::default();
+    s.known_good = prime_known_good(&[START_GRACE]).unwrap();
+    s.tick(0, false, Policy::NeverSet);
+    assert_eq!(s.field, 0, "field 0 left as-is: the gate wrote nothing");
+    assert!(s.flags_written.is_empty());
+}

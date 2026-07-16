@@ -108,7 +108,11 @@ pub fn tick() {
             }
         }
         er_logic::fast_travel::GateAction::Wait => {
-            if log_this {
+            // field <= 0 is NOT a block -- it is a gate-less area (vanilla already allows travel) or
+            // a load/death-respawn transition. Say nothing: this is the normal state across most of
+            // the map, and logging it once per field-change buried the real signal (810 lines last
+            // run). Only field > 0 with nothing cached is a genuine "waiting in a boss dungeon".
+            if log_this && field > 0 {
                 log::info!(
                     "fast-travel: gate blocked (field {field}) and no known-good flag observed yet -- WAITING. \
                      We will not set the field's flag: in a boss dungeon that flag is the boss's defeat \
