@@ -2212,28 +2212,26 @@ impl shared::Core for Core {
                 }
             }
             let inputs = self.build_desired_inputs(&recv);
+            // Defer reconciler init to the first STABLE IN-WORLD tick: `reconcile_io::init` reads the
+            // ER save_slot + play_time to key the per-character watermark (er-startitems-newchar-no-
+            // regrant), and those are only valid once a character is loaded. The reconciler is inert
+            // before world-stability anyway, so nothing is lost by waiting; received items accumulate
+            // in `recv` (rebuilt each tick) and are applied in full once init runs.
+            let world_loaded = crate::detour::has_inventory() && crate::flags::in_world();
             if !self.reconcile_inited {
-                let path = self
-                    .save_path
-                    .as_ref()
-                    .and_then(|p| p.parent().map(|d| d.join("reconcile.json")))
-                    .unwrap_or_else(|| std::path::PathBuf::from("reconcile.json"));
-                // `received_through` (this save's persisted `last_received_index`, loaded in 2b
-                // before this block runs) cross-checks the slot-name-keyed reconcile.json watermark
-                // inside init: a stale positive entry from another character/seed must not strand
-                // this save's received stream (er-reconciler-received-grant-regression).
-                //
-                // `fresh_character` re-owes the NEGATIVE start-item band when this is a brand-new
-                // character on a slot whose PRIOR character already granted its start items (the
-                // slot-keyed watermark is otherwise trusted unconditionally at init, stranding the new
-                // character's flasks/torch/pots -- Alaric playtest 2026-07-17). This MUST be a live,
-                // per-character signal (never a slot-keyed persisted value), or a same-character
-                // tutorial-death reload would re-grant and double the flasks. TODO(alaric): wire the
-                // agreed live signal here; `false` is the safe no-regression default until then (the
-                // seeded() re-arm + its regression replays already land in er-logic).
-                let fresh_character = false;
-                crate::reconcile_io::init(inputs, path, self.received_through as i64, fresh_character);
-                self.reconcile_inited = true;
+                if world_loaded {
+                    let path = self
+                        .save_path
+                        .as_ref()
+                        .and_then(|p| p.parent().map(|d| d.join("reconcile.json")))
+                        .unwrap_or_else(|| std::path::PathBuf::from("reconcile.json"));
+                    // `received_through` (this save's persisted `last_received_index`) is passed to
+                    // init for the positive-frontier cross-check; the per-character keying inside init
+                    // decides fresh-vs-resume (see reconcile_io::init / er_logic::reconcile::seed_trust).
+                    crate::reconcile_io::init(inputs, path, self.received_through as i64);
+                    self.reconcile_inited = true;
+                }
+                // else: world not loaded yet -- wait; recv keeps accumulating for the eventual init.
             } else {
                 crate::reconcile_io::set_inputs(inputs);
             }

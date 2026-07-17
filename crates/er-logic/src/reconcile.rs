@@ -55,6 +55,52 @@ pub type ItemIndex = i64;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SaveIdentity(pub String);
 
+/// A per-character persisted reconcile entry: the ledger watermark plus the ER character's play-time
+/// (`GameDataMan.play_time`, ms) at write. The watermark file is keyed by `(AP slot name, ER
+/// save-slot index)`, but the 0-9 save-slot index alone can't tell a character apart from a
+/// delete-and-recreate in the SAME slot -- so we stamp the character's play-time, which is MONOTONIC
+/// per character (resets to 0 on a new game). A live play-time that has REWOUND below the stamp
+/// proves the stamp belongs to a different (deleted) character, or to a restored pre-grant backup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharLedger {
+    pub watermark: ItemIndex,
+    pub play_time_ms: u32,
+}
+
+/// Decide, at the first stable in-world tick (when `save_slot` + `play_time` are readable), whether a
+/// persisted per-character entry may be TRUSTED, and hand back the `(fresh_character, persisted)` pair
+/// for [`Reconciler::seeded`]. This is the pure home for the fix to er-startitems-newchar-no-regrant:
+/// start-item goods are ledgered once per save, but the old store was keyed by AP SLOT NAME only, so a
+/// NEW ER character on a slot whose PRIOR character granted them inherited the watermark and never got
+/// its own flasks/torch/pots.
+///
+///   * no entry for this `(slot, save_slot)` -> **fresh**: this character has been granted nothing;
+///     [`Reconciler::seeded`] with `fresh_character=true` owes everything from the ledger floor.
+///   * entry present but live `play_time` REWOUND below the stamp -> **fresh**: a delete+recreate in
+///     the same slot (or a restored pre-grant backup) -- the stamp can't be this character's.
+///   * entry present and live `play_time >= stamp` -> **trust**: same character, resume from its
+///     watermark (never re-grants -- the flask-double-grant guard, [`crate::flask_grant_replay`]).
+pub fn seed_trust(entry: Option<CharLedger>, live_play_time_ms: u32) -> (bool, Option<ItemIndex>) {
+    match entry {
+        Some(e) if live_play_time_ms >= e.play_time_ms => (false, Some(e.watermark)),
+        // rewound stamp OR no entry -> a character this ledger was never written for.
+        Some(_) | None => (true, None),
+    }
+}
+
+/// One-time migration of a LEGACY slot-keyed watermark (the pre-fix `reconcile.json` stored a bare
+/// `slot -> watermark` with no play-time). Adopt it for the character live RIGHT NOW: stamp it with
+/// the current `play_time` so it reads as ESTABLISHED (no re-grant) and future writes carry the
+/// composite key. The glue calls this ONCE, for the first in-world character after upgrade, then
+/// drops the legacy entry. A brand-new character (different `save_slot`) has no legacy entry to adopt
+/// and stays fresh.
+pub fn legacy_adopt(legacy_watermark: ItemIndex, live_play_time_ms: u32) -> CharLedger {
+    CharLedger {
+        watermark: legacy_watermark,
+        play_time_ms: live_play_time_ms,
+    }
+}
+
 /// What one received AP item MEANS to the client. Precomputed by the client from slot_data (which
 /// knows the ER FullID / flag mapping of each AP item id) so this module needs no item database.
 ///
@@ -2563,6 +2609,53 @@ mod tests {
             0,
             "an established-character reload trusts the watermark -- no start-item double-grant"
         );
+    }
+
+    // ---- seed_trust: the per-character trust decision feeding seeded() (er-startitems-newchar) ----
+
+    #[test]
+    fn seed_trust_no_entry_is_fresh() {
+        // A brand-new character on a slot with no per-character entry: fresh, nothing persisted.
+        assert_eq!(seed_trust(None, 0), (true, None));
+        assert_eq!(seed_trust(None, 123_456), (true, None));
+    }
+
+    #[test]
+    fn seed_trust_same_character_resumes() {
+        // Live play_time at or beyond the stamp = same character continuing: trust + resume.
+        let e = CharLedger {
+            watermark: START_ITEM_INDEX_BASE + 5,
+            play_time_ms: 100_000,
+        };
+        assert_eq!(seed_trust(Some(e), 100_000), (false, Some(e.watermark))); // == stamp: trusted
+        assert_eq!(seed_trust(Some(e), 250_000), (false, Some(e.watermark))); // advanced: trusted
+    }
+
+    #[test]
+    fn seed_trust_rewound_play_time_is_fresh() {
+        // Live play_time BELOW the stamp = a different character reusing this save slot (or a
+        // restored pre-grant backup): distrust the stamp, re-owe from the floor.
+        let e = CharLedger {
+            watermark: START_ITEM_INDEX_BASE + 5,
+            play_time_ms: 100_000,
+        };
+        assert_eq!(seed_trust(Some(e), 0), (true, None)); // brand-new char in the slot
+        assert_eq!(seed_trust(Some(e), 99_999), (true, None)); // one tick short: still distrusted
+    }
+
+    #[test]
+    fn legacy_adopt_stamps_the_current_character_as_established() {
+        // A pre-fix bare watermark, adopted for the live character: stamped with live play_time so
+        // seed_trust immediately reads it as established (no re-grant), and it now carries a stamp.
+        let live = 42_000;
+        let adopted = legacy_adopt(START_ITEM_INDEX_BASE + 3, live);
+        assert_eq!(adopted.play_time_ms, live);
+        assert_eq!(
+            seed_trust(Some(adopted), live),
+            (false, Some(START_ITEM_INDEX_BASE + 3))
+        );
+        // and a later session of that same character still trusts it
+        assert!(!seed_trust(Some(adopted), live + 10_000).0);
     }
 
     #[test]

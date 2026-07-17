@@ -31,6 +31,7 @@ imgui = { version = "0.12", features = ["docking", "tables-api"] }
 log.workspace = true
 shared.workspace = true
 windows.workspace = true
+serde = { version = "1", features = ["derive"] }   # derive for the per-character WatermarkStore file
 serde_json = "1"
 retour = "0.3"   # stable GenericDetour for the AddItemFunc pickup hook (same as the standalone client)
 oneshot = { version = "0.2.1", features = ["std"] }   # scout_proof: archipelago_rs hands back a oneshot::Receiver from scout_locations (VERIFY shape on 3.0.1)

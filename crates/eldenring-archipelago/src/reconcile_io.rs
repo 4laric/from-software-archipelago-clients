@@ -26,8 +26,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use er_logic::reconcile::{
-    ApplyClasses, DesiredInputs, GameIo, Reconciler, SaveIdentity, TickBudget, WorldStability,
+    ApplyClasses, CharLedger, DesiredInputs, GameIo, Reconciler, TickBudget, WorldStability,
+    legacy_adopt, seed_trust,
 };
+use serde::{Deserialize, Serialize};
 
 /// SENTINEL flag id used for the folded-in goal-send (Gap 1). `core::build_desired_inputs` sets
 /// `SlotData.goal_flag = Some(GOAL_SENTINEL_FLAG)` and `goal_met` from the live goal predicate, so the
@@ -200,35 +202,102 @@ impl GameIo for LiveGame {
 // Per-save watermark persistence (file next to the client)
 // ---------------------------------------------------------------------------------------------
 
-/// A tiny JSON map `SaveIdentity -> applied_watermark`, persisted so the consumable ledger survives a
-/// reconnect / reload (the flask-double-grant fix depends on this). Written next to the client dll.
+/// The live ER save-slot index (0-9), or `None` if `GameMan` isn't up (menu / load). Same singleton
+/// pattern as `inventory_has_goods`.
+fn read_save_slot() -> Option<i32> {
+    use eldenring::cs::GameMan;
+    use fromsoftware_shared::FromStatic;
+    unsafe { GameMan::instance() }.ok().map(|gm| gm.save_slot)
+}
+
+/// The live character's play-time in ms (`GameDataMan.play_time`), or `None` if `GameDataMan` isn't
+/// up. Monotonic per character; resets to 0 on a new game.
+fn read_play_time_ms() -> Option<u32> {
+    use eldenring::cs::GameDataMan;
+    use fromsoftware_shared::FromStatic;
+    unsafe { GameDataMan::instance() }.ok().map(|g| g.play_time)
+}
+
+/// On-disk mirror of `CharLedger` (er-logic has no serde dep; convert at the boundary).
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct StoredLedger {
+    watermark: i64,
+    play_time_ms: u32,
+}
+
+/// The reconcile.json contents. `entries` are keyed per CHARACTER (`<slot>\u{1f}<save_slot>`) and
+/// carry a play-time stamp; `legacy` holds the pre-fix bare `<slot> -> watermark` entries for one-time
+/// migration (er-startitems-newchar-no-regrant).
+#[derive(Serialize, Deserialize, Default)]
+struct StoreFile {
+    #[serde(default)]
+    entries: BTreeMap<String, StoredLedger>,
+    #[serde(default)]
+    legacy: BTreeMap<String, i64>,
+}
+
+/// Per-CHARACTER ledger-watermark persistence (was keyed by AP slot name only, which let a new ER
+/// character on a slot inherit the prior character's watermark and never get its start items). Written
+/// next to the client dll.
 pub struct WatermarkStore {
     path: std::path::PathBuf,
-    map: BTreeMap<String, i64>,
+    file: StoreFile,
 }
 
 impl WatermarkStore {
-    /// Load (or start empty) from `path`. A missing / malformed file is treated as empty (never
-    /// panics — the same tolerance `save_state::from_json` uses).
+    /// Load (or start empty) from `path`. A missing/malformed file is empty; a pre-fix bare
+    /// `{slot: watermark}` file is read into `legacy` for migration. Never panics.
     pub fn load(path: std::path::PathBuf) -> Self {
-        let map = std::fs::read_to_string(&path)
+        let file = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|t| serde_json::from_str::<BTreeMap<String, i64>>(&t).ok())
+            .and_then(|t| {
+                serde_json::from_str::<StoreFile>(&t).ok().or_else(|| {
+                    // pre-fix format: a bare `{slot: watermark}` map -> park it as legacy.
+                    serde_json::from_str::<BTreeMap<String, i64>>(&t)
+                        .ok()
+                        .map(|legacy| StoreFile {
+                            entries: BTreeMap::new(),
+                            legacy,
+                        })
+                })
+            })
             .unwrap_or_default();
-        WatermarkStore { path, map }
+        WatermarkStore { path, file }
     }
 
-    /// The persisted watermark for this save, or `None` if this save has NEVER been reconciled
-    /// (first cutover). `init` seeds a fresh-or-existing default in that case instead of the
-    /// misleading `0`, which stranded the negative-band start items and re-owed the whole stream.
-    pub fn get_opt(&self, save: &SaveIdentity) -> Option<i64> {
-        self.map.get(&save.0).copied()
+    /// Composite per-character key: AP slot name + the ER save-slot index (unit-separated).
+    fn key(slot: &str, save_slot: i32) -> String {
+        format!("{slot}\u{1f}{save_slot}")
     }
 
-    pub fn set(&mut self, save: &SaveIdentity, watermark: i64) {
-        self.map.insert(save.0.clone(), watermark);
+    /// The persisted entry for this character, or `None` if it has never been reconciled.
+    pub fn get(&self, slot: &str, save_slot: i32) -> Option<CharLedger> {
+        self.file
+            .entries
+            .get(&Self::key(slot, save_slot))
+            .map(|s| CharLedger {
+                watermark: s.watermark,
+                play_time_ms: s.play_time_ms,
+            })
+    }
+
+    /// TAKE this slot's pre-fix (slot-keyed, play-time-less) watermark for one-time migration: the
+    /// caller adopts it for the live character via `legacy_adopt` and it is removed so no other
+    /// character can inherit it.
+    pub fn legacy_take(&mut self, slot: &str) -> Option<i64> {
+        self.file.legacy.remove(slot)
+    }
+
+    pub fn set(&mut self, slot: &str, save_slot: i32, entry: CharLedger) {
+        self.file.entries.insert(
+            Self::key(slot, save_slot),
+            StoredLedger {
+                watermark: entry.watermark,
+                play_time_ms: entry.play_time_ms,
+            },
+        );
         // Best-effort write-through; a failure just means we re-grant-check next boot (idempotent).
-        if let Ok(t) = serde_json::to_string(&self.map) {
+        if let Ok(t) = serde_json::to_string(&self.file) {
             let _ = std::fs::write(&self.path, t);
         }
     }
@@ -249,7 +318,10 @@ struct Driver {
     reconciler: Reconciler,
     io: LiveGame,
     store: WatermarkStore,
-    save: SaveIdentity,
+    /// AP slot name (the `SaveIdentity`) + the ER save-slot index: together the per-character
+    /// watermark key. `save_slot < 0` means it was unreadable at init (never persisted under it).
+    slot: String,
+    save_slot: i32,
 }
 
 /// EVENT NUDGE — call from the net loop / connect / load handlers instead of doing the grant inline.
@@ -395,17 +467,13 @@ fn apply_classes() -> ApplyClasses {
     }
 }
 
-/// Initialize the driver once, after slot_data is parsed. `persist_path` is the watermark file next
-/// to the client dll.
+/// Initialize the driver once, at the first STABLE IN-WORLD tick (NOT at connect: `save_slot` and
+/// `play_time` are only readable once a character is loaded, and the reconciler is inert before
+/// stability anyway). `persist_path` is the watermark file next to the client dll.
 ///
 /// INTEGRATION: call this from the reconstructed `core.rs` once per session, after the per-seed
-/// `DesiredInputs` are built from parsed slot_data.
-pub fn init(
-    inputs: DesiredInputs,
-    persist_path: std::path::PathBuf,
-    received_through: i64,
-    fresh_character: bool,
-) {
+/// `DesiredInputs` are built AND the world is loaded (`has_inventory() && in_world()`).
+pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_through: i64) {
     log::info!("[reconcile] mode: {}", mode_desc());
     let b = paced_budget();
     log::info!(
@@ -413,42 +481,43 @@ pub fn init(
         b.goods,
         b.min_grant_interval_ms
     );
-    let save = inputs.save.clone();
-    let store = WatermarkStore::load(persist_path);
-    // Ledger watermark seeding (er-reconciler-received-grant-regression). The ledger is a SINGLE
-    // monotonic watermark over one index-sorted list where ALL start items sit at NEGATIVE indices and
-    // received consumables at `>= 0`; "index >= watermark is owed". The seeding decision is the PURE
-    // `Reconciler::seeded` policy (host-tested in er-logic):
-    //   * persisted AND `<= received_through` (this save's `last_received_index`) -> RESUME from the
-    //     persisted watermark; it sits at (or behind) what was actually placed, so nothing re-grants
-    //     and any un-placed gap is re-owed.
-    //   * persisted but ABOVE `received_through` -> DISTRUSTED. `reconcile.json` is keyed by SLOT NAME
-    //     only, so this is another character/seed's stale positive frontier; trusting it filtered a
-    //     fresh character's entire received stream out of the diff (picked up, vanilla drop
-    //     suppressed, item never delivered -- the 2026-07-09 regression logs). Fall back below.
-    //   * fallback: `received_through > 0` -> seed THERE (the old path already granted that prefix,
-    //     start items included -- the first-cutover-on-an-existing-save case, no consumable re-grant);
-    //     else `Reconciler::new`, which starts at the desired's ledger FLOOR, so the received stream
-    //     (and any non-goods start items in the negative band) grant from scratch.
-    // NOTE (start items): ALL start items are LEDGERED at the negative band (grant-once), so seeding
-    // governs them too. The positive-frontier distrust above does NOT re-owe them: received_through is
-    // 0 at connect-init on every save, so `wm <= 0` unconditionally TRUSTS a negative start-item
-    // watermark. That strands a NEW character on a slot whose PRIOR character already granted them
-    // (Alaric playtest 2026-07-17: fresh Grafted Scion, no healing flasks). `fresh_character` -- a
-    // LIVE per-character signal from the caller (never a slot-keyed persisted value) -- re-owes the
-    // whole ledger from the floor when set, while a same-character reload (false) still trusts the
-    // watermark and never double-grants (flask_grant_replay). See Reconciler::seeded.
-    let persisted = store.get_opt(&save);
+    let slot = inputs.save.0.clone();
+    let mut store = WatermarkStore::load(persist_path);
+    let save_slot = read_save_slot();
+    let play_time = read_play_time_ms().unwrap_or(0);
+
+    // PER-CHARACTER ledger seeding (er-startitems-newchar-no-regrant). The watermark is keyed by
+    // (AP slot name, ER save_slot) and stamped with play_time; the pure `seed_trust` decides:
+    //   * no entry for this character (or a pre-fix legacy entry adopted for it) -> FRESH: re-owe
+    //     everything from the ledger floor (its start items AND its received stream). A NEW character
+    //     on a slot whose prior character was granted no longer inherits that watermark.
+    //   * entry present, live play_time >= the stamp -> RESUME from its watermark (a same-character
+    //     reload never re-grants -- flask_grant_replay stays authoritative).
+    //   * entry present, play_time REWOUND below the stamp -> FRESH (delete+recreate in the slot, or
+    //     a restored pre-grant backup).
+    // `received_through` is passed through to `seeded` for the positive-frontier cross-check
+    // (er-reconciler-received-grant-regression); a fresh character re-owes it too, which is correct
+    // because a slot-keyed `last_received_index` also can't belong to a new character.
+    let entry = match save_slot {
+        Some(ss) => store.get(&slot, ss).or_else(|| {
+            store
+                .legacy_take(&slot)
+                .map(|wm| legacy_adopt(wm, play_time))
+        }),
+        None => None, // save slot unreadable (shouldn't happen in-world) -> fresh (safe: re-owe)
+    };
+    let (fresh_character, persisted) = seed_trust(entry, play_time);
     let reconciler = Reconciler::seeded(inputs, persisted, received_through, fresh_character);
     log::info!(
-        "[reconcile] ledger seed: persisted={persisted:?} received_through={received_through} fresh_character={fresh_character} -> watermark {}",
+        "[reconcile] ledger seed: save_slot={save_slot:?} play_time={play_time} entry={entry:?} fresh_character={fresh_character} persisted={persisted:?} received_through={received_through} -> watermark {}",
         reconciler.applied_watermark()
     );
     let driver = Driver {
         reconciler,
         io: LiveGame::new(),
         store,
-        save,
+        slot,
+        save_slot: save_slot.unwrap_or(-1),
     };
     let _ = DRIVER.set(Mutex::new(driver));
     mark_dirty();
@@ -461,7 +530,7 @@ pub fn set_inputs(inputs: DesiredInputs) {
     if let Some(m) = DRIVER.get()
         && let Ok(mut d) = m.lock()
     {
-        d.save = inputs.save.clone();
+        d.slot = inputs.save.0.clone(); // same character; save_slot is unchanged
         d.reconciler.set_inputs(inputs);
     }
     mark_dirty();
@@ -512,10 +581,25 @@ pub fn tick() {
     let d = &mut *d;
     let out = d.reconciler.tick_with_classes(&mut d.io, budget, classes);
 
-    // Persist the (possibly advanced) ledger watermark for this save.
+    // Persist the (possibly advanced) ledger watermark for THIS CHARACTER, re-stamped with the live
+    // play_time. Skip if the save slot was unreadable at init or play_time isn't readable now: a
+    // 0/garbage stamp under a bad key could let a later character wrongly trust it. Idempotent —
+    // the next stable tick persists again.
     let wm = d.reconciler.applied_watermark();
-    let save = d.save.clone();
-    d.store.set(&save, wm);
+    if d.save_slot >= 0
+        && let Some(play_time_ms) = read_play_time_ms()
+    {
+        let slot = d.slot.clone();
+        let save_slot = d.save_slot;
+        d.store.set(
+            &slot,
+            save_slot,
+            CharLedger {
+                watermark: wm,
+                play_time_ms,
+            },
+        );
+    }
 
     if out.converged {
         DIRTY.store(false, Ordering::Relaxed);
