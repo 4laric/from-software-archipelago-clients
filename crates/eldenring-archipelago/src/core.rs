@@ -105,6 +105,13 @@ pub struct Core {
     /// Session-scoped: when the player most recently entered a live world (reset on menu).
     /// Gates the start-item grant so it fires only after the load/inventory settle (clobber fix).
     in_world_since: Option<std::time::Instant>,
+    /// Session-scoped last play_region seen by the start-grant gate. A change means a warp /
+    /// fast-travel happened; we restart `in_world_since` so a timer-based start grant can't fire on
+    /// an inventory pointer the warp's map reload may have left stale (the new-game spawn-kick CTD,
+    /// Alaric 2026-07-16; also the unadvertised Chapel warp-out and any early fast-travel). `None`
+    /// off-world. Only the timer path is affected -- real_pickup_seen() short-circuits it once a
+    /// genuine pickup proves the pointer live, so an established character is untouched.
+    grant_gate_last_play_region: Option<i32>,
     /// Pre-scout: resolves each shop reward's name/owner/ER-sell-id (pumped on the tick).
     scout: Option<crate::scout_proof::ScoutProof>,
     /// Goal-send (SPEC-goal-send-20260701.md): goalLocations split flag/checked at parse.
@@ -304,6 +311,7 @@ impl shared::Core for Core {
             unique_grants_ok: HashSet::new(),
             unique_grants_done: false,
             in_world_since: None,
+            grant_gate_last_play_region: None,
             scout: None,
             goal: None,
             sent_goal: false,
@@ -1107,10 +1115,25 @@ impl shared::Core for Core {
             // live: a real game AddItem has fired (bulk load replace done) OR we've been in-world
             // long enough for the load to settle. Timing-independent; received grants untouched.
             if crate::flags::in_world() {
+                // A play_region change while in-world = a warp / fast-travel just landed. Restart the
+                // settle window so a timer-based start grant can't fire on an inventory pointer the
+                // map reload may have left stale (the spawn-kick CTD + the unadvertised Chapel warp-
+                // out + early fast-travels). Skip the very first observation (last = None), so a fresh
+                // spawn's own settle timer runs normally. real_pickup_seen() still short-circuits the
+                // whole gate once a genuine pickup proves the pointer live, so this only ever DELAYS
+                // the pre-first-pickup timer path -- an established character is untouched.
+                let pr = crate::flags::play_region_id();
+                if pr.is_some() && pr != self.grant_gate_last_play_region {
+                    if self.grant_gate_last_play_region.is_some() {
+                        self.in_world_since = None;
+                    }
+                    self.grant_gate_last_play_region = pr;
+                }
                 self.in_world_since
                     .get_or_insert_with(std::time::Instant::now);
             } else {
                 self.in_world_since = None;
+                self.grant_gate_last_play_region = None;
             }
             let start_items_settled = crate::detour::real_pickup_seen()
                 || self
@@ -2410,6 +2433,7 @@ impl Core {
         self.unique_grants_ok.clear();
         self.unique_grants_done = false;
         self.in_world_since = None;
+        self.grant_gate_last_play_region = None;
         self.scout = None;
         self.goal = None;
         self.sent_goal = false;
