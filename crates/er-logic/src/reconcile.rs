@@ -726,13 +726,37 @@ impl Reconciler {
     ///
     /// A trusted `persisted < received_through` is deliberate: it re-owes the gap the reconciler
     /// never placed (and, in the crash-before-`reconcile.json`-flush case, replays a small tail --
-    /// the same replay-from-last-persisted semantics the old receive path always had). GOODS start
-    /// items are presence-diffed (never on this watermark), so no seed choice can strand them.
+    /// the same replay-from-last-persisted semantics the old receive path always had).
+    ///
+    /// FRESH-CHARACTER re-arm (`fresh_character`, er-startitems-newchar-no-regrant 2026-07-17). The
+    /// `persisted` watermark is keyed by SLOT NAME only (`reconcile.json` / the client save), NOT by
+    /// the ER character, and `received_through` is 0 at connect-init on EVERY save (the received
+    /// stream replays AFTER init). So the `wm <= received_through` distrust reduces to `wm <= 0`: it
+    /// rejects a stale POSITIVE frontier (another character's received tail) but UNCONDITIONALLY
+    /// TRUSTS a NEGATIVE start-item-band watermark. Once any character on a slot grants its start
+    /// items (watermark -> the negative band) that value persists, and a NEW character on the same
+    /// slot inherits it -- its start items (flasks/torch/pots) sit behind the frontier and never
+    /// grant (Alaric playtest 2026-07-17: fresh Grafted Scion, no healing flasks; the option-gated
+    /// unique grants re-fired only because they check LIVE per-character obtained flags, not this
+    /// slot-keyed ledger). When the caller KNOWS this is a fresh character (a live, per-character
+    /// signal the Windows glue supplies -- never a slot-keyed persisted value), re-owe everything
+    /// from the ledger floor, exactly like [`new`](Self::new). `fresh_character=false` keeps the full
+    /// distrust policy below, so a same-character tutorial-death RELOAD still trusts the watermark and
+    /// never re-grants (the flask-double-grant guard, [`crate::flask_grant_replay`], is intact).
+    ///
+    /// GOODS start items were briefly presence-diffed (never on this watermark) to dodge exactly this
+    /// stranding; that over-granted depletables (a flask/pot at 0 charge reads absent), so build step
+    /// 1c reverted to the depletion-safe ledger and the re-arm moved HERE, where it cannot double.
     pub fn seeded(
         inputs: DesiredInputs,
         persisted: Option<ItemIndex>,
         received_through: ItemIndex,
+        fresh_character: bool,
     ) -> Self {
+        if fresh_character {
+            // A brand-new character owns none of the slot-keyed ledger: owe everything from the floor.
+            return Self::new(inputs);
+        }
         match persisted.filter(|&wm| wm <= received_through) {
             Some(wm) => Self::from_persisted(inputs, wm),
             None if received_through > 0 => Self::from_persisted(inputs, received_through),
@@ -2469,12 +2493,75 @@ mod tests {
             ..Default::default()
         };
         let mut g = MockGame::stable();
-        let mut r = Reconciler::seeded(bulk_inputs(sd), Some(5), 0);
+        let mut r = Reconciler::seeded(bulk_inputs(sd), Some(5), 0, false);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(
             g.ledger_count(whistle),
             1,
             "fresh char re-owes + grants the whistle despite persisted=5"
+        );
+    }
+
+    #[test]
+    fn seeded_fresh_character_reowes_start_items_despite_a_stale_negative_watermark() {
+        // er-startitems-newchar-no-regrant (Alaric playtest 2026-07-17): a NEW character on a slot
+        // whose PRIOR character already granted the start items inherits that character's negative-band
+        // watermark (persisted, slot-keyed). received_through is 0 at init, so the `wm <= 0` distrust
+        // TRUSTS the negative watermark and the new character's start items never grant. With the live
+        // per-character `fresh_character` signal set, `seeded` must re-owe from the ledger floor.
+        let whistle = crate::progressive::GOODS_FULLID | 130;
+        let sd = SlotData {
+            start_items: vec![StartItem {
+                full_id: whistle,
+                qty: 1,
+            }],
+            ..Default::default()
+        };
+        // The prior character's persisted watermark sits ABOVE the start item's negative index, i.e.
+        // "start items done" -- the exact state that stranded the fresh character.
+        let stale = START_ITEM_INDEX_BASE + 1;
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::seeded(
+            bulk_inputs(sd),
+            Some(stale),
+            0,
+            /*fresh_character=*/ true,
+        );
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(
+            g.ledger_count(whistle),
+            1,
+            "a fresh character re-owes + grants its start items despite the prior character's watermark"
+        );
+    }
+
+    #[test]
+    fn seeded_established_reload_does_not_double_grant_start_items() {
+        // The other side of the re-arm: a SAME-character tutorial-death reload (fresh_character=false)
+        // must still TRUST the negative-band watermark and NOT re-grant -- the flask-double-grant guard
+        // (flask_grant_replay) stays intact. Same stale watermark as the test above; only the signal
+        // differs, and it flips the outcome.
+        let whistle = crate::progressive::GOODS_FULLID | 130;
+        let sd = SlotData {
+            start_items: vec![StartItem {
+                full_id: whistle,
+                qty: 1,
+            }],
+            ..Default::default()
+        };
+        let stale = START_ITEM_INDEX_BASE + 1; // "start items already granted"
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::seeded(
+            bulk_inputs(sd),
+            Some(stale),
+            0,
+            /*fresh_character=*/ false,
+        );
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(
+            g.ledger_count(whistle),
+            0,
+            "an established-character reload trusts the watermark -- no start-item double-grant"
         );
     }
 
@@ -2594,7 +2681,7 @@ mod tests {
         // 0..N < stale_wm out of the diff -- vanilla drop suppressed, item never delivered. `seeded`
         // must DISTRUST a persisted watermark above received_through and grant the full stream.
         let mut g = MockGame::stable();
-        let mut r = Reconciler::seeded(seeded_inputs(), Some(5), 0); // stale wm=5, fresh character
+        let mut r = Reconciler::seeded(seeded_inputs(), Some(5), 0, false); // stale wm=5, fresh character
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(
             g.ledger_count(3011),
@@ -2621,7 +2708,7 @@ mod tests {
         // trusted, so already-granted consumables are NOT re-granted -- only the still-owed tail.
         let mut g = MockGame::stable();
         g.goods.insert(crate::progressive::GOODS_FULLID | 130); // whistle already in inventory
-        let mut r = Reconciler::seeded(seeded_inputs(), Some(2), 2); // granted 0..=1 last session
+        let mut r = Reconciler::seeded(seeded_inputs(), Some(2), 2, false); // granted 0..=1 last session
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(
             g.ledger_count(3011),
@@ -2648,7 +2735,7 @@ mod tests {
         // placed (e.g. the reconciler sat unstable all session). The persisted watermark is the
         // actually-granted frontier: when it is BEHIND received_through it must win, re-owing the gap.
         let mut g = MockGame::stable();
-        let mut r = Reconciler::seeded(seeded_inputs(), Some(1), 3); // placed 0; saw 0..=2
+        let mut r = Reconciler::seeded(seeded_inputs(), Some(1), 3, false); // placed 0; saw 0..=2
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(
             g.ledger_count(3011),
@@ -2681,7 +2768,7 @@ mod tests {
         });
         let mut g = MockGame::stable();
         g.goods.insert(crate::progressive::GOODS_FULLID | 130); // old path granted the whistle too
-        let mut r = Reconciler::seeded(inputs, None, 2);
+        let mut r = Reconciler::seeded(inputs, None, 2, false);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(
             g.ledger_count(3011),
@@ -2708,7 +2795,7 @@ mod tests {
             qty: 1,
         });
         let mut g = MockGame::stable();
-        let mut r = Reconciler::seeded(inputs, None, 0);
+        let mut r = Reconciler::seeded(inputs, None, 0, false);
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(
             g.ledger_count(longsword),

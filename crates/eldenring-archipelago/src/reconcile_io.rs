@@ -400,7 +400,12 @@ fn apply_classes() -> ApplyClasses {
 ///
 /// INTEGRATION: call this from the reconstructed `core.rs` once per session, after the per-seed
 /// `DesiredInputs` are built from parsed slot_data.
-pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_through: i64) {
+pub fn init(
+    inputs: DesiredInputs,
+    persist_path: std::path::PathBuf,
+    received_through: i64,
+    fresh_character: bool,
+) {
     log::info!("[reconcile] mode: {}", mode_desc());
     let b = paced_budget();
     log::info!(
@@ -426,13 +431,17 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
     //     else `Reconciler::new`, which starts at the desired's ledger FLOOR, so the received stream
     //     (and any non-goods start items in the negative band) grant from scratch.
     // NOTE (start items): ALL start items are LEDGERED at the negative band (grant-once), so seeding
-    // governs them too -- the distrust rule above re-owes them on a fresh character. They were briefly
-    // presence-diffed to dodge stranding, but that re-granted depletable goods (flasks/pots on empty);
-    // depletion-safe ledger-once + this seeding fix is the durable answer (see build step 1c).
+    // governs them too. The positive-frontier distrust above does NOT re-owe them: received_through is
+    // 0 at connect-init on every save, so `wm <= 0` unconditionally TRUSTS a negative start-item
+    // watermark. That strands a NEW character on a slot whose PRIOR character already granted them
+    // (Alaric playtest 2026-07-17: fresh Grafted Scion, no healing flasks). `fresh_character` -- a
+    // LIVE per-character signal from the caller (never a slot-keyed persisted value) -- re-owes the
+    // whole ledger from the floor when set, while a same-character reload (false) still trusts the
+    // watermark and never double-grants (flask_grant_replay). See Reconciler::seeded.
     let persisted = store.get_opt(&save);
-    let reconciler = Reconciler::seeded(inputs, persisted, received_through);
+    let reconciler = Reconciler::seeded(inputs, persisted, received_through, fresh_character);
     log::info!(
-        "[reconcile] ledger seed: persisted={persisted:?} received_through={received_through} -> watermark {}",
+        "[reconcile] ledger seed: persisted={persisted:?} received_through={received_through} fresh_character={fresh_character} -> watermark {}",
         reconciler.applied_watermark()
     );
     let driver = Driver {

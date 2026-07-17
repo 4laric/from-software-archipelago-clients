@@ -2222,7 +2222,17 @@ impl shared::Core for Core {
                 // before this block runs) cross-checks the slot-name-keyed reconcile.json watermark
                 // inside init: a stale positive entry from another character/seed must not strand
                 // this save's received stream (er-reconciler-received-grant-regression).
-                crate::reconcile_io::init(inputs, path, self.received_through as i64);
+                //
+                // `fresh_character` re-owes the NEGATIVE start-item band when this is a brand-new
+                // character on a slot whose PRIOR character already granted its start items (the
+                // slot-keyed watermark is otherwise trusted unconditionally at init, stranding the new
+                // character's flasks/torch/pots -- Alaric playtest 2026-07-17). This MUST be a live,
+                // per-character signal (never a slot-keyed persisted value), or a same-character
+                // tutorial-death reload would re-grant and double the flasks. TODO(alaric): wire the
+                // agreed live signal here; `false` is the safe no-regression default until then (the
+                // seeded() re-arm + its regression replays already land in er-logic).
+                let fresh_character = false;
+                crate::reconcile_io::init(inputs, path, self.received_through as i64, fresh_character);
                 self.reconcile_inited = true;
             } else {
                 crate::reconcile_io::set_inputs(inputs);
