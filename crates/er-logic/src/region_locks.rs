@@ -198,7 +198,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Stormveil",
         lock_item: "Stormveil Lock",
         open_flag: Some(71003),
-        play_regions: &[10000, 10010],
+        play_regions: &[10000],
     },
     BakedRegionLock {
         region: "Weeping",
