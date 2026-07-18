@@ -43,6 +43,7 @@ pub mod save_state;
 pub mod scadu_blessing_replay;
 pub mod scaling;
 pub mod seed_change;
+pub mod start_backfill;
 pub mod start_grant_replay;
 pub mod static_lots;
 pub mod sweep_gate;

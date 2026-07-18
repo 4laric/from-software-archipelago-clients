@@ -553,6 +553,9 @@ impl shared::Core for Core {
                     crate::flagpoll::parse_sweep_flags(sd),
                 );
                 let start = crate::startgrants::parse(sd);
+                // Inventory-verified backfill: hand the same startItems to the backstop that grants
+                // any that a stale `start_items_granted` boolean skipped (see start_item_backfill).
+                crate::start_item_backfill::set_start_items(start.start_items.clone());
                 if start.unique_start_grants.is_empty() {
                     log::info!("unique start grants: inert (no uniqueStartGrants in slot_data)");
                 } else {
@@ -2241,6 +2244,10 @@ impl shared::Core for Core {
             // Dry-run tick: computes + logs the per-action diff; applies nothing (see reconcile_io).
             crate::reconcile_io::tick();
         }
+
+        // Backstop the persisted `start_items_granted` boolean: grant any startItems that aren't
+        // actually in the bag (self-latches once done; no-op when the normal drain already ran).
+        crate::start_item_backfill::tick(self.start_items_granted);
 
         Ok(())
     }

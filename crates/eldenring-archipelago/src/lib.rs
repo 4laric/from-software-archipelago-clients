@@ -38,6 +38,7 @@ mod shop_icon;
 mod shop_preview;
 mod shop_sell;
 mod shop_stock;
+mod start_item_backfill;
 mod startgrants;
 mod upgrade_cost;
 mod upgrades;
