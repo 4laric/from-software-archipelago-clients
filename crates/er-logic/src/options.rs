@@ -59,6 +59,11 @@ pub fn parse_flatten_cap(slot_data: &Value) -> i64 {
     }
 }
 
+/// `options.no_equip_load` (int-or-bool). Same option name on both our apworld and Bedrock/fswap's.
+pub fn parse_no_equip_load(slot_data: &Value) -> bool {
+    parse_bool_option(slot_data, "no_equip_load")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +138,19 @@ mod tests {
             parse_flatten_cap(&json!({ "options": { "flatten_regular_upgrades": 0 } })),
             0
         );
+    }
+
+    #[test]
+    fn no_equip_load_parses() {
+        assert!(parse_no_equip_load(
+            &json!({ "options": { "no_equip_load": 1 } })
+        ));
+        assert!(parse_no_equip_load(
+            &json!({ "options": { "no_equip_load": true } })
+        ));
+        assert!(!parse_no_equip_load(
+            &json!({ "options": { "no_equip_load": 0 } })
+        ));
+        assert!(!parse_no_equip_load(&json!({ "options": {} })));
     }
 }
