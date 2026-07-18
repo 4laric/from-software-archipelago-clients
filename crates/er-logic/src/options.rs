@@ -64,6 +64,12 @@ pub fn parse_no_equip_load(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "no_equip_load")
 }
 
+/// `options.auto_equip` (int-or-bool). Same option name on both our apworld and Bedrock/fswap's.
+/// When on, a received weapon is auto-equipped into a hand slot (see [`crate::auto_equip`]).
+pub fn parse_auto_equip(slot_data: &Value) -> bool {
+    parse_bool_option(slot_data, "auto_equip")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +158,17 @@ mod tests {
             &json!({ "options": { "no_equip_load": 0 } })
         ));
         assert!(!parse_no_equip_load(&json!({ "options": {} })));
+    }
+
+    #[test]
+    fn auto_equip_parses() {
+        assert!(parse_auto_equip(&json!({ "options": { "auto_equip": 1 } })));
+        assert!(parse_auto_equip(
+            &json!({ "options": { "auto_equip": true } })
+        ));
+        assert!(!parse_auto_equip(
+            &json!({ "options": { "auto_equip": 0 } })
+        ));
+        assert!(!parse_auto_equip(&json!({ "options": {} })));
     }
 }

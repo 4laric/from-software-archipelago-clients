@@ -484,6 +484,9 @@ impl shared::Core for Core {
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
                 crate::no_equip_load::set_enabled(er_logic::options::parse_no_equip_load(sd));
+                // auto_equip: received weapons get equipped into a primary hand (same option name on
+                // both apworlds). The receive loop queues weapon FullIDs; auto_equip::tick drains them.
+                crate::auto_equip::set_enabled(er_logic::options::parse_auto_equip(sd));
                 // Accepts our `no_weapon_requirements` OR Bedrock/fswap's
                 // `remove_weapon_and_spell_requirements` (same client feature, two apworld names).
                 crate::no_weapon_reqs::set_enabled(er_logic::options::parse_no_weapon_reqs(sd));
@@ -1370,6 +1373,13 @@ impl shared::Core for Core {
                     GrantAction::Enqueue {
                         full_id, qty, name, ..
                     } => {
+                        // auto_equip: queue a received WEAPON to be equipped once it's in the bag.
+                        // Independent of the grant path below (reconciler may own the actual grant),
+                        // so this fires for every recognized weapon receive. No-op unless enabled.
+                        if crate::auto_equip::enabled() && er_logic::auto_equip::is_weapon(full_id)
+                        {
+                            crate::auto_equip::enqueue(full_id);
+                        }
                         // STRANGLER (goods+ledger, THE ATOMIC FLIP): this ONE call grants every
                         // received item — key items/runes (goods) AND consumables (ledger). Once the
                         // reconciler owns BOTH classes it is the sole received-item grant path (goods
@@ -2127,6 +2137,9 @@ impl shared::Core for Core {
 
         // 8b2. no_equip_load: weightless-equipment SpEffect on the player (param edit + apply).
         crate::no_equip_load::tick();
+
+        // 8b3. auto_equip: drain queued received weapons into a primary hand (once each is in the bag).
+        crate::auto_equip::tick();
 
         // 8c. Ticker-only pickup notifs: set showDialogCondType=0 game-wide so AP grants show the
         //     native right-side ticker, not the blocking "NEW Y:OK" modal (was a retired-baker
