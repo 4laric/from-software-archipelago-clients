@@ -135,6 +135,18 @@ pub fn shop_label(item_name: &str, owner: &str, game: &str, kind: ItemKind) -> S
     }
 }
 
+/// The GoodsName + Caption for a shop slot holding a REGION LOCK (own-world region-unlock item, e.g.
+/// "Stormveil Lock"). Distinct from [`shop_label`] so a lock reads unmistakably as a REGION UNLOCK in
+/// the buy menu instead of blending in as another progression item -- the caller (shop_preview) also
+/// forces this OVER the real-good FMG protection, because a region key is worth the shared-FMG cost.
+/// `name` = the lock's AP item name (already region-descriptive); `caption` leads with REGION UNLOCK.
+pub fn shop_lock_label(item_name: &str) -> ShopLabel {
+    ShopLabel {
+        name: item_name.to_string(),
+        caption: format!("AP: {item_name}\nREGION UNLOCK\nBuy this to open the region."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +165,21 @@ mod tests {
             l.caption,
             "AP: Stormveil Lock\nFor: Alaric (Elden Ring)\nProgression"
         );
+    }
+
+    #[test]
+    fn shop_lock_label_reads_as_region_unlock() {
+        let l = shop_lock_label("Ensis Lock");
+        assert_eq!(l.name, "Ensis Lock");
+        assert_eq!(
+            l.caption,
+            "AP: Ensis Lock\nREGION UNLOCK\nBuy this to open the region."
+        );
+        // The distinguishing mark: a lock caption says REGION UNLOCK, a plain progression item doesn't.
+        assert!(l.caption.contains("REGION UNLOCK"));
+        assert!(!shop_label("Ensis Lock", "o", "g", ItemKind::Progression)
+            .caption
+            .contains("REGION UNLOCK"));
     }
 
     #[test]

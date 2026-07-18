@@ -64,6 +64,20 @@ pub fn configure(pairs: Vec<(i64, i32)>) {
     CONFIGURED_SET.store(true, Ordering::Relaxed);
 }
 
+/// Region-lock item NAMES (the `regionOpenFlags` slot_data keys, e.g. "Ensis Lock"). A shop slot whose
+/// scouted reward is one of these is a REGION UNLOCK: it gets a distinct "REGION UNLOCK" label AND is
+/// forced past the real-good FMG protection (a region key is worth renaming one shared note FMG, unlike
+/// a stone economy). Without this a lock in a shop reads as its vanilla good ("Note: Sealed Spiritsprings").
+static LOCK_NAMES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+pub fn configure_locks(names: HashSet<String>) {
+    log::info!(
+        "shop-preview: {} region-lock name(s) armed for shop marking",
+        names.len()
+    );
+    *LOCK_NAMES.lock().unwrap() = Some(names);
+}
+
 pub fn run() -> bool {
     if DONE.load(Ordering::Relaxed) {
         return true;
@@ -91,12 +105,17 @@ pub fn run() -> bool {
     let mut nmap: HashMap<u32, Vec<u16>> = HashMap::new();
     let mut imap: HashMap<u32, Vec<u16>> = HashMap::new();
     let mut cmap: HashMap<u32, Vec<u16>> = HashMap::new();
-    let (mut overridden, mut native, mut protected) = (0u32, 0u32, 0u32);
+    let lock_names = LOCK_NAMES.lock().unwrap().clone().unwrap_or_default();
+    let (mut overridden, mut native, mut protected, mut locks) = (0u32, 0u32, 0u32, 0u32);
     for (loc, good) in &pairs {
         let Some(s) = crate::scout_proof::lookup(*loc) else {
             continue;
         };
-        if s.er_sell_id.is_some() {
+        // A REGION LOCK reward: mark it as a region unlock and force it PAST the native/real-good skips
+        // below (a region key is worth renaming its shared note FMG). Locks are own-world with no
+        // apIdsToItemIds entry, so er_sell_id is already None -- but check first so intent is explicit.
+        let is_lock = lock_names.contains(&s.name);
+        if s.er_sell_id.is_some() && !is_lock {
             native += 1;
             continue; // own-world: shop_sell sells it natively
         }
@@ -111,14 +130,28 @@ pub fn run() -> bool {
         // THE GUARD (see the module header): the FMG entry is shared, so renaming the good behind this
         // slot renames every copy the player can hold. If the seed can grant this good, leave the slot
         // showing its vanilla name -- one slot lying about one reward beats a renamed stone economy.
-        if real.contains(&gid) {
+        // EXCEPTION: region locks override anyway -- an unmarked region key is a worse trade than one
+        // shared note FMG reading "Ensis Lock". The good id is logged so a rare stone-row lock is visible.
+        if real.contains(&gid) && !is_lock {
             protected += 1;
             continue;
         }
-        overridden += 1;
-        // Pure, host-tested formatter (er-logic name_override::shop_label) so the exact GoodsName +
-        // routing caption a lock/foreign slot shows is pinned by unit test, not inlined here.
-        let lbl = er_logic::name_override::shop_label(&s.name, &s.owner, &s.game, s.kind);
+        // Pure, host-tested formatters (er-logic name_override) so the exact GoodsName + caption a
+        // lock/foreign slot shows is pinned by unit test, not inlined here.
+        let lbl = if is_lock {
+            locks += 1;
+            if real.contains(&gid) {
+                log::info!(
+                    "shop-preview: region lock '{}' overrides a REAL good (row {gid}) -- one shared FMG \
+                     entry now reads the lock name (acceptable for a region key)",
+                    s.name
+                );
+            }
+            er_logic::name_override::shop_lock_label(&s.name)
+        } else {
+            overridden += 1;
+            er_logic::name_override::shop_label(&s.name, &s.owner, &s.game, s.kind)
+        };
         nmap.insert(gid, lbl.name.encode_utf16().collect());
         let u: Vec<u16> = lbl.caption.encode_utf16().collect();
         imap.insert(gid, u.clone());
@@ -131,8 +164,9 @@ pub fn run() -> bool {
     let i = crate::fmg_inject::extend_swap_overrides(GOODS_INFO_CAT, &infos);
     let c = crate::fmg_inject::extend_swap_overrides(GOODS_CAPTION_CAT, &caps);
     log::info!(
-        "shop-preview: {overridden} foreign/gem slot(s) ({} distinct, {native} own-world via shop_sell, \
-         {protected} left vanilla to protect a real good's shared FMG entry) -> extend-swap names={n} infos={i} captions={c}",
+        "shop-preview: {overridden} foreign/gem slot(s) + {locks} region-lock slot(s) marked ({} distinct, \
+         {native} own-world via shop_sell, {protected} left vanilla to protect a real good's shared FMG entry) \
+         -> extend-swap names={n} infos={i} captions={c}",
         names.len()
     );
     DONE.store(true, Ordering::Relaxed);

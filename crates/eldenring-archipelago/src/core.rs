@@ -521,6 +521,12 @@ impl shared::Core for Core {
                 crate::shop_preview::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
                 let mut region = crate::region::parse(sd);
+                // Arm shop_preview to MARK region-lock rewards that land in a shop (a lock reward
+                // otherwise reads as its vanilla good, e.g. "Note: Sealed Spiritsprings", with no hint
+                // it's a region key). Keyed by lock item name, same set open_on_received_name uses.
+                crate::shop_preview::configure_locks(
+                    region.region_open_flags.keys().cloned().collect(),
+                );
                 // Capital-version reconciler (SPEC-capital-reconciler.md): five capital* keys,
                 // parsed together; absent = INERT (logged). Also configures the shop release
                 // re-key rows (shop_flags::run_capital_release, driven from the tick below).
