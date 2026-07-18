@@ -30,6 +30,35 @@ pub fn parse_death_link(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "death_link")
 }
 
+/// Weapon/spell requirement removal, under EITHER apworld's option name.
+///
+/// Our apworld emits `options.no_weapon_requirements`; Bedrock's fswap apworld emits
+/// `options.remove_weapon_and_spell_requirements`. Same client feature — either name enables it.
+pub fn parse_no_weapon_reqs(slot_data: &Value) -> bool {
+    parse_bool_option(slot_data, "no_weapon_requirements")
+        || parse_bool_option(slot_data, "remove_weapon_and_spell_requirements")
+}
+
+/// Regular smithing-stone upgrade-cost flatten cap, in stones/level (0 = off, 1..4 = cap).
+///
+/// Our apworld emits `options.flatten_regular_upgrades` as that INT directly. Bedrock's fswap
+/// apworld emits `options.reduce_non_somber_upgrade_cost` as a BOOL toggle meaning "one stone per
+/// weapon level" == cap 1. Our int wins when present and non-zero; otherwise fall back to Bedrock's
+/// toggle mapped to cap 1. Absent/garbage => 0 (off).
+pub fn parse_flatten_cap(slot_data: &Value) -> i64 {
+    let own = slot_data
+        .pointer("/options/flatten_regular_upgrades")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if own != 0 {
+        own
+    } else if parse_bool_option(slot_data, "reduce_non_somber_upgrade_cost") {
+        1
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +95,43 @@ mod tests {
             &json!({ "options": { "x": [1, 2] } }),
             "x"
         ));
+    }
+
+    #[test]
+    fn no_weapon_reqs_accepts_either_apworld_name() {
+        // our apworld's name
+        assert!(parse_no_weapon_reqs(
+            &json!({ "options": { "no_weapon_requirements": 1 } })
+        ));
+        // bedrock/fswap's name
+        assert!(parse_no_weapon_reqs(
+            &json!({ "options": { "remove_weapon_and_spell_requirements": true } })
+        ));
+        // neither present
+        assert!(!parse_no_weapon_reqs(&json!({ "options": {} })));
+    }
+
+    #[test]
+    fn flatten_cap_our_int_wins_then_bedrock_toggle_maps_to_one() {
+        // our int form passes through unchanged
+        assert_eq!(
+            parse_flatten_cap(&json!({ "options": { "flatten_regular_upgrades": 3 } })),
+            3
+        );
+        // bedrock toggle (int or bool) -> cap 1
+        assert_eq!(
+            parse_flatten_cap(&json!({ "options": { "reduce_non_somber_upgrade_cost": 1 } })),
+            1
+        );
+        assert_eq!(
+            parse_flatten_cap(&json!({ "options": { "reduce_non_somber_upgrade_cost": true } })),
+            1
+        );
+        // off / absent
+        assert_eq!(parse_flatten_cap(&json!({ "options": {} })), 0);
+        assert_eq!(
+            parse_flatten_cap(&json!({ "options": { "flatten_regular_upgrades": 0 } })),
+            0
+        );
     }
 }

@@ -483,10 +483,9 @@ impl shared::Core for Core {
                 // int-or-bool tolerant (er_logic::options): the apworld serializes options
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
-                crate::no_weapon_reqs::set_enabled(er_logic::options::parse_bool_option(
-                    sd,
-                    "no_weapon_requirements",
-                ));
+                // Accepts our `no_weapon_requirements` OR Bedrock/fswap's
+                // `remove_weapon_and_spell_requirements` (same client feature, two apworld names).
+                crate::no_weapon_reqs::set_enabled(er_logic::options::parse_no_weapon_reqs(sd));
                 crate::upgrades::set_auto_upgrade(
                     sd.pointer("/options/auto_upgrade").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 );
@@ -498,9 +497,9 @@ impl shared::Core for Core {
                 crate::upgrades::set_dlc_blessing_floors(
                     er_logic::scaling::parse_triple_ranges(sd.get("dlcScadutreeFloorRanges")),
                 );
-                crate::upgrade_cost::set_flatten(
-                    sd.pointer("/options/flatten_regular_upgrades").and_then(|v| v.as_i64()).unwrap_or(0),
-                );
+                // Our `flatten_regular_upgrades` (int cap) OR Bedrock/fswap's
+                // `reduce_non_somber_upgrade_cost` (bool toggle -> cap 1).
+                crate::upgrade_cost::set_flatten(er_logic::options::parse_flatten_cap(sd));
                 let map = i64_map(sd.get("apIdsToItemIds"));
                 // The GOODS rows this seed can actually GRANT. shop_icon / shop_preview must never
                 // repaint one of these: EquipParamGoods.iconId and the GoodsName FMG entry are SHARED
