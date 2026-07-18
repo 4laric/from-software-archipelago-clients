@@ -527,6 +527,10 @@ impl shared::Core for Core {
                 crate::shop_preview::configure_locks(
                     region.region_open_flags.keys().cloned().collect(),
                 );
+                // ...and give those lock slots the AP flower icon (shop_icon), same lock-name set.
+                crate::shop_icon::configure_locks(
+                    region.region_open_flags.keys().cloned().collect(),
+                );
                 // Capital-version reconciler (SPEC-capital-reconciler.md): five capital* keys,
                 // parsed together; absent = INERT (logged). Also configures the shop release
                 // re-key rows (shop_flags::run_capital_release, driven from the tick below).

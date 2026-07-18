@@ -57,6 +57,20 @@ pub fn configure(pairs: Vec<(i64, i32)>) {
     CONFIGURED_SET.store(true, Ordering::Relaxed);
 }
 
+/// Region-lock item NAMES (`regionOpenFlags` keys). A shop slot whose scouted reward is a lock gets the
+/// AP flower FORCED past the real-good protection: a region key wearing the flower icon (paired with the
+/// "REGION UNLOCK" name from shop_preview) is worth re-iconing one shared note good; a stone economy is
+/// not, and stones are never locks. Same set shop_preview uses (each module owns its copy, like REAL_GOODS).
+static LOCK_NAMES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+pub fn configure_locks(names: HashSet<String>) {
+    log::info!(
+        "shop-icon: {} region-lock name(s) armed for the flower",
+        names.len()
+    );
+    *LOCK_NAMES.lock().unwrap() = Some(names);
+}
+
 pub fn run() -> bool {
     if DONE.load(Ordering::Relaxed) {
         return true;
@@ -87,14 +101,18 @@ pub fn run() -> bool {
         Some(row) => row.icon_id(),
         None => return false, // telescope row absent — retry
     };
-    let (mut flower, mut native, mut protected) = (0u32, 0u32, 0u32);
+    let lock_names = LOCK_NAMES.lock().unwrap().clone().unwrap_or_default();
+    let (mut flower, mut native, mut protected, mut locks) = (0u32, 0u32, 0u32, 0u32);
     let mut seen: HashSet<u32> = HashSet::new();
     for (loc, good) in pairs {
+        let scouted = crate::scout_proof::lookup(loc);
+        // A REGION LOCK reward gets the flower even if its ware is a real good (below) -- it's never
+        // own-world-native (no apIdsToItemIds entry -> er_sell_id None), but check first for intent.
+        let is_lock = scouted
+            .as_ref()
+            .is_some_and(|s| lock_names.contains(&s.name));
         // Own-world sellable rewards display natively (shop_sell rewrote the slot) -> nothing to flower.
-        if crate::scout_proof::lookup(loc)
-            .map(|s| s.er_sell_id.is_some())
-            .unwrap_or(false)
-        {
+        if !is_lock && scouted.as_ref().is_some_and(|s| s.er_sell_id.is_some()) {
             native += 1;
             continue;
         }
@@ -120,21 +138,32 @@ pub fn run() -> bool {
         // lies about ONE reward is a local, reversible annoyance; a smithing-stone economy that has
         // been renamed and re-iconed is not. (Restoring an honest preview for these slots needs the
         // row itself repointed at a placeholder good -- see the shop-placeholder follow-up.)
-        if real.contains(&gid) {
+        // THE GUARD -- but region locks flower anyway (an unmarked region key beats one re-iconed note).
+        if real.contains(&gid) && !is_lock {
             protected += 1;
             continue;
+        }
+        if is_lock && real.contains(&gid) {
+            log::info!(
+                "shop-icon: region lock flowers a REAL good (row {gid}) -- that good's shared icon is \
+                 now the AP flower (acceptable for a region key)"
+            );
         }
         if let Some(row) = repo.get_mut::<EquipParamGoods>(gid)
             && row.icon_id() != tele_icon
         {
             row.set_icon_id(tele_icon);
         }
-        flower += 1;
+        if is_lock {
+            locks += 1;
+        } else {
+            flower += 1;
+        }
     }
     log::info!(
-        "shop-icon: {flower} foreign/gem slot(s) flowered, {native} own-world handled by shop_sell, \
-         {protected} slot(s) LEFT VANILLA because their ware is a real item this seed can grant \
-         (flowering it would re-icon every copy globally) (telescope iconId {tele_icon})"
+        "shop-icon: {flower} foreign/gem slot(s) + {locks} region-lock slot(s) flowered, {native} \
+         own-world handled by shop_sell, {protected} slot(s) LEFT VANILLA because their ware is a real \
+         item this seed can grant (flowering it would re-icon every copy globally) (telescope iconId {tele_icon})"
     );
     DONE.store(true, Ordering::Relaxed);
     true
