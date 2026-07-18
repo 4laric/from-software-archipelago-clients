@@ -1,12 +1,14 @@
 //! Inventory-verified start-item backfill: grant any `startItems` entry that isn't actually in the
-//! bag. Backstops the persisted `start_items_granted` boolean, which lies for a character first
-//! played before an item was added to `startItems` (live case: no healing flask on a Roundtable-hub
-//! start -- the flask was in `startItems`, but the boolean said "already granted"). Logic +
+//! bag. A last-resort backstop for whatever the primary start-item paths dropped -- verifies against
+//! the BAG, not any bookkeeping flag. Live case: no healing flask on a Roundtable-hub start; the
+//! flask WAS in `startItems`, but the RECONCILER (which owns start-item goods, `apply=...,goods,...`)
+//! converged without placing it, and the old boolean-gated drain had already stood down. Logic +
 //! flask-family handling live in `er_logic::start_backfill`.
 //!
-//! Runs ONCE per client launch (in-memory latch), in-world, AFTER the normal start-item drain has
-//! had a chance to run (so on a fresh save it finds nothing missing and no double-grant), snapshot-
-//! ting the inventory fresh each tick.
+//! Runs ONCE per client launch (in-memory latch), in-world, AFTER an in-world SETTLE (so the
+//! reconciler/drain have taken their pass first -> on a healthy save it finds nothing missing and
+//! never double-grants), snapshotting the inventory fresh each tick. Inventory verification is the
+//! anti-double-grant guarantee: anything a primary path placed reads as present and is skipped.
 //!
 //! TRADEOFF: an absent start item is re-granted on the next launch. For permanent items (flask,
 //! weapons, key items) that's exactly right. A STACKABLE CONSUMABLE the player used up would refill
@@ -44,12 +46,20 @@ fn full_id_of(cat: ItemCategory, row: u32) -> u32 {
     nibble | (row & 0x0FFF_FFFF)
 }
 
-/// Per-tick until done: once the normal start-item drain has completed (`start_items_granted`) and
-/// we're in-world with the inventory populated, grant any `startItems` not in the bag. Gating on
-/// `start_items_granted` means this only ever acts as the backstop for a STALE boolean -- it never
-/// races or doubles a fresh drain (which runs while the boolean is still false).
-pub fn tick(start_items_granted: bool) {
-    if DONE.load(Ordering::Relaxed) || !start_items_granted || !crate::flags::in_world() {
+/// Per-tick until done. `settled` = the world has loaded + the primary start-item paths have had
+/// time to run (in-world settle, same signal `apply_start_flags`/the drain use). Once settled and
+/// in-world with the inventory populated, grant any `startItems` NOT in the bag.
+///
+/// GATE FIX (2026-07-18): originally gated on the persisted `start_items_granted` boolean, on the
+/// theory that a stale-TRUE boolean made the old drain skip. WRONG for the live case: start-item
+/// GOODS (the flask) are now owned by the RECONCILER (`apply=flags,goods,ledger`), the old drain
+/// stands down, so `start_items_granted` never latches TRUE -> the backfill never ran. Now gated on
+/// an in-world SETTLE instead, so it runs as a true backstop AFTER the reconciler converges,
+/// independent of whichever primary path (drain or reconciler) dropped the item. Inventory
+/// verification is what prevents a double-grant: anything the reconciler did place reads as present
+/// and is skipped; only genuinely-absent startItems are granted.
+pub fn tick(settled: bool) {
+    if DONE.load(Ordering::Relaxed) || !settled || !crate::flags::in_world() {
         return;
     }
     let items = match START_ITEMS.lock() {
@@ -78,19 +88,35 @@ pub fn tick(start_items_granted: bool) {
     }
 
     let missing = er_logic::start_backfill::missing_start_items(&present, &items);
+    // Always log the decision (once, on the settled run) so a "nothing granted" outcome is visible
+    // in diagnosis -- this is the line whose ABSENCE told us the old gate was wrong.
+    log::info!(
+        "start-item backfill: scanned {} inventory id(s), {}/{} startItems absent -> granting {:?}",
+        present.len(),
+        missing.len(),
+        items.len(),
+        missing
+            .iter()
+            .map(|&f| format!("{:#010x}", f as u32))
+            .collect::<Vec<_>>()
+    );
     if !missing.is_empty() {
         let mut granted = 0u32;
         for &fid in &missing {
-            if crate::detour::grant_full_id(fid, 1) {
+            let ok = crate::detour::grant_full_id(fid, 1);
+            if ok {
                 granted += 1;
             }
+            log::info!(
+                "start-item backfill: grant {:#010x} -> {}",
+                fid as u32,
+                if ok { "ok" } else { "FAILED (not placed)" }
+            );
         }
         log::info!(
-            "start-item backfill: {}/{} startItems absent from inventory, granted {} (backstop for \
-             the stale start_items_granted boolean)",
-            missing.len(),
-            items.len(),
-            granted
+            "start-item backfill: granted {}/{} absent startItems (backstop after reconciler converge)",
+            granted,
+            missing.len()
         );
     }
     DONE.store(true, Ordering::Relaxed);

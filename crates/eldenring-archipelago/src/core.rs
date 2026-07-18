@@ -2258,9 +2258,15 @@ impl shared::Core for Core {
             crate::reconcile_io::tick();
         }
 
-        // Backstop the persisted `start_items_granted` boolean: grant any startItems that aren't
-        // actually in the bag (self-latches once done; no-op when the normal drain already ran).
-        crate::start_item_backfill::tick(self.start_items_granted);
+        // Inventory-verified startItems backstop: after the world has SETTLED (so the reconciler /
+        // drain have had their pass), grant any startItems still absent from the bag (self-latches
+        // once done). Gated on settle, NOT on `start_items_granted` -- that boolean never latches
+        // when the reconciler owns goods (apply=...,goods,...), so the flask slipped through.
+        let start_backfill_settled = crate::detour::real_pickup_seen()
+            || self
+                .in_world_since
+                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(10));
+        crate::start_item_backfill::tick(start_backfill_settled);
 
         Ok(())
     }
