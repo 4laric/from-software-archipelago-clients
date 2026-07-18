@@ -1,23 +1,28 @@
 //! auto_equip — when `options.auto_equip` is on, equip a received WEAPON into a primary hand slot.
 //!
-//! On receiving a weapon the client calls the game's own `ReplaceTool` fn, which swaps an equipped
-//! item by id AND does the ChrAsm sync + refresh internally (the three coupled reps -- ItemId entry,
-//! gaitem handle, equip param id -- plus the arm-style refresh). That's why we drive the game fn
-//! instead of poking `equipment_entries` by hand: a raw ItemId write leaves the handle/param-id/refresh
-//! stale and the weapon reads as equipped but doesn't render / can't be used.
+//! STATUS: the option parsing, weapon detection + hand routing (`er_logic::auto_equip`), and the
+//! receive -> queue -> presence-gated `tick` pipeline are all COMPLETE and correct. The one missing
+//! piece is the game's real WEAPON-EQUIP FUNCTION, and the module ships INERT (`EQUIP_FUNC_RVA == 0`)
+//! until it's resolved -- `tick` logs once and no-ops, never wrong.
 //!
-//! Hand routing lives in `er_logic::auto_equip` (pure, host-tested): shields -> LEFT primary hand,
-//! every other weapon class -> RIGHT (main hand). Weapon type comes from `EQUIP_PARAM_WEAPON_ST.wep_type`.
+//! WHY NOT ReplaceTool: the Hexinton table's `ReplaceTool` (AOB `?? 0f b6 f1 ?? 8b d8 ...` - 0x19) is
+//! GOODS-ONLY. It masks the id to 28 bits and `bts`-sets the goods category bit, reconstructing a
+//! GOODS full id -- which is why the table uses it solely for "Set flask level" (passing raw goods
+//! rows 1000/1001/1050/1051). Feeding it a weapon row would look up the same-numbered GOODS row. So
+//! it is NOT the weapon-equip fn; the real one must be located (find-what-writes on `equipment_entries.
+//! weapon_primary_right` while equipping in the menu -> the writer is/leads to the equip fn; capture
+//! its entry + call signature). A raw ItemId write to the slot won't do either: the game keeps three
+//! coupled reps -- the `equipment_entries` ItemId, `chr_asm.gaitem_handles[slot]`, and
+//! `chr_asm.equipment_param_ids[slot]` -- plus an arm-style/model refresh, and only the equip fn
+//! updates all of them.
 //!
-//! FLOW: the received-item loop pushes weapon FullIDs to a pending queue (`enqueue`); `tick` drains
-//! it once each weapon is actually in inventory (the AP grant places it the same or next tick), so
-//! ReplaceTool always has a valid, owned target. Presence-gating mirrors start_item_backfill.
+//! Hand routing (pure, host-tested): shields -> LEFT primary hand, every other weapon class -> RIGHT
+//! (main hand), from `EQUIP_PARAM_WEAPON_ST.wep_type`.
 //!
-//! RESOLUTION: like `warp.rs`, the game fn is pinned by RVA + a prologue signature verified against
-//! the running image. **The RVA/signature are PROBE-PENDING** (`REPLACE_TOOL_FUNC_RVA == 0`); until
-//! filled from a CE AOB scan of 2.6.2.0, `tick` logs once and no-ops -- the feature ships inert, never
-//! wrong. AOB (Hexinton table): `?? 0f b6 f1 ?? 8b d8 ?? 8b f9 81 e2 ff ff ff 0f 0f ba ea ?? 89 54 ??
-//! ?? ?? 81 c1` minus 0x19 = fn entry.
+//! RESOLUTION: like `warp.rs`, the fn will be pinned by RVA + a prologue signature verified against
+//! the running image. The call shape below (equipData, current_id, replace_id, flag) is a PLACEHOLDER
+//! copied from ReplaceTool; the real fn's signature is TBD and this call is rewritten once the probe
+//! lands. The RVA-0 guard keeps the placeholder unreachable, so it can never fire with a wrong sig.
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -28,18 +33,19 @@ use eldenring::cs::{EquipParamWeapon, GameDataMan, SoloParamRepository};
 use er_logic::auto_equip::Hand;
 use fromsoftware_shared::FromStatic;
 
-/// `ReplaceTool` entry RVA on 2.6.2.0. **PROBE-PENDING** — 0 means unresolved; `tick` stays inert
-/// until this (and the prologue below) are filled from a CE AOB scan. See module docs for the AOB.
-const REPLACE_TOOL_FUNC_RVA: usize = 0x0;
+/// Weapon-equip fn entry RVA on 2.6.2.0. **PROBE-PENDING** — 0 means unresolved; `tick` stays inert
+/// until this (and the prologue below) are filled. The function itself is TBD (ReplaceTool ruled out;
+/// see module docs) -- locate it via find-what-writes on the weapon-right equip slot.
+const EQUIP_FUNC_RVA: usize = 0x0;
 /// First 16 bytes at the entry, read from the pinned exe. A mismatch = stale RVA for the running
 /// build -> refuse to call. **PROBE-PENDING** — empty until the scan reports it.
-const REPLACE_TOOL_FUNC_SIG: &[u8] = &[];
+const EQUIP_FUNC_SIG: &[u8] = &[];
 
-/// Windows-x64 extern "C": rcx=equipGameData, rdx=current_id, r8=replace_id, r9=flag (table uses 1).
-/// equipGameData = `&PlayerGameData.equipment` (the crate's `pgd.equipment`, == PGD+0x2B0).
-type ReplaceToolFn = unsafe extern "C" fn(*mut c_void, i32, i32, i32) -> u64;
-/// The flag the Hexinton CE script passes.
-const REPLACE_FLAG: i32 = 1;
+/// PLACEHOLDER call shape (from ReplaceTool): rcx=equipGameData, rdx=current_id, r8=replace_id,
+/// r9=flag. The real weapon-equip fn's signature is TBD; rewritten when the probe lands.
+type EquipFn = unsafe extern "C" fn(*mut c_void, i32, i32, i32) -> u64;
+/// Placeholder flag arg.
+const EQUIP_FLAG: i32 = 1;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PENDING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
@@ -50,7 +56,7 @@ static UNRESOLVED_LOGGED: AtomicBool = AtomicBool::new(false);
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
     if on {
-        log::info!("auto_equip: enabled (received weapons -> primary hand via ReplaceTool)");
+        log::info!("auto_equip: enabled (received weapons -> primary hand)");
     }
 }
 
@@ -75,33 +81,32 @@ fn current_module_base() -> Option<usize> {
     Some(hmodule.0 as usize)
 }
 
-/// Resolve the pinned `ReplaceTool` entry, verifying the prologue. Returns `None` (logging once)
+/// Resolve the pinned weapon-equip entry, verifying the prologue. Returns `None` (logging once)
 /// while PROBE-PENDING or on a signature mismatch — the feature simply stays inert.
-fn replace_tool_fn(base: usize) -> Option<ReplaceToolFn> {
+fn equip_fn(base: usize) -> Option<EquipFn> {
     // PROBE-PENDING gate: RVA 0 means unresolved. When the probe fills RVA it fills SIG too, so the
     // prologue check below is meaningful; a lone RVA with an empty SIG can't happen by construction.
-    if REPLACE_TOOL_FUNC_RVA == 0 {
+    if EQUIP_FUNC_RVA == 0 {
         if !UNRESOLVED_LOGGED.swap(true, Ordering::Relaxed) {
             log::warn!(
-                "auto_equip: ReplaceTool RVA/signature PROBE-PENDING -- feature inert until pinned"
+                "auto_equip: weapon-equip fn RVA/signature PROBE-PENDING -- feature inert until pinned"
             );
         }
         return None;
     }
-    let addr = base + REPLACE_TOOL_FUNC_RVA;
-    // SAFETY: reads REPLACE_TOOL_FUNC_SIG.len() bytes inside the loaded eldenring.exe image.
-    let actual =
-        unsafe { std::slice::from_raw_parts(addr as *const u8, REPLACE_TOOL_FUNC_SIG.len()) };
-    if actual != REPLACE_TOOL_FUNC_SIG {
+    let addr = base + EQUIP_FUNC_RVA;
+    // SAFETY: reads EQUIP_FUNC_SIG.len() bytes inside the loaded eldenring.exe image.
+    let actual = unsafe { std::slice::from_raw_parts(addr as *const u8, EQUIP_FUNC_SIG.len()) };
+    if actual != EQUIP_FUNC_SIG {
         if !UNRESOLVED_LOGGED.swap(true, Ordering::Relaxed) {
             log::warn!(
-                "auto_equip: ReplaceTool signature mismatch @ {addr:#x} -- pinned 2.6.2.0 RVA stale for this build"
+                "auto_equip: weapon-equip fn signature mismatch @ {addr:#x} -- pinned 2.6.2.0 RVA stale for this build"
             );
         }
         return None;
     }
     // SAFETY: signature verified; entry is the pinned game fn.
-    Some(unsafe { std::mem::transmute::<usize, ReplaceToolFn>(addr) })
+    Some(unsafe { std::mem::transmute::<usize, EquipFn>(addr) })
 }
 
 /// The base weapon param row for a weapon FullID: category is 0 (weapon), so param_id == row; round
@@ -127,7 +132,7 @@ pub fn tick() {
         Some(b) => b,
         None => return,
     };
-    let Some(replace_tool) = replace_tool_fn(base) else {
+    let Some(equip) = equip_fn(base) else {
         return; // PROBE-PENDING or stale sig -- keep the queue; nothing granted
     };
 
@@ -170,9 +175,9 @@ pub fn tick() {
             continue; // already in that hand -- done
         }
         // SAFETY: game fn on the game thread; equip_ptr is the live EquipGameData, ids are valid.
-        let rc = unsafe { replace_tool(equip_ptr, current_id, fid, REPLACE_FLAG) };
+        let rc = unsafe { equip(equip_ptr, current_id, fid, EQUIP_FLAG) };
         log::info!(
-            "auto_equip: {:?} hand {current_id:#010x} -> {fid:#010x} (ReplaceTool rc={rc})",
+            "auto_equip: {:?} hand {current_id:#010x} -> {fid:#010x} (equip rc={rc})",
             hand
         );
     }
