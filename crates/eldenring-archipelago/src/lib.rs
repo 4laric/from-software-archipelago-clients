@@ -17,6 +17,7 @@ mod enemy_drops;
 mod fast_travel;
 mod flagpoll;
 mod flags;
+mod flask;
 mod fmg_inject;
 mod fogwall;
 mod game;

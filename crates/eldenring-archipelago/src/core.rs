@@ -486,6 +486,10 @@ impl shared::Core for Core {
                 crate::no_equip_load::set_enabled(er_logic::options::parse_no_equip_load(sd));
                 // no_fall_damage: the spirit-spring fallDamageRate=0 SpEffect, kept on the player.
                 crate::no_fall_damage::set_enabled(er_logic::options::parse_no_fall_damage(sd));
+                // flask: history-agnostic reconciled LEVELED flask (charges + potency) driven by the
+                // count of received "Progressive Flask Upgrade" items vs the slot_data `flaskLadder`.
+                // Absent/empty ladder => feature OFF. No ledger; re-runs upward every tick.
+                crate::flask::set_ladder(er_logic::flask_reconcile::parse(sd));
                 // auto_equip: received weapons get equipped into a primary hand (same option name on
                 // both apworlds). The receive loop queues weapon FullIDs; auto_equip::tick drains them.
                 crate::auto_equip::set_enabled(er_logic::options::parse_auto_equip(sd));
@@ -1314,6 +1318,10 @@ impl shared::Core for Core {
         // Cumulative set of ALL received item names — natural-key triggers need the full history
         // (a clause may require an item received many ticks ago), not just this tick's new names.
         let mut received_all: HashSet<String> = HashSet::new();
+        // HISTORY-AGNOSTIC flask reconcile: total count of "Progressive Flask Upgrade" across the
+        // WHOLE received stream (not gated by the watermarks below) — AP replays every received item
+        // on connect, so this count is stable across reconnect/save-load and needs no ledger.
+        let mut flask_upgrade_count: usize = 0;
         let mut snapshot: Vec<RecvItem> = Vec::new();
         if let Some(client) = self.client() {
             let items = client.received_items();
@@ -1325,6 +1333,9 @@ impl shared::Core for Core {
             let my_slot = client.this_player().slot();
             for (idx, ri) in items.iter().enumerate() {
                 let name = ri.item().name().to_string();
+                if name == crate::flask::FLASK_UPGRADE_ITEM {
+                    flask_upgrade_count += 1;
+                }
                 if can_grant && idx >= floor {
                     // ECHO-DEDUP: an echo of our own check whose rewritten shop row already
                     // sold the reward natively must not grant again (shop_sell::echo_skip).
@@ -2152,6 +2163,11 @@ impl shared::Core for Core {
 
         // 8b2b. no_fall_damage: fallDamageRate-0 SpEffect on the player (spirit-spring trick).
         crate::no_fall_damage::tick();
+
+        // 8b2c. flask: reconcile the leveled flask (charges + potency) UP to the rung implied by the
+        // count of received "Progressive Flask Upgrade" items. History-agnostic, upward-only,
+        // idempotent; no-op unless the slot_data `flaskLadder` armed it.
+        crate::flask::tick(flask_upgrade_count);
 
         // 8b3. auto_equip: drain queued received weapons into a primary hand (once each is in the bag).
         crate::auto_equip::tick();
