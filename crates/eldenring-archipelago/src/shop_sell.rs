@@ -34,7 +34,7 @@ use eldenring::cs::{ShopLineupParam, SoloParamRepository};
 use fromsoftware_shared::FromStatic;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// slot_data `locationFlags` (AP location id -> guarding event flag). Inverted at run to map a row's
 /// `eventFlag_forStock` back to its AP location (-> scout reward). Set by net.rs.
@@ -57,12 +57,43 @@ static ARMED_SUPPRESS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 /// un-bought checks still grant. Replaces bag-add suppression (statics above stay unpopulated).
 static ECHO_SKIP: Mutex<Option<HashMap<i64, u32>>> = Mutex::new(None);
 
+/// FOREIGN-SLOT VISIBILITY (2026-07-19, Alaric — "I want to see foreign items in shops"). The AP
+/// placeholder goods row (slot_data `apPlaceholderGoods`, = `check_lots`'s 8852). A foreign check whose
+/// vanilla ware is a REAL good the seed can grant is left VANILLA by `shop_preview` (renaming its
+/// shared FMG would rename every copy the player holds — the telescope-stone bug), so it reads as an
+/// ordinary ware and the "that's another world's item" moment is lost. Point those slots at the
+/// placeholder instead: it is already DRESSED (AP flower + "Archipelago Item", `check_lots::dress_
+/// placeholder`) and SUPPRESSED on buy (`detour::is_placeholder` — no bag clutter, no popup), and the
+/// buy still fires `eventFlag_forStock` so the flag poll reports the check and the item routes to its
+/// owner. 0 = feature off (no placeholder in slot_data).
+static FOREIGN_PLACEHOLDER: AtomicI32 = AtomicI32::new(0);
+
+/// GOODS row ids the seed can actually GRANT (from `apIdsToItemIds`) — same set `shop_preview`/
+/// `shop_icon` guard on. A foreign slot whose vanilla ware is one of these is the PROTECTED case
+/// `shop_preview` leaves vanilla, and exactly the slot we redirect to the placeholder. `None` until
+/// core supplies it → the redirect stays inert (fail closed: never redirect without knowing which
+/// wares are real, or a safe-foreign slot shop_preview could mark richly would be flattened to the
+/// generic placeholder).
+static REAL_GOODS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
 pub fn configure(location_flags: HashMap<i64, u32>) {
     log::info!(
         "shop-sell: configured {} location flag(s)",
         location_flags.len()
     );
     *CONFIGURED.lock().unwrap() = Some(location_flags);
+}
+
+/// The AP placeholder goods row (`apPlaceholderGoods`); 0 leaves the foreign-slot redirect off.
+pub fn set_foreign_placeholder(placeholder_goods: i32) {
+    FOREIGN_PLACEHOLDER.store(placeholder_goods, Ordering::Relaxed);
+    log::info!("shop-sell: foreign-slot placeholder goods = {placeholder_goods} (0 = off)");
+}
+
+/// The GOODS the seed can grant — used to spot a foreign slot whose ware is a real good (the case
+/// `shop_preview` leaves vanilla) so it can be redirected to the placeholder instead.
+pub fn set_real_goods(rows: HashSet<u32>) {
+    *REAL_GOODS.lock().unwrap() = Some(rows);
 }
 
 /// Detour hook: suppress the bag-add of `full_id` if it's a reward a rewritten slot now sells AND the
@@ -160,6 +191,12 @@ pub fn run() -> bool {
     // the 2026-07-13 Bedrock run rewrote 84 of ~410 shop checks and nothing in the log said why.
     let (mut check_rows, mut no_scout) = (0u32, 0u32);
     let (mut no_sell_id, mut no_equip_type) = (0u32, 0u32);
+    // FOREIGN-SLOT VISIBILITY: the placeholder row + the real-goods guard, and a tally of foreign
+    // slots redirected to it. `foreign_placeholder == 0` (feature off) or `real` unset leaves the
+    // redirect inert; the slots then fall through to `no_sell_id` exactly as before.
+    let foreign_placeholder = FOREIGN_PLACEHOLDER.load(Ordering::Relaxed);
+    let real_goods = REAL_GOODS.lock().unwrap().clone();
+    let mut foreign_marked = 0u32;
     // shopPreviewGoods FALLBACK (see core.rs). The pair shop_preview/shop_icon need is
     // (AP location -> the VANILLA ware in that shop row), and the vanilla ware is right here in the
     // row we are already reading. Capture it for every check row we do NOT rewrite. This MUST be read
@@ -190,8 +227,31 @@ pub fn run() -> bool {
             continue;
         };
         let Some(fid) = s.er_sell_id else {
-            // foreign reward, or an own-world reward in a category we cannot sell as a shop ware
-            // (gem/custom). Both fall through to the shop_preview display-override.
+            // No native ER item to sell: a FOREIGN reward, or an own-world gem/custom.
+            //
+            // FOREIGN-SLOT VISIBILITY: a FOREIGN slot whose vanilla ware is a real grantable GOOD is
+            // the one `shop_preview` leaves vanilla (renaming the shared FMG would rename every copy).
+            // Redirect it to the AP placeholder so it reads as an "Archipelago Item" (flower) instead
+            // of an ordinary ware. Idempotent: if it already sells the placeholder, count it and move
+            // on (do NOT push it to derived_preview — shop_preview must never override the shared
+            // placeholder FMG, which check_lots owns).
+            if foreign_placeholder != 0 && s.foreign {
+                if row.equip_id() == foreign_placeholder && row.equip_type() == 3 {
+                    foreign_marked += 1;
+                    continue; // already redirected on an earlier run()
+                }
+                if let (Some(v), Some(real)) = (vanilla, real_goods.as_ref())
+                    && er_codec::item_category_of(v as u32) == er_codec::CATEGORY_GOODS
+                    && real.contains(&er_codec::row_id_of(v as u32))
+                {
+                    // Protected foreign goods slot -> sell the placeholder (goods, equipType 3). Price
+                    // (`value`) is left untouched, so the buy costs what it did before.
+                    plan.push((id, foreign_placeholder, 3));
+                    foreign_marked += 1;
+                    continue;
+                }
+            }
+            // Safe-foreign / gem / non-goods ware: fall through to the shop_preview display-override.
             no_sell_id += 1;
             if let Some(v) = vanilla {
                 derived_preview.push((loc, v));
@@ -258,7 +318,8 @@ pub fn run() -> bool {
     );
     log::info!(
         "shop-sell: skip tally -- {check_rows} check row(s) seen, {no_scout} no scout entry, \
-         {no_sell_id} no er_sell_id (foreign/gem), {no_equip_type} unsellable category"
+         {no_sell_id} no er_sell_id (foreign/gem), {no_equip_type} unsellable category, \
+         {foreign_marked} foreign slot(s) redirected to the AP placeholder (visible-in-shop)"
     );
     let unmatched: Vec<u32> = flag_to_loc
         .keys()

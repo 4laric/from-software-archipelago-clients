@@ -520,7 +520,11 @@ impl shared::Core for Core {
                     .map(er_codec::row_id_of)
                     .collect();
                 crate::shop_icon::set_real_goods(real_goods.clone());
-                crate::shop_preview::set_real_goods(real_goods);
+                crate::shop_preview::set_real_goods(real_goods.clone());
+                // shop_sell reuses the same guard to spot a FOREIGN slot whose ware is a real good --
+                // the case shop_preview leaves vanilla -- and redirects it to the AP placeholder so it
+                // reads as an "Archipelago Item" in the shop (foreign-slot visibility, 2026-07-19).
+                crate::shop_sell::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
                 let mut region = crate::region::parse(sd);
                 // Arm shop_preview to MARK region-lock rewards that land in a shop (a lock reward
@@ -711,6 +715,11 @@ impl shared::Core for Core {
                 // by the FLAG POLL, not by the pickup id.
                 {
                     let ph = sd.get("apPlaceholderGoods").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    // Foreign-slot visibility reuses the SAME placeholder row (already dressed by
+                    // check_lots::dress_placeholder + suppressed by detour::is_placeholder), so a
+                    // protected foreign shop slot reads as an "Archipelago Item" rather than its vanilla
+                    // ware. Off (0) when the seed ships no placeholder.
+                    crate::shop_sell::set_foreign_placeholder(ph);
                     // TWO tables, kept apart. ItemLotParam_map and ItemLotParam_enemy can hold the
                     // SAME row id, so a merged dict loses the table and the client has to guess. It
                     // guessed map-first -- and every enemy lot colliding with a map id was therefore
