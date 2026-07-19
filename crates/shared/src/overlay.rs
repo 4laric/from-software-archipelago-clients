@@ -51,6 +51,13 @@ pub struct Overlay<G: Game> {
     /// fighting the player if they close it.
     auto_prompted: bool,
 
+    /// Set by the menu-bar "Connection" item to request re-opening the connect
+    /// modal. `open_popup` must run at the SAME imgui ID-stack scope where the
+    /// modal is begun (the window root) -- calling it from inside `menu_bar`
+    /// scopes the popup to the menu bar and it silently never shows. So the menu
+    /// item only raises this flag, and the root-scope render loop does the open.
+    open_connect_requested: bool,
+
     /// The text the user typed in the say input.
     say_input: String,
 
@@ -124,6 +131,7 @@ impl<G: Game> Overlay<G> {
             popup_slot: Default::default(),
             popup_password: Default::default(),
             auto_prompted: false,
+            open_connect_requested: false,
             say_input: Default::default(),
             say_history: Default::default(),
             log_was_scrolled_down: false,
@@ -301,6 +309,13 @@ impl<G: Game> Overlay<G> {
                     ui.open_popup("#connect-modal");
                     self.auto_prompted = true;
                 }
+                // On-demand reopen from the menu-bar "Connection" item. Fired HERE (window-root
+                // ID scope, the same scope render_connect_modal begins the modal in) rather than
+                // inside menu_bar, so the popup id matches and it actually shows -- the fix for
+                // the "Connection entry is dead once connected" gap.
+                if mem::take(&mut self.open_connect_requested) {
+                    ui.open_popup("#connect-modal");
+                }
                 prof!(core.base_mut().profiler(), "connect modal", {
                     self.render_connect_modal(ui, core);
                 });
@@ -378,13 +393,16 @@ impl<G: Game> Overlay<G> {
 
             // Reopen the connect form on demand, even while connected, so the player can
             // switch server/slot without deleting apconfig.json. Seeds the fields from the
-            // current config; render_connect_modal runs every frame, so open_popup shows it.
+            // current config. We must NOT call open_popup here: this runs inside menu_bar's
+            // ID scope, and a popup opened there never matches the modal begun at the window
+            // root (render_connect_modal) -- the click registered but nothing showed. Instead
+            // raise a flag the root-scope render loop consumes, next to the auto-prompt open.
             if ui.menu_item("Connection") {
                 let config = core.base().config();
                 config.url().clone_into(&mut self.popup_url);
                 config.slot().clone_into(&mut self.popup_slot);
                 self.popup_password = config.password().unwrap_or("").to_string();
-                ui.open_popup("#connect-modal");
+                self.open_connect_requested = true;
             }
 
             // Game-specific menu items (e.g. the ER item tracker toggle).
