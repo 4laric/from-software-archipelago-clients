@@ -133,10 +133,18 @@ pub fn tick(received_count: usize) {
         );
     }
 
-    // --- POTENCY: raise the held flask items' tier in place (Hexinton "Set flask level") ---------
-    // Only when we actually hold a flask item this tick (else there is nothing to swap). See the
-    // module-level windows-verify note: this axis is the UNCONFIRMED half of the feature.
-    if actions.raise_potency && cur_potency.is_some() {
+    // --- POTENCY: DISABLED 2026-07-19 — the in-place item-id swap CTDs on death. -----------------
+    // The previous impl overwrote a held flask inventory slot's `item_id` in place to `base+L*2`.
+    // ER's inventory entries carry a GaItem handle alongside the display id; rewriting only the id
+    // desyncs them, and DEATH triggers ER's flask REFILL, which walks the flask entry and crashes on
+    // the inconsistent state (Alaric CTD, archipelago20260719.log: four deaths before the first
+    // potency swap were fine; the crash is the first death AFTER `potency 0 -> 1 (swapped 2 ...)`).
+    // Charges (the direct PlayerGameData write above) are confirmed safe and stay on. Potency is
+    // parked until the SAFE path lands — most likely granting Sacred Tears as consumed goods (the
+    // player upgrades at a grace the vanilla way, no inventory rewrite), or a game-function item
+    // replace. `raise_potency`/`target_potency` still compute for logging so the ladder is visible.
+    const POTENCY_SWAP_ENABLED: bool = false;
+    if POTENCY_SWAP_ENABLED && actions.raise_potency && cur_potency.is_some() {
         let mut swapped = 0usize;
         for entry in pgd.equipment.equip_inventory_data.items_data.items_mut() {
             if entry.item_id.category() != ItemCategory::Goods {
@@ -162,5 +170,11 @@ pub fn tick(received_count: usize) {
                 actions.target_potency,
             );
         }
+    } else if actions.raise_potency && cur_potency.is_some() {
+        log::info!(
+            "flask: potency raise {} -> {} SKIPPED (in-place swap disabled -- CTDs on death; charges still applied)",
+            cur_potency.unwrap_or(0),
+            actions.target_potency,
+        );
     }
 }
