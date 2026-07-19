@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use eldenring::cs::{ChrIns, ChrInsExt, WorldChrMan};
+use eldenring::cs::{ChrIns, ChrInsExt, ChrType, WorldChrMan};
 use er_logic::scaling::{
     NUM_TIERS, ScalingConfig, blessing_floor_for_region, is_scaling_speffect,
     raw_target_for_region, speffect_id_for_tier, tier_for_region, tier_rates,
@@ -37,7 +37,14 @@ const THROTTLE: u32 = 30;
 static LAST_REGION: AtomicI32 = AtomicI32::new(i32::MIN);
 static REGION_ENTERED: Mutex<Option<Instant>> = Mutex::new(None);
 /// How long to let a freshly-entered region populate before sweeping its enemies.
-const REGION_SETTLE: Duration = Duration::from_secs(4);
+///
+/// TIGHTENED 2026-07-19 (Alaric): 4s -> 2500ms. The effective un-scaled window after a warp is this
+/// PLUS the time `play_region_id` takes to stabilize to the new region (each transient region value
+/// resets the timer), which stacked to ~8s in play -- long enough to get killed by vanilla-statted
+/// enemies before scaling arms. Shaving 1.5s here narrows that danger window while keeping a margin
+/// over the native-crash guard this delay exists for (iterating a still-spawning ChrIns set natively
+/// crashed Siofra / the Eternal Cities, 2026-07-09). If that CTD returns, raise this back toward 4s.
+const REGION_SETTLE: Duration = Duration::from_millis(2500);
 
 /// Parse slot_data at connect. The parse itself — including the SWEEP H4 / R6 refuse-to-arm on an
 /// empty/missing `regionSphereTargets` — lives in `er_logic::scaling::parse_scaling_config`
@@ -150,59 +157,52 @@ pub fn tick() {
             scaled += scale_one(chr, target, &player_handle);
         }
     }
-    // Hostile NPC invaders / phantoms (e.g. Fia's Champions, the Deathbed Companions) are `PlayerIns`
-    // entities living in `player_chr_set`, NOT in the enemy sets above -- so the enemy sweep never
-    // reached them and they stayed at vanilla scaling (the reported bug). Scale the HOSTILE ones only:
-    // an entry whose `team_type` differs from the local player's is not on our side (an invader / a
-    // hostile NPC phantom); the local player and any friendly coop allies / summoned NPCs share the
-    // player's team and are skipped. (Spirit ashes / Torrent live in `summon_buddy_chr_set` and are
-    // never touched here.) The 70xx ladder is a plain stat multiplier, so it scales a `PlayerIns`
-    // phantom exactly as it does an enemy `ChrIns`.
-    // OBSERVABILITY FIRST. The hostile-phantom sweep below has never once been seen to fire (Alaric,
-    // 2026-07-12: "we still don't have scaling on npc invaders" -- and his DLL DOES contain this code:
-    // b4ad4e7 is an ancestor of the build he ran). But the only log line here fires when something is
-    // SCALED, so "no invader was present" and "an invader was present and this sweep cannot see it"
-    // produce byte-identical logs. That is why the bug has survived: it is unfalsifiable from a log.
-    //
-    // So census the set. This prints only when the population CHANGES (not per tick), and it answers
-    // the question outright: if an invader is on screen and player_chr_set is empty, they live in some
-    // other WorldChrMan set and this sweep is looking in an empty room. If they are here but skipped,
-    // the team_type test is wrong. One session with an invader now decides it.
-    let mut census: Vec<(i32, i32)> = Vec::new();
+    // HOSTILE-PHANTOM SWEEP -- revised 2026-07-19 (Alaric: "scaling works for mobs/bosses; NPC
+    // invaders specifically don't scale"). Mobs + bosses are `ChrIns` in the open-field / block sets
+    // swept above and DO scale, so an unscaled invader is a phantom entity, not a `ChrIns` in those
+    // sets. The prior sweep touched only `player_chr_set` and skipped any entry whose `team_type`
+    // matched the local player's -- but an NPC invader (BloodyFingerNpc / RecusantNpc) summoned into a
+    // co-op session can share the host's `team_type`, so that `== player_team` skip silently excluded
+    // exactly the entities it was meant to scale. Key off the unambiguous `chr_type` instead (see
+    // `is_hostile_phantom`): scale the actual hostiles (player + NPC invaders, duelists), never the
+    // local player, friendly white/blue phantoms, white-summon NPCs, or cosmetic ghosts. The 70xx
+    // ladder is a plain stat multiplier, so it scales a `PlayerIns` phantom just like an enemy `ChrIns`.
+
+    // Census (set, npc_id, chr_type, team) across ALL phantom-bearing sets, printed only when the
+    // population CHANGES. If an invader ever appears in a set the scaling sweep below doesn't cover,
+    // this names it outright (set + chr_type) so one co-op session settles where invaders live.
+    let mut census: Vec<(&'static str, i32, i32, i32)> = Vec::new();
     for p in wcm.player_chr_set.characters() {
-        census.push((p.chr_ins.npc_id, p.chr_ins.team_type as i32));
+        let c = &p.chr_ins;
+        census.push(("player", c.npc_id, c.chr_type as i32, c.team_type as i32));
+    }
+    for c in wcm.ghost_chr_set.characters() {
+        census.push(("ghost", c.npc_id, c.chr_type as i32, c.team_type as i32));
+    }
+    for c in wcm.summon_buddy_chr_set.characters() {
+        census.push(("summon", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
     {
-        use std::sync::Mutex;
-        static LAST: Mutex<Option<Vec<(i32, i32)>>> = Mutex::new(None);
+        static LAST: Mutex<Option<Vec<(&'static str, i32, i32, i32)>>> = Mutex::new(None);
         let mut last = LAST.lock().unwrap();
         if last.as_ref() != Some(&census) {
             log::info!(
-                "enemy-scaling: player_chr_set census = {} entr(ies) (player_team={player_team}): {:?} \
-                 -- an NPC invader on screen with an EMPTY census means invaders are NOT in this set",
-                census.len(),
+                "enemy-scaling: phantom census (set,npc_id,chr_type,team) player_team={player_team}: {:?}",
                 census
             );
-            *last = Some(census);
+            *last = Some(census.clone());
         }
     }
 
+    // Scale hostiles wherever a phantom can live (player_chr_set + summon_buddy_chr_set): keyed off
+    // chr_type, so the set an invader lands in no longer matters and no friendly is ever touched.
+    // (ghost_chr_set is cosmetic bloodstain/message/replay playback -- non-interactive, left alone;
+    // the census still watches it in case that assumption is ever wrong.)
     for p in wcm.player_chr_set.characters() {
-        let team = p.chr_ins.team_type;
-        if team == player_team {
-            continue; // local player or a same-team ally
-        }
-        let ty = p.chr_ins.chr_type;
-        let applied = scale_one(&mut p.chr_ins, target, &player_handle);
-        if applied > 0 {
-            scaled += applied;
-            // Diagnostic: fires once per phantom (scale_one no-ops once it carries the tier), so a
-            // test session's log names exactly what got scaled -- confirm Fia's Champions land here.
-            log::info!(
-                "enemy-scaling: scaled hostile player_chr_set entry (chr_type={ty:?} team={team} npc_id={})",
-                p.chr_ins.npc_id
-            );
-        }
+        scaled += scale_hostile_phantom(&mut p.chr_ins, target, &player_handle);
+    }
+    for c in wcm.summon_buddy_chr_set.characters() {
+        scaled += scale_hostile_phantom(c, target, &player_handle);
     }
     if scaled > 0 {
         let RegionScaleDbg {
@@ -222,6 +222,45 @@ pub fn tick() {
             if dlc_region { ", DLC region" } else { "" },
         );
     }
+}
+
+/// True for chr_types that are ACTUAL hostiles worth scaling -- player invaders (BloodyFinger /
+/// Recusant / FesteringBloodyFinger), NPC invaders (BloodyFingerNpc / RecusantNpc), and arena/world
+/// duelists (Duelist / GrayPhantom). False for everything friendly or cosmetic: the local player,
+/// white/blue phantoms, white-summon NPCs, and every ghost variant. Keyed off chr_type because the
+/// old `team_type != player_team` test wrongly skipped NPC invaders that share the host's team in co-op.
+fn is_hostile_phantom(t: ChrType) -> bool {
+    matches!(
+        t,
+        ChrType::Duelist
+            | ChrType::GrayPhantom
+            | ChrType::BloodyFinger
+            | ChrType::Recusant
+            | ChrType::FesteringBloodyFinger
+            | ChrType::BloodyFingerNpc
+            | ChrType::RecusantNpc
+    )
+}
+
+/// Scale one phantom-set entry ONLY if it is an actual hostile (see `is_hostile_phantom`); otherwise a
+/// no-op. Returns 1 if it (re)applied the tier. Logs once per hostile that gets scaled (scale_one
+/// no-ops once the entry already carries the tier), so a co-op session's log names exactly what landed.
+fn scale_hostile_phantom(
+    chr: &mut ChrIns,
+    target: i32,
+    player_handle: &eldenring::cs::FieldInsHandle,
+) -> u32 {
+    if !is_hostile_phantom(chr.chr_type) {
+        return 0;
+    }
+    let (ty, team, npc_id) = (chr.chr_type, chr.team_type, chr.npc_id);
+    let applied = scale_one(chr, target, player_handle);
+    if applied > 0 {
+        log::info!(
+            "enemy-scaling: scaled hostile phantom (chr_type={ty:?} team={team} npc_id={npc_id})"
+        );
+    }
+    applied
 }
 
 /// Ensure one enemy carries exactly `target` as its scaling SpEffect: skip if it already has it, else
