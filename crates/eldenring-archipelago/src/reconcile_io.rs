@@ -97,10 +97,24 @@ impl Default for LiveGame {
     }
 }
 
-/// Walk the player's held goods and report whether a specific goods FullID is present. Same
-/// enumeration path as `inventory::scan_synthetics` / `upgrades.rs`
-/// (`GameDataMan -> main_player_game_data -> equipment.equip_inventory_data.items_data.items()`),
-/// which is proven in-game.
+/// Walk the player's held goods and report whether a specific goods FullID is present.
+///
+/// MULTIPLAYER KEY-ITEM-LIST SWITCH (fix 2026-07-19; the Morgott's-Great-Rune re-grant loop CTD).
+/// The obvious path — `items_data.items()` — is WRONG in an online session. `items()` walks
+/// `current_key_entries()`, which follows `key_items_accessor`; per the crate that accessor "in
+/// single-player typically points to `key_items`; in MULTIPLAYER it switches to
+/// `multiplay_key_items`" — a short list holding only pots + wondrous physick tears, NO Great Runes
+/// or other key items. So in a 2-player co-op session an already-held Great Rune (which lives in the
+/// always-single-player `key_items` list) reads as MISSING, the reconciler re-grants it EVERY tick,
+/// and the re-grant flood CTDs (Alaric + Andrew playtest, `archipelago20260719 Copy 4.log`: the
+/// reconciler applied a Morgott's-Great-Rune action every frame after a Roundtable warp).
+///
+/// The fix scans all THREE backing lists explicitly instead of the accessor-following `items()`:
+///   * `normal_entries()`         — consumables, materials, most goods;
+///   * `key_entries()`            — the ALWAYS-single-player key items (Great Runes, quest keys); this
+///                                  is the list `items()` stops seeing in multiplayer;
+///   * `multiplay_key_entries()`  — the online pots/physick-tears list.
+/// A goods row present in ANY of them counts as held, in single-player OR co-op.
 ///
 /// NOTE(windows-verify) — GOODS-ID MASK REVIEW (Gap 3; CANNOT be host-tested — this crate is
 /// Windows-only). `goods` is the GRANT FullID `GOODS_FULLID | row` where `GOODS_FULLID = 0x4000_0000`
@@ -129,15 +143,25 @@ impl Default for LiveGame {
 /// comment. The proposed alternative (double-mask) is noted inline below.
 fn inventory_has_goods(goods: i32) -> bool {
     use eldenring::cs::{GameDataMan, ItemCategory};
-    use fromsoftware_shared::FromStatic;
+    use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
 
     let gdm = match unsafe { GameDataMan::instance() } {
         Ok(g) => g,
         Err(_) => return false,
     };
     let pgd = gdm.main_player_game_data.as_ref();
+    let inv = &pgd.equipment.equip_inventory_data.items_data;
     let want_row = (goods as u32 & 0x0FFF_FFFF) as i32;
-    for entry in pgd.equipment.equip_inventory_data.items_data.items() {
+    // Scan all three backing lists (NOT items(), which follows the accessor and goes blind to the
+    // single-player key items — Great Runes — in an online session). key_entries() is the always-SP
+    // key list; multiplay_key_entries() is the online pots/tears list; normal_entries() is the rest.
+    for entry in inv
+        .normal_entries()
+        .iter()
+        .chain(inv.key_entries().iter())
+        .chain(inv.multiplay_key_entries().iter())
+        .non_empty()
+    {
         if entry.item_id.category() != ItemCategory::Goods {
             continue;
         }
