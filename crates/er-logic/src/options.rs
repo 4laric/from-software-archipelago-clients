@@ -70,6 +70,12 @@ pub fn parse_auto_equip(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "auto_equip")
 }
 
+/// `options.no_fall_damage` (int-or-bool). When on, the player never takes fall damage (the
+/// spirit-spring `fallDamageRate=0` trick, applied permanently -- see [`crate::no_fall_damage`]).
+pub fn parse_no_fall_damage(slot_data: &Value) -> bool {
+    parse_bool_option(slot_data, "no_fall_damage")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +176,19 @@ mod tests {
             &json!({ "options": { "auto_equip": 0 } })
         ));
         assert!(!parse_auto_equip(&json!({ "options": {} })));
+    }
+
+    #[test]
+    fn no_fall_damage_parses() {
+        assert!(parse_no_fall_damage(
+            &json!({ "options": { "no_fall_damage": 1 } })
+        ));
+        assert!(parse_no_fall_damage(
+            &json!({ "options": { "no_fall_damage": true } })
+        ));
+        assert!(!parse_no_fall_damage(
+            &json!({ "options": { "no_fall_damage": 0 } })
+        ));
+        assert!(!parse_no_fall_damage(&json!({ "options": {} })));
     }
 }

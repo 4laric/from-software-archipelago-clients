@@ -484,6 +484,8 @@ impl shared::Core for Core {
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
                 crate::no_equip_load::set_enabled(er_logic::options::parse_no_equip_load(sd));
+                // no_fall_damage: the spirit-spring fallDamageRate=0 SpEffect, kept on the player.
+                crate::no_fall_damage::set_enabled(er_logic::options::parse_no_fall_damage(sd));
                 // auto_equip: received weapons get equipped into a primary hand (same option name on
                 // both apworlds). The receive loop queues weapon FullIDs; auto_equip::tick drains them.
                 crate::auto_equip::set_enabled(er_logic::options::parse_auto_equip(sd));
@@ -2147,6 +2149,9 @@ impl shared::Core for Core {
 
         // 8b2. no_equip_load: weightless-equipment SpEffect on the player (param edit + apply).
         crate::no_equip_load::tick();
+
+        // 8b2b. no_fall_damage: fallDamageRate-0 SpEffect on the player (spirit-spring trick).
+        crate::no_fall_damage::tick();
 
         // 8b3. auto_equip: drain queued received weapons into a primary hand (once each is in the bag).
         crate::auto_equip::tick();
