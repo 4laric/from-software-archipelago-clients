@@ -7,6 +7,7 @@ pub enum Shape {
     Any,
     Bool,
     BoolOrInt,
+    FlaskLadder,
     Int,
     IntList,
     IntOrBool,
@@ -69,6 +70,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "dungeonSweeps", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "sweepLockGates", shape: Shape::StrMap, required: false, greenfield: true },
     ContractKey { name: "progressiveGrants", shape: Shape::NestedGrants, required: false, greenfield: true },
+    ContractKey { name: "flaskLadder", shape: Shape::FlaskLadder, required: false, greenfield: true },
     ContractKey { name: "death_link", shape: Shape::BoolOrInt, required: false, greenfield: true },
     ContractKey { name: "no_weapon_requirements", shape: Shape::BoolOrInt, required: false, greenfield: true },
     ContractKey { name: "enable_dlc", shape: Shape::BoolOrInt, required: false, greenfield: true },
@@ -143,6 +145,10 @@ fn shape_ok(shape: Shape, v: &Value) -> bool {
                         .is_some_and(|f| f.iter().all(is_int))
             })))
         }),
+        Shape::FlaskLadder => v.as_array().is_some_and(|a| {
+            a.iter().all(|e| e.get("charges").is_some_and(is_int)
+                && e.get("potency").is_some_and(is_int))
+        }),
         Shape::OptionsDict => v.is_object(),
         Shape::Any => true,
     }
@@ -183,6 +189,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "03c58b40";
+pub const CONTRACT_HASH: &str = "54514b10";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.2.0";
 

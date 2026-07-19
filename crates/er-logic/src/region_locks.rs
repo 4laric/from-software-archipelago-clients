@@ -165,12 +165,6 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         play_regions: &[40020, 41010, 42020, 69000, 69020, 69030],
     },
     BakedRegionLock {
-        region: "Scaduview",
-        lock_item: "Scaduview Lock",
-        open_flag: Some(76935),
-        play_regions: &[69300],
-    },
-    BakedRegionLock {
         region: "Sewer",
         lock_item: "Sewer Lock",
         open_flag: Some(73501),
@@ -180,7 +174,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Shadow Keep",
         lock_item: "Shadow Keep Lock",
         open_flag: Some(72102),
-        play_regions: &[21000, 21010, 21020],
+        play_regions: &[21000, 21010, 21020, 69300],
     },
     BakedRegionLock {
         region: "Siofra River",
