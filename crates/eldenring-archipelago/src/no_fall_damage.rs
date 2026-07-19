@@ -41,9 +41,18 @@ pub fn tick() {
         return;
     }
     let enabled = ENABLED.load(Ordering::Relaxed);
+    if !enabled {
+        // OFF -> FULLY INERT. The block below unconditionally iterated the PLAYER's special_effect
+        // list every frame (to compute `has`), which CTD'd at the death-cam transition when the
+        // player's chr_ins is being torn down (archipelago20260719 Copy 2.log). A disabled feature
+        // must never touch the player. The strip-when-toggled-off path is unreachable: ENABLED is set
+        // once at connect, so !enabled => never applied this session => nothing to strip (a leftover
+        // from a prior on-session is a harmless fallDamageRate=0 no-op row).
+        return;
+    }
 
-    // One-time param edit: fallDamageRate -> 0 on our chosen row. Only once enabled; latch the session.
-    if enabled && !PARAM_PATCHED.load(Ordering::Relaxed) {
+    // One-time param edit: fallDamageRate -> 0 on our chosen row (enabled is guaranteed here).
+    if !PARAM_PATCHED.load(Ordering::Relaxed) {
         // SAFETY: FD4 singleton; only mutated on the single-threaded FrameBegin tick.
         let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
             return;
@@ -58,23 +67,25 @@ pub fn tick() {
         }
     }
 
-    // Apply to (or strip from) the player. SAFETY: FD4 singleton; single-threaded tick.
+    // Apply to the player. SAFETY: FD4 singleton; single-threaded tick.
     let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
         return;
     };
     let Some(player) = wcm.main_player.as_mut() else {
         return;
     };
+    // DEATH GUARD: the player's chr_ins + special_effect list tear down at the death-cam transition;
+    // iterating/mutating them there CTDs. hp <= 0 = dead/dying -> skip until respawn (the apply
+    // re-runs once hp > 0). Reading hp here is the same access DeathLink's read_local_hp does safely.
+    if player.chr_ins.modules.data.hp <= 0 {
+        return;
+    }
     let chr = &mut player.chr_ins;
-    let has = chr
+    if !chr
         .special_effect
         .entries()
-        .any(|e| e.param_id == SP_EFFECT_ID);
-    if enabled {
-        if !has {
-            chr.apply_speffect(SP_EFFECT_ID, false);
-        }
-    } else if has {
-        chr.remove_speffect(SP_EFFECT_ID);
+        .any(|e| e.param_id == SP_EFFECT_ID)
+    {
+        chr.apply_speffect(SP_EFFECT_ID, false);
     }
 }
