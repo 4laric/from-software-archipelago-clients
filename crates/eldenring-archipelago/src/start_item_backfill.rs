@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eldenring::cs::{GameDataMan, ItemCategory};
-use fromsoftware_shared::FromStatic;
+use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
 
 static START_ITEMS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -74,8 +74,24 @@ pub fn tick(settled: bool) {
     let pgd = gdm.main_player_game_data.as_ref();
 
     // Snapshot the held inventory as FullIDs.
+    //
+    // MULTIPLAYER KEY-LIST SCAN (fix 2026-07-19; Andrew's co-op reconnect re-granted his base flask).
+    // Do NOT use `items_data.items()` here: it follows `key_items_accessor`, which in an ONLINE
+    // session switches to `multiplay_key_items` (pots + wondrous physick tears only). The Flask of
+    // Crimson Tears and other key-item startItems live in the always-single-player `key_items` list,
+    // so `items()` reads them as ABSENT in co-op -> the backfill re-grants a flask the player already
+    // holds. Scan all three backing lists (normal + always-SP key + multiplay key) so a held item is
+    // always seen. (Sold/discarded items still read absent and are re-granted -- acceptable per the
+    // backstop's per-launch design.)
+    let inv = &pgd.equipment.equip_inventory_data.items_data;
     let mut present: HashSet<u32> = HashSet::new();
-    for entry in pgd.equipment.equip_inventory_data.items_data.items() {
+    for entry in inv
+        .normal_entries()
+        .iter()
+        .chain(inv.key_entries().iter())
+        .chain(inv.multiplay_key_entries().iter())
+        .non_empty()
+    {
         // `entry.item_id` is a valid `ItemId` here (not `OptionalItemId`), so category()/param_id()
         // return the values directly -- same access inventory.rs::scan_synthetics uses.
         present.insert(full_id_of(
