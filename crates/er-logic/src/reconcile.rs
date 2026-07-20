@@ -101,6 +101,26 @@ pub fn legacy_adopt(legacy_watermark: ItemIndex, live_play_time_ms: u32) -> Char
     }
 }
 
+/// Choose the `play_time_ms` stamp to persist for a character's ledger entry (the value
+/// [`seed_trust`] later compares against to tell "same character resuming" from "new character in a
+/// reused save slot").
+///
+/// * FRESH character -> reset the stamp to its own `live` playtime. A new character in a reused save
+///   slot must NOT inherit the previous occupant's (possibly high) stamp, or a still-newer character
+///   would be misjudged.
+/// * SAME character (resume / periodic re-stamp) -> `max(stored, live)`, MONOTONIC. `play_time` only
+///   grows for one character, so a read that comes back LOWER than the stored stamp is a transient
+///   bad/early read (observed 2026-07-20: `GameDataMan.play_time` read 0 at persist time on a
+///   multi-minute save, freezing the stamp at 0 and silently disabling the reuse guard). Never let
+///   such a read regress a known-good stamp.
+pub fn stamp_playtime(stored: Option<u32>, live: u32, fresh_character: bool) -> u32 {
+    if fresh_character {
+        live
+    } else {
+        stored.unwrap_or(0).max(live)
+    }
+}
+
 /// What one received AP item MEANS to the client. Precomputed by the client from slot_data (which
 /// knows the ER FullID / flag mapping of each AP item id) so this module needs no item database.
 ///
@@ -1607,12 +1627,16 @@ mod tests {
 
         let planned = r.dry_run_actions(&g);
         assert!(planned.iter().any(|a| matches!(a, Action::SetFlag(76971))));
-        assert!(planned
-            .iter()
-            .any(|a| matches!(a, Action::GrantUnique(191, _))));
-        assert!(planned
-            .iter()
-            .any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. })));
+        assert!(
+            planned
+                .iter()
+                .any(|a| matches!(a, Action::GrantUnique(191, _)))
+        );
+        assert!(
+            planned
+                .iter()
+                .any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. }))
+        );
         // Nothing was applied: no flags, no goods, no ledger entries, watermark untouched.
         assert!(g.flags.is_empty() && g.goods.is_empty() && g.ledger_log.is_empty());
         assert_eq!(r.applied_watermark(), 0);
@@ -2982,5 +3006,33 @@ mod tests {
             1,
             "the watermark still advances past the echo index"
         );
+    }
+}
+
+#[cfg(test)]
+mod stamp_playtime_tests {
+    use super::stamp_playtime;
+
+    #[test]
+    fn fresh_character_resets_to_its_own_live_playtime() {
+        // A new character in a reused slot must not inherit the old occupant's high stamp.
+        assert_eq!(stamp_playtime(Some(442_078), 5_773, true), 5_773);
+        assert_eq!(stamp_playtime(None, 0, true), 0);
+    }
+
+    #[test]
+    fn resume_is_monotonic_never_regresses() {
+        // The frozen-0 bug: stored stamp is 0, a good live read must lift it.
+        assert_eq!(stamp_playtime(Some(0), 267_817, false), 267_817);
+        // A transient low/0 read must NOT clobber a known-good stamp.
+        assert_eq!(stamp_playtime(Some(267_817), 0, false), 267_817);
+        assert_eq!(stamp_playtime(Some(267_817), 5_773, false), 267_817);
+        // Normal growth carries forward.
+        assert_eq!(stamp_playtime(Some(267_817), 300_000, false), 300_000);
+    }
+
+    #[test]
+    fn resume_with_no_prior_entry_takes_live() {
+        assert_eq!(stamp_playtime(None, 12_345, false), 12_345);
     }
 }

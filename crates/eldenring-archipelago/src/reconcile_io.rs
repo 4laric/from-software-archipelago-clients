@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use er_logic::reconcile::{
     ApplyClasses, CharLedger, DesiredInputs, GameIo, Reconciler, TickBudget, WorldStability,
-    legacy_adopt, seed_trust,
+    legacy_adopt, seed_trust, stamp_playtime,
 };
 use serde::{Deserialize, Serialize};
 
@@ -536,6 +536,22 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         "[reconcile] ledger seed: save_slot={save_slot:?} play_time={play_time} entry={entry:?} fresh_character={fresh_character} persisted={persisted:?} received_through={received_through} -> watermark {}",
         reconciler.applied_watermark()
     );
+    // Re-stamp the ledger NOW with the correctly-read seed-time play_time. The tick-tail persist
+    // (below) can run when `read_play_time_ms()` momentarily reads 0, freezing the stamp and
+    // silently disabling the save-slot-reuse guard in `seed_trust` (observed 2026-07-20:
+    // play_time_ms stuck at 0 across sessions on a multi-minute save). `stamp_playtime` keeps it
+    // monotonic for a resuming character and resets it for a fresh one.
+    if let Some(ss) = save_slot {
+        let stored = entry.as_ref().map(|e| e.play_time_ms);
+        store.set(
+            &slot,
+            ss,
+            CharLedger {
+                watermark: reconciler.applied_watermark(),
+                play_time_ms: stamp_playtime(stored, play_time, fresh_character),
+            },
+        );
+    }
     let driver = Driver {
         reconciler,
         io: LiveGame::new(),
@@ -611,16 +627,18 @@ pub fn tick() {
     // the next stable tick persists again.
     let wm = d.reconciler.applied_watermark();
     if d.save_slot >= 0
-        && let Some(play_time_ms) = read_play_time_ms()
+        && let Some(live) = read_play_time_ms()
     {
         let slot = d.slot.clone();
         let save_slot = d.save_slot;
+        // MONOTONIC: never let a transient low/0 read regress a known-good stamp (see init above).
+        let stored = d.store.get(&slot, save_slot).map(|e| e.play_time_ms);
         d.store.set(
             &slot,
             save_slot,
             CharLedger {
                 watermark: wm,
-                play_time_ms,
+                play_time_ms: stamp_playtime(stored, live, false),
             },
         );
     }
