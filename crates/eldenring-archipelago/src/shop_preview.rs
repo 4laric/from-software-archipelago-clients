@@ -128,25 +128,24 @@ pub fn run() -> bool {
         }
         let gid = er_codec::row_id_of(full);
         // THE GUARD (see the module header): the FMG entry is shared, so renaming the good behind this
-        // slot renames every copy the player can hold. If the seed can grant this good, leave the slot
-        // showing its vanilla name -- one slot lying about one reward beats a renamed stone economy.
-        // EXCEPTION: region locks override anyway -- an unmarked region key is a worse trade than one
-        // shared note FMG reading "Ensis Lock". The good id is logged so a rare stone-row lock is visible.
-        if real.contains(&gid) && !is_lock {
+        // slot renames EVERY copy the player can hold -- globally, for the whole run. If the seed can
+        // grant this good, leave the slot showing its vanilla name; one slot lying about one reward
+        // beats mislabeling every copy of a real good in the player's inventory.
+        // Region locks are NOT exempt (2026-07-20): a lock ware that collides with a grantable real
+        // good produced "9 Leyndell Locks" in a player's bag (the ware was real good row 9510). An
+        // unmarked shop slot is the lesser evil; the honest fix is repointing the lock slot at a
+        // dedicated placeholder good (the 8852 pattern) so it can be marked without hijacking a real
+        // row -- see the shop-placeholder follow-up.
+        if real.contains(&gid) {
             protected += 1;
             continue;
         }
         // Pure, host-tested formatters (er-logic name_override) so the exact GoodsName + caption a
         // lock/foreign slot shows is pinned by unit test, not inlined here.
         let lbl = if is_lock {
+            // A lock ware that is a real good was protected above; only synthetic/non-grantable lock
+            // wares reach here, so renaming them is safe (nothing else shares the row).
             locks += 1;
-            if real.contains(&gid) {
-                log::info!(
-                    "shop-preview: region lock '{}' overrides a REAL good (row {gid}) -- one shared FMG \
-                     entry now reads the lock name (acceptable for a region key)",
-                    s.name
-                );
-            }
             er_logic::name_override::shop_lock_label(&s.name)
         } else {
             overridden += 1;

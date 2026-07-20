@@ -134,20 +134,14 @@ pub fn run() -> bool {
         }
         // THE GUARD. set_icon_id writes the shared EquipParamGoods row, so this is global and
         // permanent for the run. If the player can be granted this good, flowering it repaints every
-        // copy they will ever hold. Leave the slot showing its vanilla ware instead: a shop slot that
-        // lies about ONE reward is a local, reversible annoyance; a smithing-stone economy that has
-        // been renamed and re-iconed is not. (Restoring an honest preview for these slots needs the
-        // row itself repointed at a placeholder good -- see the shop-placeholder follow-up.)
-        // THE GUARD -- but region locks flower anyway (an unmarked region key beats one re-iconed note).
-        if real.contains(&gid) && !is_lock {
+        // copy they will ever hold. Leave the slot showing its vanilla ware instead.
+        // Region locks are NOT exempt (2026-07-20): a lock ware colliding with a grantable real good
+        // re-iconed every copy in the player's bag (row 9510 -> "9 Leyndell Locks"). An unmarked slot
+        // is the lesser evil; the honest fix repoints the lock slot at a placeholder good so it can be
+        // flowered without hijacking a real row -- see the shop-placeholder follow-up.
+        if real.contains(&gid) {
             protected += 1;
             continue;
-        }
-        if is_lock && real.contains(&gid) {
-            log::info!(
-                "shop-icon: region lock flowers a REAL good (row {gid}) -- that good's shared icon is \
-                 now the AP flower (acceptable for a region key)"
-            );
         }
         if let Some(row) = repo.get_mut::<EquipParamGoods>(gid)
             && row.icon_id() != tele_icon
