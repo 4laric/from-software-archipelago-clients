@@ -1,9 +1,11 @@
 //! DeathLink (Milestone B Stage 5).
 //!
-//! INCOMING: a foreign DeathLink event latches a kill; the game tick sets flag 76996, whose baked
-//! `common.emevd` reactor (event 6996) does `ForceCharacterDeath(10000, true)` — a KEEP-RUNES death.
-//! Clears the latch only on a successful flag set, so a kill latched on a menu/load screen retries
-//! until in-world.
+//! INCOMING: a foreign DeathLink event latches a kill. On a vanilla (pure-runtime) game there is
+//! no baked reactor, so the tick does a direct HP-write death; KEEP-RUNES is preserved by
+//! snapshotting `rune_count` before the kill, zeroing it so the (late) bloodstain bank drops
+//! nothing, and writing the snapshot back on respawn (see `drive_kill`). Flag 76996 is still
+//! set best-effort for bake-compat setups. The kill latch clears only on a successful kill,
+//! so a kill latched on a menu/load screen retries until in-world.
 //!
 //! OUTGOING (RE-hole): detecting a LOCAL death needs the player HP / death-state cell, which the
 //! standalone never resolved in the `eldenring` crate. `read_local_death` returns false for now, so
@@ -12,7 +14,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eldenring::cs::WorldChrMan;
+use std::sync::Mutex;
+
+use eldenring::cs::{GameDataMan, WorldChrMan};
+use er_logic::deathlink::KeepRunes;
 use fromsoftware_shared::FromStatic;
 
 /// Flag the baked `common.emevd` reactor (event 6996) watches: set on an incoming DeathLink -> the
@@ -22,6 +27,10 @@ const DEATHLINK_KILL_FLAG: u32 = 76996;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static KILL_PENDING: AtomicBool = AtomicBool::new(false);
 static WAS_DEAD: AtomicBool = AtomicBool::new(false);
+
+/// Keep-runes decision state for incoming DeathLink deaths (see `drive_kill`). Single-threaded
+/// game-tick access; the `Mutex` just satisfies `static` mutability. Logic lives in er-logic.
+static KEEP_RUNES: Mutex<KeepRunes> = Mutex::new(KeepRunes::new());
 
 /// Set from slot_data `options.death_link` at connect.
 pub fn set_enabled(on: bool) {
@@ -37,24 +46,69 @@ pub fn latch_incoming_kill() {
     KILL_PENDING.store(true, Ordering::Relaxed);
 }
 
-/// Per-tick: if a kill is pending and we're in-world, set the reactor flag (event 6996 -> keep-runes
-/// death). Latch clears only on a successful set, so a kill latched on a menu/load screen retries.
+/// Per-tick driver for INCOMING DeathLink. Two legs:
+///
+/// * KEEP-RUNES RESTORE (ungated, runs first): if a previous kill zeroed the player's runes, write
+///   the snapshot back once they are in-world and alive again. Ungated so a `death_link` that is
+///   toggled off mid-death still pays back what we withheld.
+/// * KILL: if a kill is pending and we're in-world, do the direct HP-write death
+///   (`kill_local_player` pre-arms WAS_DEAD, suppressing the outgoing echo), zeroing held runes
+///   first so the vanilla death banks an EMPTY bloodstain -- then arm the restore. The dedicated
+///   flag is still set best-effort for bake-compat setups. Latch clears only on a successful kill,
+///   so a kill latched on a menu/load screen retries.
 pub fn drive_kill() {
+    // --- KEEP-RUNES RESTORE leg (ungated: we may owe runes even if death_link was just disabled) ---
+    if let Ok(mut keep) = KEEP_RUNES.lock() {
+        if let Some(runes) = keep.poll_restore(crate::flags::in_world(), read_local_hp()) {
+            write_rune_count(runes);
+            log::info!("DeathLink: keep-runes restored {runes} runes after respawn");
+        }
+    }
+
     // R2 (SWEEP H2): belt-and-braces -- a stale latched kill must never fire once death_link is
     // known-disabled for this slot (the event handler gates too, but the latch can outlive it).
     if !is_enabled() {
         return;
     }
     // PURE-RUNTIME (2026-07-01): no baked common.emevd reactor exists on a vanilla game, so the
-    // kill is a direct HP write (kill_local_player pre-arms WAS_DEAD, suppressing the echo).
-    // The flag is still set best-effort for bake-compat setups. Retries until in-world & alive.
-    // NOTE: direct kill has no keep-runes (the reactor's ForceCharacterDeath(10000, true) did).
-    if KILL_PENDING.load(Ordering::Relaxed) && crate::flags::in_world() && kill_local_player() {
-        let _ = crate::flags::try_set_event_flag(DEATHLINK_KILL_FLAG, true);
-        KILL_PENDING.store(false, Ordering::Relaxed);
-        log::info!(
-            "DeathLink: incoming kill applied (direct HP write; flag {DEATHLINK_KILL_FLAG} best-effort)"
-        );
+    // kill is a direct HP write. KEEP-RUNES (2026-07-20): the reactor's ForceCharacterDeath(_, true)
+    // used to hold runes; we replicate it by snapshotting rune_count BEFORE the kill and zeroing it
+    // right after, so the (late -- observed "way after YOU DIED") bloodstain bank sees 0 and drops
+    // nothing. The restore leg above pays the snapshot back on respawn.
+    if KILL_PENDING.load(Ordering::Relaxed) && crate::flags::in_world() {
+        let snapshot = read_rune_count(); // BEFORE the kill; None if GameDataMan is down -> vanilla drop
+        if kill_local_player() {
+            if let Some(runes) = snapshot {
+                write_rune_count(0);
+                if let Ok(mut keep) = KEEP_RUNES.lock() {
+                    keep.arm(Some(runes));
+                }
+            }
+            let _ = crate::flags::try_set_event_flag(DEATHLINK_KILL_FLAG, true);
+            KILL_PENDING.store(false, Ordering::Relaxed);
+            match snapshot {
+                Some(runes) => log::info!(
+                    "DeathLink: incoming kill applied (keep-runes: {runes} runes withheld; flag {DEATHLINK_KILL_FLAG} best-effort)"
+                ),
+                None => log::warn!(
+                    "DeathLink: incoming kill applied but GameDataMan was down -- runes NOT kept (vanilla drop); flag {DEATHLINK_KILL_FLAG} best-effort"
+                ),
+            }
+        }
+    }
+}
+
+/// Read the local player's held rune count (`GameDataMan -> main_player_game_data -> rune_count`),
+/// or None before the player game data is up. Same singleton idiom as `inventory`/`upgrades`.
+fn read_rune_count() -> Option<u32> {
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    Some(gdm.main_player_game_data.as_ref().rune_count)
+}
+
+/// Write the local player's held rune count. No-op before the player game data is up.
+fn write_rune_count(value: u32) {
+    if let Ok(gdm) = unsafe { GameDataMan::instance_mut() } {
+        gdm.main_player_game_data.as_mut().rune_count = value;
     }
 }
 
