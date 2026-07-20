@@ -12,9 +12,12 @@
 //! copies == grant 13x), and is preserved: an item present even once satisfies ALL its copies (we
 //! don't top up a partly-used stack), an entirely-absent item yields all its copies back.
 //!
-//! Flask nuance: the Flask of Crimson Tears / Cerulean Tears each have an empty/charged id pair
-//! (HP {1000,1001}, FP {1050,1051}); an EMPTY flask still counts as "have a flask", so any family
-//! member's presence satisfies the whole family (never re-grant a flask you just drank).
+//! Flask nuance: the Flask of Crimson Tears / Cerulean Tears each span a CONTIGUOUS goods-id range
+//! covering every empty/charged pair for upgrade levels +0..+12 (Crimson 1000..=1025, Cerulean
+//! 1050..=1075 -- verified against EquipParamGoods + GoodsName). ANY member (empty, charged, OR any
+//! +N) counts as "have a flask", so the whole family is satisfied: never re-grant the base +0 flask
+//! to a player who already holds an upgraded one (live 2026-07-20: a base Flask of Crimson Tears was
+//! granted to a character already holding Flask of Crimson Tears +4, ids 1008/1009).
 
 use std::collections::HashSet;
 
@@ -22,14 +25,12 @@ const CATEGORY_GOODS: u32 = 0x4000_0000;
 const CATEGORY_MASK: u32 = 0xF000_0000;
 const ROW_MASK: u32 = 0x0FFF_FFFF;
 
-/// Goods rows interchangeable for "do you have this flask": empty + charged variants.
-const FLASK_FAMILIES: &[&[u32]] = &[&[1000, 1001], &[1050, 1051]];
+/// Goods-row ranges interchangeable for "do you have this flask": every empty/charged pair across
+/// upgrade levels +0..+12. Crimson (HP) 1000..=1025, Cerulean (FP) 1050..=1075.
+const FLASK_RANGES: &[std::ops::RangeInclusive<u32>] = &[1000..=1025, 1050..=1075];
 
-fn flask_family(row: u32) -> Option<&'static [u32]> {
-    FLASK_FAMILIES
-        .iter()
-        .copied()
-        .find(|fam| fam.contains(&row))
+fn flask_range(row: u32) -> Option<&'static std::ops::RangeInclusive<u32>> {
+    FLASK_RANGES.iter().find(|fam| fam.contains(&row))
 }
 
 /// The `start_items` FullIDs NOT present in `present` (the set of held inventory item ids, encoded
@@ -45,8 +46,8 @@ pub fn missing_start_items(present: &HashSet<u32>, start_items: &[i32]) -> Vec<i
                 return false;
             }
             if id & CATEGORY_MASK == CATEGORY_GOODS {
-                if let Some(fam) = flask_family(id & ROW_MASK) {
-                    if fam.iter().any(|&r| present.contains(&(CATEGORY_GOODS | r))) {
+                if let Some(fam) = flask_range(id & ROW_MASK) {
+                    if fam.clone().any(|r| present.contains(&(CATEGORY_GOODS | r))) {
                         return false;
                     }
                 }
@@ -79,6 +80,17 @@ mod tests {
         // Player holds only the EMPTY crimson flask; the charged-id start item must NOT re-grant.
         let present = set(&[FLASK_HP_EMPTY]);
         assert!(missing_start_items(&present, &[FLASK_HP]).is_empty());
+    }
+
+    #[test]
+    fn upgraded_flask_satisfies_the_family() {
+        // Live 2026-07-20: holding Flask of Crimson Tears +4 (charged id 1009) must NOT re-grant the
+        // base +0 (id 1001). Any level in the family range satisfies it.
+        let present = set(&[CATEGORY_GOODS | 1009]);
+        assert!(missing_start_items(&present, &[FLASK_HP]).is_empty());
+        // ... and an upgraded Cerulean (id 1059 = +4 charged) satisfies the FP start item.
+        let fp = (CATEGORY_GOODS | 1051) as i32;
+        assert!(missing_start_items(&set(&[CATEGORY_GOODS | 1059]), &[fp]).is_empty());
     }
 
     #[test]
