@@ -82,8 +82,19 @@ pub struct CharLedger {
 ///     watermark (never re-grants -- the flask-double-grant guard, [`crate::flask_grant_replay`]).
 pub fn seed_trust(entry: Option<CharLedger>, live_play_time_ms: u32) -> (bool, Option<ItemIndex>) {
     match entry {
-        Some(e) if live_play_time_ms >= e.play_time_ms => (false, Some(e.watermark)),
-        // rewound stamp OR no entry -> a character this ledger was never written for.
+        // Resume when the live play_time is at/above the stamp OR within a wide margin below it. We
+        // stamp play_time every reconcile tick, but the GAME only persists it on save (grace rest /
+        // quit), so a reconnect LOADS a play_time slightly BELOW our last stamp -- an unsaved-play
+        // artifact, not a rewind (observed 2026-07-20: live 4943492 vs stamp 4970376, a 27s gap, was
+        // ruled a rewind and re-granted all 158 received items). A genuinely new/different character in
+        // a reused save slot starts near 0 -- dramatically below the stamp -- so `live >= stamp/2`
+        // separates "same char, unsaved jitter" from "new char" without a stable character id (which
+        // the eldenring crate does not expose). The unique received items are inventory/flag-guarded
+        // (has_good) and skip regardless; only stackables would re-grant on the rare miss.
+        Some(e) if (live_play_time_ms as u64) * 2 >= e.play_time_ms as u64 => {
+            (false, Some(e.watermark))
+        }
+        // Far below the stamp (or no entry) -> a character this ledger was never written for.
         Some(_) | None => (true, None),
     }
 }
@@ -2663,8 +2674,23 @@ mod tests {
             watermark: START_ITEM_INDEX_BASE + 5,
             play_time_ms: 100_000,
         };
-        assert_eq!(seed_trust(Some(e), 0), (true, None)); // brand-new char in the slot
-        assert_eq!(seed_trust(Some(e), 99_999), (true, None)); // one tick short: still distrusted
+        assert_eq!(seed_trust(Some(e), 0), (true, None)); // brand-new char in the slot (live 0)
+        assert_eq!(seed_trust(Some(e), 49_999), (true, None)); // < stamp/2: a new character
+        // A small backward delta is UNSAVED-PLAY jitter (we stamp per tick; the game saves less
+        // often), NOT a rewind -- resume, do not re-grant. (Was wrongly "fresh"; regression 2026-07-20.)
+        assert_eq!(seed_trust(Some(e), 99_999), (false, Some(e.watermark)));
+    }
+
+    #[test]
+    fn seed_trust_unsaved_play_jitter_resumes() {
+        // The live bug: an 82-min character reconnected with live play_time 27s below the stamp (we
+        // stamp every tick; the game persists play_time only on save) and was ruled fresh, replaying
+        // all 158 received items. A small backward delta must RESUME.
+        let e = CharLedger {
+            watermark: 158,
+            play_time_ms: 4_970_376,
+        };
+        assert_eq!(seed_trust(Some(e), 4_943_492), (false, Some(158)));
     }
 
     #[test]
