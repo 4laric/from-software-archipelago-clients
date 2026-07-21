@@ -268,9 +268,76 @@ impl shared::Core for Core {
                 }
                 true
             }
+            "!markerprobe" => {
+                // Dev harness for the save-embedded reconcile marker band (docs/EVENT-FLAG-SPACE.md).
+                // Drives the ONE check er-logic's host tests cannot: that the PLACEHOLDER band is real,
+                // save-persisted, and vanilla-free. Verify sequence: on a clean save `!markerprobe`
+                // (scan) => expect 0 set; `set`; quit to menu + reload; `verify` => expect PASS;
+                // `clear`, play normally, `!markerprobe` => expect 0 set again.
+                let base = er_logic::marker::FlagBand::PLACEHOLDER.base;
+                let n = er_logic::marker::FlagBand::RESERVED;
+                let want = |i: u32| i % 3 == 0; // recognizable, non-trivial pattern
+                match arg.map(|a| a.trim()) {
+                    Some("set") => {
+                        let (mut ok, mut busy) = (0u32, 0u32);
+                        for i in 0..n {
+                            if crate::flags::try_set_event_flag(base + i, want(i)) {
+                                ok += 1;
+                            } else {
+                                busy += 1;
+                            }
+                        }
+                        self.log(ap::Print::message(format!(
+                            "markerprobe set every-3rd across {base}..{}: {ok} written, {busy} NOT READY",
+                            base + n
+                        )));
+                    }
+                    Some("verify") => {
+                        let bad: Vec<u32> = (0..n)
+                            .filter(|&i| crate::flags::get_event_flag(base + i) != want(i))
+                            .map(|i| base + i)
+                            .collect();
+                        self.log(ap::Print::message(if bad.is_empty() {
+                            format!("markerprobe verify: PASS (pattern intact {base}..{})", base + n)
+                        } else {
+                            format!(
+                                "markerprobe verify: FAIL ({} mismatched, first {:?})",
+                                bad.len(),
+                                bad.iter().take(8).collect::<Vec<_>>()
+                            )
+                        }));
+                    }
+                    Some("clear") => {
+                        for i in 0..n {
+                            crate::flags::try_set_event_flag(base + i, false);
+                        }
+                        self.log(ap::Print::message(format!(
+                            "markerprobe clear: {base}..{}",
+                            base + n
+                        )));
+                    }
+                    _ => {
+                        let set: Vec<u32> = (0..n)
+                            .filter(|&i| crate::flags::get_event_flag(base + i))
+                            .map(|i| base + i)
+                            .collect();
+                        self.log(ap::Print::message(format!(
+                            "markerprobe scan {base}..{}: {}/{n} set{} | usage: !markerprobe set|verify|clear",
+                            base + n,
+                            set.len(),
+                            if set.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {set:?}")
+                            }
+                        )));
+                    }
+                }
+                true
+            }
             "!help" => {
                 self.log(ap::Print::message(
-                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring>"
+                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring> | !markerprobe [set|verify|clear]"
                         .to_string(),
                 ));
                 true
