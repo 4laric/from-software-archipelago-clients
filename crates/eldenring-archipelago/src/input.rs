@@ -215,7 +215,11 @@ unsafe extern "system" fn direct_input8_create_hook(
         && ORIG_CREATE_DEVICE.load(Ordering::Relaxed) == 0
     {
         let vt = vtable_of(*out);
-        let old = patch_vtable_slot(vt, IDINPUT8_CREATEDEVICE, create_device_hook as usize);
+        let old = patch_vtable_slot(
+            vt,
+            IDINPUT8_CREATEDEVICE,
+            create_device_hook as *const () as usize,
+        );
         ORIG_CREATE_DEVICE.store(old, Ordering::Relaxed);
     }
     hr
@@ -248,12 +252,16 @@ unsafe extern "system" fn create_device_hook(
                 patch_vtable_slot(
                     vt,
                     IDIDEVICE8_GETDEVICESTATE,
-                    get_device_state_hook as usize,
+                    get_device_state_hook as *const () as usize,
                 ),
                 Ordering::Relaxed,
             );
             ORIG_GET_DEVICE_DATA.store(
-                patch_vtable_slot(vt, IDIDEVICE8_GETDEVICEDATA, get_device_data_hook as usize),
+                patch_vtable_slot(
+                    vt,
+                    IDIDEVICE8_GETDEVICEDATA,
+                    get_device_data_hook as *const () as usize,
+                ),
                 Ordering::Relaxed,
             );
         }
