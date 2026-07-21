@@ -28,9 +28,9 @@ impl shared::Game for EldenRing {
     type Core = crate::core::Core;
     /// ER renders on DX12 (DS3 is DX11).
     type GraphicsHooks = hudhook::hooks::dx12::ImguiDx12Hooks; // VERIFY: dx12 hook name in workspace hudhook
-    /// No ER input blocker exists in `fromsoftware-extra` yet; start with the no-op (overlay still
-    /// captures input via Hudhook). Swap in a real blocker when one lands.
-    type InputBlocker = shared::NoOpInputBlocker;
+    /// Real ER input blocker: hooks the standard input APIs ER uses (XInput / DirectInput8 /
+    /// GetKeyboardState) so overlay input stops leaking to the game. See `crate::input`.
+    type InputBlocker = crate::input::EldenRingInputBlocker;
     const TYPE: shared::GameType = shared::GameType::EldenRing; // requires the shared change (below)
     const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
     /// ER uses the ECHO model: the server sends our own checks back as received items, so self-found

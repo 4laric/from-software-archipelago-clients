@@ -23,6 +23,7 @@ mod fogwall;
 mod game;
 mod goal;
 mod hook_impl;
+mod input;
 mod inventory;
 mod key_resolver;
 mod keyitems;
@@ -66,6 +67,12 @@ extern "system" fn DllMain(_hinst: HINSTANCE, call_reason: u32, _reserved: *mut 
     // + must run off the loader lock), not here. It suppresses synthetic placeholders so they never
     // enter inventory — no inventory scan/removal needed under shared's own_world:false model.
 
-    shared::initialize::<game::EldenRing>(shared::NoOpInputBlocker);
+    // Install the input hooks HERE (before the game's input init), so the DirectInput8Create wrap is
+    // in place before ER creates its keyboard/mouse devices. Safe to run under the loader lock: it
+    // only resolves already-loaded imports and installs detours (no LoadLibrary).
+    // Safety: called once, on the load thread, before any game input runs.
+    unsafe { input::install() };
+
+    shared::initialize::<game::EldenRing>(input::EldenRingInputBlocker);
     true
 }
