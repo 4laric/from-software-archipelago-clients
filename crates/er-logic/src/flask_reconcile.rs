@@ -93,9 +93,18 @@ mod tests {
     fn ladder() -> Vec<FlaskTarget> {
         // A representative monotonic ladder: charges climb 2->6, potency 0->2.
         vec![
-            FlaskTarget { charges: 2, potency: 0 },
-            FlaskTarget { charges: 4, potency: 1 },
-            FlaskTarget { charges: 6, potency: 2 },
+            FlaskTarget {
+                charges: 2,
+                potency: 0,
+            },
+            FlaskTarget {
+                charges: 4,
+                potency: 1,
+            },
+            FlaskTarget {
+                charges: 6,
+                potency: 2,
+            },
         ]
     }
 
@@ -119,10 +128,34 @@ mod tests {
         ]});
         let l = parse(&sd);
         assert_eq!(l.len(), 4, "the non-object rung is dropped");
-        assert_eq!(l[0], FlaskTarget { charges: 2, potency: 0 });
-        assert_eq!(l[1], FlaskTarget { charges: 8, potency: 0 });
-        assert_eq!(l[2], FlaskTarget { charges: 0, potency: 3 });
-        assert_eq!(l[3], FlaskTarget { charges: MAX_CHARGES, potency: MAX_POTENCY });
+        assert_eq!(
+            l[0],
+            FlaskTarget {
+                charges: 2,
+                potency: 0
+            }
+        );
+        assert_eq!(
+            l[1],
+            FlaskTarget {
+                charges: 8,
+                potency: 0
+            }
+        );
+        assert_eq!(
+            l[2],
+            FlaskTarget {
+                charges: 0,
+                potency: 3
+            }
+        );
+        assert_eq!(
+            l[3],
+            FlaskTarget {
+                charges: MAX_CHARGES,
+                potency: MAX_POTENCY
+            }
+        );
     }
 
     // ---- desired -------------------------------------------------------------------------
@@ -139,14 +172,35 @@ mod tests {
 
     #[test]
     fn desired_indexes_by_count() {
-        assert_eq!(desired(&ladder(), 1), Some(FlaskTarget { charges: 2, potency: 0 }));
-        assert_eq!(desired(&ladder(), 2), Some(FlaskTarget { charges: 4, potency: 1 }));
-        assert_eq!(desired(&ladder(), 3), Some(FlaskTarget { charges: 6, potency: 2 }));
+        assert_eq!(
+            desired(&ladder(), 1),
+            Some(FlaskTarget {
+                charges: 2,
+                potency: 0
+            })
+        );
+        assert_eq!(
+            desired(&ladder(), 2),
+            Some(FlaskTarget {
+                charges: 4,
+                potency: 1
+            })
+        );
+        assert_eq!(
+            desired(&ladder(), 3),
+            Some(FlaskTarget {
+                charges: 6,
+                potency: 2
+            })
+        );
     }
 
     #[test]
     fn desired_past_end_clamps_to_last_rung() {
-        let last = FlaskTarget { charges: 6, potency: 2 };
+        let last = FlaskTarget {
+            charges: 6,
+            potency: 2,
+        };
         assert_eq!(desired(&ladder(), 4), Some(last));
         assert_eq!(desired(&ladder(), 999), Some(last));
     }
@@ -155,21 +209,54 @@ mod tests {
 
     #[test]
     fn charge_deficit_raises_up_to_target() {
-        assert_eq!(charge_deficit(2, FlaskTarget { charges: 6, potency: 2 }), 4);
+        assert_eq!(
+            charge_deficit(
+                2,
+                FlaskTarget {
+                    charges: 6,
+                    potency: 2
+                }
+            ),
+            4
+        );
     }
 
     #[test]
     fn charge_deficit_zero_at_or_above_target_never_lowers() {
-        assert_eq!(charge_deficit(6, FlaskTarget { charges: 6, potency: 2 }), 0);
+        assert_eq!(
+            charge_deficit(
+                6,
+                FlaskTarget {
+                    charges: 6,
+                    potency: 2
+                }
+            ),
+            0
+        );
         // upward-only: live ALREADY exceeds the rung (hand-allocated / a prior higher rung) -> 0.
-        assert_eq!(charge_deficit(10, FlaskTarget { charges: 6, potency: 2 }), 0);
+        assert_eq!(
+            charge_deficit(
+                10,
+                FlaskTarget {
+                    charges: 6,
+                    potency: 2
+                }
+            ),
+            0
+        );
     }
 
     #[test]
     fn charge_deficit_clamps_to_cap() {
         // A ladder charge past the cap is clamped to MAX_CHARGES.
         assert_eq!(
-            charge_deficit(13, FlaskTarget { charges: MAX_CHARGES + 5, potency: 0 }),
+            charge_deficit(
+                13,
+                FlaskTarget {
+                    charges: MAX_CHARGES + 5,
+                    potency: 0
+                }
+            ),
             MAX_CHARGES - 13
         );
     }
@@ -178,7 +265,16 @@ mod tests {
     fn charge_deficit_ignores_potency() {
         // Potency is delivered via granted Sacred Tears; the ladder's potency field must NOT move
         // charges (this is what stopped the per-frame potency reconcile + its "SKIPPED" spam).
-        assert_eq!(charge_deficit(4, FlaskTarget { charges: 4, potency: 12 }), 0);
+        assert_eq!(
+            charge_deficit(
+                4,
+                FlaskTarget {
+                    charges: 4,
+                    potency: 12
+                }
+            ),
+            0
+        );
     }
 
     #[test]

@@ -1638,16 +1638,12 @@ mod tests {
 
         let planned = r.dry_run_actions(&g);
         assert!(planned.iter().any(|a| matches!(a, Action::SetFlag(76971))));
-        assert!(
-            planned
-                .iter()
-                .any(|a| matches!(a, Action::GrantUnique(191, _)))
-        );
-        assert!(
-            planned
-                .iter()
-                .any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. }))
-        );
+        assert!(planned
+            .iter()
+            .any(|a| matches!(a, Action::GrantUnique(191, _))));
+        assert!(planned
+            .iter()
+            .any(|a| matches!(a, Action::GrantLedgered { full_id: 2008, .. })));
         // Nothing was applied: no flags, no goods, no ledger entries, watermark untouched.
         assert!(g.flags.is_empty() && g.goods.is_empty() && g.ledger_log.is_empty());
         assert_eq!(r.applied_watermark(), 0);
@@ -2676,8 +2672,8 @@ mod tests {
         };
         assert_eq!(seed_trust(Some(e), 0), (true, None)); // brand-new char in the slot (live 0)
         assert_eq!(seed_trust(Some(e), 49_999), (true, None)); // < stamp/2: a new character
-        // A small backward delta is UNSAVED-PLAY jitter (we stamp per tick; the game saves less
-        // often), NOT a rewind -- resume, do not re-grant. (Was wrongly "fresh"; regression 2026-07-20.)
+                                                               // A small backward delta is UNSAVED-PLAY jitter (we stamp per tick; the game saves less
+                                                               // often), NOT a rewind -- resume, do not re-grant. (Was wrongly "fresh"; regression 2026-07-20.)
         assert_eq!(seed_trust(Some(e), 99_999), (false, Some(e.watermark)));
     }
 
