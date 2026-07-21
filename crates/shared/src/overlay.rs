@@ -84,6 +84,16 @@ pub struct Overlay<G: Game> {
     /// Whether the settings window is currently visible.
     settings_window_visible: bool,
 
+    /// Whether the dev console window (menu bar → Console) is currently visible.
+    console_window_visible: bool,
+
+    /// The text the user typed in the dev console input (separate buffer from `say_input` so both
+    /// can exist without sharing state).
+    console_input: String,
+
+    /// Whether to focus the console input on the next frame (keeps focus after pressing enter).
+    focus_console_input_next_frame: bool,
+
     /// Whether the game was on the main menu in the previous frame.
     was_main_menu: bool,
 
@@ -138,6 +148,9 @@ impl<G: Game> Overlay<G> {
             last_log_emitted: Instant::now(),
             frames_since_new_logs: 0,
             settings_window_visible: false,
+            console_window_visible: false,
+            console_input: Default::default(),
+            focus_console_input_next_frame: false,
             was_main_menu: false,
             was_window_focused: false,
             focus_say_input_next_frame: false,
@@ -160,6 +173,10 @@ impl<G: Game> Overlay<G> {
 
             prof!(core.base_mut().profiler(), "settings window", {
                 self.render_settings_window(ui);
+            });
+
+            prof!(core.base_mut().profiler(), "console window", {
+                self.render_console_window(ui, core);
             });
 
             // Game-specific overlay windows (e.g. the ER item tracker). Called at
@@ -288,12 +305,11 @@ impl<G: Game> Overlay<G> {
                         prof!(core.base_mut().profiler(), "connection buttons", {
                             self.render_connection_buttons(ui, core);
                         });
+                    } else {
+                        prof!(core.base_mut().profiler(), "say input", {
+                            self.render_say_input(ui, core, focus_say_input);
+                        });
                     }
-                    // The say box doubles as the dev command console, so keep it available even
-                    // while disconnected — dev `!` commands (e.g. `!markerprobe`) need no AP session.
-                    prof!(core.base_mut().profiler(), "say input", {
-                        self.render_say_input(ui, core, focus_say_input);
-                    });
                 }
                 // On a fresh (unconfigured) install, open the connect form once so the
                 // player is prompted for server/slot without having to hunt for a button.
@@ -406,9 +422,56 @@ impl<G: Game> Overlay<G> {
                 self.open_connect_requested = true;
             }
 
+            // Dev command console — works even while disconnected (unlike the say box, which is
+            // connection-gated). Home of `!markerprobe`, `!flag`, `!warp`, etc.
+            if ui.menu_item("Console") {
+                self.console_window_visible = true;
+                self.focus_console_input_next_frame = true;
+            }
+
             // Game-specific menu items (e.g. the ER item tracker toggle).
             core.render_overlay_menu_items(ui);
         });
+    }
+
+    /// Renders the dev console window (menu bar → Console). Always usable — including while
+    /// disconnected — so dev `!` commands (`!markerprobe`, `!flag`, ...) run without an AP session.
+    /// Command output appears in the main overlay log window. Plain (non-`!`) text is only sent to
+    /// the server when connected (see [`Self::say`]).
+    fn render_console_window(&mut self, ui: &Ui, core: &mut G::Core) {
+        if !self.console_window_visible {
+            return;
+        }
+        ui.window("Console")
+            .size([460.0, 130.0], Condition::FirstUseEver)
+            .collapsible(false)
+            .build(|| {
+                ui.text("Dev console — output shows in the log window.");
+                ui.text("!markerprobe [set|verify|clear] · !flag <id> · !setflag <id> [0|1] · !warp <grace>");
+                ui.separator();
+
+                if mem::take(&mut self.focus_console_input_next_frame) {
+                    ui.set_keyboard_focus_here();
+                }
+                let width = ui.push_item_width(-1.0);
+                let send = ui
+                    .input_text("##console-input", &mut self.console_input)
+                    .enter_returns_true(true)
+                    .callback(InputTextCallback::HISTORY, &mut self.say_history)
+                    .build();
+                drop(width);
+
+                if send {
+                    let line = mem::take(&mut self.console_input);
+                    self.say_history.add(line.clone());
+                    self.say(line, core);
+                    self.focus_console_input_next_frame = true;
+                }
+
+                if ui.button("Close") {
+                    self.console_window_visible = false;
+                }
+            });
     }
 
     /// Renders the settings popup.
@@ -552,35 +615,34 @@ impl<G: Game> Overlay<G> {
     ///
     /// If `focus` is true, this forces the input to be in focus.
     fn render_say_input(&mut self, ui: &Ui, core: &mut G::Core, focus: bool) {
-        // Always enabled: this box doubles as the dev command console (`!flag`, `!setflag`, `!warp`,
-        // `!markerprobe`, ...), which must work even without an AP connection. Plain (non-`!`) text is
-        // only forwarded to the server when a client exists — see `say`.
-        let arrow_button_width = ui.frame_height(); // Arrow buttons are square buttons.
-        let style = ui.clone_style();
-        let spacing = style.item_spacing[0] * self.font_scale * 0.7;
+        ui.disabled(core.client().is_none(), || {
+            let arrow_button_width = ui.frame_height(); // Arrow buttons are square buttons.
+            let style = ui.clone_style();
+            let spacing = style.item_spacing[0] * self.font_scale * 0.7;
 
-        let input_width = ui.push_item_width(-(arrow_button_width + spacing));
-        if focus {
-            ui.set_keyboard_focus_here();
-        }
-        let mut send = ui
-            .input_text("##say-input", &mut self.say_input)
-            .enter_returns_true(true)
-            .callback(InputTextCallback::HISTORY, &mut self.say_history)
-            .build();
-        drop(input_width);
+            let input_width = ui.push_item_width(-(arrow_button_width + spacing));
+            if focus {
+                ui.set_keyboard_focus_here();
+            }
+            let mut send = ui
+                .input_text("##say-input", &mut self.say_input)
+                .enter_returns_true(true)
+                .callback(InputTextCallback::HISTORY, &mut self.say_history)
+                .build();
+            drop(input_width);
 
-        ui.same_line_with_spacing(0.0, spacing);
-        send = ui.arrow_button("##say-button", Direction::Right) || send;
+            ui.same_line_with_spacing(0.0, spacing);
+            send = ui.arrow_button("##say-button", Direction::Right) || send;
 
-        if send {
-            // We don't have a great way to surface these errors, and
-            // they're non-fatal, so just ignore them.
-            let line = mem::take(&mut self.say_input);
-            self.say_history.add(line.clone());
-            self.say(line, core);
-            self.focus_say_input_next_frame = true;
-        }
+            if send {
+                // We don't have a great way to surface these errors, and
+                // they're non-fatal, so just ignore them.
+                let line = mem::take(&mut self.say_input);
+                self.say_history.add(line.clone());
+                self.say(line, core);
+                self.focus_say_input_next_frame = true;
+            }
+        });
     }
 
     /// Handles a command from the player, falling back to sending it to the
