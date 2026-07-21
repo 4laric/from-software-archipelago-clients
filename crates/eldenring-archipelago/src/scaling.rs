@@ -183,7 +183,9 @@ pub fn tick() {
         census.push(("summon", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
     {
-        static LAST: Mutex<Option<Vec<(&'static str, i32, i32, i32)>>> = Mutex::new(None);
+        // (set, npc_id, chr_type, team) per phantom/summon -- aliased to keep the static's type simple.
+        type PhantomCensus = Vec<(&'static str, i32, i32, i32)>;
+        static LAST: Mutex<Option<PhantomCensus>> = Mutex::new(None);
         let mut last = LAST.lock().unwrap();
         if last.as_ref() != Some(&census) {
             log::info!(

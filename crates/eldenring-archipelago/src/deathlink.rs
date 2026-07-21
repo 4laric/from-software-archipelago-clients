@@ -58,11 +58,11 @@ pub fn latch_incoming_kill() {
 ///   so a kill latched on a menu/load screen retries.
 pub fn drive_kill() {
     // --- KEEP-RUNES RESTORE leg (ungated: we may owe runes even if death_link was just disabled) ---
-    if let Ok(mut keep) = KEEP_RUNES.lock() {
-        if let Some(runes) = keep.poll_restore(crate::flags::in_world(), read_local_hp()) {
-            write_rune_count(runes);
-            log::info!("DeathLink: keep-runes restored {runes} runes after respawn");
-        }
+    if let Ok(mut keep) = KEEP_RUNES.lock()
+        && let Some(runes) = keep.poll_restore(crate::flags::in_world(), read_local_hp())
+    {
+        write_rune_count(runes);
+        log::info!("DeathLink: keep-runes restored {runes} runes after respawn");
     }
 
     // R2 (SWEEP H2): belt-and-braces -- a stale latched kill must never fire once death_link is

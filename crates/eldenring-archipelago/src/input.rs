@@ -334,19 +334,17 @@ pub unsafe fn install() {
         None => log::warn!("input: XInputGetState not found — gamepad won't block"),
     }
 
-    if let Some(target) = resolve::<GetKeyboardStateFn>(s!("user32.dll"), s!("GetKeyboardState")) {
-        if let Ok(d) = GenericDetour::new(target, get_keyboard_state_hook) {
-            if d.enable().is_ok() {
-                let _ = GETKEYBOARDSTATE_HOOK.set(d);
-            }
-        }
+    if let Some(target) = resolve::<GetKeyboardStateFn>(s!("user32.dll"), s!("GetKeyboardState"))
+        && let Ok(d) = GenericDetour::new(target, get_keyboard_state_hook)
+        && d.enable().is_ok()
+    {
+        let _ = GETKEYBOARDSTATE_HOOK.set(d);
     }
-    if let Some(target) = resolve::<GetKeyStateFn>(s!("user32.dll"), s!("GetKeyState")) {
-        if let Ok(d) = GenericDetour::new(target, get_key_state_hook) {
-            if d.enable().is_ok() {
-                let _ = GETKEYSTATE_HOOK.set(d);
-            }
-        }
+    if let Some(target) = resolve::<GetKeyStateFn>(s!("user32.dll"), s!("GetKeyState"))
+        && let Ok(d) = GenericDetour::new(target, get_key_state_hook)
+        && d.enable().is_ok()
+    {
+        let _ = GETKEYSTATE_HOOK.set(d);
     }
 
     match resolve::<DirectInput8CreateFn>(s!("dinput8.dll"), s!("DirectInput8Create")) {
