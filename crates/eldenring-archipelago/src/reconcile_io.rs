@@ -25,11 +25,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use er_logic::marker::{self, FlagBand};
 use er_logic::reconcile::{
     ApplyClasses, CharLedger, DesiredInputs, GameIo, Reconciler, TickBudget, WorldStability,
     legacy_adopt, seed_trust, stamp_playtime,
 };
 use serde::{Deserialize, Serialize};
+
+/// The save-embedded reconcile marker's flag band (`crate::marker`, minibake). The watermark +
+/// (seed, slot) identity live INSIDE the save here, so a reconnect reads ground truth instead of
+/// inferring identity from `play_time`. Band verified in-game 2026-07-21 (the `!markerprobe` pass).
+const MARKER_BAND: FlagBand = FlagBand::PLACEHOLDER;
 
 /// SENTINEL flag id used for the folded-in goal-send (Gap 1). `core::build_desired_inputs` sets
 /// `SlotData.goal_flag = Some(GOAL_SENTINEL_FLAG)` and `goal_met` from the live goal predicate, so the
@@ -338,6 +344,18 @@ static DIRTY: AtomicBool = AtomicBool::new(true);
 /// so the net thread can nudge / swap inputs while the game thread ticks.
 static DRIVER: OnceLock<Mutex<Driver>> = OnceLock::new();
 
+/// Set at init when the save-embedded marker's identity MISMATCHES this connection's (seed, slot) —
+/// i.e. this save belongs to a different seed/slot. The reconciler is NOT armed (no grants), and the
+/// caller must also gate check REPORTING on this, so seed-A's save flags aren't reported as seed-B
+/// checks (which would corrupt the multiworld, strictly worse than a double-grant). See `is_refused`.
+static REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the current session was REFUSED by the marker identity guard (see [`REFUSED`]). `core`
+/// gates check reporting on this; the reconciler simply never armed.
+pub fn is_refused() -> bool {
+    REFUSED.load(Ordering::Relaxed)
+}
+
 struct Driver {
     reconciler: Reconciler,
     io: LiveGame,
@@ -346,6 +364,9 @@ struct Driver {
     /// watermark key. `save_slot < 0` means it was unreadable at init (never persisted under it).
     slot: String,
     save_slot: i32,
+    /// The marker identity for this session = `hash(room seed, AP slot name)`. Written into the save's
+    /// marker band alongside the watermark on every tick commit; the reconnect guard compares it.
+    identity: u32,
 }
 
 /// EVENT NUDGE — call from the net loop / connect / load handlers instead of doing the grant inline.
@@ -530,10 +551,40 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         }),
         None => None, // save slot unreadable (shouldn't happen in-world) -> fresh (safe: re-owe)
     };
-    let (fresh_character, persisted) = seed_trust(entry, play_time);
-    let reconciler = Reconciler::seeded(inputs, persisted, received_through, fresh_character);
+    // MINIBAKE: read the save-embedded marker and let its (seed, slot) identity decide, instead of
+    // inferring identity from play_time. The marker's GameIo is the SAME LiveGame seam the reconciler
+    // uses. A not-ready flag holder reads all-clear -> Absent -> the safe seed_trust migration below.
+    let identity = marker::identity_hash(&inputs.seed, &slot);
+    let decision = marker::decide(marker::read(&LiveGame::new(), MARKER_BAND), identity);
+
+    // `fresh_character` governs the reconcile.json play_time re-stamp (reset for a new character,
+    // monotonic for a resume). On the marker Resume path the marker is authoritative, so it's false.
+    let (reconciler, fresh_character) = match decision {
+        marker::InitDecision::Refuse { stored, expected } => {
+            REFUSED.store(true, Ordering::Relaxed);
+            log::warn!(
+                "[reconcile] REFUSED: save marker identity {stored:#010x} != this session {expected:#010x} \
+                 -- this save belongs to a different seed/slot. NOT arming the reconciler; check \
+                 reporting is gated. Reconnect the correct save, or start a fresh character."
+            );
+            return; // no Driver -> tick() no-ops; is_refused() gates check reporting in core
+        }
+        // Marker present + matches: resume from the save's OWN cursor. No play_time inference.
+        marker::InitDecision::Resume { watermark } => {
+            (Reconciler::from_persisted(inputs, watermark), false)
+        }
+        // No marker yet (pre-minibake save, or a genuinely new character): keep the battle-tested
+        // seed_trust migration. The tick commit then writes a marker, so future connects Resume.
+        marker::InitDecision::Fresh => {
+            let (fresh_character, persisted) = seed_trust(entry, play_time);
+            (
+                Reconciler::seeded(inputs, persisted, received_through, fresh_character),
+                fresh_character,
+            )
+        }
+    };
     log::info!(
-        "[reconcile] ledger seed: save_slot={save_slot:?} play_time={play_time} entry={entry:?} fresh_character={fresh_character} persisted={persisted:?} received_through={received_through} -> watermark {}",
+        "[reconcile] ledger seed: save_slot={save_slot:?} play_time={play_time} marker={decision:?} entry={entry:?} received_through={received_through} identity={identity:#010x} -> watermark {}",
         reconciler.applied_watermark()
     );
     // Re-stamp the ledger NOW with the correctly-read seed-time play_time. The tick-tail persist
@@ -558,6 +609,7 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         store,
         slot,
         save_slot: save_slot.unwrap_or(-1),
+        identity,
     };
     let _ = DRIVER.set(Mutex::new(driver));
     mark_dirty();
@@ -621,11 +673,17 @@ pub fn tick() {
     let d = &mut *d;
     let out = d.reconciler.tick_with_classes(&mut d.io, budget, classes);
 
+    // MINIBAKE: commit the (seed, slot) identity + watermark INTO the save's marker band. Idempotent
+    // (a no-op when the active cursor already equals the watermark), so this every-tick call is cheap;
+    // it writes the marker on a fresh save's first stable tick and keeps the cursor current after. The
+    // commit is double-buffered + present-last, so a crash mid-write can't corrupt it.
+    let wm = d.reconciler.applied_watermark();
+    marker::commit(&mut d.io, MARKER_BAND, d.identity, wm);
+
     // Persist the (possibly advanced) ledger watermark for THIS CHARACTER, re-stamped with the live
     // play_time. Skip if the save slot was unreadable at init or play_time isn't readable now: a
     // 0/garbage stamp under a bad key could let a later character wrongly trust it. Idempotent —
-    // the next stable tick persists again.
-    let wm = d.reconciler.applied_watermark();
+    // the next stable tick persists again. (`wm` computed above for the marker commit.)
     if d.save_slot >= 0
         && let Some(live) = read_play_time_ms()
     {

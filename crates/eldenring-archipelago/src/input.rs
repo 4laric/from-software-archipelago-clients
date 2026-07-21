@@ -133,14 +133,46 @@ unsafe extern "system" fn get_key_state_hook(vkey: i32) -> i16 {
 /// `IDirectInput8::CreateDevice` = vtable slot 3.
 const IDINPUT8_CREATEDEVICE: usize = 3;
 /// `IDirectInputDevice8::GetDeviceState` = vtable slot 9 (`+0x48`, confirmed in KeyboardDevice::poll).
+/// IMMEDIATE state (held keys / current mouse position) — the gameplay path.
 const IDIDEVICE8_GETDEVICESTATE: usize = 9;
-/// The immediate keyboard state buffer is 256 bytes; mouse (`DIMOUSESTATE`/`2`) is 16/20. Used to tell
-/// which device a `GetDeviceState` call is for (the shared vtable hook can't otherwise distinguish).
+/// `IDirectInputDevice8::GetDeviceData` = vtable slot 10 (`+0x50`). BUFFERED events — the MENU / text /
+/// key-repeat path. ER menus read this, so blocking only `GetDeviceState` let keystrokes still reach an
+/// open menu behind the overlay (observed: typing in Change Connection navigated the game menu).
+const IDIDEVICE8_GETDEVICEDATA: usize = 10;
+/// The immediate keyboard state buffer is 256 bytes; anything smaller is the mouse. Fallback device
+/// discriminator when the device pointer wasn't captured at CreateDevice.
 const DIKEYBOARD_STATE_BYTES: u32 = 256;
+
+/// DirectInput system-device GUIDs (used to tag each created device kbd/mouse, so both `GetDeviceState`
+/// and `GetDeviceData` — which the shared vtable hook can't otherwise tell apart — know which flag
+/// governs them). `{6F1D2B6x-D5A0-11CF-BFC7-444553540000}`.
+const GUID_SYS_KEYBOARD: GUID = GUID::from_u128(0x6F1D_2B61_D5A0_11CF_BFC7_4445_5354_0000);
+const GUID_SYS_MOUSE: GUID = GUID::from_u128(0x6F1D_2B60_D5A0_11CF_BFC7_4445_5354_0000);
 
 static ORIG_CREATE_DEVICE: AtomicUsize = AtomicUsize::new(0);
 static ORIG_GET_DEVICE_STATE: AtomicUsize = AtomicUsize::new(0);
+static ORIG_GET_DEVICE_DATA: AtomicUsize = AtomicUsize::new(0);
 static DEVICE_VT_HOOKED: AtomicBool = AtomicBool::new(false);
+/// The DirectInput device instances, tagged by GUID at CreateDevice, so the shared-vtable hooks can
+/// resolve keyboard vs mouse from the `this` pointer.
+static KB_DEVICE: AtomicUsize = AtomicUsize::new(0);
+static MOUSE_DEVICE: AtomicUsize = AtomicUsize::new(0);
+
+/// Which input class a DirectInput device belongs to. Prefers the pointer tagged at CreateDevice;
+/// falls back to the `GetDeviceState` buffer size (256 = keyboard) when only that is available.
+fn device_flag(this: *mut c_void, cb: Option<u32>) -> InputFlags {
+    let p = this as usize;
+    if p != 0 && p == KB_DEVICE.load(Ordering::Relaxed) {
+        return InputFlags::Keyboard;
+    }
+    if p != 0 && p == MOUSE_DEVICE.load(Ordering::Relaxed) {
+        return InputFlags::Mouse;
+    }
+    match cb {
+        Some(n) if n == DIKEYBOARD_STATE_BYTES => InputFlags::Keyboard,
+        _ => InputFlags::Mouse,
+    }
+}
 
 /// Overwrite `vtable[index]` with `hook`, returning the original pointer. The vtable lives in a
 /// read-only page, so flip it writable for the 8-byte store.
@@ -164,6 +196,8 @@ unsafe fn vtable_of(obj: *mut c_void) -> *mut usize {
 type CreateDeviceFn =
     unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void, *mut c_void) -> i32;
 type GetDeviceStateFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
+type GetDeviceDataFn =
+    unsafe extern "system" fn(*mut c_void, u32, *mut c_void, *mut u32, u32) -> i32;
 
 unsafe extern "system" fn direct_input8_create_hook(
     inst: *mut c_void,
@@ -181,7 +215,11 @@ unsafe extern "system" fn direct_input8_create_hook(
         && ORIG_CREATE_DEVICE.load(Ordering::Relaxed) == 0
     {
         let vt = vtable_of(*out);
-        let old = patch_vtable_slot(vt, IDINPUT8_CREATEDEVICE, create_device_hook as usize);
+        let old = patch_vtable_slot(
+            vt,
+            IDINPUT8_CREATEDEVICE,
+            create_device_hook as *const () as usize,
+        );
         ORIG_CREATE_DEVICE.store(old, Ordering::Relaxed);
     }
     hr
@@ -195,24 +233,43 @@ unsafe extern "system" fn create_device_hook(
 ) -> i32 {
     let orig: CreateDeviceFn = mem::transmute(ORIG_CREATE_DEVICE.load(Ordering::Relaxed));
     let hr = orig(this, rguid, out, outer);
-    // The keyboard + mouse devices share one IDirectInputDevice8 vtable; patch it once and both are
-    // covered (as is any later-created device).
-    if hr >= 0
-        && !out.is_null()
-        && !(*out).is_null()
-        && !DEVICE_VT_HOOKED.swap(true, Ordering::Relaxed)
-    {
-        let vt = vtable_of(*out);
-        let old = patch_vtable_slot(
-            vt,
-            IDIDEVICE8_GETDEVICESTATE,
-            get_device_state_hook as usize,
-        );
-        ORIG_GET_DEVICE_STATE.store(old, Ordering::Relaxed);
+    if hr >= 0 && !out.is_null() && !(*out).is_null() {
+        let dev = *out;
+        // Tag the device by GUID so the shared-vtable hooks can resolve kbd vs mouse per call.
+        if !rguid.is_null() {
+            let g = *rguid;
+            if g == GUID_SYS_KEYBOARD {
+                KB_DEVICE.store(dev as usize, Ordering::Relaxed);
+            } else if g == GUID_SYS_MOUSE {
+                MOUSE_DEVICE.store(dev as usize, Ordering::Relaxed);
+            }
+        }
+        // Keyboard + mouse share ONE IDirectInputDevice8 vtable; patch it once — both immediate
+        // (GetDeviceState) and buffered (GetDeviceData) — and every device is covered.
+        if !DEVICE_VT_HOOKED.swap(true, Ordering::Relaxed) {
+            let vt = vtable_of(dev);
+            ORIG_GET_DEVICE_STATE.store(
+                patch_vtable_slot(
+                    vt,
+                    IDIDEVICE8_GETDEVICESTATE,
+                    get_device_state_hook as *const () as usize,
+                ),
+                Ordering::Relaxed,
+            );
+            ORIG_GET_DEVICE_DATA.store(
+                patch_vtable_slot(
+                    vt,
+                    IDIDEVICE8_GETDEVICEDATA,
+                    get_device_data_hook as *const () as usize,
+                ),
+                Ordering::Relaxed,
+            );
+        }
     }
     hr
 }
 
+/// IMMEDIATE state (held keys / mouse delta): zero the whole buffer when the device is blocked.
 unsafe extern "system" fn get_device_state_hook(
     this: *mut c_void,
     cb: u32,
@@ -220,17 +277,25 @@ unsafe extern "system" fn get_device_state_hook(
 ) -> i32 {
     let orig: GetDeviceStateFn = mem::transmute(ORIG_GET_DEVICE_STATE.load(Ordering::Relaxed));
     let hr = orig(this, cb, data);
-    if hr >= 0 && !data.is_null() {
-        // The immediate keyboard state is 256 bytes; anything smaller is the mouse. (ER polls the pad
-        // via XInput, so a DirectInput device here is keyboard or mouse.)
-        let flag = if cb == DIKEYBOARD_STATE_BYTES {
-            InputFlags::Keyboard
-        } else {
-            InputFlags::Mouse
-        };
-        if is_blocked(flag) {
-            std::ptr::write_bytes(data as *mut u8, 0, cb as usize); // nothing pressed / no delta
-        }
+    if hr >= 0 && !data.is_null() && is_blocked(device_flag(this, Some(cb))) {
+        std::ptr::write_bytes(data as *mut u8, 0, cb as usize); // nothing pressed / no delta
+    }
+    hr
+}
+
+/// BUFFERED events (menu / text / key-repeat): let `orig` DRAIN the device buffer (so events don't pile
+/// up), then report ZERO events to the caller when blocked, so no keystroke reaches the game menu.
+unsafe extern "system" fn get_device_data_hook(
+    this: *mut c_void,
+    cb_object_data: u32,
+    rgdod: *mut c_void,
+    pdw_in_out: *mut u32,
+    flags: u32,
+) -> i32 {
+    let orig: GetDeviceDataFn = mem::transmute(ORIG_GET_DEVICE_DATA.load(Ordering::Relaxed));
+    let hr = orig(this, cb_object_data, rgdod, pdw_in_out, flags);
+    if hr >= 0 && !pdw_in_out.is_null() && is_blocked(device_flag(this, None)) {
+        *pdw_in_out = 0; // events drained by `orig`; caller sees none
     }
     hr
 }
