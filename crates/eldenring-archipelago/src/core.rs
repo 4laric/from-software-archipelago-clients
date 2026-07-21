@@ -298,7 +298,10 @@ impl shared::Core for Core {
                             .map(|i| base + i)
                             .collect();
                         self.log(ap::Print::message(if bad.is_empty() {
-                            format!("markerprobe verify: PASS (pattern intact {base}..{})", base + n)
+                            format!(
+                                "markerprobe verify: PASS (pattern intact {base}..{})",
+                                base + n
+                            )
                         } else {
                             format!(
                                 "markerprobe verify: FAIL ({} mismatched, first {:?})",
@@ -443,9 +446,11 @@ impl shared::Core for Core {
         // instead of erroring, so no install latch on Core is needed.
         crate::warp_hook::install();
 
-        // 1. Report suppressed (world-pickup) synthetics. The echo grants them.
+        // 1. Report suppressed (world-pickup) synthetics. The echo grants them. Gated on the minibake
+        // refuse guard — a wrong-seed save must not report checks (see reconcile_io::is_refused).
         let checks = crate::detour::take_pending_checks();
         if !checks.is_empty()
+            && !crate::reconcile_io::is_refused()
             && let Some(client) = self.client_mut()
             && let Err(e) = client.mark_checked(checks.iter().copied())
         {
@@ -1619,7 +1624,7 @@ impl shared::Core for Core {
                         }
                     }
                 }
-                if !to_check.is_empty() {
+                if !to_check.is_empty() && !crate::reconcile_io::is_refused() {
                     log::info!("shop/offline discovery: {} new check(s)", to_check.len());
                     if let Some(client) = self.client_mut()
                         && let Err(e) = client.mark_checked(to_check.iter().copied())
@@ -2063,7 +2068,10 @@ impl shared::Core for Core {
                     }
                 }
             }
-            if !to_check.is_empty() {
+            // Gate check reporting on the minibake refuse guard: a save whose marker identity mismatches
+            // this seed/slot must NOT report its (seed-A) flags as (seed-B) checks — that corrupts the
+            // multiworld, strictly worse than any double-grant. The reconciler is also unarmed while refused.
+            if !to_check.is_empty() && !crate::reconcile_io::is_refused() {
                 to_check.sort_unstable();
                 to_check.dedup();
                 log::info!("flag-poll: {} new check(s)", to_check.len());
