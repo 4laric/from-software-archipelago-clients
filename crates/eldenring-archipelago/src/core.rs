@@ -174,6 +174,9 @@ pub struct Core {
     /// run this session. Keeps init once-only, then `set_inputs` thereafter. Never touched unless
     /// dry-run is enabled, so the live path is unaffected.
     reconcile_inited: bool,
+    /// Tracks the in-world state across ticks so a map-(re)load edge can re-arm the ItemLotParam
+    /// blank passes (check_lots / enemy_drops), which otherwise latch DONE and only reset on reconnect.
+    was_in_world: bool,
 }
 
 impl shared::Core for Core {
@@ -403,6 +406,7 @@ impl shared::Core for Core {
             boss_key_pending: HashMap::new(),
             boss_key_primed: false,
             reconcile_inited: false,
+            was_in_world: false,
         })
     }
     fn base(&self) -> &CoreBase<Self::Game, Self::SlotData> {
@@ -2262,6 +2266,21 @@ impl shared::Core for Core {
             sp.pump(client);
         }
         self.scout = scout;
+        // Re-arm the ItemLotParam blank passes on a map-(re)load edge. check_lots / enemy_drops latch
+        // DONE after their first successful in-world pass and are otherwise reset ONLY on reconnect
+        // (configure()). But a map load streams params back in -- notably the DLC (Land of Shadow)
+        // ItemLotParam rows -- reverting our rewrites, and the latched passes never re-apply them. That
+        // is the DLC "vanilla ware leaks well into the session" bug (Alaric, 2026-07-21): the connect-
+        // time blank ran (`0 missing`) yet a DLC treasure opened later handed out the real ware. Detect
+        // the in_world false->true edge (a load completed) and reset the latches so the next tick
+        // re-applies the blanks against the freshly-loaded params. Idempotent: the passes self-gate on
+        // the param repo being up and re-latch after one clean pass, so this costs one re-blank per load.
+        let now_in_world = crate::flags::in_world();
+        if now_in_world && !self.was_in_world {
+            crate::check_lots::reset();
+            crate::enemy_drops::reset();
+        }
+        self.was_in_world = now_in_world;
         if crate::flags::in_world() {
             let _ = crate::fmg_inject::run();
             let _ = crate::shop_flags::run(&[]);
