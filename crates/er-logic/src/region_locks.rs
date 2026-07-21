@@ -173,7 +173,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
     BakedRegionLock {
         region: "Shadow Keep",
         lock_item: "Shadow Keep Lock",
-        open_flag: Some(72102),
+        open_flag: Some(76935),
         play_regions: &[21000, 21010, 21020, 69300],
     },
     BakedRegionLock {
