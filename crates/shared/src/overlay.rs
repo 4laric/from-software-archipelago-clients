@@ -288,11 +288,12 @@ impl<G: Game> Overlay<G> {
                         prof!(core.base_mut().profiler(), "connection buttons", {
                             self.render_connection_buttons(ui, core);
                         });
-                    } else {
-                        prof!(core.base_mut().profiler(), "say input", {
-                            self.render_say_input(ui, core, focus_say_input);
-                        });
                     }
+                    // The say box doubles as the dev command console, so keep it available even
+                    // while disconnected — dev `!` commands (e.g. `!markerprobe`) need no AP session.
+                    prof!(core.base_mut().profiler(), "say input", {
+                        self.render_say_input(ui, core, focus_say_input);
+                    });
                 }
                 // On a fresh (unconfigured) install, open the connect form once so the
                 // player is prompted for server/slot without having to hunt for a button.
@@ -551,48 +552,55 @@ impl<G: Game> Overlay<G> {
     ///
     /// If `focus` is true, this forces the input to be in focus.
     fn render_say_input(&mut self, ui: &Ui, core: &mut G::Core, focus: bool) {
-        ui.disabled(core.client().is_none(), || {
-            let arrow_button_width = ui.frame_height(); // Arrow buttons are square buttons.
-            let style = ui.clone_style();
-            let spacing = style.item_spacing[0] * self.font_scale * 0.7;
+        // Always enabled: this box doubles as the dev command console (`!flag`, `!setflag`, `!warp`,
+        // `!markerprobe`, ...), which must work even without an AP connection. Plain (non-`!`) text is
+        // only forwarded to the server when a client exists — see `say`.
+        let arrow_button_width = ui.frame_height(); // Arrow buttons are square buttons.
+        let style = ui.clone_style();
+        let spacing = style.item_spacing[0] * self.font_scale * 0.7;
 
-            let input_width = ui.push_item_width(-(arrow_button_width + spacing));
-            if focus {
-                ui.set_keyboard_focus_here();
-            }
-            let mut send = ui
-                .input_text("##say-input", &mut self.say_input)
-                .enter_returns_true(true)
-                .callback(InputTextCallback::HISTORY, &mut self.say_history)
-                .build();
-            drop(input_width);
+        let input_width = ui.push_item_width(-(arrow_button_width + spacing));
+        if focus {
+            ui.set_keyboard_focus_here();
+        }
+        let mut send = ui
+            .input_text("##say-input", &mut self.say_input)
+            .enter_returns_true(true)
+            .callback(InputTextCallback::HISTORY, &mut self.say_history)
+            .build();
+        drop(input_width);
 
-            ui.same_line_with_spacing(0.0, spacing);
-            send = ui.arrow_button("##say-button", Direction::Right) || send;
+        ui.same_line_with_spacing(0.0, spacing);
+        send = ui.arrow_button("##say-button", Direction::Right) || send;
 
-            if send {
-                // We don't have a great way to surface these errors, and
-                // they're non-fatal, so just ignore them.
-                let line = mem::take(&mut self.say_input);
-                self.say_history.add(line.clone());
-                self.say(line, core);
-                self.focus_say_input_next_frame = true;
-            }
-        });
+        if send {
+            // We don't have a great way to surface these errors, and
+            // they're non-fatal, so just ignore them.
+            let line = mem::take(&mut self.say_input);
+            self.say_history.add(line.clone());
+            self.say(line, core);
+            self.focus_say_input_next_frame = true;
+        }
     }
 
     /// Handles a command from the player, falling back to sending it to the
     /// server.
     fn say(&mut self, message: String, core: &mut G::Core) {
         let Some(captures) = regex!("^(![^ ]+)( +)?(.*)?$").captures(message.trim()) else {
-            let _ = core.client_mut().unwrap().say(message);
+            // Plain chat: only reaches the server when connected. Dropped while offline.
+            if let Some(client) = core.client_mut() {
+                let _ = client.say(message);
+            }
             return;
         };
 
         let command = captures.get(1).unwrap().as_str();
         let arg = captures.get(3).map(|c| c.as_str());
         if !core.handle_command(command, arg) {
-            let _ = core.client_mut().unwrap().say(message);
+            // Not a recognized `!` command — forward to the server as chat if connected.
+            if let Some(client) = core.client_mut() {
+                let _ = client.say(message);
+            }
         }
     }
 
