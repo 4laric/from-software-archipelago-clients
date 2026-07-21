@@ -3908,7 +3908,7 @@ pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7773894, "Siofra River", "Siofra River", false, false),
     (7773895, "Siofra River", "Siofra River", false, false),
     (7773896, "Deeproot Depths", "Deeproot Depths", false, false),
-    (7773897, "Shadow Keep", "Shadow Keep", true, false),
+    (7773897, "Scadu Altus", "Scadu Altus", true, false),
     (7773898, "Scadu Altus", "Scadu Altus", false, false),
     (7773899, "Caelid", "Caelid", false, false),
     (7773900, "Weeping", "Weeping", true, false),
