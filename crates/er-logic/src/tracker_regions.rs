@@ -667,7 +667,7 @@ pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7770653, "Scadu Altus", "Scadu Altus", false, false),
     (7770654, "Scadu Altus", "Scadu Altus", false, false),
     (7770655, "Scadu Altus", "Scadu Altus", false, false),
-    (7770656, "Altus", "Altus", true, false),
+    (7770656, "Leyndell", "Leyndell", true, false),
     (7770657, "Liurnia", "Liurnia", false, false),
     (7770658, "Liurnia", "Liurnia", false, false),
     (7770659, "Mohgwyn", "Mohgwyn", false, false),
