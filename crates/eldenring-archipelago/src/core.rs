@@ -834,8 +834,14 @@ impl shared::Core for Core {
                             blank_enemy = legacy;
                         }
                     }
-                    if ph != 0 && !(blank_map.is_empty() && blank_enemy.is_empty()) {
-                        crate::check_lots::configure(blank_map, blank_enemy, ph);
+                    let zero_map = parse_lots("checkLotZeroMap");
+                    let zero_enemy = parse_lots("checkLotZeroEnemy");
+                    let has_lots = !(blank_map.is_empty()
+                        && blank_enemy.is_empty()
+                        && zero_map.is_empty()
+                        && zero_enemy.is_empty());
+                    if ph != 0 && has_lots {
+                        crate::check_lots::configure(blank_map, blank_enemy, zero_map, zero_enemy, ph);
                     } else {
                         // STATIC FALLBACK -- vanilla suppression for a FOREIGN apworld.
                         //
@@ -864,7 +870,15 @@ impl shared::Core for Core {
                             let (m, e) = er_logic::static_lots::blank_tables_for(&sl, &seed_flags);
                             let n = m.len() + e.len();
                             if n > 0 && sl.placeholder_goods != 0 {
-                                crate::check_lots::configure(m, e, sl.placeholder_goods);
+                                // Foreign apworld: it emits no checkLotZero* (that table is derived from
+                                // OUR gen_data), so the zero-slot tables are empty here.
+                                crate::check_lots::configure(
+                                    m,
+                                    e,
+                                    std::collections::HashMap::new(),
+                                    std::collections::HashMap::new(),
+                                    sl.placeholder_goods,
+                                );
                                 log::info!(
                                     "check-lots STATIC fallback: {} lot(s) blanked from \
                                      check_lots_table.json, scoped to this seed's {} check flag(s) \

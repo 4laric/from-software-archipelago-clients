@@ -123,6 +123,12 @@ pub fn dress_placeholder() -> bool {
 /// randomised correctly.) The apworld knows which CSV each lot came from; it just used to throw it away.
 static BLANK_MAP: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
 static BLANK_ENEMY: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+/// lot id -> NON-GOODS slot indices to ZERO (id = 0, num = 0) rather than repoint. The placeholder is a
+/// GOODS row, so it can only neutralise a goods slot; a weapon / armor / talisman / gem-ash check slot
+/// must be EMPTIED instead. Scoped by the apworld to FLAGGED one-time lots, so the check's own
+/// acquisition flag still fires on the emptied pickup -- registration is by flag poll, not by item id.
+static ZERO_MAP: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+static ZERO_ENEMY: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
 /// The one goods id we hand out at checks and then unconditionally suppress. 0 = feature off.
 static PLACEHOLDER: AtomicI32 = AtomicI32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -144,16 +150,21 @@ pub fn is_placeholder(raw_id: i32) -> bool {
 pub fn configure(
     blank_map: HashMap<u32, Vec<u8>>,
     blank_enemy: HashMap<u32, Vec<u8>>,
+    zero_map: HashMap<u32, Vec<u8>>,
+    zero_enemy: HashMap<u32, Vec<u8>>,
     placeholder_goods: i32,
 ) {
     let (nm, ne) = (blank_map.len(), blank_enemy.len());
+    let (zm, ze) = (zero_map.len(), zero_enemy.len());
     *BLANK_MAP.lock().unwrap() = Some(blank_map);
     *BLANK_ENEMY.lock().unwrap() = Some(blank_enemy);
+    *ZERO_MAP.lock().unwrap() = Some(zero_map);
+    *ZERO_ENEMY.lock().unwrap() = Some(zero_enemy);
     PLACEHOLDER.store(placeholder_goods, Ordering::Relaxed);
     DONE.store(false, Ordering::Relaxed);
     DRESSED.store(false, Ordering::Relaxed);
     log::info!(
-        "check-lots: configured {nm} MAP + {ne} ENEMY check lot(s); placeholder goods {placeholder_goods}"
+        "check-lots: configured {nm} MAP + {ne} ENEMY blank + {zm} MAP + {ze} ENEMY zero check lot(s); placeholder goods {placeholder_goods}"
     );
 }
 
@@ -177,7 +188,9 @@ pub fn run() -> bool {
         (None, None) => return true, // not configured (non-greenfield seed)
         (a, b) => (a.unwrap_or_default(), b.unwrap_or_default()),
     };
-    if blank_map.is_empty() && blank_enemy.is_empty() {
+    let zero_map = grab(&ZERO_MAP).unwrap_or_default();
+    let zero_enemy = grab(&ZERO_ENEMY).unwrap_or_default();
+    if blank_map.is_empty() && blank_enemy.is_empty() && zero_map.is_empty() && zero_enemy.is_empty() {
         DONE.store(true, Ordering::Relaxed);
         return true;
     }
@@ -225,6 +238,31 @@ pub fn run() -> bool {
             missed.push(*lot);
         }
     }
+
+    // NON-GOODS check slots: ZERO them (id = 0, num = 0) instead of repointing to the goods placeholder,
+    // which can only stand in for a GOODS slot. Same table-is-a-fact discipline as the blank loops -- each
+    // lot is written only to the table the apworld named. Scoped by the apworld to FLAGGED one-time lots,
+    // so the acquisition flag still fires on the emptied pickup and the flag poll registers the check.
+    for (lot, slots) in &zero_map {
+        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
+            for &sl in slots {
+                zero_slot(row, sl);
+                n += 1;
+            }
+        } else {
+            missed.push(*lot);
+        }
+    }
+    for (lot, slots) in &zero_enemy {
+        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
+            for &sl in slots {
+                zero_slot(row, sl);
+                n += 1;
+            }
+        } else {
+            missed.push(*lot);
+        }
+    }
     if !missed.is_empty() {
         log::warn!(
             "check-lots: {} lot(s) were not found in the table the apworld named (stale gen data?): {:?}",
@@ -233,13 +271,15 @@ pub fn run() -> bool {
         );
     }
     log::info!(
-        "check-lots: wrote {} MAP lot(s) + {} ENEMY lot(s) ({} missing from the named table)",
+        "check-lots: wrote {} MAP + {} ENEMY blank, {} MAP + {} ENEMY zero lot(s) ({} missing from the named table)",
         blank_map.len(),
         blank_enemy.len(),
+        zero_map.len(),
+        zero_enemy.len(),
         missed.len()
     );
     log::info!(
-        "check-lots: blanked {n} check goods slot(s) -> placeholder {ph} (vanilla ware never handed out at a check)"
+        "check-lots: neutralised {n} check slot(s) -> goods placeholder {ph} + non-goods zeroed (vanilla ware never handed out at a check)"
     );
     DONE.store(true, Ordering::Relaxed);
     true
@@ -259,6 +299,46 @@ fn set_slot(row: &mut eldenring::param::ITEMLOT_PARAM_ST, slot: u8, id: i32) {
         6 => row.set_lot_item_id06(id),
         7 => row.set_lot_item_id07(id),
         8 => row.set_lot_item_id08(id),
+        _ => {}
+    }
+}
+
+// Empty a NON-GOODS check slot: no item id, zero count. `lot_item_num0X` is a u8 in the param, so 0 fits.
+#[inline]
+fn zero_slot(row: &mut eldenring::param::ITEMLOT_PARAM_ST, slot: u8) {
+    match slot {
+        1 => {
+            row.set_lot_item_id01(0);
+            row.set_lot_item_num01(0);
+        }
+        2 => {
+            row.set_lot_item_id02(0);
+            row.set_lot_item_num02(0);
+        }
+        3 => {
+            row.set_lot_item_id03(0);
+            row.set_lot_item_num03(0);
+        }
+        4 => {
+            row.set_lot_item_id04(0);
+            row.set_lot_item_num04(0);
+        }
+        5 => {
+            row.set_lot_item_id05(0);
+            row.set_lot_item_num05(0);
+        }
+        6 => {
+            row.set_lot_item_id06(0);
+            row.set_lot_item_num06(0);
+        }
+        7 => {
+            row.set_lot_item_id07(0);
+            row.set_lot_item_num07(0);
+        }
+        8 => {
+            row.set_lot_item_id08(0);
+            row.set_lot_item_num08(0);
+        }
         _ => {}
     }
 }
