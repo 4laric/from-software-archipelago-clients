@@ -183,7 +183,8 @@ pub fn tick() {
         census.push(("summon", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
     {
-        static LAST: Mutex<Option<Vec<(&'static str, i32, i32, i32)>>> = Mutex::new(None);
+        type CensusRow = (&'static str, i32, i32, i32);
+        static LAST: Mutex<Option<Vec<CensusRow>>> = Mutex::new(None);
         let mut last = LAST.lock().unwrap();
         if last.as_ref() != Some(&census) {
             log::info!(

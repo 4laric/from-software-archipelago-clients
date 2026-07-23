@@ -116,10 +116,11 @@ impl Default for LiveGame {
 /// reconciler applied a Morgott's-Great-Rune action every frame after a Roundtable warp).
 ///
 /// The fix scans all THREE backing lists explicitly instead of the accessor-following `items()`:
-///   * `normal_entries()`         — consumables, materials, most goods;
-///   * `key_entries()`            — the ALWAYS-single-player key items (Great Runes, quest keys); this
-///                                  is the list `items()` stops seeing in multiplayer;
-///   * `multiplay_key_entries()`  — the online pots/physick-tears list.
+/// * `normal_entries()` — consumables, materials, most goods;
+/// * `key_entries()` — the ALWAYS-single-player key items (Great Runes, quest keys); this is the
+///   list `items()` stops seeing in multiplayer;
+/// * `multiplay_key_entries()` — the online pots/physick-tears list.
+///
 /// A goods row present in ANY of them counts as held, in single-player OR co-op.
 ///
 /// NOTE(windows-verify) — GOODS-ID MASK REVIEW (Gap 3; CANNOT be host-tested — this crate is

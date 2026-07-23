@@ -279,7 +279,7 @@ impl shared::Core for Core {
                 // `clear`, play normally, `!markerprobe` => expect 0 set again.
                 let base = er_logic::marker::FlagBand::PLACEHOLDER.base;
                 let n = er_logic::marker::FlagBand::RESERVED;
-                let want = |i: u32| i % 3 == 0; // recognizable, non-trivial pattern
+                let want = |i: u32| i.is_multiple_of(3); // recognizable, non-trivial pattern
                 match arg.map(|a| a.trim()) {
                     Some("set") => {
                         let (mut ok, mut busy) = (0u32, 0u32);
