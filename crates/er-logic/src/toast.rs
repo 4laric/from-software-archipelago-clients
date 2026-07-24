@@ -115,7 +115,11 @@ mod tests {
         assert_eq!(new_grants(None, 7), None, "first observation only primes");
         assert_eq!(new_grants(Some(7), 7), None, "steady state is silent");
         assert_eq!(new_grants(Some(7), 9), Some(2), "a real increase announces");
-        assert_eq!(new_grants(Some(9), 2), None, "a decrease re-primes silently");
+        assert_eq!(
+            new_grants(Some(9), 2),
+            None,
+            "a decrease re-primes silently"
+        );
     }
 
     #[test]
