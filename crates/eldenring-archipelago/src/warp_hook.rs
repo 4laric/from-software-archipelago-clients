@@ -97,6 +97,12 @@ unsafe extern "C" fn lua_warp_detour(rcx: *mut c_void, rdx: *mut c_void, warp_ar
     // THE PROBE SIGNAL — one line per warp, menu- or client-initiated (see module docs for how
     // the adjacent warp_to_grace line distinguishes the two).
     log::info!("LuaWarp hook: warp arg {warp_arg} -> grace entity {entity} (menu or client)");
+    // CTD guard (2026-07-24): a warp is a map teardown/rebuild. Re-arm the enemy-scaling settle
+    // window NOW so its ChrIns sweep sits out the transition — the sweep's own region-change
+    // guard misses the warp-OUT side (play_region only changes after the load). Infallible by
+    // construction (no panic path; see scaling::notify_transition), so it may run bare inside
+    // the game's call frame.
+    crate::scaling::notify_transition();
     // Original first (same order warp_to_grace uses: request the warp, then intercept). The
     // None arm is unreachable in practice — install() runs on the game thread, the same thread
     // that calls LuaWarp, so no call can land between enable() and HOOK.set() — but if it ever

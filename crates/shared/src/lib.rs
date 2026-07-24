@@ -13,6 +13,7 @@ use windows::core::*;
 mod clipboard;
 mod config;
 mod core;
+mod crash_handler;
 mod error_display;
 mod game;
 mod input_blocker;
@@ -100,10 +101,14 @@ fn start_logger_for_dir(dir: impl AsRef<Path>) -> Result<()> {
         TerminalMode::Mixed,
         ColorChoice::Auto,
     )];
-    if let Ok(logger) = create_write_logger(dir) {
+    if let Ok(logger) = create_write_logger(&dir) {
         loggers.push(logger);
     }
     CombinedLogger::init(loggers)?;
+    // Native crash telemetry, armed as soon as a logger exists so its "armed" line is captured.
+    // A native fault (the 2026-07-24 warp CTD) previously ended the log with NO record at all;
+    // this names the faulting module+offset in crash-<pid>.txt beside the log + the log itself.
+    crash_handler::install(dir.as_ref().join("log"));
     Ok(())
 }
 

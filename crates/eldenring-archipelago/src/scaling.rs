@@ -46,6 +46,28 @@ static REGION_ENTERED: Mutex<Option<Instant>> = Mutex::new(None);
 /// crashed Siofra / the Eternal Cities, 2026-07-09). If that CTD returns, raise this back toward 4s.
 const REGION_SETTLE: Duration = Duration::from_millis(2500);
 
+/// Re-arm the `REGION_SETTLE` skip from an EXTERNAL transition signal — the same `REGION_ENTERED`
+/// machinery the region-change guard uses, no new state class.
+///
+/// CTD guard (2026-07-24, "Beside the Rampart Gaol" warp postmortem). Two callers:
+///   * `warp_hook`'s LuaWarp detour — the moment ANY warp (menu or client) is requested. The
+///     region-change guard in `tick` cannot cover the warp-OUT side: `play_region` keeps its old
+///     value through the first teardown frames (main_player still placed, so `in_world()` still
+///     reads true), so the sweep kept walking the ORIGIN region's ChrIns sets while the engine
+///     streamed them out — the same native-crash class `REGION_SETTLE` exists for (Siofra,
+///     2026-07-09), just on the other edge of the transition.
+///   * core's in-world false->true edge — covers a SAME-REGION reload (death respawn), where
+///     `LAST_REGION` never changes so the region-change reset never fires, yet the ChrIns sets
+///     were just torn down and rebuilt around the sweep.
+/// Worst case is the documented degrade: enemies stay vanilla-statted for `REGION_SETTLE`
+/// longer. No panic path (a poisoned lock is skipped; `Instant::now` cannot fail): the detour
+/// caller sits inside the game's own warp call frame and must never unwind across it.
+pub fn notify_transition() {
+    if let Ok(mut entered) = REGION_ENTERED.lock() {
+        *entered = Some(Instant::now());
+    }
+}
+
 /// Parse slot_data at connect. The parse itself — including the SWEEP H4 / R6 refuse-to-arm on an
 /// empty/missing `regionSphereTargets` — lives in `er_logic::scaling::parse_scaling_config`
 /// (host-tested); this wrapper only owns the logging and the CONFIG swap.

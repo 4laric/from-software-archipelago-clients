@@ -150,6 +150,12 @@ pub struct Core {
     /// their banner never re-fires; then only a THIS-session kill (unset->set) fires. Persists
     /// across polls; reset on a genuine seed change so it re-arms.
     boss_flag_prev: HashSet<u32>,
+    /// SWEEP VISIBILITY (2026-07-24): defeat flags whose boss-sweep banner already fired this
+    /// session, so the "Boss sweep (...): N check(s) granted" line is once per group (the poll
+    /// re-pushes members until the server acks them). Reset on seed change. Reconnects never
+    /// re-banner regardless: already-checked members are filtered by the server checked-set, so
+    /// a re-fired group grants 0 and produces no candidate.
+    sweep_bannered: HashSet<u32>,
     /// ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker): per-region gate data
     /// {threshold, member_ap_ids, bloom_flags}. Empty => feature off. Parsed once per seed.
     region_attunement: HashMap<String, RegionAttunement>,
@@ -399,6 +405,7 @@ impl shared::Core for Core {
             tracker_surface_only: false,
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
+            sweep_bannered: HashSet::new(),
             region_attunement: HashMap::new(),
             boss_payout_pending: HashMap::new(),
             attuned_regions: HashSet::new(),
@@ -1669,7 +1676,16 @@ impl shared::Core for Core {
         //     whose guarding event flag has fired, plus dungeon/boss sweeps. Throttled — flags don't
         //     change fast and the map can be large. Dedup via the server's checked set (reload-safe).
         self.poll_counter = self.poll_counter.wrapping_add(1);
-        if self.locations_loaded && self.poll_counter.is_multiple_of(15) {
+        // CTD guard (2026-07-24, "Beside the Rampart Gaol" warp postmortem): gate the WHOLE poll
+        // on a live world. `get_event_flag` walks `CSEventFlagMan.virtual_memory_flag`, and during
+        // a load screen the streamer is attaching/detaching per-map flag blocks for the outgoing
+        // and incoming maps — a ~4,850-flag sweep racing that teardown/rebuild is a native-crash
+        // window. Nothing is lost by waiting: checks cannot fire mid-load, and the next in-world
+        // poll (sub-second) picks up exactly the same flags.
+        if self.locations_loaded
+            && self.poll_counter.is_multiple_of(15)
+            && crate::flags::in_world()
+        {
             // Capture the new-save baseline once, the first time we poll IN-WORLD (flags are
             // readable only after the save loads). Any guarding flag already set at this point
             // is a new-save default, not a pickup made this session, so it must not fire a check.
@@ -1786,6 +1802,12 @@ impl shared::Core for Core {
                 );
             }
             let mut to_check: Vec<i64> = Vec::new();
+            // SWEEP VISIBILITY (2026-07-24, Tibia Mariner playtest): a boss sweep firing was
+            // invisible -- the console showed only the member items ("found their X"), never the
+            // boss, so the player concluded the sweep had NOT fired when it had. Collect each
+            // group that newly fires this poll -- (defeat flag, member count, a member loc for
+            // the region lookup) -- inside the immutable borrow; bannered after it ends.
+            let mut sweep_fired: Vec<(u32, usize, i64)> = Vec::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
                 // Refresh the vanilla-suppressor's collected-flag set: the acquisition flags of every
                 // location already in the server checked-set (loc->flag via locationFlags). A location
@@ -1848,15 +1870,49 @@ impl shared::Core for Core {
                         continue;
                     }
                     if crate::flags::get_event_flag(flag) {
+                        let mut granted = 0usize;
+                        let mut sample_loc = 0i64;
                         for &loc in locs {
                             if self.valid_locations.contains(&loc)
                                 && !client.is_local_location_checked(loc)
                             {
                                 to_check.push(loc);
+                                granted += 1;
+                                sample_loc = loc;
                             }
+                        }
+                        // Sweep-visibility banner candidates: only a group that granted something
+                        // this poll and hasn't bannered this session. A reconnect stays quiet by
+                        // construction -- already-checked members are filtered above, so granted
+                        // == 0 and nothing is pushed.
+                        if granted > 0 && !self.sweep_bannered.contains(&flag) {
+                            sweep_fired.push((flag, granted, sample_loc));
                         }
                     }
                 }
+            }
+            // SWEEP VISIBILITY banners (latched once per group per session via sweep_bannered;
+            // reset on seed change). Same log/overlay channel as the Felled/attunement banners.
+            for (flag, granted, sample_loc) in sweep_fired {
+                if !self.sweep_bannered.insert(flag) {
+                    continue;
+                }
+                let boss = self.boss_defs.iter().find(|d| d.flag == flag).map(|d| {
+                    d.name
+                        .strip_prefix("Felled: ")
+                        .unwrap_or(d.name.as_str())
+                        .to_string()
+                });
+                let region = self.region_table.get(&(sample_loc as u64)).cloned();
+                let label = match (boss, region) {
+                    (Some(b), Some(r)) => format!("Boss sweep ({r}): {b}"),
+                    (Some(b), None) => format!("Boss sweep: {b}"),
+                    (None, Some(r)) => format!("Boss sweep ({r})"),
+                    (None, None) => format!("Boss sweep (flag {flag})"),
+                };
+                self.log(ap::Print::message(format!(
+                    "{label} -- {granted} check(s) granted."
+                )));
             }
             // ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker "Attunement-release"):
             // gate the BOSS PAYOUT -- the boss's own check + every dungeon-sweep member -- behind the
@@ -2313,6 +2369,12 @@ impl shared::Core for Core {
             // live-row guard (er_logic::shop_echo) covers the one-tick window and any revert
             // path this edge misses.
             crate::shop_sell::reset();
+            // CTD guard (2026-07-24): a load just completed — re-arm the enemy-scaling settle
+            // window too. A SAME-REGION reload (death respawn) never trips the sweep's
+            // region-change reset (LAST_REGION is unchanged), yet the ChrIns sets were just torn
+            // down and rebuilt; give them REGION_SETTLE to finish streaming before the next walk
+            // (scaling::notify_transition; same native-crash class as Siofra 2026-07-09).
+            crate::scaling::notify_transition();
         }
         self.was_in_world = now_in_world;
         if crate::flags::in_world() {
@@ -2643,6 +2705,8 @@ impl Core {
         // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
         self.boss_defs.clear();
         self.boss_flag_prev.clear();
+        // SWEEP VISIBILITY: re-arm the per-group sweep banner for the new seed.
+        self.sweep_bannered.clear();
         // ATTUNEMENT-RELEASE: drop the parsed gate + all per-save latches so the new seed re-parses
         // regionAttunement and re-primes / re-blooms from scratch.
         self.region_attunement.clear();

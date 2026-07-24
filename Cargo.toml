@@ -38,6 +38,11 @@ shared = { path = "crates/shared"}
 version = "0.62"
 features = [
     "Win32_Foundation",
+    # Diagnostics_Debug + Kernel: the crash handler (shared::crash_handler) — vectored/unhandled
+    # exception registration lives in Diagnostics_Debug; EXCEPTION_POINTERS/CONTEXT are gated on
+    # Win32_System_Kernel.
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
