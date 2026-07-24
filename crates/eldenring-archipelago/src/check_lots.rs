@@ -54,6 +54,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+/// Can this pass write a lot slot's CATEGORY field alongside its item id? `false` today:
+/// `check_lots` only ever writes id/num, and a goods placeholder in a non-goods slot without its
+/// category is a garbage item reference. Flip to `true` in the same commit that wires the
+/// `ITEMLOT_PARAM_ST` per-slot category setter -- `er_logic::check_neutralise::plan` then repoints
+/// non-goods slots exactly like goods ones, closing the vanilla leak without emptying anything.
+const CAN_WRITE_SLOT_CATEGORY: bool = false;
+
 /// EquipParamGoods row id of the Telescope -- its iconId is the one me3's VFS menu override repaints
 /// into the AP flower (see shop_icon.rs / er-ap-icon-override). Read live, never written.
 const TELESCOPE_GOOD_ID: u32 = 2040;
@@ -243,29 +250,51 @@ pub fn run() -> bool {
         }
     }
 
-    // NON-GOODS check slots: ZERO them (id = 0, num = 0) instead of repointing to the goods placeholder,
-    // which can only stand in for a GOODS slot. Same table-is-a-fact discipline as the blank loops -- each
-    // lot is written only to the table the apworld named. Scoped by the apworld to FLAGGED one-time lots,
-    // so the acquisition flag still fires on the emptied pickup and the flag poll registers the check.
-    for (lot, slots) in &zero_map {
-        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
-            for &sl in slots {
-                zero_slot(row, sl);
-                n += 1;
+    // NON-GOODS check slots. The comment that used to sit here claimed "the acquisition flag still
+    // fires on the emptied pickup and the flag poll registers the check". IT DOES NOT (Alaric,
+    // 2026-07-24): a zeroed slot spawns nothing, so there is no pickup, so the flag never sets and
+    // the check never registers. Weapons, armour, talismans and Ashes of War are ALL non-goods, so
+    // this quietly killed every gear chest, every scarab Ash-of-War drop and every boss drop --
+    // Leonine Misbegotten's check (flag 510800) never fired in a four-hour session while carrying
+    // progression. Note this file's own module doc had the right rule for goods all along ("the
+    // popup is cosmetic; check registration is not"); the zero pass contradicted it.
+    //
+    // Suppression loses to detection until the slot's CATEGORY can travel with the id: a lot slot's
+    // item id is only meaningful alongside its category, so a non-goods slot cannot hold the goods
+    // placeholder without one. Flip CAN_WRITE_SLOT_CATEGORY once that setter is wired and the same
+    // predicate starts repointing these too -- no other change needed here.
+    let plan = er_logic::check_neutralise::plan(false, CAN_WRITE_SLOT_CATEGORY);
+    if plan == er_logic::check_neutralise::Plan::RepointToPlaceholder {
+        for (lot, slots) in &zero_map {
+            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
+                for &sl in slots {
+                    zero_slot(row, sl);
+                    n += 1;
+                }
+            } else {
+                missed.push(*lot);
             }
-        } else {
-            missed.push(*lot);
         }
-    }
-    for (lot, slots) in &zero_enemy {
-        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
-            for &sl in slots {
-                zero_slot(row, sl);
-                n += 1;
+        for (lot, slots) in &zero_enemy {
+            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
+                for &sl in slots {
+                    zero_slot(row, sl);
+                    n += 1;
+                }
+            } else {
+                missed.push(*lot);
             }
-        } else {
-            missed.push(*lot);
         }
+    } else if !zero_map.is_empty() || !zero_enemy.is_empty() {
+        // Tolerance requires telemetry: say what is inert and why, once per arm.
+        log::warn!(
+            "check-lots: non-goods ZERO pass INERT for {} MAP + {} ENEMY lot(s) -- emptying a slot \
+             removes the pickup, and the pickup IS the check (2026-07-24: boss/scarab/gear-chest \
+             checks never registered). Vanilla ware may leak at non-goods checks until the slot \
+             category can be written; a duplicate item beats a dead check.",
+            zero_map.len(),
+            zero_enemy.len()
+        );
     }
     if !missed.is_empty() {
         log::warn!(
@@ -283,7 +312,8 @@ pub fn run() -> bool {
         missed.len()
     );
     log::info!(
-        "check-lots: neutralised {n} check slot(s) -> goods placeholder {ph} + non-goods zeroed (vanilla ware never handed out at a check)"
+        "check-lots: neutralised {n} check slot(s) -> goods placeholder {ph}; non-goods slots keep their \
+         vanilla ware for now (emptying them removed the pickup, and the pickup IS the check)"
     );
     DONE.store(true, Ordering::Relaxed);
     true
