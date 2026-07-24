@@ -223,7 +223,13 @@ mod replay {
         // grant sets 60130 with the VANILLA goods, the echo of Hero's Rune [5] arrives and is
         // skipped as "sold natively at purchase" -- no purchase ever happened.
         let timeline = [Ev::ShopSellRun, Ev::UniqueStartGrant, Ev::EchoArrive];
-        let old = replay(&timeline, START_GRANT_FLAG, Policy::ArmAll, SkipRule::FlagOnly, &exempt());
+        let old = replay(
+            &timeline,
+            START_GRANT_FLAG,
+            Policy::ArmAll,
+            SkipRule::FlagOnly,
+            &exempt(),
+        );
         assert_eq!(old.vanilla, 1, "start grant delivered the vanilla ware");
         assert_eq!(
             old.ap_reward, 0,
@@ -251,7 +257,13 @@ mod replay {
         // No uniqueStartGrants in play: the vanilla item arrives from the POOL and keyitems.rs
         // sets its obtained-flag -- the echo of this check's reward must still grant.
         let timeline = [Ev::ShopSellRun, Ev::KeyItemReceiveSetsFlag, Ev::EchoArrive];
-        let old = replay(&timeline, START_GRANT_FLAG, Policy::ArmAll, SkipRule::FlagOnly, &exempt());
+        let old = replay(
+            &timeline,
+            START_GRANT_FLAG,
+            Policy::ArmAll,
+            SkipRule::FlagOnly,
+            &exempt(),
+        );
         assert_eq!(old.ap_reward, 0, "pre-fix loses it here too");
         let new = replay(
             &timeline,
@@ -320,7 +332,12 @@ mod replay {
         // ware -- the row sells the VANILLA Note (screenshot: "No. Held 1"), the flag sets, and
         // the FlagOnly rule eats the echo of the real reward. Rule fix: the live row no longer
         // sells the reward, so the echo grants.
-        let timeline = [Ev::ShopSellRun, Ev::ParamRevert, Ev::Purchase, Ev::EchoArrive];
+        let timeline = [
+            Ev::ShopSellRun,
+            Ev::ParamRevert,
+            Ev::Purchase,
+            Ev::EchoArrive,
+        ];
         let old = replay(
             &timeline,
             ORDINARY_FLAG,
@@ -375,7 +392,12 @@ mod replay {
         // The accepted trade: buy (native reward), then a load reverts the row BEFORE the echo
         // lands. The live-row rule can no longer prove delivery, so it grants -- a duplicate.
         // Deliberate bias: a dupe is junk, a loss past the watermark is unrecoverable.
-        let timeline = [Ev::ShopSellRun, Ev::Purchase, Ev::ParamRevert, Ev::EchoArrive];
+        let timeline = [
+            Ev::ShopSellRun,
+            Ev::Purchase,
+            Ev::ParamRevert,
+            Ev::EchoArrive,
+        ];
         let g = replay(
             &timeline,
             ORDINARY_FLAG,

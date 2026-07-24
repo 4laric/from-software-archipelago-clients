@@ -138,8 +138,14 @@ unsafe extern "system" fn first_chance_handler(info: *mut EXCEPTION_POINTERS) ->
             .and_then(|i| i.ExceptionRecord.as_ref())
             .map(|r| r.ExceptionCode.0 as u32)
     };
-    if let Some(code) = code && is_fatal_class(code) && take_first_chance_budget() {
-        report(info as usize, "first-chance — a handler may still absorb it");
+    if let Some(code) = code
+        && is_fatal_class(code)
+        && take_first_chance_budget()
+    {
+        report(
+            info as usize,
+            "first-chance — a handler may still absorb it",
+        );
     }
     EXCEPTION_CONTINUE_SEARCH
 }

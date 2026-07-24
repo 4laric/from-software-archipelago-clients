@@ -467,7 +467,9 @@ mod tests {
             items: vec!["Rusty Key".into()],
             ..Default::default()
         }];
-        assert!(natural_key_fired(&clauses, &names(&["Rusty Key"]), &|_| false));
+        assert!(natural_key_fired(&clauses, &names(&["Rusty Key"]), &|_| {
+            false
+        }));
         assert!(!natural_key_fired(&clauses, &names(&[]), &|_| false));
     }
 

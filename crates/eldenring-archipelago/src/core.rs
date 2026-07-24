@@ -1682,9 +1682,7 @@ impl shared::Core for Core {
         // and incoming maps — a ~4,850-flag sweep racing that teardown/rebuild is a native-crash
         // window. Nothing is lost by waiting: checks cannot fire mid-load, and the next in-world
         // poll (sub-second) picks up exactly the same flags.
-        if self.locations_loaded
-            && self.poll_counter.is_multiple_of(15)
-            && crate::flags::in_world()
+        if self.locations_loaded && self.poll_counter.is_multiple_of(15) && crate::flags::in_world()
         {
             // Capture the new-save baseline once, the first time we poll IN-WORLD (flags are
             // readable only after the save loads). Any guarding flag already set at this point
