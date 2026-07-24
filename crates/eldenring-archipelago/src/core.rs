@@ -2395,7 +2395,8 @@ impl shared::Core for Core {
             && self.flask_seen.is_some()
         {
             let now = self.toast_clock.elapsed().as_millis() as u64;
-            self.toasts.push(format!("Flask charges {before} -> {after}"), now);
+            self.toasts
+                .push(format!("Flask charges {before} -> {after}"), now);
         }
         self.flask_seen = Some(flask_upgrade_count);
 
