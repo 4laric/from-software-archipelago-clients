@@ -59,6 +59,7 @@ const REGION_SETTLE: Duration = Duration::from_millis(2500);
 ///   * core's in-world false->true edge — covers a SAME-REGION reload (death respawn), where
 ///     `LAST_REGION` never changes so the region-change reset never fires, yet the ChrIns sets
 ///     were just torn down and rebuilt around the sweep.
+///
 /// Worst case is the documented degrade: enemies stay vanilla-statted for `REGION_SETTLE`
 /// longer. No panic path (a poisoned lock is skipped; `Instant::now` cannot fail): the detour
 /// caller sits inside the game's own warp call frame and must never unwind across it.

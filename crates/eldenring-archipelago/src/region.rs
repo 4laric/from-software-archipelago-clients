@@ -233,6 +233,7 @@ pub fn tick_natural_key_triggers(cfg: &RegionConfig, received: &HashSet<String>)
 ///     Absent fields default to `[]`/`0`, making the term vacuous — full backward compatibility
 ///     with the pre-count `{"items", "flags"}` shape. `{}` (or `{"items":[],"flags":[]}`) is an
 ///     ALWAYS-OPEN clause (blooms on first tick).
+///
 /// Ported from the standalone `net.rs::parse_natural_keys`.
 fn parse_natural_keys(v: Option<&Value>) -> HashMap<String, Vec<NkClause>> {
     let mut m = HashMap::new();

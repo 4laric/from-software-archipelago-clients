@@ -51,6 +51,12 @@ static SOLD_SUPPRESS: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
 /// a fresh run().
 static ARMED_SUPPRESS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 
+/// One armed row: `(stock flag, ShopLineupParam row id, sold equipId, equipType)`. The last two are
+/// what [`echo_skip`] re-reads LIVE to prove the row still sells the reward -- a reverted row no
+/// longer matches, which is the whole param-revert guard, so this tuple is load-bearing and gets a
+/// name rather than an `#[allow(clippy::type_complexity)]`.
+type EchoArm = (u32, u32, i32, u8);
+
 /// ECHO-DEDUP (2026-07-03): {AP location -> (stock flag, row id, sold equipId, equipType)} for
 /// every rewritten row whose check was still OPEN at run() time. The receive loop skips the echo
 /// grant for these iff the stock flag is NOW SET **and the row still sells that reward LIVE**
@@ -58,7 +64,7 @@ static ARMED_SUPPRESS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 /// rewrite while this map survives -- the set flag then proves only a VANILLA sale, and the
 /// flag-only rule ate the AP item; Kalé "Note: Waypoint Ruins" repro). !collect / server-sent
 /// items for un-bought checks still grant. Replaces bag-add suppression (statics stay unpopulated).
-static ECHO_SKIP: Mutex<Option<HashMap<i64, (u32, u32, i32, u8)>>> = Mutex::new(None);
+static ECHO_SKIP: Mutex<Option<HashMap<i64, EchoArm>>> = Mutex::new(None);
 
 /// CLIENT-SETTABLE flags (uniqueStartGrants obtained-flags + keyitems acquire flags): flags the
 /// client itself writes outside any purchase. A check detected by one of these is EXEMPT from the
@@ -201,7 +207,7 @@ pub fn run() -> bool {
     // Scan immutably -> plan the rewrites, then apply (avoids holding a row borrow across get_mut).
     let mut plan: Vec<(u32, i32, u8)> = Vec::new(); // (row id, new equipId, equipType)
     // AP location -> (stock flag, row id, sold equipId, equipType) (ECHO-DEDUP + revert guard)
-    let mut echo_skip: HashMap<i64, (u32, u32, i32, u8)> = HashMap::new();
+    let mut echo_skip: HashMap<i64, EchoArm> = HashMap::new();
     // SKIP TALLY -- why a check row did NOT get a native rewrite. On a SOLO seed a large `no_scout` or
     // `no_sell_id` means the scout cache / apIdsToItemIds is THINNER than the check set, not that the
     // rewards are genuinely un-sellable. Do not reason about the rewrite count without this breakdown:
