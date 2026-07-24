@@ -51,6 +51,16 @@ pub struct StaticLots {
     pub enemy: HashMap<u32, (u32, Vec<u8>)>,
     /// acquisition flag -> the WEAPON/ARMOR item ids that check hands out (id-keyed suppression)
     pub items: HashMap<u32, Vec<u32>>,
+    /// CO-CHECK OVERLAY (`map_v2` / `enemy_v2`): a shared getItemFlagId can drive SEVERAL lots, each
+    /// its own co-firing check (SPEC-flag-lot-item-model). `map` keys the PRIMARY (lowest) lot only;
+    /// this lists EVERY lot on such a flag so all of them are blanked -- otherwise the sibling
+    /// co-check hands out its vanilla ware alongside its AP item. Additive: a flag absent here falls
+    /// back to `map`/`enemy` (single lot), so an old table / an apworld that emits no `_v2` degrades to
+    /// exactly today's lowest-lot blanking. Contract (gen_check_lots_table.py): >=2 entries per flag,
+    /// lot-sorted, and `map[flag] == map_v2[flag][0]`.
+    pub map_v2: HashMap<u32, Vec<(u32, Vec<u8>)>>,
+    /// acquisition flag -> all ItemLotParam_enemy co-check lots (see `map_v2`).
+    pub enemy_v2: HashMap<u32, Vec<(u32, Vec<u8>)>>,
 }
 
 impl StaticLots {
@@ -82,6 +92,43 @@ fn parse_side(v: Option<&Value>) -> HashMap<u32, (u32, Vec<u8>)> {
             .unwrap_or_default();
         if !slots.is_empty() && lot > 0 {
             out.insert(flag, (lot as u32, slots));
+        }
+    }
+    out
+}
+
+/// Parse a co-check overlay side (`map_v2` / `enemy_v2`): `{flag: [{lot, slots}, ...]}` -> the full
+/// per-flag lot list. Same per-row validation as `parse_side`; a flag with no valid rows is dropped.
+fn parse_side_v2(v: Option<&Value>) -> HashMap<u32, Vec<(u32, Vec<u8>)>> {
+    let mut out = HashMap::new();
+    let Some(obj) = v.and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (k, arr) in obj {
+        let Ok(flag) = k.parse::<u32>() else { continue };
+        let Some(rows) = arr.as_array() else { continue };
+        let mut lots: Vec<(u32, Vec<u8>)> = Vec::new();
+        for row in rows {
+            let Some(lot) = row.get("lot").and_then(|x| x.as_u64()) else {
+                continue;
+            };
+            let slots: Vec<u8> = row
+                .get("slots")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_u64())
+                        .filter(|&s| (1..=8).contains(&s))
+                        .map(|s| s as u8)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !slots.is_empty() && lot > 0 {
+                lots.push((lot as u32, slots));
+            }
+        }
+        if !lots.is_empty() {
+            out.insert(flag, lots);
         }
     }
     out
@@ -122,6 +169,8 @@ pub fn parse(text: &str) -> StaticLots {
         map: parse_side(v.get("map")),
         enemy: parse_side(v.get("enemy")),
         items,
+        map_v2: parse_side_v2(v.get("map_v2")),
+        enemy_v2: parse_side_v2(v.get("enemy_v2")),
     }
 }
 
@@ -134,12 +183,24 @@ pub fn blank_tables_for(
 ) -> (HashMap<u32, Vec<u8>>, HashMap<u32, Vec<u8>>) {
     let (mut m, mut e) = (HashMap::new(), HashMap::new());
     for f in seed_flags {
-        if let Some((lot, slots)) = lots.map.get(f) {
+        // CO-CHECK OVERLAY WINS: a shared flag blanks EVERY co-check lot, not just the primary --
+        // otherwise the sibling co-check leaks its vanilla ware. Absent from the overlay -> the
+        // single-lot `map`/`enemy` (today's behavior). map[flag] == map_v2[flag][0], so the primary
+        // is covered either way.
+        if let Some(rows) = lots.map_v2.get(f) {
+            for (lot, slots) in rows {
+                m.insert(*lot, slots.clone());
+            }
+        } else if let Some((lot, slots)) = lots.map.get(f) {
             m.insert(*lot, slots.clone());
         }
         // NB a flag can appear in BOTH tables (5 do). Blank both -- the client only writes a row
         // that actually exists, so this cannot corrupt the table it is not in.
-        if let Some((lot, slots)) = lots.enemy.get(f) {
+        if let Some(rows) = lots.enemy_v2.get(f) {
+            for (lot, slots) in rows {
+                e.insert(*lot, slots.clone());
+            }
+        } else if let Some((lot, slots)) = lots.enemy.get(f) {
             e.insert(*lot, slots.clone());
         }
     }
@@ -241,5 +302,63 @@ mod tests {
             "slot 9 is out of range, dropped"
         );
         assert_eq!(l.map.len(), 1);
+    }
+
+    // ---- co-check overlay (map_v2 / enemy_v2) ----------------------------------------------------
+    const T_V2: &str = r#"{
+      "placeholder_goods": 8852,
+      "map":    {"510460": {"lot": 10460, "slots": [1]},
+                 "520110": {"lot": 20110, "slots": [1]}},
+      "map_v2": {"510460": [{"lot": 10460, "slots": [1]}, {"lot": 10461, "slots": [1]}]},
+      "enemy":  {"777": {"lot": 900, "slots": [2]}},
+      "enemy_v2": {"777": [{"lot": 900, "slots": [2]}, {"lot": 901, "slots": [3]}]}
+    }"#;
+
+    #[test]
+    fn v2_overlay_parses_and_upholds_the_primary_contract() {
+        let l = parse(T_V2);
+        // map[flag] == map_v2[flag][0]: the primary is the first (lowest) lot.
+        assert_eq!(l.map.get(&510460), Some(&(10460u32, vec![1u8])));
+        let rows = l.map_v2.get(&510460).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (10460u32, vec![1u8]));
+        assert_eq!(rows[1], (10461u32, vec![1u8]));
+        assert_eq!(l.enemy_v2.get(&777).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn co_check_flag_blanks_every_lot_not_just_the_primary() {
+        // THE POINT: Messmer's flag 510460 drives lot 10460 (Rem. Impaler) AND 10461 (Kindling).
+        // Blanking only the primary leaks the sibling co-check's vanilla ware. The overlay blanks both.
+        let l = parse(T_V2);
+        let (m, e) = blank_tables_for(&l, &[510460, 777]);
+        assert_eq!(m.get(&10460), Some(&vec![1u8]), "primary lot blanked");
+        assert_eq!(
+            m.get(&10461),
+            Some(&vec![1u8]),
+            "SIBLING co-check lot blanked too"
+        );
+        assert_eq!(e.get(&900), Some(&vec![2u8]));
+        assert_eq!(e.get(&901), Some(&vec![3u8]), "enemy sibling blanked too");
+    }
+
+    #[test]
+    fn no_overlay_degrades_to_single_lot_blanking() {
+        // A flag with only a `map` entry (no _v2) blanks its one lot -- exactly today's behavior, so
+        // an old table / an apworld that emits no overlay is no worse than before.
+        let l = parse(T_V2);
+        let (m, _e) = blank_tables_for(&l, &[520110]);
+        assert_eq!(m.get(&20110), Some(&vec![1u8]));
+        assert_eq!(m.len(), 1, "no overlay for 520110 -> just its single lot");
+    }
+
+    #[test]
+    fn absent_overlay_is_fully_backward_compatible() {
+        // The pre-overlay table (no map_v2/enemy_v2 keys) parses to empty overlays and behaves as
+        // it always has.
+        let l = parse(T);
+        assert!(l.map_v2.is_empty() && l.enemy_v2.is_empty());
+        let (m, _e) = blank_tables_for(&l, &[520110]);
+        assert_eq!(m.get(&20110), Some(&vec![1u8]));
     }
 }
