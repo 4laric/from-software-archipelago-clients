@@ -465,29 +465,6 @@ impl shared::Core for Core {
         self.render_toasts(ui);
     }
 
-    /// Bottom-left, borderless, input-transparent: a notice must never eat a click or steal focus
-    /// from the game. Nothing is drawn when the deck is empty, so this costs a length check a frame.
-    fn render_toasts(&mut self, ui: &imgui::Ui) {
-        let now = self.toast_clock.elapsed().as_millis() as u64;
-        self.toasts.expire(now);
-        if self.toasts.is_empty() {
-            return;
-        }
-        let height = ui.io().display_size[1];
-        ui.window("###ap-toasts")
-            .position([24.0, height - 160.0], imgui::Condition::Always)
-            .no_decoration()
-            .always_auto_resize(true)
-            .movable(false)
-            .bg_alpha(0.55)
-            .build(|| {
-                for t in self.toasts.visible() {
-                    let a = self.toasts.alpha(t, now);
-                    ui.text_colored([1.0, 0.85, 0.35, a], t.text.as_str());
-                }
-            });
-    }
-
     fn update_live(&mut self) -> Result<()> {
         if !self.detour_installed {
             match crate::detour::install() {
@@ -2886,6 +2863,29 @@ impl Core {
     /// Build the per-frame tracker snapshot and draw the window (SPEC-item-tracker.md Phase 1).
     /// Everything the imgui closure touches is a local snapshot -- `self` stays out of it so the
     /// window's close button can just write a local.
+    /// Bottom-left, borderless, input-transparent: a notice must never eat a click or steal focus
+    /// from the game. Nothing is drawn when the deck is empty, so this costs a length check a frame.
+    fn render_toasts(&mut self, ui: &imgui::Ui) {
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        self.toasts.expire(now);
+        if self.toasts.is_empty() {
+            return;
+        }
+        let height = ui.io().display_size[1];
+        ui.window("###ap-toasts")
+            .position([24.0, height - 160.0], imgui::Condition::Always)
+            .no_decoration()
+            .always_auto_resize(true)
+            .movable(false)
+            .bg_alpha(0.55)
+            .build(|| {
+                for t in self.toasts.visible() {
+                    let a = self.toasts.alpha(t, now);
+                    ui.text_colored([1.0, 0.85, 0.35, a], t.text.as_str());
+                }
+            });
+    }
+
     fn render_tracker_window(&mut self, ui: &imgui::Ui) {
         // One client borrow: location id sets (+ id -> display name) and received-item names.
         let mut checked: Vec<u64> = Vec::new();
