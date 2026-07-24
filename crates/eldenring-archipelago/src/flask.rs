@@ -74,13 +74,8 @@ pub fn tick(received_count: usize) -> Option<(u32, u32)> {
     // Desired rung from the received count. `None` => ladder absent/empty or count 0 => no-op.
     let target = {
         let guard = LADDER.lock().unwrap();
-        let Some(ladder) = guard.as_ref() else {
-            return None;
-        };
-        match flask_reconcile::desired(ladder, received_count) {
-            Some(t) => t,
-            None => return None,
-        }
+        let ladder = guard.as_ref()?;
+        flask_reconcile::desired(ladder, received_count)?
     };
 
     // SAFETY: FD4 singleton; only mutated on the single-threaded FrameBegin / reconcile tick.
