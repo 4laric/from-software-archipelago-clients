@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use eldenring::cs::GameDataMan;
@@ -24,6 +24,13 @@ type AddItemFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64
 static HOOK: OnceLock<GenericDetour<AddItemFn>> = OnceLock::new();
 /// Live inventory pointer captured on every pickup; reused to grant items that never pass a pickup.
 static LAST_INVENTORY: AtomicUsize = AtomicUsize::new(0);
+/// World epoch the pointer in `LAST_INVENTORY` was captured in. See [`WORLD_EPOCH`].
+static LAST_INVENTORY_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Bumped on every in-world false->true edge (load / save-load / warp arrival / respawn), i.e.
+/// every point at which the game may have freed and rebuilt the inventory object. A pointer
+/// captured in an older epoch is DEAD -- handing it to the game's AddItemFunc is a use-after-free,
+/// and it is what crashed the 2026-07-24 playtest twice (er_logic::inv_ptr, replay-tested).
+static WORLD_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// checkItemFlags from slot_data: full AddItemFunc-space item id -> acquisition flags of the check
 /// locations that vanilla-hold it. LIVE vanilla-suppressor since 2026-07-01. The re-pickup
 /// discriminator is now the COLLECTED set (KNOWN_COLLECTED_FLAGS), not the live game flag —
@@ -165,7 +172,13 @@ fn static_inventory_ptr_rva() -> Option<usize> {
 /// static path so grants flush WITHOUT waiting for a pickup. No-op unless `USE_STATIC_INVENTORY_PRIME`
 /// is enabled (and confirmed safe). Once a real pickup captures the game's own pointer it takes over.
 pub fn prime_inventory_if_needed() {
-    if !USE_STATIC_INVENTORY_PRIME || LAST_INVENTORY.load(Ordering::Relaxed) >= 0x10000 {
+    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
+    let have = er_logic::inv_ptr::usable(
+        LAST_INVENTORY.load(Ordering::Relaxed),
+        LAST_INVENTORY_EPOCH.load(Ordering::Relaxed),
+        epoch,
+    );
+    if !USE_STATIC_INVENTORY_PRIME || have {
         return;
     }
     if !crate::flags::in_world() {
@@ -174,8 +187,21 @@ pub fn prime_inventory_if_needed() {
     // Use the RVA pointer-slot resolver (CONFIRMED 2026-06-30); the typed-field resolver MISMATCHED.
     if let Some(inv) = static_inventory_ptr_rva() {
         LAST_INVENTORY.store(inv, Ordering::Relaxed);
+        LAST_INVENTORY_EPOCH.store(WORLD_EPOCH.load(Ordering::Relaxed), Ordering::Relaxed);
         log::info!("primed inventory pointer from rva-slot @ {inv:#x} (no pickup needed)");
     }
+}
+
+/// Called on the in-world false->true edge (core.rs), beside the check_lots / enemy_drops /
+/// shop_sell re-arms. Retires the cached inventory pointer: the game may have freed the object
+/// during the load, and a pointer that outlives its world is a native crash the moment the
+/// reconciler grants through it. The next tick re-primes from the static slot (or the player's
+/// next pickup), so this costs at most a tick or two of deferred grants.
+pub fn on_world_edge() {
+    let e = WORLD_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    log::info!(
+        "inventory-ptr: retired at world edge (epoch {e}) -- re-priming before the next grant"
+    );
 }
 
 /// Cracked Pot FullID (GOODS | goods 9500) — the item the Chapel pot-relief guard watches.
@@ -286,8 +312,15 @@ pub fn grant_full_id(full_id: i32, qty: i32) -> bool {
     // Stage 6a: raise granted weapons to the player's current max reinforce tier (inert if off).
     let full_id = crate::upgrades::apply_auto_upgrade(full_id);
     let inv = LAST_INVENTORY.load(Ordering::Relaxed);
-    if inv < 0x10000 {
-        return false; // no inventory instance captured yet; retry after the player's first pickup
+    if !er_logic::inv_ptr::usable(
+        inv,
+        LAST_INVENTORY_EPOCH.load(Ordering::Relaxed),
+        WORLD_EPOCH.load(Ordering::Relaxed),
+    ) {
+        // Either nothing captured yet, or the capture predates a load and now points at freed
+        // memory. Both mean RETRY, never "grant anyway": every caller treats false as retry, and
+        // prime_inventory_if_needed re-seeds within a tick or two of the world coming back.
+        return false;
     }
     grant_item(inv as *mut c_void, full_id, qty);
     true
@@ -307,6 +340,7 @@ unsafe extern "C" fn add_item_detour(
     r9: u64,
 ) -> u64 {
     LAST_INVENTORY.store(inventory as usize, Ordering::Relaxed);
+    LAST_INVENTORY_EPOCH.store(WORLD_EPOCH.load(Ordering::Relaxed), Ordering::Relaxed);
     REAL_PICKUP_SEEN.store(true, Ordering::Relaxed);
     // One-time: compare the pointer the game hands us against the static-resolved candidate, so we
     // can safely enable USE_STATIC_INVENTORY_PRIME (a wrong static pointer would crash on grant).

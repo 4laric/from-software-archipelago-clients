@@ -2431,6 +2431,13 @@ impl shared::Core for Core {
         if now_in_world && !self.was_in_world {
             crate::check_lots::reset();
             crate::enemy_drops::reset();
+            // THE CTD (2026-07-24, symbolized): the inventory pointer grant_full_id hands to the
+            // game's AddItemFunc is captured once and was trusted forever. A load frees that
+            // object, so the next grant made the GAME dereference freed memory
+            // (eldenring.exe+0x560714, AV read at 0x1ffa585e148, reached via
+            // grant_full_id <- Reconciler::tick_with_classes <- classify_received). Retire it here
+            // and let the next tick re-prime. See er_logic::inv_ptr (replay-tested).
+            crate::detour::on_world_edge();
             // shop_sell was MISSING from this edge (2026-07-24): the same stream-in reverts
             // ShopLineupParam, so every rewritten check row went back to selling its VANILLA
             // ware after the session's first load -- while ECHO_SKIP survived and kept eating
