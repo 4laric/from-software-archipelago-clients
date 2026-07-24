@@ -48,6 +48,7 @@ pub mod scadu_blessing_replay;
 pub mod scaling;
 pub mod seed_change;
 pub mod shop_echo;
+pub mod sweep_flush;
 pub mod start_backfill;
 pub mod start_grant_replay;
 pub mod static_lots;

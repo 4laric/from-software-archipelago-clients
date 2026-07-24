@@ -156,6 +156,11 @@ pub struct Core {
     /// re-banner regardless: already-checked members are filtered by the server checked-set, so
     /// a re-fired group grants 0 and produces no candidate.
     sweep_bannered: HashSet<u32>,
+    /// SWEEP FLAG FLUSH (2026-07-24): acquisition flags owed to swept members, held until each one
+    /// READS BACK set. A sweep fires exactly once -- on the poll that observes the defeat flag,
+    /// which can be mid-load when the game refuses writes -- so a fire-and-forget write would leave
+    /// those pickups dead in the world forever. See `er_logic::sweep_flush` (replay-tested).
+    sweep_flag_pending: Vec<u32>,
     /// ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker): per-region gate data
     /// {threshold, member_ap_ids, bloom_flags}. Empty => feature off. Parsed once per seed.
     region_attunement: HashMap<String, RegionAttunement>,
@@ -406,6 +411,7 @@ impl shared::Core for Core {
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
             sweep_bannered: HashSet::new(),
+            sweep_flag_pending: Vec::new(),
             region_attunement: HashMap::new(),
             boss_payout_pending: HashMap::new(),
             attuned_regions: HashSet::new(),
@@ -1806,6 +1812,9 @@ impl shared::Core for Core {
             // group that newly fires this poll -- (defeat flag, member count, a member loc for
             // the region lookup) -- inside the immutable borrow; bannered after it ends.
             let mut sweep_fired: Vec<(u32, usize, i64)> = Vec::new();
+            // (location, detection flag) for every member this poll actually granted -- the input
+            // to the sweep flag flush below (er_logic::sweep_flush::flags_to_assert).
+            let mut swept_members: Vec<(i64, u32)> = Vec::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
                 // Refresh the vanilla-suppressor's collected-flag set: the acquisition flags of every
                 // location already in the server checked-set (loc->flag via locationFlags). A location
@@ -1852,6 +1861,8 @@ impl shared::Core for Core {
                                 && !client.is_local_location_checked(m)
                             {
                                 to_check.push(m);
+                                swept_members
+                                    .push((m, fp.location_flags.get(&m).copied().unwrap_or(0)));
                             }
                         }
                     }
@@ -1877,6 +1888,8 @@ impl shared::Core for Core {
                                 to_check.push(loc);
                                 granted += 1;
                                 sample_loc = loc;
+                                swept_members
+                                    .push((loc, fp.location_flags.get(&loc).copied().unwrap_or(0)));
                             }
                         }
                         // Sweep-visibility banner candidates: only a group that granted something
@@ -1911,6 +1924,37 @@ impl shared::Core for Core {
                 self.log(ap::Print::message(format!(
                     "{label} -- {granted} check(s) granted."
                 )));
+            }
+            // SWEEP FLAG FLUSH (2026-07-24, "chests are still broken"): granting the check told
+            // the SERVER the member was collected; nothing told the GAME. Its lot is already
+            // neutralised to the 8852 placeholder, so the pickup sat in the world as a dead prop
+            // that opens and gives nothing. Stage the owed flags, then re-assert every tick until
+            // each reads back (reconcile, don't dispatch -- the sweep never fires twice).
+            if !swept_members.is_empty() {
+                let owed = er_logic::sweep_flush::flags_to_assert(&swept_members, |f| {
+                    crate::flags::get_event_flag(f)
+                });
+                for f in owed {
+                    if !self.sweep_flag_pending.contains(&f) {
+                        self.sweep_flag_pending.push(f);
+                    }
+                }
+            }
+            if !self.sweep_flag_pending.is_empty() && crate::flags::in_world() {
+                let owed_before = self.sweep_flag_pending.len();
+                for &f in &self.sweep_flag_pending {
+                    let _ = crate::flags::try_set_event_flag(f, true);
+                }
+                er_logic::sweep_flush::retire(&mut self.sweep_flag_pending, |f| {
+                    crate::flags::get_event_flag(f)
+                });
+                let landed = owed_before - self.sweep_flag_pending.len();
+                if landed > 0 {
+                    log::info!(
+                        "sweep-flush: {landed} swept member flag(s) confirmed set ({} still owed)",
+                        self.sweep_flag_pending.len()
+                    );
+                }
             }
             // ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker "Attunement-release"):
             // gate the BOSS PAYOUT -- the boss's own check + every dungeon-sweep member -- behind the
@@ -2663,6 +2707,9 @@ impl Core {
     /// coarse_table, tracker UI prefs) and install-once globals (detour_installed) are left intact.
     /// Recovered after commit 4bb3c95 accidentally dropped the body while leaving the call sites.
     fn reset_for_new_seed(&mut self) {
+        // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
+        // flags the new seed never earned.
+        self.sweep_flag_pending.clear();
         self.received_through = 0;
         self.dispatched_through = 0;
         self.item_map = None;

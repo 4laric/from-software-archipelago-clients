@@ -25,10 +25,14 @@
 //!     fresh file handle (no lock shared with anything), and only THEN mirrored via
 //!     `log::error!` — if the crashing thread was inside the logger when it faulted, the direct
 //!     file still lands even if the mirror deadlocks a process that is dying anyway.
-//!   * Backtrace = raw frame walk (`backtrace::trace_unsynchronized`; NO dbghelp symbolization —
-//!     dbghelp is not safe from an exception handler), each frame resolved to module+offset via
-//!     `GetModuleHandleExW(FROM_ADDRESS)`. A stack-overflow report skips the walk (no stack to
-//!     walk it on) and keeps its path minimal.
+//!   * Backtrace = manual unwind of the FAULTING thread's `CONTEXT` (`RtlLookupFunctionEntry` +
+//!     `RtlVirtualUnwind` on a local copy; NO dbghelp symbolization — dbghelp is not safe from
+//!     an exception handler). Walking our OWN stack here names the handler, not the crash: the
+//!     first live report (2026-07-24) spent frames 0-2 on this module's report machinery and
+//!     never showed the game frames that led to the fault. Each frame resolves to module+offset
+//!     via `GetModuleHandleExW(FROM_ADDRESS)`, and the module bases seen are listed so an
+//!     offset (RVA) stays comparable across ASLR'd sessions. A stack-overflow report skips the
+//!     walk (the handler itself runs on whatever stack is left) and keeps its path minimal.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -36,12 +40,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, EXCEPTION_POINTERS, LPTOP_LEVEL_EXCEPTION_FILTER,
-    SetUnhandledExceptionFilter,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, LPTOP_LEVEL_EXCEPTION_FILTER,
+    RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
+};
+use windows::Win32::System::Memory::{
+    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
+    VirtualQuery,
 };
 use windows::core::PCWSTR;
 
@@ -199,6 +207,8 @@ fn report_inner(info: usize, phase: &str) {
     let mut fault_addr = 0usize;
     let mut av_detail = String::new();
     let mut rip = 0u64;
+    let mut rsp = 0u64;
+    let mut ctx_ptr: *const CONTEXT = std::ptr::null();
     // SAFETY: pointers come straight from the OS dispatcher and are valid for the call; every
     // dereference is null-checked. Read-only.
     unsafe {
@@ -217,8 +227,10 @@ fn report_inner(info: usize, phase: &str) {
                     av_detail = format!(" ({op} at {:#x})", rec.ExceptionInformation[1]);
                 }
             }
-            if let Some(ctx) = i.ContextRecord.as_ref() {
+            ctx_ptr = i.ContextRecord.cast_const();
+            if let Some(ctx) = ctx_ptr.as_ref() {
                 rip = ctx.Rip;
+                rsp = ctx.Rsp;
             }
         }
     }
@@ -232,20 +244,48 @@ fn report_inner(info: usize, phase: &str) {
     if rip != 0 && rip as usize != fault_addr {
         out.push_str(&format!("rip {}\n", format_addr(rip as usize)));
     }
+    if rsp != 0 {
+        out.push_str(&format!("rsp {rsp:#x}\n"));
+    }
     out.push_str(&format!("thread {:?}\n", std::thread::current().id()));
 
     // STACK_OVERFLOW runs on the exhausted stack: skip the walk, keep the path minimal.
     if code != 0xC000_00FD {
-        out.push_str("backtrace (module+offset):\n");
-        let mut n = 0usize;
-        // SAFETY: unsynchronized raw frame walk on the current thread only — no dbghelp, no
-        // global lock to deadlock on. Bounded to 32 frames.
-        unsafe {
-            backtrace::trace_unsynchronized(|frame| {
-                out.push_str(&format!("  {n:2}: {}\n", format_addr(frame.ip() as usize)));
-                n += 1;
-                n < 32
-            });
+        let mut frames = [0usize; MAX_FRAMES];
+        // SAFETY: the context pointer came from the OS dispatcher and stays valid for the whole
+        // handler call; walk_fault_context copies it before unwinding anything.
+        let mut nframes = match unsafe { ctx_ptr.as_ref() } {
+            Some(ctx) => walk_fault_context(ctx, &mut frames),
+            None => 0,
+        };
+        if nframes > 0 {
+            out.push_str("backtrace (module+offset):\n");
+        } else {
+            // No context to walk (or its rip was garbage from the start): degrade to the old
+            // self-stack walk rather than report nothing — and say so in the header, because
+            // these frames name the handler, not the fault.
+            nframes = walk_own_stack(&mut frames);
+            out.push_str("backtrace (module+offset, HANDLER stack — fault context unusable):\n");
+        }
+        for (i, &addr) in frames[..nframes].iter().enumerate() {
+            out.push_str(&format!("  {i:2}: {}\n", format_addr(addr)));
+        }
+        // Module bases behind the module+offset lines above: ASLR moves the base every launch;
+        // the offset (RVA) is the part that stays comparable across sessions — record both
+        // sides of that equation.
+        let mut mods: Vec<(String, usize)> = Vec::with_capacity(4);
+        for &addr in frames[..nframes].iter().chain(std::iter::once(&fault_addr)) {
+            if let Some((name, base, _)) = module_offset(addr)
+                && !mods.iter().any(|(_, b)| *b == base)
+            {
+                mods.push((name, base));
+            }
+        }
+        if !mods.is_empty() {
+            out.push_str("modules:\n");
+            for (name, base) in &mods {
+                out.push_str(&format!("  {name} @ {base:#x}\n"));
+            }
         }
     }
 
@@ -272,19 +312,135 @@ fn report_inner(info: usize, phase: &str) {
     log::logger().flush();
 }
 
+/// Cap on recorded frames — same bound the old self-stack walk used.
+const MAX_FRAMES: usize = 32;
+
+/// Top of the x64 user-mode address range; an rip/rsp beyond it means the frame chain is
+/// corrupt, and the walk stops rather than chase garbage.
+const USER_ADDR_MAX: u64 = 0x7FFF_FFFF_FFFF;
+
+/// A `CONTEXT` copy carrying the 16-byte alignment the OS requires of one. The windows-rs
+/// struct is plain `repr(C)` (8-aligned), and `RtlVirtualUnwind` restores nonvolatile XMM state
+/// with aligned stores — an under-aligned copy could itself fault, inside the crash handler.
+#[repr(C, align(16))]
+struct AlignedContext(CONTEXT);
+
+/// Unwind the FAULTING thread's stack from the exception `CONTEXT`, recording `Rip` per frame;
+/// returns the frame count. This is the same table walk the OS dispatcher performs on this very
+/// context during SEH search — `RtlLookupFunctionEntry` + `RtlVirtualUnwind`, both kernel32
+/// exports with no dbghelp state and no lock we could already hold — done on a local COPY so
+/// the context the OS still owns is never mutated.
+fn walk_fault_context(ctx: &CONTEXT, frames: &mut [usize; MAX_FRAMES]) -> usize {
+    let mut ctx = AlignedContext(*ctx);
+    let mut n = 0usize;
+    while n < MAX_FRAMES {
+        let rip = ctx.0.Rip;
+        if rip == 0 || rip > USER_ADDR_MAX {
+            break;
+        }
+        frames[n] = rip as usize;
+        n += 1;
+        let rsp = ctx.0.Rsp;
+        if rsp == 0 || rsp > USER_ADDR_MAX || !readable(rsp as usize) {
+            break;
+        }
+        let mut image_base = 0u64;
+        // SAFETY: a read-only lookup over the loader's function tables; a null result just
+        // means no unwind info exists for this rip.
+        let entry = unsafe { RtlLookupFunctionEntry(rip, &raw mut image_base, None) };
+        if entry.is_null() {
+            if n > 1 {
+                // Mid-walk rip with no unwind info: JIT/trampoline code (e.g. a retour detour
+                // stub). Guessing a frame size past it would fabricate frames — stop; the
+                // recorded "(no module)" address is itself the evidence of the detour.
+                break;
+            }
+            // Faulting rip with no unwind info at frame 0: a fault in a true leaf function, or
+            // a jump/call to a bad address — either way the return address sits untouched at
+            // [rsp], so simulate the pop.
+            // SAFETY: readable(rsp) above verified the page is committed and readable, and an
+            // 8-aligned 8-byte read cannot cross into the next page.
+            ctx.0.Rip = unsafe { (rsp as *const u64).read_unaligned() };
+            ctx.0.Rsp = rsp + 8;
+        } else {
+            let mut handler_data: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut establisher_frame = 0u64;
+            // SAFETY: unwinds one frame of the local aligned copy using the entry just looked
+            // up for this exact rip; out-params are live locals. readable(rsp) fences off the
+            // common nested-fault case (garbage rsp), though a frame extending past the queried
+            // region could still in principle fault — accepted residual risk, latched by
+            // IN_HANDLER either way.
+            unsafe {
+                RtlVirtualUnwind(
+                    UNW_FLAG_NHANDLER,
+                    image_base,
+                    rip,
+                    entry,
+                    &raw mut ctx.0,
+                    &raw mut handler_data,
+                    &raw mut establisher_frame,
+                    None,
+                );
+            }
+        }
+        if ctx.0.Rsp <= rsp {
+            // Rsp must strictly rise as frames pop; anything else is a corrupt chain (or the
+            // end of the stack) — stop.
+            break;
+        }
+    }
+    n
+}
+
+/// Fallback when the OS handed us no usable `CONTEXT`: walk OUR OWN stack. The frames name the
+/// handler machinery rather than the fault site — the report header says so — but a labeled,
+/// degraded backtrace still beats none.
+fn walk_own_stack(frames: &mut [usize; MAX_FRAMES]) -> usize {
+    let mut n = 0usize;
+    // SAFETY: unsynchronized raw frame walk on the current thread only — no dbghelp, no global
+    // lock to deadlock on. Bounded to MAX_FRAMES.
+    unsafe {
+        backtrace::trace_unsynchronized(|frame| {
+            frames[n] = frame.ip() as usize;
+            n += 1;
+            n < MAX_FRAMES
+        });
+    }
+    n
+}
+
+/// Best-effort "safe to read a stack slot here": committed, and neither PAGE_GUARD nor
+/// PAGE_NOACCESS. Keeps our own leaf-frame read — and the common failure mode of
+/// `RtlVirtualUnwind`'s stack reads — from raising a NESTED fault inside the crash handler.
+fn readable(addr: usize) -> bool {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: writes only into the live local struct, bounded by that struct's true size.
+    let len = unsafe {
+        VirtualQuery(
+            Some(addr as *const std::ffi::c_void),
+            &raw mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    len != 0
+        && info.State == MEM_COMMIT
+        && (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == PAGE_PROTECTION_FLAGS(0)
+}
+
 /// `module+offset` for an address (falls back to the bare address when no module claims it —
 /// JIT/trampoline/heap, e.g. a retour detour stub).
 fn format_addr(addr: usize) -> String {
     match module_offset(addr) {
-        Some((module, off)) => format!("{module}+{off:#x} ({addr:#x})"),
+        Some((module, _base, off)) => format!("{module}+{off:#x} ({addr:#x})"),
         None => format!("{addr:#x} (no module)"),
     }
 }
 
-/// Resolve an address to (module file name, offset). Same FROM_ADDRESS shape as
+/// Resolve an address to (module file name, module base, offset). Same FROM_ADDRESS shape as
 /// `utils::current_module_directory`, but with a fixed MAX_PATH buffer — no allocation growth
-/// loops inside a crash handler.
-fn module_offset(addr: usize) -> Option<(String, usize)> {
+/// loops inside a crash handler. The base rides along so the report can list it next to the
+/// offsets that were computed against it.
+fn module_offset(addr: usize) -> Option<(String, usize, usize)> {
     let mut module = HMODULE::default();
     // SAFETY: FROM_ADDRESS treats the "name" pointer as an address to resolve;
     // UNCHANGED_REFCOUNT takes no reference. Failure -> None.
@@ -312,5 +468,5 @@ fn module_offset(addr: usize) -> Option<(String, usize)> {
         .next()
         .unwrap_or(full.as_str())
         .to_string();
-    Some((name, addr - base))
+    Some((name, base, addr - base))
 }
