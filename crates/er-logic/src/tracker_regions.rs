@@ -757,7 +757,7 @@ pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7770743, "Shadow Keep", "Shadow Keep", false, false),
     (7770744, "Shadow Keep", "Shadow Keep", false, true),
     (7770745, "Belurat", "Belurat", false, false),
-    (7770746, "Scadu Altus", "Scadu Altus", true, false),
+    (7770746, "Scadu Altus", "Scadu Altus", false, false),
     (7770747, "Belurat", "Belurat", false, false),
     (7770748, "Belurat", "Belurat", false, false),
     (7770749, "Gravesite", "Gravesite", false, false),
@@ -3909,7 +3909,7 @@ pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7773895, "Siofra River", "Siofra River", false, false),
     (7773896, "Siofra River", "Siofra River", false, false),
     (7773897, "Deeproot Depths", "Deeproot Depths", false, false),
-    (7773898, "Scadu Altus", "Scadu Altus", true, false),
+    (7773898, "Scadu Altus", "Scadu Altus", false, false),
     (7773899, "Scadu Altus", "Scadu Altus", false, false),
     (7773900, "Caelid", "Caelid", false, false),
     (7773901, "Weeping", "Weeping", true, false),
@@ -3928,7 +3928,7 @@ pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7773914, "Altus", "Altus", false, false),
     (7773915, "Caelid", "Caelid", false, false),
     (7773916, "Caelid", "Caelid", false, false),
-    (7773917, "Caelid", "Caelid", true, false),
+    (7773917, "Caelid", "Caelid", false, false),
     (7773918, "Mountaintops of the Giants", "Mountaintops of the Giants", false, false),
     (7773919, "Mountaintops of the Giants", "Mountaintops of the Giants", true, false),
     (7773920, "Mountaintops of the Giants", "Mountaintops of the Giants", false, false),
@@ -4860,6 +4860,10 @@ pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7774846, "Stormveil", "Stormveil", false, false),
     (7774847, "Shadow Keep", "Shadow Keep", false, false),
     (7774848, "Scadu Altus", "Scadu Altus", false, false),
+    (7900000, "Scadu Altus", "Scadu Altus", true, false),
+    (7900001, "Scadu Altus", "Scadu Altus", true, false),
+    (7900002, "Shadow Keep", "Shadow Keep", false, false),
+    (7900003, "Caelid", "Caelid", true, false),
 ];
 
 /// Coarse region name -> its region-lock ITEM name. The client resolves each to a live
