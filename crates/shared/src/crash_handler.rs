@@ -104,6 +104,31 @@ unsafe extern "system" fn top_level_filter(info: *const EXCEPTION_POINTERS) -> i
     }
 }
 
+/// Claim one unit of the first-chance report budget; `false` once it is spent.
+///
+/// A hand-rolled CAS loop rather than `fetch_update`: that method is deprecated (renamed
+/// `try_update`) on current stable, and CI builds with `-D warnings`, so calling it FAILS THE
+/// BUILD — which is exactly what happened to `dc2bd41`, leaving the crash handler we shipped to
+/// diagnose the CTD unbuildable. `try_update` would fix it only for toolchains new enough to have
+/// it; `compare_exchange_weak` has been stable for years and cannot rot the same way. The
+/// semantics are unchanged: saturating decrement, and we report only if WE were the one who
+/// decremented (so the budget is never over-drawn under concurrent faults).
+fn take_first_chance_budget() -> bool {
+    let mut left = FIRST_CHANCE_LEFT.load(Ordering::Relaxed);
+    while left > 0 {
+        match FIRST_CHANCE_LEFT.compare_exchange_weak(
+            left,
+            left - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => left = observed,
+        }
+    }
+    false
+}
+
 /// The vectored handler — first-chance. Reports fatal-class codes only, under a session budget,
 /// and ALWAYS continues the search (zero effect on dispatch).
 unsafe extern "system" fn first_chance_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -113,12 +138,7 @@ unsafe extern "system" fn first_chance_handler(info: *mut EXCEPTION_POINTERS) ->
             .and_then(|i| i.ExceptionRecord.as_ref())
             .map(|r| r.ExceptionCode.0 as u32)
     };
-    if let Some(code) = code
-        && is_fatal_class(code)
-        && FIRST_CHANCE_LEFT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
-    {
+    if let Some(code) = code && is_fatal_class(code) && take_first_chance_budget() {
         report(info as usize, "first-chance — a handler may still absorb it");
     }
     EXCEPTION_CONTINUE_SEARCH
