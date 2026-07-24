@@ -26,6 +26,7 @@
 //! + the gen derives the tear schedule from it).
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use eldenring::cs::GameDataMan;
 use fromsoftware_shared::FromStatic;
@@ -36,6 +37,10 @@ use er_logic::flask_reconcile::{self, FlaskTarget};
 /// `progressiveGrants` (a consumed Sacred Tear per copy → the potency axis); that path is handled by
 /// the reconciler ledger, independently of the charge count here. Non-overlapping: tears ≠ charges.
 pub const FLASK_UPGRADE_ITEM: &str = "Progressive Flask Upgrade";
+
+/// Last rung whose "absorbed, nothing to add" explanation was logged (0 = none). Keeps the
+/// explanation to one line per rung instead of one per frame.
+static ABSORBED_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 /// The parsed `flaskLadder` from slot_data. `None`/empty => feature OFF (tick is a hard no-op).
 /// `Mutex<Option<..>>` because `Vec::new()` is not const and this is a `static` (a bare
@@ -57,27 +62,30 @@ pub fn set_ladder(ladder: Vec<FlaskTarget>) {
 /// Per-tick. When configured + in-world: reconcile the live flask up to the rung implied by
 /// `received_count`. Idempotent — a converged flask does nothing. Gated on `in_world()` exactly like
 /// `no_fall_damage`/`no_equip_load` (the player game data + inventory aren't settled at boot/menu).
-pub fn tick(received_count: usize) {
+/// Returns `Some((before, after))` when this call actually RAISED the charge allocation, so the
+/// caller can announce a change the player can see. `None` means nothing moved -- including the
+/// common absorbed case below, which is reported separately because it is silent by nature.
+pub fn tick(received_count: usize) -> Option<(u32, u32)> {
     // MENU/BOOT GATE: GameDataMan / the inventory aren't stable before the world is live.
     if !crate::flags::in_world() {
-        return;
+        return None;
     }
 
     // Desired rung from the received count. `None` => ladder absent/empty or count 0 => no-op.
     let target = {
         let guard = LADDER.lock().unwrap();
         let Some(ladder) = guard.as_ref() else {
-            return;
+            return None;
         };
         match flask_reconcile::desired(ladder, received_count) {
             Some(t) => t,
-            None => return,
+            None => return None,
         }
     };
 
     // SAFETY: FD4 singleton; only mutated on the single-threaded FrameBegin / reconcile tick.
     let Ok(gdm) = (unsafe { GameDataMan::instance_mut() }) else {
-        return;
+        return None;
     };
     let pgd = gdm.main_player_game_data.as_mut();
 
@@ -97,7 +105,7 @@ pub fn tick(received_count: usize) {
     let headroom = u8::MAX - pgd.max_hp_flask;
     let add = add.min(headroom as u32) as u8;
     if add == 0 {
-        return;
+        return None;
     }
     pgd.max_hp_flask = pgd.max_hp_flask.saturating_add(add);
     log::info!(
@@ -106,4 +114,5 @@ pub fn tick(received_count: usize) {
         cur_charges + add as u32,
         target.charges,
     );
+    Some((cur_charges, cur_charges + add as u32))
 }

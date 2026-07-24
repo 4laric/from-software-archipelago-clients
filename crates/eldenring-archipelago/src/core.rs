@@ -2384,17 +2384,18 @@ impl shared::Core for Core {
         // 8b2c. flask: reconcile the leveled flask (charges + potency) UP to the rung implied by the
         // count of received "Progressive Flask Upgrade" items. History-agnostic, upward-only,
         // idempotent; no-op unless the slot_data `flaskLadder` armed it.
-        crate::flask::tick(flask_upgrade_count);
         // The flask reconciler changes max_hp_flask/max_fp_flask -- no item enters the bag, so the
-        // game shows nothing. Announce a genuine increase ourselves; a connect only primes.
-        if let Some(n) = er_logic::toast::new_grants(self.flask_seen, flask_upgrade_count) {
+        // game shows nothing. Announce the EFFECT, not the receipt: an early rung can ask for fewer
+        // charges than the player already has, and toasting "Flask upgraded" while the allocation
+        // sat still would be a nicer-looking version of the same lie the silent no-op told
+        // (2026-07-24: "I'm getting the sacred tear but no extra charge"). Only a real raise talks.
+        // `flask_seen` still primes on connect so a reconnect cannot replay old grants.
+        let applied = crate::flask::tick(flask_upgrade_count);
+        if let Some((before, after)) = applied
+            && self.flask_seen.is_some()
+        {
             let now = self.toast_clock.elapsed().as_millis() as u64;
-            let text = if n == 1 {
-                "Flask upgraded".to_string()
-            } else {
-                format!("Flask upgraded x{n}")
-            };
-            self.toasts.push(text, now);
+            self.toasts.push(format!("Flask charges {before} -> {after}"), now);
         }
         self.flask_seen = Some(flask_upgrade_count);
 
