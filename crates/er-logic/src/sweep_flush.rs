@@ -131,9 +131,16 @@ mod replay {
             Ev::TickInWorld,
         ];
         let ff = replay(&timeline, Policy::FireAndForget);
-        assert!(ff.set.is_empty(), "fire-and-forget: the rejected write is gone");
+        assert!(
+            ff.set.is_empty(),
+            "fire-and-forget: the rejected write is gone"
+        );
         let new = replay(&timeline, Policy::Reconcile);
-        assert_eq!(new.set.len(), 2, "reconciled: the retry lands once writes are accepted");
+        assert_eq!(
+            new.set.len(),
+            2,
+            "reconciled: the retry lands once writes are accepted"
+        );
         assert!(new.pending.is_empty());
     }
 
