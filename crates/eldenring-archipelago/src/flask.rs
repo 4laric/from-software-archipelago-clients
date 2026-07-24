@@ -99,7 +99,19 @@ pub fn tick(received_count: usize) -> Option<(u32, u32)> {
     let cur_charges = pgd.max_hp_flask as u32 + pgd.max_fp_flask as u32;
     let add = flask_reconcile::charge_deficit(cur_charges, target);
     if add == 0 {
-        return; // at/above target allocation -- idempotent no-op, NO per-frame log
+        // ABSORBED -- and this used to be SILENT (2026-07-24: "I'm getting the sacred tear but no
+        // extra charge"). The ladder starts at 2 charges while a fresh character already has more,
+        // so the early rungs ask for FEWER charges than the player has and the upward-only
+        // reconcile correctly adds nothing. Indistinguishable from a broken feature unless it says
+        // so: one line per rung target (CONTRIBUTING -- a path that degrades to a no-op announces
+        // it), not one per frame.
+        if ABSORBED_LOGGED.swap(target.charges, Ordering::Relaxed) != target.charges {
+            log::info!(
+                "flask: rung {received_count} asks for {} charge(s); you already have                  {cur_charges} -- nothing to add (charges are upward-only). The Sacred Tear you                  received is the POTENCY axis; charges move once a rung exceeds your allocation.",
+                target.charges,
+            );
+        }
+        return None;
     }
     // Bounded by MAX_CHARGES (14) upstream, so this never overflows u8; saturate defensively.
     let headroom = u8::MAX - pgd.max_hp_flask;
