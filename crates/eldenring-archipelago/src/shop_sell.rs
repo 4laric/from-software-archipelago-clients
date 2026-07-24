@@ -51,17 +51,29 @@ static SOLD_SUPPRESS: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
 /// a fresh run().
 static ARMED_SUPPRESS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 
-/// ECHO-DEDUP (2026-07-03): {AP location -> stock flag} for every rewritten row whose check
-/// was still OPEN at run() time. The receive loop skips the echo grant for these iff the stock
-/// flag is NOW SET (the native sale really happened) -- so !collect / server-sent items for
-/// un-bought checks still grant. Replaces bag-add suppression (statics above stay unpopulated).
-static ECHO_SKIP: Mutex<Option<HashMap<i64, u32>>> = Mutex::new(None);
+/// ECHO-DEDUP (2026-07-03): {AP location -> (stock flag, row id, sold equipId, equipType)} for
+/// every rewritten row whose check was still OPEN at run() time. The receive loop skips the echo
+/// grant for these iff the stock flag is NOW SET **and the row still sells that reward LIVE**
+/// (PARAM-REVERT GUARD, 2026-07-24: a map load streams ShopLineupParam back in and reverts the
+/// rewrite while this map survives -- the set flag then proves only a VANILLA sale, and the
+/// flag-only rule ate the AP item; Kalé "Note: Waypoint Ruins" repro). !collect / server-sent
+/// items for un-bought checks still grant. Replaces bag-add suppression (statics stay unpopulated).
+static ECHO_SKIP: Mutex<Option<HashMap<i64, (u32, u32, i32, u8)>>> = Mutex::new(None);
 
-pub fn configure(location_flags: HashMap<i64, u32>) {
+/// CLIENT-SETTABLE flags (uniqueStartGrants obtained-flags + keyitems acquire flags): flags the
+/// client itself writes outside any purchase. A check detected by one of these is EXEMPT from the
+/// native rewrite AND the echo-arm (er_logic::shop_echo::echo_dedup_eligible) — flag-set no longer
+/// proves a native sale there, and echo-skipping on it LOSES the AP item (START-GRANT collision,
+/// 2026-07-24: unique grant set 60020/60110/60130, echoes for locs 7770011/12/13 were eaten).
+static EXEMPT_FLAGS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
+pub fn configure(location_flags: HashMap<i64, u32>, exempt_flags: HashSet<u32>) {
     log::info!(
-        "shop-sell: configured {} location flag(s)",
-        location_flags.len()
+        "shop-sell: configured {} location flag(s), {} client-settable exempt flag(s)",
+        location_flags.len(),
+        exempt_flags.len()
     );
+    *EXEMPT_FLAGS.lock().unwrap() = Some(exempt_flags);
     *CONFIGURED.lock().unwrap() = Some(location_flags);
 }
 
@@ -101,14 +113,38 @@ pub fn should_suppress_sold(full_id: i32, _get_flag: &dyn Fn(u32) -> bool) -> bo
 }
 
 /// ECHO-DEDUP: should the echo grant for `loc` be skipped? True iff a rewritten row sells this
-/// check's reward natively AND its stock flag is now set (the purchase actually happened).
-/// The flag check keeps !collect / server-sent items for un-bought checks grantable.
+/// check's reward natively, its stock flag is now set (the purchase actually happened), AND the
+/// live row STILL carries the reward (er_logic::shop_echo::echo_skip_decision). The flag check
+/// keeps !collect / server-sent items for un-bought checks grantable; the live-row check is the
+/// PARAM-REVERT GUARD -- a map load can stream the vanilla ware back into the row while this map
+/// survives, and a set flag then proves a vanilla sale, not a reward delivery. Unprovable
+/// delivery (repo down, row missing, ware mismatched) GRANTS: a rare duplicate beats a lost item.
 pub fn echo_skip(loc: i64) -> bool {
-    let flag = match ECHO_SKIP.lock().unwrap().as_ref().and_then(|m| m.get(&loc)) {
-        Some(&f) => f,
-        None => return false,
-    };
-    crate::flags::get_event_flag(flag)
+    let (flag, row_id, eid, etype) =
+        match ECHO_SKIP.lock().unwrap().as_ref().and_then(|m| m.get(&loc)) {
+            Some(&t) => t,
+            None => return false,
+        };
+    let flag_set = crate::flags::get_event_flag(flag);
+    if !flag_set {
+        return false; // un-bought: echo must grant (!collect / server-sent)
+    }
+    // SAFETY: FD4 singleton, read-only use; called from the core tick (game thread), same
+    // context run() writes rows from.
+    let row_still_sells_reward = unsafe { SoloParamRepository::instance_mut() }
+        .ok()
+        .and_then(|repo| repo.get_mut::<ShopLineupParam>(row_id))
+        .map(|row| row.equip_id() == eid && row.equip_type() == etype)
+        .unwrap_or(false);
+    let skip = er_logic::shop_echo::echo_skip_decision(flag_set, row_still_sells_reward);
+    if !skip {
+        log::warn!(
+            "shop-sell: echo-skip REFUSED for loc {loc} -- stock flag {flag} is set but row \
+             {row_id} no longer sells the reward (equipId {eid}/type {etype} expected; param \
+             revert?). The sale delivered the vanilla ware; the echo grants the AP item."
+        );
+    }
+    skip
 }
 
 /// FullID category -> ShopLineupParam `equipType`. `None` for gem/custom (not natively sellable here).
@@ -120,6 +156,16 @@ fn equip_type_for(fid: i64) -> Option<u8> {
         er_codec::CATEGORY_GOODS => Some(3),
         _ => None,
     }
+}
+
+/// Re-arm the pass: a map load streams ShopLineupParam back in, silently reverting every rewrite
+/// while the DONE latch (and ECHO_SKIP) survive. Called by core.rs on the in_world false->true
+/// edge, exactly like check_lots::reset / enemy_drops::reset (the 2026-07-21 DLC-leak fix this
+/// pass was missing from -- the 2026-07-24 "vanilla ware sold, echo eaten" bug). ECHO_SKIP is NOT
+/// cleared here: echo_skip() self-guards against the stale window via the live-row check, and the
+/// next run() rebuild replaces it (dropping now-completed checks per the flag gate).
+pub fn reset() {
+    DONE.store(false, Ordering::Relaxed);
 }
 
 /// Run once in-world + scout-ready (after shop_flags): rewrite each own-world check row to sell its
@@ -138,6 +184,7 @@ pub fn run() -> bool {
     if !crate::scout_proof::cache_ready() {
         return false; // need the rewards
     }
+    let exempt_flags = EXEMPT_FLAGS.lock().unwrap().clone().unwrap_or_default();
     // invert: stock flag -> AP location
     let mut flag_to_loc: HashMap<u32, i64> = HashMap::with_capacity(loc_flags.len());
     for (&loc, &flag) in loc_flags.iter() {
@@ -153,13 +200,15 @@ pub fn run() -> bool {
 
     // Scan immutably -> plan the rewrites, then apply (avoids holding a row borrow across get_mut).
     let mut plan: Vec<(u32, i32, u8)> = Vec::new(); // (row id, new equipId, equipType)
-    let mut echo_skip: HashMap<i64, u32> = HashMap::new(); // AP location -> stock flag (ECHO-DEDUP)
+    // AP location -> (stock flag, row id, sold equipId, equipType) (ECHO-DEDUP + revert guard)
+    let mut echo_skip: HashMap<i64, (u32, u32, i32, u8)> = HashMap::new();
     // SKIP TALLY -- why a check row did NOT get a native rewrite. On a SOLO seed a large `no_scout` or
     // `no_sell_id` means the scout cache / apIdsToItemIds is THINNER than the check set, not that the
     // rewards are genuinely un-sellable. Do not reason about the rewrite count without this breakdown:
     // the 2026-07-13 Bedrock run rewrote 84 of ~410 shop checks and nothing in the log said why.
     let (mut check_rows, mut no_scout) = (0u32, 0u32);
     let (mut no_sell_id, mut no_equip_type) = (0u32, 0u32);
+    let mut exempt_rows = 0u32; // client-settable flag -> no rewrite, no echo-arm
     // shopPreviewGoods FALLBACK (see core.rs). The pair shop_preview/shop_icon need is
     // (AP location -> the VANILLA ware in that shop row), and the vanilla ware is right here in the
     // row we are already reading. Capture it for every check row we do NOT rewrite. This MUST be read
@@ -185,6 +234,24 @@ pub fn run() -> bool {
         check_rows += 1;
         matched_flags.insert(f);
         let vanilla = er_codec::full_id_from_equip_type(row.equip_type(), row.equip_id());
+        // START-GRANT COLLISION FIX (2026-07-24): a check whose detection flag the CLIENT can set
+        // outside a purchase (unique start grant / keyitems pool receive) is exempt from BOTH the
+        // rewrite and the echo-arm -- together, never split: arming without rewriting eats the AP
+        // item (the reproduced bug), rewriting without arming double-grants a genuine purchase.
+        // The row keeps its vanilla ware; its echo always grants (pre-ECHO-DEDUP behaviour, which
+        // never loses an item). Falls through to the shop_preview display-override like foreign/gem.
+        if !er_logic::shop_echo::echo_dedup_eligible(f, &exempt_flags) {
+            exempt_rows += 1;
+            log::info!(
+                "shop-sell: row {id} (stock flag {f}, loc {loc}) EXEMPT from native rewrite + \
+                 echo-dedup -- flag is client-settable (start grant / key item receive), so \
+                 flag-set does not prove a sale; echo will grant normally"
+            );
+            if let Some(v) = vanilla {
+                derived_preview.push((loc, v));
+            }
+            continue;
+        }
         let Some(s) = crate::scout_proof::lookup(loc) else {
             no_scout += 1;
             continue;
@@ -236,9 +303,10 @@ pub fn run() -> bool {
         // ECHO-DEDUP: this row sells the exact reward natively from here on, so a FUTURE
         // purchase must skip its echo grant. Checks already completed (flag set) are NOT
         // recorded -- e.g. a pre-rewrite-window buy sold the VANILLA ware and still needs
-        // its echo to deliver the reward.
+        // its echo to deliver the reward. The row identity + sold ware ride along so
+        // echo_skip() can re-verify the row LIVE at echo time (PARAM-REVERT GUARD).
         if !crate::flags::get_event_flag(f) {
-            echo_skip.insert(loc, f);
+            echo_skip.insert(loc, (f, id, new_eid, etype));
         }
     }
     let n = plan.len();
@@ -257,8 +325,9 @@ pub fn run() -> bool {
         "shop-sell: rewrote {n} own-world slot(s) to natively sell their reward ({skip_count} echo-skip, cross-type OPEN, auto_upgrade baked)"
     );
     log::info!(
-        "shop-sell: skip tally -- {check_rows} check row(s) seen, {no_scout} no scout entry, \
-         {no_sell_id} no er_sell_id (foreign/gem), {no_equip_type} unsellable category"
+        "shop-sell: skip tally -- {check_rows} check row(s) seen, {exempt_rows} exempt \
+         (client-settable flag), {no_scout} no scout entry, {no_sell_id} no er_sell_id \
+         (foreign/gem), {no_equip_type} unsellable category"
     );
     let unmatched: Vec<u32> = flag_to_loc
         .keys()

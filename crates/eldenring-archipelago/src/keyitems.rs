@@ -54,6 +54,17 @@ pub fn acquire_flags(name: &str) -> Vec<u32> {
     out
 }
 
+/// EVERY flag these tables can set — i.e. every vanilla obtained/restored flag the CLIENT ITSELF
+/// writes on a pool receive, outside any shop purchase. Feeds the shop_sell ECHO-DEDUP exemption
+/// set (er_logic::shop_echo): a check detected by one of these flags must never be echo-armed,
+/// because flag-set does not prove a native sale (START-GRANT collision, 2026-07-24).
+pub fn all_acquire_flags() -> impl Iterator<Item = u32> {
+    COMPANION_ACQUIRE_FLAGS
+        .iter()
+        .chain(KEY_ITEM_ACQUIRE_FLAGS)
+        .flat_map(|(_, fs)| fs.iter().copied())
+}
+
 /// Fast-path one-shot: set the vanilla obtained/restored flag(s) for a received item name, if any.
 /// Idempotent, but BEST-EFFORT -- writes at menu/load are silently discarded (R3, SWEEP), so this
 /// no longer logs success; `tick_keyitem_flags` (the reconcile tick) re-applies and owns the log.

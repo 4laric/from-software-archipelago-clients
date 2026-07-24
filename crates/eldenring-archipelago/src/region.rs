@@ -51,11 +51,19 @@ const WARP_SETTLE_SECS: u64 = 5; // let play_region_id settle after world entry 
 const ROUNDTABLE_GRACE_ID: u32 = 11102950;
 
 /// One disjunctive clause of a natural-key trigger: satisfied when ALL `items` were received AND ALL
-/// `flags` are set. Ported from the standalone `features.rs::NkClause`.
+/// `flags` are set AND at least `count` distinct names of `count_items` were received. Ported from
+/// the standalone `features.rs::NkClause`; COUNT term added 2026-07-24 (natural-progression count
+/// gates: Caelid = 2-of-the-remembrances, Leyndell = N Great Runes). The pure evaluation twin is
+/// `er_logic::region_lock::NkClause` / `natural_key_fired` (host-tested); keep the semantics in
+/// lockstep. Absent count fields parse to `[]`/`0` (vacuous term), so old data is unchanged.
 #[derive(Default)]
 pub struct NkClause {
     pub items: Vec<String>,
     pub flags: Vec<u32>,
+    /// COUNT term (N-of-a-set): the clause additionally requires >= `count` of these in `received`.
+    pub count_items: Vec<String>,
+    /// Threshold for `count_items`. `0` = no count requirement.
+    pub count: usize,
 }
 
 /// Region-lock config, parsed from slot_data (shapes mirror the standalone `net.rs`).
@@ -184,6 +192,13 @@ pub fn tick_natural_key_triggers(cfg: &RegionConfig, received: &HashSet<String>)
         let fired = clauses.iter().any(|cl| {
             cl.items.iter().all(|nm| received.contains(nm))
                 && cl.flags.iter().all(|&fl| flags::get_event_flag(fl))
+                && cl
+                    .count_items
+                    .iter()
+                    .filter(|nm| received.contains(*nm))
+                    .collect::<HashSet<_>>()
+                    .len()
+                    >= cl.count
         });
         if !fired {
             continue;
@@ -207,7 +222,17 @@ pub fn tick_natural_key_triggers(cfg: &RegionConfig, received: &HashSet<String>)
     }
 }
 
-/// `{ "LockName": { "anyOf": [ {"items":[..],"flags":[..]}, ... ] } }` -> region -> clause disjunction.
+/// `{ "LockName": { "anyOf": [ <clause>, ... ] } }` -> region -> clause disjunction.
+///
+/// CLAUSE WIRE SHAPE (all fields optional; a clause fires when every present term holds):
+///   `{"items": [name, ..], "flags": [u32, ..], "countItems": [name, ..], "count": N}`
+///   * `items`      — ALL must be in `received` (all-of).
+///   * `flags`      — ALL event flags must read set.
+///   * `countItems` + `count` — at least `count` DISTINCT names of `countItems` in `received`
+///     (the COUNT primitive, 2026-07-24: Caelid 2-of-the-remembrances, Leyndell N Great Runes).
+///     Absent fields default to `[]`/`0`, making the term vacuous — full backward compatibility
+///     with the pre-count `{"items", "flags"}` shape. `{}` (or `{"items":[],"flags":[]}`) is an
+///     ALWAYS-OPEN clause (blooms on first tick).
 /// Ported from the standalone `net.rs::parse_natural_keys`.
 fn parse_natural_keys(v: Option<&Value>) -> HashMap<String, Vec<NkClause>> {
     let mut m = HashMap::new();
@@ -234,7 +259,22 @@ fn parse_natural_keys(v: Option<&Value>) -> HashMap<String, Vec<NkClause>> {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    clauses.push(NkClause { items, flags });
+                    let count_items = c
+                        .get("countItems")
+                        .and_then(|x| x.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let count = c.get("count").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    clauses.push(NkClause {
+                        items,
+                        flags,
+                        count_items,
+                        count,
+                    });
                 }
             }
             m.insert(region.clone(), clauses);

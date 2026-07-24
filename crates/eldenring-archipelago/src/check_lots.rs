@@ -190,7 +190,11 @@ pub fn run() -> bool {
     };
     let zero_map = grab(&ZERO_MAP).unwrap_or_default();
     let zero_enemy = grab(&ZERO_ENEMY).unwrap_or_default();
-    if blank_map.is_empty() && blank_enemy.is_empty() && zero_map.is_empty() && zero_enemy.is_empty() {
+    if blank_map.is_empty()
+        && blank_enemy.is_empty()
+        && zero_map.is_empty()
+        && zero_enemy.is_empty()
+    {
         DONE.store(true, Ordering::Relaxed);
         return true;
     }

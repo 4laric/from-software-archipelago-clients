@@ -890,7 +890,19 @@ impl shared::Core for Core {
                         }
                     }
                 }
-                crate::shop_sell::configure(loc_flags.clone());
+                // START-GRANT COLLISION FIX (2026-07-24): flags the CLIENT ITSELF can set outside
+                // a purchase -- uniqueStartGrants obtained-flags plus the keyitems acquire tables.
+                // shop_sell must neither rewrite nor echo-arm a check detected by one of these:
+                // the unique start grant set 60020/60110/60130 at connect and ECHO-DEDUP then ate
+                // the echoes for locs 7770011/12/13 as "sold natively" (no sale ever happened) --
+                // vanilla in the bag, three AP items lost. See er_logic::shop_echo (replay-tested).
+                let echo_exempt: std::collections::HashSet<u32> = start
+                    .unique_start_grants
+                    .iter()
+                    .map(|&(_, flag)| flag)
+                    .chain(crate::keyitems::all_acquire_flags())
+                    .collect();
+                crate::shop_sell::configure(loc_flags.clone(), echo_exempt);
                 // SLOT_DATA WINS, PARAMS ARE THE FALLBACK. `shopPreviewGoods` is the VANILLA ware
                 // sitting in each check's shop row -- that is GAME data, not seed data, so when a
                 // foreign apworld (Bedrock) omits the key we can read it straight off the live
@@ -2293,6 +2305,14 @@ impl shared::Core for Core {
         if now_in_world && !self.was_in_world {
             crate::check_lots::reset();
             crate::enemy_drops::reset();
+            // shop_sell was MISSING from this edge (2026-07-24): the same stream-in reverts
+            // ShopLineupParam, so every rewritten check row went back to selling its VANILLA
+            // ware after the session's first load -- while ECHO_SKIP survived and kept eating
+            // the AP echoes of post-load purchases ("Note: Waypoint Ruins" Kalé repro; ~548
+            // armed shop checks exposed). Re-arm so the next tick re-rewrites; echo_skip()'s
+            // live-row guard (er_logic::shop_echo) covers the one-tick window and any revert
+            // path this edge misses.
+            crate::shop_sell::reset();
         }
         self.was_in_world = now_in_world;
         if crate::flags::in_world() {

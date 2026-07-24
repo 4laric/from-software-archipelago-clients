@@ -31,11 +31,23 @@ pub fn kick_decision(
     random_start_done_flag == 0 || get_flag(random_start_done_flag)
 }
 
-/// One natural-key clause: ALL items received AND ALL flags set => the clause is satisfied.
+/// One natural-key clause: ALL `items` received AND ALL `flags` set AND at least `count` distinct
+/// names of `count_items` received => the clause is satisfied.
+///
+/// The COUNT term (2026-07-24, natural-progression count gates: Caelid = 2-of-the-remembrances,
+/// Leyndell = N Great Runes) is fully backward compatible: the pre-count wire shape parses to
+/// `count_items = []` / `count = 0`, and `0 >= 0` makes the term vacuously true, so old
+/// `{items, flags}` clauses behave exactly as before. `count_items` is treated as a SET of names
+/// (received is a set, so listing a name twice cannot double-count it — each distinct received
+/// name counts once).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NkClause {
     pub items: Vec<String>,
     pub flags: Vec<u32>,
+    /// COUNT term: the clause additionally requires >= `count` of these names in `received`.
+    pub count_items: Vec<String>,
+    /// Threshold for `count_items`. `0` (with or without names) = no count requirement.
+    pub count: usize,
 }
 
 /// A region's natural-key trigger fires when ANY clause is satisfied (anyOf disjunction).
@@ -45,7 +57,15 @@ pub fn natural_key_fired(
     get_flag: &dyn Fn(u32) -> bool,
 ) -> bool {
     clauses.iter().any(|cl| {
-        cl.items.iter().all(|n| received.contains(n)) && cl.flags.iter().all(|&f| get_flag(f))
+        cl.items.iter().all(|n| received.contains(n))
+            && cl.flags.iter().all(|&f| get_flag(f))
+            && cl
+                .count_items
+                .iter()
+                .filter(|n| received.contains(*n))
+                .collect::<HashSet<_>>()
+                .len()
+                >= cl.count
     })
 }
 
@@ -302,6 +322,7 @@ mod tests {
         let clauses = vec![NkClause {
             items: vec!["Rold Medallion".into()],
             flags: vec![11000800],
+            ..Default::default()
         }];
         let recv = names(&["Rold Medallion"]);
         assert!(natural_key_fired(&clauses, &recv, &|f| f == 11000800));
@@ -312,6 +333,7 @@ mod tests {
         let clauses = vec![NkClause {
             items: vec!["Rold Medallion".into()],
             flags: vec![11000800],
+            ..Default::default()
         }];
         let recv = names(&["Rold Medallion"]);
         assert!(!natural_key_fired(&clauses, &recv, &|_| false));
@@ -322,6 +344,7 @@ mod tests {
         let clauses = vec![NkClause {
             items: vec!["Rold Medallion".into()],
             flags: vec![11000800],
+            ..Default::default()
         }];
         assert!(!natural_key_fired(&clauses, &names(&[]), &|f| f == 11000800));
     }
@@ -331,11 +354,11 @@ mod tests {
         let clauses = vec![
             NkClause {
                 items: vec!["Missing".into()],
-                flags: vec![],
+                ..Default::default()
             },
             NkClause {
-                items: vec![],
                 flags: vec![71000, 71001],
+                ..Default::default()
             },
         ];
         assert!(natural_key_fired(&clauses, &names(&[]), &|f| f == 71000 || f == 71001));
@@ -345,6 +368,120 @@ mod tests {
     fn nk_empty_clause_is_vacuously_true() {
         let clauses = vec![NkClause::default()];
         assert!(natural_key_fired(&clauses, &names(&[]), &|_| false));
+    }
+
+    // --- COUNT term (N-of-a-set; Caelid 2-remembrances / Leyndell N-Great-Runes) ---
+
+    fn rune_count_clause(n: usize) -> Vec<NkClause> {
+        vec![NkClause {
+            count_items: vec![
+                "Godrick's Great Rune".into(),
+                "Rykard's Great Rune".into(),
+                "Radahn's Great Rune".into(),
+            ],
+            count: n,
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn nk_count_fires_at_exactly_n_not_at_n_minus_1() {
+        let clauses = rune_count_clause(2);
+        assert!(
+            !natural_key_fired(&clauses, &names(&[]), &|_| false),
+            "0 of 2 must not fire"
+        );
+        assert!(
+            !natural_key_fired(&clauses, &names(&["Godrick's Great Rune"]), &|_| false),
+            "N-1 (1 of 2) must not fire"
+        );
+        assert!(
+            natural_key_fired(
+                &clauses,
+                &names(&["Godrick's Great Rune", "Radahn's Great Rune"]),
+                &|_| false
+            ),
+            "exactly N (2 of 2) fires"
+        );
+        // any N-subset of the set fires, and extras beyond N keep it fired.
+        assert!(natural_key_fired(
+            &clauses,
+            &names(&["Rykard's Great Rune", "Radahn's Great Rune"]),
+            &|_| false
+        ));
+        assert!(natural_key_fired(
+            &clauses,
+            &names(&[
+                "Godrick's Great Rune",
+                "Rykard's Great Rune",
+                "Radahn's Great Rune"
+            ]),
+            &|_| false
+        ));
+    }
+
+    #[test]
+    fn nk_count_names_outside_the_set_never_count() {
+        let clauses = rune_count_clause(2);
+        let recv = names(&["Godrick's Great Rune", "Rusty Key", "Uchigatana"]);
+        assert!(!natural_key_fired(&clauses, &recv, &|_| false));
+    }
+
+    #[test]
+    fn nk_count_combines_with_items_and_flags_all_terms_required() {
+        let clauses = vec![NkClause {
+            items: vec!["Rold Medallion".into()],
+            flags: vec![11000800],
+            count_items: vec!["A".into(), "B".into(), "C".into()],
+            count: 2,
+            ..Default::default()
+        }];
+        let flag_on = |f: u32| f == 11000800;
+        // count satisfied but item missing -> no fire.
+        assert!(!natural_key_fired(&clauses, &names(&["A", "B"]), &flag_on));
+        // item + count satisfied but flag off -> no fire.
+        assert!(!natural_key_fired(
+            &clauses,
+            &names(&["Rold Medallion", "A", "B"]),
+            &|_| false
+        ));
+        // item + flag satisfied but count at N-1 -> no fire.
+        assert!(!natural_key_fired(
+            &clauses,
+            &names(&["Rold Medallion", "A"]),
+            &flag_on
+        ));
+        // all three terms satisfied -> fires.
+        assert!(natural_key_fired(
+            &clauses,
+            &names(&["Rold Medallion", "A", "B"]),
+            &flag_on
+        ));
+    }
+
+    #[test]
+    fn nk_empty_count_term_is_old_behavior() {
+        // The pre-count wire shape (count_items=[], count=0) must evaluate exactly like the old
+        // all-items/all-flags clause: satisfied items alone fire it.
+        let clauses = vec![NkClause {
+            items: vec!["Rusty Key".into()],
+            ..Default::default()
+        }];
+        assert!(natural_key_fired(&clauses, &names(&["Rusty Key"]), &|_| false));
+        assert!(!natural_key_fired(&clauses, &names(&[]), &|_| false));
+    }
+
+    #[test]
+    fn nk_duplicate_count_names_count_once() {
+        // A malformed emitter listing the same name twice must not let 1 received item satisfy
+        // count=2 (count_items is a SET of names).
+        let clauses = vec![NkClause {
+            count_items: vec!["A".into(), "A".into(), "B".into()],
+            count: 2,
+            ..Default::default()
+        }];
+        assert!(!natural_key_fired(&clauses, &names(&["A"]), &|_| false));
+        assert!(natural_key_fired(&clauses, &names(&["A", "B"]), &|_| false));
     }
 
     // --- EnforcementLatch (kick/kill rising-edge throttle + death-loop guard) ---
