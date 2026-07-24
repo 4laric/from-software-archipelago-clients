@@ -161,6 +161,15 @@ pub struct Core {
     /// which can be mid-load when the game refuses writes -- so a fire-and-forget write would leave
     /// those pickups dead in the world forever. See `er_logic::sweep_flush` (replay-tested).
     sweep_flag_pending: Vec<u32>,
+    /// On-screen notices for grants the GAME cannot announce (see `er_logic::toast`). A client-
+    /// APPLIED grant -- flask rungs today -- changes state without an item entering the bag, so the
+    /// native ticker never fires and the player cannot tell delivery from breakage.
+    toasts: er_logic::toast::Deck,
+    /// Monotonic clock for the toast deck (ms since this Core was built).
+    toast_clock: std::time::Instant,
+    /// Last OBSERVED flask-upgrade count. `None` until primed: the count is history-agnostic, so
+    /// the first observation after a connect is a baseline, not news.
+    flask_seen: Option<usize>,
     /// ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker): per-region gate data
     /// {threshold, member_ap_ids, bloom_flags}. Empty => feature off. Parsed once per seed.
     region_attunement: HashMap<String, RegionAttunement>,
@@ -412,6 +421,9 @@ impl shared::Core for Core {
             boss_flag_prev: HashSet::new(),
             sweep_bannered: HashSet::new(),
             sweep_flag_pending: Vec::new(),
+            toasts: er_logic::toast::Deck::new(4, 6000),
+            toast_clock: std::time::Instant::now(),
+            flask_seen: None,
             region_attunement: HashMap::new(),
             boss_payout_pending: HashMap::new(),
             attuned_regions: HashSet::new(),
@@ -449,6 +461,31 @@ impl shared::Core for Core {
         if self.tracker_visible {
             self.render_tracker_window(ui);
         }
+
+        self.render_toasts(ui);
+    }
+
+    /// Bottom-left, borderless, input-transparent: a notice must never eat a click or steal focus
+    /// from the game. Nothing is drawn when the deck is empty, so this costs a length check a frame.
+    fn render_toasts(&mut self, ui: &imgui::Ui) {
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        self.toasts.expire(now);
+        if self.toasts.is_empty() {
+            return;
+        }
+        let height = ui.io().display_size[1];
+        ui.window("###ap-toasts")
+            .position([24.0, height - 160.0], imgui::Condition::Always)
+            .no_decoration()
+            .always_auto_resize(true)
+            .movable(false)
+            .bg_alpha(0.55)
+            .build(|| {
+                for t in self.toasts.visible() {
+                    let a = self.toasts.alpha(t, now);
+                    ui.text_colored([1.0, 0.85, 0.35, a], t.text.as_str());
+                }
+            });
     }
 
     fn update_live(&mut self) -> Result<()> {
@@ -2371,6 +2408,18 @@ impl shared::Core for Core {
         // count of received "Progressive Flask Upgrade" items. History-agnostic, upward-only,
         // idempotent; no-op unless the slot_data `flaskLadder` armed it.
         crate::flask::tick(flask_upgrade_count);
+        // The flask reconciler changes max_hp_flask/max_fp_flask -- no item enters the bag, so the
+        // game shows nothing. Announce a genuine increase ourselves; a connect only primes.
+        if let Some(n) = er_logic::toast::new_grants(self.flask_seen, flask_upgrade_count) {
+            let now = self.toast_clock.elapsed().as_millis() as u64;
+            let text = if n == 1 {
+                "Flask upgraded".to_string()
+            } else {
+                format!("Flask upgraded x{n}")
+            };
+            self.toasts.push(text, now);
+        }
+        self.flask_seen = Some(flask_upgrade_count);
 
         // 8b3. auto_equip: drain queued received weapons into a primary hand (once each is in the bag).
         crate::auto_equip::tick();
@@ -2710,6 +2759,7 @@ impl Core {
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
         // flags the new seed never earned.
         self.sweep_flag_pending.clear();
+        self.flask_seen = None;
         self.received_through = 0;
         self.dispatched_through = 0;
         self.item_map = None;
