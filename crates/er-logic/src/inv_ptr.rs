@@ -122,7 +122,10 @@ mod replay {
         );
         let new = replay(&timeline, Policy::EpochScoped);
         assert_eq!(new.stale_uses, 0, "post-fix: never handed a stale pointer");
-        assert_eq!(new.deferred, 1, "deferred instead -- caller retries after a re-prime");
+        assert_eq!(
+            new.deferred, 1,
+            "deferred instead -- caller retries after a re-prime"
+        );
     }
 
     #[test]
