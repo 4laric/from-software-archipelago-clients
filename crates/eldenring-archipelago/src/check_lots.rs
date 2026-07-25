@@ -54,12 +54,14 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-/// Can this pass write a lot slot's CATEGORY field alongside its item id? `false` today:
-/// `check_lots` only ever writes id/num, and a goods placeholder in a non-goods slot without its
-/// category is a garbage item reference. Flip to `true` in the same commit that wires the
-/// `ITEMLOT_PARAM_ST` per-slot category setter -- `er_logic::check_neutralise::plan` then repoints
-/// non-goods slots exactly like goods ones, closing the vanilla leak without emptying anything.
-const CAN_WRITE_SLOT_CATEGORY: bool = false;
+/// Can this pass write a lot slot's CATEGORY field alongside its item id? **`true` since the
+/// `ITEMLOT_PARAM_ST` per-slot category setter was wired** (`set_lot_item_category01..08`, `s32`).
+///
+/// The setter name was not guessed. `ItemLotParam.xml` in `fromsoftware-rs` at the SHA this crate
+/// pins declares `s32 lotItemCategory01`; the param generator emits `set_{normalize_name(field)}`
+/// for every standard field; and `normalize_name` maps `lotItemId01 -> lot_item_id01`, which is the
+/// control -- that setter is already called eight times in this file.
+const CAN_WRITE_SLOT_CATEGORY: bool = true;
 
 /// EquipParamGoods row id of the Telescope -- its iconId is the one me3's VFS menu override repaints
 /// into the AP flower (see shop_icon.rs / er-ap-icon-override). Read live, never written.
@@ -263,12 +265,17 @@ pub fn run() -> bool {
     // item id is only meaningful alongside its category, so a non-goods slot cannot hold the goods
     // placeholder without one. Flip CAN_WRITE_SLOT_CATEGORY once that setter is wired and the same
     // predicate starts repointing these too -- no other change needed here.
-    let plan = er_logic::check_neutralise::plan(false, CAN_WRITE_SLOT_CATEGORY);
-    if plan == er_logic::check_neutralise::Plan::RepointToPlaceholder {
+    // The WRITE comes from er_logic, not from a branch here. This block used to ask er_logic for a
+    // Plan and then call zero_slot() inside the RepointToPlaceholder arm -- so flipping the flag
+    // above would have EMPTIED every non-goods check slot and reintroduced the dead-check bug
+    // eee9b1b fixed, while the predicate next to it said "repoint". The decision and the write are
+    // one value now (`slot_write`), so they cannot disagree again.
+    let write = er_logic::check_neutralise::slot_write(false, CAN_WRITE_SLOT_CATEGORY, ph);
+    if let Some(w) = write {
         for (lot, slots) in &zero_map {
             if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
                 for &sl in slots {
-                    zero_slot(row, sl);
+                    set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
                 }
             } else {
@@ -278,7 +285,7 @@ pub fn run() -> bool {
         for (lot, slots) in &zero_enemy {
             if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
                 for &sl in slots {
-                    zero_slot(row, sl);
+                    set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
                 }
             } else {
@@ -304,7 +311,7 @@ pub fn run() -> bool {
         );
     }
     log::info!(
-        "check-lots: wrote {} MAP + {} ENEMY blank, {} MAP + {} ENEMY zero lot(s) ({} missing from the named table)",
+        "check-lots: wrote {} MAP + {} ENEMY goods-blank, {} MAP + {} ENEMY non-goods repoint lot(s) ({} missing from the named table)",
         blank_map.len(),
         blank_enemy.len(),
         zero_map.len(),
@@ -312,8 +319,9 @@ pub fn run() -> bool {
         missed.len()
     );
     log::info!(
-        "check-lots: neutralised {n} check slot(s) -> goods placeholder {ph}; non-goods slots keep their \
-         vanilla ware for now (emptying them removed the pickup, and the pickup IS the check)"
+        "check-lots: neutralised {n} check slot(s) -> goods placeholder {ph}; non-goods slots are \
+         REPOINTED (id + category) now that the category travels with the id -- never emptied, \
+         because the pickup IS the check"
     );
     DONE.store(true, Ordering::Relaxed);
     true
@@ -337,42 +345,34 @@ fn set_slot(row: &mut eldenring::param::ITEMLOT_PARAM_ST, slot: u8, id: i32) {
     }
 }
 
-// Empty a NON-GOODS check slot: no item id, zero count. `lot_item_num0X` is a u8 in the param, so 0 fits.
+// Repoint a NON-GOODS check slot at the goods placeholder: the id AND the category, in one write.
+// A lot slot's item id is only meaningful alongside its category -- the placeholder is an
+// EquipParamGoods row, so a weapon/armour/talisman/Ash slot must be told it now holds goods or the
+// id is a garbage reference into the wrong table. `category: None` leaves the slot's category alone
+// (a slot that is already goods).
+//
+// This REPLACES `zero_slot`, which wrote (id 0, num 0). That function is deliberately gone rather
+// than left unused: emptying a slot removes the pickup, the pickup IS the check, and the way this
+// bug shipped was an emptying helper sitting in reach of a branch that meant to repoint. Do not
+// reintroduce one -- `er_logic::check_neutralise` has no "empty it" variant for the same reason.
 #[inline]
-fn zero_slot(row: &mut eldenring::param::ITEMLOT_PARAM_ST, slot: u8) {
+fn set_slot_full(
+    row: &mut eldenring::param::ITEMLOT_PARAM_ST,
+    slot: u8,
+    id: i32,
+    category: Option<i32>,
+) {
+    set_slot(row, slot, id);
+    let Some(cat) = category else { return };
     match slot {
-        1 => {
-            row.set_lot_item_id01(0);
-            row.set_lot_item_num01(0);
-        }
-        2 => {
-            row.set_lot_item_id02(0);
-            row.set_lot_item_num02(0);
-        }
-        3 => {
-            row.set_lot_item_id03(0);
-            row.set_lot_item_num03(0);
-        }
-        4 => {
-            row.set_lot_item_id04(0);
-            row.set_lot_item_num04(0);
-        }
-        5 => {
-            row.set_lot_item_id05(0);
-            row.set_lot_item_num05(0);
-        }
-        6 => {
-            row.set_lot_item_id06(0);
-            row.set_lot_item_num06(0);
-        }
-        7 => {
-            row.set_lot_item_id07(0);
-            row.set_lot_item_num07(0);
-        }
-        8 => {
-            row.set_lot_item_id08(0);
-            row.set_lot_item_num08(0);
-        }
+        1 => row.set_lot_item_category01(cat),
+        2 => row.set_lot_item_category02(cat),
+        3 => row.set_lot_item_category03(cat),
+        4 => row.set_lot_item_category04(cat),
+        5 => row.set_lot_item_category05(cat),
+        6 => row.set_lot_item_category06(cat),
+        7 => row.set_lot_item_category07(cat),
+        8 => row.set_lot_item_category08(cat),
         _ => {}
     }
 }
