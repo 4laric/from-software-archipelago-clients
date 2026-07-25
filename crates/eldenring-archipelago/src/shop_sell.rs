@@ -66,6 +66,29 @@ type EchoArm = (u32, u32, i32, u8);
 /// items for un-bought checks still grant. Replaces bag-add suppression (statics stay unpopulated).
 static ECHO_SKIP: Mutex<Option<HashMap<i64, EchoArm>>> = Mutex::new(None);
 
+/// ShopLineupParam row ids this pass REWROTE to natively sell an own-world reward. `shop_repoint`
+/// must leave these alone: the world deliberately keeps their `shopPreviewGoods` at the VANILLA ware
+/// (the row sells the real item, so it needs no display override), and repointing on "preview differs
+/// from the ware" would therefore drag the row off its reward and back onto the vanilla good --
+/// undoing the native sale AND tripping ECHO-DEDUP's param-revert guard, which re-reads the row to
+/// prove the purchase delivered the reward. Rebuilt by every `run()`.
+static REWROTE_ROWS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
+/// Did `run()` rewrite this row to sell an own-world reward natively? False until the first run.
+pub fn sold_natively(row_id: u32) -> bool {
+    REWROTE_ROWS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|s| s.contains(&row_id))
+}
+
+/// Has `run()` completed its pass? `shop_repoint` gates on this: until it latches, `REWROTE_ROWS` is
+/// incomplete and the `derived_preview` fallback below has not yet read the rows' vanilla wares.
+pub fn is_done() -> bool {
+    DONE.load(Ordering::Relaxed)
+}
+
 /// CLIENT-SETTABLE flags (uniqueStartGrants obtained-flags + keyitems acquire flags): flags the
 /// client itself writes outside any purchase. A check detected by one of these is EXEMPT from the
 /// native rewrite AND the echo-arm (er_logic::shop_echo::echo_dedup_eligible) — flag-set no longer
@@ -324,6 +347,9 @@ pub fn run() -> bool {
     }
     let skip_count = echo_skip.len();
     *ECHO_SKIP.lock().unwrap() = Some(echo_skip);
+    // Publish the rows we own BEFORE latching DONE, so shop_repoint (which gates on is_done) can
+    // never observe a latched-but-empty set and repoint a row this pass rewrote.
+    *REWROTE_ROWS.lock().unwrap() = Some(plan.iter().map(|(id, _, _)| *id).collect());
     // Bag-add suppression RETIRED (ECHO-DEDUP): SOLD_SUPPRESS / ARMED_SUPPRESS stay
     // unpopulated, so should_suppress_sold() short-circuits false and the detour never nulls
     // a shop bag-add again. Native sale + echo-skip is the whole dedup now.

@@ -982,6 +982,10 @@ impl shared::Core for Core {
                     .chain(crate::keyitems::all_acquire_flags())
                     .collect();
                 crate::shop_sell::configure(loc_flags.clone(), echo_exempt);
+                // Same table, different consumer: shop_repoint inverts it to map a live row's
+                // eventFlag_forStock back to its AP location, so it can look up that location's
+                // preview good and WRITE it onto the row (er_logic::shop_repoint).
+                crate::shop_repoint::configure(loc_flags.clone());
                 // SLOT_DATA WINS, PARAMS ARE THE FALLBACK. `shopPreviewGoods` is the VANILLA ware
                 // sitting in each check's shop row -- that is GAME data, not seed data, so when a
                 // foreign apworld (Bedrock) omits the key we can read it straight off the live
@@ -2498,6 +2502,11 @@ impl shared::Core for Core {
             // live-row guard (er_logic::shop_echo) covers the one-tick window and any revert
             // path this edge misses.
             crate::shop_sell::reset();
+            // Same revert, same re-arm: the load just streamed ShopLineupParam back in, so the
+            // repointed rows are selling their vanilla wares again until the next pass rewrites
+            // them. Without this the shop display is correct until the player's first load and
+            // wrong for the rest of the run (er_logic::shop_repoint_replay pins the timeline).
+            crate::shop_repoint::reset();
             // CTD guard (2026-07-24): a load just completed — re-arm the enemy-scaling settle
             // window too. A SAME-REGION reload (death respawn) never trips the sweep's
             // region-change reset (LAST_REGION is unchanged), yet the ChrIns sets were just torn
@@ -2525,6 +2534,11 @@ impl shared::Core for Core {
             let _ = crate::check_lots::dress_placeholder();
             let _ = crate::shop_preview::run();
             let _ = crate::shop_icon::run();
+            // AFTER shop_sell has latched (it gates on shop_sell::is_done) and after the two display
+            // overrides: writes the preview good onto the check row so those overrides are something
+            // the player can actually SEE. Until this existed the row kept selling its vanilla ware
+            // and every foreign/lock slot read as that ware (Alaric in-game 2026-07-25).
+            let _ = crate::shop_repoint::run();
             let _ = crate::minibaker::run();
             crate::scaling::tick();
             // Anti-stuck: keep the FieldArea fast-travel gate open so a dungeon/catacomb can never

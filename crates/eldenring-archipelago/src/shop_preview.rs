@@ -64,6 +64,18 @@ pub fn configure(pairs: Vec<(i64, i32)>) {
     CONFIGURED_SET.store(true, Ordering::Relaxed);
 }
 
+/// The (loc -> preview good) pairs, or `None` before either source has supplied them. `shop_repoint`
+/// reads them here rather than being plumbed separately, so it is fed by BOTH the slot_data
+/// `shopPreviewGoods` path and the runtime ShopLineupParam fallback shop_sell installs for a foreign
+/// apworld that omits the key -- there is one place a pair can enter the client, so there is one
+/// place to read it from.
+pub fn configured_pairs() -> Option<Vec<(i64, i32)>> {
+    if !CONFIGURED_SET.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(CONFIGURED.lock().unwrap().clone())
+}
+
 /// Region-lock item NAMES (the `regionOpenFlags` slot_data keys, e.g. "Ensis Lock"). A shop slot whose
 /// scouted reward is one of these is a REGION UNLOCK: it gets a distinct "REGION UNLOCK" label AND is
 /// forced past the real-good FMG protection (a region key is worth renaming one shared note FMG, unlike
