@@ -166,7 +166,10 @@ mod tests {
 
     #[test]
     fn no_category_write_means_no_write_at_all_for_non_goods() {
-        assert_eq!(slot_write(false, false, 8852), None,
-                   "without a category write the vanilla ware STAYS -- a duplicate beats a dead check");
+        assert_eq!(
+            slot_write(false, false, 8852),
+            None,
+            "without a category write the vanilla ware STAYS -- a duplicate beats a dead check"
+        );
     }
 }
