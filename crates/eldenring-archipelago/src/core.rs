@@ -361,9 +361,51 @@ impl shared::Core for Core {
                 }
                 true
             }
+            "!give" => {
+                // PROBE, not a cheat: the one question params cannot answer is whether a goods row has
+                // an FMG NAME (names live in the msgbnd), and the only way to see a name is to hold the
+                // item. Finding the SECOND placeholder row -- the unblock for repointing shop slots
+                // without hijacking a real good's shared FMG entry -- needs exactly this and nothing
+                // more. Reusable on purpose: this is the third time a spare-row / FMG question would
+                // have been one command away.
+                //
+                // Takes a FULL id (category nibble | raw), the same space `grant_full_id` and the
+                // detour speak, so a goods row R is `0x40000000 | R` -- e.g. 8853 -> 1073750549. The
+                // nibble is REQUIRED and not inferred: guessing an id space is how ids silently never
+                // match (CONTRACT rule 3), and a probe that quietly grants the wrong table is worse
+                // than no probe.
+                let parts: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+                let full = parts.first().and_then(|s| {
+                    s.strip_prefix("0x")
+                        .and_then(|h| i32::from_str_radix(h, 16).ok())
+                        .or_else(|| s.parse::<i32>().ok())
+                });
+                match full {
+                    Some(f) if f != 0 => {
+                        let qty = parts.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                        // Report the DECODED id back before granting: if the nibble is not what the
+                        // caller meant, they see it here rather than inferring it from a wrong item.
+                        let (cat, raw) = (f as u32 & 0xF000_0000, er_codec::row_id_of(f as u32));
+                        let ok = crate::detour::grant_full_id(f, qty);
+                        let status = if ok {
+                            "granted"
+                        } else {
+                            "NOT READY (hook down or deferred) -- retry"
+                        };
+                        self.log(ap::Print::message(format!(
+                            "give {f} (category 0x{cat:08X}, row {raw}) x{qty} -> {status}"
+                        )));
+                    }
+                    _ => self.log(ap::Print::message(
+                        "usage: !give <fullId> [qty]  -- fullId = category nibble | raw, so goods row R                          is 0x40000000|R (goods 8853 = 1073750549 = 0x40002295)"
+                            .to_string(),
+                    )),
+                }
+                true
+            }
             "!help" => {
                 self.log(ap::Print::message(
-                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring> | !markerprobe [set|verify|clear]"
+                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring> | !markerprobe [set|verify|clear] | !give <fullId> [qty]"
                         .to_string(),
                 ));
                 true
