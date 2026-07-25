@@ -986,6 +986,13 @@ impl shared::Core for Core {
                 // eventFlag_forStock back to its AP location, so it can look up that location's
                 // preview good and WRITE it onto the row (er_logic::shop_repoint).
                 crate::shop_repoint::configure(loc_flags.clone());
+                // shopRunePrices: {ShopLineupParam row id (str) -> rolled rune price}.
+                crate::shop_prices::configure(
+                    i64_to_u32_map(sd.get("shopRunePrices"))
+                        .into_iter()
+                        .map(|(k, v)| (k as u32, v as i32))   // key = ShopLineupParam ROW id
+                        .collect(),
+                );
                 // SLOT_DATA WINS, PARAMS ARE THE FALLBACK. `shopPreviewGoods` is the VANILLA ware
                 // sitting in each check's shop row -- that is GAME data, not seed data, so when a
                 // foreign apworld (Bedrock) omits the key we can read it straight off the live
@@ -2507,6 +2514,7 @@ impl shared::Core for Core {
             // them. Without this the shop display is correct until the player's first load and
             // wrong for the rest of the run (er_logic::shop_repoint_replay pins the timeline).
             crate::shop_repoint::reset();
+            crate::shop_prices::reset();
             // CTD guard (2026-07-24): a load just completed — re-arm the enemy-scaling settle
             // window too. A SAME-REGION reload (death respawn) never trips the sweep's
             // region-change reset (LAST_REGION is unchanged), yet the ChrIns sets were just torn
@@ -2539,6 +2547,9 @@ impl shared::Core for Core {
             // the player can actually SEE. Until this existed the row kept selling its vanilla ware
             // and every foreign/lock slot read as that ware (Alaric in-game 2026-07-25).
             let _ = crate::shop_repoint::run();
+            // Disjoint from the two above: they own the WARE, this owns the PRICE. A rune reward on a
+            // slot that kept its old (much higher) cost is a check nobody collects.
+            let _ = crate::shop_prices::run();
             let _ = crate::minibaker::run();
             crate::scaling::tick();
             // Anti-stuck: keep the FieldArea fast-travel gate open so a dungeon/catacomb can never

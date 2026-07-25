@@ -40,6 +40,7 @@ mod scout_proof;
 mod shop_flags;
 mod shop_icon;
 mod shop_preview;
+mod shop_prices;
 mod shop_repoint;
 mod shop_sell;
 mod shop_stock;
