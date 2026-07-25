@@ -861,14 +861,24 @@ impl shared::Core for Core {
                             blank_enemy = legacy;
                         }
                     }
-                    let zero_map = parse_lots("checkLotZeroMap");
-                    let zero_enemy = parse_lots("checkLotZeroEnemy");
+                    // The WIRE KEYS keep their historical `...Zero...` names -- renaming a slot_data
+                    // key is a cross-repo contract change and would break connect for a seed rolled
+                    // on an older apworld. The BEHAVIOUR they name is gone: these slots are repointed
+                    // at the placeholder now, never emptied. Locals are named for what happens.
+                    let non_goods_map = parse_lots("checkLotZeroMap");
+                    let non_goods_enemy = parse_lots("checkLotZeroEnemy");
                     let has_lots = !(blank_map.is_empty()
                         && blank_enemy.is_empty()
-                        && zero_map.is_empty()
-                        && zero_enemy.is_empty());
+                        && non_goods_map.is_empty()
+                        && non_goods_enemy.is_empty());
                     if ph != 0 && has_lots {
-                        crate::check_lots::configure(blank_map, blank_enemy, zero_map, zero_enemy, ph);
+                        crate::check_lots::configure(
+                            blank_map,
+                            blank_enemy,
+                            non_goods_map,
+                            non_goods_enemy,
+                            ph,
+                        );
                     } else {
                         // STATIC FALLBACK -- vanilla suppression for a FOREIGN apworld.
                         //

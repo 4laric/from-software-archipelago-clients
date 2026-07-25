@@ -132,12 +132,19 @@ pub fn dress_placeholder() -> bool {
 /// randomised correctly.) The apworld knows which CSV each lot came from; it just used to throw it away.
 static BLANK_MAP: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
 static BLANK_ENEMY: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
-/// lot id -> NON-GOODS slot indices to ZERO (id = 0, num = 0) rather than repoint. The placeholder is a
-/// GOODS row, so it can only neutralise a goods slot; a weapon / armor / talisman / gem-ash check slot
-/// must be EMPTIED instead. Scoped by the apworld to FLAGGED one-time lots, so the check's own
-/// acquisition flag still fires on the emptied pickup -- registration is by flag poll, not by item id.
-static ZERO_MAP: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
-static ZERO_ENEMY: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+/// lot id -> NON-GOODS slot indices (weapon / armor / talisman / gem-ash). These are REPOINTED at the
+/// placeholder like goods slots, writing the slot's category alongside its id so a GOODS row is legal
+/// where a weapon used to sit. They were once EMPTIED (id = 0, num = 0) -- that removed the pickup, and
+/// the pickup IS the check, so it silently killed every gear chest, scarab drop and boss drop.
+///
+/// Scoped by the apworld to FLAGGED one-time lots, so a farmable source is never eaten.
+///
+/// This comment used to end: "the check's own acquisition flag still fires on the emptied pickup --
+/// registration is by flag poll, not by item id." That sentence was FALSE, and believing it is why the
+/// bug shipped: an emptied slot spawns nothing, so there is no pickup and the flag never fires. Left
+/// as a headstone -- a comment asserting an invariant is a claim, and this claim had no test.
+static NON_GOODS_MAP: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+static NON_GOODS_ENEMY: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
 /// The one goods id we hand out at checks and then unconditionally suppress. 0 = feature off.
 static PLACEHOLDER: AtomicI32 = AtomicI32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -159,21 +166,21 @@ pub fn is_placeholder(raw_id: i32) -> bool {
 pub fn configure(
     blank_map: HashMap<u32, Vec<u8>>,
     blank_enemy: HashMap<u32, Vec<u8>>,
-    zero_map: HashMap<u32, Vec<u8>>,
-    zero_enemy: HashMap<u32, Vec<u8>>,
+    non_goods_map: HashMap<u32, Vec<u8>>,
+    non_goods_enemy: HashMap<u32, Vec<u8>>,
     placeholder_goods: i32,
 ) {
     let (nm, ne) = (blank_map.len(), blank_enemy.len());
-    let (zm, ze) = (zero_map.len(), zero_enemy.len());
+    let (zm, ze) = (non_goods_map.len(), non_goods_enemy.len());
     *BLANK_MAP.lock().unwrap() = Some(blank_map);
     *BLANK_ENEMY.lock().unwrap() = Some(blank_enemy);
-    *ZERO_MAP.lock().unwrap() = Some(zero_map);
-    *ZERO_ENEMY.lock().unwrap() = Some(zero_enemy);
+    *NON_GOODS_MAP.lock().unwrap() = Some(non_goods_map);
+    *NON_GOODS_ENEMY.lock().unwrap() = Some(non_goods_enemy);
     PLACEHOLDER.store(placeholder_goods, Ordering::Relaxed);
     DONE.store(false, Ordering::Relaxed);
     DRESSED.store(false, Ordering::Relaxed);
     log::info!(
-        "check-lots: configured {nm} MAP + {ne} ENEMY blank + {zm} MAP + {ze} ENEMY zero check lot(s); placeholder goods {placeholder_goods}"
+        "check-lots: configured {nm} MAP + {ne} ENEMY goods + {zm} MAP + {ze} ENEMY non-goods check lot(s); placeholder goods {placeholder_goods}"
     );
 }
 
@@ -197,12 +204,12 @@ pub fn run() -> bool {
         (None, None) => return true, // not configured (non-greenfield seed)
         (a, b) => (a.unwrap_or_default(), b.unwrap_or_default()),
     };
-    let zero_map = grab(&ZERO_MAP).unwrap_or_default();
-    let zero_enemy = grab(&ZERO_ENEMY).unwrap_or_default();
+    let non_goods_map = grab(&NON_GOODS_MAP).unwrap_or_default();
+    let non_goods_enemy = grab(&NON_GOODS_ENEMY).unwrap_or_default();
     if blank_map.is_empty()
         && blank_enemy.is_empty()
-        && zero_map.is_empty()
-        && zero_enemy.is_empty()
+        && non_goods_map.is_empty()
+        && non_goods_enemy.is_empty()
     {
         DONE.store(true, Ordering::Relaxed);
         return true;
@@ -231,24 +238,38 @@ pub fn run() -> bool {
     // Note we deliberately do NOT blank both tables "to be safe": that would gut an unrelated map lot's
     // goods slot at the same id. The table is a FACT the apworld already has; it just used to throw it
     // away. Now it travels with the lot.
-    for (lot, slots) in &blank_map {
-        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
-            for &sl in slots {
-                set_slot(row, sl, ph);
-                n += 1;
+    // GOODS slots go through the same predicate as non-goods. This arm used to call set_slot()
+    // directly, which is the very decision/write split the non-goods arm below was fixed to remove --
+    // half an invariant is not an invariant. Behaviour is unchanged: slot_write(goods) yields the
+    // placeholder id with `category: None`, i.e. exactly the old id-only write.
+    //
+    // `category: None` is deliberate and load-bearing. The goods bucket is lotItemCategory {0, 1, 6}
+    // (greenfield/gen_data.py `_LOT_CAT_GOODS`), NOT just 1 -- 0 is Golden Rune / Gravel Stone, 6 is
+    // sorceries, and all three carry the goods FullID nibble. That path is in-game-proven, so we leave
+    // those categories exactly as the game shipped them and normalise only the non-goods slots, which
+    // are the ones that genuinely need telling. Do not "tidy" this into an unconditional category
+    // write: it would churn a proven path on a symmetry argument.
+    let goods_write = er_logic::check_neutralise::slot_write(true, CAN_WRITE_SLOT_CATEGORY, ph);
+    if let Some(w) = goods_write {
+        for (lot, slots) in &blank_map {
+            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
+                for &sl in slots {
+                    set_slot_full(row, sl, w.item_id, w.category);
+                    n += 1;
+                }
+            } else {
+                missed.push(*lot);
             }
-        } else {
-            missed.push(*lot);
         }
-    }
-    for (lot, slots) in &blank_enemy {
-        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
-            for &sl in slots {
-                set_slot(row, sl, ph);
-                n += 1;
+        for (lot, slots) in &blank_enemy {
+            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
+                for &sl in slots {
+                    set_slot_full(row, sl, w.item_id, w.category);
+                    n += 1;
+                }
+            } else {
+                missed.push(*lot);
             }
-        } else {
-            missed.push(*lot);
         }
     }
 
@@ -272,7 +293,7 @@ pub fn run() -> bool {
     // one value now (`slot_write`), so they cannot disagree again.
     let write = er_logic::check_neutralise::slot_write(false, CAN_WRITE_SLOT_CATEGORY, ph);
     if let Some(w) = write {
-        for (lot, slots) in &zero_map {
+        for (lot, slots) in &non_goods_map {
             if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
                 for &sl in slots {
                     set_slot_full(row, sl, w.item_id, w.category);
@@ -282,7 +303,7 @@ pub fn run() -> bool {
                 missed.push(*lot);
             }
         }
-        for (lot, slots) in &zero_enemy {
+        for (lot, slots) in &non_goods_enemy {
             if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
                 for &sl in slots {
                     set_slot_full(row, sl, w.item_id, w.category);
@@ -292,15 +313,15 @@ pub fn run() -> bool {
                 missed.push(*lot);
             }
         }
-    } else if !zero_map.is_empty() || !zero_enemy.is_empty() {
+    } else if !non_goods_map.is_empty() || !non_goods_enemy.is_empty() {
         // Tolerance requires telemetry: say what is inert and why, once per arm.
         log::warn!(
-            "check-lots: non-goods ZERO pass INERT for {} MAP + {} ENEMY lot(s) -- emptying a slot \
-             removes the pickup, and the pickup IS the check (2026-07-24: boss/scarab/gear-chest \
-             checks never registered). Vanilla ware may leak at non-goods checks until the slot \
-             category can be written; a duplicate item beats a dead check.",
-            zero_map.len(),
-            zero_enemy.len()
+            "check-lots: non-goods REPOINT pass INERT for {} MAP + {} ENEMY lot(s) -- \
+             CAN_WRITE_SLOT_CATEGORY is off, so the vanilla ware LEAKS at these checks (you may \
+             receive a duplicate). The checks still register: this arm deliberately does not empty \
+             the slot, because emptying removes the pickup and the pickup IS the check.",
+            non_goods_map.len(),
+            non_goods_enemy.len()
         );
     }
     if !missed.is_empty() {
@@ -314,8 +335,8 @@ pub fn run() -> bool {
         "check-lots: wrote {} MAP + {} ENEMY goods-blank, {} MAP + {} ENEMY non-goods repoint lot(s) ({} missing from the named table)",
         blank_map.len(),
         blank_enemy.len(),
-        zero_map.len(),
-        zero_enemy.len(),
+        non_goods_map.len(),
+        non_goods_enemy.len(),
         missed.len()
     );
     log::info!(
