@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const GOODS_NAME_CAT: u32 = 10;
 const GOODS_INFO_CAT: u32 = 20; // the "Item Effect" line the buy menu renders
@@ -42,6 +42,13 @@ static REAL_GOODS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 static CONFIGURED: Mutex<Vec<(i64, i32)>> = Mutex::new(Vec::new());
 static CONFIGURED_SET: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
+
+/// Ticks spent waiting for the MSG repo before we stop retrying the name override. A BOUND, not a
+/// timeout: `extend_swap_overrides` returns 0 both for "repo not up yet" (retry) and for "not one of
+/// these ids is writable" (never retry), and it cannot tell the caller which. Without a cap the
+/// second case spins an FMG parse every tick forever. ~10s at 60fps.
+static NAME_RETRIES: AtomicU32 = AtomicU32::new(0);
+const NAME_RETRY_LIMIT: u32 = 600;
 
 pub fn set_real_goods(rows: HashSet<u32>) {
     log::info!(
@@ -62,6 +69,9 @@ pub fn configure(pairs: Vec<(i64, i32)>) {
     log::info!("shop-preview: configured {} shop slot(s)", pairs.len());
     *CONFIGURED.lock().unwrap() = pairs;
     CONFIGURED_SET.store(true, Ordering::Relaxed);
+    // Fresh budget per connect: a reconnect must not inherit an exhausted one and latch instantly.
+    NAME_RETRIES.store(0, Ordering::Relaxed);
+    DONE.store(false, Ordering::Relaxed);
 }
 
 /// The (loc -> preview good) pairs, or `None` before either source has supplied them. `shop_repoint`
@@ -172,6 +182,34 @@ pub fn run() -> bool {
     let infos: Vec<(u32, Vec<u16>)> = imap.into_iter().collect();
     let caps: Vec<(u32, Vec<u16>)> = cmap.into_iter().collect();
     let n = crate::fmg_inject::extend_swap_overrides(GOODS_NAME_CAT, &names);
+    // RETRY, do not latch, when the NAME write did not land. `extend_swap_overrides` returns 0 when
+    // the MSG repo or the category is not up yet and explicitly asks the caller to retry next tick --
+    // `check_lots::dress_placeholder` does exactly that, and this pass did not, so it latched DONE on
+    // a write of nothing and never tried again. shop_preview arms as soon as the scout cache and
+    // apIdsToItemIds are ready, which is comfortably before the MSG repo, so losing the whole
+    // override this way is the common case rather than the rare one. The icon (a PARAM write, repo up
+    // much earlier) landed regardless, which is why a slot could show the AP flower with a vanilla
+    // name. (Alaric, playtest 2026-07-25.)
+    if n == 0 && !names.is_empty() {
+        let tries = NAME_RETRIES.fetch_add(1, Ordering::Relaxed) + 1;
+        if tries < NAME_RETRY_LIMIT {
+            if tries == 1 {
+                log::info!(
+                    "shop-preview: name override wrote 0 of {} -- MSG repo/category not up yet, \
+                     retrying (NOT latching)",
+                    names.len()
+                );
+            }
+            return false;
+        }
+        log::warn!(
+            "shop-preview: name override still wrote 0 of {} after {NAME_RETRY_LIMIT} ticks -- \
+             giving up and latching. Those slots keep their VANILLA name (or render `?GoodsName?` \
+             if the row has no FMG entry at all); the flower icon and the reward routing are \
+             unaffected. See the FMG extend-swap warning above for the ids.",
+            names.len()
+        );
+    }
     let i = crate::fmg_inject::extend_swap_overrides(GOODS_INFO_CAT, &infos);
     let c = crate::fmg_inject::extend_swap_overrides(GOODS_CAPTION_CAT, &caps);
     log::info!(

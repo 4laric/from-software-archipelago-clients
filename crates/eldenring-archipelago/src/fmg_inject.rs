@@ -546,6 +546,27 @@ pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> us
         .filter(|(id, _)| groups.iter().any(|g| *id >= g.first_id && *id <= g.last_id))
         .cloned()
         .collect();
+    // SAY WHAT WAS DROPPED. An id outside every group has no string slot to redirect, and `injects`
+    // cannot take it either -- build_block requires injected ids to sort ABOVE every vanilla id, and
+    // a spare goods row sits in the middle of the range. So it is genuinely unwritable here, and
+    // until 2026-07-25 it was unwritable SILENTLY: the caller saw a smaller count and nothing named
+    // the ids, so a shop slot repointed at such a row rendered the game's `?GoodsName?` tag and the
+    // log said only that fewer overrides landed than were asked for. That is the whole "absence of
+    // behavior is indistinguishable from off" failure this project keeps paying for.
+    // (Alaric, playtest 2026-07-25: shop slots reading `?GoodsName?` / `?GoodsInfo?`.)
+    let dropped = overrides.len() - resolvable.len();
+    if dropped > 0 {
+        let sample: Vec<u32> = overrides
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !groups.iter().any(|g| *id >= g.first_id && *id <= g.last_id))
+            .take(8)
+            .collect();
+        log::warn!(
+            "FMG extend-swap(cat {category}): {dropped} of {} id(s) are in NO vanilla group, so they              have no string slot to redirect and CANNOT be named here -- they will render as              `?GoodsName?` in game. Pick rows that already carry an FMG entry (an EMPTY one is fine              -- that is the `[ERROR]` render). ids: {sample:?}",
+            overrides.len()
+        );
+    }
     if resolvable.is_empty() {
         return 0;
     }
