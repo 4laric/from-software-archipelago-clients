@@ -229,6 +229,9 @@ pub fn run() -> bool {
 
     // Scan immutably -> plan the rewrites, then apply (avoids holding a row borrow across get_mut).
     let mut plan: Vec<(u32, i32, u8)> = Vec::new(); // (row id, new equipId, equipType)
+    // Every row this pass sells natively -- see the note at the `owned.insert` below for why this is
+    // NOT derived from `plan`.
+    let mut owned: HashSet<u32> = HashSet::new();
     // AP location -> (stock flag, row id, sold equipId, equipType) (ECHO-DEDUP + revert guard)
     let mut echo_skip: HashMap<i64, EchoArm> = HashMap::new();
     // SKIP TALLY -- why a check row did NOT get a native rewrite. On a SOLO seed a large `no_scout` or
@@ -326,6 +329,14 @@ pub fn run() -> bool {
         // player's max reinforce tier as it climbs.
         let sell_fid = crate::upgrades::apply_auto_upgrade(fid as i32);
         let new_eid = er_codec::row_id_of(sell_fid as u32) as i32;
+        // OWNERSHIP is recorded here, not from `plan`. `plan` holds only the rows that still NEED a
+        // write, so on an idempotent re-run (the common case: the tick re-arms this pass and every
+        // row already sells its reward) it is EMPTY -- and an ownership set built from it would say
+        // this pass owns NOTHING. shop_repoint gates on that set, so it would then repoint 354 rows
+        // straight off their native sale and onto a cosmetic placeholder. Observed doing exactly
+        // that in Alaric's 2026-07-25 log: `shop-repoint: repointed 354 ... 0 owned by shop_sell`.
+        // A row this pass has DECIDED to sell natively is owned whether or not the write was needed.
+        owned.insert(id);
         if row.equip_id() != new_eid {
             plan.push((id, new_eid, etype));
         }
@@ -348,13 +359,16 @@ pub fn run() -> bool {
     let skip_count = echo_skip.len();
     *ECHO_SKIP.lock().unwrap() = Some(echo_skip);
     // Publish the rows we own BEFORE latching DONE, so shop_repoint (which gates on is_done) can
-    // never observe a latched-but-empty set and repoint a row this pass rewrote.
-    *REWROTE_ROWS.lock().unwrap() = Some(plan.iter().map(|(id, _, _)| *id).collect());
+    // never observe a latched-but-empty set and repoint a row this pass owns.
+    let owned_n = owned.len();
+    *REWROTE_ROWS.lock().unwrap() = Some(owned);
     // Bag-add suppression RETIRED (ECHO-DEDUP): SOLD_SUPPRESS / ARMED_SUPPRESS stay
     // unpopulated, so should_suppress_sold() short-circuits false and the detour never nulls
     // a shop bag-add again. Native sale + echo-skip is the whole dedup now.
     log::info!(
-        "shop-sell: rewrote {n} own-world slot(s) to natively sell their reward ({skip_count} echo-skip, cross-type OPEN, auto_upgrade baked)"
+        "shop-sell: rewrote {n} own-world slot(s) to natively sell their reward ({owned_n} owned in \
+         total -- rewritten this pass plus already-correct; shop_repoint must not touch any of them) \
+         ({skip_count} echo-skip, cross-type OPEN, auto_upgrade baked)"
     );
     log::info!(
         "shop-sell: skip tally -- {check_rows} check row(s) seen, {exempt_rows} exempt \

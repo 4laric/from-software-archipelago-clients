@@ -36,7 +36,7 @@
 #![allow(dead_code)]
 
 use eldenring::cs::{ShopLineupParam, SoloParamRepository};
-use er_logic::shop_repoint::{decide, Repoint, SkipReason};
+use er_logic::shop_repoint::{Repoint, SkipReason, decide};
 use fromsoftware_shared::FromStatic;
 use std::collections::HashMap;
 use std::sync::Mutex;
