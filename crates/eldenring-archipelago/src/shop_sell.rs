@@ -350,11 +350,40 @@ pub fn run() -> bool {
         }
     }
     let n = plan.len();
+    let mut overrides_cleared = 0u32;
     for (id, eid, etype) in &plan {
         if let Some(row) = repo.get_mut::<ShopLineupParam>(*id) {
             row.set_equip_id(*eid);
             row.set_equip_type(*etype);
+            // CLEAR THE ROW'S OWN NAME OVERRIDE. `ShopLineupParam.nameMsgId` lets a shop row label
+            // itself instead of using the ware's name, and rewriting equipId/equipType leaves that
+            // override pointing at the ware we just replaced. The menu prefers it, so the slot keeps
+            // showing the OLD item's name -- or, when the id does not resolve in the NEW ware's FMG
+            // category, the `?ProtectorName?` / `?GoodsName?` tag.
+            //
+            // Alaric, playtest 2026-07-25: a slot reading `?ProtectorName?` over real armour stats
+            // that paid out Blackflame Monk Greaves correctly, and the same Greaves displaying its
+            // name perfectly IN THE INVENTORY. The item, the routing and the FMG were all fine; the
+            // ROW was labelling itself. Only some vanilla rows carry an override, which is why most
+            // slots looked right and a handful did not.
+            //
+            // -1 is the assumed "no override" sentinel. The OLD value is logged for every row that
+            // had one, so if -1 turns out to be wrong the log says exactly what it was.
+            if row.name_msg_id() != -1 {
+                log::debug!(
+                    "shop-sell: row {id} nameMsgId {} -> -1 (was labelling itself)",
+                    row.name_msg_id()
+                );
+                row.set_name_msg_id(-1);
+                overrides_cleared += 1;
+            }
         }
+    }
+    if overrides_cleared > 0 {
+        log::info!(
+            "shop-sell: cleared {overrides_cleared} row-level nameMsgId override(s) -- those slots \
+             were showing the name of the ware they USED to sell (or its tag)"
+        );
     }
     let skip_count = echo_skip.len();
     *ECHO_SKIP.lock().unwrap() = Some(echo_skip);

@@ -135,6 +135,12 @@ pub fn run() -> bool {
         if let Some(row) = repo.get_mut::<ShopLineupParam>(*id) {
             row.set_equip_id(*eid);
             row.set_equip_type(*etype);
+            // Same reason as shop_sell: a row-level nameMsgId override outlives the ware and the menu
+            // prefers it, so a repointed slot would show its old label instead of the AP name we just
+            // went to the trouble of writing into the placeholder's FMG entry.
+            if row.name_msg_id() != -1 {
+                row.set_name_msg_id(-1);
+            }
             // `value` (the rune price) is deliberately UNTOUCHED: the slot must still cost what the
             // slot cost. shop_stock rewrites price because it rerolls the WARE of an infinite row;
             // here the ware is a cosmetic stand-in for a reward the player is buying at this slot's
