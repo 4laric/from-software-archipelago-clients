@@ -370,7 +370,7 @@ impl shared::Core for Core {
                 // have been one command away.
                 //
                 // Takes a FULL id (category nibble | raw), the same space `grant_full_id` and the
-                // detour speak, so a goods row R is `0x40000000 | R` -- e.g. 8853 -> 1073750549. The
+                // detour speak, so a goods row R is `0x40000000 | R` -- e.g. 8853 -> 0x40002295 (1073750677). The
                 // nibble is REQUIRED and not inferred: guessing an id space is how ids silently never
                 // match (CONTRACT rule 3), and a probe that quietly grants the wrong table is worse
                 // than no probe.
@@ -397,7 +397,7 @@ impl shared::Core for Core {
                         )));
                     }
                     _ => self.log(ap::Print::message(
-                        "usage: !give <fullId> [qty]  -- fullId = category nibble | raw, so goods row R                          is 0x40000000|R (goods 8853 = 1073750549 = 0x40002295)"
+                        "usage: !give <fullId> [qty]  -- fullId = category nibble | raw, so goods row R                          is 0x40000000|R -- PREFER HEX: goods 8853 = 0x40002295 (decimal 1073750677); hex needs no arithmetic"
                             .to_string(),
                     )),
                 }
