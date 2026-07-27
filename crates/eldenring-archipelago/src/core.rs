@@ -631,14 +631,14 @@ impl shared::Core for Core {
                 let missing = er_logic::client_features::unsupported(
                     &er_logic::client_features::required_from_slot_data(sd));
                 if !missing.is_empty() {
-                    let msg = er_logic::client_features::refusal_message(&missing);
-                    log::error!("CLIENT TOO OLD: {msg}");
-                    // On SCREEN as well as in the log: a player who never opens the log is exactly
-                    // the one who would otherwise conclude the option does nothing.
-                    let now = self.toast_clock.elapsed().as_millis() as u64;
-                    self.toasts.push(
-                        format!("Client too old for this seed: {}", missing.join(", ")), now);
+                    log::error!(
+                        "CLIENT TOO OLD: {}",
+                        er_logic::client_features::refusal_message(&missing));
                 }
+                // The on-screen half is pushed by the CALLER: this closure already borrows `*self`
+                // (via `self.client()`), so touching `self.toasts` here is E0500. Same shape as
+                // `gate_warn` below -- compute in the closure, surface after it.
+                let feature_warn = missing;
 
                 // Two-sided contract validation: warn (not reject) on any slot_data mismatch
                 // so a partially-compatible seed still boots but every problem is visible.
@@ -1175,7 +1175,7 @@ impl shared::Core for Core {
                     }
                 };
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface)
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, feature_warn)
             });
             if let Some((
                 map,
@@ -1193,6 +1193,7 @@ impl shared::Core for Core {
                 boss_defs,
                 region_attunement,
                 progression_surface,
+                feature_warn,
             )) = parsed
             {
                 log::info!(
@@ -1249,6 +1250,16 @@ impl shared::Core for Core {
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
                 self.parsed_seed = Some(current_room_seed.clone());
+                // A seed that needs a client feature this build lacks: say so ON SCREEN too. A
+                // player who never opens the log is exactly the one who would otherwise conclude
+                // the option they set simply does nothing.
+                if !feature_warn.is_empty() {
+                    let now = self.toast_clock.elapsed().as_millis() as u64;
+                    self.toasts.push(
+                        format!("Client too old for this seed: {}", feature_warn.join(", ")),
+                        now,
+                    );
+                }
                 if let Some(warning) = gate_warn {
                     log::error!("{warning}");
                     self.log(ap::Print::message(warning));
