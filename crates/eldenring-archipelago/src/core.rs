@@ -3430,6 +3430,31 @@ mod tests {
     /// DATA HASH, which is what actually matters). What replaces the test is the assertion that the
     /// apworld's real `versions` string is the shape the handshake parses -- i.e. test the CONTRACT,
     /// not a hand-built stand-in.
+    /// The crate version and the apworld's must MOVE TOGETHER.
+    ///
+    /// They sat apart for months -- client 0.1.0-beta.4 against apworld 0.2.0 -- because the thing
+    /// that used to force them together was the semver BAND gate, retired 2026-07-11 when `versions`
+    /// became a descriptive string. Nothing replaced the pressure, so the number stopped moving and
+    /// its Cargo.toml comment went on describing a mechanism that no longer existed.
+    ///
+    /// Nothing in PRODUCTION reads the crate version (version_gate is test-only now), so this is not
+    /// protecting a runtime behaviour -- it is protecting the bug report. `versions` is the string
+    /// every report carries, and a client that names a version unrelated to the apworld it was built
+    /// against makes triage guesswork. They ship as one bundle; they get one number.
+    ///
+    /// If patch-level drift ever needs to be allowed, compare only MAJOR.MINOR here -- but do it
+    /// deliberately, not by letting this rot again.
+    #[test]
+    fn client_version_matches_the_apworld_it_was_built_against() {
+        assert_eq!(
+            env!("CARGO_PKG_VERSION"),
+            crate::contract_gen::APWORLD_VERSION_EXPECTED,
+            "client crate version and APWORLD_VERSION (via generated contract_gen.rs) have drifted. \
+             Bump crates/eldenring-archipelago/Cargo.toml to match, or the apworld's \
+             contract.py APWORLD_VERSION if the client is the one that is right."
+        );
+    }
+
     #[test]
     fn versions_string_is_what_the_handshake_parses_not_a_semver_band() {
         // Exactly what greenfield/eldenring/contract.py version_string() emits.

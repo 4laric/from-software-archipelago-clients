@@ -1,10 +1,19 @@
 [package]
 name = "eldenring-archipelago"
-# LOCKSTEP with Archipelago/worlds/eldenring/__init__.py fill_slot_data "versions"
-# (">=0.1.0-beta.4 <0.1.0-beta.5"): er-semver orders a bare release 0.1.0 ABOVE every
-# 0.1.0-beta.*, so "0.1.0" fails the connect gate on every seed. Guarded by the core.rs
-# test client_version_is_inside_apworld_contract_band.
-version = "0.1.0-beta.4"
+# LOCKSTEP WITH THE APWORLD. This must equal contract.py's APWORLD_VERSION (mirrored here as
+# contract_gen::APWORLD_VERSION_EXPECTED); core.rs::client_version_matches_the_apworld_it_was_built_against
+# asserts it. The two ship together in one release bundle, and any APWORLD_VERSION change already
+# regenerates contract_gen.rs into this repo, so the coupling costs nothing it did not already.
+#
+# WHY IT SAT AT 0.1.0-beta.4 FOR MONTHS: the thing that used to force it to move was a semver BAND
+# gate (">=0.1.0-beta.4 <0.1.0-beta.5"), and that gate was RETIRED on 2026-07-11 -- `versions` became
+# a descriptive "apworld/X contract/Y data/Z" string and the handshake compares the CONTRACT HASH
+# instead. Nothing replaced the pressure, so the number simply stopped moving, and this comment went
+# on describing a mechanism and a test that no longer existed. (`er_logic::version::version_gate` is
+# now referenced only from a test; nothing in production reads this version, which is exactly why
+# jumping 0.1.0-beta.4 -> 0.2.12 is safe. The old er-semver warning that a bare 0.1.0 outranks every
+# 0.1.0-beta.* is likewise moot -- no range is parsed any more.)
+version = "0.2.12"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
