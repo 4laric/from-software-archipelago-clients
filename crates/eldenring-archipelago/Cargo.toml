@@ -11,9 +11,9 @@ name = "eldenring-archipelago"
 # instead. Nothing replaced the pressure, so the number simply stopped moving, and this comment went
 # on describing a mechanism and a test that no longer existed. (`er_logic::version::version_gate` is
 # now referenced only from a test; nothing in production reads this version, which is exactly why
-# jumping 0.1.0-beta.4 -> 0.2.12 is safe. The old er-semver warning that a bare 0.1.0 outranks every
-# 0.1.0-beta.* is likewise moot -- no range is parsed any more.)
-version = "0.2.12"
+# jumping 0.1.0-beta.4 -> the 0.2.x line is safe. The old er-semver warning that a bare
+# 0.1.0 outranks every 0.1.0-beta.* is likewise moot -- no range is parsed any more.)
+version = "0.2.13"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
