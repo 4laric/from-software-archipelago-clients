@@ -53,6 +53,7 @@ pub mod shop_echo;
 pub mod shop_repoint;
 pub mod shop_repoint_replay;
 pub mod start_backfill;
+pub mod sweep_settle;
 pub mod start_grant_replay;
 pub mod static_lots;
 pub mod sweep_flush;

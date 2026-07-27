@@ -11,43 +11,112 @@
 //! idempotent and re-scales correctly when the player changes region or an enemy reloads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
-use eldenring::cs::{ChrIns, ChrInsExt, ChrType, WorldChrMan};
+use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
     NUM_TIERS, ScalingConfig, blessing_floor_for_region, is_scaling_speffect,
     raw_target_for_region, speffect_id_for_tier, tier_for_region, tier_rates,
 };
-use fromsoftware_shared::FromStatic;
+use er_logic::sweep_settle::{SettlePolicy, SweepGate};
+use fromsoftware_shared::{FromStatic, Subclass};
 use serde_json::Value;
 
 static CONFIG: Mutex<Option<ScalingConfig>> = Mutex::new(None);
 static TICK: AtomicU32 = AtomicU32::new(0);
 
 /// Apply the region's tier SpEffect only a few times a second (enemy stats don't need per-frame).
+///
+/// ⚠️ This is a REPEAT-sweep throttle only. It used to be checked BEFORE the settle guard, which
+/// meant the first sweep after a transition also had to wait for the next multiple of 30 -- ~500 ms
+/// at 60fps and a full second at 30, and post-load framerate is exactly when it is worst. It is now
+/// measured as "ticks since the last sweep", so the first allowed sweep happens immediately.
 const THROTTLE: u32 = 30;
 
-/// Native-crash guard (Siofra / Eternal Cities CTD, 2026-07-09): the last play_region the sweep ran
-/// in, and when we first observed the CURRENT one. We do NOT walk the enemy `ChrIns` lists in the
-/// first `REGION_SETTLE` after a region change -- the new map's enemies are still streaming in, and
-/// iterating / mutating a chr set mid-spawn can dereference a half-constructed `ChrIns` and crash the
-/// game natively (no Rust panic; it's the game's own memory). Enemies are merely left un-scaled for a
-/// couple of seconds after a load; the very next sweep after the window scales them.
-static LAST_REGION: AtomicI32 = AtomicI32::new(i32::MIN);
-static REGION_ENTERED: Mutex<Option<Instant>> = Mutex::new(None);
-/// How long to let a freshly-entered region populate before sweeping its enemies.
-///
-/// TIGHTENED 2026-07-19 (Alaric): 4s -> 2500ms. The effective un-scaled window after a warp is this
-/// PLUS the time `play_region_id` takes to stabilize to the new region (each transient region value
-/// resets the timer), which stacked to ~8s in play -- long enough to get killed by vanilla-statted
-/// enemies before scaling arms. Shaving 1.5s here narrows that danger window while keeping a margin
-/// over the native-crash guard this delay exists for (iterating a still-spawning ChrIns set natively
-/// crashed Siofra / the Eternal Cities, 2026-07-09). If that CTD returns, raise this back toward 4s.
-const REGION_SETTLE: Duration = Duration::from_millis(2500);
+/// Transition/region bookkeeping for the time-based backstop (`er_logic::sweep_settle`, host-tested;
+/// see `active_characters` below for the PRIMARY crash defence and `SETTLE` for the policy).
+static GATE: Mutex<SweepGate> = Mutex::new(SweepGate::new());
+/// Process-relative clock for the gate (which is pure and takes `now_ms`).
+static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
+/// Ticks at the last sweep -- the repeat throttle. `None` = never swept, so the first allowed tick
+/// sweeps immediately instead of waiting for a modulo phase.
+static LAST_SWEEP_TICK: Mutex<Option<u32>> = Mutex::new(None);
+/// Entries skipped this sweep because `chr_load_status != Active` (see `active_characters`).
+/// Reported in the release log: a non-zero count AFTER the settle window is the proof that the old
+/// timer alone was never sufficient.
+static SKIPPED_NOT_ACTIVE: AtomicU32 = AtomicU32::new(0);
+/// One-shot release log per transition.
+static RELEASE_LOGGED: Mutex<bool> = Mutex::new(true);
 
-/// Re-arm the `REGION_SETTLE` skip from an EXTERNAL transition signal — the same `REGION_ENTERED`
-/// machinery the region-change guard uses, no new state class.
+fn now_ms() -> u64 {
+    let mut epoch = match EPOCH.lock() {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    epoch.get_or_insert_with(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Iterate a chr set's LOADED, FULLY-CONSTRUCTED characters.
+///
+/// 🛑 THIS IS THE CTD FIX. Upstream `ChrSet::characters()` (fromsoftware-rs
+/// `cs/world_chr_man.rs`) walks the entries array and yields every slot where `chr_ins.is_some()` --
+/// it never looks at `chr_load_status`. So during a map load it hands out `ChrIns` pointers in state
+/// `Initializing` (still being constructed) and `Unloading` (being torn down), and
+/// `scale_one`'s `apply_speffect` dereferences them. That is the Siofra / Eternal Cities native
+/// crash of 2026-07-09, and the 2.5 s `REGION_SETTLE` window was built to avoid it by WAITING --
+/// a timer standing in for a state byte the game had been publishing all along.
+///
+/// `chr_load_status` lives on the ENTRY, in the flat `capacity`-sized array -- reading it
+/// dereferences no `ChrIns`, so it is safe to consult mid-stream, which is exactly what a timer
+/// could never be. Filtering on `Active` also covers the warp-OUT teardown edge that
+/// `notify_transition` was bolted onto in 2026-07-24.
+///
+/// The time-based gate is deliberately RETAINED as a backstop for the one hazard this cannot
+/// describe: a torn read of the entries ARRAY itself while the game rebuilds it. Two independent
+/// guards, because the crash class is still open elsewhere in this client.
+fn active_characters<T>(set: &ChrSet<T>) -> impl Iterator<Item = &mut T>
+where
+    T: Subclass<ChrIns> + 'static,
+{
+    let mut current = set.entries;
+    let end = unsafe { current.add(set.capacity as usize) };
+    std::iter::from_fn(move || {
+        while current != end {
+            // Read the ENTRY (flat array slot) -- never the ChrIns behind it -- before deciding.
+            let entry = unsafe { current.as_ref() };
+            let (chr_ins, status) = (entry.chr_ins, entry.chr_load_status);
+            current = unsafe { current.add(1) };
+            let Some(mut chr_ins) = chr_ins else {
+                continue;
+            };
+            if status != ChrLoadStatus::Active {
+                // COUNT the skip; a filter with no tally is a lie (CONTRIBUTING rule 4).
+                SKIPPED_NOT_ACTIVE.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            return Some(unsafe { chr_ins.as_mut() });
+        }
+        None
+    })
+}
+/// How long to let a freshly-loaded map settle before sweeping, and how long the region must have
+/// been stable. Pure policy; the gate that consumes it is `er_logic::sweep_settle` (host-tested).
+///
+/// `settle_ms` is UNCHANGED at 2500 (4s -> 2500 was Alaric's 2026-07-19 tightening). It is not
+/// lowered here on purpose: it moves the native-crash boundary, `active_characters` above has just
+/// replaced its *mechanism* and is not yet confirmed in-game, and the crash class is still open (the
+/// "Beside the Rampart Gaol" warp). Lower it from the release-log data, not from a third guess.
+///
+/// `stable_ms` is the NEW half. The old guard restarted the full 2500 on every observed region
+/// change, so the transient `play_region_id` values a warp produces compounded the real window to
+/// ~8s in play. Worse, the region was only SAMPLED every 30 ticks, so a flap shorter than ~500ms was
+/// never seen at all -- too slow and too blind, from the same line ordering. Observation is now
+/// per-tick (strictly MORE protective: those flaps now hold the gate) and a flap costs `stable_ms`
+/// rather than a fresh `settle_ms`. Starts conservative at the shipping default; see sweep_settle.
+const SETTLE: SettlePolicy = SettlePolicy::SHIPPING;
+
+/// Re-arm the settle window from an EXTERNAL transition signal.
 ///
 /// CTD guard (2026-07-24, "Beside the Rampart Gaol" warp postmortem). Two callers:
 ///   * `warp_hook`'s LuaWarp detour — the moment ANY warp (menu or client) is requested. The
@@ -64,8 +133,13 @@ const REGION_SETTLE: Duration = Duration::from_millis(2500);
 /// longer. No panic path (a poisoned lock is skipped; `Instant::now` cannot fail): the detour
 /// caller sits inside the game's own warp call frame and must never unwind across it.
 pub fn notify_transition() {
-    if let Ok(mut entered) = REGION_ENTERED.lock() {
-        *entered = Some(Instant::now());
+    let now = now_ms();
+    if let Ok(mut gate) = GATE.lock() {
+        gate.on_transition(now);
+    }
+    // Re-arm the one-shot release log so the NEXT release describes this transition.
+    if let Ok(mut logged) = RELEASE_LOGGED.lock() {
+        *logged = false;
     }
 }
 
@@ -116,12 +190,13 @@ pub fn tick() {
             return;
         }
     }
-    if !TICK
-        .fetch_add(1, Ordering::Relaxed)
-        .is_multiple_of(THROTTLE)
-    {
-        return;
-    }
+    // ORDERING IS THE FIX (2026-07-27). The throttle used to be checked HERE, before the region was
+    // read -- so the region was sampled only every 30 ticks (missing any flap shorter than that),
+    // the region-change branch RESTARTED the clock at the first throttled tick (discarding the
+    // arrival-edge arm from core.rs), and the settle expiry was likewise only noticed on a throttled
+    // tick. Three terms of pure latency on top of the 2500ms anyone actually chose. Now: observe
+    // every tick, and throttle only REPEAT sweeps.
+    let tick_no = TICK.fetch_add(1, Ordering::Relaxed);
     let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {
         return;
     };
@@ -134,18 +209,32 @@ pub fn tick() {
     let player_handle = player.field_ins_handle; // skip the player itself in the sweep
     let player_team = player.chr_ins.team_type; // hostiles (invader/NPC phantoms) carry a different team
 
-    // Native-crash guard: on a region change, note the entry time and SKIP this sweep; keep skipping
-    // until the region has settled (`REGION_SETTLE`). This keeps the ChrIns walk out of the mid-load
-    // window where enemies are still being constructed. (See LAST_REGION / REGION_ENTERED above.)
-    let prev_region = LAST_REGION.swap(region, Ordering::Relaxed);
-    if prev_region != region {
-        *REGION_ENTERED.lock().unwrap() = Some(Instant::now());
+    // Time-based backstop (er_logic::sweep_settle). Not the primary CTD defence any more -- that is
+    // `active_characters`'s chr_load_status filter -- but retained for the hazard a per-entry status
+    // byte cannot describe: a torn read of the entries ARRAY while the game rebuilds it.
+    let now = now_ms();
+    let (allowed, diag) = {
+        let Ok(mut gate) = GATE.lock() else {
+            return;
+        };
+        gate.on_region(region, now, &SETTLE); // EVERY tick, before any throttle
+        (gate.sweep_allowed(now, &SETTLE), gate.release_diag(now))
+    };
+    if !allowed {
         return;
     }
-    match *REGION_ENTERED.lock().unwrap() {
-        Some(entered) if entered.elapsed() < REGION_SETTLE => return,
-        _ => {}
+    // Repeat-sweep throttle, measured from the LAST SWEEP rather than a modulo phase, so the first
+    // allowed sweep after a transition runs on this tick instead of waiting up to 30 more frames.
+    {
+        let Ok(mut last) = LAST_SWEEP_TICK.lock() else {
+            return;
+        };
+        match *last {
+            Some(t) if tick_no.wrapping_sub(t) < THROTTLE => return,
+            _ => *last = Some(tick_no),
+        }
     }
+    SKIPPED_NOT_ACTIVE.store(0, Ordering::Relaxed);
 
     // Resolve the tier once, and capture the inputs that drove it so the emit below can EXPLAIN the
     // number instead of just printing it. (Before: the log showed only `-> speffect NNNN`, which
@@ -171,12 +260,12 @@ pub fn tick() {
 
     let mut scaled = 0u32;
     // Overworld enemies.
-    for chr in wcm.open_field_chr_set.base.characters() {
+    for chr in active_characters(&wcm.open_field_chr_set.base) {
         scaled += scale_one(chr, target, &player_handle);
     }
     // Legacy-dungeon / block chr sets.
     for slot in wcm.chr_sets.iter().flatten() {
-        for chr in slot.characters() {
+        for chr in active_characters(slot) {
             scaled += scale_one(chr, target, &player_handle);
         }
     }
@@ -195,14 +284,14 @@ pub fn tick() {
     // population CHANGES. If an invader ever appears in a set the scaling sweep below doesn't cover,
     // this names it outright (set + chr_type) so one co-op session settles where invaders live.
     let mut census: Vec<(&'static str, i32, i32, i32)> = Vec::new();
-    for p in wcm.player_chr_set.characters() {
+    for p in active_characters(&wcm.player_chr_set) {
         let c = &p.chr_ins;
         census.push(("player", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
-    for c in wcm.ghost_chr_set.characters() {
+    for c in active_characters(&wcm.ghost_chr_set) {
         census.push(("ghost", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
-    for c in wcm.summon_buddy_chr_set.characters() {
+    for c in active_characters(&wcm.summon_buddy_chr_set) {
         census.push(("summon", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
     {
@@ -222,12 +311,38 @@ pub fn tick() {
     // chr_type, so the set an invader lands in no longer matters and no friendly is ever touched.
     // (ghost_chr_set is cosmetic bloodstain/message/replay playback -- non-interactive, left alone;
     // the census still watches it in case that assumption is ever wrong.)
-    for p in wcm.player_chr_set.characters() {
+    for p in active_characters(&wcm.player_chr_set) {
         scaled += scale_hostile_phantom(&mut p.chr_ins, target, &player_handle);
     }
-    for c in wcm.summon_buddy_chr_set.characters() {
+    for c in active_characters(&wcm.summon_buddy_chr_set) {
         scaled += scale_hostile_phantom(c, target, &player_handle);
     }
+
+    // ---- SETTLE RELEASE TELEMETRY (one line per transition) ------------------------------------
+    // The old guard returned early on BOTH skip paths with no log, ever -- so a window that stacked
+    // to ~8s in play was invisible to everything except a human noticing enemies felt wrong. This is
+    // the "tolerance requires telemetry" line, and it is what turns `settle_ms` from a feel-based
+    // constant into a measured one:
+    //   +Xms       how long the player actually spent unscaled after the load
+    //   flaps N    how many transient play_region values fired (each cost a full 2500ms before)
+    //   inactive K entries skipped as chr_load_status != Active. K > 0 HERE, after the settle
+    //              window expired, is direct evidence the timer alone never sufficed -- the exact
+    //              claim the old design could not check.
+    if let Ok(mut logged) = RELEASE_LOGGED.lock()
+        && !*logged
+    {
+        *logged = true;
+        let inactive = SKIPPED_NOT_ACTIVE.load(Ordering::Relaxed);
+        log::info!(
+            "enemy-scaling: settle release after {}ms (region stable {}ms, flaps {}); \
+             swept {scaled}, skipped {inactive} not-Active entr{}",
+            diag.since_transition_ms,
+            diag.since_region_change_ms,
+            diag.flaps,
+            if inactive == 1 { "y" } else { "ies" },
+        );
+    }
+
     if scaled > 0 {
         let RegionScaleDbg {
             tier,
