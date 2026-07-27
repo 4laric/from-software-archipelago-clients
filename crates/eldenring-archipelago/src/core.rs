@@ -617,6 +617,29 @@ impl shared::Core for Core {
                     }
                 }
 
+                // FEATURE HANDSHAKE (2026-07-27). The contract-hash check above folds in CONTRACT
+                // only -- NOT OPTIONS_SUBKEYS -- so an apworld can add a client-consumed OPTION
+                // without moving the hash, and this binary would report "VERSION: OK" while being
+                // structurally unable to see the new key. A player who set that option would get
+                // silence: the setting evaporates and the game looks like the feature never existed.
+                //
+                // So a seed declares the features it ACTUALLY depends on, and we refuse the ones we
+                // do not have rather than ignoring them. Deliberately LOUDER than the contract
+                // validator below (which warns and boots): a shape mismatch degrades one key, while
+                // an unknown feature tag means a setting the player chose cannot happen at all.
+                // Seeds that leave those options at their defaults declare nothing and are unaffected.
+                let missing = er_logic::client_features::unsupported(
+                    &er_logic::client_features::required_from_slot_data(sd));
+                if !missing.is_empty() {
+                    let msg = er_logic::client_features::refusal_message(&missing);
+                    log::error!("CLIENT TOO OLD: {msg}");
+                    // On SCREEN as well as in the log: a player who never opens the log is exactly
+                    // the one who would otherwise conclude the option does nothing.
+                    let now = self.toast_clock.elapsed().as_millis() as u64;
+                    self.toasts.push(
+                        format!("Client too old for this seed: {}", missing.join(", ")), now);
+                }
+
                 // Two-sided contract validation: warn (not reject) on any slot_data mismatch
                 // so a partially-compatible seed still boots but every problem is visible.
                 let contract_problems = crate::contract_gen::validate(sd);

@@ -38,6 +38,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "regionSphereTargets", shape: Shape::ScalarIntMap, required: false, greenfield: true },
     ContractKey { name: "regionSphereTargetRanges", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "dlcScadutreeFloorRanges", shape: Shape::TripleList, required: false, greenfield: true },
+    ContractKey { name: "requiresClientFeatures", shape: Shape::StrList, required: false, greenfield: true },
     ContractKey { name: "dlcRegionBuckets", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "completionScalingBasis", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "areaLockFlags", shape: Shape::TripleList, required: false, greenfield: true },
@@ -114,6 +115,7 @@ pub const OPTIONS_SUBKEYS: &[ContractKey] = &[
     ContractKey { name: "no_weapon_requirements", shape: Shape::BoolOrInt, required: true, greenfield: true },
     ContractKey { name: "completion_scaling", shape: Shape::IntOrBool, required: true, greenfield: true },
     ContractKey { name: "completion_scaling_floor", shape: Shape::Number, required: true, greenfield: true },
+    ContractKey { name: "completion_scaling_ceiling", shape: Shape::Number, required: false, greenfield: true },
     ContractKey { name: "global_scadutree_blessing", shape: Shape::Int, required: true, greenfield: true },
     ContractKey { name: "auto_upgrade", shape: Shape::Int, required: true, greenfield: true },
     ContractKey { name: "flatten_regular_upgrades", shape: Shape::Int, required: true, greenfield: true },
@@ -193,6 +195,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "47c95215";
+pub const CONTRACT_HASH: &str = "8550ab05";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.2.0";
 

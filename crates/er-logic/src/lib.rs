@@ -18,6 +18,7 @@ pub mod boss_key_replay;
 pub mod capital;
 pub mod capital_replay;
 pub mod check_neutralise;
+pub mod client_features;
 pub mod config_reload;
 pub mod config_reload_replay;
 pub mod deathlink;

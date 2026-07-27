@@ -245,18 +245,41 @@ pub struct ScalingConfig {
     /// seed. It only decorated a log line, so nothing failed. It is exactly the wrong thing to key
     /// the DLC enemy ladder off. Empty = no DLC region in play.
     pub dlc_buckets: Vec<i32>,
+    /// Maximum tier -- from `completion_scaling_ceiling`; nothing scales above this. `NUM_TIERS - 1`
+    /// (the default) means uncapped. The MIRROR of `floor_tier`: gen sends an HP multiplier and this
+    /// is the last rung no stronger than it.
+    ///
+    /// ⚠️ A client that predates this key simply never reads it and scales uncapped. That is why a
+    /// seed which actually SETS a ceiling also lists `scaling_ceiling` in `requiresClientFeatures`
+    /// (see `er_logic::client_features`) -- the connect check refuses rather than quietly ignoring a
+    /// difficulty setting the player chose.
+    pub ceiling_tier: usize,
 }
 
 /// Map a raw target to a tier index in `[floor_tier, NUM_TIERS)`. `max_target <= 0` → the floor tier.
 /// Monotonic in `target`.
-pub fn tier_for_target(target: i32, max_target: i32, floor_tier: usize) -> usize {
-    let floor = floor_tier.min(NUM_TIERS - 1);
+pub fn tier_for_target(
+    target: i32,
+    max_target: i32,
+    floor_tier: usize,
+    ceiling_tier: usize,
+) -> usize {
+    // A ceiling below the floor would make `clamp` PANIC (min > max). Gen rejects that pair with an
+    // OptionError, but this is a PURE function reachable from hand-rolled or foreign slot_data, so it
+    // resolves the contradiction rather than trusting its producer.
+    //
+    // THE CEILING WINS. When two difficulty bounds contradict each other the safe direction is the
+    // gentler one: too-weak enemies are a disappointing seed, too-strong ones can be an unplayable
+    // one. (This comment first claimed the floor won, which was neither what the code did nor the
+    // better answer -- caught by the test below, which is why it exists.)
+    let ceiling = ceiling_tier.min(NUM_TIERS - 1);
+    let floor = floor_tier.min(ceiling);
     if max_target <= 0 {
         return floor;
     }
     let frac = (target.max(0) as f32 / max_target as f32).clamp(0.0, 1.0);
     let tier = (frac * (NUM_TIERS - 1) as f32).round() as usize;
-    tier.clamp(floor, NUM_TIERS - 1)
+    tier.clamp(floor, ceiling)
 }
 
 /// Region → tier. A region absent from `region_targets` falls back to the floor tier (unknown = don't
@@ -264,7 +287,7 @@ pub fn tier_for_target(target: i32, max_target: i32, floor_tier: usize) -> usize
 /// (`DLC_SCALING_ID_RANGE`), DLC enemies scale by sphere depth exactly like base game.
 pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> usize {
     if let Some(&target) = cfg.region_targets.get(&region) {
-        tier_for_target(target, cfg.max_target, cfg.floor_tier)
+        tier_for_target(target, cfg.max_target, cfg.floor_tier, cfg.ceiling_tier)
     } else if let Some(&(_, _, target)) =
         // SCALING_WIRE: range fallback -- `region` is the play_region/100 sub id; the apworld
         // emits [lo, hi, target] buckets in the same space (a few dozen; linear scan is fine).
@@ -273,7 +296,7 @@ pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> usize {
             .iter()
             .find(|&&(lo, hi, _)| (lo..=hi).contains(&region))
     {
-        tier_for_target(target, cfg.max_target, cfg.floor_tier)
+        tier_for_target(target, cfg.max_target, cfg.floor_tier, cfg.ceiling_tier)
     } else {
         cfg.floor_tier.min(NUM_TIERS - 1)
     }
@@ -338,6 +361,17 @@ pub fn tier_rates(tier: usize) -> ScalingTier {
 
 /// Lowest tier whose HP rate is ≥ `floor_mult` — converts a `completion_scaling_floor` multiplier
 /// into a floor tier index. Below the ladder → tier 0; above it → the top tier.
+/// Highest tier whose HP rate is <= `ceil_mult` -- the MIRROR of `floor_tier_from_multiplier`, and
+/// deliberately a separate function. A floor is "the first rung at least this strong"; a ceiling is
+/// "the last rung no stronger than this". Reusing the floor search for both would cap one rung high.
+/// Below the ladder -> tier 0 (the weakest rung is the least we can do).
+pub fn ceiling_tier_from_multiplier(ceil_mult: f32) -> usize {
+    SCALING_TIERS
+        .iter()
+        .rposition(|t| t.hp <= ceil_mult)
+        .unwrap_or(0)
+}
+
 pub fn floor_tier_from_multiplier(floor_mult: f32) -> usize {
     SCALING_TIERS
         .iter()
@@ -402,6 +436,14 @@ pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0) as f32;
     let floor_tier = floor_tier_from_multiplier(floor_mult);
+    // Absent (older apworld) -> uncapped, which is what every seed did before this key existed.
+    let ceiling_tier = match sd
+        .pointer("/options/completion_scaling_ceiling")
+        .and_then(|v| v.as_f64())
+    {
+        Some(m) => ceiling_tier_from_multiplier(m as f32),
+        None => NUM_TIERS - 1,
+    };
     Some(ScalingConfig {
         basis,
         floor_tier,
@@ -410,6 +452,7 @@ pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
         max_target,
         dlc_blessing_floors,
         dlc_buckets,
+        ceiling_tier,
     })
 }
 
@@ -447,6 +490,7 @@ mod tests {
             max_target,
             dlc_blessing_floors: vec![],
             dlc_buckets: vec![],
+            ceiling_tier: NUM_TIERS - 1,
         }
     }
 
@@ -624,26 +668,26 @@ mod tests {
 
     #[test]
     fn target_zero_is_floor_tier() {
-        assert_eq!(tier_for_target(0, 100, 0), 0);
-        assert_eq!(tier_for_target(0, 100, 2), 2); // floor clamps up
+        assert_eq!(tier_for_target(0, 100, 0, NUM_TIERS - 1), 0);
+        assert_eq!(tier_for_target(0, 100, 2, NUM_TIERS - 1), 2); // floor clamps up
     }
 
     #[test]
     fn target_max_is_top_tier() {
-        assert_eq!(tier_for_target(100, 100, 0), NUM_TIERS - 1);
+        assert_eq!(tier_for_target(100, 100, 0, NUM_TIERS - 1), NUM_TIERS - 1);
     }
 
     #[test]
     fn target_midpoint_rounds_to_middle_tier() {
         let mid = ((NUM_TIERS - 1) as f32 / 2.0).round() as usize;
-        assert_eq!(tier_for_target(50, 100, 0), mid);
+        assert_eq!(tier_for_target(50, 100, 0, NUM_TIERS - 1), mid);
     }
 
     #[test]
     fn tier_is_monotonic_in_target() {
         let mut last = 0;
         for t in (0..=100).step_by(5) {
-            let tier = tier_for_target(t, 100, 0);
+            let tier = tier_for_target(t, 100, 0, NUM_TIERS - 1);
             assert!(tier >= last, "tier decreased at target {t}");
             last = tier;
         }
@@ -651,20 +695,20 @@ mod tests {
 
     #[test]
     fn floor_clamps_low_targets_but_not_high() {
-        assert_eq!(tier_for_target(0, 100, 3), 3);
-        assert_eq!(tier_for_target(100, 100, 3), NUM_TIERS - 1);
+        assert_eq!(tier_for_target(0, 100, 3, NUM_TIERS - 1), 3);
+        assert_eq!(tier_for_target(100, 100, 3, NUM_TIERS - 1), NUM_TIERS - 1);
     }
 
     #[test]
     fn no_scaling_info_returns_floor() {
-        assert_eq!(tier_for_target(999, 0, 0), 0);
-        assert_eq!(tier_for_target(999, -5, 1), 1);
+        assert_eq!(tier_for_target(999, 0, 0, NUM_TIERS - 1), 0);
+        assert_eq!(tier_for_target(999, -5, 1, NUM_TIERS - 1), 1);
     }
 
     #[test]
     fn out_of_range_target_clamps() {
-        assert_eq!(tier_for_target(1000, 100, 0), NUM_TIERS - 1);
-        assert_eq!(tier_for_target(-50, 100, 0), 0);
+        assert_eq!(tier_for_target(1000, 100, 0, NUM_TIERS - 1), NUM_TIERS - 1);
+        assert_eq!(tier_for_target(-50, 100, 0, NUM_TIERS - 1), 0);
     }
 
     // --- tier_for_region ---
@@ -692,6 +736,107 @@ mod tests {
         assert_eq!(speffect_id_for_tier(0), 7010);
         assert_eq!(speffect_id_for_tier(NUM_TIERS - 1), top);
         assert_eq!(speffect_id_for_tier(999), top); // clamp
+    }
+
+    #[test]
+    fn ceiling_is_the_mirror_of_the_floor_not_a_reuse_of_it() {
+        // A floor is "first rung at least this strong"; a ceiling is "last rung no stronger than
+        // this". Reusing the floor search for both would cap ONE RUNG HIGH, which is the kind of
+        // off-by-one nobody would ever notice in play.
+        let top = SCALING_TIERS[NUM_TIERS - 1];
+        assert_eq!(
+            ceiling_tier_from_multiplier(top.hp),
+            NUM_TIERS - 1,
+            "top rung = uncapped"
+        );
+        assert_eq!(
+            ceiling_tier_from_multiplier(1000.0),
+            NUM_TIERS - 1,
+            "above the ladder = uncapped"
+        );
+        assert_eq!(
+            ceiling_tier_from_multiplier(0.0),
+            0,
+            "below the ladder = weakest rung"
+        );
+        for (i, t) in SCALING_TIERS.iter().enumerate() {
+            assert_eq!(
+                ceiling_tier_from_multiplier(t.hp),
+                i,
+                "rung {i} must round-trip"
+            );
+            // strictly between rung i and i+1 -> still i (no stronger than the value)
+            if i + 1 < NUM_TIERS {
+                let mid = (t.hp + SCALING_TIERS[i + 1].hp) / 2.0;
+                assert_eq!(
+                    ceiling_tier_from_multiplier(mid),
+                    i,
+                    "midpoint above rung {i}"
+                );
+                assert_eq!(
+                    floor_tier_from_multiplier(mid),
+                    i + 1,
+                    "the FLOOR rounds the other way"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_ceiling_caps_the_deepest_region_and_leaves_the_rest_alone() {
+        let cap = 5;
+        // deepest region (frac 1.0) would be NUM_TIERS-1; the cap holds it at `cap`.
+        assert_eq!(tier_for_target(100, 100, 0, cap), cap);
+        // a shallow region is untouched by a ceiling above it.
+        assert_eq!(tier_for_target(0, 100, 0, cap), 0);
+        // uncapped is the previous behaviour, exactly.
+        assert_eq!(tier_for_target(100, 100, 0, NUM_TIERS - 1), NUM_TIERS - 1);
+    }
+
+    #[test]
+    fn an_inverted_floor_and_ceiling_resolves_instead_of_panicking() {
+        // gen rejects this pair with an OptionError, but tier_for_target is PURE and reachable from
+        // hand-rolled or foreign slot_data -- and `clamp` PANICS when min > max. The CEILING wins:
+        // when two difficulty bounds contradict, the gentler one is the safe resolution.
+        assert_eq!(tier_for_target(50, 100, 9, 3), 3);
+        assert_eq!(tier_for_target(0, 0, 9, 3), 3, "the max_target==0 path too");
+    }
+
+    #[test]
+    fn an_apworld_that_sends_no_ceiling_is_uncapped() {
+        // Every seed rolled before this key existed must behave exactly as it did.
+        let sd = serde_json::json!({
+            "completion_scaling": 1,
+            "completionScalingBasis": 1,
+            "regionSphereTargetRanges": [[100, 100, 0], [200, 200, 10000]],
+            "options": { "completion_scaling": 1, "completion_scaling_floor": 0.0 },
+        });
+        let cfg = parse_scaling_config(&sd).expect("should arm");
+        assert_eq!(cfg.ceiling_tier, NUM_TIERS - 1);
+        assert_eq!(tier_for_region(&cfg, 200), NUM_TIERS - 1);
+    }
+
+    #[test]
+    fn a_ceiling_in_slot_data_is_parsed_and_applied() {
+        let sd = serde_json::json!({
+            "completion_scaling": 1,
+            "completionScalingBasis": 1,
+            "regionSphereTargetRanges": [[100, 100, 0], [200, 200, 10000]],
+            "options": { "completion_scaling": 1, "completion_scaling_floor": 0.0,
+                         "completion_scaling_ceiling": SCALING_TIERS[5].hp },
+        });
+        let cfg = parse_scaling_config(&sd).expect("should arm");
+        assert_eq!(cfg.ceiling_tier, 5);
+        assert_eq!(
+            tier_for_region(&cfg, 200),
+            5,
+            "the deepest region is capped"
+        );
+        assert_eq!(
+            tier_for_region(&cfg, 100),
+            0,
+            "the shallowest is unaffected"
+        );
     }
 
     #[test]
