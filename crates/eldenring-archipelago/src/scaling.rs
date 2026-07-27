@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
-    NUM_TIERS, ScalingConfig, blessing_floor_for_region, is_scaling_speffect,
-    raw_target_for_region, speffect_id_for_tier, tier_for_region, tier_rates,
+    NUM_TIERS, ScalingConfig, is_dlc_bucket, is_scaling_speffect, raw_target_for_region,
+    speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -251,7 +251,7 @@ pub fn tick() {
             tier,
             raw_target: raw_target_for_region(cfg, region),
             max_target: cfg.max_target,
-            dlc_region: blessing_floor_for_region(&cfg.dlc_blessing_floors, region).is_some(),
+            dlc_region: is_dlc_bucket(cfg, region),
             hp: rates.hp,
             attack: rates.attack,
         };

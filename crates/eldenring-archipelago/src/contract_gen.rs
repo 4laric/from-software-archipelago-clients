@@ -38,6 +38,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "regionSphereTargets", shape: Shape::ScalarIntMap, required: false, greenfield: true },
     ContractKey { name: "regionSphereTargetRanges", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "dlcScadutreeFloorRanges", shape: Shape::TripleList, required: false, greenfield: true },
+    ContractKey { name: "dlcRegionBuckets", shape: Shape::IntList, required: false, greenfield: true },
     ContractKey { name: "completionScalingBasis", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "areaLockFlags", shape: Shape::TripleList, required: false, greenfield: true },
     ContractKey { name: "lockRevealFlags", shape: Shape::ListvalIntMap, required: false, greenfield: true },
@@ -192,6 +193,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "b3739fdf";
+pub const CONTRACT_HASH: &str = "47c95215";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.2.0";
 

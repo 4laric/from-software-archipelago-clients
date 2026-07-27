@@ -149,9 +149,18 @@ pub struct ScalingConfig {
     pub max_target: i32,
     /// `dlcScadutreeFloorRanges` (mode 2): `(lo, hi, floor)` in play_region/100 sub-id space -> the
     /// Scadutree-blessing FLOOR level for that DLC bucket. Consumed by upgrades.rs (the blessing
-    /// floor); also used purely as a "is this a DLC region" flag for the enemy-scaling diagnostic log.
-    /// (No longer gates enemy tiers -- the DLC tier cap was removed.) Empty = no DLC / mode != 2.
+    /// floor). Empty = no DLC / mode != 2 -- which is the DEFAULT, so see `dlc_buckets` before
+    /// reaching for this.
     pub dlc_blessing_floors: Vec<(i32, i32, i32)>,
+    /// `dlcRegionBuckets`: the play_region/100 sub-ids of the seed's KEPT DLC regions, sorted.
+    ///
+    /// 🛑 THIS is the DLC-region test. `dlc_blessing_floors` was used for it until 2026-07-27, which
+    /// was wrong in a way that could not be seen: those floors are emitted only when
+    /// `global_scadutree_blessing == 2`, and the shipped default has been `off` since 2026-07-18 --
+    /// so "is this a DLC region?" answered `false` for every bucket in the game on every default
+    /// seed. It only decorated a log line, so nothing failed. It is exactly the wrong thing to key
+    /// the DLC enemy ladder off. Empty = no DLC region in play.
+    pub dlc_buckets: Vec<i32>,
 }
 
 /// Map a raw target to a tier index in `[floor_tier, NUM_TIERS)`. `max_target <= 0` → the floor tier.
@@ -186,9 +195,32 @@ pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> usize {
     }
 }
 
+/// `[i32, ...]` slot_data array -> `Vec<i32>`, non-integers skipped. Tolerant like the rest of the
+/// slot_data parses.
+pub fn parse_int_list(v: Option<&Value>) -> Vec<i32> {
+    v.and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_i64().map(|n| n as i32))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Is this play_region/100 bucket part of a kept DLC region? Pure.
+///
+/// The apworld emits `dlcRegionBuckets` sorted, but this does not rely on that -- a membership test
+/// that silently depends on ordering is the kind of assumption that rots. A few dozen entries; a
+/// linear scan is not the bottleneck.
+pub fn is_dlc_bucket(cfg: &ScalingConfig, region: i32) -> bool {
+    cfg.dlc_buckets.contains(&region)
+}
+
 /// The Scadutree-blessing FLOOR level for a play_region/100 `region` bucket, or `None` if the bucket
-/// isn't in the DLC floor wire (unknown = no floor). Pure. Used by upgrades.rs (write
-/// max(fragment level, floor)) and by the client's enemy-scaling log as a DLC-region flag.
+/// isn't in the DLC floor wire (unknown = no floor). Pure. Used by upgrades.rs to write
+/// max(fragment level, floor).
+///
+/// 🛑 NOT a DLC-region test -- use `is_dlc_bucket`. See `ScalingConfig::dlc_buckets`.
 pub fn blessing_floor_for_region(ranges: &[(i32, i32, i32)], region: i32) -> Option<i32> {
     ranges
         .iter()
@@ -261,6 +293,9 @@ pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
     // DLC Scadutree-blessing floors (mode 2). Independent of completion_scaling, but folded into the
     // same config so the enemy-tier CAP has the DLC-bucket set. upgrades.rs reads these floors too.
     let dlc_blessing_floors = parse_triple_ranges(sd.get("dlcScadutreeFloorRanges"));
+    // The real DLC-region membership set (see ScalingConfig::dlc_buckets). Independent of the
+    // blessing option, unlike the floors above.
+    let dlc_buckets = parse_int_list(sd.get("dlcRegionBuckets"));
     if region_targets.is_empty() && region_ranges.is_empty() {
         return None; // H4: refuse to arm — see doc above.
     }
@@ -290,6 +325,7 @@ pub fn parse_scaling_config(sd: &Value) -> Option<ScalingConfig> {
         region_ranges,
         max_target,
         dlc_blessing_floors,
+        dlc_buckets,
     })
 }
 
@@ -326,7 +362,44 @@ mod tests {
             region_ranges: vec![],
             max_target,
             dlc_blessing_floors: vec![],
+            dlc_buckets: vec![],
         }
+    }
+
+    #[test]
+    fn dlc_membership_comes_from_its_own_wire_not_the_blessing_floors() {
+        // THE BUG THIS PINS (2026-07-27). `is_dlc_bucket` used to be
+        // `blessing_floor_for_region(&cfg.dlc_blessing_floors, r).is_some()`. Those floors are
+        // emitted ONLY when global_scadutree_blessing == 2, and the shipped default has been `off`
+        // since 2026-07-18 -- so on every default seed the DLC test answered `false` for every
+        // bucket in the game, silently. It only decorated a log line, which is why it survived.
+        let mut c = cfg(&[(20010, 5000)], 0);
+        c.dlc_buckets = vec![20010, 21000, 22000];
+        assert!(is_dlc_bucket(&c, 20010));
+        assert!(is_dlc_bucket(&c, 22000));
+        assert!(!is_dlc_bucket(&c, 6800), "a base-game bucket is not DLC");
+
+        // ...and it must NOT depend on the blessing floors, in either direction.
+        assert!(
+            c.dlc_blessing_floors.is_empty(),
+            "this seed has no blessing floors (the DEFAULT), and DLC membership still resolves"
+        );
+        let mut blessing_only = cfg(&[(20010, 5000)], 0);
+        blessing_only.dlc_blessing_floors = vec![(20010, 20010, 15)];
+        assert!(
+            !is_dlc_bucket(&blessing_only, 20010),
+            "DLC membership must come from dlcRegionBuckets alone -- inferring it from a blessing \
+             floor is the bug, and a floor without the bucket wire is a foreign/old apworld"
+        );
+    }
+
+    #[test]
+    fn int_list_parse_is_tolerant_and_empty_means_absent() {
+        use serde_json::json;
+        assert_eq!(parse_int_list(Some(&json!([1, 2, 3]))), vec![1, 2, 3]);
+        assert_eq!(parse_int_list(Some(&json!([1, "x", 3]))), vec![1, 3]);
+        assert!(parse_int_list(None).is_empty());
+        assert!(parse_int_list(Some(&json!("not an array"))).is_empty());
     }
 
     #[test]
