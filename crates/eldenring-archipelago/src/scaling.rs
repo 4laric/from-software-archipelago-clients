@@ -35,17 +35,24 @@ static TICK: AtomicU32 = AtomicU32::new(0);
 const THROTTLE: u32 = 30;
 
 /// Transition/region bookkeeping for the time-based backstop (`er_logic::scaling_settle`, host-tested;
-/// see `active_characters` below for the PRIMARY crash defence and `SETTLE` for the policy).
+/// see `SETTLE` for the policy). This is the PRIMARY crash guard again -- see sweepable_characters.
 static GATE: Mutex<SweepGate> = Mutex::new(SweepGate::new());
 /// Process-relative clock for the gate (which is pure and takes `now_ms`).
 static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
 /// Ticks at the last sweep -- the repeat throttle. `None` = never swept, so the first allowed tick
 /// sweeps immediately instead of waiting for a modulo phase.
 static LAST_SWEEP_TICK: Mutex<Option<u32>> = Mutex::new(None);
-/// Entries skipped this sweep because `chr_load_status != Active` (see `active_characters`).
-/// Reported in the release log: a non-zero count AFTER the settle window is the proof that the old
-/// timer alone was never sufficient.
-static SKIPPED_NOT_ACTIVE: AtomicU32 = AtomicU32::new(0);
+/// Per-sweep tally of the `chr_load_status` of every entry we walked, indexed by `status_slot`.
+/// Diagnostic ONLY -- nothing filters on it. It exists because the last thing that DID filter on it
+/// rejected every enemy in the game, and no log at the time could say what the real states were.
+static STATUS_HIST: [AtomicU32; 6] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 /// One-shot release log per transition.
 static RELEASE_LOGGED: Mutex<bool> = Mutex::new(true);
 
@@ -57,25 +64,34 @@ fn now_ms() -> u64 {
     epoch.get_or_insert_with(Instant::now).elapsed().as_millis() as u64
 }
 
-/// Iterate a chr set's LOADED, FULLY-CONSTRUCTED characters.
+/// Iterate a chr set's characters, recording the `chr_load_status` distribution as it goes.
 ///
-/// 🛑 THIS IS THE CTD FIX. Upstream `ChrSet::characters()` (fromsoftware-rs
-/// `cs/world_chr_man.rs`) walks the entries array and yields every slot where `chr_ins.is_some()` --
-/// it never looks at `chr_load_status`. So during a map load it hands out `ChrIns` pointers in state
-/// `Initializing` (still being constructed) and `Unloading` (being torn down), and
-/// `scale_one`'s `apply_speffect` dereferences them. That is the Siofra / Eternal Cities native
-/// crash of 2026-07-09, and the 2.5 s `REGION_SETTLE` window was built to avoid it by WAITING --
-/// a timer standing in for a state byte the game had been publishing all along.
+/// 🛑 THIS FUNCTION FILTERED ON `chr_load_status == Active` FROM 2026-07-27 (98a2362) UNTIL THE SAME
+/// DAY, AND IT BROKE ENEMY SCALING COMPLETELY. Alaric's repro log, a rolled Mohgwyn start:
 ///
-/// `chr_load_status` lives on the ENTRY, in the flat `capacity`-sized array -- reading it
-/// dereferences no `ChrIns`, so it is safe to consult mid-stream, which is exactly what a timer
-/// could never be. Filtering on `Active` also covers the warp-OUT teardown edge that
-/// `notify_transition` was bolted onto in 2026-07-24.
+///     enemy-scaling: settle release after 2512ms (...); swept 1, skipped 242 not-Active entries
+///     enemy-scaling: settle release after 2508ms (...); swept 2, skipped 1219 not-Active entries
+///     enemy-scaling: region 12050 -> speffect 7010 (tier 0/19, sphere target 0/10000, 1.14x HP)
 ///
-/// The time-based gate is deliberately RETAINED as a backstop for the one hazard this cannot
-/// describe: a torn read of the entries ARRAY itself while the game rebuilds it. Two independent
-/// guards, because the crash class is still open elsewhere in this client.
-fn active_characters<T>(set: &ChrSet<T>) -> impl Iterator<Item = &mut T>
+/// The apworld was perfect -- Mohgwyn as the start region resolved to tier 0, exactly as designed.
+/// But ~99.5% of entries were rejected, and the phantom census shows the one entity actually being
+/// swept was `npc_id 8000` -- TORRENT. Not a single real enemy was ever scaled, so every one of them
+/// kept its VANILLA rung: a player starting in Mohgwyn met endgame-strength enemies and was
+/// oneshot. Reported by ShadowTL on Nexus for a Snowfield start, same mechanism.
+///
+/// WHAT WAS TRUE AND WHAT WAS NOT. True: `chr_load_status` exists on the ENTRY, so reading it
+/// dereferences no `ChrIns`, and upstream's `characters()` genuinely ignores it. NOT true, and never
+/// checked against a running game: that a loaded, fightable enemy is in state `Active`. It is not.
+/// I inferred the meaning of an enum variant from its NAME and shipped it flagged
+/// "UNVERIFIED IN-GAME", which is not the same as safe.
+///
+/// So this is back to upstream's behaviour -- every non-null entry -- which is what shipped for
+/// months before 98a2362 and never had this problem. The 2500 ms `SETTLE` window is untouched and is
+/// once again the primary guard, so the CTD exposure is exactly what it was, not worse.
+///
+/// The histogram is the part that stops this recurring: the next build's logs will say what states
+/// enemies are ACTUALLY in, and only then can this be narrowed on evidence instead of on a name.
+fn sweepable_characters<T>(set: &ChrSet<T>) -> impl Iterator<Item = &mut T>
 where
     T: Subclass<ChrIns> + 'static,
 {
@@ -83,30 +99,40 @@ where
     let end = unsafe { current.add(set.capacity as usize) };
     std::iter::from_fn(move || {
         while current != end {
-            // Read the ENTRY (flat array slot) -- never the ChrIns behind it -- before deciding.
+            // Read the ENTRY (flat array slot) -- never the ChrIns behind it.
             let entry = unsafe { current.as_ref() };
             let (chr_ins, status) = (entry.chr_ins, entry.chr_load_status);
             current = unsafe { current.add(1) };
             let Some(mut chr_ins) = chr_ins else {
                 continue;
             };
-            if status != ChrLoadStatus::Active {
-                // COUNT the skip; a filter with no tally is a lie (CONTRIBUTING rule 4).
-                SKIPPED_NOT_ACTIVE.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            // COUNT, do not filter. A tally with no filter is evidence; a filter with no tally was
+            // the bug (CONTRIBUTING rule 4 cuts both ways).
+            STATUS_HIST[status_slot(status)].fetch_add(1, Ordering::Relaxed);
             return Some(unsafe { chr_ins.as_mut() });
         }
         None
     })
 }
+
+/// Stable index for a `ChrLoadStatus` in `STATUS_HIST`. Exhaustive on purpose: if upstream adds a
+/// variant this stops compiling rather than silently bucketing it as something else.
+fn status_slot(s: ChrLoadStatus) -> usize {
+    match s {
+        ChrLoadStatus::Unloaded => 0,
+        ChrLoadStatus::Initializing => 1,
+        ChrLoadStatus::Active => 2,
+        ChrLoadStatus::NetworkInitializing => 3,
+        ChrLoadStatus::ReadyForActivation => 4,
+        ChrLoadStatus::Unloading => 5,
+    }
+}
 /// How long to let a freshly-loaded map settle before sweeping, and how long the region must have
 /// been stable. Pure policy; the gate that consumes it is `er_logic::scaling_settle` (host-tested).
 ///
-/// `settle_ms` is UNCHANGED at 2500 (4s -> 2500 was Alaric's 2026-07-19 tightening). It is not
-/// lowered here on purpose: it moves the native-crash boundary, `active_characters` above has just
-/// replaced its *mechanism* and is not yet confirmed in-game, and the crash class is still open (the
-/// "Beside the Rampart Gaol" warp). Lower it from the release-log data, not from a third guess.
+/// `settle_ms` is UNCHANGED at 2500, and after the 98a2362 revert it is once again the PRIMARY
+/// crash guard rather than a backstop -- `sweepable_characters` no longer filters. Do not lower it
+/// without live evidence: that is the mistake this file has already made once today.
 ///
 /// `stable_ms` is the NEW half. The old guard restarted the full 2500 on every observed region
 /// change, so the transient `play_region_id` values a warp produces compounded the real window to
@@ -210,8 +236,8 @@ pub fn tick() {
     let player_team = player.chr_ins.team_type; // hostiles (invader/NPC phantoms) carry a different team
 
     // Time-based backstop (er_logic::scaling_settle). Not the primary CTD defence any more -- that is
-    // `active_characters`'s chr_load_status filter -- but retained for the hazard a per-entry status
-    // byte cannot describe: a torn read of the entries ARRAY while the game rebuilds it.
+    // the PRIMARY crash guard once more: the chr_load_status filter that briefly replaced it
+    // rejected every enemy in the game and was reverted the same day (see sweepable_characters).
     let now = now_ms();
     let (allowed, diag) = {
         let Ok(mut gate) = GATE.lock() else {
@@ -234,7 +260,9 @@ pub fn tick() {
             _ => *last = Some(tick_no),
         }
     }
-    SKIPPED_NOT_ACTIVE.store(0, Ordering::Relaxed);
+    for h in &STATUS_HIST {
+        h.store(0, Ordering::Relaxed);
+    }
 
     // Resolve the tier once, and capture the inputs that drove it so the emit below can EXPLAIN the
     // number instead of just printing it. (Before: the log showed only `-> speffect NNNN`, which
@@ -260,12 +288,12 @@ pub fn tick() {
 
     let mut scaled = 0u32;
     // Overworld enemies.
-    for chr in active_characters(&wcm.open_field_chr_set.base) {
+    for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
         scaled += scale_one(chr, target, &player_handle);
     }
     // Legacy-dungeon / block chr sets.
     for slot in wcm.chr_sets.iter().flatten() {
-        for chr in active_characters(slot) {
+        for chr in sweepable_characters(slot) {
             scaled += scale_one(chr, target, &player_handle);
         }
     }
@@ -284,14 +312,14 @@ pub fn tick() {
     // population CHANGES. If an invader ever appears in a set the scaling sweep below doesn't cover,
     // this names it outright (set + chr_type) so one co-op session settles where invaders live.
     let mut census: Vec<(&'static str, i32, i32, i32)> = Vec::new();
-    for p in active_characters(&wcm.player_chr_set) {
+    for p in sweepable_characters(&wcm.player_chr_set) {
         let c = &p.chr_ins;
         census.push(("player", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
-    for c in active_characters(&wcm.ghost_chr_set) {
+    for c in sweepable_characters(&wcm.ghost_chr_set) {
         census.push(("ghost", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
-    for c in active_characters(&wcm.summon_buddy_chr_set) {
+    for c in sweepable_characters(&wcm.summon_buddy_chr_set) {
         census.push(("summon", c.npc_id, c.chr_type as i32, c.team_type as i32));
     }
     {
@@ -311,10 +339,10 @@ pub fn tick() {
     // chr_type, so the set an invader lands in no longer matters and no friendly is ever touched.
     // (ghost_chr_set is cosmetic bloodstain/message/replay playback -- non-interactive, left alone;
     // the census still watches it in case that assumption is ever wrong.)
-    for p in active_characters(&wcm.player_chr_set) {
+    for p in sweepable_characters(&wcm.player_chr_set) {
         scaled += scale_hostile_phantom(&mut p.chr_ins, target, &player_handle);
     }
-    for c in active_characters(&wcm.summon_buddy_chr_set) {
+    for c in sweepable_characters(&wcm.summon_buddy_chr_set) {
         scaled += scale_hostile_phantom(c, target, &player_handle);
     }
 
@@ -332,14 +360,23 @@ pub fn tick() {
         && !*logged
     {
         *logged = true;
-        let inactive = SKIPPED_NOT_ACTIVE.load(Ordering::Relaxed);
+        let hist: Vec<u32> = STATUS_HIST
+            .iter()
+            .map(|h| h.load(Ordering::Relaxed))
+            .collect();
         log::info!(
-            "enemy-scaling: settle release after {}ms (region stable {}ms, flaps {}); \
-             swept {scaled}, skipped {inactive} not-Active entr{}",
+            "enemy-scaling: settle release after {}ms (region stable {}ms, flaps {}); swept \
+             {scaled}; chr_load_status seen unloaded={} init={} active={} netinit={} ready={} \
+             unloading={}",
             diag.since_transition_ms,
             diag.since_region_change_ms,
             diag.flaps,
-            if inactive == 1 { "y" } else { "ies" },
+            hist[0],
+            hist[1],
+            hist[2],
+            hist[3],
+            hist[4],
+            hist[5],
         );
     }
 
