@@ -3,11 +3,34 @@
 //! Maps a region's sphere target to a scaling TIER, and a tier to the vanilla `SpEffectParam` row the
 //! client applies to an enemy (`ChrIns::apply_speffect`). Host-tested, no game.
 //!
-//! The ladder is the game's OWN progressive enemy-scaling SpEffects (`7010..7200`, from the offline
-//! `SpEffectParam.csv` dump): all visually silent (`vfxId/stateInfo/iconId = -1/0/-1`) and leave rune
-//! reward unchanged (`haveSoulRate = 1`). We use the lower-to-mid subset `7010..7100` (1.14x..3.70x HP)
-//! — the full ladder tops out at ~7.4x HP (NG+-cycle steepness), too much for sphere depth; extend
-//! toward `7200` here for a harsher curve. (`7400..7680` is a DESCENDING co-op/rune set — not usable.)
+//! The ladder is the game's OWN progressive enemy-scaling SpEffects: all visually silent
+//! (`vfxId/stateInfo/iconId = -1/0/-1`), `spCategory 0`, and rune-neutral (`haveSoulRate = 1`).
+//!
+//! # `7010..7200` — the FULL run (extended 2026-07-27)
+//!
+//! This used to be the subset `7010..7100` (1.14x..3.70x HP), with a comment saying the full ladder
+//! "tops out at ~7.4x HP ... extend toward `7200` here for a harsher curve." That was right, and
+//! there was nothing to check it against until `SpEffectParam.csv` joined `gen_inputs.db`. Now
+//! DERIVED from the param: 20 rungs, **1.141x .. 7.422x HP**, strictly ascending, every row's
+//! `spCategory`/`haveSoulRate` asserted at generation time. The first ten rungs' HP are byte-identical
+//! to the values that were hand-transcribed here, so the old transcription was correct; `attack` and
+//! `defense` now carry the param's full precision (both are display-only — `speffect_id` is what gets
+//! applied). Doubling the top rung is a deliberate balance change: the DEEPEST region in a seed now
+//! reaches 7.42x rather than 3.70x, and mid-run tiers rise with it.
+//!
+//! `defense` comes from `physicsDiffenceRate` — FromSoft's spelling, which is why a search for
+//! "defence"/"defense" in the param finds nothing.
+//!
+//! # What is NOT in the ladder, and why
+//!
+//! * `7210..7280` — a separate ascending sub-run (5.3x..5.8x). Different purpose; not sphere depth.
+//! * `7400..7680` — DESCENDING (3.43x down to 1.0x): the co-op/rune set. Not usable as difficulty.
+//! * `7800..7902` — `spCategory 140`, a different stacking class entirely.
+//! * `20007000..20007150` — the DLC block, and the literal CONTINUATION of this one: `7170` is
+//!   `7.047` and `20007000` is `7.046875`, the same rung. It runs on to **16.64x**, but its `attack`
+//!   is nearly flat (3.747..3.85 across the whole block) while HP does all the work, so it is a
+//!   different SHAPE, not just a steeper version. Using it would also need a live check that
+//!   base-game enemies accept a DLC-block speffect at all. Left alone for now.
 
 use std::collections::HashMap;
 
@@ -31,67 +54,128 @@ pub struct ScalingTier {
     pub defense: f32,
 }
 
-/// The tier ladder — vanilla `7010..7100`, ascending. Index 0 = shallowest sphere, last = deepest.
+/// The tier ladder — vanilla `7010..7200`, ascending, DERIVED from SpEffectParam (see module doc).
+/// Index 0 = shallowest sphere, last = deepest. 1.141x .. 7.422x HP.
 pub const SCALING_TIERS: &[ScalingTier] = &[
     ScalingTier {
         speffect_id: 7010,
         hp: 1.141,
-        attack: 1.097,
+        attack: 1.096703,
         defense: 1.013,
     },
     ScalingTier {
         speffect_id: 7020,
         hp: 1.281,
-        attack: 1.202,
+        attack: 1.202198,
         defense: 1.026,
     },
     ScalingTier {
         speffect_id: 7030,
         hp: 1.656,
-        attack: 1.495,
+        attack: 1.494506,
         defense: 1.039,
     },
     ScalingTier {
         speffect_id: 7040,
         hp: 1.813,
-        attack: 1.495,
+        attack: 1.494506,
         defense: 1.053,
     },
     ScalingTier {
         speffect_id: 7050,
         hp: 1.953,
-        attack: 1.690,
+        attack: 1.69011,
         defense: 1.066,
     },
     ScalingTier {
         speffect_id: 7060,
         hp: 2.266,
-        attack: 1.758,
+        attack: 1.758242,
         defense: 1.079,
     },
     ScalingTier {
         speffect_id: 7070,
         hp: 2.406,
-        attack: 1.831,
+        attack: 1.830769,
         defense: 1.093,
     },
     ScalingTier {
         speffect_id: 7080,
         hp: 2.688,
-        attack: 2.000,
+        attack: 2.0,
         defense: 1.106,
     },
     ScalingTier {
         speffect_id: 7090,
-        hp: 3.250,
-        attack: 2.279,
+        hp: 3.25,
+        attack: 2.279121,
         defense: 1.119,
     },
     ScalingTier {
         speffect_id: 7100,
         hp: 3.703,
-        attack: 2.473,
+        attack: 2.472527,
         defense: 1.133,
+    },
+    ScalingTier {
+        speffect_id: 7110,
+        hp: 4.125,
+        attack: 2.672528,
+        defense: 1.146,
+    },
+    ScalingTier {
+        speffect_id: 7120,
+        hp: 4.844,
+        attack: 3.243956,
+        defense: 1.159,
+    },
+    ScalingTier {
+        speffect_id: 7130,
+        hp: 5.484,
+        attack: 3.243956,
+        defense: 1.172,
+    },
+    ScalingTier {
+        speffect_id: 7140,
+        hp: 6.563,
+        attack: 3.52967,
+        defense: 1.186,
+    },
+    ScalingTier {
+        speffect_id: 7150,
+        hp: 6.688,
+        attack: 3.584615,
+        defense: 1.2,
+    },
+    ScalingTier {
+        speffect_id: 7160,
+        hp: 6.875,
+        attack: 3.63956,
+        defense: 1.2,
+    },
+    ScalingTier {
+        speffect_id: 7170,
+        hp: 7.047,
+        attack: 3.745055,
+        defense: 1.217,
+    },
+    ScalingTier {
+        speffect_id: 7180,
+        hp: 7.203,
+        attack: 3.795605,
+        defense: 1.22,
+    },
+    ScalingTier {
+        speffect_id: 7190,
+        hp: 7.328,
+        attack: 3.795605,
+        defense: 1.23,
+    },
+    ScalingTier {
+        speffect_id: 7200,
+        hp: 7.422,
+        attack: 3.795605,
+        defense: 1.232,
     },
 ];
 
@@ -454,8 +538,35 @@ mod tests {
 
     #[test]
     fn ids_are_the_vanilla_ladder() {
+        // DERIVED from SpEffectParam (2026-07-27), so pin the SHAPE, not a length that will move
+        // again the next time the run is extended: contiguous 7010..=NNN in steps of 10, strictly
+        // ascending HP, every id inside the clear range so our own tier is stripped on re-scale.
         assert_eq!(SCALING_TIERS[0].speffect_id, 7010);
-        assert_eq!(SCALING_TIERS[NUM_TIERS - 1].speffect_id, 7100);
+        assert_eq!(
+            SCALING_TIERS[NUM_TIERS - 1].speffect_id,
+            7010 + 10 * (NUM_TIERS as i32 - 1)
+        );
+        for (i, t) in SCALING_TIERS.iter().enumerate() {
+            assert_eq!(
+                t.speffect_id,
+                7010 + 10 * i as i32,
+                "ladder is not contiguous at {i}"
+            );
+            assert!(SCALING_ID_RANGE.contains(&t.speffect_id));
+        }
+        assert!(
+            SCALING_TIERS.windows(2).all(|w| w[0].hp < w[1].hp),
+            "ladder HP must be strictly ascending -- floor_tier_from_multiplier's search depends on it"
+        );
+    }
+
+    #[test]
+    fn the_top_rung_is_the_full_run_not_the_old_subset() {
+        // The ladder was 7010..7100 (3.703x) until 2026-07-27; extending it to 7200 DOUBLED the
+        // deepest region's difficulty, which is a balance change and should not drift back silently.
+        let top = SCALING_TIERS[NUM_TIERS - 1];
+        assert_eq!(top.speffect_id, 7200);
+        assert!((top.hp - 7.422).abs() < 1e-4, "top rung HP is {}", top.hp);
     }
 
     // --- SCALING_WIRE: range-keyed targets (play_region/100 buckets) ---
@@ -524,8 +635,8 @@ mod tests {
 
     #[test]
     fn target_midpoint_rounds_to_middle_tier() {
-        // frac 0.5 * (10-1) = 4.5 -> round 5
-        assert_eq!(tier_for_target(50, 100, 0), 5);
+        let mid = ((NUM_TIERS - 1) as f32 / 2.0).round() as usize;
+        assert_eq!(tier_for_target(50, 100, 0), mid);
     }
 
     #[test]
@@ -561,8 +672,9 @@ mod tests {
     #[test]
     fn known_region_maps_to_its_tier() {
         let c = cfg(&[(60000, 0), (63000, 50), (76000, 100)], 0);
+        let mid = ((NUM_TIERS - 1) as f32 / 2.0).round() as usize; // ladder-length agnostic
         assert_eq!(tier_for_region(&c, 60000), 0);
-        assert_eq!(tier_for_region(&c, 63000), 5);
+        assert_eq!(tier_for_region(&c, 63000), mid);
         assert_eq!(tier_for_region(&c, 76000), NUM_TIERS - 1);
     }
 
@@ -576,9 +688,10 @@ mod tests {
 
     #[test]
     fn speffect_id_lookup_and_clamp() {
+        let top = SCALING_TIERS[NUM_TIERS - 1].speffect_id;
         assert_eq!(speffect_id_for_tier(0), 7010);
-        assert_eq!(speffect_id_for_tier(NUM_TIERS - 1), 7100);
-        assert_eq!(speffect_id_for_tier(999), 7100); // clamp
+        assert_eq!(speffect_id_for_tier(NUM_TIERS - 1), top);
+        assert_eq!(speffect_id_for_tier(999), top); // clamp
     }
 
     #[test]
