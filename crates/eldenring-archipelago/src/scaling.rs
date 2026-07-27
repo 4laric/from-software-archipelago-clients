@@ -19,7 +19,7 @@ use er_logic::scaling::{
     NUM_TIERS, ScalingConfig, blessing_floor_for_region, is_scaling_speffect,
     raw_target_for_region, speffect_id_for_tier, tier_for_region, tier_rates,
 };
-use er_logic::sweep_settle::{SettlePolicy, SweepGate};
+use er_logic::scaling_settle::{SettlePolicy, SweepGate};
 use fromsoftware_shared::{FromStatic, Subclass};
 use serde_json::Value;
 
@@ -34,7 +34,7 @@ static TICK: AtomicU32 = AtomicU32::new(0);
 /// measured as "ticks since the last sweep", so the first allowed sweep happens immediately.
 const THROTTLE: u32 = 30;
 
-/// Transition/region bookkeeping for the time-based backstop (`er_logic::sweep_settle`, host-tested;
+/// Transition/region bookkeeping for the time-based backstop (`er_logic::scaling_settle`, host-tested;
 /// see `active_characters` below for the PRIMARY crash defence and `SETTLE` for the policy).
 static GATE: Mutex<SweepGate> = Mutex::new(SweepGate::new());
 /// Process-relative clock for the gate (which is pure and takes `now_ms`).
@@ -101,7 +101,7 @@ where
     })
 }
 /// How long to let a freshly-loaded map settle before sweeping, and how long the region must have
-/// been stable. Pure policy; the gate that consumes it is `er_logic::sweep_settle` (host-tested).
+/// been stable. Pure policy; the gate that consumes it is `er_logic::scaling_settle` (host-tested).
 ///
 /// `settle_ms` is UNCHANGED at 2500 (4s -> 2500 was Alaric's 2026-07-19 tightening). It is not
 /// lowered here on purpose: it moves the native-crash boundary, `active_characters` above has just
@@ -113,7 +113,7 @@ where
 /// ~8s in play. Worse, the region was only SAMPLED every 30 ticks, so a flap shorter than ~500ms was
 /// never seen at all -- too slow and too blind, from the same line ordering. Observation is now
 /// per-tick (strictly MORE protective: those flaps now hold the gate) and a flap costs `stable_ms`
-/// rather than a fresh `settle_ms`. Starts conservative at the shipping default; see sweep_settle.
+/// rather than a fresh `settle_ms`. Starts conservative at the shipping default; see scaling_settle.
 const SETTLE: SettlePolicy = SettlePolicy::SHIPPING;
 
 /// Re-arm the settle window from an EXTERNAL transition signal.
@@ -209,7 +209,7 @@ pub fn tick() {
     let player_handle = player.field_ins_handle; // skip the player itself in the sweep
     let player_team = player.chr_ins.team_type; // hostiles (invader/NPC phantoms) carry a different team
 
-    // Time-based backstop (er_logic::sweep_settle). Not the primary CTD defence any more -- that is
+    // Time-based backstop (er_logic::scaling_settle). Not the primary CTD defence any more -- that is
     // `active_characters`'s chr_load_status filter -- but retained for the hazard a per-entry status
     // byte cannot describe: a torn read of the entries ARRAY while the game rebuilds it.
     let now = now_ms();
