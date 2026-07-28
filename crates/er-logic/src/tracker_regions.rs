@@ -921,7 +921,7 @@ pub const LOCATION_META: &[(u64, &str, &str, bool, bool)] = &[
     (7770907, "Caelid", "Caelid", false, false),
     (7770908, "Gravesite", "Gravesite", false, false),
     (7770909, "Jagged Peak", "Jagged Peak", false, false),
-    (7770910, "Belurat", "Belurat", false, false),
+    (7770910, "Belurat", "Belurat", false, true),
     (7770911, "Stormveil", "Stormveil", false, false),
     (7770912, "Stormveil", "Stormveil", false, false),
     (7770913, "Stormveil", "Stormveil", false, false),
