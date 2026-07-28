@@ -128,13 +128,16 @@ pub struct Core {
     /// this watermark and hints in the popped span are missed. DataStorage `_read_hints` is the
     /// robust follow-up (spec option (b)).
     hint_log_watermark: usize,
-    /// Static AP location id -> region display name (generated er_logic::tracker_regions).
+    /// AP location id -> FINE region display name. PER SEED, from slot_data `locationRegions`
+    /// (er_logic::tracker_tables). Empty until connect, and empty means "not sent", never
+    /// "no regions" -- the parse logs which.
     region_table: HashMap<u64, String>,
-    /// Static AP location id -> COARSE region name (in-logic key; "" = always open).
+    /// AP location id -> COARSE region name (the in-logic key; "" = always open). Per seed, from
+    /// slot_data `regionCoarseKeys`.
     coarse_table: HashMap<u64, String>,
     /// The PROGRESSION SURFACE: location ids this world's own progression may occupy (starred).
     progression_surface: HashSet<u64>,
-    /// Static coarse region name -> its lock item name (absent = never locked).
+    /// Coarse region name -> its lock item name, `"<coarse> Lock"` (absent = never locked).
     coarse_lock_items: HashMap<String, String>,
     /// Tracker filter: show only checks whose coarse region is currently accessible.
     tracker_in_logic_only: bool,
@@ -453,10 +456,13 @@ impl shared::Core for Core {
             tracker_visible: false,
             hints: HintSet::new(),
             hint_log_watermark: 0,
-            region_table: er_logic::tracker_regions::location_region_table(),
-            coarse_table: er_logic::tracker_regions::location_coarse_table(),
-            progression_surface: er_logic::tracker_regions::progression_surface_set(),
-            coarse_lock_items: er_logic::tracker_regions::coarse_lock_item_table(),
+            // EMPTY until slot_data arrives. There is no baked table any more: it described the
+            // DEFAULT seed's regions and was wrong for every num_regions seed. Filled by the
+            // slot_data parse, which logs armed-or-why-not.
+            region_table: HashMap::new(),
+            coarse_table: HashMap::new(),
+            progression_surface: HashSet::new(),
+            coarse_lock_items: HashMap::new(),
             tracker_in_logic_only: false,
             tracker_surface_only: false,
             boss_defs: Vec::new(),
@@ -1175,7 +1181,27 @@ impl shared::Core for Core {
                     }
                 };
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, feature_warn)
+                // THE TRACKER'S REGION MODEL, sent rather than baked (2026-07-28). The parse and
+                // every rule about it live in er_logic::tracker_tables, which is host-tested; this
+                // is the wiring. SAME DELETED FALLBACK as the surface above, and for a sharper
+                // reason: the old baked table was built from the DEFAULT seed's regions, so on a
+                // num_regions seed it grouped locations into regions the seed does not contain and
+                // called them in-logic. A visibly empty tracker beats a confidently wrong one.
+                let (tracker_tables, tracker_status) =
+                    er_logic::tracker_tables::build_tracker_tables(
+                        sd.get("locationRegions"),
+                        sd.get("regionCoarseKeys"),
+                    );
+                match &tracker_status {
+                    er_logic::tracker_tables::TablesStatus::Armed { .. } => {
+                        log::info!("{}", tracker_status.describe())
+                    }
+                    er_logic::tracker_tables::TablesStatus::NoRegions => {
+                        log::warn!("{}", tracker_status.describe())
+                    }
+                }
+
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn)
             });
             if let Some((
                 map,
@@ -1193,6 +1219,7 @@ impl shared::Core for Core {
                 boss_defs,
                 region_attunement,
                 progression_surface,
+                tracker_tables,
                 feature_warn,
             )) = parsed
             {
@@ -1246,6 +1273,9 @@ impl shared::Core for Core {
                 // Assign the progression surface parsed inside the slot_data closure above (where
                 // `sd` was in scope).
                 self.progression_surface = progression_surface;
+                self.region_table = tracker_tables.region;
+                self.coarse_table = tracker_tables.coarse;
+                self.coarse_lock_items = tracker_tables.lock_items;
                 self.slot_data_parsed = true;
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
@@ -2849,8 +2879,9 @@ impl Core {
 
     /// Rebuild all per-seed / per-save state when a reconnect targets a DIFFERENT seed without an
     /// ER reload (see the `parsed_seed` guard). Clears every table that slot_data or the save file
-    /// repopulates, so the one-shot parse and save-load run fresh; static tables (region_table,
-    /// coarse_table, tracker UI prefs) and install-once globals (detour_installed) are left intact.
+    /// repopulates, so the one-shot parse and save-load run fresh; seed-scoped tables (region_table,
+    /// coarse_table, coarse_lock_items, progression_surface) are CLEARED, while tracker UI prefs
+    /// and install-once globals (detour_installed) are left intact.
     /// Recovered after commit 4bb3c95 accidentally dropped the body while leaving the call sites.
     fn reset_for_new_seed(&mut self) {
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
@@ -2889,10 +2920,14 @@ impl Core {
         self.sent_goal = false;
         self.hints = HintSet::new();
         self.hint_log_watermark = 0;
-        // Restore the DEFAULT progression surface so a new seed does not inherit the prior seed's
-        // set (the slot_data parse re-applies this seed's own surface, or leaves it empty and stars
-        // nothing -- see the deleted-fallback note there).
-        self.progression_surface = er_logic::tracker_regions::progression_surface_set();
+        // CLEAR the tracker's seed-scoped model so a new seed cannot inherit the prior seed's
+        // regions or surface. The slot_data parse re-applies this seed's own (or leaves them empty
+        // and shows nothing -- see the deleted-fallback note there). Under num_regions two seeds
+        // routinely disagree about which regions EXIST, so inheriting is not a cosmetic bug.
+        self.progression_surface = HashSet::new();
+        self.region_table = HashMap::new();
+        self.coarse_table = HashMap::new();
+        self.coarse_lock_items = HashMap::new();
         // Boss-lock mode A: drop the parsed defs AND re-arm the felled-edge state, so the new
         // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
         self.boss_defs.clear();
