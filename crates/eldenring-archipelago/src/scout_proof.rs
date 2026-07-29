@@ -100,6 +100,10 @@ fn store(items: &[ap::LocatedItem]) {
                                 | er_codec::CATEGORY_PROTECTOR
                                 | er_codec::CATEGORY_ACCESSORY
                                 | er_codec::CATEGORY_GOODS
+                                // GEM (Ash of War): equipType 4, sellable natively. Excluded here
+                                // until 2026-07-29 on the false premise that ShopLineupParam had no
+                                // equipType for a gem -- vanilla has 135 such rows.
+                                | er_codec::CATEGORY_GEM
                         )
                 })
         };

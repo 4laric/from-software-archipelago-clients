@@ -19,6 +19,8 @@ pub const CATEGORY_WEAPON: u32 = 0x0000_0000;
 pub const CATEGORY_PROTECTOR: u32 = 0x1000_0000;
 pub const CATEGORY_ACCESSORY: u32 = 0x2000_0000;
 pub const CATEGORY_GOODS: u32 = 0x4000_0000;
+/// Gem = Ash of War. Sellable via ShopLineupParam equipType 4 (135 vanilla rows do exactly that).
+pub const CATEGORY_GEM: u32 = 0x8000_0000;
 pub const CATEGORY_MASK: u32 = 0xF000_0000;
 pub const ROW_ID_MASK: u32 = 0x0FFF_FFFF;
 

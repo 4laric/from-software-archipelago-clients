@@ -7,7 +7,7 @@
 //!
 //! Field encoding (confirmed against the vanilla ShopLineupParam dump): `equipId` is the RAW item id
 //! (no category nibble) and `equipType` selects the param table — 0 Weapon, 1 Protector, 2 Accessory,
-//! 3 Goods (4 Gem, 5 CustomWeapon, not handled here). So equipId = `row_id_of(FullID)`, equipType =
+//! 3 Goods, 4 Gem (5 CustomWeapon is still not handled). So equipId = `row_id_of(FullID)`, equipType =
 //! FullID category.
 //!
 //! Because the slot now hands the player the real reward R on purchase, the redundant AP ECHO
@@ -183,6 +183,12 @@ fn equip_type_for(fid: i64) -> Option<u8> {
         er_codec::CATEGORY_PROTECTOR => Some(1),
         er_codec::CATEGORY_ACCESSORY => Some(2),
         er_codec::CATEGORY_GOODS => Some(3),
+        // GEM (Ash of War) = equipType 4. Added 2026-07-29: this arm was missing on the premise
+        // that ShopLineupParam cannot sell a gem, but vanilla ships 135 rows with equipType=4 --
+        // merchants sell Ashes of War in the base game. Without it every own-world Ash of War fell
+        // through to the shop_preview flower override AND consumed a spare preview row, which is
+        // how an ash ended up wearing the AP flower with `?GoodsInfo?` for its description.
+        er_codec::CATEGORY_GEM => Some(4),
         _ => None,
     }
 }
