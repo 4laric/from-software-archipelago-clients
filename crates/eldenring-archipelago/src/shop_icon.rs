@@ -71,6 +71,23 @@ pub fn configure_locks(names: HashSet<String>) {
     *LOCK_NAMES.lock().unwrap() = Some(names);
 }
 
+/// Re-arm on the in-world edge, exactly like the other param writers.
+///
+/// THE BUG THIS FIXES. `run()` writes `EquipParamGoods.iconId` -- a PARAM. Loads stream params back
+/// in and revert our writes, which is why `core.rs` calls `reset()` on the in-world edge for
+/// `check_lots`, `enemy_drops`, `shop_sell`, `shop_repoint` and `shop_prices` (each learned the
+/// hard way: DLC ItemLotParam 2026-07-21, ShopLineupParam 2026-07-24). This module was the ONLY one
+/// of the six with no `reset()` at all, so once `DONE` latched, the flower icon was never
+/// re-applied: after the session's first load every repointed shop slot silently fell back to the
+/// literal telescope for the rest of the run, and a reconnect never re-flowered it either.
+///
+/// Deliberately does NOT clear `CONFIGURED`/`REAL_GOODS`/`LOCK_NAMES`: those come from slot_data at
+/// connect and survive a load. Only the "already applied" latch is cleared, so `run()` re-applies
+/// the same configured set. Idempotent -- it re-writes the same iconId to the same rows.
+pub fn reset() {
+    DONE.store(false, Ordering::Relaxed);
+}
+
 pub fn run() -> bool {
     if DONE.load(Ordering::Relaxed) {
         return true;

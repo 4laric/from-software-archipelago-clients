@@ -2579,6 +2579,13 @@ impl shared::Core for Core {
             // wrong for the rest of the run (er_logic::shop_repoint_replay pins the timeline).
             crate::shop_repoint::reset();
             crate::shop_prices::reset();
+            // shop_icon was MISSING from this list until 2026-07-29 -- the only one of the six
+            // param writers with no reset() at all. It writes EquipParamGoods.iconId, so a load
+            // reverted it and the DONE latch meant it never re-applied: every repointed shop slot
+            // fell back to the literal telescope after the first load. Reported as "telescope icon"
+            // on Nexus. Must run AFTER shop_repoint (same ordering as the rest): repoint decides
+            // WHICH rows are ours, icon dresses them.
+            crate::shop_icon::reset();
             // CTD guard (2026-07-24): a load just completed — re-arm the enemy-scaling settle
             // window too. A SAME-REGION reload (death respawn) never trips the sweep's
             // region-change reset (LAST_REGION is unchanged), yet the ChrIns sets were just torn
