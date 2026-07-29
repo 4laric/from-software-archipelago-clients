@@ -294,9 +294,12 @@ fn walk_inventory_targets() -> Option<(i32, i32)> {
 /// Scadutree Fragment goods row id (no category nibble). FullID = SCADU_FRAGMENT_GOODS | category.
 const SCADU_FRAGMENT_GOODS: u32 = 2_010_000;
 
-/// Cumulative Scadutree Fragments required to REACH each combat-blessing level (index = level 0..20).
-/// Verbatim from C++ `kScaduCum`. Pure data — no RE needed.
 /// Maximum stored blessing level the game's combat-blessing curve defines (caps the raise-only write).
+///
+/// The cumulative fragments-per-level table this used to sit beside (C++ `kScaduCum`) now lives in
+/// `er_logic::upgrades::SCADU_CUM` with the decision that consumes it; only the cap stayed here.
+/// Confirmed 2026-07-29 against `SpEffectParam`: the vanilla ladder is `20000100..=20000120`, i.e.
+/// levels 0..=20 at stride 1, so 20 is the real ceiling and not a chosen clamp.
 const SCADU_MAX_LEVEL: i32 = 20;
 
 /// Scadu writer throttle (~1s, mirrors C++ `s_lastTick`). A stored-byte watchdog doesn't need to run

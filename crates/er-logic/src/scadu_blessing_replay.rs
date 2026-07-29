@@ -5,8 +5,15 @@
 //! But because the floor wire (`dlcScadutreeFloorRanges`) is emitted ONLY when the option == 2,
 //! freezing it off meant the key was never emitted and this client's floor path was DEAD CODE. A DLC
 //! region unlocked with no fragments handed the player to enemies tuned for blessing ~12 at blessing 0.
-//! The option now ships at its declared default (2 = scaled), so this decision is LIVE for every DLC
-//! seed -- and it had no test at all.
+//!
+//! 🛑 STATUS, corrected 2026-07-29. An earlier version of this header claimed "the option now ships at
+//! its declared default (2 = scaled), so this decision is LIVE for every DLC seed." That is NOT true
+//! and has not been since the 2026-07-18 balance call: `GlobalScadutreeBlessing.default = 0`
+//! (greenfield/eldenring/features/scaling.py) and `defaults.FROZEN_OPTIONS` pins
+//! `"global_scadutree_blessing": (0, "off")` (defaults.py:119). No default seed emits
+//! `dlcScadutreeFloorRanges`, so the floor path this harness covers is STILL dead code in shipped
+//! seeds -- it is live only for a yaml that opts in to `scaled`. The tests below are therefore
+//! guarding a mechanism, not a shipped default. See docs/specs/SPEC-global-scadutree-blessing-20260729.md.
 //!
 //! The decision is a timeline, not a tick: fragments arrive over the run, the player crosses region
 //! boundaries (so the floor changes under them), the bag walk can transiently fail, and a reconnect
