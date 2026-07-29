@@ -2579,6 +2579,16 @@ impl shared::Core for Core {
             // wrong for the rest of the run (er_logic::shop_repoint_replay pins the timeline).
             crate::shop_repoint::reset();
             crate::shop_prices::reset();
+            // shop_stock was MISSING from this list until 2026-07-29 -- the THIRD writer to make the
+            // same mistake (shop_sell 07-24, shop_icon earlier today). Its reset() existed and was
+            // never called, so the 455 rerolled infinite-stock rows applied once on connect, the
+            // first map load streamed ShopLineupParam back in and reverted them, and the DONE latch
+            // meant they never re-applied. Every below-value rune price in a seed lives in that
+            // table -- Alaric reported three times over that he had "never seen a single rune priced
+            // below its value ... nothing remotely close to the 0 end", and he was exactly right:
+            // his seed had a Golden Rune [5] for 4 runes and a [1] for 2, and neither existed in his
+            // game past the first load. Must follow shop_repoint like the rest.
+            crate::shop_stock::reset();
             // shop_icon was MISSING from this list until 2026-07-29 -- the only one of the six
             // param writers with no reset() at all. It writes EquipParamGoods.iconId, so a load
             // reverted it and the DONE latch meant it never re-applied: every repointed shop slot
