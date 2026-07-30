@@ -414,7 +414,11 @@ pub fn run() -> bool {
                  {new_eid} equipType {etype} (row holds equipId {} equipType {}) -- write {}",
                 row.equip_id(),
                 row.equip_type(),
-                if row.equip_id() != new_eid { "NEEDED" } else { "already correct, skipped" }
+                if row.equip_id() != new_eid {
+                    "NEEDED"
+                } else {
+                    "already correct, skipped"
+                }
             );
         }
         if row.equip_id() != new_eid {
