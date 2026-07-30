@@ -283,26 +283,28 @@ fn count_held_goods_row(row: i32) -> Option<i32> {
 static POT_CAP_ANNOUNCED: AtomicU32 = AtomicU32::new(0);
 
 fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
-    let Some((idx, &(_, cap))) = POT_DELIVERY_CAPS
-        .iter()
-        .enumerate()
-        .find(|(_, &(id, _))| id == full_id)
-    else {
+    // `position` + index, NOT `enumerate().find(|(_, &(id, _))| ..)`: the latter mixes an explicit
+    // `&` deref pattern into an implicitly-borrowing tuple pattern, which edition 2024 rejects
+    // ("cannot explicitly dereference within an implicitly-borrowing pattern"). Caught by the
+    // Windows CI, which is the only thing that compiles this crate.
+    let Some(idx) = POT_DELIVERY_CAPS.iter().position(|&(id, _)| id == full_id) else {
         return qty;
     };
+    let cap = POT_DELIVERY_CAPS[idx].1;
     match count_held_goods_row(full_id & 0x0FFF_FFFF) {
         Some(held) => {
             let allowed = qty.min((cap - held).max(0));
             // TELEMETRY (2026-07-30). Swallowing part of a grant and reporting success is precisely
             // the "polite false" CONTRIBUTING forbids: `grant_full_id` returns true either way, so a
             // pot the player never receives is indistinguishable from one they did. Eldakin's
-            // 2026-07-29 log shows the consequence -- start-item backfill re-granting 10 Hefty
-            // Cracked Pots that were also swallowed, with nothing anywhere saying why.
+            // 2026-07-29 log shows the consequence -- start-item backfill granting 10 Hefty Cracked
+            // Pots that the cap then swallowed, with nothing anywhere saying why. (That backfill
+            // burst is a one-shot early-scan race on a fresh character, not a permanent re-grant.)
             // 🛑 A seed that hands out MORE start pots than the cap can never deliver the remainder;
             // this line is how that becomes visible instead of silent.
             if allowed < qty {
                 let bit = 1u32 << idx;
-                if POT_CAP_ANNOUNCED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                if (POT_CAP_ANNOUNCED.fetch_or(bit, Ordering::Relaxed) & bit) == 0 {
                     log::warn!(
                         "pot-cap: goods {full_id:#x} grant of {qty} CAPPED to {allowed} (held {held}, cap {cap}) \
                          -- the remainder is reported delivered but never enters the inventory. \
