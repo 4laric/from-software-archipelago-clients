@@ -39,6 +39,7 @@ pub mod marker_replay;
 pub mod name_override;
 pub mod options;
 pub mod progressive;
+pub mod prologue_probe;
 pub mod receive;
 pub mod receive_watermark_replay;
 pub mod reconcile;

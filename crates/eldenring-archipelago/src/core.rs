@@ -44,6 +44,11 @@ struct RegionAttunement {
 pub struct Core {
     base: CoreBase<crate::game::EldenRing, Value>,
     detour_installed: bool,
+    /// One-shot latch for the detour-install failure notice. `update_live` retries the install
+    /// EVERY frame, so an un-latched warn floods the log at frame rate — and the player who most
+    /// needs to see it (items silently never arrive) is the one least likely to open the log at
+    /// all. Latch the log line, and raise it on screen once.
+    detour_install_warned: bool,
     received_through: usize,
     dispatched_through: usize,
     item_map: Option<HashMap<i64, i64>>,
@@ -421,6 +426,7 @@ impl shared::Core for Core {
         Ok(Self {
             base: CoreBase::new("Elden Ring")?,
             detour_installed: false,
+            detour_install_warned: false,
             received_through: 0,
             dispatched_through: 0,
             item_map: None,
@@ -517,7 +523,19 @@ impl shared::Core for Core {
         if !self.detour_installed {
             match crate::detour::install() {
                 Ok(()) => self.detour_installed = true,
-                Err(e) => log::warn!("AddItemFunc detour install deferred: {e}"),
+                Err(e) => {
+                    // Refusing to hook means grant_full_id returns false forever: checks keep
+                    // SENDING (they come from the inventory scan) while nothing is ever RECEIVED.
+                    // That asymmetry reads as "the server stopped giving me items", so the notice
+                    // has to reach the screen, not just the log. Once — the retry is per-frame.
+                    if !self.detour_install_warned {
+                        self.detour_install_warned = true;
+                        log::warn!("AddItemFunc detour install deferred: {e}");
+                        let now = self.toast_clock.elapsed().as_millis() as u64;
+                        self.toasts
+                            .push(format!("Item delivery is not hooked — {e}"), now);
+                    }
+                }
             }
         }
         // LuaWarp probe hook (warp_hook.rs; capital-reconciler menu-warp seam): self-guarded

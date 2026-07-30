@@ -4,8 +4,15 @@
 //! `FieldArea` singleton: `enable_fast_travel_event_flag` (i32 @ +0xA0). The engine treats it as an
 //! event-flag id — "can travel" == `EventFlagMan.get(field)`. In the overworld the engine points it at
 //! a persistent, already-set flag; inside legacy dungeons / catacombs / caves it repoints it at a flag
-//! that stays OFF (or, in some areas, sets it to 0 = "unconditionally blocked"), which is how you end
-//! up stranded with "Unable to travel." (Confirmed via the fromsoftware-rs `FieldArea` binding — the
+//! that stays OFF, which is how you end up stranded with "Unable to travel."
+//!
+//! ⚠️ `0` is NOT "blocked". It is the NO-GATE sentinel: vanilla already allows travel where the field
+//! reads 0, and it is also what the field reads mid death→respawn. This docstring used to claim the
+//! opposite, and acting on that claim (redirecting the field whenever it read 0) meant writing into
+//! engine map state while the map tore down — the 2026-07-16 death CTD. `er_logic::fast_travel::
+//! gate_action` has carried the correct reading since that fix; only this comment lagged. The
+//! Hexinton CE table corroborates it independently: its "Enable FastTravel In Dungeons" script
+//! ENABLES travel by writing 0 to this very field. (Confirmed via the fromsoftware-rs `FieldArea` binding — the
 //! field carries the RTTI comment "Flag to check if fast travel should be enabled." — and the Grand
 //! Archives CE table's FieldArea base @ the `48 8B 3D ?? ?? ?? ?? 49 8B D8 …` static.)
 //!

@@ -17,6 +17,7 @@ use fromsoftware_shared::FromStatic;
 use retour::GenericDetour;
 
 use er_codec::{decode_synthetic, is_synthetic_goods, row_id_of};
+use er_logic::prologue_probe::PrologueVerdict;
 
 use crate::params;
 
@@ -128,9 +129,16 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     }
     let target_addr =
         current_module_base().ok_or("no module base for eldenring.exe")? + ADD_ITEM_FUNC_RVA;
-    if !signature_matches(target_addr) {
+    // A mismatch has TWO explanations — a stale pinned RVA on a newer game build, or another mod
+    // that detoured this same routine before us — and until 2026-07-30 we only ever reported the
+    // first. The second is what a player actually hit (matt's randomizer "helper" + our fail-closed
+    // guard = item receiving dead forever, checks unaffected). Classify, so the message names the
+    // thing the player can act on. Behaviour is unchanged: we refuse either way.
+    let verdict = prologue_verdict(target_addr);
+    if verdict != PrologueVerdict::Pristine {
         return Err(format!(
-            "AddItemFunc signature mismatch @ {target_addr:#x} — pinned 2.6.2.0 RVA stale for this build"
+            "AddItemFunc signature mismatch @ {target_addr:#x} — {}",
+            er_logic::prologue_probe::explain(verdict, "item pickup")
         )
         .into());
     }
@@ -552,9 +560,11 @@ fn current_module_base() -> Option<usize> {
     let hmodule = unsafe { GetModuleHandleW(None) }.ok()?;
     Some(hmodule.0 as usize)
 }
-fn signature_matches(addr: usize) -> bool {
+/// Read the pinned entry and classify what we find there. The judgement itself is pure and lives
+/// in `er_logic::prologue_probe` (host-tested); this seam only supplies the bytes.
+pub fn prologue_verdict(addr: usize) -> PrologueVerdict {
     let actual = unsafe { std::slice::from_raw_parts(addr as *const u8, ADD_ITEM_FUNC_SIG.len()) };
-    actual == ADD_ITEM_FUNC_SIG
+    er_logic::prologue_probe::classify(ADD_ITEM_FUNC_SIG, actual)
 }
 unsafe fn read_i32(base: *const c_void, off: usize) -> i32 {
     unsafe { ((base as *const u8).add(off) as *const i32).read_unaligned() }
