@@ -141,14 +141,18 @@ fn stock_flag_addr(row_id: u32) -> Option<usize> {
     Some((row as *const SHOP_LINEUP_PARAM as usize) + STOCK_FLAG_OFF)
 }
 
-fn read_stock_flag(row_id: u32) -> Option<u32> {
+pub(crate) fn read_stock_flag(row_id: u32) -> Option<u32> {
     let a = stock_flag_addr(row_id)?;
     Some(unsafe { (a as *const u32).read_unaligned() })
 }
 
 /// Overwrite a row's `eventFlag_forStock`. Returns Some(old) on success. Idempotent: if it already
 /// equals `flag`, it still returns Some(flag) without writing.
-fn write_stock_flag(row_id: u32, flag: u32) -> Option<u32> {
+///
+/// `pub(crate)` since 2026-07-30 so `shop_stock` can zero the flag on the rows it rerolls -- see the
+/// note there. This offset is PROBE-confirmed 3/3 (2026-06-30) and is the same write this module has
+/// used since June, so it is not a new class of write.
+pub(crate) fn write_stock_flag(row_id: u32, flag: u32) -> Option<u32> {
     let a = stock_flag_addr(row_id)?;
     let p = a as *mut u32;
     let old = unsafe { p.read_unaligned() };
