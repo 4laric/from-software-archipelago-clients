@@ -80,58 +80,62 @@ pub fn run() -> bool {
         None => return true, // not configured (non-greenfield seed)
     };
 
-    // SAFETY: FD4 singleton; game thread, in-world (caller gates). instance_mut/get_mut are the crate's
-    // sanctioned mutable access to the live RW param table -- same path shop_sell/shop_flags use.
-    let repo = match unsafe { SoloParamRepository::instance_mut() } {
-        Ok(r) => r,
-        Err(_) => return false, // repo not up yet -- retry
-    };
-
     let mut n = 0usize;
     let mut missing = 0usize;
     let mut todo: Vec<u32> = Vec::new();
     let mut rolled: Vec<(u32, i32, i32)> = Vec::new();
-    for (row_id, (gid, etype, price)) in roll {
-        let Some(row) = repo.get_mut::<ShopLineupParam>(row_id) else {
-            missing += 1;
-            continue;
+
+    // The `instance_mut()` borrow is scoped to THIS BLOCK on purpose. shop_flags' stock-flag
+    // helpers re-enter the repo through `instance()`, so the flag pass below must not run while a
+    // mutable borrow of the same table is alive.
+    {
+        // SAFETY: FD4 singleton; game thread, in-world (caller gates). instance_mut/get_mut are the
+        // crate's sanctioned mutable access to the live RW param table -- same path shop_sell uses.
+        let repo = match unsafe { SoloParamRepository::instance_mut() } {
+            Ok(r) => r,
+            Err(_) => return false, // repo not up yet -- retry
         };
-        // NOTE the flag is read and cleared in a SECOND PASS below, not here: shop_flags'
-        // read/write_stock_flag re-enter the repo through `instance()`, and doing that while this
-        // loop holds the `instance_mut()` borrow would alias the same table through two paths.
-        let ware_ok = row.equip_id() == gid && row.equip_type() == etype && row.value() == price;
-        if ware_ok {
-            // Ware already correct; the flag pass below still gets a look at it, because a row can
-            // be correctly rerolled and STILL be invisible if its stock flag survived.
+        for (row_id, (gid, etype, price)) in roll {
+            let Some(row) = repo.get_mut::<ShopLineupParam>(row_id) else {
+                missing += 1;
+                continue;
+            };
+            // NOTE the flag is read and cleared in a SECOND PASS below, not here: shop_flags'
+            // read/write_stock_flag re-enter the repo through `instance()`, and doing that while this
+            // loop holds the `instance_mut()` borrow would alias the same table through two paths.
+            let ware_ok = row.equip_id() == gid && row.equip_type() == etype && row.value() == price;
+            if ware_ok {
+                // Ware already correct; the flag pass below still gets a look at it, because a row can
+                // be correctly rerolled and STILL be invisible if its stock flag survived.
+                todo.push(row_id);
+                continue;
+            }
+            row.set_equip_id(gid);
+            row.set_equip_type(etype);
+            // `set_value` CONFIRMED to exist by the Windows build 2026-07-11 -- the raw +0x04 write is
+            // not needed (VALUE_OFF is kept only as documentation of the row layout).
+            row.set_value(price);
+            // sellQuantity stays -1: infinite stock is the whole point.
+            //
+            // 🛑 ZERO THE STOCK FLAG. Paramdex calls eventFlag_forStock the "flag holding the count"
+            // (個数保持イベントフラグ) -- on a purchasable row it is SAVE STATE, not a static property.
+            // Leaving a rewritten unlimited shelf pointing at a live counter makes its visibility depend
+            // on that save's history, and on 2026-07-29 it did: Alaric's Iji shelf 100226 showed its
+            // reroll while 100225, param-identical after the write, did not appear at all. Same for
+            // Patches' 100104. Both invisible rows were the ones we most wanted seen (they had rolled
+            // Golden Rune [1] below worth). Zeroing severs visibility from save history -- matt's
+            // randomizer zeroes this field on every infinite shop entry it writes
+            // (PermutationWriter.cs:748/780), and our own former 455-row set were all flag-0 rows,
+            // which DID render their rerolled wares in game.
+            //
+            // The world-side predicate still SELECTS on eventFlag_forStock > 0: that clause is what
+            // separates the 14 real shelves from the 455 menus. Selecting on it and then clearing it
+            // are not in tension -- one is how we find a shelf, the other is how we make it browsable.
             todo.push(row_id);
-            continue;
+            rolled.push((row_id, gid, price));
+            n += 1;
         }
-        row.set_equip_id(gid);
-        row.set_equip_type(etype);
-        // `set_value` CONFIRMED to exist by the Windows build 2026-07-11 -- the raw +0x04 write is
-        // not needed (VALUE_OFF is kept only as documentation of the row layout).
-        row.set_value(price);
-        // sellQuantity stays -1: infinite stock is the whole point.
-        //
-        // 🛑 ZERO THE STOCK FLAG. Paramdex calls eventFlag_forStock the "flag holding the count"
-        // (個数保持イベントフラグ) -- on a purchasable row it is SAVE STATE, not a static property.
-        // Leaving a rewritten unlimited shelf pointing at a live counter makes its visibility depend
-        // on that save's history, and on 2026-07-29 it did: Alaric's Iji shelf 100226 showed its
-        // reroll while 100225, param-identical after the write, did not appear at all. Same for
-        // Patches' 100104. Both invisible rows were the ones we most wanted seen (they had rolled
-        // Golden Rune [1] below worth). Zeroing severs visibility from save history -- matt's
-        // randomizer zeroes this field on every infinite shop entry it writes
-        // (PermutationWriter.cs:748/780), and our own former 455-row set were all flag-0 rows,
-        // which DID render their rerolled wares in game.
-        //
-        // The world-side predicate still SELECTS on eventFlag_forStock > 0: that clause is what
-        // separates the 14 real shelves from the 455 menus. Selecting on it and then clearing it
-        // are not in tension -- one is how we find a shelf, the other is how we make it browsable.
-        todo.push(row_id);
-        rolled.push((row_id, gid, price));
-        n += 1;
-    }
-    drop(repo); // release the instance_mut() borrow before the flag pass re-enters via instance()
+    } // instance_mut() borrow ends here
 
     let mut cleared = 0usize;
     for row_id in todo {
