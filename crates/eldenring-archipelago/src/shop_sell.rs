@@ -30,7 +30,7 @@
 
 #![allow(dead_code)]
 
-use eldenring::cs::{ShopLineupParam, SoloParamRepository};
+use eldenring::cs::{EquipParamGoods, ShopLineupParam, SoloParamRepository};
 use fromsoftware_shared::FromStatic;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -284,6 +284,9 @@ pub fn run() -> bool {
     // inside this loop, before the rewrite below lands: afterwards the row's equipId is the AP reward,
     // not the vanilla ware, and the fallback would preview the item onto itself.
     let mut derived_preview: Vec<(i64, i32)> = Vec::new();
+    // Traced rows and the ware they end up selling, captured in the SCAN so the dump still fires on
+    // an idempotent re-run (when `plan` is empty because every row is already correct).
+    let mut traced_wares: Vec<(u32, i32, u8)> = Vec::new();
     let need_preview_fallback = !crate::shop_preview::is_configured();
     // Which configured flags actually landed on a live ShopLineupParam row. A flag in flag_to_loc with
     // NO live row is the interesting case: the location says "this check is a shop purchase guarded by
@@ -409,6 +412,9 @@ pub fn run() -> bool {
         // A row this pass has DECIDED to sell natively is owned whether or not the write was needed.
         owned.insert(id);
         if traced {
+            traced_wares.push((id, new_eid, etype));
+        }
+        if traced {
             log::info!(
                 "shop-sell TRACE row {id} (loc {loc}): PLAN sell_fid {sell_fid} -> equipId \
                  {new_eid} equipType {etype} (row holds equipId {} equipType {}) -- write {}",
@@ -517,6 +523,31 @@ pub fn run() -> bool {
             plan.len(),
             mismatched[..mismatched.len().min(10)].join(" | ")
         );
+    }
+    // THE WARE'S OWN SORT FIELDS. 2026-07-30: the read-back proved every write lands and sticks, so
+    // the missing shop rows are written correctly and hidden by the MENU. The menu renders sorted by
+    // WARE, not row order (Corhyn's shelf opens with row 100356, his 600-rune slot), so the ware's
+    // sort keys are the first thing to look at on the render side. Separate loop on purpose: the scan
+    // holds an iterator over ShopLineupParam and the read-back holds a get_mut, and neither can also
+    // borrow EquipParamGoods.
+    for (id, eid, etype) in &traced_wares {
+        if *etype != 3 {
+            continue; // only GOODS live in EquipParamGoods
+        }
+        match repo.get::<EquipParamGoods>(*eid as u32) {
+            Some(g) => log::info!(
+                "shop-sell TRACE row {id}: WARE goods {eid} sortGroupId {} sortId {} sellValue {} \
+                 iconId {}",
+                g.sort_group_id(),
+                g.sort_id(),
+                g.sell_value(),
+                g.icon_id()
+            ),
+            None => log::info!(
+                "shop-sell TRACE row {id}: WARE goods {eid} has NO EquipParamGoods row -- that alone \
+                 would explain a slot the menu cannot render"
+            ),
+        }
     }
     if overrides_cleared > 0 {
         log::info!(
