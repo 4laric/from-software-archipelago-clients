@@ -49,6 +49,37 @@ pub fn run() -> bool {
     if DONE.load(Ordering::Relaxed) {
         return true;
     }
+    // ⭐⭐⭐ A/B KILL SWITCH -- `ER_SHOP_PRICES=off` skips the write entirely.
+    //
+    // Alaric, 2026-07-30: "we've had runes in the shop before we started trying to fix the price."
+    // That is ground truth and it OUTRANKS the 15-for-15 absence pattern I had been reading as "the
+    // purchase menu cannot display a rune". If runes rendered before, the menu can display one, and
+    // something we added since is what hides it.
+    //
+    // This module is the only one that writes ShopLineupParam.value, and it writes it ONLY on rune
+    // rows -- so "rune" and "we rewrote the price" have been the SAME VARIABLE in every observation
+    // to date. A day was spent diffing EquipParamGoods columns that are all merely collinear with
+    // rune-ness (sortGroupId 100, canMultiUse 1, goodsUseAnim 9) while the actual manipulated
+    // variable sat in this file, unconsidered.
+    //
+    // So: one switch, one variable, same save and same seed. Rune visible with the write skipped and
+    // absent with it applied ⇒ the rolled `value` is the cause. Absent both ways ⇒ this module is
+    // exonerated and the difference is elsewhere in the price-era commits.
+    if std::env::var("ER_SHOP_PRICES")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "off" || v == "0" || v == "false"
+        })
+        .unwrap_or(false)
+    {
+        log::warn!(
+            "shop-prices: DISABLED by ER_SHOP_PRICES -- rune rows keep the price of the ware their \
+             slot used to sell. A/B probe for the 2026-07-30 shop-visibility hunt, not a shipping \
+             configuration."
+        );
+        DONE.store(true, Ordering::Relaxed);
+        return true;
+    }
     let prices: Vec<(u32, i32)> = match PRICES.lock().unwrap().as_ref() {
         Some(m) if !m.is_empty() => m.iter().map(|(k, v)| (*k, *v)).collect(),
         Some(_) => {
