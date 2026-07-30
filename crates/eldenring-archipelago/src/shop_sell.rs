@@ -176,6 +176,36 @@ pub fn echo_skip(loc: i64) -> bool {
     skip
 }
 
+/// Rows to TRACE in full, at every decision point and again after read-back.
+///
+/// The 2026-07-30 shop-visibility hunt: 19 rows were mapped BY HAND out of a client log plus the
+/// generated tables, which bought four dead hypotheses (already-purchased, cross-type rewrite,
+/// `sellValue`, `sortGroupId`) and no mechanism -- because every one of them was a property of the
+/// REWARD, and the falsifying case was two merchants disagreeing about the SAME reward class.
+/// `Somber Smithing Stone [2]` renders on Kale row 100511 while `Somber Smithing Stone [6]` does not
+/// on Gostoc row 100016, so the discriminator is the ROW or the WRITE. This is the instrument for
+/// that question; those two rows are its fixtures (CONTRIBUTING rule 11 -- the case that motivated
+/// the work is the acceptance test).
+///
+/// Override with `ER_SHOP_TRACE=100016,100511,...`; `ER_SHOP_TRACE=all` traces every check row.
+fn trace_rows() -> (HashSet<u32>, bool) {
+    // The two fixtures ride along by default so the next run answers the question with no setup.
+    let mut set: HashSet<u32> = [100016u32, 100511].into_iter().collect();
+    let mut all = false;
+    if let Ok(v) = std::env::var("ER_SHOP_TRACE") {
+        if v.trim().eq_ignore_ascii_case("all") {
+            all = true;
+        } else {
+            for tok in v.split(',') {
+                if let Ok(id) = tok.trim().parse::<u32>() {
+                    set.insert(id);
+                }
+            }
+        }
+    }
+    (set, all)
+}
+
 /// FullID category -> ShopLineupParam `equipType`. `None` for gem/custom (not natively sellable here).
 fn equip_type_for(fid: i64) -> Option<u8> {
     match er_codec::item_category_of(fid as u32) {
@@ -232,6 +262,7 @@ pub fn run() -> bool {
         Ok(r) => r,
         Err(_) => return false, // repo not up yet — retry next tick
     };
+    let (trace, trace_all) = trace_rows();
 
     // Scan immutably -> plan the rewrites, then apply (avoids holding a row borrow across get_mut).
     let mut plan: Vec<(u32, i32, u8)> = Vec::new(); // (row id, new equipId, equipType)
@@ -262,6 +293,24 @@ pub fn run() -> bool {
     let mut live_rows_with_flag = 0u32;
     for (id, row) in repo.rows::<ShopLineupParam>() {
         let f = row.event_flag_for_stock();
+        // TRACE (pre-decision). Deliberately BEFORE both continues: "row 100016 is not a check row
+        // at all" and "its stock flag is not in slot_data" are findings, and a tally can never say
+        // either one. `eventFlag_forRelease` is the field this dump most wants and the pinned
+        // `eldenring` crate was not readable from the sandbox to confirm an accessor -- it is
+        // UNCHECKED here, not absent by judgement (CONTRIBUTING: name every stage you did not check).
+        if trace.contains(&id) {
+            log::info!(
+                "shop-sell TRACE row {id}: LIVE equipId {} equipType {} value {} sellQuantity {} \
+                 nameMsgId {} iconId {} eventFlag_forStock {f} | in slot_data = {}",
+                row.equip_id(),
+                row.equip_type(),
+                row.value(),
+                row.sell_quantity(),
+                row.name_msg_id(),
+                row.icon_id(),
+                flag_to_loc.get(&f).is_some()
+            );
+        }
         if f == 0 {
             continue;
         }
@@ -270,6 +319,7 @@ pub fn run() -> bool {
             continue;
         };
         check_rows += 1;
+        let traced = trace_all || trace.contains(&id);
         matched_flags.insert(f);
         let vanilla = er_codec::full_id_from_equip_type(row.equip_type(), row.equip_id());
         // START-GRANT COLLISION FIX (2026-07-24): a check whose detection flag the CLIENT can set
@@ -292,12 +342,21 @@ pub fn run() -> bool {
         }
         let Some(s) = crate::scout_proof::lookup(loc) else {
             no_scout += 1;
+            if traced {
+                log::info!("shop-sell TRACE row {id} (loc {loc}): SKIP -- no scout entry");
+            }
             continue;
         };
         let Some(fid) = s.er_sell_id else {
             // foreign reward, or an own-world reward in a category we cannot sell as a shop ware
             // (gem/custom). Both fall through to the shop_preview display-override.
             no_sell_id += 1;
+            if traced {
+                log::info!(
+                    "shop-sell TRACE row {id} (loc {loc}): SKIP -- no er_sell_id (foreign reward, \
+                     or own-world in an unsellable category); falls through to shop_preview"
+                );
+            }
             if let Some(v) = vanilla {
                 derived_preview.push((loc, v));
             }
@@ -305,6 +364,12 @@ pub fn run() -> bool {
         };
         let Some(etype) = equip_type_for(fid) else {
             no_equip_type += 1;
+            if traced {
+                log::info!(
+                    "shop-sell TRACE row {id} (loc {loc}): SKIP -- er_sell_id {fid} has no \
+                     equipType mapping (gem/custom category)"
+                );
+            }
             if let Some(v) = vanilla {
                 derived_preview.push((loc, v));
             }
@@ -343,6 +408,15 @@ pub fn run() -> bool {
         // that in Alaric's 2026-07-25 log: `shop-repoint: repointed 354 ... 0 owned by shop_sell`.
         // A row this pass has DECIDED to sell natively is owned whether or not the write was needed.
         owned.insert(id);
+        if traced {
+            log::info!(
+                "shop-sell TRACE row {id} (loc {loc}): PLAN sell_fid {sell_fid} -> equipId \
+                 {new_eid} equipType {etype} (row holds equipId {} equipType {}) -- write {}",
+                row.equip_id(),
+                row.equip_type(),
+                if row.equip_id() != new_eid { "NEEDED" } else { "already correct, skipped" }
+            );
+        }
         if row.equip_id() != new_eid {
             plan.push((id, new_eid, etype));
         }
@@ -384,6 +458,61 @@ pub fn run() -> bool {
                 overrides_cleared += 1;
             }
         }
+    }
+    // READ-BACK VERIFY -- "reconcile, don't dispatch" (CONTRIBUTING, *Runtime visibility*).
+    // Until 2026-07-30 this pass wrote every planned row and latched DONE without ever reading one
+    // back, so `rewrote N own-world slot(s)` reported DISPATCH, not effect. That is the exact shape
+    // of the 2026-07-29 rune-price incident, where `shop-stock: rerolled 455` stayed cheerfully high
+    // while a map load had reverted every write. A count with no read-back cannot tell "the menu is
+    // hiding a correct row" from "the row is not correct", and that is the fork the 2026-07-30
+    // shop-visibility hunt is stuck on.
+    let mut verified = 0u32;
+    let mut mismatched: Vec<String> = Vec::new();
+    for (id, eid, etype) in &plan {
+        match repo.get_mut::<ShopLineupParam>(*id) {
+            Some(row) => {
+                let got_eid = row.equip_id();
+                let got_etype = row.equip_type();
+                if got_eid == *eid && got_etype == *etype {
+                    verified += 1;
+                } else {
+                    mismatched.push(format!(
+                        "row {id}: wrote equipId {eid}/type {etype}, read back \
+                         {got_eid}/{got_etype}"
+                    ));
+                }
+                if trace_all || trace.contains(id) {
+                    log::info!(
+                        "shop-sell TRACE row {id}: READ-BACK equipId {got_eid} (wrote {eid}) \
+                         equipType {got_etype} (wrote {etype}) value {} sellQuantity {} \
+                         nameMsgId {} iconId {}",
+                        row.value(),
+                        row.sell_quantity(),
+                        row.name_msg_id(),
+                        row.icon_id()
+                    );
+                }
+            }
+            None => mismatched.push(format!(
+                "row {id}: VANISHED from ShopLineupParam between the write and the read-back"
+            )),
+        }
+    }
+    if mismatched.is_empty() {
+        log::info!(
+            "shop-sell: read-back OK -- all {verified} written row(s) hold the equipId and \
+             equipType we wrote"
+        );
+    } else {
+        // WARN, not info: a write that did not stick is the failure this instrument exists to catch,
+        // and it must be loud on an otherwise green run.
+        log::warn!(
+            "shop-sell: READ-BACK MISMATCH on {} of {} written row(s) -- the write did NOT stick. \
+             First 10: {}",
+            mismatched.len(),
+            plan.len(),
+            mismatched[..mismatched.len().min(10)].join(" | ")
+        );
     }
     if overrides_cleared > 0 {
         log::info!(
