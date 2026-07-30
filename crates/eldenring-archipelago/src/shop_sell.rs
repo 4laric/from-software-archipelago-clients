@@ -308,7 +308,7 @@ pub fn run() -> bool {
                 row.sell_quantity(),
                 row.name_msg_id(),
                 row.icon_id(),
-                flag_to_loc.get(&f).is_some()
+                flag_to_loc.contains_key(&f)
             );
         }
         if f == 0 {
