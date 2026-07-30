@@ -180,7 +180,7 @@ pub fn run() -> bool {
                 .map(|r| (*row_id, r.equip_type(), r.equip_id()))
         })
         .collect();
-    crate::shop_value::clamp(repo, &clamp_rows, "shop_prices");
+    crate::shop_value::render_guard(repo, &clamp_rows, "shop_prices");
 
     DONE.store(true, Ordering::Relaxed);
     true

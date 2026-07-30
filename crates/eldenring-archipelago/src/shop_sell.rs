@@ -546,7 +546,7 @@ pub fn run() -> bool {
     // vanished, which makes it a CHECK-AVAILABILITY bug for any reward on an under-priced slot.
     // Uses the ids this pass decided to sell, not a re-read of the row, so it cannot disagree with
     // the write above.
-    crate::shop_value::clamp(repo, &traced_all, "shop_sell");
+    crate::shop_value::render_guard(repo, &traced_all, "shop_sell");
     // THE WARE'S OWN SORT FIELDS. 2026-07-30: the read-back proved every write lands and sticks, so
     // the missing shop rows are written correctly and hidden by the MENU. The menu renders sorted by
     // WARE, not row order (Corhyn's shelf opens with row 100356, his 600-rune slot), so the ware's
