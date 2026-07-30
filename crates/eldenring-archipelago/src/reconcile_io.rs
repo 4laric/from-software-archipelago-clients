@@ -136,10 +136,18 @@ impl Default for LiveGame {
 /// and the independent `category()` guard prevents a weapon/armor row with the same numeric row from
 /// false-matching.
 ///
+/// ✅ RESOLVED 2026-07-30 — suspicion 1 below is FALSIFIED AT THE SOURCE, no Windows run needed.
+/// In the pinned crate rev (`Cargo.lock`: `fromsoftware-rs` @ `8c67a84`),
+/// `crates/eldenring/src/cs/item_id.rs:56` declares `param_id_raw, set_param_id_raw: 27, 0` — a
+/// bitfield over bits 27..0, i.e. the CATEGORY-STRIPPED row, exactly as assumed. The single-masked
+/// compare below is correct and the "keep BOTH until confirmed" instruction is discharged; the
+/// proposed double-mask alternative is dead and should NOT be reinstated. Field behaviour agrees:
+/// were it wrong, every key item in every solo session would fail its readback and re-grant forever,
+/// which is not what players see. Re-derive from the pinned rev if that dependency is bumped.
+///
 /// SUSPICIOUS / MUST CONFIRM ON WINDOWS with a set->readback (grant one known good, then re-read):
-///   1. Does `ItemId::param_id()` return the CATEGORY-STRIPPED row (assumed here), or the full
-///      category-tagged id? If the latter, this compare never matches and BOTH sides must be masked:
-///      `entry.item_id.param_id() as i32 & 0x0FFF_FFFF == want_row`.
+///   1. ~~Does `ItemId::param_id()` return the CATEGORY-STRIPPED row (assumed here), or the full
+///      category-tagged id?~~ RESOLVED above — it is the stripped row.
 ///   2. Great Runes / key items are granted at the SAME `0x4000_0000` goods category, so they ride
 ///      this predicate correctly ONLY if their grant FullID also uses that nibble — verify the
 ///      key-item / great-rune mapper packs `GOODS_FULLID`, not a raw row or a different category.
@@ -182,6 +190,87 @@ fn inventory_has_goods(goods: i32) -> bool {
         //   if (entry.item_id.param_id() as i32 & 0x0FFF_FFFF) == want_row { return true; }
     }
     false
+}
+
+/// Why a grant could not be observed, read from the game's OWN inventory bookkeeping.
+///
+/// Every field here is a datum the game already maintains — `is_*_full()` is
+/// `len >= capacity` inside the crate, not our arithmetic — so this reports rather than infers.
+/// Ordered by what it would let us conclude:
+///
+/// * the three list len/capacity pairs answer "was the add REFUSED for want of a slot" — the
+///   "would exceed the maximum storage" popup both 2026-07-30 reporters saw;
+/// * `sp_key_list` answers whether `key_items_accessor` is currently pointed at the always-single-
+///   player `key_items` list or has switched to `multiplay_key_items`. The 2026-07-19 fix widened
+///   the READ across all three lists but left the WRITE on the game's accessor, so an accessor
+///   switched to the pots-only multiplay list is the leading candidate for a refused key-item add.
+///   That is a HYPOTHESIS, not a finding — this line is here to confirm or kill it from one log;
+/// * `in_storage` answers whether the good is sitting in the storage box, which
+///   `inventory_has_goods` deliberately does not read (it walks the held bag only).
+///
+/// Returns a plain sentence on any failure to read rather than a partial line implying a fact.
+fn inventory_forensics(goods: i32) -> String {
+    use eldenring::cs::{GameDataMan, ItemCategory};
+    use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
+
+    let Ok(gdm) = (unsafe { GameDataMan::instance() }) else {
+        return "inventory unreadable (no GameDataMan) -- cause UNKNOWN".to_string();
+    };
+    let pgd = gdm.main_player_game_data.as_ref();
+    let inv = &pgd.equipment.equip_inventory_data.items_data;
+    let want_row = (goods as u32 & 0x0FFF_FFFF) as i32;
+
+    // Is the key-item accessor on the always-SP list, or has it switched to the multiplay one?
+    let sp_key_list = std::ptr::eq(
+        inv.key_items_accessor.head.as_ptr() as *const u8,
+        inv.key_items_head.as_ptr() as *const u8,
+    );
+
+    let in_storage = match pgd.storage.as_ref() {
+        None => "n/a".to_string(),
+        Some(st) => {
+            let found = st
+                .items_data
+                .normal_entries()
+                .iter()
+                .chain(st.items_data.key_entries().iter())
+                .non_empty()
+                .any(|e| {
+                    e.item_id.category() == ItemCategory::Goods
+                        && e.item_id.param_id() as i32 == want_row
+                });
+            found.to_string()
+        }
+    };
+
+    format!(
+        "normal {}/{}{} | key {}/{}{} | multiplay_key {}/{}{} | global_cap {} | \
+         key_accessor={} | in_storage={}",
+        inv.normal_items_len,
+        inv.normal_items_capacity,
+        if inv.is_normal_items_full() {
+            " FULL"
+        } else {
+            ""
+        },
+        inv.key_items_len,
+        inv.key_items_capacity,
+        if inv.is_key_items_full() { " FULL" } else { "" },
+        inv.multiplay_key_items_len,
+        inv.multiplay_key_items_capacity,
+        if inv.is_multiplay_key_items_full() {
+            " FULL"
+        } else {
+            ""
+        },
+        inv.global_capacity,
+        if sp_key_list {
+            "key_items (single-player)"
+        } else {
+            "multiplay_key_items (SWITCHED)"
+        },
+        in_storage,
+    )
 }
 
 impl GameIo for LiveGame {
@@ -613,6 +702,11 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         identity,
     };
     let _ = DRIVER.set(Mutex::new(driver));
+    log::info!(
+        "[reconcile] grant-stall guard ARMED: a unique good is parked after {} accepted-but-\
+         unobservable grants, and re-armed on every world edge",
+        er_logic::reconcile::MAX_GRANT_ATTEMPTS
+    );
     mark_dirty();
 }
 
@@ -699,6 +793,23 @@ pub fn tick() {
                 watermark: wm,
                 play_time_ms: stamp_playtime(stored, live, false),
             },
+        );
+    }
+
+    // GRANT STALL — the ONE place a permanently-refused unique good gets announced. Fires once per
+    // good per arming window (the pure reconciler owns that de-duplication), never per frame.
+    //
+    // This is the telemetry the 2026-07-30 softlock had none of: pre-fix, a refused grant re-fired
+    // ~6x/second and the ONLY log line was `applied 1 action(s) (converged=true)` — reporting
+    // success while the item hit the floor. Every number below is read from the game's own
+    // inventory bookkeeping rather than inferred, so the next report NAMES the cause instead of
+    // leaving us to theorise about it (three rounds of plausible theories is the house failure mode).
+    for g in &out.newly_stalled {
+        log::warn!(
+            "[reconcile] INERT: goods {g:#x} accepted {} grant(s) and was never observable -- \
+             no longer re-granting until the next load. {}",
+            er_logic::reconcile::MAX_GRANT_ATTEMPTS,
+            inventory_forensics(*g)
         );
     }
 
