@@ -793,4 +793,75 @@ mod replay {
         );
         assert!(out.applied.is_empty(), "and it must not apply anything");
     }
+
+    /// The 2026-07-29 WILD timeline (player log `archipelago-2026-07-29.log`: 6 process sessions,
+    /// 4525 flood grants at ~6.6/s, every session ending in a native CTD). The risk under review:
+    /// [`Reconciler::rearm_grant_stalls`] fires on EVERY unstable tick, so if world stability
+    /// flapped mid-flood the guard would re-arm forever and never park. The log says stability did
+    /// NOT flap: `inventory-ptr: retired at world edge` / `enemy-scaling: settle release` appear
+    /// only at load screens -- one per session load-in, plus one mid-session warp in two sessions
+    /// -- and each is followed by MINUTES of continuously stable flood (the last session floods
+    /// stable for 8 minutes straight). Encoded here as [unstable load] -> [long stable stretch]
+    /// per stretch, one stretch per world edge the log shows. The guard must spend exactly
+    /// MAX_GRANT_ATTEMPTS grants per stretch and then hold converged, turning the wild 4525-grant
+    /// flood into 24 grants for the whole evening.
+    #[test]
+    fn wild_20260729_six_session_flood_timeline_is_bounded_replay() {
+        let mut g = MockGame::stable();
+        g.refuse_unique_adds = true; // accepted, never observable -- the wild failure mode
+
+        // Stable-stretch lengths (in ticks) between world edges, per session. Sessions 4 and 5 had
+        // a second mid-session world edge (01:41:07+01:41:22, 01:42:27+01:42:41); the rest had only
+        // the load-in. Lengths are scaled-down stand-ins for minutes of stable flood.
+        let sessions: [&[usize]; 6] = [
+            &[450],     // S1: edge 01:35:20, flood to CTD 01:37:19
+            &[160],     // S2: 01:37:30 -> CTD 01:38:37
+            &[290],     // S3: 01:38:46 -> CTD 01:40:18
+            &[90, 140], // S4: two edges, CTD 01:41:43
+            &[95, 260], // S5: two edges, CTD 01:43:21
+            &[3200],    // S6: 01:45:21 edge, EIGHT stable minutes -> CTD 01:53:35
+        ];
+
+        let mut stretches = 0usize;
+        for session in sessions {
+            // Process restart = fresh reconciler state (the stall set is deliberately not
+            // persisted), exactly like the player relaunching after each CTD.
+            let mut r = Reconciler::new(rune_inputs());
+            for &len in session {
+                // The world edge: a few unstable ticks (load screen / dwell not yet settled).
+                g.set_stable(false);
+                for _ in 0..5 {
+                    let out = r.tick(&mut g, TickBudget::default());
+                    assert!(out.skipped_unstable);
+                }
+                g.set_stable(true);
+
+                let before = g.unique_grant_calls.len();
+                let mut last = TickOutcome::default();
+                for _ in 0..len {
+                    last = r.tick(&mut g, TickBudget::default());
+                    r.mark_dirty(); // core.rs re-marks dirty every frame
+                }
+                assert_eq!(
+                    g.unique_grant_calls.len() - before,
+                    MAX_GRANT_ATTEMPTS as usize,
+                    "each stable stretch must cost exactly the allowance, then park"
+                );
+                assert!(
+                    last.converged && last.applied.is_empty(),
+                    "after parking, the stretch must sit converged instead of flooding"
+                );
+                stretches += 1;
+            }
+        }
+        assert_eq!(
+            stretches, 8,
+            "the log shows 8 world edges across the 6 flood sessions"
+        );
+        assert_eq!(
+            g.unique_grant_calls.len(),
+            stretches * MAX_GRANT_ATTEMPTS as usize,
+            "the whole wild evening is bounded at 3 grants per world edge -- 24, not 4525"
+        );
+    }
 }
