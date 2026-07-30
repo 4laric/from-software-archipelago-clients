@@ -103,6 +103,14 @@ unsafe extern "C" fn lua_warp_detour(rcx: *mut c_void, rdx: *mut c_void, warp_ar
     // construction (no panic path; see scaling::notify_transition), so it may run bare inside
     // the game's call frame.
     crate::scaling::notify_transition();
+    // SAME EDGE, OTHER VICTIM (2026-07-30, generalizing the 2026-07-24 pair): the GRANT path had
+    // the identical warp-out blindness. `on_world_edge` only fires at ARRIVAL, so through the
+    // teardown frames the captured inventory pointer stayed same-epoch while the engine freed the
+    // origin map -- and `in_world()` still read true, so grants kept flowing through it. Retire it
+    // NOW, and hold the static-slot primer for `inv_ptr::PRIME_HOLDOFF_MS` so it cannot recapture
+    // the dying object (see er_logic::inv_ptr::may_prime, replay-tested). Atomic stores + one log
+    // line; no panic path, safe inside the game's call frame like notify_transition above.
+    crate::detour::on_warp_request();
     // Original first (same order warp_to_grace uses: request the warp, then intercept). The
     // None arm is unreachable in practice — install() runs on the game thread, the same thread
     // that calls LuaWarp, so no call can land between enable() and HOOK.set() — but if it ever

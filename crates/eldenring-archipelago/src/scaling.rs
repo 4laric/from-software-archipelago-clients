@@ -19,7 +19,7 @@ use er_logic::scaling::{
     NUM_TIERS, ScalingConfig, is_dlc_bucket, is_scaling_speffect, raw_target_for_region,
     speffect_id_for_tier, tier_for_region, tier_rates,
 };
-use er_logic::scaling_settle::{SettlePolicy, SweepGate};
+use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
 use serde_json::Value;
 
@@ -229,6 +229,17 @@ pub fn tick() {
     let Some(player) = wcm.main_player.as_ref() else {
         return;
     };
+    // DEATH GUARD (2026-07-30, generalizing the guard no_fall_damage / no_equip_load / deathlink
+    // have each carried for the player's OWN SpEffect list): at the death-cam transition the
+    // engine tears chr_ins + special_effect lists down, and mutating one mid-teardown is a native
+    // CTD. A death in place raises no signal this sweep's gates can see -- no warp request, no
+    // region change, and the in-world edge only fires AFTER teardown -- yet scale_one mutates the
+    // same list type on every swept entity. hp is read exactly as DeathLink's read_local_hp reads
+    // it; the predicate + timeline live in er_logic::scaling_settle (host-tested). Degrade:
+    // enemies keep their current tier while the player is dead, invisible in play.
+    if sweep_blocked_by_death(player.chr_ins.modules.data.hp) {
+        return;
+    }
     // SCALING_WIRE: resolve in play_region/100 sub-id space -- the same bucket the
     // region-lock kick uses and the space regionSphereTargetRanges is emitted in.
     let region = (player.play_region_id / 100) as i32;

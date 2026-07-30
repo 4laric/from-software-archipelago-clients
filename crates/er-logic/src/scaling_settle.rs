@@ -10,16 +10,17 @@
 //! dereference a half-constructed `ChrIns` and crash the game NATIVELY -- no Rust panic, the game's
 //! own memory (Siofra / the Eternal Cities, 2026-07-09).
 //!
-//! The primary defence against that is NOT this gate. It is `scaling.rs::active_characters`, which
-//! filters on `ChrSetEntry::chr_load_status == Active` -- a `u8` the game publishes on the ENTRY, so
-//! reading it dereferences no `ChrIns` at all. Upstream's `ChrSet::characters()` checks only
-//! `chr_ins.is_some()` and ignores that byte entirely, which is how a half-constructed character
-//! ever reached `apply_speffect` in the first place.
+//! THIS GATE IS THE PRIMARY DEFENCE. (An earlier revision of this paragraph said the primary
+//! defence was `scaling.rs::active_characters` filtering on `chr_load_status == Active`. That
+//! filter shipped on 2026-07-27 and was REVERTED the same day: fightable, loaded enemies are not
+//! in state `Active`, so it rejected ~99.5% of entries and no real enemy was ever scaled -- a
+//! Mohgwyn/Snowfield start met vanilla endgame stats. The sweep is back to walking every non-null
+//! entry; `chr_load_status` is only COUNTED into a histogram now, never filtered on, until live
+//! logs say what states enemies actually occupy. See `scaling.rs::sweepable_characters`.)
 //!
-//! This gate remains as a TIME-BASED BACKSTOP for the hazard the status byte cannot describe: a torn
-//! read of the `entries` ARRAY itself while the game is rebuilding it. Belt and braces, deliberately
-//! -- the crash class is still open elsewhere in this client (the "Beside the Rampart Gaol" warp),
-//! so the mechanism was replaced without also removing the old guard in the same change.
+//! Alongside the timer, [`sweep_blocked_by_death`] closes the one transition edge no timer signal
+//! covers from its start: the local player's death (hp <= 0 fires frames before any in-world edge
+//! or region change is observable).
 //!
 //! # The window it replaces
 //!
@@ -177,6 +178,27 @@ impl SweepGate {
     }
 }
 
+/// Is the enemy sweep blocked because the LOCAL PLAYER is dead or dying?
+///
+/// The death-cam transition tears down `chr_ins` + `special_effect` lists, and mutating a
+/// SpEffect list mid-teardown is a NATIVE crash. Three client modules have carried an
+/// `hp <= 0` guard for exactly this class since it was first observed (`no_fall_damage.rs`,
+/// `no_equip_load.rs`, `deathlink.rs`) -- each protecting only the PLAYER's own list. The
+/// scaling sweep mutates the same list type on up to ~340 entities per pass and had no such
+/// guard: between the death edge (`hp <= 0`, observable immediately) and the respawn's
+/// in-world false->true edge (which re-arms the settle gate, but only AFTER teardown has run),
+/// the engine begins tearing the world down while the sweep keeps walking and mutating it.
+/// Neither the region-stability half nor the transition half of [`SweepGate`] can see this
+/// edge: a death in place changes no region and requests no warp.
+///
+/// Pure predicate so the timeline is host-testable; the production caller is
+/// `scaling.rs::tick`, reading hp exactly as DeathLink's `read_local_hp` does (the read the
+/// three existing guards already trust). Worst case of a false positive is the documented
+/// degrade: enemies keep their current tier for the seconds the player is dead.
+pub fn sweep_blocked_by_death(player_hp: i32) -> bool {
+    player_hp <= 0
+}
+
 #[cfg(test)]
 mod replay {
     //! Timeline harness (CONTRIBUTING: "regression by replay -- model the timeline, not a single
@@ -187,6 +209,33 @@ mod replay {
     use super::*;
 
     const THROTTLE_TICKS: u32 = 30;
+
+    #[test]
+    fn a_death_in_place_blocks_the_sweep_until_respawn_replay() {
+        // THE TIMELINE the timer gate cannot see: a settled, region-stable player dies in place.
+        // No warp request, no region change, no in-world edge yet -- every timer says "sweep".
+        // Pre-fix the sweep walks the tearing-down entries and mutates their SpEffect lists;
+        // post-fix hp <= 0 blocks it from the FIRST death frame, and respawn (hp > 0 again,
+        // plus the in-world edge re-arming the settle gate) restores service.
+        let (mut gate, pol) = (SweepGate::new(), SettlePolicy::SHIPPING);
+        gate.on_transition(0);
+        gate.on_region(1042, 0, &pol);
+        let settled = pol.settle_ms.max(pol.stable_ms) + 1;
+        assert!(
+            gate.sweep_allowed(settled, &pol),
+            "settled and stable: the timer gate is fully open"
+        );
+        let hp_dying = 0;
+        assert!(
+            sweep_blocked_by_death(hp_dying),
+            "the death edge blocks the sweep while every timer says go"
+        );
+        let hp_respawned = 450;
+        assert!(
+            !sweep_blocked_by_death(hp_respawned),
+            "respawn restores the sweep"
+        );
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum Ev {

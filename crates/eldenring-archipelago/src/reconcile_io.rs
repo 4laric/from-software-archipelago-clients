@@ -831,6 +831,16 @@ pub fn tick() {
             inventory_forensics(*g)
         );
     }
+    for f in &out.newly_stalled_flags {
+        log::warn!(
+            "[reconcile] INERT: flag {f} was written {} time(s) and never read back at the \
+             written value -- no longer re-asserting until the next load. Either the id has no \
+             flag-block descriptor on this build (CSEventFlagMan::set_flag silently discards \
+             unknown ids) or something un-sets it within the same tick. A flag vanilla merely \
+             CONTESTS (clears a frame later) reads back fine and is never parked.",
+            er_logic::reconcile::MAX_FLAG_ATTEMPTS,
+        );
+    }
 
     if out.converged {
         DIRTY.store(false, Ordering::Relaxed);
