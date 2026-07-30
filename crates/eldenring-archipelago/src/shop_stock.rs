@@ -103,7 +103,8 @@ pub fn run() -> bool {
             // NOTE the flag is read and cleared in a SECOND PASS below, not here: shop_flags'
             // read/write_stock_flag re-enter the repo through `instance()`, and doing that while this
             // loop holds the `instance_mut()` borrow would alias the same table through two paths.
-            let ware_ok = row.equip_id() == gid && row.equip_type() == etype && row.value() == price;
+            let ware_ok =
+                row.equip_id() == gid && row.equip_type() == etype && row.value() == price;
             if ware_ok {
                 // Ware already correct; the flag pass below still gets a look at it, because a row can
                 // be correctly rerolled and STILL be invisible if its stock flag survived.
