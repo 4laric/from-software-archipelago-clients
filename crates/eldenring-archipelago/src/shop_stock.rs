@@ -144,7 +144,12 @@ pub fn run() -> bool {
             Some(0) => {}
             Some(old) => {
                 cleared += 1;
-                log::info!("shop-stock: row {row_id} stock flag {old} -> 0 (was hiding the shelf)");
+                // STATE WHAT HAPPENED, NOT WHY. This used to say "(was hiding the shelf)" and that
+                // was a claim the log cannot support: every one of these rows has a nonzero stock
+                // flag by construction (it is the world-side selector), so the message fired for
+                // all 14 every time -- including rows that were plainly visible in game with the
+                // flag still set. A log line that always asserts the same cause is not evidence.
+                log::info!("shop-stock: row {row_id} stock flag {old} -> 0");
             }
             None => log::warn!("shop-stock: row {row_id} stock flag not writable"),
         }
