@@ -65,6 +65,8 @@ pub fn run() -> bool {
         Err(_) => return false, // repo not up yet -- retry next tick
     };
 
+    // The write loop CONSUMES `prices`; the read-back below needs the same pairs.
+    let verify: Vec<(u32, i32)> = prices.clone();
     let (mut n, mut missing) = (0usize, 0usize);
     for (row_id, price) in prices {
         let Some(row) = repo.get_mut::<ShopLineupParam>(row_id) else {
@@ -79,9 +81,40 @@ pub fn run() -> bool {
             n += 1;
         }
     }
+    // READ-BACK VERIFY. `n` counts rows whose value DIFFERED and were written; it is a dispatch
+    // count, and dispatch counts are what lied through the whole 2026-07-29 rune-price incident
+    // (CONTRIBUTING rule 12: "a correct wire is not a correct feature"). Note the shape of the
+    // count: `n == 0` on a later pass means every row ALREADY held the rolled price -- it is not a
+    // DONE-latch artefact. That distinction cost a session to re-derive from the log, so assert it
+    // here instead: re-read every configured row and report what the param actually holds.
+    let mut ok = 0u32;
+    let mut wrong: Vec<String> = Vec::new();
+    for (row_id, price) in &verify {
+        match repo.get_mut::<ShopLineupParam>(*row_id) {
+            Some(row) => {
+                let got = row.value();
+                if got == *price {
+                    ok += 1;
+                } else {
+                    wrong.push(format!("row {row_id}: wrote {price}, read back {got}"));
+                }
+            }
+            None => wrong.push(format!("row {row_id}: no live row at read-back")),
+        }
+    }
     log::info!(
         "shop-prices: rolled rune price written to {n} row(s) ({missing} configured row(s) had no live ShopLineupParam entry)"
     );
+    if wrong.is_empty() {
+        log::info!("shop-prices: read-back OK -- {ok} row(s) hold the rolled price");
+    } else {
+        log::warn!(
+            "shop-prices: READ-BACK MISMATCH on {} of {} configured row(s). First 10: {}",
+            wrong.len(),
+            verify.len(),
+            wrong[..wrong.len().min(10)].join(" | ")
+        );
+    }
     DONE.store(true, Ordering::Relaxed);
     true
 }
