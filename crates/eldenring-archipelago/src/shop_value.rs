@@ -168,15 +168,21 @@ fn set_ware_sell_value(
 ) -> bool {
     let id = equip_id as u32;
     match equip_type {
-        0 => repo.get_mut::<EquipParamWeapon>(id).map(|r| r.set_sell_value(v)),
+        0 => repo
+            .get_mut::<EquipParamWeapon>(id)
+            .map(|r| r.set_sell_value(v)),
         1 => repo
             .get_mut::<EquipParamProtector>(id)
             .map(|r| r.set_sell_value(v)),
         2 => repo
             .get_mut::<EquipParamAccessory>(id)
             .map(|r| r.set_sell_value(v)),
-        3 => repo.get_mut::<EquipParamGoods>(id).map(|r| r.set_sell_value(v)),
-        4 => repo.get_mut::<EquipParamGem>(id).map(|r| r.set_sell_value(v)),
+        3 => repo
+            .get_mut::<EquipParamGoods>(id)
+            .map(|r| r.set_sell_value(v)),
+        4 => repo
+            .get_mut::<EquipParamGem>(id)
+            .map(|r| r.set_sell_value(v)),
         _ => None,
     }
     .is_some()
@@ -329,12 +335,21 @@ mod tests {
             Action::RefuseSynthetic
         );
         // ...and the refusal is about GOODS specifically: the same id as a weapon is a real ware.
-        assert_ne!(plan(10, 5000, 0, synthetic, Mode::Lower), Action::RefuseSynthetic);
+        assert_ne!(
+            plan(10, 5000, 0, synthetic, Mode::Lower),
+            Action::RefuseSynthetic
+        );
     }
 
     #[test]
     fn raise_mode_is_the_old_behaviour_and_still_available_as_a_fallback() {
-        assert_eq!(plan(137, 5000, 3, 2909, Mode::Raise), Action::SetRowValue(5001));
-        assert_eq!(plan(137, 5000, 3, 2909, Mode::RaiseEq), Action::SetRowValue(5000));
+        assert_eq!(
+            plan(137, 5000, 3, 2909, Mode::Raise),
+            Action::SetRowValue(5001)
+        );
+        assert_eq!(
+            plan(137, 5000, 3, 2909, Mode::RaiseEq),
+            Action::SetRowValue(5000)
+        );
     }
 }
