@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use eldenring::cs::GameDataMan;
 use fromsoftware_shared::FromStatic;
@@ -31,6 +32,19 @@ static LAST_INVENTORY_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// captured in an older epoch is DEAD -- handing it to the game's AddItemFunc is a use-after-free,
 /// and it is what crashed the 2026-07-24 playtest twice (er_logic::inv_ptr, replay-tested).
 static WORLD_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// `now_ms()` timestamp of the most recent warp REQUEST (LuaWarp detour), or
+/// [`er_logic::inv_ptr::NEVER_WARPED`] if none yet. From the request until
+/// `inv_ptr::PRIME_HOLDOFF_MS` later, the static-slot primer sits out: the slot still points at
+/// the ORIGIN map's inventory object while the engine frees it, and a prime in that window would
+/// recapture the dying object in the current epoch -- reopening the exact use-after-free the
+/// warp-request epoch bump just closed (er_logic::inv_ptr::may_prime, replay-tested).
+static LAST_WARP_REQUEST_MS: AtomicU64 = AtomicU64::new(er_logic::inv_ptr::NEVER_WARPED);
+
+/// Process-relative monotonic clock for the warp-request holdoff (same shape as scaling.rs's).
+fn now_ms() -> u64 {
+    static T0: OnceLock<Instant> = OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 /// checkItemFlags from slot_data: full AddItemFunc-space item id -> acquisition flags of the check
 /// locations that vanilla-hold it. LIVE vanilla-suppressor since 2026-07-01. The re-pickup
 /// discriminator is now the COLLECTED set (KNOWN_COLLECTED_FLAGS), not the live game flag —
@@ -134,10 +148,22 @@ pub fn take_pending_checks() -> Vec<i64> {
     std::mem::take(&mut *PENDING_CHECKS.lock().unwrap())
 }
 
-/// Whether the detour has captured a live inventory pointer yet (set on the player's first pickup).
-/// `update_live` gates server-pushed grants on this so the receive watermark advances atomically.
+/// Whether the detour holds an inventory pointer that is USABLE NOW -- captured, plausible, and
+/// belonging to the CURRENT world epoch. `update_live` gates server-pushed grants (and the
+/// reconciler's world-loaded reading) on this so the receive watermark advances atomically.
+///
+/// EPOCH-AWARE since 2026-07-30: this was the verbatim pre-fix `>= 0x10000` test, so for the tick
+/// or two after a world edge it reported "inventory ready" through a pointer `grant_full_id`
+/// itself would refuse -- gate and enforcement disagreeing about the same question. Harmless in
+/// the observed cases (every caller retries on a failed grant), but the 2026-07-24 postmortem's
+/// rule is that a stale pointer is DEAD, not "probably fine", and a gate that answers from a dead
+/// pointer is exactly the kind of leftover the next instance of the class grows from.
 pub fn has_inventory() -> bool {
-    LAST_INVENTORY.load(Ordering::Relaxed) >= 0x10000
+    er_logic::inv_ptr::usable(
+        LAST_INVENTORY.load(Ordering::Relaxed),
+        LAST_INVENTORY_EPOCH.load(Ordering::Relaxed),
+        WORLD_EPOCH.load(Ordering::Relaxed),
+    )
 }
 
 /// Address of `PlayerGameData.equipment.equip_inventory_data` — the structure AddItemFunc takes as
@@ -184,6 +210,19 @@ pub fn prime_inventory_if_needed() {
     if !crate::flags::in_world() {
         return; // the slot only holds a valid inventory instance once the player is loaded
     }
+    // WARP-OUT HOLDOFF (2026-07-30): for the first teardown frames after a warp request,
+    // `in_world()` still reads true and the static slot still points at the ORIGIN map's dying
+    // inventory object. Priming here would recapture it in the CURRENT epoch and defeat the
+    // retirement `on_warp_request` just performed -- the epoch test cannot see a free that
+    // happens within an epoch; only time can. Time-bounded (PRIME_HOLDOFF_MS), so a warp that
+    // never completes merely defers grants a few seconds, never permanently.
+    if !er_logic::inv_ptr::may_prime(
+        now_ms(),
+        LAST_WARP_REQUEST_MS.load(Ordering::Relaxed),
+        er_logic::inv_ptr::PRIME_HOLDOFF_MS,
+    ) {
+        return;
+    }
     // Use the RVA pointer-slot resolver (CONFIRMED 2026-06-30); the typed-field resolver MISMATCHED.
     if let Some(inv) = static_inventory_ptr_rva() {
         LAST_INVENTORY.store(inv, Ordering::Relaxed);
@@ -201,6 +240,23 @@ pub fn on_world_edge() {
     let e = WORLD_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
         "inventory-ptr: retired at world edge (epoch {e}) -- re-priming before the next grant"
+    );
+}
+
+/// Called from the LuaWarp detour the moment ANY warp (menu or client) is REQUESTED -- the
+/// warp-OUT edge `on_world_edge` cannot cover, because it only fires at ARRIVAL (in-world
+/// false->true) and `in_world()` keeps reading true through the first teardown frames. Retires
+/// the captured pointer (epoch bump) AND stamps the primer holdoff so the static slot cannot
+/// re-seed the dying object (see `LAST_WARP_REQUEST_MS`). Same crash class, same postmortems:
+/// the 2026-07-24 arrival-side pair (er_logic::inv_ptr) and the Rampart Gaol warp-out sweep.
+///
+/// Runs inside the game's own warp call frame: atomics + one log line, no panic path.
+pub fn on_warp_request() {
+    LAST_WARP_REQUEST_MS.store(now_ms(), Ordering::Relaxed);
+    let e = WORLD_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    log::info!(
+        "inventory-ptr: retired at warp request (epoch {e}); primer held {}ms",
+        er_logic::inv_ptr::PRIME_HOLDOFF_MS
     );
 }
 
