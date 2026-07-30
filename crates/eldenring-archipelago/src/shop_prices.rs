@@ -49,6 +49,54 @@ pub fn run() -> bool {
     if DONE.load(Ordering::Relaxed) {
         return true;
     }
+    // ⭐⭐⭐ A/B KILL SWITCH -- `ER_SHOP_PRICES=off` skips the write entirely.
+    //
+    // Alaric, 2026-07-30: "we've had runes in the shop before we started trying to fix the price."
+    // That is ground truth and it OUTRANKS the 15-for-15 absence pattern I had been reading as "the
+    // purchase menu cannot display a rune". If runes rendered before, the menu can display one, and
+    // something we added since is what hides it.
+    //
+    // This module is the only one that writes ShopLineupParam.value, and it writes it ONLY on rune
+    // rows -- so "rune" and "we rewrote the price" have been the SAME VARIABLE in every observation
+    // to date. A day was spent diffing EquipParamGoods columns that are all merely collinear with
+    // rune-ness (sortGroupId 100, canMultiUse 1, goodsUseAnim 9) while the actual manipulated
+    // variable sat in this file, unconsidered.
+    //
+    // 🛑 THE DECISION TABLE THAT WAS HERE WAS WRONG IN THE DANGEROUS DIRECTION. It read: "absent both
+    // ways ⇒ this module is exonerated." Fable root-caused the bug while this switch was in flight,
+    // and under the real rule this A/B would have SHIPPED A FALSE EXONERATION.
+    //
+    // THE RULE (Fable, 2026-07-30, 16/16 row-level predictions across two seeds, zero misses):
+    // the purchase menu excludes any row whose `value` is BELOW the ware's own `sellValue`. Not
+    // `value == 0`, not the write itself -- the RELATION. Corroborated by a non-rune: Veteran's Helm
+    // (sellValue 1000) on a 600-value slot is hidden, while protector 201100 (sellValue 100) on a
+    // 1000-value slot two rows away renders.
+    //
+    // Runes are hidden 15/15 BY CONSTRUCTION, not by bad luck: `rune_worth` is `GOODS_PRICE // 10`,
+    // which is exactly `sellValue`, and the roll is `randint(0, 1 * worth)` -- so every rolled price
+    // is <= sellValue and the whole roll range sits inside the hidden region. It also retro-explains
+    // 2026-07-29's "I have never seen a single rune priced below its value": the below-value ones
+    // were there and INVISIBLE. That report was a direct observation of this rule.
+    //
+    // With the switch OFF, some rune rows reappear and others do NOT (a slot whose vanilla price is
+    // under the ware's sellValue stays hidden), and the helm stays hidden in BOTH arms. So a
+    // both-arms-absent result would have meant nothing. Kept only as a probe; the fix is a clamp at
+    // the write choke point, not this flag.
+    if std::env::var("ER_SHOP_PRICES")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "off" || v == "0" || v == "false"
+        })
+        .unwrap_or(false)
+    {
+        log::warn!(
+            "shop-prices: DISABLED by ER_SHOP_PRICES -- rune rows keep the price of the ware their \
+             slot used to sell. A/B probe for the 2026-07-30 shop-visibility hunt, not a shipping \
+             configuration."
+        );
+        DONE.store(true, Ordering::Relaxed);
+        return true;
+    }
     let prices: Vec<(u32, i32)> = match PRICES.lock().unwrap().as_ref() {
         Some(m) if !m.is_empty() => m.iter().map(|(k, v)| (*k, *v)).collect(),
         Some(_) => {
@@ -115,6 +163,25 @@ pub fn run() -> bool {
             wrong[..wrong.len().min(10)].join(" | ")
         );
     }
+    // CLAMP ABOVE sellValue -- AFTER the read-back, deliberately.
+    //
+    // A rolled rune price is `<= sellValue` BY CONSTRUCTION (`rune_worth` is `GOODS_PRICE // 10`,
+    // which is exactly `sellValue`, and the roll is `randint(0, 1 * worth)`), so without this every
+    // rune row we price is invisible in the menu -- the whole 2026-07-30 bug. See `shop_value`.
+    //
+    // ORDER MATTERS: the read-back above asserts the ROLLED price landed. Clamping first would
+    // raise some of those values and the read-back would then report a MISMATCH on rows that are
+    // working perfectly -- an instrument screaming at its own colleague. Verify the write, then
+    // apply the floor.
+    let clamp_rows: Vec<(u32, u8, i32)> = verify
+        .iter()
+        .filter_map(|(row_id, _)| {
+            repo.get::<ShopLineupParam>(*row_id)
+                .map(|r| (*row_id, r.equip_type(), r.equip_id()))
+        })
+        .collect();
+    crate::shop_value::render_guard(repo, &clamp_rows, "shop_prices");
+
     DONE.store(true, Ordering::Relaxed);
     true
 }
