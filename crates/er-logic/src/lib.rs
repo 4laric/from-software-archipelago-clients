@@ -58,6 +58,7 @@ pub mod shop_repoint_replay;
 pub mod start_backfill;
 pub mod start_grant_replay;
 pub mod static_lots;
+pub mod summon_pools;
 pub mod sweep_flush;
 pub mod sweep_gate;
 pub mod toast;

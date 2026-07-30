@@ -47,6 +47,7 @@ mod shop_stock;
 mod shop_value;
 mod start_item_backfill;
 mod startgrants;
+mod summon_pools;
 mod upgrade_cost;
 mod upgrades;
 mod warp;

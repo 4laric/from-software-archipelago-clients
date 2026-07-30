@@ -39,6 +39,9 @@
 pub const SUPPORTED: &[&str] = &[
     // options.completion_scaling_ceiling -> er_logic::scaling::ceiling_tier (2026-07-27).
     "scaling_ceiling",
+    // options.no_rune_loss -> deathlink.rs tick_rune_snapshot / on_local_death_keep_runes
+    // (2026-07-30). Added in the same change as the behaviour, per the rule above.
+    "no_rune_loss",
 ];
 
 /// Feature tags the seed requires that this build does not know.

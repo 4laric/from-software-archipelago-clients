@@ -91,6 +91,9 @@ pub struct Core {
     flag_poll_baseline: HashSet<u32>,
     /// Whether flag_poll_baseline has been captured (once, on the first in-world poll).
     flag_poll_baseline_done: bool,
+    /// Summoning pools activated this session (see `summon_pools`). Latched once applied; the write
+    /// is idempotent and save-persisted, so the latch is about log noise and not correctness.
+    summon_pools_done: bool,
     /// Start-of-run grants (items / graces / map reveal).
     start: Option<crate::startgrants::StartConfig>,
     start_flags_done: bool,
@@ -448,6 +451,7 @@ impl shared::Core for Core {
             poll_counter: 0,
             flag_poll_baseline: HashSet::new(),
             flag_poll_baseline_done: false,
+            summon_pools_done: false,
             start: None,
             start_flags_done: false,
             start_items_granted: false,
@@ -675,6 +679,7 @@ impl shared::Core for Core {
                 // int-or-bool tolerant (er_logic::options): the apworld serializes options
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
+                crate::deathlink::set_no_rune_loss(er_logic::options::parse_no_rune_loss(sd));
                 crate::no_equip_load::set_enabled(er_logic::options::parse_no_equip_load(sd));
                 // no_fall_damage: the spirit-spring fallDamageRate=0 SpEffect, kept on the player.
                 crate::no_fall_damage::set_enabled(er_logic::options::parse_no_fall_damage(sd));
@@ -1472,6 +1477,26 @@ impl shared::Core for Core {
                         log::warn!(
                             "start graces set but sentinel flag {sentinel:?} read back FALSE (clobbered by save load?) — retrying next tick"
                         );
+                    }
+                }
+                // Summoning pools ride the SAME world-loaded gate as the start flags above, for the
+                // same reason: a flag written during the load screen is clobbered by the save-data
+                // load. The protected set is assembled from the LIVE merged flag-poll table (values
+                // = per-location guards, keys = sweep groups) rather than a literal list — pool row
+                // ids collide with shop stock flags, and a hardcoded exclusion list would rot the
+                // moment the shop corpus moved. No table yet ⇒ nothing is proven safe ⇒ don't write.
+                if !self.summon_pools_done
+                    && has_inv
+                    && let Some(fp) = self.flag_poll.as_ref()
+                {
+                    let protected: std::collections::BTreeSet<u32> = fp
+                        .location_flags
+                        .values()
+                        .copied()
+                        .chain(fp.sweep_flags.keys().copied())
+                        .collect();
+                    if crate::summon_pools::apply(&protected) {
+                        self.summon_pools_done = true;
                     }
                 }
                 // R11 (SWEEP): `.all(grant_full_id)` re-granted already-succeeded items on a
@@ -2518,9 +2543,20 @@ impl shared::Core for Core {
                 }
             }
         }
+        // Sample runes while alive BEFORE anything can kill us this tick (no_rune_loss needs a
+        // pre-death value; see deathlink::tick_rune_snapshot). No-op unless the option is on.
+        crate::deathlink::tick_rune_snapshot();
         crate::deathlink::drive_kill();
-        if crate::deathlink::is_enabled()
-            && crate::deathlink::poll_local_death()
+        // The death EDGE is no longer gated on death_link. It feeds two consumers now — the
+        // outgoing DeathLink broadcast (still gated) and no_rune_loss (independent of DeathLink) —
+        // and leaving the poll inside the gate meant a slot with no_rune_loss but no death_link
+        // never advanced WAS_DEAD, so its first death produced no edge at all.
+        let died_locally = crate::deathlink::poll_local_death();
+        if died_locally {
+            crate::deathlink::on_local_death_keep_runes();
+        }
+        if died_locally
+            && crate::deathlink::is_enabled()
             && let Some(client) = self.client_mut()
         {
             log::info!("DeathLink: local death detected -> broadcasting");

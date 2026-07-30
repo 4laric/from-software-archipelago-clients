@@ -12,7 +12,7 @@
 //! outgoing is inert; INCOMING is unaffected. Fill `read_local_death` (WorldChrMan.main_player → HP)
 //! to enable sending, and add a post-incoming-kill grace window so our own baked kill doesn't echo.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use std::sync::Mutex;
 
@@ -25,6 +25,14 @@ use fromsoftware_shared::FromStatic;
 const DEATHLINK_KILL_FLAG: u32 = 76996;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// `options.no_rune_loss` — keep runes on EVERY death, not just DeathLink-inflicted ones. Rides the
+/// same KeepRunes latch, so the two features compose rather than each owning a copy of the state.
+static NO_RUNE_LOSS: AtomicBool = AtomicBool::new(false);
+/// Last rune count observed while in-world and ALIVE. The withhold has to write 0 *before* the
+/// engine banks the bloodstain, which is after we notice the death — so the value we pay back has
+/// to have been captured on an earlier tick. `u32::MAX` is the "never sampled" sentinel (the game
+/// caps runes far below it).
+static LAST_ALIVE_RUNES: AtomicU32 = AtomicU32::new(u32::MAX);
 static KILL_PENDING: AtomicBool = AtomicBool::new(false);
 static WAS_DEAD: AtomicBool = AtomicBool::new(false);
 
@@ -39,6 +47,57 @@ pub fn set_enabled(on: bool) {
 }
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// Set from slot_data `options.no_rune_loss` at connect.
+pub fn set_no_rune_loss(on: bool) {
+    NO_RUNE_LOSS.store(on, Ordering::Relaxed);
+    log::info!("no_rune_loss: {}", if on { "ENABLED" } else { "off" });
+}
+pub fn no_rune_loss_enabled() -> bool {
+    NO_RUNE_LOSS.load(Ordering::Relaxed)
+}
+
+/// Sample the held rune count while the player is in-world and alive. MUST run every tick when
+/// `no_rune_loss` is on: it is the only source of a pre-death value, since by the time the death
+/// edge fires the count we can read may already be on its way to the bloodstain.
+pub fn tick_rune_snapshot() {
+    if !no_rune_loss_enabled() {
+        return;
+    }
+    if !crate::flags::in_world() {
+        return;
+    }
+    // Alive only. Sampling a dead/dying player is how you "restore" a zero.
+    if !matches!(read_local_hp(), Some(hp) if hp > 0) {
+        return;
+    }
+    if let Some(runes) = read_rune_count() {
+        LAST_ALIVE_RUNES.store(runes, Ordering::Relaxed);
+    }
+}
+
+/// Handle a local death edge for `no_rune_loss`: zero the held runes so the (late) bloodstain bank
+/// takes nothing, and arm the existing restore leg to pay the snapshot back on respawn.
+///
+/// Called on EVERY local death edge. Deaths we inflict ourselves for an incoming DeathLink do not
+/// reach here — `kill_local_player` pre-arms `WAS_DEAD`, so `poll_local_death` never sees an edge
+/// for them and `drive_kill` has already armed the latch with its own snapshot. One latch, two
+/// producers, no double-arm.
+pub fn on_local_death_keep_runes() {
+    if !no_rune_loss_enabled() {
+        return;
+    }
+    let snapshot = LAST_ALIVE_RUNES.load(Ordering::Relaxed);
+    if snapshot == u32::MAX {
+        log::warn!("no_rune_loss: died before any alive rune sample -- vanilla drop this once");
+        return;
+    }
+    write_rune_count(0);
+    if let Ok(mut keep) = KEEP_RUNES.lock() {
+        keep.arm(Some(snapshot));
+    }
+    log::info!("no_rune_loss: withheld {snapshot} runes from the bloodstain");
 }
 
 /// A foreign DeathLink arrived (caller already applied the self-source guard): latch a kill.

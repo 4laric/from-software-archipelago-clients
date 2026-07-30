@@ -30,6 +30,12 @@ pub fn parse_death_link(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "death_link")
 }
 
+/// Keep held runes on EVERY death (not only DeathLink-inflicted ones). Independent of
+/// [`parse_death_link`] — a slot may run either, both, or neither.
+pub fn parse_no_rune_loss(slot_data: &Value) -> bool {
+    parse_bool_option(slot_data, "no_rune_loss")
+}
+
 /// Weapon/spell requirement removal, under EITHER apworld's option name.
 ///
 /// Our apworld emits `options.no_weapon_requirements`; Bedrock's fswap apworld emits
@@ -100,6 +106,21 @@ mod tests {
         let sd = json!({ "options": { "enable_dlc": 0, "death_link": 1 } });
         assert!(!parse_dlc(&sd));
         assert!(parse_death_link(&sd));
+    }
+
+    /// no_rune_loss must NOT be inferred from death_link, in either direction — a player can want
+    /// runes kept without opting into DeathLink at all, and the client gates the two separately.
+    #[test]
+    fn no_rune_loss_is_independent_of_death_link() {
+        let only_runes = json!({ "options": { "no_rune_loss": 1 } });
+        assert!(parse_no_rune_loss(&only_runes));
+        assert!(!parse_death_link(&only_runes));
+
+        let only_deathlink = json!({ "options": { "death_link": 1 } });
+        assert!(!parse_no_rune_loss(&only_deathlink));
+        assert!(parse_death_link(&only_deathlink));
+
+        assert!(!parse_no_rune_loss(&json!({ "options": {} })));
     }
 
     #[test]
