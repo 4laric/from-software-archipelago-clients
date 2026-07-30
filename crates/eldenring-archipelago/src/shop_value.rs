@@ -236,11 +236,11 @@ pub fn render_guard(repo: &mut SoloParamRepository, rows: &[(u32, u8, i32)], who
                 row_value,
                 sell_value,
             } => {
-                if let Some(row) = repo.get_mut::<ShopLineupParam>(*id) {
-                    if row.value() != *row_value {
-                        row.set_value(*row_value);
-                        rows_moved += 1;
-                    }
+                if let Some(row) = repo.get_mut::<ShopLineupParam>(*id)
+                    && row.value() != *row_value
+                {
+                    row.set_value(*row_value);
+                    rows_moved += 1;
                 }
                 if set_ware_sell_value(repo, *etype, *eid, *sell_value) {
                     wares_moved += 1;
