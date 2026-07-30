@@ -724,6 +724,9 @@ pub struct TickOutcome {
     /// the stall set. Emitted exactly ONCE per good per arming window so the client can `warn!` the
     /// forensics once instead of every frame. Empty on almost every tick.
     pub newly_stalled: Vec<GoodsId>,
+    /// Flags that reached [`MAX_FLAG_ATTEMPTS`] on THIS tick and have just been parked. Same
+    /// once-per-arming-window contract as `newly_stalled`.
+    pub newly_stalled_flags: Vec<FlagId>,
 }
 
 /// The tick-driven, event-nudged reconciler. Holds the server-authoritative inputs, the derived
@@ -751,6 +754,18 @@ pub struct Reconciler {
     /// loop terminates. NOT persisted — [`rearm_grant_stalls`] restores them on the next world edge,
     /// so the worst case is three refusal popups per load rather than an endless flood.
     stalled_goods: BTreeSet<GoodsId>,
+    /// Per-flag count of writes the holder ACCEPTED (`set_flag` -> `true`) that did not read back
+    /// at the written value IN THE SAME TICK. The live `CSEventFlagMan::set_flag` returns nothing
+    /// and silently discards an id with no flag-block descriptor, so acceptance is not landing —
+    /// the same polite false `grant_item` tells about `AddItemFunc`, one class over. A
+    /// holder-not-ready `false` is backpressure, not an attempt. Cleared the moment the flag is
+    /// observed at its desired value.
+    flag_attempts: BTreeMap<FlagId, u32>,
+    /// Flags parked after [`MAX_FLAG_ATTEMPTS`] discarded writes: no longer re-emitted, so a flag
+    /// id the game silently drops (or something un-sets within the same tick) costs three writes
+    /// and one named warning instead of `budget.flags` writes per frame forever. NOT persisted —
+    /// [`rearm_grant_stalls`] restores them on the next world edge, same as goods.
+    stalled_flags: BTreeSet<FlagId>,
 }
 
 /// How many ACCEPTED-but-unobservable grants of one unique good are tolerated before it is parked.
@@ -770,6 +785,21 @@ pub struct Reconciler {
 /// menu/load backpressure (which returns `false` and is not counted anyway) cannot trip it, low
 /// enough that the popup storm is over in half a second.
 pub const MAX_GRANT_ATTEMPTS: u32 = 3;
+
+/// How many ACCEPTED-but-not-read-back writes of one flag are tolerated before it is parked.
+///
+/// The flag analogue of [`MAX_GRANT_ATTEMPTS`], added BEFORE a fourth instance of the class rather
+/// than after it: `Action::SetFlag` had none of the four properties the goods path earned from the
+/// 2026-07-30 softlock (read-back, attempt cap, pacing, stall log), and the live
+/// `CSEventFlagMan::set_flag` silently discards any id with no flag-block descriptor — so an
+/// invented flag id would be re-written `budget.flags`-deep every frame for the rest of the
+/// session with nothing anywhere saying so.
+///
+/// The discriminator is the SAME-TICK read-back: a silently-discarded write never reads back and
+/// accumulates attempts; a CONTESTED flag (we set it, vanilla EMEVD clears it a frame later —
+/// the 9116 shape) reads back fine every time, resets its attempts every tick, and keeps being
+/// re-asserted forever, exactly as before. Parking must never lose that fight for a real flag.
+pub const MAX_FLAG_ATTEMPTS: u32 = 3;
 
 impl Reconciler {
     /// Build from fresh inputs; use [`from_persisted`] to resume a save.
@@ -793,6 +823,8 @@ impl Reconciler {
             last_grant_ms: None,
             grant_attempts: BTreeMap::new(),
             stalled_goods: BTreeSet::new(),
+            flag_attempts: BTreeMap::new(),
+            stalled_flags: BTreeSet::new(),
         }
     }
 
@@ -810,6 +842,8 @@ impl Reconciler {
             last_grant_ms: None,
             grant_attempts: BTreeMap::new(),
             stalled_goods: BTreeSet::new(),
+            flag_attempts: BTreeMap::new(),
+            stalled_flags: BTreeSet::new(),
         }
     }
 
@@ -961,6 +995,12 @@ impl Reconciler {
         &self.stalled_goods
     }
 
+    /// Flags currently parked by the flag-stall guard (accepted [`MAX_FLAG_ATTEMPTS`] writes that
+    /// never read back in-tick). Reported by the client as `inert because ...`, like goods.
+    pub fn stalled_flags(&self) -> &BTreeSet<FlagId> {
+        &self.stalled_flags
+    }
+
     /// Drop every parked good and every attempt count, restoring a full retry allowance.
     ///
     /// Called on an UNSTABLE tick (load screen / warp / save-load) because that is the edge where
@@ -969,6 +1009,8 @@ impl Reconciler {
     pub fn rearm_grant_stalls(&mut self) {
         self.grant_attempts.clear();
         self.stalled_goods.clear();
+        self.flag_attempts.clear();
+        self.stalled_flags.clear();
     }
 
     /// One convergence attempt. Reads stability; if not stable, does NOTHING (no read, no write) and
@@ -1002,6 +1044,7 @@ impl Reconciler {
                 skipped_unstable: true,
                 converged: false,
                 newly_stalled: Vec::new(),
+                newly_stalled_flags: Vec::new(),
             };
         }
 
@@ -1013,6 +1056,14 @@ impl Reconciler {
             self.grant_attempts.remove(g);
             self.stalled_goods.remove(g);
         }
+        // A flag observed at its DESIRED value has landed: forget attempts and un-park it, so a
+        // late-landing write (or a world edge that fixed whatever discarded it) restores service.
+        for (&f, &have) in &observed.flags {
+            if self.desired.flags.get(&f) == Some(&have) {
+                self.flag_attempts.remove(&f);
+                self.stalled_flags.remove(&f);
+            }
+        }
         let mut actions = diff(&self.desired, &observed);
         actions.retain(|a| classes.allows(a));
         // Drop parked goods from the plan BEFORE the emptiness check, so a tick whose only
@@ -1020,6 +1071,9 @@ impl Reconciler {
         // spinning forever on actions it will never apply.
         actions
             .retain(|a| !matches!(a, Action::GrantUnique(g, _) if self.stalled_goods.contains(g)));
+        actions.retain(|a| {
+            !matches!(a, Action::SetFlag(f) | Action::ClearFlag(f) if self.stalled_flags.contains(f))
+        });
         if actions.is_empty() {
             self.dirty = false;
             return TickOutcome {
@@ -1027,6 +1081,7 @@ impl Reconciler {
                 skipped_unstable: false,
                 converged: true,
                 newly_stalled: Vec::new(),
+                newly_stalled_flags: Vec::new(),
             };
         }
 
@@ -1048,6 +1103,7 @@ impl Reconciler {
         let mut deferred = false;
         let mut granted_this_tick = false;
         let mut newly_stalled: Vec<GoodsId> = Vec::new();
+        let mut newly_stalled_flags: Vec<FlagId> = Vec::new();
 
         // Pass 1: flags + unique goods (independent budgets; order = the diff's deterministic order).
         for a in &actions {
@@ -1060,6 +1116,24 @@ impl Reconciler {
                     if io.set_flag(*f, true) {
                         flags_used += 1;
                         applied.push(a.clone());
+                        // Acceptance is not landing: the live `set_flag` returns nothing and
+                        // silently discards an unknown id, so read the flag back IN THIS TICK and
+                        // let the observation decide — the read-back the goods class earned from
+                        // the 2026-07-30 softlock, applied to flags BEFORE their instance of it.
+                        // Same-tick read-back is also what keeps a CONTESTED flag (set now,
+                        // cleared by vanilla EMEVD next frame) out of the park: its write reads
+                        // back fine, its attempts reset, and the re-assert fight continues
+                        // unbounded exactly as before.
+                        if io.get_flag(*f) {
+                            self.flag_attempts.remove(f);
+                        } else {
+                            let n = self.flag_attempts.entry(*f).or_insert(0);
+                            *n += 1;
+                            if *n >= MAX_FLAG_ATTEMPTS {
+                                self.stalled_flags.insert(*f);
+                                newly_stalled_flags.push(*f);
+                            }
+                        }
                     } else {
                         deferred = true; // holder not ready -> retry next tick
                     }
@@ -1072,6 +1146,17 @@ impl Reconciler {
                     if io.set_flag(*f, false) {
                         flags_used += 1;
                         applied.push(a.clone());
+                        // Mirror of the SetFlag read-back, polarity inverted.
+                        if !io.get_flag(*f) {
+                            self.flag_attempts.remove(f);
+                        } else {
+                            let n = self.flag_attempts.entry(*f).or_insert(0);
+                            *n += 1;
+                            if *n >= MAX_FLAG_ATTEMPTS {
+                                self.stalled_flags.insert(*f);
+                                newly_stalled_flags.push(*f);
+                            }
+                        }
                     } else {
                         deferred = true;
                     }
@@ -1173,6 +1258,7 @@ impl Reconciler {
             skipped_unstable: false,
             converged,
             newly_stalled,
+            newly_stalled_flags,
         }
     }
 
@@ -1224,6 +1310,14 @@ pub struct MockGame {
     pub refuse_unique_adds: bool,
     /// Every `grant_good` call the mock ACCEPTED, refused or not. The unbounded-loop detector.
     pub unique_grant_calls: Vec<GoodsId>,
+    /// Model the SILENTLY-DISCARDED flag write: `set_flag` still returns `true` (the holder
+    /// resolved), but the value never changes — the live `VirtualMemoryFlag::set_flag` finds no
+    /// block descriptor for the id and returns nothing either way, so the client cannot tell.
+    /// Distinct from `flag_ready: false`, which is honest backpressure.
+    pub discard_flag_writes: bool,
+    /// Every `set_flag` call the mock ACCEPTED, discarded or not. The unbounded-loop detector
+    /// for the flag class.
+    pub flag_set_calls: Vec<(FlagId, bool)>,
     pub stability: WorldStability,
 }
 
@@ -1237,6 +1331,8 @@ impl Default for MockGame {
             inventory_ready: true,
             refuse_unique_adds: false,
             unique_grant_calls: Vec::new(),
+            discard_flag_writes: false,
+            flag_set_calls: Vec::new(),
             stability: WorldStability {
                 in_game: true,
                 player_valid: true,
@@ -1322,6 +1418,13 @@ impl GameIo for MockGame {
     fn set_flag(&mut self, flag: FlagId, on: bool) -> bool {
         if !self.flag_ready {
             return false;
+        }
+        self.flag_set_calls.push((flag, on));
+        if self.discard_flag_writes {
+            // Accepted — the holder resolved — but the write vanishes (no block descriptor for
+            // this id). The live client cannot distinguish this from success, so neither may
+            // the mock.
+            return true;
         }
         self.flags.insert(flag, on);
         true
@@ -3141,6 +3244,130 @@ mod tests {
             r.applied_watermark(),
             1,
             "the watermark still advances past the echo index"
+        );
+    }
+
+    // ---- flag-stall guard (the volume-class generalization, 2026-07-30) -----------------
+
+    #[test]
+    fn flag_silently_discarded_is_parked_after_max_attempts_replay() {
+        // THE TIMELINE (pre-fix): `core.rs` marks the reconciler dirty every frame, `diff`
+        // re-emits SetFlag for any wanted-set flag observed clear, and the live `set_flag`
+        // silently discards an id with no flag-block descriptor -- so one bad flag id is
+        // re-written every frame for the rest of the session, with `converged=true` in the log.
+        // The exact three-part composition that produced the 2026-07-30 goods softlock, one
+        // class over. Post-fix: MAX_FLAG_ATTEMPTS writes, ONE newly_stalled_flags emission,
+        // then silence.
+        let mut g = MockGame::stable();
+        g.discard_flag_writes = true;
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![region(0, "Limgrave Lock", &[76971])],
+            vec![],
+        ));
+
+        let mut stall_reports = 0usize;
+        for _ in 0..10 {
+            r.mark_dirty(); // the live client re-marks every frame (core.rs set_inputs)
+            let out = r.tick(&mut g, TickBudget::default());
+            stall_reports += out.newly_stalled_flags.len();
+        }
+        assert_eq!(
+            g.flag_set_calls.len(),
+            MAX_FLAG_ATTEMPTS as usize,
+            "pre-fix this is 10 (one write per frame, forever); the guard bounds the loop"
+        );
+        assert!(r.stalled_flags().contains(&76971), "the flag is parked");
+        assert_eq!(
+            stall_reports, 1,
+            "forensics fire exactly once per arming window"
+        );
+        // With only stalled work left the plan is empty and the tick reports converged -- the
+        // same contract the goods park has (stops re-planning at frame rate).
+        r.mark_dirty();
+        let out = r.tick(&mut g, TickBudget::default());
+        assert!(out.converged);
+    }
+
+    #[test]
+    fn contested_flag_keeps_being_reasserted_and_is_never_parked_replay() {
+        // The 9116 shape: WE set the flag (it lands -- same-tick read-back true), and vanilla
+        // EMEVD clears it between ticks. The guard must not lose that fight: attempts reset on
+        // every successful read-back, so the re-assert continues unbounded exactly as pre-guard.
+        // This is the "do NOT suppress legitimate work" boundary, tested from the other side.
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![region(0, "Limgrave Lock", &[76971])],
+            vec![],
+        ));
+        for _ in 0..10 {
+            r.mark_dirty();
+            r.tick(&mut g, TickBudget::default());
+            g.flags.insert(76971, false); // vanilla wins the frame; the fight resumes next tick
+        }
+        assert_eq!(g.flag_set_calls.len(), 10, "the fight continues every tick");
+        assert!(
+            r.stalled_flags().is_empty(),
+            "a contested flag is NEVER parked"
+        );
+    }
+
+    #[test]
+    fn flag_stall_rearms_on_the_world_edge_replay() {
+        // Parity with goods: an unstable tick (load screen / warp / save-load) clears the park,
+        // so a cause that stopped being true across the edge gets a fresh MAX_FLAG_ATTEMPTS and
+        // no flag is abandoned forever.
+        let mut g = MockGame::stable();
+        g.discard_flag_writes = true;
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![region(0, "Limgrave Lock", &[76971])],
+            vec![],
+        ));
+        for _ in 0..5 {
+            r.mark_dirty();
+            r.tick(&mut g, TickBudget::default());
+        }
+        assert!(r.stalled_flags().contains(&76971));
+
+        g.set_stable(false);
+        r.mark_dirty();
+        r.tick(&mut g, TickBudget::default()); // the unstable tick re-arms
+        g.set_stable(true);
+        g.discard_flag_writes = false; // the cause stopped being true across the edge
+
+        r.mark_dirty();
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(
+            g.get_flag(76971),
+            "the flag lands after the edge; nothing is abandoned forever"
+        );
+        assert!(r.stalled_flags().is_empty());
+    }
+
+    #[test]
+    fn holder_not_ready_is_backpressure_not_an_attempt() {
+        // `set_flag -> false` (CSEventFlagMan unresolved) must never count toward the park:
+        // menu/load backpressure is honest, self-clears, and was already handled correctly.
+        let mut g = MockGame::stable();
+        g.flag_ready = false;
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![region(0, "Limgrave Lock", &[76971])],
+            vec![],
+        ));
+        for _ in 0..10 {
+            r.mark_dirty();
+            r.tick(&mut g, TickBudget::default());
+        }
+        assert!(r.stalled_flags().is_empty(), "backpressure never parks");
+        g.flag_ready = true;
+        r.mark_dirty();
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(
+            g.get_flag(76971),
+            "and the flag lands once the holder is ready"
         );
     }
 }
