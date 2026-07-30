@@ -206,6 +206,9 @@ fn report_inner(info: usize, phase: &str) {
     let mut code = 0u32;
     let mut fault_addr = 0usize;
     let mut av_detail = String::new();
+    // The AV TARGET (the address being read/written), distinct from `fault_addr` (the faulting
+    // instruction). This is the number the foreign-block registry classifies.
+    let mut av_target = 0usize;
     let mut rip = 0u64;
     let mut rsp = 0u64;
     let mut ctx_ptr: *const CONTEXT = std::ptr::null();
@@ -224,7 +227,8 @@ fn report_inner(info: usize, phase: &str) {
                         8 => "execute",
                         _ => "access",
                     };
-                    av_detail = format!(" ({op} at {:#x})", rec.ExceptionInformation[1]);
+                    av_target = rec.ExceptionInformation[1];
+                    av_detail = format!(" ({op} at {av_target:#x})");
                 }
             }
             ctx_ptr = i.ContextRecord.cast_const();
@@ -241,6 +245,12 @@ fn report_inner(info: usize, phase: &str) {
         code_name(code)
     ));
     out.push_str(&format!("at  {}\n", format_addr(fault_addr)));
+    // Is the faulting ADDRESS under memory we allocated and handed the game? A HIT names
+    // fmg_inject's block; a MISS exonerates it. Either way the next crash report decides what
+    // 14 identical reports could only suggest. See `foreign_blocks`.
+    if av_target != 0 {
+        out.push_str(&crate::foreign_blocks::annotate(av_target));
+    }
     if rip != 0 && rip as usize != fault_addr {
         out.push_str(&format!("rip {}\n", format_addr(rip as usize)));
     }
