@@ -465,6 +465,47 @@ pub fn is_refused() -> bool {
     REFUSED.load(Ordering::Relaxed)
 }
 
+/// Re-ask the reconnect guard's question about an ALREADY-ARMED reconciler, and disarm it if the
+/// session's identity has moved out from under it.
+///
+/// 🛑 WHY THIS EXISTS (2026-07-30, boblerrr): the marker guard in [`init`] is evaluated ONCE, on the
+/// first stable in-world tick, behind `core`'s `reconcile_inited` latch — and `reset_for_new_seed`
+/// does not clear that latch. So a player who reconnects to a DIFFERENT room WITHOUT restarting the
+/// game kept an armed reconciler built for the old room: **229 of room A's checks were reported into
+/// room B** before the next game restart let `init` run and refuse. That is the exact corruption the
+/// doc on [`REFUSED`] calls "strictly worse than a double-grant", and it cannot be undone — the
+/// checks are already on someone else's server.
+///
+/// Fail-CLOSED by construction: this only ever SETS `REFUSED`, never clears it. Re-arming a
+/// reconciler mid-session would mean rebuilding the `Driver` for the new identity, and `DRIVER` is a
+/// `OnceLock` — it cannot be replaced, so a "clear the latch and re-init" fix would silently keep
+/// the OLD driver while looking correct. Gating until the player restarts the game is the honest
+/// bound, and a restart is exactly what the message asks for.
+///
+/// No-op when nothing is armed: [`init`] has not run, so its own guard still covers that session.
+pub fn disarm_if_identity_moved(room_seed: &str) {
+    let Some(m) = DRIVER.get() else {
+        return; // never armed -> init's guard is still ahead of us, nothing to disarm
+    };
+    let Ok(d) = m.lock() else {
+        return; // poisoned: a refusal we cannot evaluate must not panic the game thread
+    };
+    match marker::armed_verdict(d.identity, room_seed, &d.slot) {
+        marker::ArmedVerdict::Keep => {}
+        marker::ArmedVerdict::Disarm { armed, live } => {
+            REFUSED.store(true, Ordering::Relaxed);
+            log::warn!(
+                "[reconcile] DISARMED: the armed reconciler belongs to identity {armed:#010x} but \
+                 this connection is {live:#010x} (room seed {room_seed:?}, slot {:?}) -- the room \
+                 changed under a live session. NOT applying anything further and check reporting is \
+                 gated, so this save's checks are not reported into the new room. RESTART the game \
+                 to play the new room, or reconnect to the original one.",
+                d.slot
+            );
+        }
+    }
+}
+
 struct Driver {
     reconciler: Reconciler,
     io: LiveGame,
@@ -751,6 +792,12 @@ pub fn set_inputs(inputs: DesiredInputs) {
 /// call, per the strangler phases in `docs/history/MIGRATION.md` (archived; cutover complete).
 pub fn tick() {
     if !DIRTY.load(Ordering::Relaxed) {
+        return;
+    }
+    // A REFUSED session must not apply, and after `disarm_if_identity_moved` a DRIVER can exist
+    // while refused — so `DRIVER.get()` alone is no longer the whole gate. Without this line the
+    // disarm is cosmetic: the old room's reconciler keeps granting and reporting.
+    if is_refused() {
         return;
     }
     let Some(m) = DRIVER.get() else { return };
