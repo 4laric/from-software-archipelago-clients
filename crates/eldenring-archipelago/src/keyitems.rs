@@ -15,14 +15,33 @@
 use crate::flags;
 
 /// Companion items whose possession is gated by a vanilla "obtained" event flag.
+///
+/// WHETBLADES SET THE **DERIVED** AFFINITY FLAGS, NEVER THE PICKUP FLAG (2026-07-30). A
+/// whetblade's pickup flag (65610/65640/65660/65680/65720) is an item-LOT flag -- which is this
+/// world's randomized CHECK flag for that location (e.g. 65610 = `Stormveil :: Iron Whetblade -
+/// near Rampart Tower`, AP loc 7770041). Setting it on a pool RECEIVE falsely reported the check
+/// as collected (seen live: Eldakin 2026-07-29, a received Glintstone Whetblade auto-completed
+/// f65680 within the same second). Vanilla itself never keys the affinity menu on the pickup flag:
+/// common.emevd event 1450 (slots 0-4) WAITS on each pickup flag and then sets these derived
+/// flags, which are what the grace "Ashes of War" menu consumes -- and the derived flags are not
+/// lot/check/region flags anywhere in the world's corpus. So we set what event 1450 would have
+/// set, and the pickup flag stays untouched for the real location check. Mapping (common.emevd):
+///   65610 -> 65620, 65630   (Iron)
+///   65640 -> 65650          (Red-Hot)
+///   65660 -> 65670          (Sanctified)
+///   65680 -> 65690          (Glintstone)
+///   65720 -> 65700, 65710   (Black)
+/// Bell/Knife are DIFFERENT: 60110/60130 are read directly by vanilla events (no derived cascade
+/// exists), so they must stay even though they are also check flags (locs 7770012/7770014) --
+/// that residual false-collect is a known, separate issue.
 const COMPANION_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Spirit Calling Bell", &[60110]),
     ("Whetstone Knife", &[60130]),
-    ("Iron Whetblade", &[65610]),
-    ("Red-Hot Whetblade", &[65640]),
-    ("Sanctified Whetblade", &[65660]),
-    ("Glintstone Whetblade", &[65680]),
-    ("Black Whetblade", &[65720]),
+    ("Iron Whetblade", &[65620, 65630]),
+    ("Red-Hot Whetblade", &[65650]),
+    ("Sanctified Whetblade", &[65670]),
+    ("Glintstone Whetblade", &[65690]),
+    ("Black Whetblade", &[65700, 65710]),
 ];
 
 /// Vanilla key items whose progression gate reads an obtained event flag, not inventory -- plus the
@@ -99,5 +118,54 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
                 "key item '{n}': obtained/restored flag(s) {fs:?} applied ({applied} newly set)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The five whetblade PICKUP flags. Each is the world's randomized CHECK flag for the
+    /// corresponding vanilla location, so the client must never set one as an acquire flag: doing
+    /// so reports a location the player never touched (the 2026-07-29/30 false-collect).
+    const WHETBLADE_PICKUP_FLAGS: [u32; 5] = [65610, 65640, 65660, 65680, 65720];
+
+    #[test]
+    fn no_acquire_flag_is_a_whetblade_pickup_flag() {
+        for f in all_acquire_flags() {
+            assert!(
+                !WHETBLADE_PICKUP_FLAGS.contains(&f),
+                "acquire flag {f} is a randomized check flag; setting it on receive \
+                 falsely collects that location -- set the event-1450 derived flags instead"
+            );
+        }
+    }
+
+    /// The motivating case, at the seam the live path uses: receiving a whetblade must yield the
+    /// DERIVED affinity flags common.emevd event 1450 would have set from the pickup flag.
+    #[test]
+    fn whetblade_receive_maps_to_the_event_1450_derived_flags() {
+        let expect: &[(&str, &[u32])] = &[
+            ("Iron Whetblade", &[65620, 65630]),
+            ("Red-Hot Whetblade", &[65650]),
+            ("Sanctified Whetblade", &[65670]),
+            ("Glintstone Whetblade", &[65690]),
+            ("Black Whetblade", &[65700, 65710]),
+        ];
+        for (name, flags) in expect {
+            assert_eq!(
+                acquire_flags(name),
+                flags.to_vec(),
+                "{name}: acquire flags must be exactly the event-1450 derived set"
+            );
+        }
+    }
+
+    /// Bell/Knife keep their direct obtained flags: vanilla events READ 60110/60130 (no derived
+    /// cascade exists), so dropping them would break summoning / Ashes of War on a pool receive.
+    #[test]
+    fn bell_and_knife_keep_their_vanilla_read_flags() {
+        assert_eq!(acquire_flags("Spirit Calling Bell"), vec![60110]);
+        assert_eq!(acquire_flags("Whetstone Knife"), vec![60130]);
     }
 }

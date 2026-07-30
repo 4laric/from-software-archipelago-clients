@@ -22,6 +22,13 @@ pub const CLIENT_BUILD: &str = concat!(
     ")"
 );
 
+/// Short build identity for the OVERLAY WINDOW TITLE: `<version> (<sha>)`. Deliberately omits the
+/// build timestamp so the title stays short enough to survive a narrow window + a player
+/// screenshot -- the title is the one surface a player photographs without being asked. The
+/// long form ([`CLIENT_BUILD`], with timestamp) stays on the connect banner in the log.
+pub const CLIENT_BUILD_TITLE: &str =
+    concat!(env!("CARGO_PKG_VERSION"), " (", env!("ER_GIT_SHA"), ")");
+
 pub struct EldenRing;
 
 impl shared::Game for EldenRing {
@@ -33,6 +40,10 @@ impl shared::Game for EldenRing {
     type InputBlocker = crate::input::EldenRingInputBlocker;
     const TYPE: shared::GameType = shared::GameType::EldenRing; // requires the shared change (below)
     const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+    /// Overlay title shows version + git SHA so a screenshot identifies the exact build (the
+    /// version alone cannot: the lockstep-bump commit and the guard-fix commit both report the
+    /// same CLIENT_VERSION).
+    const CLIENT_BUILD: &str = CLIENT_BUILD_TITLE;
     /// ER uses the ECHO model: the server sends our own checks back as received items, so self-found
     /// items run the same name-based logic (progressive / region-open / notify) as remote items.
     /// (DS3/Sekiro keep the default `false` inventory-scan-convert model.) Requires the shared change.

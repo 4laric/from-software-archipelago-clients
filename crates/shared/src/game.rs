@@ -20,6 +20,13 @@ pub trait Game: Send + Sync + 'static {
 
     /// The version of this client.
     const CLIENT_VERSION: &str;
+    /// The BUILD identity shown on player-visible surfaces (the overlay window title). Defaults to
+    /// the plain version; a game crate that bakes a build stamp (ER: git SHA via build.rs) overrides
+    /// this so a player's screenshot pins the exact build -- two builds can share CLIENT_VERSION
+    /// (the 2026-07-30 "I'm on the new version" flood report was undecidable from a screenshot
+    /// because the version-bump commit and the fix commit both said 0.2.17). Version-conflict
+    /// checks keep using CLIENT_VERSION; this const is identity, not compatibility.
+    const CLIENT_BUILD: &str = Self::CLIENT_VERSION;
     /// Echo own checks back (items_handling own_world bit); ER overrides to true.
     const OWN_WORLD: bool = false;
 
