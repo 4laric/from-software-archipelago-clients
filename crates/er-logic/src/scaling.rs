@@ -475,6 +475,70 @@ pub fn parse_triple_ranges(v: Option<&Value>) -> Vec<(i32, i32, i32)> {
     out
 }
 
+// ---- REGION SCALING, SAID OUT LOUD -------------------------------------------------------------
+// Alaric + CrazzyMatthew21, 2026-07-29: "it feels unclear at which points im supposed to be in which
+// areas." That is an INFORMATION problem before it is a tuning one. Scaling ramps over the ORDER a
+// seed's regions unlock, so a late Limgrave is a hard Limgrave -- correct by design, and completely
+// invisible to the player, who only knows Patches hits like a truck.
+//
+// The client already holds everything needed to say so, so it says so. Pure and host-tested: the
+// caller does the I/O, this decides the words.
+
+/// What we actually know about a region's scaling when the player walks into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionScaling {
+    /// The seed put this region's bucket on the wire; `target` resolved to this tier.
+    Known(usize),
+    /// No target for this bucket (hub, tutorial, an unmapped sub-area, or a foreign/older seed), so
+    /// the client is using the floor tier. NOT the same thing as "tier 0", and the toast must not
+    /// present a defaulted value as a derived one -- unknown is said out loud, per the house rule
+    /// that a derivation which cannot answer must say so rather than answer.
+    Defaulted(usize),
+}
+
+/// Resolve a region's scaling for display. `target: None` means the bucket was absent from the wire.
+pub fn region_scaling(
+    target: Option<i32>,
+    max_target: i32,
+    floor_tier: usize,
+    ceiling_tier: usize,
+) -> RegionScaling {
+    match target {
+        Some(t) => RegionScaling::Known(tier_for_target(t, max_target, floor_tier, ceiling_tier)),
+        None => RegionScaling::Defaulted(floor_tier.min(NUM_TIERS - 1)),
+    }
+}
+
+/// The HP multiplier of a tier, clamped into the ladder.
+pub fn tier_multiplier(tier: usize) -> f32 {
+    SCALING_TIERS[tier.min(NUM_TIERS - 1)].hp
+}
+
+/// The one-line toast shown when the player first enters a region.
+///
+///   `Liurnia — enemy scaling 4.12x (tier 10 of 19)`
+///   `Liurnia — enemy scaling not set for this area; using the floor, 1.14x`
+///
+/// The NUMBER is the point. A tier index alone means nothing to a player, and "hard" means nothing
+/// either; `4.12x` is a thing you can compare to your own weapon. The tier fraction rides along so
+/// two regions can be ranked against each other at a glance.
+pub fn region_scaling_toast(region: &str, scaling: RegionScaling) -> String {
+    match scaling {
+        RegionScaling::Known(tier) => format!(
+            "{} — enemy scaling {:.2}x (tier {} of {})",
+            region,
+            tier_multiplier(tier),
+            tier.min(NUM_TIERS - 1),
+            NUM_TIERS - 1
+        ),
+        RegionScaling::Defaulted(tier) => format!(
+            "{} — enemy scaling not set for this area; using the floor, {:.2}x",
+            region,
+            tier_multiplier(tier)
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,5 +999,75 @@ mod tests {
         assert_eq!(m.get(&62000), Some(&7));
         assert!(i32_i32_map(None).is_empty());
         assert!(i32_i32_map(Some(&json!([1, 2]))).is_empty());
+    }
+    // ---- the region-entry toast ----------------------------------------------------------------
+    // The words a player reads are a user-facing string, and this project's rule is that those get
+    // checked as RENDERED, not as code. These pin the rendering; the in-game check is that the
+    // toast appears on entry at all.
+
+    #[test]
+    fn a_known_region_shows_the_multiplier_and_where_it_sits() {
+        // tier 10 of 19 is `auto`'s cap for a 5-region seed -- the number Alaric calibrated.
+        let s = region_scaling_toast("Liurnia", RegionScaling::Known(10));
+        // 4.12, NOT 4.13: rung 10 is 4.125 and `{:.2}` on that f32 renders DOWN. Verified with a
+        // standalone rustc rather than reasoned about -- the assertion this file first carried said
+        // 4.13x and would have reddened CI for a rounding rule nobody can eyeball.
+        assert_eq!(s, "Liurnia — enemy scaling 4.12x (tier 10 of 19)");
+    }
+
+    #[test]
+    fn the_top_and_bottom_of_the_ladder_render() {
+        assert_eq!(
+            region_scaling_toast("Limgrave", RegionScaling::Known(0)),
+            "Limgrave — enemy scaling 1.14x (tier 0 of 19)"
+        );
+        assert_eq!(
+            region_scaling_toast("Farum Azula", RegionScaling::Known(NUM_TIERS - 1)),
+            "Farum Azula — enemy scaling 7.42x (tier 19 of 19)"
+        );
+    }
+
+    #[test]
+    fn an_unknown_bucket_says_so_instead_of_showing_tier_zero() {
+        // THE POINT OF THE ENUM. A region with no target on the wire falls back to the floor, and
+        // rendering that as "tier 0" would present a defaulted value as a derived one -- the exact
+        // confident-wrong-answer shape this crate's comments keep warning about.
+        let s = region_scaling_toast("Roundtable Hold", RegionScaling::Defaulted(0));
+        assert!(s.contains("not set for this area"), "{s}");
+        assert!(
+            !s.contains("tier"),
+            "a defaulted region must not claim a tier: {s}"
+        );
+    }
+
+    #[test]
+    fn region_scaling_maps_a_missing_target_to_defaulted_not_to_the_bottom() {
+        assert_eq!(
+            region_scaling(None, 10_000, 3, 19),
+            RegionScaling::Defaulted(3)
+        );
+        assert!(matches!(
+            region_scaling(Some(10_000), 10_000, 0, 19),
+            RegionScaling::Known(_)
+        ));
+    }
+
+    #[test]
+    fn the_ceiling_is_visible_in_the_toast() {
+        // A capped seed must SHOW its cap: the deepest region of a 5-region run reads 4.12x, not
+        // 7.42x. This is how a player can tell `maximum_enemy_difficulty` did anything at all.
+        let ceiling = ceiling_tier_from_multiplier(4.125);
+        let deepest = region_scaling(Some(10_000), 10_000, 0, ceiling);
+        assert_eq!(deepest, RegionScaling::Known(10));
+        assert_eq!(
+            region_scaling_toast("Leyndell", deepest),
+            "Leyndell — enemy scaling 4.12x (tier 10 of 19)"
+        );
+    }
+
+    #[test]
+    fn a_tier_past_the_ladder_clamps_instead_of_panicking() {
+        // Reachable from foreign or hand-rolled slot_data, so it must not index out of bounds.
+        assert_eq!(tier_multiplier(usize::MAX), SCALING_TIERS[NUM_TIERS - 1].hp);
     }
 }
