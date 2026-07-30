@@ -45,10 +45,18 @@ const HEADER_WINDOW: usize = 64;
 pub enum Verdict {
     /// The fault is just BELOW one of our blocks: the game read an allocator header that is not
     /// there. This is the shape all 14 of boblerrr's crashes had.
-    HeaderRead { base: usize, size: usize, below: usize },
+    HeaderRead {
+        base: usize,
+        size: usize,
+        below: usize,
+    },
     /// The fault is INSIDE one of our blocks: still ours, but a layout bug rather than a header
     /// read. Must not be reported as a miss.
-    Inside { base: usize, size: usize, offset: usize },
+    Inside {
+        base: usize,
+        size: usize,
+        offset: usize,
+    },
     /// The fault matches nothing we allocated. This EXONERATES `fmg_inject` for that crash, which
     /// is why it is a verdict and not silence.
     Miss,
@@ -65,10 +73,18 @@ pub fn classify(blocks: &[(usize, usize)], addr: usize) -> Verdict {
             continue;
         }
         if addr < base && base - addr <= HEADER_WINDOW {
-            return Verdict::HeaderRead { base, size, below: base - addr };
+            return Verdict::HeaderRead {
+                base,
+                size,
+                below: base - addr,
+            };
         }
         if size != 0 && addr >= base && addr < base + size {
-            return Verdict::Inside { base, size, offset: addr - base };
+            return Verdict::Inside {
+                base,
+                size,
+                offset: addr - base,
+            };
         }
     }
     Verdict::Miss
@@ -143,7 +159,11 @@ mod tests {
         let blocks = [(0x2458_6050_000usize, 0x8000usize)];
         assert_eq!(
             classify(&blocks, 0x2458_604f_ff8),
-            Verdict::HeaderRead { base: 0x2458_6050_000, size: 0x8000, below: 8 }
+            Verdict::HeaderRead {
+                base: 0x2458_6050_000,
+                size: 0x8000,
+                below: 8
+            }
         );
     }
 
@@ -152,14 +172,28 @@ mod tests {
     #[test]
     fn every_one_of_the_fourteen_observed_faults_classifies_as_a_header_read() {
         for fault in [
-            0x2458604fff8usize, 0x177f669fff8, 0x2827a2dfff8, 0x1ee15fbfff8, 0x22afcf0fff8,
-            0x15b5384fff8, 0x1dcd5d7fff8, 0x1c5a2f2fff8, 0x272f412fff8, 0x2789ebcfff8,
-            0x1a05822fff8, 0x1ee837efff8, 0x18ffb05fff8, 0x1a37de0fff8,
+            0x2458604fff8usize,
+            0x177f669fff8,
+            0x2827a2dfff8,
+            0x1ee15fbfff8,
+            0x22afcf0fff8,
+            0x15b5384fff8,
+            0x1dcd5d7fff8,
+            0x1c5a2f2fff8,
+            0x272f412fff8,
+            0x2789ebcfff8,
+            0x1a05822fff8,
+            0x1ee837efff8,
+            0x18ffb05fff8,
+            0x1a37de0fff8,
         ] {
             let base = fault + 8;
             assert_eq!(base % 0x1_0000, 0, "{base:#x} is not 64KB-aligned");
             assert!(
-                matches!(classify(&[(base, 0x8000)], fault), Verdict::HeaderRead { below: 8, .. }),
+                matches!(
+                    classify(&[(base, 0x8000)], fault),
+                    Verdict::HeaderRead { below: 8, .. }
+                ),
                 "{fault:#x}"
             );
         }
@@ -167,14 +201,21 @@ mod tests {
 
     #[test]
     fn an_unrelated_address_is_a_miss_not_silence() {
-        assert_eq!(classify(&[(0x1000_0000, 0x1000)], 0xdead_0000), Verdict::Miss);
+        assert_eq!(
+            classify(&[(0x1000_0000, 0x1000)], 0xdead_0000),
+            Verdict::Miss
+        );
     }
 
     #[test]
     fn an_address_inside_a_block_is_a_hit_but_not_a_header_read() {
         assert_eq!(
             classify(&[(0x2000_0000, 0x1000)], 0x2000_0800),
-            Verdict::Inside { base: 0x2000_0000, size: 0x1000, offset: 0x800 }
+            Verdict::Inside {
+                base: 0x2000_0000,
+                size: 0x1000,
+                offset: 0x800
+            }
         );
     }
 
@@ -183,7 +224,10 @@ mod tests {
     #[test]
     fn a_fault_far_below_a_block_is_not_pulled_in_by_the_header_window() {
         let base = 0x2458_6050_000usize;
-        assert_eq!(classify(&[(base, 0x8000)], base - HEADER_WINDOW - 1), Verdict::Miss);
+        assert_eq!(
+            classify(&[(base, 0x8000)], base - HEADER_WINDOW - 1),
+            Verdict::Miss
+        );
         assert!(matches!(
             classify(&[(base, 0x8000)], base - HEADER_WINDOW),
             Verdict::HeaderRead { .. }
