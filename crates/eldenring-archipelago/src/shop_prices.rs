@@ -129,6 +129,19 @@ pub fn run() -> bool {
             n += 1;
         }
     }
+    // CLAMP ABOVE sellValue. A rolled rune price is <= the rune's sellValue BY CONSTRUCTION
+    // (`rune_worth` is `GOODS_PRICE // 10`, which is exactly `sellValue`, and the roll is
+    // `randint(0, 1 * worth)`), so without this every rune row we price is invisible in the menu --
+    // which is the whole 2026-07-30 bug. Runs AFTER the write so it sees the rolled value.
+    let clamp_rows: Vec<(u32, u8, i32)> = verify
+        .iter()
+        .filter_map(|(row_id, _)| {
+            repo.get::<ShopLineupParam>(*row_id)
+                .map(|r| (*row_id, r.equip_type(), r.equip_id()))
+        })
+        .collect();
+    crate::shop_value::clamp(repo, &clamp_rows, "shop_prices");
+
     // READ-BACK VERIFY. `n` counts rows whose value DIFFERED and were written; it is a dispatch
     // count, and dispatch counts are what lied through the whole 2026-07-29 rune-price incident
     // (CONTRIBUTING rule 12: "a correct wire is not a correct feature"). Note the shape of the
