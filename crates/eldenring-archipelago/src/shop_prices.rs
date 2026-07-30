@@ -62,9 +62,26 @@ pub fn run() -> bool {
     // rune-ness (sortGroupId 100, canMultiUse 1, goodsUseAnim 9) while the actual manipulated
     // variable sat in this file, unconsidered.
     //
-    // So: one switch, one variable, same save and same seed. Rune visible with the write skipped and
-    // absent with it applied ⇒ the rolled `value` is the cause. Absent both ways ⇒ this module is
-    // exonerated and the difference is elsewhere in the price-era commits.
+    // 🛑 THE DECISION TABLE THAT WAS HERE WAS WRONG IN THE DANGEROUS DIRECTION. It read: "absent both
+    // ways ⇒ this module is exonerated." Fable root-caused the bug while this switch was in flight,
+    // and under the real rule this A/B would have SHIPPED A FALSE EXONERATION.
+    //
+    // THE RULE (Fable, 2026-07-30, 16/16 row-level predictions across two seeds, zero misses):
+    // the purchase menu excludes any row whose `value` is BELOW the ware's own `sellValue`. Not
+    // `value == 0`, not the write itself -- the RELATION. Corroborated by a non-rune: Veteran's Helm
+    // (sellValue 1000) on a 600-value slot is hidden, while protector 201100 (sellValue 100) on a
+    // 1000-value slot two rows away renders.
+    //
+    // Runes are hidden 15/15 BY CONSTRUCTION, not by bad luck: `rune_worth` is `GOODS_PRICE // 10`,
+    // which is exactly `sellValue`, and the roll is `randint(0, 1 * worth)` -- so every rolled price
+    // is <= sellValue and the whole roll range sits inside the hidden region. It also retro-explains
+    // 2026-07-29's "I have never seen a single rune priced below its value": the below-value ones
+    // were there and INVISIBLE. That report was a direct observation of this rule.
+    //
+    // With the switch OFF, some rune rows reappear and others do NOT (a slot whose vanilla price is
+    // under the ware's sellValue stays hidden), and the helm stays hidden in BOTH arms. So a
+    // both-arms-absent result would have meant nothing. Kept only as a probe; the fix is a clamp at
+    // the write choke point, not this flag.
     if std::env::var("ER_SHOP_PRICES")
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
