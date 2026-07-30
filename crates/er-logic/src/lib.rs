@@ -71,3 +71,4 @@ pub mod upgrades_replay;
 pub mod vanilla_suppress;
 pub mod vanilla_suppress_replay;
 pub mod version;
+pub mod whetblade;

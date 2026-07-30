@@ -1251,6 +1251,21 @@ impl shared::Core for Core {
                 for (flag, locs) in sweeps.2 {
                     fp.sweep_flags.insert(flag, locs);
                 }
+                // WHETBLADE CHECK SPLIT (er_logic::whetblade): a whetblade's check flag is ALSO
+                // the smithing menu's first-affinity unlock (Hexinton CE table, 2026-07-30), so
+                // the poll moves each such check to the client-owned flag and whetblade_lots
+                // repoints the lot's getItemFlagId to match. Runs on the MERGED table so legacy
+                // apconfig entries are covered too; after this line no polled flag is ever one a
+                // whetblade receive sets (keyitems), which is the false-collect fix. configure()
+                // is called unconditionally so a seed without whetblade checks clears stale state.
+                let whet_rewrites = er_logic::whetblade::repoint_poll_flags(&mut fp.location_flags);
+                if !whet_rewrites.is_empty() {
+                    log::info!(
+                        "whetblade split: {} check(s) repointed off their affinity flag",
+                        whet_rewrites.len()
+                    );
+                }
+                crate::whetblade_lots::configure(whet_rewrites);
                 log::info!(
                     "flag-poll table: {} location flags ({} sweep groups)",
                     fp.location_flags.len(),
@@ -2557,6 +2572,10 @@ impl shared::Core for Core {
         let now_in_world = crate::flags::in_world();
         if now_in_world && !self.was_in_world {
             crate::check_lots::reset();
+            // Same stream-in revert, same re-arm: the whetblade getItemFlagId repoints are
+            // ItemLotParam writes too, and a reverted one flips a whetblade check back onto the
+            // affinity flag keyitems sets (the false-collect this split exists to kill).
+            crate::whetblade_lots::reset();
             crate::enemy_drops::reset();
             // THE CTD (2026-07-24, symbolized): the inventory pointer grant_full_id hands to the
             // game's AddItemFunc is captured once and was trusted forever. A load frees that
@@ -2616,6 +2635,8 @@ impl shared::Core for Core {
             let _ = crate::shop_stock::run();
             let _ = crate::enemy_drops::run();
             let _ = crate::check_lots::run();
+            // The whetblade check-flag split (repoint getItemFlagId; see whetblade_lots.rs).
+            let _ = crate::whetblade_lots::run();
             // Cosmetic, and deliberately AFTER the rewrite: dresses the placeholder (AP flower
             // iconId + "Archipelago Item" + caption) so its pickup toast is not ER's nameless-goods
             // render, `[ERROR]`. Own latch — the MSG repo comes up later than the param repo and

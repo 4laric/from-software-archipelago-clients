@@ -51,6 +51,7 @@ mod upgrade_cost;
 mod upgrades;
 mod warp;
 mod warp_hook;
+mod whetblade_lots;
 // progressive logic lives in er_logic::progressive (pure, host-tested); no local module needed.
 
 /// DLL entry point — standard 3-arg Win32 `DllMain`. ModEngine2 loads externals via `LoadLibrary`,

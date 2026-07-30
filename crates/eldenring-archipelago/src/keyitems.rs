@@ -16,32 +16,27 @@ use crate::flags;
 
 /// Companion items whose possession is gated by a vanilla "obtained" event flag.
 ///
-/// WHETBLADES SET THE **DERIVED** AFFINITY FLAGS, NEVER THE PICKUP FLAG (2026-07-30). A
-/// whetblade's pickup flag (65610/65640/65660/65680/65720) is an item-LOT flag -- which is this
-/// world's randomized CHECK flag for that location (e.g. 65610 = `Stormveil :: Iron Whetblade -
-/// near Rampart Tower`, AP loc 7770041). Setting it on a pool RECEIVE falsely reported the check
-/// as collected (seen live: Eldakin 2026-07-29, a received Glintstone Whetblade auto-completed
-/// f65680 within the same second). Vanilla itself never keys the affinity menu on the pickup flag:
-/// common.emevd event 1450 (slots 0-4) WAITS on each pickup flag and then sets these derived
-/// flags, which are what the grace "Ashes of War" menu consumes -- and the derived flags are not
-/// lot/check/region flags anywhere in the world's corpus. So we set what event 1450 would have
-/// set, and the pickup flag stays untouched for the real location check. Mapping (common.emevd):
-///   65610 -> 65620, 65630   (Iron)
-///   65640 -> 65650          (Red-Hot)
-///   65660 -> 65670          (Sanctified)
-///   65680 -> 65690          (Glintstone)
-///   65720 -> 65700, 65710   (Black)
-/// Bell/Knife are DIFFERENT: 60110/60130 are read directly by vanilla events (no derived cascade
-/// exists), so they must stay even though they are also check flags (locs 7770012/7770014) --
-/// that residual false-collect is a known, separate issue.
+/// WHETBLADES LIVE IN `er_logic::whetblade`, NOT HERE (2026-07-30, superseding the 2026-07-30 AM
+/// "derived flags only" model). Ground truth from the Hexinton CE table: the smithing menu keys
+/// each affinity on ONE flag, and a whetblade's PICKUP flag (65610/65640/65660/65680/65720) IS its
+/// first affinity's unlock (Iron 65610 = Heavy; Black 65720 = Occult; ...) -- common.emevd event
+/// 1450 only adds the SIBLING affinities. So the previous table here, which set the siblings and
+/// deliberately skipped the pickup flag (because it doubles as the world's CHECK flag -- the
+/// Eldakin 2026-07-29 false-collect), shipped every pool-received whetblade missing exactly one
+/// affinity. The fix is a SPLIT, not a choice: core.rs repoints those checks onto client-owned
+/// flags (er_logic::whetblade::repoint_poll_flags + whetblade_lots.rs rewriting the lot's
+/// getItemFlagId), after which the FULL affinity set -- pickup flag included -- is safe to set on a
+/// receive: nothing polls it, and the treasure's spawn is governed by the new flag. The whetblade
+/// entries below therefore come from er_logic::whetblade::WHETBLADES ([`entries`]), the same table
+/// that drives the repoint, so the two mechanisms cannot drift apart.
+///
+/// Bell/Knife are DIFFERENT: 60110/60130 are set by ESD/EMEVD scripts and read directly by vanilla
+/// events -- there is no lot getItemFlagId to repoint -- so they must stay even though they are
+/// also check flags (locs 7770012/7770014); that residual false-collect is a known, separate issue
+/// (needs flagpoll-side suppression, not a lot rewrite).
 const COMPANION_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Spirit Calling Bell", &[60110]),
     ("Whetstone Knife", &[60130]),
-    ("Iron Whetblade", &[65620, 65630]),
-    ("Red-Hot Whetblade", &[65650]),
-    ("Sanctified Whetblade", &[65670]),
-    ("Glintstone Whetblade", &[65690]),
-    ("Black Whetblade", &[65700, 65710]),
 ];
 
 /// Vanilla key items whose progression gate reads an obtained event flag, not inventory -- plus the
@@ -58,6 +53,21 @@ const KEY_ITEM_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Malenia's Great Rune", &[196]),
 ];
 
+/// Every (item name, obtained flags) pair this module applies: the two local tables plus the
+/// whetblade affinity sets from `er_logic::whetblade` -- ONE source shared with the check repoint,
+/// so a whetblade's receive-set flags and its repointed check can never disagree by drift.
+fn entries() -> impl Iterator<Item = (&'static str, &'static [u32])> {
+    COMPANION_ACQUIRE_FLAGS
+        .iter()
+        .chain(KEY_ITEM_ACQUIRE_FLAGS)
+        .copied()
+        .chain(
+            er_logic::whetblade::WHETBLADES
+                .iter()
+                .map(|w| (w.name, w.affinity_flags)),
+        )
+}
+
 /// The vanilla obtained / great-rune restored flag(s) mapped to a received item `name` (empty if
 /// none). READ-ONLY companion to [`set_acquire_flags`]: the reconciler's dry-run mapper
 /// (`reconcile_io::build_desired_inputs`) uses it to classify a received item as an
@@ -65,8 +75,8 @@ const KEY_ITEM_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
 /// so the two never drift.
 pub fn acquire_flags(name: &str) -> Vec<u32> {
     let mut out = Vec::new();
-    for (n, fs) in COMPANION_ACQUIRE_FLAGS.iter().chain(KEY_ITEM_ACQUIRE_FLAGS) {
-        if *n == name {
+    for (n, fs) in entries() {
+        if n == name {
             out.extend_from_slice(fs);
         }
     }
@@ -78,19 +88,16 @@ pub fn acquire_flags(name: &str) -> Vec<u32> {
 /// set (er_logic::shop_echo): a check detected by one of these flags must never be echo-armed,
 /// because flag-set does not prove a native sale (START-GRANT collision, 2026-07-24).
 pub fn all_acquire_flags() -> impl Iterator<Item = u32> {
-    COMPANION_ACQUIRE_FLAGS
-        .iter()
-        .chain(KEY_ITEM_ACQUIRE_FLAGS)
-        .flat_map(|(_, fs)| fs.iter().copied())
+    entries().flat_map(|(_, fs)| fs.iter().copied())
 }
 
 /// Fast-path one-shot: set the vanilla obtained/restored flag(s) for a received item name, if any.
 /// Idempotent, but BEST-EFFORT -- writes at menu/load are silently discarded (R3, SWEEP), so this
 /// no longer logs success; `tick_keyitem_flags` (the reconcile tick) re-applies and owns the log.
 pub fn set_acquire_flags(name: &str) {
-    for (n, fs) in COMPANION_ACQUIRE_FLAGS.iter().chain(KEY_ITEM_ACQUIRE_FLAGS) {
-        if *n == name {
-            for &f in *fs {
+    for (n, fs) in entries() {
+        if n == name {
+            for &f in fs {
                 flags::set_event_flag(f, true);
             }
         }
@@ -103,12 +110,12 @@ pub fn set_acquire_flags(name: &str) {
 /// menu/load self-heals on the next settled tick, and once all flags read back set this is a
 /// cheap no-op. Logs on the tick a flag actually lands (once per name in the normal case).
 pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
-    for (n, fs) in COMPANION_ACQUIRE_FLAGS.iter().chain(KEY_ITEM_ACQUIRE_FLAGS) {
-        if !received.contains(*n) {
+    for (n, fs) in entries() {
+        if !received.contains(n) {
             continue;
         }
         let mut applied = 0u32;
-        for &f in *fs {
+        for &f in fs {
             if !flags::get_event_flag(f) && flags::try_set_event_flag(f, true) {
                 applied += 1;
             }
@@ -125,44 +132,55 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
 mod tests {
     use super::*;
 
-    /// The five whetblade PICKUP flags. Each is the world's randomized CHECK flag for the
-    /// corresponding vanilla location, so the client must never set one as an acquire flag: doing
-    /// so reports a location the player never touched (the 2026-07-29/30 false-collect).
-    const WHETBLADE_PICKUP_FLAGS: [u32; 5] = [65610, 65640, 65660, 65680, 65720];
-
+    /// The motivating case (rule 11): a pool-received whetblade must unlock ITS FULL affinity set,
+    /// FIRST affinity included -- the Hexinton CE table showed the pickup flag IS that unlock, so
+    /// the old "siblings only" table shipped Iron without Heavy, Black without Occult, etc.
     #[test]
-    fn no_acquire_flag_is_a_whetblade_pickup_flag() {
-        for f in all_acquire_flags() {
-            assert!(
-                !WHETBLADE_PICKUP_FLAGS.contains(&f),
-                "acquire flag {f} is a randomized check flag; setting it on receive \
-                 falsely collects that location -- set the event-1450 derived flags instead"
-            );
-        }
-    }
-
-    /// The motivating case, at the seam the live path uses: receiving a whetblade must yield the
-    /// DERIVED affinity flags common.emevd event 1450 would have set from the pickup flag.
-    #[test]
-    fn whetblade_receive_maps_to_the_event_1450_derived_flags() {
+    fn whetblade_receive_sets_the_full_affinity_set_including_the_first() {
         let expect: &[(&str, &[u32])] = &[
-            ("Iron Whetblade", &[65620, 65630]),
-            ("Red-Hot Whetblade", &[65650]),
-            ("Sanctified Whetblade", &[65670]),
-            ("Glintstone Whetblade", &[65690]),
-            ("Black Whetblade", &[65700, 65710]),
+            ("Iron Whetblade", &[65610, 65620, 65630]),
+            ("Red-Hot Whetblade", &[65640, 65650]),
+            ("Sanctified Whetblade", &[65660, 65670]),
+            ("Glintstone Whetblade", &[65680, 65690]),
+            ("Black Whetblade", &[65720, 65700, 65710]),
         ];
         for (name, flags) in expect {
             assert_eq!(
                 acquire_flags(name),
                 flags.to_vec(),
-                "{name}: acquire flags must be exactly the event-1450 derived set"
+                "{name}: must set the first affinity (pickup flag) AND the event-1450 siblings"
             );
         }
     }
 
+    /// The safety half of the split: setting the pickup flag is only sound because the poll no
+    /// longer watches it. Chain the two mechanisms at their real seam: repoint a seed's poll map
+    /// exactly as core.rs does, then assert NOTHING any receive sets is still polled.
+    #[test]
+    fn no_receive_set_flag_survives_the_poll_repoint_as_a_check() {
+        let mut poll = std::collections::HashMap::from([
+            (7770041i64, 65610u32),
+            (7770042, 65640),
+            (7770043, 65660),
+            (7770044, 65680),
+            (7770045, 65720),
+        ]);
+        let _ = er_logic::whetblade::repoint_poll_flags(&mut poll);
+        let polled: std::collections::HashSet<u32> = poll.values().copied().collect();
+        for w in &er_logic::whetblade::WHETBLADES {
+            for f in w.affinity_flags {
+                assert!(
+                    !polled.contains(f),
+                    "{}: receive-set flag {f} is still a live check flag -- false collect",
+                    w.name
+                );
+            }
+        }
+    }
+
     /// Bell/Knife keep their direct obtained flags: vanilla events READ 60110/60130 (no derived
-    /// cascade exists), so dropping them would break summoning / Ashes of War on a pool receive.
+    /// cascade exists, no lot getItemFlagId to repoint), so dropping them would break summoning /
+    /// Ashes of War on a pool receive. Their check-flag collision is a known, separate issue.
     #[test]
     fn bell_and_knife_keep_their_vanilla_read_flags() {
         assert_eq!(acquire_flags("Spirit Calling Bell"), vec![60110]);
