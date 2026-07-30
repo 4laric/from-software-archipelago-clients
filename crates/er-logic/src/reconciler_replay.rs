@@ -637,4 +637,160 @@ mod replay {
             "PACED (fix): all 40 consumables + 2 unique goods land, none lost or double-granted"
         );
     }
+
+    // ---- the grant-stall guard: the 2026-07-30 infinite-drop softlock ------------------------
+
+    /// Mohg's Great Rune, the good both 2026-07-30 reporters watched loop.
+    fn rune_inputs() -> DesiredInputs {
+        DesiredInputs {
+            seed: SEED.into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![ReceivedItem {
+                index: 0,
+                name: "Mohg's Great Rune".into(),
+                semantics: ItemSemantics::GreatRune {
+                    goods: 195,
+                    restored_flag: 6905,
+                },
+            }],
+            slot_data: SlotData::default(),
+        }
+    }
+
+    /// Drive `ticks` dirty ticks against a game that ACCEPTS every grant and lands none.
+    ///
+    /// `guarded == false` reproduces the PRE-FIX reconciler exactly: re-arming on every tick means
+    /// the attempt counter can never reach `MAX_GRANT_ATTEMPTS`, which is precisely the state the
+    /// code was in before the stall set existed. That is the policy flag this pair toggles.
+    fn drive_refused(guarded: bool, ticks: usize) -> (usize, Vec<GoodsId>) {
+        let mut g = MockGame::stable();
+        g.refuse_unique_adds = true;
+        let mut r = Reconciler::new(rune_inputs());
+        let mut stalled = Vec::new();
+        for _ in 0..ticks {
+            if !guarded {
+                r.rearm_grant_stalls();
+            }
+            let out = r.tick(&mut g, TickBudget::default());
+            stalled.extend(out.newly_stalled);
+            r.mark_dirty(); // core.rs re-marks dirty EVERY frame; that is what defeats convergence
+        }
+        (g.unique_grant_calls.len(), stalled)
+    }
+
+    /// A unique good the game keeps refusing must stop being re-granted, say so exactly once, and
+    /// get a fresh allowance on the next world edge.
+    ///
+    /// THE BUG: `diff` re-emits `GrantUnique` for any desired good a snapshot cannot see;
+    /// `core.rs` re-marks the reconciler dirty every frame; and `grant_good` reports success for
+    /// anything it dispatched, because `grant_item` throws away `AddItemFunc`'s result. When the
+    /// game REFUSES the add — inventory at cap, "would exceed the maximum storage", item dropped on
+    /// the floor — those three compose into an unbounded re-grant at ~6/second for the rest of the
+    /// session, logged as `converged=true`. Two players lost saves to it on 2026-07-30; it is the
+    /// third instance of the class (2026-07-12 flask ladder, 2026-07-19 co-op Morgott's rune), and
+    /// the first two fixes each removed one CAUSE and left the loop.
+    #[test]
+    fn refused_unique_grant_stalls_after_max_attempts_and_rearms_on_reload_replay() {
+        // PRE-FIX: unbounded. 200 frames of gameplay, 200 grants, no end in sight.
+        let (unguarded_calls, unguarded_stalled) = drive_refused(false, 200);
+        assert_eq!(
+            unguarded_calls, 200,
+            "PRE-FIX: the refused grant must re-fire on EVERY tick -- the softlock is reproduced"
+        );
+        assert!(
+            unguarded_stalled.is_empty(),
+            "PRE-FIX: nothing is ever parked, which is the whole defect"
+        );
+
+        // POST-FIX: bounded at the cap, and announced exactly once however long the player plays.
+        let (guarded_calls, guarded_stalled) = drive_refused(true, 200);
+        assert_eq!(
+            guarded_calls, MAX_GRANT_ATTEMPTS as usize,
+            "FIX: exactly MAX_GRANT_ATTEMPTS grants, then silence -- not {guarded_calls}"
+        );
+        assert_eq!(
+            guarded_stalled,
+            vec![195],
+            "FIX: the good is announced ONCE (the client warns on this), not once per frame"
+        );
+    }
+
+    /// The stall is per-load, not permanent: a load screen restores the full allowance, because the
+    /// reason for a refusal (full bag, an accessor pointed at the multiplay key list) can stop being
+    /// true across a world edge. Worst case is MAX_GRANT_ATTEMPTS popups per load, never a flood.
+    #[test]
+    fn grant_stall_rearms_across_a_load_screen_replay() {
+        let mut g = MockGame::stable();
+        g.refuse_unique_adds = true;
+        let mut r = Reconciler::new(rune_inputs());
+
+        for _ in 0..50 {
+            r.tick(&mut g, TickBudget::default());
+            r.mark_dirty();
+        }
+        assert_eq!(g.unique_grant_calls.len(), MAX_GRANT_ATTEMPTS as usize);
+        assert!(r.stalled_goods().contains(&195), "parked before the load");
+
+        // A load screen: one unstable tick.
+        g.set_stable(false);
+        r.tick(&mut g, TickBudget::default());
+        assert!(
+            r.stalled_goods().is_empty(),
+            "a world edge must re-arm -- the refusal cause may be gone"
+        );
+
+        // Back in world, still refusing: exactly one more allowance, not an endless one.
+        g.set_stable(true);
+        for _ in 0..50 {
+            r.tick(&mut g, TickBudget::default());
+            r.mark_dirty();
+        }
+        assert_eq!(
+            g.unique_grant_calls.len(),
+            2 * MAX_GRANT_ATTEMPTS as usize,
+            "exactly one fresh allowance per load"
+        );
+    }
+
+    /// The guard must not cost us the save-scum self-heal. A good that is genuinely LOST (not
+    /// refused) is re-granted, lands, is observed, and its counter is cleared -- so the allowance is
+    /// never consumed and the good can be healed an unlimited number of times.
+    #[test]
+    fn stall_guard_leaves_the_save_scum_self_heal_intact_replay() {
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(rune_inputs());
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(g.has_good(195));
+
+        // Lose and heal it far more times than the cap would allow if healing counted as an attempt.
+        for i in 0..15 {
+            g.drop_good(195);
+            r.mark_dirty();
+            r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+            assert!(g.has_good(195), "heal {i} must land");
+            assert!(
+                r.stalled_goods().is_empty(),
+                "a LANDING re-grant must never consume the refusal allowance"
+            );
+        }
+    }
+
+    /// A stalled good must not hold the reconciler dirty forever: once it is parked, a tick with no
+    /// other work reports converged, so the client stops re-planning and the log stops lying.
+    #[test]
+    fn a_stalled_good_lets_the_tick_converge_replay() {
+        let mut g = MockGame::stable();
+        g.refuse_unique_adds = true;
+        let mut r = Reconciler::new(rune_inputs());
+        for _ in 0..16 {
+            r.tick(&mut g, TickBudget::default());
+            r.mark_dirty();
+        }
+        let out = r.tick(&mut g, TickBudget::default());
+        assert!(
+            out.converged,
+            "a parked good must not keep the reconciler permanently unconverged"
+        );
+        assert!(out.applied.is_empty(), "and it must not apply anything");
+    }
 }
