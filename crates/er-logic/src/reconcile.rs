@@ -720,10 +720,6 @@ pub struct TickOutcome {
     pub skipped_unstable: bool,
     /// The desired state was fully reached this tick (nothing left to do).
     pub converged: bool,
-    /// Unique goods that reached [`MAX_GRANT_ATTEMPTS`] on THIS tick and have just been parked in
-    /// the stall set. Emitted exactly ONCE per good per arming window so the client can `warn!` the
-    /// forensics once instead of every frame. Empty on almost every tick.
-    pub newly_stalled: Vec<GoodsId>,
 }
 
 /// The tick-driven, event-nudged reconciler. Holds the server-authoritative inputs, the derived
@@ -743,33 +739,7 @@ pub struct Reconciler {
     /// persisted (a fresh session re-paces from its first grant); the ledger watermark — not this —
     /// is what guards against re-granting an already-applied item.
     last_grant_ms: Option<u64>,
-    /// Per-good count of grant calls the game ACCEPTED (`grant_good` -> `true`) that a later
-    /// snapshot still could not see. A not-ready `false` is NOT an attempt — that is backpressure,
-    /// not refusal. Cleared for a good the moment it is observed held.
-    grant_attempts: BTreeMap<GoodsId, u32>,
-    /// Goods parked after [`MAX_GRANT_ATTEMPTS`] unobservable grants: no longer re-emitted, so the
-    /// loop terminates. NOT persisted — [`rearm_grant_stalls`] restores them on the next world edge,
-    /// so the worst case is three refusal popups per load rather than an endless flood.
-    stalled_goods: BTreeSet<GoodsId>,
 }
-
-/// How many ACCEPTED-but-unobservable grants of one unique good are tolerated before it is parked.
-///
-/// This is the bound the reconciler never had. `diff` re-emits `GrantUnique` for any desired good a
-/// snapshot cannot see, `core.rs` re-marks the reconciler dirty every frame, and `grant_good`
-/// reports success for any call it dispatched — because `grant_item` discards `AddItemFunc`'s
-/// result. Compose those three and a good the game REFUSES (it is dropped on the floor with
-/// "would exceed the maximum storage") is re-granted ~6x/second for the rest of the session while
-/// the log cheerfully reports `converged=true`. That is the 2026-07-30 player softlock, and it is
-/// the third instance of one class: the 2026-07-12 flask ladder and the 2026-07-19 co-op
-/// Morgott's-Great-Rune flood each removed one CAUSE of a stuck-false readback and left the
-/// unbounded loop in place. This bounds the loop itself, so the next new cause degrades to three
-/// popups plus a named warning instead of a destroyed save.
-///
-/// 3 is a judgement call, not a derived constant: high enough that ordinary
-/// menu/load backpressure (which returns `false` and is not counted anyway) cannot trip it, low
-/// enough that the popup storm is over in half a second.
-pub const MAX_GRANT_ATTEMPTS: u32 = 3;
 
 impl Reconciler {
     /// Build from fresh inputs; use [`from_persisted`] to resume a save.
@@ -791,8 +761,6 @@ impl Reconciler {
             applied_watermark: floor,
             dirty: true,
             last_grant_ms: None,
-            grant_attempts: BTreeMap::new(),
-            stalled_goods: BTreeSet::new(),
         }
     }
 
@@ -808,8 +776,6 @@ impl Reconciler {
             applied_watermark,
             dirty: true,
             last_grant_ms: None,
-            grant_attempts: BTreeMap::new(),
-            stalled_goods: BTreeSet::new(),
         }
     }
 
@@ -954,23 +920,6 @@ impl Reconciler {
         diff(&self.desired, &observed)
     }
 
-    /// Goods currently parked by the grant-stall guard: the reconciler has stopped re-emitting
-    /// `GrantUnique` for these because the game accepted [`MAX_GRANT_ATTEMPTS`] grants of each and
-    /// no snapshot could see the result. The client reports these as `inert because ...`.
-    pub fn stalled_goods(&self) -> &BTreeSet<GoodsId> {
-        &self.stalled_goods
-    }
-
-    /// Drop every parked good and every attempt count, restoring a full retry allowance.
-    ///
-    /// Called on an UNSTABLE tick (load screen / warp / save-load) because that is the edge where
-    /// the cause of a refusal — a full bag, a key-item accessor switched to the multiplay list —
-    /// can stop being true. Public so the client can also re-arm on an explicit reconnect.
-    pub fn rearm_grant_stalls(&mut self) {
-        self.grant_attempts.clear();
-        self.stalled_goods.clear();
-    }
-
     /// One convergence attempt. Reads stability; if not stable, does NOTHING (no read, no write) and
     /// stays dirty. Otherwise snapshots, diffs, and applies up to the per-tick budget. Flag-holder /
     /// inventory not-ready responses (and budget exhaustion) leave the remainder for the next tick.
@@ -991,42 +940,22 @@ impl Reconciler {
     ) -> TickOutcome {
         let stab = io.stability();
         if !stab.stable() {
-            // RE-ARM on the world edge. An unstable tick is a load screen / warp / save-load — the
-            // exact moment the reason a grant was refused (full bag, an accessor pointed at the
-            // multiplay key list) can stop being true. Clearing here gives every parked good a
-            // fresh MAX_GRANT_ATTEMPTS on the other side, so the guard bounds the flood WITHOUT
-            // permanently abandoning an item the player is still owed.
-            self.rearm_grant_stalls();
             return TickOutcome {
                 applied: Vec::new(),
                 skipped_unstable: true,
                 converged: false,
-                newly_stalled: Vec::new(),
             };
         }
 
         let observed = self.snapshot(io);
-        // A good we can SEE is a good that landed: forget any attempts against it and un-park it.
-        // This is what keeps the save-scum self-heal intact — the healing re-grant lands, is
-        // observed, and its counter is gone long before it could reach the cap.
-        for g in &observed.unique_goods {
-            self.grant_attempts.remove(g);
-            self.stalled_goods.remove(g);
-        }
         let mut actions = diff(&self.desired, &observed);
         actions.retain(|a| classes.allows(a));
-        // Drop parked goods from the plan BEFORE the emptiness check, so a tick whose only
-        // remaining work is stalled reports `converged` and stops re-planning, rather than
-        // spinning forever on actions it will never apply.
-        actions
-            .retain(|a| !matches!(a, Action::GrantUnique(g, _) if self.stalled_goods.contains(g)));
         if actions.is_empty() {
             self.dirty = false;
             return TickOutcome {
                 applied: Vec::new(),
                 skipped_unstable: false,
                 converged: true,
-                newly_stalled: Vec::new(),
             };
         }
 
@@ -1047,7 +976,6 @@ impl Reconciler {
         let mut goods_used = 0usize;
         let mut deferred = false;
         let mut granted_this_tick = false;
-        let mut newly_stalled: Vec<GoodsId> = Vec::new();
 
         // Pass 1: flags + unique goods (independent budgets; order = the diff's deterministic order).
         for a in &actions {
@@ -1089,30 +1017,6 @@ impl Reconciler {
                         goods_used += 1;
                         granted_this_tick = true;
                         applied.push(a.clone());
-                        // The call was ACCEPTED — but acceptance is NOT observation. `grant_good`
-                        // can only report that it dispatched, because `grant_item` throws away
-                        // `AddItemFunc`'s result. So read the inventory back IN THIS TICK and let
-                        // the observation, not the dispatch, decide.
-                        //
-                        // Read-back here rather than relying on the next tick's snapshot: a good
-                        // that lands and is then legitimately lost (save-scum) would otherwise
-                        // carry a stale count forward, and three ordinary losses in a row would
-                        // park an item the player is still owed. Caught by
-                        // `stall_guard_leaves_the_save_scum_self_heal_intact_replay`.
-                        //
-                        // If the game inserts a frame late, the miss is harmless: the count reaches
-                        // 1 and the NEXT snapshot clears it. Only a good that is never observable
-                        // climbs to the cap.
-                        if io.has_good(*g) {
-                            self.grant_attempts.remove(g);
-                        } else {
-                            let n = self.grant_attempts.entry(*g).or_insert(0);
-                            *n += 1;
-                            if *n >= MAX_GRANT_ATTEMPTS {
-                                self.stalled_goods.insert(*g);
-                                newly_stalled.push(*g);
-                            }
-                        }
                     } else {
                         deferred = true; // inventory not ready -> retry next tick
                     }
@@ -1172,7 +1076,6 @@ impl Reconciler {
             applied,
             skipped_unstable: false,
             converged,
-            newly_stalled,
         }
     }
 
@@ -1215,15 +1118,6 @@ pub struct MockGame {
     pub flag_ready: bool,
     /// Inventory pointer captured (false => grants return false, caller retries).
     pub inventory_ready: bool,
-    /// Model the REFUSED grant: `grant_good` still returns `true` (the live `grant_item` discards
-    /// `AddItemFunc`'s result, so the client cannot tell), but the good never enters `goods` — the
-    /// game dropped it on the floor with "would exceed the maximum storage". This is the one
-    /// condition the reconciler could not represent before the stall guard, and it is exactly what
-    /// the 2026-07-30 reports describe. Distinct from `inventory_ready: false`, which is honest
-    /// backpressure (`false`, retry, not an attempt).
-    pub refuse_unique_adds: bool,
-    /// Every `grant_good` call the mock ACCEPTED, refused or not. The unbounded-loop detector.
-    pub unique_grant_calls: Vec<GoodsId>,
     pub stability: WorldStability,
 }
 
@@ -1235,8 +1129,6 @@ impl Default for MockGame {
             ledger_log: Vec::new(),
             flag_ready: true,
             inventory_ready: true,
-            refuse_unique_adds: false,
-            unique_grant_calls: Vec::new(),
             stability: WorldStability {
                 in_game: true,
                 player_valid: true,
@@ -1332,12 +1224,6 @@ impl GameIo for MockGame {
     fn grant_good(&mut self, goods: GoodsId, companion_flags: &[FlagId]) -> bool {
         if !self.inventory_ready {
             return false;
-        }
-        self.unique_grant_calls.push(goods);
-        if self.refuse_unique_adds {
-            // Dispatched and "accepted", but the item never lands. The live client cannot
-            // distinguish this from success, so neither may the mock: it returns `true`.
-            return true;
         }
         self.goods.insert(goods);
         for &f in companion_flags {
