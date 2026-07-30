@@ -16,8 +16,9 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
-    NUM_TIERS, ScalingConfig, is_dlc_bucket, is_scaling_speffect, raw_target_for_region,
-    speffect_id_for_tier, tier_for_region, tier_rates,
+    NUM_TIERS, RegionToastLedger, ScalingConfig, is_dlc_bucket, is_scaling_speffect,
+    raw_target_for_region, region_name_for_bucket, speffect_id_for_tier, tier_for_region,
+    tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -55,6 +56,10 @@ static STATUS_HIST: [AtomicU32; 6] = [
 ];
 /// One-shot release log per transition.
 static RELEASE_LOGGED: Mutex<bool> = Mutex::new(true);
+/// Once-per-announcement ledger for the region-entry scaling toast (pure + host-tested in
+/// `er_logic::scaling::RegionToastLedger`; the dedup policy and its tests live there). Reset in
+/// `configure` so a new seed's tiers announce afresh.
+static TOAST_LEDGER: Mutex<RegionToastLedger> = Mutex::new(RegionToastLedger::new());
 
 fn now_ms() -> u64 {
     let mut epoch = match EPOCH.lock() {
@@ -194,6 +199,11 @@ pub fn configure(sd: &Value) {
         (None, false) => {}
     }
     *CONFIG.lock().unwrap() = cfg;
+    // New config = new tiers: the region-entry announcements start over. A poisoned lock only
+    // ever costs announcements, never the sweep.
+    if let Ok(mut ledger) = TOAST_LEDGER.lock() {
+        ledger.reset();
+    }
 }
 
 /// What drove the tier for a region this sweep -- captured while `CONFIG` is locked so the emit can
@@ -209,11 +219,17 @@ struct RegionScaleDbg {
 }
 
 /// Per-tick sweep (call from `update_live`, in-world). Throttled; no-op unless configured.
-pub fn tick() {
+///
+/// Returns the region-entry scaling announcement owed this tick, if any (the production caller of
+/// `er_logic::scaling::region_scaling_toast`). Resolved AFTER the settle gate and the repeat
+/// throttle, so it fires when the tier actually lands rather than during teardown flaps, and
+/// deduped by `RegionToastLedger` -- once per distinct announcement per session. The caller
+/// (core.rs) owns the toast deck; this function owns no I/O beyond the sweep itself.
+pub fn tick() -> Option<String> {
     {
         let guard = CONFIG.lock().unwrap();
         if guard.is_none() {
-            return;
+            return None;
         }
     }
     // ORDERING IS THE FIX (2026-07-27). The throttle used to be checked HERE, before the region was
@@ -224,10 +240,10 @@ pub fn tick() {
     // every tick, and throttle only REPEAT sweeps.
     let tick_no = TICK.fetch_add(1, Ordering::Relaxed);
     let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {
-        return;
+        return None;
     };
     let Some(player) = wcm.main_player.as_ref() else {
-        return;
+        return None;
     };
     // DEATH GUARD (2026-07-30, generalizing the guard no_fall_damage / no_equip_load / deathlink
     // have each carried for the player's OWN SpEffect list): at the death-cam transition the
@@ -238,7 +254,7 @@ pub fn tick() {
     // it; the predicate + timeline live in er_logic::scaling_settle (host-tested). Degrade:
     // enemies keep their current tier while the player is dead, invisible in play.
     if sweep_blocked_by_death(player.chr_ins.modules.data.hp) {
-        return;
+        return None;
     }
     // SCALING_WIRE: resolve in play_region/100 sub-id space -- the same bucket the
     // region-lock kick uses and the space regionSphereTargetRanges is emitted in.
@@ -252,22 +268,22 @@ pub fn tick() {
     let now = now_ms();
     let (allowed, diag) = {
         let Ok(mut gate) = GATE.lock() else {
-            return;
+            return None;
         };
         gate.on_region(region, now, &SETTLE); // EVERY tick, before any throttle
         (gate.sweep_allowed(now, &SETTLE), gate.release_diag(now))
     };
     if !allowed {
-        return;
+        return None;
     }
     // Repeat-sweep throttle, measured from the LAST SWEEP rather than a modulo phase, so the first
     // allowed sweep after a transition runs on this tick instead of waiting up to 30 more frames.
     {
         let Ok(mut last) = LAST_SWEEP_TICK.lock() else {
-            return;
+            return None;
         };
         match *last {
-            Some(t) if tick_no.wrapping_sub(t) < THROTTLE => return,
+            Some(t) if tick_no.wrapping_sub(t) < THROTTLE => return None,
             _ => *last = Some(tick_no),
         }
     }
@@ -279,10 +295,10 @@ pub fn tick() {
     // number instead of just printing it. (Before: the log showed only `-> speffect NNNN`, which
     // couldn't distinguish "sphere resolved this tier" from "DLC cap clamped it" from "unmapped ->
     // floor" -- the exact ambiguity the fable consult flagged, 2026-07-15.)
-    let (target, dbg) = {
+    let (target, dbg, entry_toast) = {
         let guard = CONFIG.lock().unwrap();
         let Some(cfg) = guard.as_ref() else {
-            return;
+            return None;
         };
         let tier = tier_for_region(cfg, region);
         let rates = tier_rates(tier);
@@ -294,7 +310,15 @@ pub fn tick() {
             hp: rates.hp,
             attack: rates.attack,
         };
-        (speffect_id_for_tier(tier), dbg)
+        // Region-entry announcement: decided while the config is in hand, deduped per-session by
+        // the ledger (message-keyed -- see er_logic::scaling::RegionToastLedger). Named buckets
+        // only: the baked geometry (region_locks.rs) names exactly the buckets the wire can
+        // target, so hub/tutorial buckets stay silent instead of guessing.
+        let entry_toast = TOAST_LEDGER
+            .lock()
+            .ok()
+            .and_then(|mut l| l.on_region(cfg, region, region_name_for_bucket(region)));
+        (speffect_id_for_tier(tier), dbg, entry_toast)
     };
 
     let mut scaled = 0u32;
@@ -409,6 +433,8 @@ pub fn tick() {
             if dlc_region { ", DLC region" } else { "" },
         );
     }
+
+    entry_toast
 }
 
 /// True for chr_types that are ACTUAL hostiles worth scaling -- player invaders (BloodyFinger /

@@ -2653,7 +2653,17 @@ impl shared::Core for Core {
             // slot that kept its old (much higher) cost is a check nobody collects.
             let _ = crate::shop_prices::run();
             let _ = crate::minibaker::run();
-            crate::scaling::tick();
+            // Region-entry scaling announcement (er_logic::scaling::region_scaling_toast, wired
+            // v0.2.19): the sweep just resolved a tier this session had not yet said out loud --
+            // put the NUMBER on screen. v0.2.18 made `maximum_enemy_difficulty: auto` the
+            // default, which quietly lowers a short seed's ceiling (5 regions cap at 4.12x, not
+            // 7.42x); a line the player can read is the only way that change is perceptible in
+            // game at all. Dedup lives in er_logic (once per distinct announcement per session);
+            // the deck's refresh-on-identical-text is the backstop.
+            if let Some(entry_toast) = crate::scaling::tick() {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(entry_toast, now);
+            }
             // Anti-stuck: keep the FieldArea fast-travel gate open so a dungeon/catacomb can never
             // strand the player (SELF-CALIBRATING field overwrite; see fast_travel.rs). Game-thread.
             crate::fast_travel::tick();

@@ -539,6 +539,76 @@ pub fn region_scaling_toast(region: &str, scaling: RegionScaling) -> String {
     }
 }
 
+/// The coarse region NAME for a play_region/100 bucket, from the baked geometry table
+/// (`region_locks::REGION_LOCKS` -- generated from the SAME `REGION_PLAY_IDS` the apworld derives
+/// `regionSphereTargetRanges` from, so a bucket the scaling wire can target is a bucket this can
+/// name). `None` = geometry that names no region (Roundtable, the tutorial, unmapped sub-areas).
+/// The entry toast DERIVES its name here or stays silent; it never invents one.
+pub fn region_name_for_bucket(bucket: i32) -> Option<&'static str> {
+    crate::region_locks::REGION_LOCKS
+        .iter()
+        .find(|r| r.play_regions.contains(&bucket))
+        .map(|r| r.region)
+}
+
+/// Once-per-announcement ledger for the region-entry scaling toast -- the production caller's
+/// dedup, host-tested here because "when to repeat yourself" is a decision, not I/O.
+///
+/// Dedup is by the MESSAGE, not the bucket. A region spans many buckets (Altus has 13), and
+/// crossing between two buckets of one region must not re-say the same words -- riding a border
+/// would otherwise strobe the deck. But a hand-authored intra-fold delta (Greyoll's Dragonbarrow
+/// inside Caelid) resolves a DIFFERENT tier under the same name, and that difference is exactly
+/// worth one line of its own. So: each distinct rendered announcement fires once per session;
+/// `reset()` on (re)configure lets a new seed -- whose tiers all changed -- speak afresh.
+pub struct RegionToastLedger {
+    announced: Vec<String>,
+}
+
+impl RegionToastLedger {
+    /// `const` so the client can hold one in a `static Mutex` (see the const-construction test).
+    pub const fn new() -> Self {
+        RegionToastLedger {
+            announced: Vec::new(),
+        }
+    }
+
+    /// Forget everything said. Call when a new `ScalingConfig` arrives (connect / seed change).
+    pub fn reset(&mut self) {
+        self.announced.clear();
+    }
+
+    /// The announcement owed for observing the player in `bucket`, or `None`: no name for the
+    /// bucket (hub/tutorial -- silence, not a guess), or these exact words were already said this
+    /// session. `name` is a parameter (the caller passes [`region_name_for_bucket`]) so the
+    /// decision stays testable without the baked table.
+    pub fn on_region(
+        &mut self,
+        cfg: &ScalingConfig,
+        bucket: i32,
+        name: Option<&str>,
+    ) -> Option<String> {
+        let name = name?;
+        let scaling = region_scaling(
+            raw_target_for_region(cfg, bucket),
+            cfg.max_target,
+            cfg.floor_tier,
+            cfg.ceiling_tier,
+        );
+        let msg = region_scaling_toast(name, scaling);
+        if self.announced.contains(&msg) {
+            return None;
+        }
+        self.announced.push(msg.clone());
+        Some(msg)
+    }
+}
+
+impl Default for RegionToastLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1069,5 +1139,113 @@ mod tests {
     fn a_tier_past_the_ladder_clamps_instead_of_panicking() {
         // Reachable from foreign or hand-rolled slot_data, so it must not index out of bounds.
         assert_eq!(tier_multiplier(usize::MAX), SCALING_TIERS[NUM_TIERS - 1].hp);
+    }
+
+    // ---- the region-entry ledger (the toast's production dedup) --------------------------------
+
+    #[test]
+    fn the_entry_toast_speaks_once_per_distinct_announcement() {
+        // Two Caelid buckets on the same tier: ONE line, ever -- riding a bucket border must not
+        // strobe. The delta'd Dragonbarrow bucket resolves a different tier under the same name:
+        // its own line, once.
+        let c = cfg(&[(64000, 5000), (64010, 5000), (64020, 7500)], 0);
+        let mut ledger = RegionToastLedger::new();
+        let first = ledger
+            .on_region(&c, 64000, Some("Caelid"))
+            .expect("first entry announces");
+        assert!(first.starts_with("Caelid — enemy scaling"), "{first}");
+        assert_eq!(
+            ledger.on_region(&c, 64000, Some("Caelid")),
+            None,
+            "the repeat sweep in the same bucket is silent"
+        );
+        assert_eq!(
+            ledger.on_region(&c, 64010, Some("Caelid")),
+            None,
+            "a same-region bucket rendering the same words is silent"
+        );
+        let bumped = ledger
+            .on_region(&c, 64020, Some("Caelid"))
+            .expect("the intra-fold delta bucket is a different announcement");
+        assert_ne!(bumped, first);
+        assert_eq!(ledger.on_region(&c, 64020, Some("Caelid")), None);
+    }
+
+    #[test]
+    fn a_nameless_bucket_stays_silent() {
+        // Roundtable / tutorial class: no name in the baked geometry, no announcement -- and the
+        // silence must not consume anything (a later NAMED bucket still speaks).
+        let c = cfg(&[(60000, 5000)], 0);
+        let mut ledger = RegionToastLedger::new();
+        assert_eq!(ledger.on_region(&c, 11100, None), None);
+        assert!(ledger.on_region(&c, 60000, Some("Limgrave")).is_some());
+    }
+
+    #[test]
+    fn an_unmapped_named_bucket_announces_the_floor_wording_once() {
+        // A named region the wire does not target (a sealed num_regions neighbour the player rode
+        // into): honest telemetry -- you are in unscaled territory -- said once, not per sweep.
+        let c = cfg(&[(60000, 5000)], 2);
+        let mut ledger = RegionToastLedger::new();
+        let msg = ledger
+            .on_region(&c, 64000, Some("Caelid"))
+            .expect("announces");
+        assert!(msg.contains("not set for this area"), "{msg}");
+        assert_eq!(ledger.on_region(&c, 64000, Some("Caelid")), None);
+    }
+
+    #[test]
+    fn a_new_seed_resets_the_ledger() {
+        let c = cfg(&[(60000, 5000)], 0);
+        let mut ledger = RegionToastLedger::new();
+        assert!(ledger.on_region(&c, 60000, Some("Limgrave")).is_some());
+        ledger.reset();
+        assert!(
+            ledger.on_region(&c, 60000, Some("Limgrave")).is_some(),
+            "a reconfigure (new seed) announces afresh"
+        );
+    }
+
+    #[test]
+    fn the_announced_tier_is_the_applied_tier() {
+        // The words must agree with what the sweep actually applies (tier_for_region) -- mapped,
+        // unmapped, and ceiling-clamped alike. If region_scaling ever grows resolution rules of
+        // its own, this is the tripwire: a toast that disagrees with the applied speffect would be
+        // the confident wrong answer this crate keeps warning about.
+        let mut c = cfg(&[(64000, 5000), (30000, 10000)], 1);
+        c.ceiling_tier = 8;
+        for bucket in [64000, 30000, 99999] {
+            let applied = tier_for_region(&c, bucket);
+            let (RegionScaling::Known(shown) | RegionScaling::Defaulted(shown)) = region_scaling(
+                raw_target_for_region(&c, bucket),
+                c.max_target,
+                c.floor_tier,
+                c.ceiling_tier,
+            );
+            assert_eq!(shown, applied, "bucket {bucket}");
+        }
+    }
+
+    #[test]
+    fn baked_geometry_names_the_buckets_the_wire_speaks() {
+        // Spot-checks against the generated table (region_locks.rs): the intra-fold delta bucket
+        // and a DLC bucket both resolve; an id in no region does not.
+        assert_eq!(region_name_for_bucket(64020), Some("Caelid"));
+        assert_eq!(region_name_for_bucket(41020), Some("Charo's"));
+        assert_eq!(region_name_for_bucket(99999), None);
+    }
+
+    #[test]
+    fn the_ledger_const_constructs_in_a_static() {
+        // The client holds the ledger in `static TOAST_LEDGER: Mutex<RegionToastLedger>` --
+        // Windows-only code this crate cannot compile, so the const-construction is proven here.
+        static LEDGER: std::sync::Mutex<RegionToastLedger> =
+            std::sync::Mutex::new(RegionToastLedger::new());
+        let c = cfg(&[(60000, 5000)], 0);
+        assert!(LEDGER
+            .lock()
+            .unwrap()
+            .on_region(&c, 60000, Some("Limgrave"))
+            .is_some());
     }
 }
