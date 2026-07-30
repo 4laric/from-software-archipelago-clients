@@ -304,13 +304,24 @@ pub fn run() -> bool {
         if trace.contains(&id) {
             log::info!(
                 "shop-sell TRACE row {id}: LIVE equipId {} equipType {} value {} sellQuantity {} \
-                 nameMsgId {} iconId {} eventFlag_forStock {f} | in slot_data = {}",
+                 nameMsgId {} iconId {} eventFlag_forStock {f} = {} | in slot_data = {}",
                 row.equip_id(),
                 row.equip_type(),
                 row.value(),
                 row.sell_quantity(),
                 row.name_msg_id(),
                 row.icon_id(),
+                // ⭐ 2026-07-30: Alaric confirmed the blank cells after the last item are NOT
+                // selectable, so a missing row is not a render fault -- the menu never built an
+                // entry for it. The standard reason a valid ShopLineupParam row is excluded from a
+                // shop list is its stock flag being SET (already purchased => out of stock), and
+                // this file already calls get_event_flag a few lines down for ECHO-DEDUP. Reading
+                // it here costs nothing and turns the question into a log line.
+                if crate::flags::get_event_flag(f) {
+                    "SET (row would be OUT OF STOCK)"
+                } else {
+                    "clear"
+                },
                 flag_to_loc.contains_key(&f)
             );
         }
