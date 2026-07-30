@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use eldenring::cs::GameDataMan;
@@ -278,12 +278,40 @@ fn count_held_goods_row(row: i32) -> Option<i32> {
 /// threshold. Returns the qty to actually grant (0 = at/over the cap, skip). Non-pot full_ids and an
 /// unreadable inventory pass through unchanged (a transient read miss must not drop an item; the cap
 /// re-checks on the next pot grant).
+/// One announce-bit per `POT_DELIVERY_CAPS` row, so a capped pot says so ONCE per session instead of
+/// once per grant or never.
+static POT_CAP_ANNOUNCED: AtomicU32 = AtomicU32::new(0);
+
 fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
-    let Some(&(_, cap)) = POT_DELIVERY_CAPS.iter().find(|&&(id, _)| id == full_id) else {
+    let Some((idx, &(_, cap))) = POT_DELIVERY_CAPS
+        .iter()
+        .enumerate()
+        .find(|(_, &(id, _))| id == full_id)
+    else {
         return qty;
     };
     match count_held_goods_row(full_id & 0x0FFF_FFFF) {
-        Some(held) => qty.min((cap - held).max(0)),
+        Some(held) => {
+            let allowed = qty.min((cap - held).max(0));
+            // TELEMETRY (2026-07-30). Swallowing part of a grant and reporting success is precisely
+            // the "polite false" CONTRIBUTING forbids: `grant_full_id` returns true either way, so a
+            // pot the player never receives is indistinguishable from one they did. Eldakin's
+            // 2026-07-29 log shows the consequence -- start-item backfill re-granting 10 Hefty
+            // Cracked Pots that were also swallowed, with nothing anywhere saying why.
+            // 🛑 A seed that hands out MORE start pots than the cap can never deliver the remainder;
+            // this line is how that becomes visible instead of silent.
+            if allowed < qty {
+                let bit = 1u32 << idx;
+                if POT_CAP_ANNOUNCED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    log::warn!(
+                        "pot-cap: goods {full_id:#x} grant of {qty} CAPPED to {allowed} (held {held}, cap {cap}) \
+                         -- the remainder is reported delivered but never enters the inventory. \
+                         Further caps on this row are silent."
+                    );
+                }
+            }
+            allowed
+        }
         None => qty,
     }
 }
