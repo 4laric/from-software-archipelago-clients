@@ -242,9 +242,7 @@ pub fn tick() -> Option<String> {
     let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {
         return None;
     };
-    let Some(player) = wcm.main_player.as_ref() else {
-        return None;
-    };
+    let player = wcm.main_player.as_ref()?;
     // DEATH GUARD (2026-07-30, generalizing the guard no_fall_damage / no_equip_load / deathlink
     // have each carried for the player's OWN SpEffect list): at the death-cam transition the
     // engine tears chr_ins + special_effect lists down, and mutating one mid-teardown is a native
@@ -297,9 +295,7 @@ pub fn tick() -> Option<String> {
     // floor" -- the exact ambiguity the fable consult flagged, 2026-07-15.)
     let (target, dbg, entry_toast) = {
         let guard = CONFIG.lock().unwrap();
-        let Some(cfg) = guard.as_ref() else {
-            return None;
-        };
+        let cfg = guard.as_ref()?;
         let tier = tier_for_region(cfg, region);
         let rates = tier_rates(tier);
         let dbg = RegionScaleDbg {
