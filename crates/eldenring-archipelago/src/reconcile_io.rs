@@ -226,6 +226,24 @@ fn inventory_forensics(goods: i32) -> String {
         inv.key_items_head.as_ptr() as *const u8,
     );
 
+    // GREAT-RUNE EQUIP SLOT. Leading hypothesis for the 2026-07-29 flood: equipping a Great Rune at
+    // a grace detaches its row from the three bag lists while the game still counts it as possessed,
+    // so `inventory_has_goods` reads absent forever and the re-grant is refused forever. The timeline
+    // fits -- the flood began LIVE at 01:36:10, ~50s after arriving at Roundtable with a
+    // just-received Morgott's Great Rune, with no world edge -- but it is UNPROVEN, and this line is
+    // what proves or kills it. `selector == 0` with an empty handle means nothing is equipped.
+    let gr = &pgd.equipment.equip_item_data.great_rune;
+    // NB: `GaitemHandle`'s inner u32 is NOT pub outside the crate (bitfield tuple struct), so read
+    // it through its accessors + derived Debug rather than `.0`.
+    let great_rune_slot = format!(
+        "{:?} selector={:#x} indexed={} index={} category={:?}",
+        gr.gaitem_handle,
+        gr.gaitem_handle.selector(),
+        gr.gaitem_handle.is_indexed(),
+        gr.index,
+        gr.gaitem_handle.category(),
+    );
+
     let in_storage = match pgd.storage.as_ref() {
         None => "n/a".to_string(),
         Some(st) => {
@@ -245,7 +263,7 @@ fn inventory_forensics(goods: i32) -> String {
 
     format!(
         "normal {}/{}{} | key {}/{}{} | multiplay_key {}/{}{} | global_cap {} | \
-         key_accessor={} | in_storage={}",
+         key_accessor={} | in_storage={} | great_rune_slot[{}]",
         inv.normal_items_len,
         inv.normal_items_capacity,
         if inv.is_normal_items_full() {
@@ -270,6 +288,7 @@ fn inventory_forensics(goods: i32) -> String {
             "multiplay_key_items (SWITCHED)"
         },
         in_storage,
+        great_rune_slot,
     )
 }
 
