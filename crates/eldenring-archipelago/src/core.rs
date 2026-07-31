@@ -687,6 +687,16 @@ impl shared::Core for Core {
                 );
                 // mode 2 (scaled): the per-DLC-region Scadutree-blessing floor wire. Absent for base
                 // game / mode != 2 -> empty -> mode 2 behaves as mode 1.
+                // scaduBlessingCap: the seed's ceiling for the blessing curve (tier-aware under
+                // `scaled`, the ladder ceiling under `player_only`). ABSENT => 0 => the client falls
+                // back to SCADU_MAX_LEVEL, never to 0 — an absent key that read as the floor would
+                // ship the whole feature inert, which is the exact failure this option already had.
+                crate::scadu_blessing::set_cap(
+                    sd.get("scaduBlessingCap").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                );
+                // A reconnect / seed change must re-sync the clone row rather than trust a level
+                // cached from a different seed.
+                crate::scadu_blessing::reset();
                 crate::upgrades::set_dlc_blessing_floors(
                     er_logic::scaling::parse_triple_ranges(sd.get("dlcScadutreeFloorRanges")),
                 );

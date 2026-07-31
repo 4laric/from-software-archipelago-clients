@@ -36,6 +36,7 @@ mod notif_ticker;
 mod params;
 mod reconcile_io;
 mod region;
+mod scadu_blessing;
 mod scaling;
 mod scout_proof;
 mod shop_flags;

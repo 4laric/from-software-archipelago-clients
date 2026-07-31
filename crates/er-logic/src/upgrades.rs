@@ -119,6 +119,63 @@ pub fn blessing_target(mode: i32, frag_qty: i32, floor: i32) -> Option<i32> {
     Some(target.clamp(0, SCADU_MAX_LEVEL))
 }
 
+/// Blessing-clone rate pair: `(attack, cut)` to write into our repurposed `SpEffectParam` row.
+///
+/// WHY A RATIO AND NOT `A(t)` DIRECTLY. The vanilla Scadutree ladder is ONE scalar: every level row
+/// `20000100 + n` sets all five `atk*DmgCorrectRate` channels to `A(n)` and all eight
+/// `*DamageCutRate` channels to `1/A(n)`, exactly (RECON-scadutree-blessing-speffect-20260729 §2).
+/// Inside the Land of Shadow the engine is refreshing a REAL rung `k` every tick, so if our clone
+/// also carried the full `A(t)` the two would multiply and the player would double-dip. Carrying
+/// `A(t)/A(k)` makes the product exactly `A(t)` wherever the player stands, and `k = 0` (no vanilla
+/// rung active -- i.e. the whole base game) gives `A(t)/1.0 = A(t)`. So ONE formula covers base game
+/// and DLC and the spec's double-dip rule (§3.4) reduces to this function.
+///
+/// Both inputs are READ FROM THE PARAM ROWS at runtime (`base + t`, `base + k`), never from a table
+/// we carry: the curve then self-updates across game patches and we never ship FromSoft's numbers
+/// (`er-foreign-list-provenance-rule`).
+///
+/// Returns `(1.0, 1.0)` -- a true no-op -- for every input that isn't a sane raise:
+///
+/// * `a_active <= 0.0` or non-finite: the caller's read of the active rung failed or the row was
+///   garbage. A ratio against 0 is `inf`; refusing is the only safe answer.
+/// * `a_target` non-finite, or `<= 0.0`.
+/// * `a_active >= a_target`: the player's own blessing already meets or beats our target. The clone
+///   must NEVER carry a value below 1.0 -- that would be a DEBUFF, silently taking away a blessing
+///   the player earned. Compose as `max`, never as a sum and never as a subtraction.
+///
+/// 🛑 These branches are unreachable from any seed corpus, so they are called directly in the tests
+/// below rather than assumed covered (`guard-absent-from-corpus-needs-a-direct-call`).
+pub fn clone_rates(a_target: f32, a_active: f32) -> (f32, f32) {
+    const NOOP: (f32, f32) = (1.0, 1.0);
+    if !a_target.is_finite() || !a_active.is_finite() {
+        return NOOP;
+    }
+    if a_target <= 0.0 || a_active <= 0.0 {
+        return NOOP;
+    }
+    if a_active >= a_target {
+        // Player's real blessing already >= our target. Raise-only: never write a cut > 1 / attack < 1.
+        return NOOP;
+    }
+    let attack = a_target / a_active;
+    if !attack.is_finite() || attack < 1.0 {
+        return NOOP;
+    }
+    (attack, 1.0 / attack)
+}
+
+/// Clamp a blessing target to the seed's cap (`scaduBlessingCap` from slot_data).
+///
+/// Separate from [`blessing_target`] on purpose: the cap is a SEED fact that arrives over the wire,
+/// while `blessing_target` is the per-tick decision. A cap <= 0 or absent means "no extra cap" and
+/// falls back to [`SCADU_MAX_LEVEL`] -- an absent key must never silently pin the blessing to 0
+/// (`er-unfreezing-an-option-needs-the-class-default`: an unset value that reads as the floor is how
+/// a feature ships inert).
+pub fn apply_blessing_cap(target: i32, cap: i32) -> i32 {
+    let cap = if cap <= 0 { SCADU_MAX_LEVEL } else { cap };
+    target.clamp(0, cap.min(SCADU_MAX_LEVEL))
+}
+
 /// Raise the stored scadutree blessing to `level` (clamped to `[0, SCADU_MAX_LEVEL]`); never lowers.
 ///   None => PlayerGameData unreachable; Some(None) => already >= target; Some(Some((was, now))) => raised.
 pub fn raise_stored_blessing(hook: &mut dyn GameHook, level: i32) -> Option<Option<(i32, i32)>> {
@@ -267,5 +324,100 @@ mod tests {
     fn classify_unknown_material_defaults_normal_never_panics() {
         // materialSetId -1/other with a real run -> treat as normal (never somber-leak, never crash).
         assert_eq!(classify_track(25, -1), Some((25, false)));
+    }
+
+    // ============================================================================================
+    // clone_rates -- Lever D's arithmetic. Every branch here is called DIRECTLY: none of them is
+    // reachable from a seed corpus, and a guard the corpus never triggers is untested.
+    // ============================================================================================
+
+    /// The base game: nothing active, so the clone carries the full curve.
+    #[test]
+    fn clone_rates_no_active_rung_is_the_full_curve() {
+        // A(0) = 1.0 (the identity row). A(20) = 2.05.
+        let (atk, cut) = clone_rates(2.05, 1.0);
+        assert!((atk - 2.05).abs() < 1e-6, "attack {atk}");
+        // The ladder's own identity: cut == 1/attack, exactly.
+        assert!((cut - 1.0 / 2.05).abs() < 1e-6, "cut {cut}");
+    }
+
+    /// In the DLC with a real rung live: the clone supplies only the DIFFERENCE, so the product the
+    /// player actually experiences is A(target) and not A(target)*A(active).
+    #[test]
+    fn clone_rates_composes_to_exactly_the_target() {
+        let a_target = 2.05; // level 20
+        let a_active = 1.425; // level ~5, a real revere
+        let (atk, cut) = clone_rates(a_target, a_active);
+        // What the damage pipeline sees = vanilla rung * our clone.
+        assert!(
+            (a_active * atk - a_target).abs() < 1e-5,
+            "product {}",
+            a_active * atk
+        );
+        // And the defensive half composes the same way, in reverse.
+        assert!(((1.0 / a_active) * cut - 1.0 / a_target).abs() < 1e-5);
+    }
+
+    /// 🛑 The one that would silently hurt the player: their real blessing already beats our target.
+    /// A naive ratio gives attack < 1 = a DEBUFF. Must be a no-op instead.
+    #[test]
+    fn clone_rates_never_debuffs_when_active_exceeds_target() {
+        assert_eq!(clone_rates(1.425, 2.05), (1.0, 1.0));
+        // Exactly equal is also a no-op, not a 1.0 computed through a division.
+        assert_eq!(clone_rates(2.05, 2.05), (1.0, 1.0));
+    }
+
+    /// A failed read of the active rung yields 0.0; dividing by it is `inf`.
+    #[test]
+    fn clone_rates_zero_active_is_a_noop_not_infinity() {
+        assert_eq!(clone_rates(2.05, 0.0), (1.0, 1.0));
+        assert_eq!(clone_rates(2.05, -1.0), (1.0, 1.0));
+        assert_eq!(clone_rates(0.0, 1.0), (1.0, 1.0));
+    }
+
+    #[test]
+    fn clone_rates_non_finite_is_a_noop() {
+        assert_eq!(clone_rates(f32::NAN, 1.0), (1.0, 1.0));
+        assert_eq!(clone_rates(2.05, f32::NAN), (1.0, 1.0));
+        assert_eq!(clone_rates(f32::INFINITY, 1.0), (1.0, 1.0));
+        assert_eq!(clone_rates(2.05, f32::INFINITY), (1.0, 1.0));
+    }
+
+    /// The pair is always reciprocal -- that property is what makes the composition exact, so it is
+    /// asserted across the whole ladder rather than at one point.
+    #[test]
+    fn clone_rates_pair_is_always_reciprocal() {
+        for step in 1..=40 {
+            let a_target = 1.0 + step as f32 * 0.05;
+            for astep in 0..=step {
+                let a_active = 1.0 + astep as f32 * 0.05;
+                let (atk, cut) = clone_rates(a_target, a_active);
+                assert!(atk >= 1.0, "clone must never debuff: {atk}");
+                assert!(
+                    (atk * cut - 1.0).abs() < 1e-5,
+                    "not reciprocal: {atk} {cut}"
+                );
+            }
+        }
+    }
+
+    // ============================================================================================
+    // apply_blessing_cap
+    // ============================================================================================
+
+    #[test]
+    fn cap_absent_means_the_ladder_ceiling_not_zero() {
+        // 🛑 The failure this pins: an unset/absent scaduBlessingCap reading as 0 would clamp every
+        // blessing to 0 and ship the feature inert. Absent => SCADU_MAX_LEVEL.
+        assert_eq!(apply_blessing_cap(20, 0), 20);
+        assert_eq!(apply_blessing_cap(20, -1), 20);
+    }
+
+    #[test]
+    fn cap_clamps_and_never_exceeds_the_ladder() {
+        assert_eq!(apply_blessing_cap(20, 12), 12);
+        assert_eq!(apply_blessing_cap(5, 12), 5);
+        assert_eq!(apply_blessing_cap(99, 99), 20); // cap can't lift past the real ceiling
+        assert_eq!(apply_blessing_cap(-3, 12), 0);
     }
 }

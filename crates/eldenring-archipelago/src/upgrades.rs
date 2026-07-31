@@ -357,6 +357,14 @@ pub fn tick_global_scadu() {
         return; // mode off -> never touch the byte
     };
 
+    // LEVER D — the game-wide half. The stored byte below is DLC-only (the engine declines to apply
+    // its rung outside the Land of Shadow, measured in-game 2026-07-29), so on its own this feature
+    // has never touched base-game balance. `scadu_blessing::drive` clones the rung onto a row of our
+    // own and applies that, which works everywhere. It is driven from here, and not from its own
+    // tick, so that an `off` seed makes zero new game accesses: the mode gate, the `in_world()`
+    // gate, the throttle and the bag walk above are all shared.
+    crate::scadu_blessing::drive(level);
+
     // Read the current stored blessing, then ONLY raise it (never stomp a higher real DLC revere,
     // never down-flicker). The read+write share one mutable PlayerGameData borrow inside
     // `raise_stored_blessing` so the value can't change between the compare and the store.
