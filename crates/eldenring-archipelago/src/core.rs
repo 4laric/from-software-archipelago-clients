@@ -2669,6 +2669,16 @@ impl shared::Core for Core {
                 let now = self.toast_clock.elapsed().as_millis() as u64;
                 self.toasts.push(entry_toast, now);
             }
+            // A REFUSED session is the one state where the mod deliberately does NOTHING, and it is
+            // indistinguishable from a broken install unless we say so: checks stop reporting,
+            // items stop arriving, and the only trace was a `log::warn!`. boblerrr played ~55
+            // minutes like that on 2026-07-30. Re-pushed every tick on purpose -- the condition
+            // persists until the player acts, and the deck refreshes identical text rather than
+            // stacking, so this is free after the first frame.
+            if let Some(refusal) = crate::reconcile_io::refusal_toast() {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(refusal, now);
+            }
             // Anti-stuck: keep the FieldArea fast-travel gate open so a dungeon/catacomb can never
             // strand the player (SELF-CALIBRATING field overwrite; see fast_travel.rs). Game-thread.
             crate::fast_travel::tick();

@@ -364,6 +364,38 @@ pub fn armed_verdict(armed: Identity, room_seed: &str, ap_slot: &str) -> ArmedVe
     }
 }
 
+/// Why a session was refused — decides the WORDS, because the two cases need different actions
+/// from the player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// At connect: the loaded save's marker belongs to a different (seed, slot). The player has the
+    /// wrong SAVE for this room. See [`InitDecision::Refuse`].
+    WrongSaveAtConnect,
+    /// Mid-session: the ROOM changed under a live, already-armed reconciler. See [`ArmedVerdict`].
+    RoomChangedMidSession,
+}
+
+/// The on-screen words for a refused session.
+///
+/// 🛑 A refused session looks EXACTLY like a broken mod from the player's chair: checks stop
+/// reporting, items stop arriving, and until now the only trace was a `log::warn!` nobody reads.
+/// boblerrr played ~55 minutes across two sessions in that state on 2026-07-30. The guard was
+/// right; it was just invisible. So these strings must name the ACTION, not the diagnosis — a
+/// player cannot act on "marker identity mismatch".
+///
+/// Kept in er-logic (pure, host-tested) for the same reason as
+/// [`crate::scaling::region_scaling_toast`]: the words are a product decision, and the client
+/// should own no copy of them. The caller pushes into `toast::Deck`, whose identical-text refresh
+/// makes a per-tick re-push free — which is what a persistent condition wants.
+pub fn refusal_toast(refusal: Refusal) -> String {
+    match refusal {
+        Refusal::WrongSaveAtConnect => "Archipelago: this save belongs to a DIFFERENT seed.              Nothing will send or arrive. Load the save for this room, or start a fresh character."
+            .to_string(),
+        Refusal::RoomChangedMidSession => "Archipelago: the room changed while you were playing.              Nothing will send or arrive, so this save's checks are not sent to the new room.              RESTART the game."
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,4 +624,43 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------------------------
+    // refusal_toast — the on-screen half of the guard (2026-07-30)
+    // -----------------------------------------------------------------------------------------
+
+    /// Both refusals must tell the player what to DO. A player cannot act on "identity mismatch",
+    /// which is all the log said while boblerrr played ~55 minutes into a gated session.
+    #[test]
+    fn both_refusal_toasts_name_an_action_the_player_can_take() {
+        let wrong = refusal_toast(Refusal::WrongSaveAtConnect);
+        let changed = refusal_toast(Refusal::RoomChangedMidSession);
+        for t in [&wrong, &changed] {
+            assert!(t.contains("Archipelago:"), "{t}");
+            // The consequence, so a silent game is explained rather than merely flagged.
+            assert!(t.contains("Nothing will send or arrive"), "{t}");
+        }
+        assert!(wrong.to_lowercase().contains("fresh character"), "{wrong}");
+        assert!(changed.to_lowercase().contains("restart"), "{changed}");
+    }
+
+    /// The two cases need DIFFERENT actions — restarting does not fix a wrong save, and loading
+    /// another save does not fix a room that moved. Collapsing them would give bad advice.
+    #[test]
+    fn the_two_refusals_do_not_give_the_same_advice() {
+        assert_ne!(
+            refusal_toast(Refusal::WrongSaveAtConnect),
+            refusal_toast(Refusal::RoomChangedMidSession)
+        );
+    }
+
+    /// A toast is re-pushed every tick while refused and deduped by `toast::Deck` on EXACT text —
+    /// so the words must be stable for a given refusal, or the deck stacks a new toast per frame.
+    #[test]
+    fn the_words_are_stable_so_the_decks_dedup_holds() {
+        for r in [Refusal::WrongSaveAtConnect, Refusal::RoomChangedMidSession] {
+            assert_eq!(refusal_toast(r), refusal_toast(r));
+        }
+    }
+
 }

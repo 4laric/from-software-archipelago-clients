@@ -465,6 +465,32 @@ pub fn is_refused() -> bool {
     REFUSED.load(Ordering::Relaxed)
 }
 
+/// WHY the session was refused, so the player can be told what to DO about it. `REFUSED` stays an
+/// `AtomicBool` because `is_refused` is on the check-reporting hot path; this is read once a tick.
+static REFUSAL: Mutex<Option<marker::Refusal>> = Mutex::new(None);
+
+/// The on-screen notice owed while this session is refused, or `None` when it is healthy.
+///
+/// Re-computed every tick by design: the condition PERSISTS (a refused session never heals without
+/// player action), and `er_logic::toast::Deck::push` refreshes identical text instead of stacking,
+/// so a per-tick re-push keeps the notice on screen for free. Same shape as
+/// `scaling::tick() -> Option<String>`: this owns no I/O, the caller owns the deck.
+pub fn refusal_toast() -> Option<String> {
+    if !is_refused() {
+        return None;
+    }
+    let refusal = (*REFUSAL.lock().ok()?)?;
+    Some(marker::refusal_toast(refusal))
+}
+
+/// Latch the refusal + its reason together, so `is_refused` and `refusal_toast` can never disagree.
+fn set_refused(refusal: marker::Refusal) {
+    if let Ok(mut r) = REFUSAL.lock() {
+        *r = Some(refusal);
+    }
+    REFUSED.store(true, Ordering::Relaxed);
+}
+
 /// Re-ask the reconnect guard's question about an ALREADY-ARMED reconciler, and disarm it if the
 /// session's identity has moved out from under it.
 ///
@@ -493,7 +519,7 @@ pub fn disarm_if_identity_moved(room_seed: &str) {
     match marker::armed_verdict(d.identity, room_seed, &d.slot) {
         marker::ArmedVerdict::Keep => {}
         marker::ArmedVerdict::Disarm { armed, live } => {
-            REFUSED.store(true, Ordering::Relaxed);
+            set_refused(marker::Refusal::RoomChangedMidSession);
             log::warn!(
                 "[reconcile] DISARMED: the armed reconciler belongs to identity {armed:#010x} but \
                  this connection is {live:#010x} (room seed {room_seed:?}, slot {:?}) -- the room \
@@ -711,7 +737,7 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
     // monotonic for a resume). On the marker Resume path the marker is authoritative, so it's false.
     let (reconciler, fresh_character) = match decision {
         marker::InitDecision::Refuse { stored, expected } => {
-            REFUSED.store(true, Ordering::Relaxed);
+            set_refused(marker::Refusal::WrongSaveAtConnect);
             log::warn!(
                 "[reconcile] REFUSED: save marker identity {stored:#010x} != this session {expected:#010x} \
                  -- this save belongs to a different seed/slot. NOT arming the reconciler; check \
