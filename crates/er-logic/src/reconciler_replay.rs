@@ -655,6 +655,92 @@ mod replay {
         }
     }
 
+    // ---- the POLL itself: issue #237, the gate that must never come back --------------------
+
+    /// Drive an OBSERVED-ONLY divergence under one of the two tick policies.
+    ///
+    /// `convergence_gated == true` reproduces the PRE-#237 architecture faithfully: the `DIRTY`
+    /// gate lived in `reconcile_io::tick`, OUTSIDE the pure reconciler, and decided whether `tick`
+    /// was called at all. So the policy belongs in this driver -- at the call site -- not in
+    /// `Reconciler`. It is the shape you get by "finishing the event layer": once a tick reports
+    /// converged, stop polling until something nudges you.
+    ///
+    /// Nothing nudges. That is the entire point. Elden Ring emits no event when it diverges from
+    /// what we wrote, so the gated arm sleeps through the divergence forever.
+    ///
+    /// Returns `(flag_healed, good_healed)` after the divergence + 30 frames of ordinary play.
+    fn drive_observed_only_divergence(convergence_gated: bool) -> (bool, bool) {
+        const RUNE_GOODS: GoodsId = 195;
+        const RESTORED_FLAG: FlagId = 6905;
+
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(rune_inputs());
+
+        // 1. Converge normally: the rune is granted and its restored-flag set.
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(
+            g.goods.contains(&RUNE_GOODS) && g.get_flag(RESTORED_FLAG),
+            "precondition: the run must converge before the divergence is interesting"
+        );
+
+        // 2. THE DIVERGENCE -- game-side ONLY. Desired does not move, nothing is received,
+        //    `set_inputs` is never called, there is no world edge and no nudge of any kind.
+        //    This is the shared shape of all four no-event classes: the 2026-07-30 rune going
+        //    blind at a live player action, a CONTESTED flag vanilla re-clears (the 9116 shape),
+        //    a co-op accessor switch, and a save-scum rollback.
+        g.goods.remove(&RUNE_GOODS);
+        g.flags.insert(RESTORED_FLAG, false);
+
+        // 3. Ordinary play. The gated arm believes it converged, so it never looks again.
+        let mut believed_converged = true;
+        for _ in 0..30 {
+            if convergence_gated && believed_converged {
+                continue; // the dead `DIRTY` early-out, alive
+            }
+            let out = r.tick(&mut g, TickBudget::default());
+            believed_converged = out.converged;
+        }
+
+        (g.get_flag(RESTORED_FLAG), g.goods.contains(&RUNE_GOODS))
+    }
+
+    /// An observed-only divergence heals with NO nudge -- and a convergence gate loses it.
+    ///
+    /// This is issue #237 encoded. `reconcile_io` shipped a documented event-nudge architecture
+    /// that was never built: a `static DIRTY` that `set_inputs` re-stored `true` every frame, so
+    /// the early-out at the top of `tick()` could never once observe `false`. Dead code -- and an
+    /// armed footgun, because the obvious tidy-up ("finish the event layer", or "add the missing
+    /// equality guard so the flag stops being re-dirtied") turns the gate ON, and the gate loses
+    /// every divergence class the game does not announce.
+    ///
+    /// The deletion shipped in client `0e12450`. This pair is what stops it coming back: the
+    /// mutation is no longer a paragraph in a commit message, it is the `true` arm below.
+    ///
+    /// 🛑 Do not "optimise" `tick` to skip work after convergence. Converging is not a reason to
+    /// stop looking; it is only a statement about the last frame's DESIRED-vs-OBSERVED diff.
+    #[test]
+    fn observed_only_divergence_is_lost_under_a_convergence_gate_but_heals_when_polling_replay() {
+        // PRE-FIX / "finished event layer": the gate holds, nothing re-observes, nothing heals.
+        let (gated_flag, gated_good) = drive_observed_only_divergence(true);
+        assert!(
+            !gated_flag && !gated_good,
+            "PRE-FIX: a convergence gate sleeps through an unannounced divergence -- the flag \
+             stays clear and the good stays missing for the rest of the session. That is the \
+             regression this test exists to keep dead."
+        );
+
+        // SHIPPED: an unconditional per-frame poll sees it and re-plans against it.
+        let (polled_flag, polled_good) = drive_observed_only_divergence(false);
+        assert!(
+            polled_flag,
+            "the flag vanilla cleared must be re-asserted with no nudge"
+        );
+        assert!(
+            polled_good,
+            "the good that went blind must be re-granted with no nudge"
+        );
+    }
+
     /// Drive `ticks` polling ticks against a game that ACCEPTS every grant and lands none.
     ///
     /// `guarded == false` reproduces the PRE-FIX reconciler exactly: re-arming on every tick means
