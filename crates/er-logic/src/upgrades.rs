@@ -2,6 +2,8 @@
 //! through the `GameHook` seam; the id math is pure (decode is faithful to `upgrades.rs`:
 //! REINFORCE_STEP = 100, base = row - row%100).
 
+use std::collections::HashMap;
+
 use crate::hook::GameHook;
 
 /// ER id stride per smithing level (base = id - id%100).
@@ -90,6 +92,74 @@ pub fn level_for_fragments(frag_qty: i32) -> i32 {
         }
     }
     level
+}
+
+/// Scadutree Fragment goods row (no category nibble). A received AP item counts toward the blessing
+/// iff `apIdsToItemIds` maps it to this row.
+pub const SCADU_FRAGMENT_GOODS: i64 = 2_010_000;
+
+/// Fragments delivered by the MULTIWORLD, from the received stream — the input to the blessing curve.
+///
+/// 🛑 WHY NOT THE BAG. This used to walk the player's inventory and sum held Scadutree Fragments,
+/// carried over from the C++ client. That is wrong for a reason that only shows up in a DLC seed:
+/// **revering at a grace CONSUMES the fragments.** Held count drops to 0, the derived level collapses
+/// to 0, and the game-wide blessing silently switches off for a player who did nothing but play
+/// normally. AP replays the whole received set on every connect, so a received count is stable across
+/// reconnect and save-load, immune to consumption, needs no ledger, and costs no per-tick bag walk.
+/// This is the same idiom `flask_reconcile::desired` already uses over "Progressive Flask Upgrade".
+///
+/// 🛑 MATCH ON THE ITEM ID, NOT THE NAME. `apIdsToItemIds` is the same map the grant path resolves
+/// through, so this counts whatever the seed calls its fragments — including a foreign apworld
+/// (Bedrock/fswap) whose item name differs from ours. A name match would fail silently on exactly
+/// the seeds we cannot test.
+///
+/// Honours `itemCounts` (an AP item may grant a stack), defaulting to 1 — the same
+/// `unwrap_or(1).max(1)` the grant path uses, so the blessing can never disagree with what was
+/// actually handed over.
+///
+/// NOT COUNTED, and correctly so: fragments from `startItems` or a `!give` console grant never enter
+/// the received stream. Neither is a normal way to obtain one, and counting out-of-band fragments
+/// would be a route to smuggling blessing levels between saves.
+pub fn fragments_from_received(
+    received_ap_item_ids: impl IntoIterator<Item = i64>,
+    item_map: &HashMap<i64, i64>,
+    item_counts: &HashMap<i64, i64>,
+) -> i32 {
+    let mut total: i64 = 0;
+    for ap_id in received_ap_item_ids {
+        total += fragment_units_for(ap_id, item_map, item_counts) as i64;
+    }
+    total.clamp(0, i32::MAX as i64) as i32
+}
+
+/// How many Scadutree Fragments ONE received AP item is worth. 0 for everything that isn't one.
+///
+/// Split out from [`fragments_from_received`] so the client can accumulate inside the single pass it
+/// already makes over the received stream (`core.rs`, the same loop that counts
+/// "Progressive Flask Upgrade") instead of materialising a second list of every item id ever
+/// received. The aggregate form is what the tests drive; this is what ships.
+pub fn fragment_units_for(
+    ap_item_id: i64,
+    item_map: &HashMap<i64, i64>,
+    item_counts: &HashMap<i64, i64>,
+) -> i32 {
+    let Some(&full_id) = item_map.get(&ap_item_id) else {
+        return 0; // unmapped (region locks, boss keys) — never a fragment
+    };
+    // The category nibble lives in the high bits; the goods ROW is the low 28. This is the client's
+    // own `param_id()` split (`cs/item_id.rs:56`, bits 27..0), restated rather than imported because
+    // er-logic must stay free of the Windows-only crate.
+    if (full_id & 0x0FFF_FFFF) != SCADU_FRAGMENT_GOODS {
+        return 0;
+    }
+    // Same `unwrap_or(1).max(1)` the grant path uses, so the blessing can never disagree with the
+    // quantity actually handed over.
+    item_counts
+        .get(&ap_item_id)
+        .copied()
+        .unwrap_or(1)
+        .max(1)
+        .clamp(0, i32::MAX as i64) as i32
 }
 
 /// THE blessing decision, as one pure function.
@@ -324,6 +394,102 @@ mod tests {
     fn classify_unknown_material_defaults_normal_never_panics() {
         // materialSetId -1/other with a real run -> treat as normal (never somber-leak, never crash).
         assert_eq!(classify_track(25, -1), Some((25, false)));
+    }
+
+    // ============================================================================================
+    // fragments_from_received -- the blessing's INPUT. Held-count was the original bug.
+    // ============================================================================================
+
+    fn maps(pairs: &[(i64, i64)], counts: &[(i64, i64)]) -> (HashMap<i64, i64>, HashMap<i64, i64>) {
+        (
+            pairs.iter().copied().collect(),
+            counts.iter().copied().collect(),
+        )
+    }
+
+    /// Goods FullID = category nibble in the high bits | row. 0x40000000 is the goods category the
+    /// seed's apIdsToItemIds actually carries, so the match must survive it.
+    const GOODS: i64 = 0x4000_0000;
+
+    #[test]
+    fn counts_only_items_that_map_to_the_fragment_row() {
+        let (m, c) = maps(
+            &[
+                (100, GOODS | SCADU_FRAGMENT_GOODS),
+                (101, GOODS | SCADU_FRAGMENT_GOODS),
+                (102, GOODS | 2_010_001), // the NEXT goods row — must not count
+            ],
+            &[],
+        );
+        assert_eq!(fragments_from_received([100, 101, 102], &m, &c), 2);
+    }
+
+    #[test]
+    fn an_unmapped_item_is_not_a_fragment() {
+        // Region locks and boss keys are deliberately absent from apIdsToItemIds. A lookup miss must
+        // be 0, never a panic and never a default-counted item.
+        let (m, c) = maps(&[(100, GOODS | SCADU_FRAGMENT_GOODS)], &[]);
+        assert_eq!(fragments_from_received([999, 100, 999], &m, &c), 1);
+        assert_eq!(fragments_from_received([], &m, &c), 0);
+    }
+
+    #[test]
+    fn item_counts_are_honoured_so_a_stack_is_not_one_fragment() {
+        // 🛑 The scale trap. If a seed ever stacks fragments, counting ITEMS instead of UNITS would
+        // undercount and silently cap the curve below what the player was given.
+        let (m, c) = maps(&[(100, GOODS | SCADU_FRAGMENT_GOODS)], &[(100, 5)]);
+        assert_eq!(fragments_from_received([100, 100], &m, &c), 10);
+    }
+
+    #[test]
+    fn a_zero_or_negative_item_count_still_grants_one() {
+        // Mirrors the grant path's `unwrap_or(1).max(1)`: a malformed itemCounts entry must not make
+        // a delivered fragment worth nothing. Called directly — no seed produces this.
+        let (m, c) = maps(&[(100, GOODS | SCADU_FRAGMENT_GOODS)], &[(100, 0)]);
+        assert_eq!(fragments_from_received([100], &m, &c), 1);
+        let (m, c) = maps(&[(100, GOODS | SCADU_FRAGMENT_GOODS)], &[(100, -7)]);
+        assert_eq!(fragments_from_received([100], &m, &c), 1);
+    }
+
+    #[test]
+    fn the_received_count_never_falls_when_the_game_consumes_fragments() {
+        // THE MOTIVATING CASE (rule 11). Revering at a DLC grace CONSUMES fragments, which is what
+        // made the old held-count reading collapse to level 0 mid-run. The received stream is a
+        // ledger of what was DELIVERED, so the same input replays identically afterwards.
+        let (m, c) = maps(&[(100, GOODS | SCADU_FRAGMENT_GOODS)], &[]);
+        let delivered: Vec<i64> = std::iter::repeat_n(100, 26).collect();
+        let before = fragments_from_received(delivered.clone(), &m, &c);
+        // ... player reveres; the bag is now empty. AP replays the identical stream on reconnect.
+        let after = fragments_from_received(delivered, &m, &c);
+        assert_eq!(before, 26);
+        assert_eq!(
+            after, before,
+            "a consumed fragment must not lower the blessing"
+        );
+        assert_eq!(
+            level_for_fragments(after),
+            12,
+            "26 fragments is exactly the cap-12 rung"
+        );
+    }
+
+    #[test]
+    fn the_shipped_pool_can_actually_reach_the_cap() {
+        // 🛑 REACHABILITY, pinned. data.py carries 46 `Scadutree Fragment` locations, so at most 46
+        // items can ever be received. Under the vanilla curve that is level 18 -- so a cap of 20
+        // would be UNREACHABLE and the option would promise a rung no seed can deliver. Cap 12 needs
+        // 26 and clears it with room. If someone raises SCADU_BLESSING_CAP, this is the check that
+        // should stop them at 19.
+        const SHIPPED_FRAGMENT_LOCATIONS: i32 = 46;
+        assert_eq!(level_for_fragments(SHIPPED_FRAGMENT_LOCATIONS), 18);
+        assert!(
+            SCADU_CUM[12] <= SHIPPED_FRAGMENT_LOCATIONS,
+            "cap 12 must be reachable from the shipped pool"
+        );
+        assert!(
+            SCADU_CUM[20] > SHIPPED_FRAGMENT_LOCATIONS,
+            "if this ever passes, the pool grew and cap 20 became reachable — revisit the cap"
+        );
     }
 
     // ============================================================================================
