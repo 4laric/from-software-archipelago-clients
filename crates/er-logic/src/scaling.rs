@@ -516,25 +516,53 @@ pub fn tier_multiplier(tier: usize) -> f32 {
 
 /// The one-line toast shown when the player first enters a region.
 ///
-///   `Liurnia - enemy scaling 4.12x (tier 10 of 19)`
+///   `Liurnia - enemy scaling 4.12x (tier 10 of 19)`      (uncapped seed: the band IS the ladder)
+///   `Liurnia - enemy scaling 4.12x (tier 7 of 12)`       (floor 3, ceiling 15)
 ///   `Liurnia - enemy scaling not set for this area; using the floor, 1.14x`
 ///
 /// The NUMBER is the point. A tier index alone means nothing to a player, and "hard" means nothing
 /// either; `4.12x` is a thing you can compare to your own weapon. The tier fraction rides along so
 /// two regions can be ranked against each other at a glance.
 ///
+/// THE FRACTION IS ABOUT THIS RUN. It used to print the absolute ladder index over `NUM_TIERS - 1`,
+/// a compile-time constant that knows nothing about the seed. On a seed with
+/// `completion_scaling_floor` / `_ceiling` set, that denominator LIED: a player standing on their
+/// hardest region read "of 19" and concluded they were two-thirds of the way up a ladder they could
+/// never climb. Now both ends come from the resolved band, and the numerator is the rung within it.
+/// (On an uncapped seed the band is the whole ladder -- the deepest kept region normalizes to
+/// `frac == 1.0` and lands on the top rung -- so "of 19" was never wrong THERE, only where a bound
+/// was set. Alaric asked 2026-07-31 whether the denominator was global or per-seed; it was global.)
+///
 /// STOP: ASCII ONLY. This string is drawn by the GAME, not by a terminal, and the in-game font has
 /// no glyph for an em-dash: Alaric's 2026-07-31 screenshot reads `Altus ? enemy scaling 1.14x`
 /// because this used U+2014. Everything a player reads in-game goes through that font, so the same
 /// rule the .ps1 and gen_data surfaces already carry applies here. `every_toast_is_ascii` pins it.
-pub fn region_scaling_toast(region: &str, scaling: RegionScaling) -> String {
+pub fn region_scaling_toast(
+    region: &str,
+    scaling: RegionScaling,
+    floor_tier: usize,
+    ceiling_tier: usize,
+) -> String {
+    // THE FRACTION IS ABOUT THIS RUN, not the ladder. Same clamp order as `tier_for_target` --
+    // ceiling first, then floor into it -- so the two cannot disagree about the band.
+    let ceiling = ceiling_tier.min(NUM_TIERS - 1);
+    let floor = floor_tier.min(ceiling);
+    let span = ceiling - floor;
     match scaling {
+        // Position WITHIN the band, not the absolute ladder index: with a floor of 3 an absolute
+        // "tier 3" is the player's FIRST rung, and calling it 3 would read as "already a third of
+        // the way up" when they have not moved at all.
+        RegionScaling::Known(tier) if span == 0 => format!(
+            "{} - enemy scaling {:.2}x (the only tier this seed)",
+            region,
+            tier_multiplier(tier)
+        ),
         RegionScaling::Known(tier) => format!(
             "{} - enemy scaling {:.2}x (tier {} of {})",
             region,
             tier_multiplier(tier),
-            tier.min(NUM_TIERS - 1),
-            NUM_TIERS - 1
+            tier.clamp(floor, ceiling) - floor,
+            span
         ),
         RegionScaling::Defaulted(tier) => format!(
             "{} - enemy scaling not set for this area; using the floor, {:.2}x",
@@ -599,7 +627,7 @@ impl RegionToastLedger {
             cfg.floor_tier,
             cfg.ceiling_tier,
         );
-        let msg = region_scaling_toast(name, scaling);
+        let msg = region_scaling_toast(name, scaling, cfg.floor_tier, cfg.ceiling_tier);
         if self.announced.contains(&msg) {
             return None;
         }
@@ -1092,8 +1120,15 @@ mod tests {
         // matched the broken string just as happily.
         for tier in 0..=NUM_TIERS + 1 {
             for s in [
-                region_scaling_toast("Farum Azula", RegionScaling::Known(tier)),
-                region_scaling_toast("Farum Azula", RegionScaling::Defaulted(tier)),
+                region_scaling_toast("Farum Azula", RegionScaling::Known(tier), 0, NUM_TIERS - 1),
+                region_scaling_toast(
+                    "Farum Azula",
+                    RegionScaling::Defaulted(tier),
+                    0,
+                    NUM_TIERS - 1,
+                ),
+                region_scaling_toast("Farum Azula", RegionScaling::Known(tier), 3, 15),
+                region_scaling_toast("Farum Azula", RegionScaling::Known(tier), 7, 7),
             ] {
                 assert!(
                     s.is_ascii(),
@@ -1106,7 +1141,7 @@ mod tests {
     #[test]
     fn a_known_region_shows_the_multiplier_and_where_it_sits() {
         // tier 10 of 19 is `auto`'s cap for a 5-region seed -- the number Alaric calibrated.
-        let s = region_scaling_toast("Liurnia", RegionScaling::Known(10));
+        let s = region_scaling_toast("Liurnia", RegionScaling::Known(10), 0, NUM_TIERS - 1);
         // 4.12, NOT 4.13: rung 10 is 4.125 and `{:.2}` on that f32 renders DOWN. Verified with a
         // standalone rustc rather than reasoned about -- the assertion this file first carried said
         // 4.13x and would have reddened CI for a rounding rule nobody can eyeball.
@@ -1116,13 +1151,73 @@ mod tests {
     #[test]
     fn the_top_and_bottom_of_the_ladder_render() {
         assert_eq!(
-            region_scaling_toast("Limgrave", RegionScaling::Known(0)),
+            region_scaling_toast("Limgrave", RegionScaling::Known(0), 0, NUM_TIERS - 1),
             "Limgrave - enemy scaling 1.14x (tier 0 of 19)"
         );
         assert_eq!(
-            region_scaling_toast("Farum Azula", RegionScaling::Known(NUM_TIERS - 1)),
+            region_scaling_toast(
+                "Farum Azula",
+                RegionScaling::Known(NUM_TIERS - 1),
+                0,
+                NUM_TIERS - 1
+            ),
             "Farum Azula - enemy scaling 7.42x (tier 19 of 19)"
         );
+    }
+
+    #[test]
+    fn the_fraction_is_the_seeds_band_not_the_global_ladder() {
+        // Alaric, 2026-07-31, on seeing `tier 0 of 19` in game: "is that of 20 total or 20 in this
+        // seed". It was global -- `NUM_TIERS - 1`, a compile-time constant. On a seed that sets
+        // `completion_scaling_floor` / `_ceiling` that denominator LIES: the player on their
+        // hardest region reads "of 19" and thinks they are two-thirds up a ladder they can never
+        // climb.
+        //
+        // floor 3, ceiling 15 -> a 12-rung band, and the numerator is the rung WITHIN it.
+        assert_eq!(
+            region_scaling_toast("Liurnia", RegionScaling::Known(3), 3, 15),
+            "Liurnia - enemy scaling 1.81x (tier 0 of 12)",
+            "the floor is the player's FIRST rung, not rung 3" // 1.81, not 1.53: rung 3 is hp 1.813. Rendered with a standalone rustc rather than
+                                                               // reasoned about -- my first guess at this constant was simply wrong.
+        );
+        assert_eq!(
+            region_scaling_toast("Farum Azula", RegionScaling::Known(15), 3, 15),
+            "Farum Azula - enemy scaling 6.88x (tier 12 of 12)",
+            "the ceiling is the TOP of this run, and must read as the top"
+        );
+        // Out-of-band inputs clamp instead of underflowing (usize subtraction panics on wrap).
+        assert!(region_scaling_toast("X", RegionScaling::Known(0), 3, 15).contains("tier 0 of 12"));
+        assert!(
+            region_scaling_toast("X", RegionScaling::Known(99), 3, 15).contains("tier 12 of 12")
+        );
+    }
+
+    #[test]
+    fn an_uncapped_seed_still_reads_against_the_whole_ladder() {
+        // Not a regression -- it is the honest answer. With no bound set, the deepest kept region
+        // normalizes to frac == 1.0 and lands on the top rung, so the band IS the ladder.
+        assert!(
+            region_scaling_toast("Limgrave", RegionScaling::Known(0), 0, NUM_TIERS - 1)
+                .contains("tier 0 of 19")
+        );
+    }
+
+    #[test]
+    fn a_single_tier_seed_does_not_say_zero_of_zero() {
+        // floor == ceiling: a fixed-difficulty seed. "tier 0 of 0" is nonsense to read, so the
+        // fraction is dropped rather than rendered as a degenerate ratio.
+        let s = region_scaling_toast("Caelid", RegionScaling::Known(7), 7, 7);
+        assert!(s.contains("the only tier this seed"), "{s}");
+        assert!(!s.contains("of 0"), "{s}");
+    }
+
+    #[test]
+    fn a_contradictory_band_resolves_instead_of_panicking() {
+        // floor above ceiling is rejected at generation, but this is a PURE function reachable from
+        // hand-rolled or foreign slot_data. Same resolution as `tier_for_target`: the ceiling wins.
+        // floor 18 > ceiling 4 -> ceiling wins, floor clamps into it, span 0.
+        let s = region_scaling_toast("Altus", RegionScaling::Known(10), 18, 4);
+        assert!(s.contains("the only tier this seed"), "{s}");
     }
 
     #[test]
@@ -1130,7 +1225,12 @@ mod tests {
         // THE POINT OF THE ENUM. A region with no target on the wire falls back to the floor, and
         // rendering that as "tier 0" would present a defaulted value as a derived one -- the exact
         // confident-wrong-answer shape this crate's comments keep warning about.
-        let s = region_scaling_toast("Roundtable Hold", RegionScaling::Defaulted(0));
+        let s = region_scaling_toast(
+            "Roundtable Hold",
+            RegionScaling::Defaulted(0),
+            0,
+            NUM_TIERS - 1,
+        );
         assert!(s.contains("not set for this area"), "{s}");
         assert!(
             !s.contains("tier"),
@@ -1158,7 +1258,7 @@ mod tests {
         let deepest = region_scaling(Some(10_000), 10_000, 0, ceiling);
         assert_eq!(deepest, RegionScaling::Known(10));
         assert_eq!(
-            region_scaling_toast("Leyndell", deepest),
+            region_scaling_toast("Leyndell", deepest, 0, NUM_TIERS - 1),
             "Leyndell - enemy scaling 4.12x (tier 10 of 19)"
         );
     }
