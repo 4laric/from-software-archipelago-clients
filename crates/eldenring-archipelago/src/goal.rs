@@ -35,6 +35,19 @@ pub struct GoalConfig {
     /// every rune boss and never held a single Great Rune, and the run would end.
     ///
     /// A kill is not a collection. Goal now requires the ITEM.
+    ///
+    /// ALSO CARRIES `goalRequiredItems` (2026-07-30): this seed's kept Region Locks, minus the
+    /// precollected start anchor. Same class of bug, one layer out. `core.set_rules` tells
+    /// Archipelago the slot completes on `has_all(kept locks)` -- that is what fill balances around
+    /// -- but `is_met` below checked the goal BOSS FLAGS ALONE, and OUR send is what ends the run.
+    /// Region access is warp, so every kept region sits at sphere ~1 and fill may legitimately put
+    /// the terminal region's Lock in sphere 0: measured over generated seeds, 25% of rolled draws
+    /// made the goal region the SECOND region opened. The player killed the boss and the run ended
+    /// while the world still claimed every lock was required. Two terminal conditions, one of them
+    /// silently ignored. They are ONE list now.
+    ///
+    /// Absent on a foreign apworld, on natural_progression (which mints no Lock items at all), and
+    /// on any pre-0.2.18 seed -> empty -> no added requirement, exactly as before.
     pub item_goals: Vec<String>,
 }
 
@@ -53,23 +66,37 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
     // NO-READ DIAGNOSTIC -- the apworld sent the answer and the client never looked, which is exactly
     // how the bug survived. Absent on a foreign apworld and on any ending needing no items -> empty,
     // which adds no requirement.
-    let item_goals: Vec<String> = sd
-        .get("great_rune_items")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    if !item_goals.is_empty() {
+    fn str_list(sd: &Value, key: &str) -> Vec<String> {
+        sd.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let runes = str_list(sd, "great_rune_items");
+    // `goalRequiredItems`: the kept Region Locks the world's own completion_condition requires.
+    // Additive, never replacing -- a great_runes seed needs the runes AND the locks.
+    let locks = str_list(sd, "goalRequiredItems");
+    if !runes.is_empty() {
         log::info!(
             "goal: {} item(s) must be HELD, not merely their boss killed: {}",
-            item_goals.len(),
-            item_goals.join(", ")
+            runes.len(),
+            runes.join(", ")
         );
     }
+    if !locks.is_empty() {
+        log::info!(
+            "goal: {} Region Lock(s) must also be HELD before Goal is sent (the world's own \
+             completion condition; pre-0.2.18 seeds omit this key and behave as before)",
+            locks.len()
+        );
+    }
+    let mut item_goals: Vec<String> = runes;
+    item_goals.extend(locks);
     let ids: Vec<i64> = sd
         .get("goalLocations")
         .and_then(|v| v.as_array())
@@ -313,5 +340,80 @@ mod foreign_goal {
         let cfg = parse(&json!({"great_rune_items": ["A"]}), &lf(&[]));
         assert!(!cfg.is_empty());
         assert!(is_met(&cfg, |_| true, |_| true, |n| n == "A"));
+    }
+
+    // --- goalRequiredItems: the kept Region Locks (2026-07-30) -------------------------------------
+    //
+    // MOTIVATING CASE (CONTRIBUTING rule 11). Measured over generated seeds: on 25% of rolled
+    // `num_regions` draws, fill placed the goal region's Lock in sphere 0 -- the goal region was the
+    // SECOND region opened. The player killed the goal boss and `is_met` fired, while the world's own
+    // `completion_condition` still required every kept lock. These tests are that seed, inverted.
+
+    #[test]
+    fn killing_the_goal_boss_on_region_two_is_not_finishing_the_seed() {
+        // THE BUG. Every goal flag reads true (boss dead), every location checked -- but the player
+        // holds none of the seed's other Region Locks. Goal must NOT fire.
+        let cfg = parse(
+            &json!({
+                "goalLocations": [10],
+                "goalRequiredItems": ["Caelid Lock", "Farum Azula Lock"]
+            }),
+            &lf(&[(10, 800)]),
+        );
+        assert_eq!(
+            cfg.item_goals,
+            vec!["Caelid Lock".to_string(), "Farum Azula Lock".to_string()]
+        );
+        assert!(
+            !is_met(&cfg, |_| true, |_| true, |_| false),
+            "goal boss dead on the second region, locks unheld -- the run is NOT over"
+        );
+        assert!(
+            !is_met(&cfg, |_| true, |_| true, |n| n == "Caelid Lock"),
+            "holding one of two locks is not done"
+        );
+        assert!(is_met(&cfg, |_| true, |_| true, |n| n.ends_with(" Lock")));
+    }
+
+    #[test]
+    fn required_locks_compose_with_great_runes_rather_than_replacing_them() {
+        // A great_runes seed needs the runes AND the locks. Neither key may shadow the other --
+        // they arrive as two separate slot_data keys and must both land in item_goals.
+        let cfg = parse(
+            &json!({
+                "goalLocations": [],
+                "great_rune_items": ["Godrick's Great Rune"],
+                "goalRequiredItems": ["Limgrave Lock"]
+            }),
+            &lf(&[]),
+        );
+        assert_eq!(cfg.item_goals.len(), 2, "one key overwrote the other");
+        assert!(
+            !is_met(&cfg, |_| true, |_| true, |n| n == "Limgrave Lock"),
+            "locks held but the rune was never received"
+        );
+        assert!(
+            !is_met(&cfg, |_| true, |_| true, |n| n == "Godrick's Great Rune"),
+            "rune held but a kept lock is missing"
+        );
+        assert!(is_met(&cfg, |_| true, |_| true, |_| true));
+    }
+
+    #[test]
+    fn a_seed_without_the_key_is_untouched() {
+        // Pre-0.2.18 seeds, foreign apworlds, and natural_progression (which mints NO Lock items --
+        // requiring them would deadlock the seed) all omit the key. Absent => no added requirement.
+        let cfg = parse(&json!({"goalLocations": [10]}), &lf(&[(10, 800)]));
+        assert!(cfg.item_goals.is_empty());
+        assert!(is_met(&cfg, |_| true, |_| true, |_| false));
+    }
+
+    #[test]
+    fn required_locks_alone_are_a_valid_goal() {
+        // is_empty() already accounts for item_goals; pin it for THIS key too, or a lock-only config
+        // would read as "can never be met" and fail closed on a legitimate seed.
+        let cfg = parse(&json!({"goalRequiredItems": ["Limgrave Lock"]}), &lf(&[]));
+        assert!(!cfg.is_empty());
+        assert!(is_met(&cfg, |_| true, |_| true, |n| n == "Limgrave Lock"));
     }
 }
