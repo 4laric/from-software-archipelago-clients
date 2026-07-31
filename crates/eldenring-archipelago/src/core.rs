@@ -116,6 +116,9 @@ pub struct Core {
     scout: Option<crate::scout_proof::ScoutProof>,
     /// Goal-send (SPEC-goal-send-20260701.md): goalLocations split flag/checked at parse.
     goal: Option<crate::goal::GoalConfig>,
+    /// Region-lock hints: the server-backed ledger of what the player has paid to reveal.
+    /// Pricing/decision are pure (`er_logic::lock_hint_economy`); this holds only the socket half.
+    lock_hints: crate::lock_hints::LockHints,
     /// Session latch: Goal sent once per connect (NOT persisted -- re-send is idempotent).
     sent_goal: bool,
     /// Item-tracker window visibility (overlay menu "Tracker" + F6 toggle).
@@ -452,6 +455,7 @@ impl shared::Core for Core {
             grant_gate_last_play_region: None,
             scout: None,
             goal: None,
+            lock_hints: crate::lock_hints::LockHints::new(),
             sent_goal: false,
             tracker_visible: false,
             hints: HintSet::new(),
@@ -2565,6 +2569,13 @@ impl shared::Core for Core {
             sp.pump(client);
         }
         self.scout = scout;
+        // Region-lock hint ledger. Same take()/put-back dance as the scout above, for the same
+        // reason: pump needs client_mut and would otherwise double-borrow self.
+        let mut lh = std::mem::take(&mut self.lock_hints);
+        if let Some(client) = self.client_mut() {
+            lh.pump(client);
+        }
+        self.lock_hints = lh;
         // Re-arm the ItemLotParam blank passes on a map-(re)load edge. check_lots / enemy_drops latch
         // DONE after their first successful in-world pass and are otherwise reset ONLY on reconnect
         // (configure()). But a map load streams params back in -- notably the DLC (Land of Shadow)
@@ -2991,6 +3002,10 @@ impl Core {
         self.region_table = HashMap::new();
         self.coarse_table = HashMap::new();
         self.coarse_lock_items = HashMap::new();
+        // The hint ledger is keyed per SLOT, not per seed, so a new seed must not inherit the old
+        // seed's purchases -- and its location ids would be meaningless here anyway. Re-read from
+        // the server on the next pump.
+        self.lock_hints.reset();
         // Boss-lock mode A: drop the parsed defs AND re-arm the felled-edge state, so the new
         // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
         self.boss_defs.clear();
@@ -3110,6 +3125,7 @@ impl Core {
         let mut unchecked: Vec<u64> = Vec::new();
         let mut loc_names = HashMap::new(); // id -> Ustr (Copy, interned)
         let mut received: HashSet<String> = HashSet::new();
+        let mut points_per_hint: u64 = 0;
         if let Some(client) = self.client() {
             for loc in client.checked_locations() {
                 let id = loc.id() as u64;
@@ -3124,7 +3140,12 @@ impl Core {
             for ri in client.received_items() {
                 received.insert(ri.item().name().to_string());
             }
+            // Lock-hint economy inputs, read in the SAME client borrow. `points_per_hint()` is
+            // `total_locations * hint_cost% / 100`, so dividing it back out below recovers the
+            // HOST's setting -- the price tracks their `hint_cost` instead of a number we invented.
+            points_per_hint = client.points_per_hint();
         }
+        let total_locations = (checked.len() + unchecked.len()) as u64;
 
         // Region-lock accessibility snapshot (bound to a local BEFORE the model borrows &self
         // fields -- keeps the borrows sequential).
@@ -3157,6 +3178,33 @@ impl Core {
                 .map(|n| n.as_str().to_string())
                 .unwrap_or_else(|| format!("(location {id})"))
         };
+
+        // ---- lock-hint economy snapshot (see er_logic::lock_hint_economy) --------------------
+        // Everything the button needs, resolved before the imgui closure so the closure never
+        // borrows self. Clicks are collected into `buy_clicks` and committed after `.build()`.
+        let surface_checked_n = er_logic::lock_hint_economy::surface_checked(
+            &checked.iter().map(|&id| id as i64).collect(),
+            &self
+                .progression_surface
+                .iter()
+                .map(|&id| id as i64)
+                .collect(),
+        );
+        let surface_total_n = self.progression_surface.len() as u64;
+        let lock_scout = crate::scout_proof::item_names_by_location();
+        let mut hinted_locs: HashSet<i64> =
+            self.hints.iter().map(|h| h.location_id as i64).collect();
+        // Treat a paid-for location as hinted immediately, so the button cannot be clicked twice
+        // in the window between the purchase and the server's hint broadcast coming back.
+        hinted_locs.extend(self.lock_hints.bought().iter().copied());
+        let ledger_ready = self.lock_hints.is_ready();
+        let purchases_n = self.lock_hints.purchases();
+        let lock_item_of: HashMap<String, String> = self.coarse_lock_items.clone();
+        // location id -> coarse region. NOT keyed by region name: `coarse_table` is
+        // HashMap<u64, RegionId>. tracker.rs:117 states every location in a tracker region shares
+        // one coarse region, so any of the region's location ids resolves it.
+        let coarse_of: HashMap<u64, String> = self.coarse_table.clone();
+        let mut buy_clicks: Vec<i64> = Vec::new();
 
         let mut open = true;
         // Filter state as locals (the closure stays self-free); written back to self after.
@@ -3208,6 +3256,55 @@ impl Core {
                         .then(|| ui.push_style_color(imgui::StyleColor::Text, LOCKED_GRAY));
                     let expanded = ui.collapsing_header(header, imgui::TreeNodeFlags::empty());
                     drop(dim);
+                    // ---- "hint lock" button ---------------------------------------------------
+                    // Only on a LOCKED region, and only once the ledger has been read back: a
+                    // balance computed against an unread ledger looks like free money.
+                    if !region.accessible && ledger_ready {
+                        let lock_item = region
+                            .unchecked
+                            .first()
+                            .and_then(|u| coarse_of.get(&u.location_id))
+                            .and_then(|c| lock_item_of.get(c))
+                            .map(|s| s.as_str());
+                        let offer = er_logic::lock_hint_economy::offer(
+                            lock_item,
+                            &lock_scout,
+                            &hinted_locs,
+                            surface_total_n,
+                            surface_checked_n,
+                            purchases_n,
+                            points_per_hint,
+                            total_locations,
+                        );
+                        use er_logic::lock_hint_economy::LockHintOffer as Offer;
+                        match offer {
+                            Offer::Buyable { price, location } => {
+                                ui.same_line();
+                                if ui.small_button(format!(
+                                    "hint lock ({price} sp)###trk-buy-{}",
+                                    region.region
+                                )) {
+                                    buy_clicks.push(location);
+                                }
+                            }
+                            Offer::Insufficient { price, have, .. } => {
+                                // DISABLED WITH THE COST, never hidden: a player who cannot see
+                                // the price, or that they are making progress toward it, learns
+                                // nothing from the mechanic.
+                                ui.same_line();
+                                ui.text_disabled(format!("hint lock ({price} sp -- have {have})"));
+                            }
+                            Offer::AlreadyHinted { .. } => {
+                                ui.same_line();
+                                ui.text_colored(HINT_YELLOW, "hinted");
+                            }
+                            Offer::Spilled => {
+                                ui.same_line();
+                                ui.text_disabled("lock is in another world -- use !hint");
+                            }
+                            Offer::Unknown => {}
+                        }
+                    }
                     if expanded {
                         if shown.is_empty() {
                             ui.text_disabled("  complete");
@@ -3303,6 +3400,10 @@ impl Core {
                     }
                 }
             });
+        // Commit outside the closure -- inside it, `self` is not borrowable.
+        for loc in buy_clicks {
+            self.lock_hints.buy(loc);
+        }
         if !open {
             self.tracker_visible = false;
         }

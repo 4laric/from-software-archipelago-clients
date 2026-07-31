@@ -33,6 +33,7 @@ pub mod grace_flush_replay;
 pub mod grants;
 pub mod hook;
 pub mod inv_ptr;
+pub mod lock_hint_economy;
 pub mod map_reveal_replay;
 pub mod marker;
 pub mod marker_replay;

@@ -75,6 +75,20 @@ pub fn lookup(location_id: i64) -> Option<ScoutedItem> {
     CACHE.lock().unwrap().as_ref()?.get(&location_id).cloned()
 }
 
+/// AP location id -> item NAME, for every location the connect-time scout covered.
+///
+/// The scout only ever covers OUR OWN locations, which is exactly the property
+/// `er_logic::lock_hint_economy::resolve_lock_location` relies on: a lock name absent from a
+/// POPULATED cache means the lock spilled into another player's world. Returns an EMPTY map before
+/// the scout lands, and that distinction is load-bearing -- an empty cache must read as "not known
+/// yet", never as "every lock is foreign".
+pub fn item_names_by_location() -> HashMap<i64, String> {
+    match CACHE.lock().unwrap().as_ref() {
+        Some(m) => m.iter().map(|(&k, v)| (k, v.name.clone())).collect(),
+        None => HashMap::new(),
+    }
+}
+
 fn store(items: &[ap::LocatedItem]) {
     use er_logic::name_override::ItemKind;
     let item_map = AP_ITEM_TO_FULLID.lock().unwrap();
