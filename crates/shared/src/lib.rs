@@ -15,6 +15,7 @@ mod config;
 mod core;
 mod crash_handler;
 mod error_display;
+pub mod foreign_blocks;
 mod game;
 mod input_blocker;
 mod overlay;

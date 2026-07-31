@@ -187,7 +187,21 @@ unsafe fn valloc(size: usize) -> Option<usize> {
     if p.is_null() {
         None
     } else {
-        Some(p as usize) // VirtualAlloc memory is zero-initialized
+        let base = p as usize;
+        // Hand the address to the crash handler's registry BEFORE anyone can swap it in. Every
+        // block is recorded, including ones a failed validation never swaps: a block the game was
+        // never given cannot be the one it faulted under, so a hit on an unswapped block would
+        // itself be information. `VirtualAlloc` returns the base of the RESERVATION, so the bytes
+        // below `base` are unmapped -- which is the whole hypothesis under test.
+        shared::foreign_blocks::record(base, size);
+        log::info!(
+            "FMG valloc: block #{} @ {base:#x} size {size:#x} (base % 64K = {:#x}) -- a crash \
+             reading just BELOW this address is the game looking for an allocator header we did \
+             not put there",
+            shared::foreign_blocks::recorded(),
+            base % 0x1_0000
+        );
+        Some(base) // VirtualAlloc memory is zero-initialized
     }
 }
 
