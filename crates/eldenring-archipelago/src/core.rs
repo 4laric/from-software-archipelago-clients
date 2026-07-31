@@ -1612,6 +1612,12 @@ impl shared::Core for Core {
         // WHOLE received stream (not gated by the watermarks below) — AP replays every received item
         // on connect, so this count is stable across reconnect/save-load and needs no ledger.
         let mut flask_upgrade_count: usize = 0;
+        // Same doctrine, for the Scadutree blessing: fragments DELIVERED, not fragments held. The
+        // game consumes held fragments when you revere at a DLC grace, which used to switch the
+        // game-wide blessing off mid-run. Matched by ITEM ID through apIdsToItemIds rather than by
+        // name, so a foreign apworld (Bedrock/fswap) that calls its fragments something else still
+        // counts — a name match would fail silently on exactly the seeds we cannot test.
+        let mut scadu_fragment_units: i32 = 0;
         let mut snapshot: Vec<RecvItem> = Vec::new();
         if let Some(client) = self.client() {
             let items = client.received_items();
@@ -1625,6 +1631,13 @@ impl shared::Core for Core {
                 let name = ri.item().name().to_string();
                 if name == crate::flask::FLASK_UPGRADE_ITEM {
                     flask_upgrade_count += 1;
+                }
+                if let Some(map) = self.item_map.as_ref() {
+                    scadu_fragment_units += er_logic::upgrades::fragment_units_for(
+                        ri.item().id(),
+                        map,
+                        &self.item_counts,
+                    );
                 }
                 if can_grant && idx >= floor {
                     // ECHO-DEDUP: an echo of our own check whose rewritten shop row already
@@ -1640,6 +1653,19 @@ impl shared::Core for Core {
                 }
                 received_all.insert(name);
             }
+            // Publish the fragment total for `upgrades::tick_global_scadu`.
+            //
+            // INSIDE the `client()` block on purpose. Out here it would run on a tick with no
+            // connection and publish 0 -- so an AP disconnect mid-fight would strip the player's
+            // blessing, which is a worse failure than the held-count bug this replaced. With no
+            // client we simply do not update, and the last known total stays latched.
+            //
+            // It is still unconditional WITHIN the block, so a seed with no fragments publishes a
+            // real 0 rather than inheriting a count from a previous connect
+            // (`er-seed-change-bypasses-the-marker-guard`: a stale cross-seed value is how 229
+            // checks once crossed seeds). A reconnect replays the whole stream, so the first pass
+            // after connecting recomputes the total from scratch.
+            crate::upgrades::set_received_fragments(scadu_fragment_units);
         }
 
         // 3b. Baked region-lock fallback arming (bedrock interop): the first received

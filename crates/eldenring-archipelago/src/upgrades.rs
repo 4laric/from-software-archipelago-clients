@@ -110,6 +110,20 @@ pub fn set_global_scadu_blessing(mode: i32) {
 fn auto_upgrade_on() -> bool {
     AUTO_UPGRADE.load(Ordering::Relaxed) != 0
 }
+/// Scadutree Fragments DELIVERED BY THE MULTIWORLD, accumulated by core.rs over the whole received
+/// stream (the same single pass that counts "Progressive Flask Upgrade"). Replaces a per-tick bag
+/// walk -- see `er_logic::upgrades::fragments_from_received` for why the bag was the wrong source.
+static RECEIVED_FRAGMENTS: AtomicI32 = AtomicI32::new(0);
+
+/// core.rs (every received-stream pass): total fragment UNITS received this session.
+pub fn set_received_fragments(units: i32) {
+    RECEIVED_FRAGMENTS.store(units.max(0), Ordering::Relaxed);
+}
+
+fn received_fragments() -> i32 {
+    RECEIVED_FRAGMENTS.load(Ordering::Relaxed)
+}
+
 fn scadu_mode() -> i32 {
     GLOBAL_SCADU.load(Ordering::Relaxed)
 }
@@ -291,8 +305,9 @@ fn walk_inventory_targets() -> Option<(i32, i32)> {
 //
 // Worksheet §B.
 
-/// Scadutree Fragment goods row id (no category nibble). FullID = SCADU_FRAGMENT_GOODS | category.
-const SCADU_FRAGMENT_GOODS: u32 = 2_010_000;
+// The Scadutree Fragment goods row moved to `er_logic::upgrades::SCADU_FRAGMENT_GOODS` when the
+// blessing switched to the received stream: the id is now used by the pure matcher that reads
+// apIdsToItemIds, and a second copy here would be a constant to drift.
 
 /// Maximum stored blessing level the game's combat-blessing curve defines (caps the raise-only write).
 ///
@@ -337,11 +352,18 @@ pub fn tick_global_scadu() {
         *last = Some(Instant::now());
     }
 
-    // Read total held Scadutree Fragments (goods 2010000). None => bag not reachable this tick ->
-    // inert (never writes a transient 0; avoids flicker if the walk raced a realloc, like the C++).
-    let Some(frag_qty) = held_scadu_fragments() else {
-        return;
-    };
+    // Fragments DELIVERED by the multiworld, not fragments currently in the bag.
+    //
+    // 🛑 THE BUG THIS FIXES (2026-07-31). This used to walk the inventory and sum held Scadutree
+    // Fragments. Revering at a DLC grace CONSUMES them, so a player who used the blessing the way
+    // the game intends dropped to a held count of 0, the derived level collapsed to 0, and the
+    // game-wide blessing switched itself off. `drive()` has no raise-only clamp -- it applies
+    // whatever level it is handed -- so the clone rung genuinely fell.
+    //
+    // The received stream cannot do that: AP replays the whole set on connect, so the count is
+    // stable across reconnect, save-load and anything the game does to the bag. It also costs no
+    // per-tick inventory walk, which matters while the boss-sweep CTD is open.
+    let frag_qty = received_fragments();
 
     // THE DECISION lives in er_logic::upgrades::blessing_target (host-tested; see
     // er-logic/src/scadu_blessing_replay.rs -- the floor over a TIMELINE: enter a DLC region with no
@@ -382,30 +404,9 @@ pub fn tick_global_scadu() {
     }
 }
 
-/// RE-B1 RESOLVED (typed binding): total held Scadutree Fragments (goods 2010000). Walks the same
-/// typed inventory iterator as auto_upgrade and sums the quantity of every goods entry whose
-/// `param_id()` is the fragment row. (Both AP fragment variants share goods id 2010000, so this is
-/// effectively one stack; summing is safe even if the game ever splits it.) None if the bag isn't
-/// reachable this tick. Read-only.
-fn held_scadu_fragments() -> Option<i32> {
-    // SAFETY: FD4 singleton (read-only walk). None before the player is placed.
-    let gdm = unsafe { GameDataMan::instance() }.ok()?;
-    let pgd = gdm.main_player_game_data.as_ref();
-    let mut total: i64 = 0;
-    for entry in pgd.equipment.equip_inventory_data.items_data.items() {
-        if entry.item_id.category() != ItemCategory::Goods {
-            continue;
-        }
-        if entry.item_id.param_id() == SCADU_FRAGMENT_GOODS {
-            total += entry.quantity as i64;
-        }
-    }
-    // ER stacks cap well under i32; clamp defensively.
-    if total > i32::MAX as i64 {
-        total = i32::MAX as i64;
-    }
-    Some(total as i32)
-}
+// `held_scadu_fragments()` lived here and walked the bag for goods 2010000. REMOVED 2026-07-31: the
+// blessing is driven by fragments RECEIVED, not held, because the game consumes held ones when you
+// revere. The typed inventory walk it used is still demonstrated in `walk_inventory_targets` below.
 
 /// RE-B2 / RE-B3 RESOLVED (typed binding): read the current stored combat-blessing level and RAISE
 /// it to `level` if higher. Returns:
