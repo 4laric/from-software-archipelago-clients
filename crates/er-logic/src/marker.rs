@@ -320,6 +320,50 @@ pub fn commit(
     }
 }
 
+/// Verdict for an ALREADY-ARMED reconciler when the session's identity may have moved under it.
+///
+/// [`decide`] answers "may this session arm?" and is evaluated ONCE, at reconciler init. That left a
+/// hole: nothing re-asked the question afterwards. If the player reconnects to a DIFFERENT room
+/// without restarting the game, the armed reconciler keeps running against the old room's identity
+/// and the init guard never fires -- it has already run.
+///
+/// 2026-07-30, boblerrr: exactly that. Room `58616176906260760086` -> `87077892385581357560` on a
+/// live reconnect; `229` of the old room's checks were reported into the new one before the next
+/// game restart finally let [`decide`] refuse. `reconcile_io.rs`'s own note calls this outcome
+/// "strictly worse than a double-grant" -- and it is not recoverable, because the checks are already
+/// on someone else's server.
+///
+/// So this is the SAME question as [`decide`], asked at the other end: does the identity an armed
+/// reconciler was built for still equal the live session's? Deliberately keyed on `(room_seed,
+/// ap_slot)` via [`identity_hash`] rather than on the seed string alone, so a SLOT change is caught
+/// by the same predicate -- the symptom was a seed change, but the datum is the identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmedVerdict {
+    /// The armed reconciler still belongs to this session -- keep applying.
+    Keep,
+    /// The armed reconciler belongs to a DIFFERENT (seed, slot). It must be disarmed and the whole
+    /// pipeline gated, exactly as [`InitDecision::Refuse`] does at init.
+    Disarm {
+        /// The identity the armed reconciler was built for.
+        armed: Identity,
+        /// The identity the live connection has now.
+        live: Identity,
+    },
+}
+
+/// Does an armed reconciler built for `armed` still belong to the live `(room_seed, ap_slot)`?
+///
+/// Total and pure: the caller supplies the live room seed and slot name, this computes the live
+/// identity the same way init does. See [`ArmedVerdict`].
+pub fn armed_verdict(armed: Identity, room_seed: &str, ap_slot: &str) -> ArmedVerdict {
+    let live = identity_hash(room_seed, ap_slot);
+    if armed == live {
+        ArmedVerdict::Keep
+    } else {
+        ArmedVerdict::Disarm { armed, live }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +502,94 @@ mod tests {
             decide(read(&g, B), expected),
             InitDecision::Refuse { stored, expected }
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // armed_verdict — the mid-session half of the reconnect guard (2026-07-30, boblerrr)
+    // -----------------------------------------------------------------------------------------
+
+    /// THE MOTIVATING CASE, pinned to the wild numbers. boblerrr's client logged
+    /// `save marker identity 0x45d35730 != this session 0x9911460c` after reconnecting from room
+    /// `58616176906260760086` to room `87077892385581357560` as slot `bobler1`. Both identities are
+    /// reproduced here from the seed strings alone, so this test also pins `identity_hash` against a
+    /// value observed in the field -- if the hash ever changes, every player's marker silently stops
+    /// matching, and this reds.
+    #[test]
+    fn boblerrrs_live_room_switch_disarms_the_armed_reconciler() {
+        const ROOM_A: &str = "58616176906260760086";
+        const ROOM_B: &str = "87077892385581357560";
+        let armed = identity_hash(ROOM_A, "bobler1");
+        assert_eq!(
+            armed, 0x45d3_5730,
+            "identity_hash drifted from the observed marker"
+        );
+        assert_eq!(
+            identity_hash(ROOM_B, "bobler1"),
+            0x9911_460c,
+            "identity_hash drifted from the observed session identity"
+        );
+        assert_eq!(
+            armed_verdict(armed, ROOM_B, "bobler1"),
+            ArmedVerdict::Disarm {
+                armed: 0x45d3_5730,
+                live: 0x9911_460c
+            }
+        );
+    }
+
+    /// The negative case that keeps the guard from becoming a bug: a reconnect to the SAME room must
+    /// keep the reconciler armed. `is_seed_change` already refuses to fire here, but this predicate
+    /// is evaluated independently, so it has to be right on its own.
+    #[test]
+    fn a_same_room_reconnect_keeps_the_reconciler_armed() {
+        let armed = identity_hash("58616176906260760086", "bobler1");
+        assert_eq!(
+            armed_verdict(armed, "58616176906260760086", "bobler1"),
+            ArmedVerdict::Keep
+        );
+    }
+
+    /// The symptom was a SEED change, but the datum is the IDENTITY: a slot change on the same room
+    /// is the same failure (the save belongs to the other slot) and must disarm too. If this ever
+    /// reds, someone has narrowed the predicate back to the symptom.
+    #[test]
+    fn a_slot_change_on_the_same_room_also_disarms() {
+        let armed = identity_hash("58616176906260760086", "bobler1");
+        assert!(matches!(
+            armed_verdict(armed, "58616176906260760086", "boblerHK"),
+            ArmedVerdict::Disarm { .. }
+        ));
+    }
+
+    /// `armed_verdict` must agree with `decide` -- they are the same question asked at two moments,
+    /// and a client that disarmed mid-session but would Resume at init (or vice versa) would flap.
+    #[test]
+    fn armed_verdict_agrees_with_the_init_decision() {
+        let armed = identity_hash("A", "slot");
+        for (room, slot) in [("A", "slot"), ("B", "slot"), ("A", "other")] {
+            let live = identity_hash(room, slot);
+            let init = decide(
+                MarkerRead::Present {
+                    identity: armed,
+                    watermark: 7,
+                },
+                live,
+            );
+            match armed_verdict(armed, room, slot) {
+                ArmedVerdict::Keep => {
+                    assert_eq!(init, InitDecision::Resume { watermark: 7 }, "{room}/{slot}")
+                }
+                ArmedVerdict::Disarm { armed: a, live: l } => {
+                    assert_eq!(
+                        init,
+                        InitDecision::Refuse {
+                            stored: a,
+                            expected: l
+                        },
+                        "{room}/{slot}"
+                    )
+                }
+            }
+        }
     }
 }

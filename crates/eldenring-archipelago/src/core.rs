@@ -561,6 +561,11 @@ impl shared::Core for Core {
                 "seed change detected (parsed {:?} -> room {current_room_seed:?}) -- rebuilding per-seed state",
                 self.parsed_seed
             );
+            // Per-seed TABLES are rebuilt above; the armed RECONCILER is a separate thing and
+            // `reset_for_new_seed` cannot reach it (`DRIVER` is a `OnceLock` owned by reconcile_io,
+            // and `reconcile_inited` stays true). Ask the reconnect guard again — see
+            // `reconcile_io::disarm_if_identity_moved` for the 229-checks incident that needs it.
+            crate::reconcile_io::disarm_if_identity_moved(&current_room_seed);
             self.reset_for_new_seed();
         }
         if !self.slot_data_parsed {
