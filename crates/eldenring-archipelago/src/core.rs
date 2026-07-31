@@ -2731,7 +2731,18 @@ impl shared::Core for Core {
         //      applies the owned classes via `reconcile_io::tick`, and the OLD handlers above skip
         //      whatever the reconciler owns (see the `owns_*` gates). Widened from the dry-run-only
         //      gate: `tick()` was previously unreachable in apply mode (the cutover wiring gap). The
-        //      whole block is a no-op only when neither dry-run nor any apply class is active. ----
+        //      whole block is a no-op only when neither dry-run nor any apply class is active.
+        //
+        //      THE SHAPE, named (issue #237), because both halves look like something you could
+        //      skip and neither is:
+        //        * DESIRED side  -- rebuilt from scratch EVERY frame (the cumulative `recv` below),
+        //          then handed to `set_inputs`, which EQUALITY-GUARDS it in the pure layer. The
+        //          rebuild is cheap-ish and unconditional; the swap is guarded. Do not move that
+        //          guard out here -- `reconcile_io::set_inputs` also re-stamps `d.slot`.
+        //        * OBSERVED side -- `tick()` polls EVERY frame, unconditionally. The game emits no
+        //          event when it diverges from what we wrote, so there is nothing to subscribe to
+        //          and convergence is not a reason to stop looking. There is no dirty flag and no
+        //          nudge; a gate here would break four already-healed bug classes. ----
         if (crate::reconcile_io::dry_run_enabled() || crate::reconcile_io::apply_active())
             && self.slot_data_parsed
         {
@@ -2777,7 +2788,8 @@ impl shared::Core for Core {
             } else {
                 crate::reconcile_io::set_inputs(inputs);
             }
-            // Dry-run tick: computes + logs the per-action diff; applies nothing (see reconcile_io).
+            // POLL. Unconditional, every frame, converged or not (see `reconcile_io::tick`).
+            // In dry-run it computes + logs the per-action diff and applies nothing.
             crate::reconcile_io::tick();
         }
 

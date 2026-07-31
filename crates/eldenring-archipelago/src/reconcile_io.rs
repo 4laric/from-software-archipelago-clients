@@ -3,8 +3,8 @@
 //! This is the ONLY place the reconciler touches the live game: it implements [`GameIo`] against the
 //! `fromsoftware-rs` singletons (event flags via `crate::flags`, goods via the `GameDataMan`
 //! inventory walk that `inventory.rs` / `upgrades.rs` already use, item grants via
-//! `crate::detour::grant_full_id`), owns the poll-thread tick + the dirty flag, and persists the
-//! per-save ledger watermark to a file next to the client.
+//! `crate::detour::grant_full_id`), owns the poll-thread tick, and persists the per-save ledger
+//! watermark to a file next to the client.
 //!
 //! ## Build / wiring status
 //!
@@ -443,14 +443,12 @@ impl WatermarkStore {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The poll-thread driver: dirty flag + tick
+// The poll-thread driver
 // ---------------------------------------------------------------------------------------------
 
-/// Set by every event (connect / load / ItemReceived) instead of mutating the game directly.
-static DIRTY: AtomicBool = AtomicBool::new(true);
-
-/// The live reconciler + its IO + watermark store, owned by the poll thread. `OnceLock<Mutex<..>>`
-/// so the net thread can nudge / swap inputs while the game thread ticks.
+/// The live reconciler + its IO + watermark store. `OnceLock<Mutex<..>>` because `set_inputs` and
+/// `tick` are separate entry points; both are called from the game thread today, and the mutex keeps
+/// that an implementation detail rather than a requirement.
 static DRIVER: OnceLock<Mutex<Driver>> = OnceLock::new();
 
 /// Set at init when the save-embedded marker's identity MISMATCHES this connection's (seed, slot) —
@@ -543,12 +541,6 @@ struct Driver {
     /// The marker identity for this session = `hash(room seed, AP slot name)`. Written into the save's
     /// marker band alongside the watermark on every tick commit; the reconnect guard compares it.
     identity: u32,
-}
-
-/// EVENT NUDGE — call from the net loop / connect / load handlers instead of doing the grant inline.
-/// Cheap and lock-free.
-pub fn mark_dirty() {
-    DIRTY.store(true, Ordering::Relaxed);
 }
 
 /// A PROCESS-monotonic clock in ms that — unlike the per-world dwell clock — never resets on a load
@@ -793,12 +785,13 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
          unobservable grants, and re-armed on every world edge",
         er_logic::reconcile::MAX_GRANT_ATTEMPTS
     );
-    mark_dirty();
 }
 
 /// SWAP inputs (received prefix grew, or a reconnect). Atomic + seed-change aware inside the pure
 /// reconciler (resets the ledger watermark only on a genuine seed change — the reconnect-new-seed
-/// fix). Call from the net loop when `items_received` / room seed changes.
+/// fix). `core.rs` calls this every frame with a freshly rebuilt `DesiredInputs`; the pure
+/// `Reconciler::set_inputs` equality-guards identical inputs, so the repeat cost is one comparison.
+/// The `d.slot` stamp below runs either way — that is why the guard lives in the pure layer.
 pub fn set_inputs(inputs: DesiredInputs) {
     if let Some(m) = DRIVER.get()
         && let Ok(mut d) = m.lock()
@@ -806,20 +799,28 @@ pub fn set_inputs(inputs: DesiredInputs) {
         d.slot = inputs.save.0.clone(); // same character; save_slot is unchanged
         d.reconciler.set_inputs(inputs);
     }
-    mark_dirty();
 }
 
-/// TICK — call once per game-thread frame (from the reconstructed `update_live`). Does nothing unless
-/// dirty; the reconciler itself gates every read/write on world stability, so this is safe to call
-/// during load screens (it simply no-ops).
+/// TICK — call once per game-thread frame (from the reconstructed `update_live`), UNCONDITIONALLY.
+/// It polls: it re-reads the observed game state whether or not anything changed on our side,
+/// because the game's own divergences emit no events. A refused grant that goes blind, a flag
+/// vanilla EMEVD re-clears, an accessor that switches to the multiplay key list, a save-scum
+/// rollback — none of them announce themselves, so convergence is never a reason to stop looking.
+/// The reconciler itself gates every read/write on world stability, so this is safe to call during
+/// load screens (it simply no-ops), and `refresh_dwell` below is what keeps that gate honest across
+/// one.
+///
+/// 🛑 Do NOT reintroduce a dirty/convergence gate here. There used to be one (a `static DIRTY` that
+/// `set_inputs` re-stored `true` every frame, so it never once observed `false`). It was deleted in
+/// issue #237 along with its twin in `er_logic`, because a live one would break four already-healed
+/// bug classes — the acceptance test is
+/// `er_logic::reconcile::tests::observed_only_divergence_heals_with_no_nudge_replay`, and a
+/// convergence gate reds it plus `stall_guard_leaves_the_save_scum_self_heal_intact_replay`.
 ///
 /// INTEGRATION: replace the scattered `drain_start_items` / `flush_grace_flags` /
 /// `open_on_received_name` / great-rune restore / map-reveal calls in `update_live` with this ONE
 /// call, per the strangler phases in `docs/history/MIGRATION.md` (archived; cutover complete).
 pub fn tick() {
-    if !DIRTY.load(Ordering::Relaxed) {
-        return;
-    }
     // A REFUSED session must not apply, and after `disarm_if_identity_moved` a DRIVER can exist
     // while refused — so `DRIVER.get()` alone is no longer the whole gate. Without this line the
     // disarm is cosmetic: the old room's reconciler keeps granting and reporting.
@@ -850,7 +851,8 @@ pub fn tick() {
             planned.len(),
             planned,
         );
-        // Do NOT clear dirty in dry-run: keep logging until the operator switches modes.
+        // READ-ONLY: return before the apply path. The poll keeps logging every frame so the
+        // operator sees the live plan, including one that only changed because the GAME moved.
         return;
     }
 
@@ -915,9 +917,6 @@ pub fn tick() {
         );
     }
 
-    if out.converged {
-        DIRTY.store(false, Ordering::Relaxed);
-    }
     if !out.applied.is_empty() {
         log::info!(
             "[reconcile] applied {} action(s) this tick (converged={})",
@@ -928,22 +927,25 @@ pub fn tick() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// INTEGRATION (now wired into core.rs::update_live behind RECONCILE_DRYRUN; core.rs is NOT
-// truncated). The wiring is five calls:
+// INTEGRATION (wired into core.rs::update_live). The wiring is THREE calls, all from the game
+// thread, and there are no event handlers:
 //
-//   // 1. after slot_data parse (once):
-//   reconcile_io::init(build_desired_inputs(&slot_data, &received), client_dir.join("reconcile.json"));
+//   // 1. once, on the first stable in-world tick:
+//   reconcile_io::init(build_desired_inputs(&slot_data, &received), path, received_through);
 //
-//   // 2. every frame from update_live:
-//   reconcile_io::tick();
-//
-//   // 3. net loop, when items_received or the room seed changes:
+//   // 2. every frame: rebuild the CUMULATIVE desired inputs and swap them in. Identical inputs
+//   //    are equality-guarded inside the pure reconciler, so the steady-state cost is a compare.
 //   reconcile_io::set_inputs(build_desired_inputs(&slot_data, &received));
 //
-//   // 4. connect / load handlers (instead of the old inline grants):
-//   reconcile_io::mark_dirty();
+//   // 3. every frame: poll. Not "when something changed" — every frame. See `tick`.
+//   reconcile_io::tick();
 //
-//   // 5. `build_desired_inputs` maps each archipelago_rs received item -> ReceivedItem with the
+// There is deliberately NO fourth "nudge from the connect / load / net-loop handler" step. An
+// earlier version of this comment described one and no such handler was ever written; the polling
+// that replaced it is the design, not a stopgap (issue #237). The desired side is a per-frame
+// rebuild plus an equality-guarded swap; the observed side is a per-frame poll.
+//
+//   // `build_desired_inputs` maps each archipelago_rs received item -> ReceivedItem with the
 //   //    right ItemSemantics (RegionFlags / MapReveal / KeyItem / GreatRune / Consumable / GoalFlag),
 //   //    reusing the tables the old feature modules already carry (region.rs open flags,
 //   //    startgrants.rs MAP_REVEAL_FLAGS_BASE + 82001, keyitems.rs 4000xx obtained flags, the
