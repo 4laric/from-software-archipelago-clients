@@ -516,23 +516,28 @@ pub fn tier_multiplier(tier: usize) -> f32 {
 
 /// The one-line toast shown when the player first enters a region.
 ///
-///   `Liurnia — enemy scaling 4.12x (tier 10 of 19)`
-///   `Liurnia — enemy scaling not set for this area; using the floor, 1.14x`
+///   `Liurnia - enemy scaling 4.12x (tier 10 of 19)`
+///   `Liurnia - enemy scaling not set for this area; using the floor, 1.14x`
 ///
 /// The NUMBER is the point. A tier index alone means nothing to a player, and "hard" means nothing
 /// either; `4.12x` is a thing you can compare to your own weapon. The tier fraction rides along so
 /// two regions can be ranked against each other at a glance.
+///
+/// STOP: ASCII ONLY. This string is drawn by the GAME, not by a terminal, and the in-game font has
+/// no glyph for an em-dash: Alaric's 2026-07-31 screenshot reads `Altus ? enemy scaling 1.14x`
+/// because this used U+2014. Everything a player reads in-game goes through that font, so the same
+/// rule the .ps1 and gen_data surfaces already carry applies here. `every_toast_is_ascii` pins it.
 pub fn region_scaling_toast(region: &str, scaling: RegionScaling) -> String {
     match scaling {
         RegionScaling::Known(tier) => format!(
-            "{} — enemy scaling {:.2}x (tier {} of {})",
+            "{} - enemy scaling {:.2}x (tier {} of {})",
             region,
             tier_multiplier(tier),
             tier.min(NUM_TIERS - 1),
             NUM_TIERS - 1
         ),
         RegionScaling::Defaulted(tier) => format!(
-            "{} — enemy scaling not set for this area; using the floor, {:.2}x",
+            "{} - enemy scaling not set for this area; using the floor, {:.2}x",
             region,
             tier_multiplier(tier)
         ),
@@ -1076,24 +1081,47 @@ mod tests {
     // toast appears on entry at all.
 
     #[test]
+    fn every_toast_is_ascii() {
+        // MOTIVATING CASE (rule 11): Alaric's 2026-07-31 screenshot showed
+        // `Altus ? enemy scaling 1.14x (tier 0 of 19)` -- the toast format string carried a U+2014
+        // em-dash and the in-game font has no glyph for it, so the game drew `?`. The toast system
+        // itself was working perfectly; the STRING was unrenderable.
+        //
+        // Checked over the whole tier range and both variants, plus a region name with a space,
+        // because the defect was in the constant part and a single-case assertion would have
+        // matched the broken string just as happily.
+        for tier in 0..=NUM_TIERS + 1 {
+            for s in [
+                region_scaling_toast("Farum Azula", RegionScaling::Known(tier)),
+                region_scaling_toast("Farum Azula", RegionScaling::Defaulted(tier)),
+            ] {
+                assert!(
+                    s.is_ascii(),
+                    "toast is drawn by the GAME's font, which has no glyph for non-ASCII: {s:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_known_region_shows_the_multiplier_and_where_it_sits() {
         // tier 10 of 19 is `auto`'s cap for a 5-region seed -- the number Alaric calibrated.
         let s = region_scaling_toast("Liurnia", RegionScaling::Known(10));
         // 4.12, NOT 4.13: rung 10 is 4.125 and `{:.2}` on that f32 renders DOWN. Verified with a
         // standalone rustc rather than reasoned about -- the assertion this file first carried said
         // 4.13x and would have reddened CI for a rounding rule nobody can eyeball.
-        assert_eq!(s, "Liurnia — enemy scaling 4.12x (tier 10 of 19)");
+        assert_eq!(s, "Liurnia - enemy scaling 4.12x (tier 10 of 19)");
     }
 
     #[test]
     fn the_top_and_bottom_of_the_ladder_render() {
         assert_eq!(
             region_scaling_toast("Limgrave", RegionScaling::Known(0)),
-            "Limgrave — enemy scaling 1.14x (tier 0 of 19)"
+            "Limgrave - enemy scaling 1.14x (tier 0 of 19)"
         );
         assert_eq!(
             region_scaling_toast("Farum Azula", RegionScaling::Known(NUM_TIERS - 1)),
-            "Farum Azula — enemy scaling 7.42x (tier 19 of 19)"
+            "Farum Azula - enemy scaling 7.42x (tier 19 of 19)"
         );
     }
 
@@ -1131,7 +1159,7 @@ mod tests {
         assert_eq!(deepest, RegionScaling::Known(10));
         assert_eq!(
             region_scaling_toast("Leyndell", deepest),
-            "Leyndell — enemy scaling 4.12x (tier 10 of 19)"
+            "Leyndell - enemy scaling 4.12x (tier 10 of 19)"
         );
     }
 
@@ -1153,7 +1181,7 @@ mod tests {
         let first = ledger
             .on_region(&c, 64000, Some("Caelid"))
             .expect("first entry announces");
-        assert!(first.starts_with("Caelid — enemy scaling"), "{first}");
+        assert!(first.starts_with("Caelid - enemy scaling"), "{first}");
         assert_eq!(
             ledger.on_region(&c, 64000, Some("Caelid")),
             None,
