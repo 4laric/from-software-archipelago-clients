@@ -662,5 +662,4 @@ mod tests {
             assert_eq!(refusal_toast(r), refusal_toast(r));
         }
     }
-
 }
