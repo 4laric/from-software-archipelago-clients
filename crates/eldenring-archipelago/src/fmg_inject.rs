@@ -13,6 +13,12 @@
 //! SAFETY: the rebuilt block is validated in OUR memory (re-lookup the check ids) BEFORE the swap; a
 //! build mismatch aborts the swap (game untouched). The new block is VirtualAlloc'd RW and leaked for
 //! the process. Identity stage makes NO visible change if correct — that's the proof.
+//!
+//! 🔥 THE BLOCK NEEDS PADDING BELOW IT (`GUARD_BELOW`). The game reads an allocator header 8
+//! bytes under the MsgData pointer, and a bare `VirtualAlloc` base has nothing mapped there. That
+//! was the CTD: boblerrr crashed 14/14 sessions on 2026-07-30, every fault 8 bytes below a 64 KB
+//! boundary, then 6/6 `foreign-blocks: HIT` on the instrumented build on 2026-07-31. Do not
+//! "simplify" the guard away.
 
 // This module is deliberately one big raw-pointer FFI surface: every `unsafe fn` here IS the safety
 // boundary (its own doc/SAFETY notes cover the invariants), so Rust 2024's `unsafe_op_in_unsafe_fn`
@@ -181,27 +187,53 @@ fn my_lookup(md: usize, groups: &[Group], offsets: &[u64], id: u32) -> Option<St
     read_string(md + off as usize)
 }
 
+/// Bytes of committed, zeroed padding placed BELOW every block we hand the game.
+///
+/// PROVEN 2026-07-31 by boblerrr's log, client `0.2.18 (7e03d2856019)`: SIX crashes, SIX
+/// `foreign-blocks: HIT`, zero misses, every one of them `fault is 8 byte(s) BELOW our block` and
+/// naming the block by address and size. The game reads an allocator header immediately under the
+/// MsgData pointer -- a `DLKR::DLAllocator` convention -- and `VirtualAlloc` returns the base of the
+/// RESERVATION, so those 8 bytes were unmapped. Hence 14/14 earlier faults at an address ending
+/// `fff8`, i.e. 8 below a 64 KB boundary.
+///
+/// A whole page, not 8 or 16 bytes: the crash proves a read at -8, but nothing proves -8 is the
+/// deepest the game ever reaches, and 4 KB against a ~115 KB block is free. The padding is zeroed by
+/// `VirtualAlloc`, so the header reads as zeros instead of faulting.
+///
+/// 🛑 This makes the READ safe. It does NOT make us the owner: if the game ever tries to FREE or
+/// REALLOC this block it will hand a zeroed header to its own allocator. The real fix is allocating
+/// through the game's allocator so the header is genuine; that needs the allocator entry point,
+/// which is not pinned yet. Keep `foreign_blocks` armed -- if this regresses, the next crash says so
+/// in one line.
+const GUARD_BELOW: usize = 0x1000;
+
 unsafe fn valloc(size: usize) -> Option<usize> {
     use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-    let p = VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    let p = VirtualAlloc(
+        None,
+        size + GUARD_BELOW,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
     if p.is_null() {
         None
     } else {
+        // Hand out a pointer INSIDE the reservation, so the bytes below it are ours and mapped.
+        let p = (p as usize + GUARD_BELOW) as *mut c_void;
         let base = p as usize;
-        // Hand the address to the crash handler's registry BEFORE anyone can swap it in. Every
-        // block is recorded, including ones a failed validation never swaps: a block the game was
-        // never given cannot be the one it faulted under, so a hit on an unswapped block would
-        // itself be information. `VirtualAlloc` returns the base of the RESERVATION, so the bytes
-        // below `base` are unmapped -- which is the whole hypothesis under test.
+        // Stay registered even though the fault is fixed: `foreign_blocks` is what PROVED this
+        // (6 crashes, 6 HITs, 0 misses on 2026-07-31), and it is the only thing that would catch a
+        // regression -- if `GUARD_BELOW` is ever dropped or the game reaches deeper than a page,
+        // the next crash report says so in one line instead of costing another round trip.
         shared::foreign_blocks::record(base, size);
         log::info!(
-            "FMG valloc: block #{} @ {base:#x} size {size:#x} (base % 64K = {:#x}) -- a crash \
-             reading just BELOW this address is the game looking for an allocator header we did \
-             not put there",
+            "FMG valloc: block #{} @ {base:#x} size {size:#x} (+{:#x} guard below, mapped) -- a \
+             crash reading BELOW this address would mean the game reached past the guard for an \
+             allocator header",
             shared::foreign_blocks::recorded(),
-            base % 0x1_0000
+            GUARD_BELOW
         );
-        Some(base) // VirtualAlloc memory is zero-initialized
+        Some(base) // VirtualAlloc memory is zero-initialized, guard page included
     }
 }
 
