@@ -27,6 +27,7 @@ mod input;
 mod inventory;
 mod key_resolver;
 mod keyitems;
+mod lock_hints;
 mod minibaker;
 mod no_equip_load;
 mod no_fall_damage;
