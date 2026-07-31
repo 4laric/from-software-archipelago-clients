@@ -17,7 +17,9 @@ use eldenring::cs::{ChrInsExt, SoloParamRepository, SpEffectParam, WorldChrMan};
 use fromsoftware_shared::FromStatic;
 
 /// A repurposed vanilla no-op `SpEffectParam` row (safe set; distinct from no_equip_load's 20012080).
-const SP_EFFECT_ID: i32 = 20010827;
+const SP_EFFECT_ID: i32 = er_logic::safe_speffect_rows::NO_FALL_DAMAGE;
+// CLAIMED, not chosen here: `er-logic/src/safe_speffect_rows.rs` is the single source of
+// truth for repurposed rows and carries the eligibility criteria + the duplicate-claim test.
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PARAM_PATCHED: AtomicBool = AtomicBool::new(false);
