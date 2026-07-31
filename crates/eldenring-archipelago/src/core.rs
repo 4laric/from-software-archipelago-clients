@@ -3196,7 +3196,10 @@ impl Core {
         let ledger_ready = self.lock_hints.is_ready();
         let purchases_n = self.lock_hints.purchases();
         let lock_item_of: HashMap<String, String> = self.coarse_lock_items.clone();
-        let region_coarse: HashMap<String, String> = self.coarse_table.clone();
+        // location id -> coarse region. NOT keyed by region name: `coarse_table` is
+        // HashMap<u64, RegionId>. tracker.rs:117 states every location in a tracker region shares
+        // one coarse region, so any of the region's location ids resolves it.
+        let coarse_of: HashMap<u64, String> = self.coarse_table.clone();
         let mut buy_clicks: Vec<i64> = Vec::new();
 
         let mut open = true;
@@ -3253,8 +3256,10 @@ impl Core {
                     // Only on a LOCKED region, and only once the ledger has been read back: a
                     // balance computed against an unread ledger looks like free money.
                     if !region.accessible && ledger_ready {
-                        let lock_item = region_coarse
-                            .get(&region.region)
+                        let lock_item = region
+                            .unchecked
+                            .first()
+                            .and_then(|u| coarse_of.get(&u.location_id))
                             .and_then(|c| lock_item_of.get(c))
                             .map(|s| s.as_str());
                         let offer = er_logic::lock_hint_economy::offer(
