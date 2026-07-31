@@ -80,7 +80,11 @@ pub enum LockHintOffer {
     Buyable { price: u64, location: i64 },
     /// Not affordable yet. Render DISABLED WITH THE COST — never hidden. A player who cannot see
     /// what the button costs, or that they are making progress toward it, learns nothing.
-    Insufficient { price: u64, have: u64, location: i64 },
+    Insufficient {
+        price: u64,
+        have: u64,
+        location: i64,
+    },
     /// Already hinted, through our button or AP's own `!hint`. No button, and NO charge: spend
     /// derives from our ledger, not from the standing-hint set, so nobody pays twice for one reveal.
     AlreadyHinted { location: i64 },
@@ -255,7 +259,11 @@ mod tests {
         // at 1. The floor is a guard the corpus never triggers, so it is called DIRECTLY.
         assert_eq!(price_per_hint(30, 10 * 30 / 100 * 10, 300), Some(3));
         assert_eq!(price_per_hint(1, PPH_10PCT, TOTAL), Some(1), "floor");
-        assert_eq!(price_per_hint(0, PPH_10PCT, TOTAL), Some(1), "floor at zero surface");
+        assert_eq!(
+            price_per_hint(0, PPH_10PCT, TOTAL),
+            Some(1),
+            "floor at zero surface"
+        );
         for surface in 1..=200u64 {
             assert!(
                 price_per_hint(surface, PPH_10PCT, TOTAL).unwrap() >= 1,
@@ -276,7 +284,11 @@ mod tests {
     fn balance_is_checks_minus_what_purchases_cost() {
         assert_eq!(balance(20, 0, 16), 20);
         assert_eq!(balance(20, 1, 16), 4);
-        assert_eq!(balance(20, 2, 16), 0, "debt saturates to zero, never underflows");
+        assert_eq!(
+            balance(20, 2, 16),
+            0,
+            "debt saturates to zero, never underflows"
+        );
     }
 
     // --- resolution -------------------------------------------------------------------------------
@@ -315,7 +327,11 @@ mod tests {
 
     #[test]
     fn duplicate_names_resolve_deterministically() {
-        let s = scout(&[(30, "Caelid Lock"), (11, "Caelid Lock"), (22, "Caelid Lock")]);
+        let s = scout(&[
+            (30, "Caelid Lock"),
+            (11, "Caelid Lock"),
+            (22, "Caelid Lock"),
+        ]);
         for _ in 0..50 {
             assert_eq!(
                 resolve_lock_location(Some("Caelid Lock"), &s),
@@ -334,33 +350,65 @@ mod tests {
     #[test]
     fn fifteen_checks_cannot_afford_sixteen_and_the_button_still_shows_the_cost() {
         let got = offer(
-            Some("Caelid Lock"), &s_default(), &HashSet::new(),
-            SURFACE, 15, 0, PPH_10PCT, TOTAL,
+            Some("Caelid Lock"),
+            &s_default(),
+            &HashSet::new(),
+            SURFACE,
+            15,
+            0,
+            PPH_10PCT,
+            TOTAL,
         );
         assert_eq!(
             got,
-            LockHintOffer::Insufficient { price: 16, have: 15, location: 77 }
+            LockHintOffer::Insufficient {
+                price: 16,
+                have: 15,
+                location: 77
+            }
         );
     }
 
     #[test]
     fn sixteen_checks_buys_it() {
         let got = offer(
-            Some("Caelid Lock"), &s_default(), &HashSet::new(),
-            SURFACE, 16, 0, PPH_10PCT, TOTAL,
+            Some("Caelid Lock"),
+            &s_default(),
+            &HashSet::new(),
+            SURFACE,
+            16,
+            0,
+            PPH_10PCT,
+            TOTAL,
         );
-        assert_eq!(got, LockHintOffer::Buyable { price: 16, location: 77 });
+        assert_eq!(
+            got,
+            LockHintOffer::Buyable {
+                price: 16,
+                location: 77
+            }
+        );
     }
 
     #[test]
     fn after_one_purchase_the_balance_is_spent() {
         let got = offer(
-            Some("Caelid Lock"), &s_default(), &HashSet::new(),
-            SURFACE, 16, 1, PPH_10PCT, TOTAL,
+            Some("Caelid Lock"),
+            &s_default(),
+            &HashSet::new(),
+            SURFACE,
+            16,
+            1,
+            PPH_10PCT,
+            TOTAL,
         );
         assert_eq!(
             got,
-            LockHintOffer::Insufficient { price: 16, have: 0, location: 77 }
+            LockHintOffer::Insufficient {
+                price: 16,
+                have: 0,
+                location: 77
+            }
         );
     }
 
@@ -369,8 +417,14 @@ mod tests {
         // Includes locks hinted through AP's own paid !hint: spend derives from OUR ledger, so the
         // player cannot be billed for a reveal they already have.
         let got = offer(
-            Some("Caelid Lock"), &s_default(), &HashSet::from([77]),
-            SURFACE, 100, 0, PPH_10PCT, TOTAL,
+            Some("Caelid Lock"),
+            &s_default(),
+            &HashSet::from([77]),
+            SURFACE,
+            100,
+            0,
+            PPH_10PCT,
+            TOTAL,
         );
         assert_eq!(got, LockHintOffer::AlreadyHinted { location: 77 });
     }
@@ -378,17 +432,33 @@ mod tests {
     #[test]
     fn a_spilled_lock_is_not_purchasable() {
         let got = offer(
-            Some("Enir Ilim Lock"), &s_default(), &HashSet::new(),
-            SURFACE, 999, 0, PPH_10PCT, TOTAL,
+            Some("Enir Ilim Lock"),
+            &s_default(),
+            &HashSet::new(),
+            SURFACE,
+            999,
+            0,
+            PPH_10PCT,
+            TOTAL,
         );
-        assert_eq!(got, LockHintOffer::Spilled, "we cannot CreateHints a foreign-world location");
+        assert_eq!(
+            got,
+            LockHintOffer::Spilled,
+            "we cannot CreateHints a foreign-world location"
+        );
     }
 
     #[test]
     fn an_underivable_price_offers_nothing_rather_than_something_free() {
         let got = offer(
-            Some("Caelid Lock"), &s_default(), &HashSet::new(),
-            SURFACE, 999, 0, PPH_10PCT, 0,
+            Some("Caelid Lock"),
+            &s_default(),
+            &HashSet::new(),
+            SURFACE,
+            999,
+            0,
+            PPH_10PCT,
+            0,
         );
         assert_eq!(got, LockHintOffer::Unknown);
     }
@@ -403,7 +473,16 @@ mod tests {
         let s = s_default();
         let hinted = HashSet::new();
         let derive = |checked: u64, purchases: u64| {
-            offer(Some("Caelid Lock"), &s, &hinted, SURFACE, checked, purchases, PPH_10PCT, TOTAL)
+            offer(
+                Some("Caelid Lock"),
+                &s,
+                &hinted,
+                SURFACE,
+                checked,
+                purchases,
+                PPH_10PCT,
+                TOTAL,
+            )
         };
         for checked in [0u64, 15, 16, 31, 32, 200] {
             for purchases in [0u64, 1, 2] {

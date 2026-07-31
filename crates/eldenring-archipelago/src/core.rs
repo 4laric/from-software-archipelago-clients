@@ -3184,7 +3184,11 @@ impl Core {
         // borrows self. Clicks are collected into `buy_clicks` and committed after `.build()`.
         let surface_checked_n = er_logic::lock_hint_economy::surface_checked(
             &checked.iter().map(|&id| id as i64).collect(),
-            &self.progression_surface.iter().map(|&id| id as i64).collect(),
+            &self
+                .progression_surface
+                .iter()
+                .map(|&id| id as i64)
+                .collect(),
         );
         let surface_total_n = self.progression_surface.len() as u64;
         let lock_scout = crate::scout_proof::item_names_by_location();

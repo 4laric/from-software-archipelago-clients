@@ -26,8 +26,8 @@
 //!    an array is `Appends(Vec<Value>)`. They serialise to the same wire name `"add"`, which makes
 //!    the mistake invisible in the protocol docs — it is a Rust type error waiting on the server.
 
-use archipelago_rs as ap;
 use ap::{CreateAsHint, DataStorageOperation};
+use archipelago_rs as ap;
 use oneshot::TryRecvError;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -213,7 +213,11 @@ mod tests {
         assert_eq!(lh.queue, vec![42], "a double click must not double-charge");
         lh.ledger.push(7);
         lh.buy(7);
-        assert_eq!(lh.queue, vec![42], "an already-bought location is never re-queued");
+        assert_eq!(
+            lh.queue,
+            vec![42],
+            "an already-bought location is never re-queued"
+        );
     }
 
     #[test]
