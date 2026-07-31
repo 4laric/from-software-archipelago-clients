@@ -24,10 +24,14 @@
 //!   3. apply the DIFF, idempotently,
 //!   4. all of it gated on "world loaded and stable".
 //!
-//! Events stop being mutators; they only mark the reconciler DIRTY. Because the desired state is a
-//! pure function of the *set* of received items (not their order) and the loop drains to a FIXPOINT,
-//! event order / duplication / interleaved load screens can no longer change the result. That
-//! invariant is proven in [`crate::reconciler_replay`].
+//! Events stop being mutators entirely: nothing subscribes to them, and [`Reconciler::tick`] POLLS
+//! the observed state unconditionally on every game-thread frame. That is not a shortcut for a
+//! missing event layer — it is the design. Elden Ring emits no event when it diverges from what we
+//! wrote (a refused grant, a contested flag vanilla re-clears, an accessor that switches lists, a
+//! save-scum rollback), so there is nothing to subscribe TO on the observation side. Because the
+//! desired state is a pure function of the *set* of received items (not their order) and the loop
+//! drains to a FIXPOINT, event order / duplication / interleaved load screens can no longer change
+//! the result. That invariant is proven in [`crate::reconciler_replay`].
 //!
 //! # Structure
 //!
@@ -729,9 +733,12 @@ pub struct TickOutcome {
     pub newly_stalled_flags: Vec<FlagId>,
 }
 
-/// The tick-driven, event-nudged reconciler. Holds the server-authoritative inputs, the derived
-/// desired state, and the persisted ledger watermark. Orchestration is PURE + host-testable; the
-/// thread + memory I/O binding lives in the client's `reconcile_io.rs`.
+/// The POLLING reconciler. Holds the server-authoritative inputs, the derived desired state, and the
+/// persisted ledger watermark. Orchestration is PURE + host-testable; the thread + memory I/O binding
+/// lives in the client's `reconcile_io.rs`.
+///
+/// There is no dirty flag and no nudge: [`tick`](Self::tick) re-observes every frame. See the module
+/// doc for why an event layer cannot gate the observation side.
 #[derive(Clone, Debug)]
 pub struct Reconciler {
     inputs: DesiredInputs,
@@ -740,7 +747,6 @@ pub struct Reconciler {
     session_seed: String,
     /// Persisted-per-save contiguous frontier for the consumable ledger.
     applied_watermark: ItemIndex,
-    dirty: bool,
     /// [`WorldStability::now_ms`] of the most recent tick that LANDED a good/ledger grant, or `None`
     /// if none has landed yet. Drives the [`TickBudget::min_grant_interval_ms`] pacing gate. NOT
     /// persisted (a fresh session re-paces from its first grant); the ledger watermark — not this —
@@ -771,7 +777,7 @@ pub struct Reconciler {
 /// How many ACCEPTED-but-unobservable grants of one unique good are tolerated before it is parked.
 ///
 /// This is the bound the reconciler never had. `diff` re-emits `GrantUnique` for any desired good a
-/// snapshot cannot see, `core.rs` re-marks the reconciler dirty every frame, and `grant_good`
+/// snapshot cannot see, `tick` polls every frame, and `grant_good`
 /// reports success for any call it dispatched — because `grant_item` discards `AddItemFunc`'s
 /// result. Compose those three and a good the game REFUSES (it is dropped on the floor with
 /// "would exceed the maximum storage") is re-granted ~6x/second for the rest of the session while
@@ -819,7 +825,6 @@ impl Reconciler {
             desired,
             session_seed,
             applied_watermark: floor,
-            dirty: true,
             last_grant_ms: None,
             grant_attempts: BTreeMap::new(),
             stalled_goods: BTreeSet::new(),
@@ -838,7 +843,6 @@ impl Reconciler {
             desired,
             session_seed,
             applied_watermark,
-            dirty: true,
             last_grant_ms: None,
             grant_attempts: BTreeMap::new(),
             stalled_goods: BTreeSet::new(),
@@ -914,11 +918,6 @@ impl Reconciler {
         self.applied_watermark
     }
 
-    /// Whether a convergence attempt is owed (an event nudged us, or a prior tick didn't finish).
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
     /// A read-only view of the current desired state (for the dry-run / logging path).
     pub fn desired(&self) -> &DesiredState {
         &self.desired
@@ -927,12 +926,6 @@ impl Reconciler {
     /// A read-only view of the current inputs.
     pub fn inputs(&self) -> &DesiredInputs {
         &self.inputs
-    }
-
-    /// EVENT NUDGE: connect / load / ItemReceived call this instead of mutating the game. It only
-    /// marks the reconciler dirty; the next [`tick`](Self::tick) does the (idempotent) work.
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
     }
 
     /// Atomically swap in new server-authoritative inputs. If the room seed genuinely CHANGED
@@ -944,7 +937,18 @@ impl Reconciler {
     /// desired from the (possibly grown) received prefix. The swap is atomic: `inputs`, `desired`,
     /// `session_seed` and `applied_watermark` all move together, so no half-updated table is ever
     /// observed by a concurrent tick.
+    ///
+    /// IDENTICAL-INPUTS GUARD: `core.rs` rebuilds `DesiredInputs` from the whole cumulative received
+    /// stream and calls this EVERY frame, so the overwhelmingly common case is inputs that did not
+    /// change. Returning early skips the [`DesiredState::build`] BTreeMap churn. It is safe because
+    /// `session_seed` is only ever assigned from `inputs.seed` (here and in both constructors), so
+    /// `inputs == self.inputs` implies the seed is unchanged and there is no watermark reset to miss.
+    /// It changes NOTHING about the observation side — [`tick`](Self::tick) polls regardless of
+    /// whether desired moved, which is what heals a divergence the game never announced.
     pub fn set_inputs(&mut self, inputs: DesiredInputs) {
+        if inputs == self.inputs {
+            return;
+        }
         let desired = DesiredState::build(&inputs);
         if crate::seed_change::is_seed_change(Some(&self.session_seed), &inputs.seed) {
             // Brand-new seed: reset to the NEW desired's band floor (not a blind 0) so the new seed's
@@ -954,7 +958,6 @@ impl Reconciler {
         self.session_seed = inputs.seed.clone();
         self.desired = desired;
         self.inputs = inputs;
-        self.dirty = true;
     }
 
     /// Snapshot ONLY the flags/goods the desired state references. Gated by the caller on stability.
@@ -1013,9 +1016,14 @@ impl Reconciler {
         self.stalled_flags.clear();
     }
 
-    /// One convergence attempt. Reads stability; if not stable, does NOTHING (no read, no write) and
-    /// stays dirty. Otherwise snapshots, diffs, and applies up to the per-tick budget. Flag-holder /
-    /// inventory not-ready responses (and budget exhaustion) leave the remainder for the next tick.
+    /// One convergence attempt. Reads stability; if not stable, does NOTHING (no read, no write).
+    /// Otherwise snapshots, diffs, and applies up to the per-tick budget. Flag-holder / inventory
+    /// not-ready responses (and budget exhaustion) leave the remainder for the next tick.
+    ///
+    /// UNCONDITIONAL: call this every game-thread frame. It re-snapshots even when nothing changed
+    /// on the desired side, because that is the only way a divergence the game never announced (a
+    /// good that went blind, a flag vanilla cleared, a save-scum rollback) is ever seen. Converging
+    /// is not a reason to stop looking.
     pub fn tick(&mut self, io: &mut dyn GameIo, budget: TickBudget) -> TickOutcome {
         self.tick_with_classes(io, budget, ApplyClasses::ALL)
     }
@@ -1075,7 +1083,6 @@ impl Reconciler {
             !matches!(a, Action::SetFlag(f) | Action::ClearFlag(f) if self.stalled_flags.contains(f))
         });
         if actions.is_empty() {
-            self.dirty = false;
             return TickOutcome {
                 applied: Vec::new(),
                 skipped_unstable: false,
@@ -1252,7 +1259,6 @@ impl Reconciler {
         }
 
         let converged = !deferred && applied.len() == actions.len();
-        self.dirty = !converged;
         TickOutcome {
             applied,
             skipped_unstable: false,
@@ -1833,7 +1839,6 @@ mod tests {
         );
 
         // Phase 3: enable everything; the good + consumable now land, still exactly once.
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert!(g.has_good(191), "rune granted once ALL classes are enabled");
         assert_eq!(g.ledger_count(2008), 1, "Torch granted exactly once");
@@ -1890,7 +1895,6 @@ mod tests {
         assert!(g.get_flag(76971) && g.get_flag(76972), "grace bundle set");
 
         g.flags.insert(76971, false); // the game loses a bundle flag
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert!(
             g.get_flag(76971),
@@ -2014,7 +2018,10 @@ mod tests {
                 out.applied.is_empty(),
                 "no grant lands before the interval elapses"
             );
-            assert!(!out.converged, "still owed, stays dirty");
+            assert!(
+                !out.converged,
+                "still owed, so the tick does not report converged"
+            );
         }
         assert_eq!(
             g.ledger_log.len(),
@@ -2106,7 +2113,10 @@ mod tests {
             !g.has_good(9000),
             "the good re-grant is HELD until the interval elapses"
         );
-        assert!(!out.converged, "still owes the good, stays dirty");
+        assert!(
+            !out.converged,
+            "still owes the good, so the tick does not report converged"
+        );
 
         // Once the cooldown clears, the held good self-heals.
         g.advance_ms(150);
@@ -2334,7 +2344,6 @@ mod tests {
         g.drop_good(10010);
         g.drop_good(10020);
         for _ in 0..3 {
-            r.mark_dirty();
             r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
             assert!(
                 !g.has_good(10010) && !g.has_good(10020),
@@ -2396,7 +2405,6 @@ mod tests {
         assert!(g.has_good(8101) && g.has_good(8102));
 
         g.drop_good(8101);
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
         assert!(
             g.has_good(8101),
@@ -2450,7 +2458,6 @@ mod tests {
         // Per-rung semantics: the bearing self-heals; the spent seed stays spent.
         g.drop_good(8101);
         g.drop_good(10010); // no-op under the fix (never presence-tracked); the BUG resurrected it
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 16);
         assert!(g.has_good(8101), "owned rung self-heals");
         assert!(!g.has_good(10010), "consumed rung stays spent");
@@ -2711,7 +2718,6 @@ mod tests {
         // Empty it (drink / reallocate to 0). Under presence-diff this re-granted; under the ledger the
         // advanced watermark leaves the flask index behind the frontier, so nothing re-owes.
         g.drop_good(crimson);
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert_eq!(
             g.ledger_count(crimson),
@@ -3251,10 +3257,10 @@ mod tests {
 
     #[test]
     fn flag_silently_discarded_is_parked_after_max_attempts_replay() {
-        // THE TIMELINE (pre-fix): `core.rs` marks the reconciler dirty every frame, `diff`
-        // re-emits SetFlag for any wanted-set flag observed clear, and the live `set_flag`
-        // silently discards an id with no flag-block descriptor -- so one bad flag id is
-        // re-written every frame for the rest of the session, with `converged=true` in the log.
+        // THE TIMELINE (pre-fix): `tick` polls every frame, `diff` re-emits SetFlag for any
+        // wanted-set flag observed clear, and the live `set_flag` silently discards an id with no
+        // flag-block descriptor -- so one bad flag id is re-written every frame for the rest of
+        // the session, with `converged=true` in the log.
         // The exact three-part composition that produced the 2026-07-30 goods softlock, one
         // class over. Post-fix: MAX_FLAG_ATTEMPTS writes, ONE newly_stalled_flags emission,
         // then silence.
@@ -3268,7 +3274,6 @@ mod tests {
 
         let mut stall_reports = 0usize;
         for _ in 0..10 {
-            r.mark_dirty(); // the live client re-marks every frame (core.rs set_inputs)
             let out = r.tick(&mut g, TickBudget::default());
             stall_reports += out.newly_stalled_flags.len();
         }
@@ -3284,7 +3289,6 @@ mod tests {
         );
         // With only stalled work left the plan is empty and the tick reports converged -- the
         // same contract the goods park has (stops re-planning at frame rate).
-        r.mark_dirty();
         let out = r.tick(&mut g, TickBudget::default());
         assert!(out.converged);
     }
@@ -3302,7 +3306,6 @@ mod tests {
             vec![],
         ));
         for _ in 0..10 {
-            r.mark_dirty();
             r.tick(&mut g, TickBudget::default());
             g.flags.insert(76971, false); // vanilla wins the frame; the fight resumes next tick
         }
@@ -3326,18 +3329,15 @@ mod tests {
             vec![],
         ));
         for _ in 0..5 {
-            r.mark_dirty();
             r.tick(&mut g, TickBudget::default());
         }
         assert!(r.stalled_flags().contains(&76971));
 
         g.set_stable(false);
-        r.mark_dirty();
         r.tick(&mut g, TickBudget::default()); // the unstable tick re-arms
         g.set_stable(true);
         g.discard_flag_writes = false; // the cause stopped being true across the edge
 
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert!(
             g.get_flag(76971),
@@ -3358,16 +3358,104 @@ mod tests {
             vec![],
         ));
         for _ in 0..10 {
-            r.mark_dirty();
             r.tick(&mut g, TickBudget::default());
         }
         assert!(r.stalled_flags().is_empty(), "backpressure never parks");
         g.flag_ready = true;
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
         assert!(
             g.get_flag(76971),
             "and the flag lands once the holder is ready"
+        );
+    }
+
+    // ---- the poll IS the design (issue #237) ---------------------------------------------
+
+    #[test]
+    fn observed_only_divergence_heals_with_no_nudge_replay() {
+        // THE ACCEPTANCE TEST for deleting the dirty flags.
+        //
+        // Run to convergence, then mutate ONLY the game: vanilla clears a flag we own, and a
+        // granted unique good goes blind to the inventory walk. Desired does not move, nothing is
+        // received, `set_inputs` is not called, and there is no nudge of any kind -- because in
+        // the live client there IS none: Elden Ring emits no event when it diverges from what we
+        // wrote. This is the shared shape of all four no-event divergence classes:
+        //
+        //   * a Great Rune going blind to `inventory_has_goods` at a live player action, with no
+        //     load and no world edge (the 2026-07-30 softlock's own mechanism);
+        //   * a CONTESTED flag -- we set it, vanilla EMEVD clears it a frame later (the 9116 shape);
+        //   * a co-op accessor switch pointing `items()` at the multiplay key list (2026-07-19);
+        //   * a save-scum / quit-to-menu rollback losing a granted item (the save-scum self-heal).
+        //
+        // A convergence-gated `tick` breaks every one of them, which is why `reconcile_io`'s dead
+        // `DIRTY` early-out was a loaded footgun rather than harmless dead code. Mutation-test this
+        // by re-adding a gate that skips `tick` once converged: it goes red here and nowhere else.
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![
+                region(0, "Limgrave Lock", &[76971]),
+                great_rune(1, "Godrick's Great Rune", 8148, 180),
+            ],
+            vec![],
+        ));
+        let ticks = r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(ticks < 8, "converged before the mutation");
+        assert!(g.get_flag(76971));
+        assert!(g.goods.contains(&8148));
+
+        // THE DIVERGENCE -- game-side only. No inputs change, no nudge, no world edge.
+        g.flags.insert(76971, false);
+        g.goods.remove(&8148);
+
+        let out = r.tick(&mut g, TickBudget::default());
+        assert!(
+            !out.applied.is_empty(),
+            "an unconditional poll must SEE the divergence and re-plan against it"
+        );
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(
+            g.get_flag(76971),
+            "the flag vanilla cleared is re-asserted with no nudge"
+        );
+        assert!(
+            g.goods.contains(&8148),
+            "the good that went blind is re-granted with no nudge"
+        );
+    }
+
+    #[test]
+    fn set_inputs_with_identical_inputs_is_a_noop() {
+        // `core.rs` rebuilds DesiredInputs from the whole cumulative received stream and calls
+        // `set_inputs` EVERY frame, so identical inputs are the common case. The guard must skip
+        // the DesiredState rebuild without disturbing any state -- and must NOT swallow a genuine
+        // seed change, which is what resets the ledger watermark (the reconnect-new-seed fix).
+        let items = vec![consumable(0, "Torch", 2008, 1)];
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(inputs("A", items.clone(), vec![]));
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+
+        let wm = r.applied_watermark();
+        let desired_before = r.desired().clone();
+        let inputs_before = r.inputs().clone();
+        assert_eq!(wm, 1, "the Torch was applied and the watermark advanced");
+
+        r.set_inputs(inputs("A", items.clone(), vec![]));
+        assert_eq!(r.applied_watermark(), wm, "watermark unchanged");
+        assert_eq!(r.desired(), &desired_before, "desired unchanged");
+        assert_eq!(r.inputs(), &inputs_before, "inputs unchanged");
+
+        // ...and a re-tick still grants nothing (the ledger watermark, not the guard, is what
+        // makes this true -- asserted so a regression in either shows up here).
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert_eq!(g.ledger_count(2008), 1, "no re-grant through the guard");
+
+        // A SEED CHANGE must still pass the guard and reset the watermark to the new seed's floor.
+        r.set_inputs(inputs("B", items, vec![]));
+        assert_eq!(
+            r.applied_watermark(),
+            0,
+            "a genuine seed change still resets the watermark (er-reconnect-newseed-panic)"
         );
     }
 }

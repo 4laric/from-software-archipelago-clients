@@ -188,7 +188,6 @@ mod replay {
 
         // Whatever the scramble, end fully live and drained.
         g.set_stable(true);
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, budget, 32);
         snapshot(&g)
     }
@@ -422,7 +421,6 @@ mod replay {
             }
         }
         g.set_stable(true);
-        r.mark_dirty();
         r.run_to_fixpoint(&mut g, budget, 32);
         snapshot(&g)
     }
@@ -657,7 +655,7 @@ mod replay {
         }
     }
 
-    /// Drive `ticks` dirty ticks against a game that ACCEPTS every grant and lands none.
+    /// Drive `ticks` polling ticks against a game that ACCEPTS every grant and lands none.
     ///
     /// `guarded == false` reproduces the PRE-FIX reconciler exactly: re-arming on every tick means
     /// the attempt counter can never reach `MAX_GRANT_ATTEMPTS`, which is precisely the state the
@@ -673,7 +671,6 @@ mod replay {
             }
             let out = r.tick(&mut g, TickBudget::default());
             stalled.extend(out.newly_stalled);
-            r.mark_dirty(); // core.rs re-marks dirty EVERY frame; that is what defeats convergence
         }
         (g.unique_grant_calls.len(), stalled)
     }
@@ -682,7 +679,7 @@ mod replay {
     /// get a fresh allowance on the next world edge.
     ///
     /// THE BUG: `diff` re-emits `GrantUnique` for any desired good a snapshot cannot see;
-    /// `core.rs` re-marks the reconciler dirty every frame; and `grant_good` reports success for
+    /// `tick` polls every frame regardless of convergence; and `grant_good` reports success for
     /// anything it dispatched, because `grant_item` throws away `AddItemFunc`'s result. When the
     /// game REFUSES the add — inventory at cap, "would exceed the maximum storage", item dropped on
     /// the floor — those three compose into an unbounded re-grant at ~6/second for the rest of the
@@ -726,7 +723,6 @@ mod replay {
 
         for _ in 0..50 {
             r.tick(&mut g, TickBudget::default());
-            r.mark_dirty();
         }
         assert_eq!(g.unique_grant_calls.len(), MAX_GRANT_ATTEMPTS as usize);
         assert!(r.stalled_goods().contains(&195), "parked before the load");
@@ -743,7 +739,6 @@ mod replay {
         g.set_stable(true);
         for _ in 0..50 {
             r.tick(&mut g, TickBudget::default());
-            r.mark_dirty();
         }
         assert_eq!(
             g.unique_grant_calls.len(),
@@ -765,7 +760,6 @@ mod replay {
         // Lose and heal it far more times than the cap would allow if healing counted as an attempt.
         for i in 0..15 {
             g.drop_good(195);
-            r.mark_dirty();
             r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
             assert!(g.has_good(195), "heal {i} must land");
             assert!(
@@ -775,8 +769,9 @@ mod replay {
         }
     }
 
-    /// A stalled good must not hold the reconciler dirty forever: once it is parked, a tick with no
-    /// other work reports converged, so the client stops re-planning and the log stops lying.
+    /// A stalled good must not keep the plan non-empty forever: once it is parked, a tick with no
+    /// other work reports converged, so the log stops lying. (The poll itself never stops — parking
+    /// suppresses the ACTION, not the observation.)
     #[test]
     fn a_stalled_good_lets_the_tick_converge_replay() {
         let mut g = MockGame::stable();
@@ -784,7 +779,6 @@ mod replay {
         let mut r = Reconciler::new(rune_inputs());
         for _ in 0..16 {
             r.tick(&mut g, TickBudget::default());
-            r.mark_dirty();
         }
         let out = r.tick(&mut g, TickBudget::default());
         assert!(
@@ -840,7 +834,6 @@ mod replay {
                 let mut last = TickOutcome::default();
                 for _ in 0..len {
                     last = r.tick(&mut g, TickBudget::default());
-                    r.mark_dirty(); // core.rs re-marks dirty every frame
                 }
                 assert_eq!(
                     g.unique_grant_calls.len() - before,
