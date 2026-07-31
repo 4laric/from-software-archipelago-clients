@@ -364,7 +364,6 @@ pub fn armed_verdict(armed: Identity, room_seed: &str, ap_slot: &str) -> ArmedVe
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,7 +519,10 @@ mod tests {
         const ROOM_A: &str = "58616176906260760086";
         const ROOM_B: &str = "87077892385581357560";
         let armed = identity_hash(ROOM_A, "bobler1");
-        assert_eq!(armed, 0x45d3_5730, "identity_hash drifted from the observed marker");
+        assert_eq!(
+            armed, 0x45d3_5730,
+            "identity_hash drifted from the observed marker"
+        );
         assert_eq!(
             identity_hash(ROOM_B, "bobler1"),
             0x9911_460c,
@@ -528,7 +530,10 @@ mod tests {
         );
         assert_eq!(
             armed_verdict(armed, ROOM_B, "bobler1"),
-            ArmedVerdict::Disarm { armed: 0x45d3_5730, live: 0x9911_460c }
+            ArmedVerdict::Disarm {
+                armed: 0x45d3_5730,
+                live: 0x9911_460c
+            }
         );
     }
 
@@ -538,7 +543,10 @@ mod tests {
     #[test]
     fn a_same_room_reconnect_keeps_the_reconciler_armed() {
         let armed = identity_hash("58616176906260760086", "bobler1");
-        assert_eq!(armed_verdict(armed, "58616176906260760086", "bobler1"), ArmedVerdict::Keep);
+        assert_eq!(
+            armed_verdict(armed, "58616176906260760086", "bobler1"),
+            ArmedVerdict::Keep
+        );
     }
 
     /// The symptom was a SEED change, but the datum is the IDENTITY: a slot change on the same room
@@ -560,16 +568,28 @@ mod tests {
         let armed = identity_hash("A", "slot");
         for (room, slot) in [("A", "slot"), ("B", "slot"), ("A", "other")] {
             let live = identity_hash(room, slot);
-            let init = decide(MarkerRead::Present { identity: armed, watermark: 7 }, live);
+            let init = decide(
+                MarkerRead::Present {
+                    identity: armed,
+                    watermark: 7,
+                },
+                live,
+            );
             match armed_verdict(armed, room, slot) {
                 ArmedVerdict::Keep => {
                     assert_eq!(init, InitDecision::Resume { watermark: 7 }, "{room}/{slot}")
                 }
                 ArmedVerdict::Disarm { armed: a, live: l } => {
-                    assert_eq!(init, InitDecision::Refuse { stored: a, expected: l }, "{room}/{slot}")
+                    assert_eq!(
+                        init,
+                        InitDecision::Refuse {
+                            stored: a,
+                            expected: l
+                        },
+                        "{room}/{slot}"
+                    )
                 }
             }
         }
     }
-
 }
