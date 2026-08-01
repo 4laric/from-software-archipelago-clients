@@ -45,7 +45,12 @@ jobs:
     # once run in CI. Same for the foreign-apworld DEGRADATION tests in region.rs / fogwall.rs,
     # which encode a promise made in writing: an apworld that emits none of our keys must still
     # yield a playable vanilla seed. A promise with no test is a rumour.
-    - run: cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago
+    #
+    # `shared` ADDED 2026-08-01, same lesson one crate over. It was BUILT here and never TESTED,
+    # so its unit tests ran nowhere -- including the 7 in `foreign_blocks.rs`, the module whose
+    # HIT/MISS verdict the FMG CTD diagnosis rests on, and every test in `crash_handler.rs`.
+    # An instrument whose own tests never run is the shape of #244: a gate that reports nothing.
+    - run: cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago -p shared
 
     - run: cargo fmt -- --check
     # RE-ARMED 2026-07-12. eldenring-archipelago had 44 accumulated lints -- the whole backlog of a crate
