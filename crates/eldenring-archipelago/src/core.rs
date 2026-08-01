@@ -1476,6 +1476,13 @@ impl shared::Core for Core {
                 // correct slot_data. (The standalone gated its grace flush the same way.) After
                 // applying, read a sentinel grace back — only latch `done` once it sticks; a false
                 // read-back means it was clobbered, so we log it and retry next tick.
+                // 🛑 DO NOT add an `owns_flags()` gate here for symmetry with the item drain
+                // below. This block is deliberately UNGATED: the unique-start-grants block further
+                // down keys off `(already_flags || did_flags)`, and `already_flags` only ever
+                // latches BECAUSE this runs even when the reconciler owns flags. Gate it and the
+                // physick/whistle/bell grants die silently. (The reconciler's flags class now lands
+                // map/grace flags on the FIRST in-world tick via WorldStability::flags_ready, so
+                // this path is the RECONCILE_APPLY=none fallback, not the timing-critical one.)
                 if !already_flags
                     && has_inv
                     && start_items_settled
