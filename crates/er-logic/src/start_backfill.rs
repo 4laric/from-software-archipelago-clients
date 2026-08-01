@@ -200,6 +200,16 @@ pub enum ScanVerdict {
 #[derive(Debug, Default)]
 pub struct BackfillState {
     attempts: HashMap<i32, u32>,
+    /// Which round each fid last burned an attempt in. `MAX_ATTEMPTS` is meant to bound the number
+    /// of TICKS we keep asking, but `record` is called once per COPY, and repetition in `startItems`
+    /// encodes quantity -- 10 Cracked Pots means ten calls in one tick. Counting per call let a
+    /// 10-copy item burn its whole budget before the first tick ended, so the next tick would declare
+    /// it FAILED after what was really a single round. Observed as a near miss in Alaric's
+    /// 2026-08-01 smoke test: four consecutive rounds of ten grants each, saved only because they
+    /// were all `NotReady` (which deliberately burns nothing) while the inventory pointer re-primed
+    /// after a world edge. Had they been `Capped`, the pots would have been declared undeliverable.
+    last_round: HashMap<i32, u64>,
+    round: u64,
     prev_snapshot: Option<HashSet<u32>>,
     /// Items delivered AND confirmed present by a later snapshot — the only ones we may report.
     confirmed: Vec<i32>,
@@ -222,6 +232,7 @@ impl BackfillState {
             return ScanVerdict::Unsettled;
         }
 
+        self.round += 1;
         let missing = missing_start_items(present, start_items);
         if missing.is_empty() {
             return ScanVerdict::Converged;
@@ -247,6 +258,11 @@ impl BackfillState {
         if outcome == GrantOutcome::NotReady {
             return; // nothing was attempted -- do not burn an attempt on a pointer that wasn't up
         }
+        // ONE attempt per fid per ROUND, however many copies were asked for. See `last_round`.
+        if self.last_round.get(&fid) == Some(&self.round) {
+            return;
+        }
+        self.last_round.insert(fid, self.round);
         *self.attempts.entry(fid).or_insert(0) += 1;
     }
 
@@ -368,6 +384,36 @@ mod honesty_tests {
         assert!(st.unconfirmed().is_empty());
         st.observe(&after, &[POT]);
         assert_eq!(st.observe(&after, &[POT]), ScanVerdict::Converged);
+    }
+
+    /// A repeated start item (10 Cracked Pots = ten calls in ONE tick) must burn ONE attempt, not
+    /// ten. Counting per call gave a 10-copy item less than a single round of retries before it was
+    /// declared FAILED. Alaric's 2026-08-01 smoke test came within one outcome of hitting this.
+    #[test]
+    fn quantity_does_not_burn_the_retry_budget() {
+        let mut st = BackfillState::new();
+        let bag = snap(&[LANTERN]);
+        st.observe(&bag, &[POT; 10]);
+        for round in 1..=MAX_ATTEMPTS {
+            match st.observe(&bag, &[POT; 10]) {
+                ScanVerdict::Grant(fids) => {
+                    assert_eq!(
+                        fids.len(),
+                        10,
+                        "all ten copies are still owed on round {round}"
+                    );
+                    for f in fids {
+                        st.record(f, GrantOutcome::Capped); // accepted, never lands
+                    }
+                }
+                other => panic!("round {round} must still be retryable, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            st.observe(&bag, &[POT; 10]),
+            ScanVerdict::Exhausted(vec![POT]),
+            "and only AFTER MAX_ATTEMPTS full rounds is it declared failed"
+        );
     }
 
     /// A not-ready inventory pointer must not burn an attempt -- otherwise three load-screen ticks
