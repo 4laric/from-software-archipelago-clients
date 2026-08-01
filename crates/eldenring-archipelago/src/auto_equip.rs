@@ -98,10 +98,10 @@ pub fn enqueue(full_id: i32) {
     if !ENABLED.load(Ordering::Relaxed) || er_logic::auto_equip::equipable(full_id).is_none() {
         return;
     }
-    if let Ok(mut q) = PENDING.lock() {
-        if !q.contains(&full_id) {
-            q.push(full_id);
-        }
+    if let Ok(mut q) = PENDING.lock()
+        && !q.contains(&full_id)
+    {
+        q.push(full_id);
     }
 }
 
