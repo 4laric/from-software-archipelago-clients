@@ -1,6 +1,6 @@
 //! `region_lock_replay` — headless timeline replay for the region-lock BLOOM reconcile.
 //!
-//! Twin of [`crate::start_grant_replay`], for the next timing bug. Receiving a `<Region> Lock` item
+//! Twin of [`crate::start_backfill`], for the next timing bug. Receiving a `<Region> Lock` item
 //! should "bloom" the region — set its warp-unlock GRACES + the region open flag + reveal flags. The
 //! Windows bloom pass (`eldenring-ap` `region.rs`, `bloom_regions`) latches on the OPEN FLAG alone:
 //! `if flags::get_event_flag(open_flag) { continue; }` (region.rs:143). When a region's front-door

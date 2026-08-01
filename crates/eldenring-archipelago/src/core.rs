@@ -89,11 +89,6 @@ pub struct Core {
     /// Start-of-run grants (items / graces / map reveal).
     start: Option<crate::startgrants::StartConfig>,
     start_flags_done: bool,
-    /// Persisted (SaveState): start items granted once for this save.
-    start_items_granted: bool,
-    /// Session-scoped (R11, SWEEP): indices into start_items that verifiably granted -- only the
-    /// failed ones re-attempt; `start_items_granted` latches once ALL have landed.
-    start_items_ok: HashSet<usize>,
     /// Session-scoped tidy-latch for `uniqueStartGrants` entries that have been DECIDED this
     /// session (granted-or-skipped). Deliberately NOT persisted: the obtained-FLAG is the single
     /// source of truth for "has it" (er_logic::unique_grants) -- this set only stops re-deciding
@@ -453,8 +448,6 @@ impl shared::Core for Core {
             flag_poll_baseline_done: false,
             start: None,
             start_flags_done: false,
-            start_items_granted: false,
-            start_items_ok: HashSet::new(),
             unique_grants_ok: HashSet::new(),
             unique_grants_done: false,
             in_world_since: None,
@@ -772,8 +765,9 @@ impl shared::Core for Core {
                     crate::flagpoll::parse_sweep_flags(sd),
                 );
                 let start = crate::startgrants::parse(sd);
-                // Inventory-verified backfill: hand the same startItems to the backstop that grants
-                // any that a stale `start_items_granted` boolean skipped (see start_item_backfill).
+                // POSSESSION DEDUP (#267): hand the startItems to the convergence loop that now OWNS
+                // plain start-item delivery -- it grants whatever is absent from the bag and stops
+                // when a fresh scan finds nothing missing.
                 crate::start_item_backfill::set_start_items(start.start_items.clone());
                 if start.unique_start_grants.is_empty() {
                     log::info!("unique start grants: inert (no uniqueStartGrants in slot_data)");
@@ -1381,13 +1375,8 @@ impl shared::Core for Core {
                         .collect(),
                     st.progressive_high_index,
                 );
-                // NOTE(I3, 2026-08-01): this latch IS the (seed, slot)-keyed inheritance that
-                // denies a NEW character its start items. It is NOT removed here: `start_items_ok`
-                // is in-memory only, so this boolean is the plain drain's ONLY cross-session dedup,
-                // and clearing it re-grants every start item each session in exactly the configs
-                // where the drain is the sole path (RECONCILE_APPLY=flags/none, and the unarmed
-                // sessions I3 just handed back to it). Needs a per-character key, not a deletion.
-                self.start_items_granted = st.start_items_granted;
+                // `start_items_granted` is GONE (#267): possession is the dedup now, so there is
+                // no per-character key to get wrong and nothing to inherit from a previous character.
                 // Reuse the once-captured fresh-save baseline ACROSS reconnects
                 // (gf-flagpoll-newsave-default-flags / "picked it up, got nothing"):
                 // re-snapshotting the progressed save would fold mid-session pickups into the
@@ -1429,7 +1418,6 @@ impl shared::Core for Core {
         //     items (Torrent etc.) once per save (persisted), gated on a captured inventory pointer.
         if self.slot_data_parsed {
             let already_flags = self.start_flags_done;
-            let already_items = self.start_items_granted;
             // Same in_world tightening as can_grant (SWEEP H3): the inventory pointer never
             // resets on quit-to-menu, so menu-time start grants would write through a stale one.
             // I3 FIX (a): a refused save must not receive start grants either (see `can_grant`).
@@ -1468,7 +1456,6 @@ impl shared::Core for Core {
                     .in_world_since
                     .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(8));
             let mut did_flags = false;
-            let mut did_items = false;
             if let Some(sc) = self.start.as_ref() {
                 // Gate start FLAGS on a loaded world (has_inventory), not just CSEventFlagMan being
                 // up: setting grace/map flags during the load screen lets the subsequent save-data
@@ -1498,39 +1485,16 @@ impl shared::Core for Core {
                         );
                     }
                 }
-                // R11 (SWEEP): `.all(grant_full_id)` re-granted already-succeeded items on a
-                // partial failure next tick (duplicates). Track per-item success (by index,
-                // session-scoped) so only the FAILED ones re-attempt; latch once all landed.
-                // STRANGLER: start items are folded into `build_desired_inputs`, now SPLIT across two
-                // reconciler classes — GOODS-category start items are presence-diffed unique goods
-                // (owned with `goods`), non-goods ones stay ledgered at the negative
-                // START_ITEM_INDEX_BASE band (owned with `ledger`). So this old drain must stand down
-                // whenever the reconciler owns EITHER of those classes, or it would race/double-grant
-                // the class the reconciler already handles. Runtime-revertible: drop both `goods` and
-                // `ledger` from RECONCILE_APPLY (e.g. RECONCILE_APPLY=flags or =none) and the drain runs
-                // again as the sole start-item path.
-                if !crate::reconcile_io::owns_goods()
-                    && !crate::reconcile_io::owns_ledger()
-                    && !already_items
-                    && has_inv
-                    && start_items_settled
-                {
-                    let mut all_ok = true;
-                    for (i, &id) in sc.start_items.iter().enumerate() {
-                        if self.start_items_ok.contains(&i) {
-                            continue;
-                        }
-                        if crate::detour::grant_full_id(id, 1) {
-                            self.start_items_ok.insert(i);
-                        } else {
-                            all_ok = false;
-                            warn_start_item_fail_once(i, id);
-                        }
-                    }
-                    if all_ok {
-                        did_items = true;
-                    }
-                }
+                // PLAIN START ITEMS are delivered by the reconciler's start-item ledger and
+                // reconciled by `start_item_backfill`, whose dedup is POSSESSION (#267). The old
+                // boolean-gated drain that lived here is DELETED: `start_items_granted` was keyed
+                // (room seed, AP slot) with no character component, so a new character on a used
+                // slot inherited "already granted" and got nothing. Both of the drain's motivating
+                // bugs are re-homed onto the convergence loop and are strictly stronger there --
+                // see `er_logic::start_backfill`'s `flask_dedup_survives_a_reload_via_the_bag_replay`
+                // (the bag survives a reload; a boolean's absence does not) and
+                // `a_clobbered_start_item_is_re_granted_not_lost_replay` (the Torch clobber is now
+                // DETECTED and healed rather than avoided with a timer).
                 // UNIQUE start grants (slot_data `uniqueStartGrants`, [[fullId, obtainedFlag]]):
                 // grant the goods ONLY if the obtained-flag is unset, then set the flag WITH the
                 // grant. The flag is the single source of truth for "has it" (the game itself
@@ -1607,11 +1571,6 @@ impl shared::Core for Core {
                         sc.reveal_all_maps
                     );
                 }
-            }
-            if did_items {
-                self.start_items_granted = true;
-                log::info!("start items granted");
-                self.write_save();
             }
         }
 
@@ -2887,10 +2846,11 @@ impl shared::Core for Core {
             }
         }
 
-        // Inventory-verified startItems backstop: after the world has SETTLED (so the reconciler /
-        // drain have had their pass), grant any startItems still absent from the bag (self-latches
-        // once done). Gated on settle, NOT on `start_items_granted` -- that boolean never latches
-        // when the reconciler owns goods (apply=...,goods,...), so the flask slipped through.
+        // START-ITEM DELIVERY, reconciled against the BAG (#267). After the world has SETTLED (so
+        // the reconciler's ledger has had its pass), grant any startItems still absent and keep
+        // going until a fresh scan finds nothing missing. Possession is the dedup: it is
+        // per-character for free, cannot be inherited by a new character on a used slot, and cannot
+        // go stale the way the deleted `start_items_granted` boolean did.
         let start_backfill_settled = crate::detour::real_pickup_seen()
             || self
                 .in_world_since
@@ -3103,8 +3063,6 @@ impl Core {
         self.flag_poll_baseline_done = false;
         self.start = None;
         self.start_flags_done = false;
-        self.start_items_granted = false;
-        self.start_items_ok.clear();
         self.unique_grants_ok.clear();
         self.unique_grants_done = false;
         self.in_world_since = None;
@@ -3538,7 +3496,6 @@ impl Core {
         let (counter, high) = self.progressive.snapshot();
         let st = SaveState {
             last_received_index: self.received_through as i64,
-            start_items_granted: self.start_items_granted,
             flag_poll_baseline: self.flag_poll_baseline.iter().copied().collect(),
             notify_granted: Default::default(),
             progressive_counter: counter.into_iter().collect::<BTreeMap<_, _>>(),
@@ -3562,24 +3519,6 @@ impl Core {
     }
 }
 
-/// R5 (SWEEP): one warning per unmapped AP item id -- the grant loop would otherwise drop the
-/// item with no trace, every session, on every replay.
-static START_ITEM_FAIL_LOGGED: std::sync::Mutex<Option<HashSet<usize>>> =
-    std::sync::Mutex::new(None);
-
-/// Fail-loud (once per start-item index) when a start grant does not land despite a captured
-/// inventory pointer. The start-items loop retries every tick, so without this a stuck grant
-/// (Torrent / dlc_only flasks) is silent. Mirrors `warn_unmapped_once`.
-fn warn_start_item_fail_once(idx: usize, full_id: i32) {
-    let mut guard = START_ITEM_FAIL_LOGGED.lock().unwrap();
-    if guard.get_or_insert_with(HashSet::new).insert(idx) {
-        log::warn!(
-            "start item #{idx} ({full_id:#x}) failed to grant (inventory captured but AddItem \
-             rejected) -- retrying each tick; if this persists the start grant is stuck"
-        );
-    }
-}
-
 static UNIQUE_GRANT_FAIL_LOGGED: std::sync::Mutex<Option<HashSet<usize>>> =
     std::sync::Mutex::new(None);
 
@@ -3595,6 +3534,9 @@ fn warn_unique_grant_fail_once(idx: usize, full_id: i32) {
     }
 }
 
+/// R5 (SWEEP): one warning per unmapped AP item id -- the grant loop would otherwise drop the
+/// item with no trace, every session, on every replay. (Doc re-attached to the static it actually
+/// describes; it had drifted one static too high, onto the now-deleted START_ITEM_FAIL_LOGGED.)
 static UNMAPPED_LOGGED: std::sync::Mutex<Option<HashSet<i64>>> = std::sync::Mutex::new(None);
 
 fn warn_unmapped_once(name: &str, ap_id: i64) {

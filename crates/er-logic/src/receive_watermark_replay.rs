@@ -1,6 +1,6 @@
 //! `receive_watermark_replay` — headless multi-connect replay for the RECEIVE two-watermark split.
 //!
-//! Twin of [`crate::start_grant_replay`] / [`crate::region_lock_replay`], for the reconnect-safety
+//! Twin of [`crate::start_backfill`] / [`crate::region_lock_replay`], for the reconnect-safety
 //! invariant that lives in [`crate::receive`]. The single-connect decision core (name-dispatch vs
 //! grant-enqueue, the `AlreadyPushed` short-circuit) is already host-tested inside `receive.rs`; what
 //! had no test is the state that only shows up ACROSS CONNECTS: the two watermarks

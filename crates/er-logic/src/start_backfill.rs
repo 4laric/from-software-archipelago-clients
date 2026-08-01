@@ -21,6 +21,20 @@
 
 use std::collections::HashSet;
 
+/// Continuous in-world dwell after which the inventory is trusted without a real pickup.
+///
+/// REHOMED from the deleted `start_grant_replay` (#267). The gate itself is unchanged and still
+/// needed -- it guards start FLAGS and the unique start grants, and it is the settle the backfill
+/// waits out before its first scan. Only the DRAIN it was written for is gone.
+pub const START_ITEM_SETTLE_MS: u64 = 8_000;
+
+/// The inventory is SETTLED once the game has driven a real `AddItem` (`real_pickup_seen` -- proof
+/// the save / new-game bulk load replace is done) OR we have been continuously in-world at least
+/// [`START_ITEM_SETTLE_MS`] (the fallback when the player triggers no pickup).
+pub fn start_items_settled(real_pickup_seen: bool, in_world_ms: u64) -> bool {
+    real_pickup_seen || in_world_ms >= START_ITEM_SETTLE_MS
+}
+
 const CATEGORY_GOODS: u32 = 0x4000_0000;
 const CATEGORY_MASK: u32 = 0xF000_0000;
 const ROW_MASK: u32 = 0x0FFF_FFFF;
@@ -67,6 +81,17 @@ mod tests {
     const FLASK_HP: i32 = (CATEGORY_GOODS | 1001) as i32; // charged crimson
     const FLASK_HP_EMPTY: u32 = CATEGORY_GOODS | 1000; // empty crimson
     const WEAPON_X: i32 = 0x0000_2710; // weapon row 10000
+
+    #[test]
+    fn settle_needs_a_real_pickup_or_the_dwell() {
+        assert!(!start_items_settled(false, 0));
+        assert!(!start_items_settled(false, START_ITEM_SETTLE_MS - 1));
+        assert!(start_items_settled(false, START_ITEM_SETTLE_MS));
+        assert!(
+            start_items_settled(true, 0),
+            "a real pickup proves the bulk load is done -- no need to wait out the dwell"
+        );
+    }
 
     #[test]
     fn absent_items_are_returned_present_ones_dropped() {

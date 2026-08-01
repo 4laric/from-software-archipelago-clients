@@ -1,6 +1,6 @@
 //! `flagpoll_baseline_replay` — headless timeline replay for the flag-poll CONNECT BASELINE.
 //!
-//! Sibling of [`crate::start_grant_replay`] / [`crate::region_lock_replay`], for the next timing
+//! Sibling of [`crate::start_backfill`] / [`crate::region_lock_replay`], for the next timing
 //! bug. The client's flag-poll fires a location CHECK whenever a watched acquisition flag reads
 //! SET — i.e. on a LEVEL, not a TRANSITION. On a FRESH save some acquisition flags are already set
 //! by default (Flask of Crimson Tears = 60000, Wondrous Physick = 60020, the Third-Church Sacred

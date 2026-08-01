@@ -770,7 +770,7 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
     //     everything from the ledger floor (its start items AND its received stream). A NEW character
     //     on a slot whose prior character was granted no longer inherits that watermark.
     //   * entry present, live play_time >= the stamp -> RESUME from its watermark (a same-character
-    //     reload never re-grants -- flask_grant_replay stays authoritative).
+    //     reload never re-grants -- the possession dedup in start_backfill is authoritative).
     //   * entry present, play_time REWOUND below the stamp -> FRESH (delete+recreate in the slot, or
     //     a restored pre-grant backup).
     // `received_through` is passed through to `seeded` for the positive-frontier cross-check

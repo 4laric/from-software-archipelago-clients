@@ -1,6 +1,6 @@
 //! `upgrades_replay` — headless timeline replay for the auto_upgrade RECONNECT GRANT-BURST.
 //!
-//! Sibling of [`crate::start_grant_replay`] / [`crate::flask_grant_replay`], for the auto_upgrade
+//! Sibling of [`crate::start_backfill`], for the auto_upgrade
 //! feature. The decision itself is already pure + unit-tested in [`crate::upgrades`]
 //! (`apply_auto_upgrade(hook, on, full_id)`: raise-only, cap-clamped, identity when off / off-world
 //! / non-weapon / unresolvable). Those tests fire ONE call. This module adds the dimension they

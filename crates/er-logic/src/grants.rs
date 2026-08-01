@@ -1,4 +1,8 @@
-//! Once-per-save grant drains, extracted from `features.rs` `drain_start_items` / `drain_notify_grants`.
+//! Once-per-save grant drains, extracted from `features.rs` `drain_notify_grants`.
+//!
+//! `drain_start_items` was DELETED 2026-08-01 (#267): its dedup was the persisted, character-less
+//! `start_items_granted` boolean. Plain start items are now delivered by the reconciler ledger and
+//! reconciled against the BAG by `crate::start_backfill`, whose dedup is possession.
 //! The persisted guards live on a passed-in [`SaveState`] (the live code keeps them as `grant.rs`
 //! statics) so tests get fresh state.
 
@@ -6,31 +10,6 @@ use crate::hook::GameHook;
 use crate::save_state::SaveState;
 use std::collections::VecDeque;
 
-/// Grant the start-items queue exactly once per save. If already granted, clear the queue. If any
-/// grant can't place (no inventory pointer yet), abort the whole tick with NO state change (retry).
-pub fn drain_start_items(
-    hook: &mut dyn GameHook,
-    queue: &mut VecDeque<(i32, i32)>,
-    save: &mut SaveState,
-) {
-    if queue.is_empty() {
-        return;
-    }
-    if save.start_items_granted {
-        queue.clear();
-        return;
-    }
-    let snapshot: Vec<(i32, i32)> = queue.iter().copied().collect();
-    for &(id, qty) in &snapshot {
-        if !hook.grant_full_id(id, qty) {
-            return; // not ready -> retry next tick, no partial state
-        }
-    }
-    queue.clear();
-    save.start_items_granted = true;
-}
-
-/// Grant each notify item once per save (dedup via `save.notify_granted`); requeue ones that can't
 /// place yet.
 pub fn drain_notify_grants(
     hook: &mut dyn GameHook,
@@ -56,36 +35,11 @@ mod tests {
     use super::*;
     use crate::hook::fake::FakeGame;
 
-    #[test]
-    fn start_items_granted_once_then_not_regranted() {
-        let mut g = FakeGame::new();
-        let mut save = SaveState::default();
-        let mut q: VecDeque<(i32, i32)> = [(130, 1), (2008021, 5)].into_iter().collect();
-
-        drain_start_items(&mut g, &mut q, &mut save);
-        assert_eq!(g.grants, vec![(130, 1), (2008021, 5)]);
-        assert!(save.start_items_granted);
-        assert!(q.is_empty());
-
-        // Replay re-queues on reconnect; the persisted flag drops it.
-        let mut q2: VecDeque<(i32, i32)> = [(130, 1)].into_iter().collect();
-        drain_start_items(&mut g, &mut q2, &mut save);
-        assert_eq!(g.grants, vec![(130, 1), (2008021, 5)]); // unchanged
-        assert!(q2.is_empty());
-    }
-
-    #[test]
-    fn start_items_no_inventory_keeps_whole_queue() {
-        let mut g = FakeGame::new();
-        g.set_inventory_ready(false);
-        let mut save = SaveState::default();
-        let mut q: VecDeque<(i32, i32)> = [(130, 1), (2008021, 5)].into_iter().collect();
-
-        drain_start_items(&mut g, &mut q, &mut save);
-        assert!(g.grants.is_empty());
-        assert!(!save.start_items_granted); // all-or-nothing
-        assert_eq!(q.len(), 2);
-    }
+    // The two start-item drain tests were deleted with the drain (#267). Their cases have honest
+    // homes on the possession-dedup convergence loop, in `crate::start_backfill`:
+    //   * "granted once, not re-granted on reconnect"  -> flask_dedup_survives_a_reload_via_the_bag_replay
+    //   * "no inventory keeps the whole queue"         -> not_ready_does_not_consume_an_attempt
+    // Both are stronger there: the bag cannot go stale, and a NotReady tick cannot burn an attempt.
 
     #[test]
     fn notify_granted_once_then_dedup() {
