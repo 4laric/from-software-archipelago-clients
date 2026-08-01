@@ -198,12 +198,15 @@ pub fn blessing_target(mode: i32, frag_qty: i32, floor: i32) -> Option<i32> {
 /// must be called directly with synthetic input, not assumed covered") and which shipped uncovered
 /// anyway.
 ///
-/// 🛑 ONE RULE, FOUR SITES. `hp <= 0` is also implemented inline in `no_equip_load.rs` and
-/// `deathlink.rs`, and as [`crate::scaling_settle::sweep_blocked_by_death`] for the enemy sweep.
-/// This makes two of the four testable and leaves two inline; unifying all of them touches
-/// Windows-only crates and is a follow-up, not something to pretend away here.
+/// 🛑 ONE RULE, ONE IMPLEMENTATION. This delegates to
+/// [`crate::death_guard::lists_unsafe_to_touch`]; it is a NAME at the blessing's call site, not a
+/// second copy. I first wrote this as its own `hp <= 0` and documented "four sites" -- the real
+/// count was FIVE (`no_equip_load`, `no_fall_damage`, `scaling`, this, plus DeathLink's two
+/// unrelated uses), which is how a miscount in a comment becomes folklore.
+///
+/// DeathLink's `hp <= 0` tests are deliberately NOT unified -- see `death_guard`'s module docs.
 pub fn blessing_blocked_by_death(player_hp: i32) -> bool {
-    player_hp <= 0
+    crate::death_guard::lists_unsafe_to_touch(player_hp)
 }
 
 /// The rates to write this tick, or `None` if the applier must not write at all.

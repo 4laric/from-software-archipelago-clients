@@ -77,10 +77,10 @@ pub fn tick() {
     let Some(player) = wcm.main_player.as_mut() else {
         return;
     };
-    // DEATH GUARD: the player's chr_ins + special_effect list tear down at the death-cam transition;
-    // iterating/mutating them there CTDs. hp <= 0 = dead/dying -> skip until respawn (the apply
-    // re-runs once hp > 0). Reading hp here is the same access DeathLink's read_local_hp does safely.
-    if player.chr_ins.modules.data.hp <= 0 {
+    // DEATH GUARD -- THE canonical predicate, not a private copy. This module is where the CTD
+    // was first observed (archipelago20260719 Copy 2.log); the rule now lives once in
+    // er_logic::death_guard. Reading hp here is the same access DeathLink's read_local_hp does.
+    if er_logic::death_guard::lists_unsafe_to_touch(player.chr_ins.modules.data.hp) {
         return;
     }
     let chr = &mut player.chr_ins;

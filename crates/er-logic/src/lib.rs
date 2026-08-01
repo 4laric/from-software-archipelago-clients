@@ -21,6 +21,7 @@ pub mod check_neutralise;
 pub mod client_features;
 pub mod config_reload;
 pub mod config_reload_replay;
+pub mod death_guard;
 pub mod deathlink;
 pub mod deathlink_gate_replay;
 pub mod fast_travel;

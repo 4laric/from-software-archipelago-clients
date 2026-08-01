@@ -79,7 +79,7 @@ pub fn tick() {
     // DEATH GUARD: the player's chr_ins + special_effect list tear down at the death-cam transition;
     // iterating/mutating them there CTDs. hp <= 0 = dead/dying -> skip until respawn (the apply
     // re-runs once hp > 0). Reading hp here is the same access DeathLink's read_local_hp does safely.
-    if player.chr_ins.modules.data.hp <= 0 {
+    if er_logic::death_guard::lists_unsafe_to_touch(player.chr_ins.modules.data.hp) {
         return;
     }
     let chr = &mut player.chr_ins;

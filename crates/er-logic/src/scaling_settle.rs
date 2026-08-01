@@ -195,8 +195,12 @@ impl SweepGate {
 /// `scaling.rs::tick`, reading hp exactly as DeathLink's `read_local_hp` does (the read the
 /// three existing guards already trust). Worst case of a false positive is the documented
 /// degrade: enemies keep their current tier for the seconds the player is dead.
+///
+/// 🛑 Kept as a NAME, not a second implementation: the rule lives once in
+/// [`crate::death_guard::lists_unsafe_to_touch`]. Five modules grew private copies of `hp <= 0`
+/// before anyone counted them.
 pub fn sweep_blocked_by_death(player_hp: i32) -> bool {
-    player_hp <= 0
+    crate::death_guard::lists_unsafe_to_touch(player_hp)
 }
 
 #[cfg(test)]
