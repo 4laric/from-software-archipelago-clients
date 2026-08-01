@@ -118,3 +118,263 @@ mod tests {
         assert!(missing_start_items(&HashSet::new(), &[]).is_empty());
     }
 }
+
+// =================================================================================================
+// HONESTY + CONVERGENCE (#248, 2026-08-01)
+// =================================================================================================
+//
+// The backfill reported items it had not delivered. Two layers, both by design elsewhere:
+//
+//   (a) `detour::grant_full_id` returns TRUE for a pot grant capped to zero ("At/over the cap we
+//       report success"). That is CORRECT for the ledger watermark -- the item is as delivered as it
+//       will ever be -- and catastrophic for a VERIFIER, which must not count it.
+//   (b) the settle gate admits a PARTIALLY POPULATED inventory, so absences were read off a bag that
+//       was still filling (the 17-id scan that declared 32/35 absent).
+//
+// Plus the caller latched DONE unconditionally, so hard failures were never retried.
+//
+// The property this module now enforces:
+//
+//   **The backfill never reports an item delivered unless a subsequent snapshot contains it.**
+//
+// Nothing here talks to the game; the client feeds it snapshots and outcomes.
+
+use std::collections::HashMap;
+
+/// What one grant attempt actually achieved — the distinction `grant_full_id`'s `bool` cannot carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantOutcome {
+    /// The item entered the bag. The ONLY outcome that may be reported as delivered.
+    Placed,
+    /// The call succeeded but the game capped the quantity to zero (pot delivery caps). The ledger
+    /// counts this as delivered; the verifier must NOT.
+    Capped,
+    /// Inventory pointer not ready — nothing happened, retry.
+    NotReady,
+}
+
+/// How many times one FullID may be attempted before it is declared FAILED. Mirrors the grant
+/// stall guard's `MAX_GRANT_ATTEMPTS`: bound the flood, never abandon silently.
+pub const MAX_ATTEMPTS: u32 = 3;
+
+/// What the caller should do this tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanVerdict {
+    /// The snapshot is not trustworthy yet (empty, or it disagrees with the previous tick). Do
+    /// nothing and do NOT latch — this is the guard against reading absences off a filling bag.
+    Unsettled,
+    /// Every start item is accounted for. Latch DONE and report converged.
+    Converged,
+    /// Attempt these FullIDs (repetition preserved = quantity).
+    Grant(Vec<i32>),
+    /// Nothing left that may be retried, and these never landed. Latch DONE and warn LOUDLY.
+    Exhausted(Vec<i32>),
+}
+
+/// Cross-tick bookkeeping for the convergence loop.
+#[derive(Debug, Default)]
+pub struct BackfillState {
+    attempts: HashMap<i32, u32>,
+    prev_snapshot: Option<HashSet<u32>>,
+    /// Items delivered AND confirmed present by a later snapshot — the only ones we may report.
+    confirmed: Vec<i32>,
+}
+
+impl BackfillState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decide what to do given this tick's inventory snapshot.
+    ///
+    /// TWO-TICK AGREEMENT: a snapshot is only trusted once an identical, non-empty snapshot was seen
+    /// on the previous tick. A bag that is still filling changes between ticks, so it can never
+    /// satisfy this — which is precisely the 17-id false-absence class.
+    pub fn observe(&mut self, present: &HashSet<u32>, start_items: &[i32]) -> ScanVerdict {
+        let agreed = !present.is_empty() && self.prev_snapshot.as_ref() == Some(present);
+        self.prev_snapshot = Some(present.clone());
+        if !agreed {
+            return ScanVerdict::Unsettled;
+        }
+
+        let missing = missing_start_items(present, start_items);
+        if missing.is_empty() {
+            return ScanVerdict::Converged;
+        }
+        let retryable: Vec<i32> = missing
+            .iter()
+            .copied()
+            .filter(|f| self.attempts.get(f).copied().unwrap_or(0) < MAX_ATTEMPTS)
+            .collect();
+        if retryable.is_empty() {
+            // Deduplicate for the warn: the player wants the ids, not the multiplicity.
+            let mut failed = missing;
+            failed.sort_unstable();
+            failed.dedup();
+            return ScanVerdict::Exhausted(failed);
+        }
+        ScanVerdict::Grant(retryable)
+    }
+
+    /// Record what an attempt achieved. `Capped` and `NotReady` are NOT deliveries; only a later
+    /// snapshot showing the item present makes it one (see [`Self::confirm`]).
+    pub fn record(&mut self, fid: i32, outcome: GrantOutcome) {
+        if outcome == GrantOutcome::NotReady {
+            return; // nothing was attempted -- do not burn an attempt on a pointer that wasn't up
+        }
+        *self.attempts.entry(fid).or_insert(0) += 1;
+    }
+
+    /// Fold the NEXT snapshot into the delivered set: an item we attempted and can now SEE is
+    /// delivered; one we attempted and still cannot see is not, whatever the call returned.
+    pub fn confirm(&mut self, present: &HashSet<u32>) {
+        for (&fid, _) in self.attempts.iter() {
+            if present.contains(&(fid as u32)) && !self.confirmed.contains(&fid) {
+                self.confirmed.push(fid);
+            }
+        }
+    }
+
+    /// The count we are entitled to report as granted. Bag-verified, never call-verified.
+    pub fn confirmed_count(&self) -> usize {
+        self.confirmed.len()
+    }
+
+    /// FullIDs attempted at least once that no snapshot has ever confirmed.
+    pub fn unconfirmed(&self) -> Vec<i32> {
+        let mut v: Vec<i32> = self
+            .attempts
+            .keys()
+            .copied()
+            .filter(|f| !self.confirmed.contains(f))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+#[cfg(test)]
+mod honesty_tests {
+    use super::*;
+
+    const POT: i32 = (CATEGORY_GOODS | 2000) as i32;
+    const LANTERN: i32 = (CATEGORY_GOODS | 2001) as i32;
+
+    fn snap(ids: &[i32]) -> HashSet<u32> {
+        ids.iter().map(|&i| i as u32).collect()
+    }
+
+    /// A filling bag changes between ticks, so it never earns agreement -- the 17-id false-absence
+    /// class cannot happen.
+    #[test]
+    fn a_changing_snapshot_is_never_acted_on() {
+        let mut st = BackfillState::new();
+        assert_eq!(
+            st.observe(&snap(&[LANTERN]), &[POT]),
+            ScanVerdict::Unsettled
+        );
+        assert_eq!(
+            st.observe(&snap(&[LANTERN, POT]), &[POT]),
+            ScanVerdict::Unsettled,
+            "the bag changed -- still filling, still not trustworthy"
+        );
+        // Now it holds still.
+        assert_eq!(
+            st.observe(&snap(&[LANTERN, POT]), &[POT]),
+            ScanVerdict::Converged
+        );
+    }
+
+    #[test]
+    fn an_empty_snapshot_is_never_acted_on() {
+        let mut st = BackfillState::new();
+        assert_eq!(st.observe(&HashSet::new(), &[POT]), ScanVerdict::Unsettled);
+        assert_eq!(st.observe(&HashSet::new(), &[POT]), ScanVerdict::Unsettled);
+    }
+
+    /// THE #248 ACCEPTANCE TEST (Rule 11: the motivating case IS the test).
+    ///
+    /// A hook that ACCEPTS every call but never adds the item -- exactly what a capped-to-zero pot
+    /// grant looks like -- must report ZERO granted and name the item as FAILED. The old code
+    /// reported `granted 22/32` in this situation.
+    #[test]
+    fn a_grant_that_accepts_but_never_places_reports_zero_and_fails_loudly() {
+        let mut st = BackfillState::new();
+        let bag = snap(&[LANTERN]); // POT never arrives, no matter how often we ask
+
+        let mut verdicts = Vec::new();
+        for _ in 0..8 {
+            let v = st.observe(&bag, &[POT]);
+            if let ScanVerdict::Grant(ref fids) = v {
+                for &f in fids {
+                    // The game says "sure" and does nothing. This is the whole bug.
+                    st.record(f, GrantOutcome::Capped);
+                }
+            }
+            st.confirm(&bag);
+            verdicts.push(v);
+        }
+
+        assert_eq!(
+            st.confirmed_count(),
+            0,
+            "NOTHING was delivered -- reporting any non-zero count is the #248 lie"
+        );
+        assert_eq!(st.unconfirmed(), vec![POT]);
+        assert!(
+            verdicts.contains(&ScanVerdict::Exhausted(vec![POT])),
+            "after MAX_ATTEMPTS the item must be declared FAILED, not silently dropped: {verdicts:?}"
+        );
+    }
+
+    /// The honest success path: the item actually lands and IS reported.
+    #[test]
+    fn a_grant_that_places_is_confirmed_by_the_next_snapshot() {
+        let mut st = BackfillState::new();
+        let before = snap(&[LANTERN]);
+        st.observe(&before, &[POT]);
+        let v = st.observe(&before, &[POT]);
+        assert_eq!(v, ScanVerdict::Grant(vec![POT]));
+        st.record(POT, GrantOutcome::Placed);
+
+        let after = snap(&[LANTERN, POT]);
+        st.confirm(&after);
+        assert_eq!(st.confirmed_count(), 1);
+        assert!(st.unconfirmed().is_empty());
+        st.observe(&after, &[POT]);
+        assert_eq!(st.observe(&after, &[POT]), ScanVerdict::Converged);
+    }
+
+    /// A not-ready inventory pointer must not burn an attempt -- otherwise three load-screen ticks
+    /// would exhaust an item that was never actually asked for.
+    #[test]
+    fn not_ready_does_not_consume_an_attempt() {
+        let mut st = BackfillState::new();
+        let bag = snap(&[LANTERN]);
+        st.observe(&bag, &[POT]);
+        for _ in 0..10 {
+            if let ScanVerdict::Grant(fids) = st.observe(&bag, &[POT]) {
+                for f in fids {
+                    st.record(f, GrantOutcome::NotReady);
+                }
+            }
+        }
+        assert_eq!(
+            st.observe(&bag, &[POT]),
+            ScanVerdict::Grant(vec![POT]),
+            "still retryable: no real attempt was ever made"
+        );
+    }
+
+    /// A healthy established save: everything already present, so the loop converges on the first
+    /// agreed snapshot and reports zero granted (no re-delivery).
+    #[test]
+    fn healthy_save_converges_with_nothing_granted() {
+        let mut st = BackfillState::new();
+        let bag = snap(&[LANTERN, POT]);
+        st.observe(&bag, &[POT, LANTERN]);
+        assert_eq!(st.observe(&bag, &[POT, LANTERN]), ScanVerdict::Converged);
+        assert_eq!(st.confirmed_count(), 0);
+        assert!(st.unconfirmed().is_empty());
+    }
+}
