@@ -366,6 +366,85 @@ mod honesty_tests {
         );
     }
 
+    // ---- MIGRATED from the drain's replay tier (#267) --------------------------------------
+    //
+    // The drain's dedup was `start_items_granted`, a PERSISTED boolean. Possession replaces it. These
+    // two cases are the drain's motivating bugs, re-homed onto the convergence loop rather than
+    // deleted with it -- and both are STRICTLY STRONGER here, because a bag cannot go stale the way
+    // a boolean can.
+
+    /// FROM `flask_grant_replay` (er-flask-double-grant-reconnect, 2026-07-05). A fresh Grafted Scion
+    /// dies in the tutorial and the game reloads; the drain re-ran and turned a 3+1 flask start into
+    /// 6+2. Its fix was "latch on PERSISTED state, not a session proxy a reload wipes".
+    ///
+    /// Under possession there is no latch to wipe: `BackfillState` is per-LAUNCH and starts empty,
+    /// but the BAG persists, so a relaunch sees the flasks and converges. The dedup survives a reload
+    /// because it never depended on our bookkeeping at all.
+    #[test]
+    fn flask_dedup_survives_a_reload_via_the_bag_replay() {
+        let hp = (CATEGORY_GOODS | 1001) as i32;
+        let fp = (CATEGORY_GOODS | 1051) as i32;
+        let start = [hp, hp, hp, fp]; // 3 heal + 1 FP
+
+        // First launch: empty bag, both flasks granted.
+        let mut st = BackfillState::new();
+        let empty = snap(&[]);
+        st.observe(&empty, &start);
+        assert_eq!(
+            st.observe(&empty, &start),
+            ScanVerdict::Unsettled,
+            "empty bag is never trusted"
+        );
+
+        let bag = snap(&[hp, fp]);
+        st.observe(&bag, &start);
+        assert_eq!(st.observe(&bag, &start), ScanVerdict::Converged);
+
+        // RELOAD: a brand-new state (session latches are gone), same bag.
+        let mut after_reload = BackfillState::new();
+        after_reload.observe(&bag, &start);
+        assert_eq!(
+            after_reload.observe(&bag, &start),
+            ScanVerdict::Converged,
+            "post-reload must grant NOTHING -- 3+1 must not become 6+2"
+        );
+        assert_eq!(after_reload.confirmed_count(), 0);
+    }
+
+    /// FROM `start_grant_replay` (Torch clobber, 2026-07-06). The grant fired during the load screen,
+    /// the bulk inventory load then REPLACED the bag and wiped the Torch, and because the grant had
+    /// latched with no read-back it never retried -- the Torch was gone forever.
+    ///
+    /// The old fix AVOIDED the clobber with a timer. The convergence loop DETECTS and heals it: the
+    /// post-clobber snapshot shows the item absent and it is granted again. That covers a clobber
+    /// landing after any timer would have expired, which the timer never could.
+    #[test]
+    fn a_clobbered_start_item_is_re_granted_not_lost_replay() {
+        let torch = (CATEGORY_GOODS | 2000) as i32;
+        let other = (CATEGORY_GOODS | 2001) as i32;
+        let start = [torch];
+
+        let mut st = BackfillState::new();
+        let pre = snap(&[other]);
+        st.observe(&pre, &start);
+        assert_eq!(st.observe(&pre, &start), ScanVerdict::Grant(vec![torch]));
+        st.record(torch, GrantOutcome::Placed);
+
+        let landed = snap(&[other, torch]);
+        st.confirm(&landed);
+        assert_eq!(st.confirmed_count(), 1);
+
+        // BULK LOAD REPLACES THE BAG: the Torch is gone and nothing told us.
+        let clobbered = snap(&[other]);
+        st.confirm(&clobbered);
+        st.observe(&clobbered, &start);
+        assert_eq!(
+            st.observe(&clobbered, &start),
+            ScanVerdict::Grant(vec![torch]),
+            "the clobber must be SEEN and re-granted -- the old latch lost the Torch forever"
+        );
+    }
+
     /// A healthy established save: everything already present, so the loop converges on the first
     /// agreed snapshot and reports zero granted (no re-delivery).
     #[test]
