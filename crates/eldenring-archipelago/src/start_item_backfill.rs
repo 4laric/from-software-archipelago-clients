@@ -10,20 +10,34 @@
 //! never double-grants), snapshotting the inventory fresh each tick. Inventory verification is the
 //! anti-double-grant guarantee: anything a primary path placed reads as present and is skipped.
 //!
-//! TRADEOFF: an absent start item is re-granted on the next launch. For permanent items (flask,
-//! weapons, key items) that's exactly right. A STACKABLE CONSUMABLE the player used up would refill
-//! on relaunch -- if unwanted, gate this behind a persisted hash of the `startItems` content
-//! (follow-up); today it re-runs per launch by design so a stale boolean can't strand an item.
+//! # DURABLE-ONLY INVARIANT (2026-08-01)
+//!
+//! An absent start item is re-granted on the next launch. That is correct precisely because **every
+//! shipped `startItems` entry is DURABLE**: flasks (the family ranges cover the empty/charged pairs,
+//! so a drained flask still reads present), pot/perfume/hefty vessels (permanent reusable
+//! containers whose count only rises), the lantern, whetblades. Possession is therefore a valid
+//! "already delivered" signal for every one of them, which is what lets this be the start-item
+//! DEDUP rather than a backstop -- and why no per-character key is needed for start items at all.
+//!
+//! 🛑 It would NOT be valid for a stackable consumable the player used up: the bag cannot tell
+//! "never granted" from "granted and consumed" (count the RECEIVED stream, never the bag). The
+//! world side asserts the durable-only invariant so a future consumable start item fails a test
+//! instead of silently becoming a per-launch refill.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eldenring::cs::{GameDataMan, ItemCategory};
+use er_logic::start_backfill::ScanVerdict;
 use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
 
 static START_ITEMS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 static DONE: AtomicBool = AtomicBool::new(false);
+/// Cross-tick convergence bookkeeping (#248). Owns the per-fid attempt counters, the previous
+/// snapshot for the two-tick agreement, and the BAG-CONFIRMED delivered set. All decisions live in
+/// the pure `er_logic::start_backfill`; this module only supplies snapshots and outcomes.
+static STATE: Mutex<Option<er_logic::start_backfill::BackfillState>> = Mutex::new(None);
 
 /// Set from slot_data `startItems` at connect (the same list `startgrants` parses).
 pub fn set_start_items(items: Vec<i32>) {
@@ -31,6 +45,9 @@ pub fn set_start_items(items: Vec<i32>) {
         *g = items;
     }
     DONE.store(false, Ordering::Relaxed);
+    if let Ok(mut st) = STATE.lock() {
+        *st = Some(er_logic::start_backfill::BackfillState::new());
+    }
 }
 
 /// FullID for a held item id: `(category<<28) | row`, matching the `startItems` / `grant_full_id`
@@ -85,6 +102,13 @@ pub fn tick(settled: bool) {
     // backstop's per-launch design.)
     let inv = &pgd.equipment.equip_inventory_data.items_data;
     let mut present: HashSet<u32> = HashSet::new();
+    // Per-list counts, logged with every scan: when a scan reads implausibly small (the 17-id
+    // incident) this says WHICH list came up short, instead of leaving it to be guessed.
+    let counts = (
+        inv.normal_entries().len(),
+        inv.key_entries().len(),
+        inv.multiplay_key_entries().len(),
+    );
     for entry in inv
         .normal_entries()
         .iter()
@@ -103,37 +127,73 @@ pub fn tick(settled: bool) {
         return; // inventory holder not populated yet -- retry next tick (don't latch)
     }
 
-    let missing = er_logic::start_backfill::missing_start_items(&present, &items);
-    // Always log the decision (once, on the settled run) so a "nothing granted" outcome is visible
-    // in diagnosis -- this is the line whose ABSENCE told us the old gate was wrong.
-    log::info!(
-        "start-item backfill: scanned {} inventory id(s), {}/{} startItems absent -> granting {:?}",
-        present.len(),
-        missing.len(),
-        items.len(),
-        missing
-            .iter()
-            .map(|&f| format!("{:#010x}", f as u32))
-            .collect::<Vec<_>>()
-    );
-    if !missing.is_empty() {
-        let mut granted = 0u32;
-        for &fid in &missing {
-            let ok = crate::detour::grant_full_id(fid, 1);
-            if ok {
-                granted += 1;
-            }
-            log::info!(
-                "start-item backfill: grant {:#010x} -> {}",
-                fid as u32,
-                if ok { "ok" } else { "FAILED (not placed)" }
-            );
+    // CONVERGENCE LOOP (#248). The decision is pure; this block is glue.
+    //
+    // The old code scanned once, granted, counted `grant_full_id() == true` as delivered, and
+    // latched DONE unconditionally. All three were wrong: the scan could run against a filling bag
+    // (the 17-id scan), a capped-to-zero pot returns true, and hard failures were never retried.
+    let Ok(mut guard) = STATE.lock() else { return };
+    let st = guard.get_or_insert_with(er_logic::start_backfill::BackfillState::new);
+
+    // Fold this snapshot into the delivered set FIRST: an item we asked for last tick and can now
+    // SEE is delivered. This -- not the grant call's return value -- is what may be reported.
+    st.confirm(&present);
+
+    match st.observe(&present, &items) {
+        ScanVerdict::Unsettled => {
+            // Bag empty or still changing between ticks. Do NOT latch, do NOT read absences off it.
         }
-        log::info!(
-            "start-item backfill: granted {}/{} absent startItems (backstop after reconciler converge)",
-            granted,
-            missing.len()
-        );
+        ScanVerdict::Converged => {
+            log::info!(
+                "start-item backfill: CONVERGED -- all {} startItems present in bag ({} inventory id(s) scanned: {} normal, {} key, {} multiplay). granted {} this session",
+                items.len(),
+                present.len(),
+                counts.0,
+                counts.1,
+                counts.2,
+                st.confirmed_count()
+            );
+            DONE.store(true, Ordering::Relaxed);
+        }
+        ScanVerdict::Grant(missing) => {
+            log::info!(
+                "start-item backfill: {}/{} startItems absent ({} inventory id(s): {} normal, {} key, {} multiplay) -> attempting {:?}",
+                missing.len(),
+                items.len(),
+                present.len(),
+                counts.0,
+                counts.1,
+                counts.2,
+                missing
+                    .iter()
+                    .map(|&f| format!("{:#010x}", f as u32))
+                    .collect::<Vec<_>>()
+            );
+            for &fid in &missing {
+                let outcome = crate::detour::grant_full_id_outcome(fid, 1);
+                st.record(fid, outcome);
+                log::info!(
+                    "start-item backfill: grant {:#010x} -> {outcome:?}",
+                    fid as u32
+                );
+            }
+            // No latch. The NEXT tick's snapshot decides whether any of that actually landed.
+        }
+        ScanVerdict::Exhausted(failed) => {
+            // FAIL LOUD. These were attempted MAX_ATTEMPTS times and no snapshot ever showed them.
+            // The old code's silence here is exactly what produced "granted 22/32".
+            log::warn!(
+                "start-item backfill: FAILED to deliver {} startItem(s) after {} attempts each -- {:?} \
+                 are NOT in the bag and will not be retried this session. If these are pots, the \
+                 delivery cap swallowed them; check the yaml against POT_DELIVERY_CAPS",
+                failed.len(),
+                er_logic::start_backfill::MAX_ATTEMPTS,
+                failed
+                    .iter()
+                    .map(|&f| format!("{:#010x}", f as u32))
+                    .collect::<Vec<_>>()
+            );
+            DONE.store(true, Ordering::Relaxed);
+        }
     }
-    DONE.store(true, Ordering::Relaxed);
 }

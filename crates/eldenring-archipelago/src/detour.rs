@@ -379,21 +379,42 @@ fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
 /// installed or no inventory pointer has been captured yet (no pickup this session) — caller retries.
 /// MUST run on the game thread (the FrameBegin tick / update_live).
 pub fn grant_full_id(full_id: i32, qty: i32) -> bool {
+    !matches!(
+        grant_full_id_outcome(full_id, qty),
+        er_logic::start_backfill::GrantOutcome::NotReady
+    )
+}
+
+/// The same grant, reporting WHAT ACTUALLY HAPPENED (#248, 2026-08-01).
+///
+/// `grant_full_id`'s `bool` conflates two very different successes: the item entered the bag, and
+/// the item was capped to zero and delivered nowhere. That conflation is CORRECT for the ledger --
+/// a capped pot is as delivered as it will ever be, and the watermark must advance past it or the
+/// stream stalls forever -- and it is exactly what let the start-item backfill report `granted
+/// 22/32` for items it had not placed.
+///
+/// So the outcome is split at the source and `grant_full_id` becomes a thin wrapper preserving the
+/// old contract byte for byte (`Placed | Capped -> true`, `NotReady -> false`). Ledger callers keep
+/// the semantics they had; the VERIFIER gets the truth it needs.
+pub fn grant_full_id_outcome(full_id: i32, qty: i32) -> er_logic::start_backfill::GrantOutcome {
+    use er_logic::start_backfill::GrantOutcome;
     if HOOK.get().is_none() {
-        return false;
+        return GrantOutcome::NotReady;
     }
     // Chapel pot-relief guard: defer Cracked Pot grants that would trip m10_01's migration event
     // (phantom checks f66150/f66170). Every caller treats `false` as retry-next-tick, so the
     // stack simply lands a few seconds later, after the event's own latch (10019200) sets.
     if full_id == CRACKED_POT_FULL_ID && !chapel_pot_relief_safe() {
-        return false;
+        return GrantOutcome::NotReady; // deferred, not refused -- caller retries
     }
     // Pot-delivery cap: never let a pot grant push the held count to a mass-phantom-check threshold.
     // At/over the cap we report success (the AP item is delivered as far as the watermark cares) but
     // add no physical pot, so the count can't reach 20/10/10 and fire relief events 6902/6903/6904.
     let qty = pot_capped_qty(full_id, qty);
     if qty <= 0 {
-        return true;
+        // CAPPED: the call "succeeded" and no physical pot was added. Delivered for the watermark,
+        // NOT delivered for anyone verifying against the bag.
+        return GrantOutcome::Capped;
     }
     // Stage 6a: raise granted weapons to the player's current max reinforce tier (inert if off).
     let full_id = crate::upgrades::apply_auto_upgrade(full_id);
@@ -406,10 +427,10 @@ pub fn grant_full_id(full_id: i32, qty: i32) -> bool {
         // Either nothing captured yet, or the capture predates a load and now points at freed
         // memory. Both mean RETRY, never "grant anyway": every caller treats false as retry, and
         // prime_inventory_if_needed re-seeds within a tick or two of the world coming back.
-        return false;
+        return GrantOutcome::NotReady;
     }
     grant_item(inv as *mut c_void, full_id, qty);
-    true
+    GrantOutcome::Placed
 }
 
 fn call_original(inventory: *mut c_void, entry: *mut c_void, itembuf: *mut c_void, r9: u64) -> u64 {
