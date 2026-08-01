@@ -625,6 +625,27 @@ impl WorldStability {
             && self.player_valid
             && (self.real_pickup_seen || self.dwell_ms >= Self::SETTLE_MS)
     }
+
+    /// May the FLAGS class apply this tick? In-world and player-valid, with NO dwell requirement.
+    ///
+    /// # Why flags get their own tier (2026-08-01)
+    ///
+    /// [`SETTLE_MS`](Self::SETTLE_MS) exists to distrust the INVENTORY POINTER: the bulk save load
+    /// replaces the inventory object, so a grant made before it settles is clobbered (the Torch) or
+    /// floods `AddItemFunc` (the mass-grant CTD). **Flags never touch the inventory.** Gating them on
+    /// an inventory predicate was a conflation, and it had a visible cost: map-reveal flags landed
+    /// ~8s into the world, which is AFTER the player regains control if they skip the opening
+    /// cutscene -- and a map revealed while you hold control makes you click OK for every map. A
+    /// player learned to sit in the cutscene until the flags landed. That is the motivating case.
+    ///
+    /// Dropping the wait is safe because the thing the wait was standing in for now exists: the flags
+    /// class read-backs every `SetFlag` in the same tick, re-observes every desired flag every frame,
+    /// parks at `MAX_FLAG_ATTEMPTS` and un-parks on observed-at-desired. Every flag is its own
+    /// sentinel, so a write the save load clobbers is detected and rewritten next tick instead of
+    /// being avoided by a timer. (The 8s predates that read-back.)
+    pub fn flags_ready(&self) -> bool {
+        self.in_game && self.player_valid
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -961,15 +982,20 @@ impl Reconciler {
     }
 
     /// Snapshot ONLY the flags/goods the desired state references. Gated by the caller on stability.
-    fn snapshot(&self, io: &dyn GameIo) -> ObservedState {
+    /// `read_goods = false` skips every `has_good` call — used by the pre-settle FLAGS-ONLY tick, which
+    /// must not read an inventory the settle window exists to distrust. The goods set comes back empty,
+    /// which is inert: goods actions are already filtered out of that tick by its narrowed classes.
+    fn snapshot(&self, io: &dyn GameIo, read_goods: bool) -> ObservedState {
         let mut flags = BTreeMap::new();
         for &f in self.desired.flags.keys() {
             flags.insert(f, io.get_flag(f));
         }
         let mut goods = BTreeSet::new();
-        for &g in self.desired.unique_goods.keys() {
-            if io.has_good(g) {
-                goods.insert(g);
+        if read_goods {
+            for &g in self.desired.unique_goods.keys() {
+                if io.has_good(g) {
+                    goods.insert(g);
+                }
             }
         }
         ObservedState {
@@ -987,7 +1013,7 @@ impl Reconciler {
         if !io.stability().stable() {
             return Vec::new();
         }
-        let observed = self.snapshot(io);
+        let observed = self.snapshot(io, true);
         diff(&self.desired, &observed)
     }
 
@@ -1040,7 +1066,11 @@ impl Reconciler {
         classes: ApplyClasses,
     ) -> TickOutcome {
         let stab = io.stability();
-        if !stab.stable() {
+        // TIERED STABILITY (2026-08-01). `flags_ready()` is the floor: no world, nothing to do.
+        // Between `flags_ready()` and `stable()` the FLAGS class applies while goods + ledger keep
+        // waiting out the inventory settle -- see `WorldStability::flags_ready` for why that split is
+        // the correct one and what it fixes.
+        if !stab.flags_ready() {
             // RE-ARM on the world edge. An unstable tick is a load screen / warp / save-load — the
             // exact moment the reason a grant was refused (full bag, an accessor pointed at the
             // multiplay key list) can stop being true. Clearing here gives every parked good a
@@ -1056,7 +1086,21 @@ impl Reconciler {
             };
         }
 
-        let observed = self.snapshot(io);
+        // PRE-SETTLE: flags only. The inventory is not yet trustworthy, so goods/ledger stay parked
+        // and `rearm_grant_stalls` still runs for them exactly as it did on an unstable tick.
+        let settled = stab.stable();
+        let classes = if settled {
+            classes
+        } else {
+            self.rearm_grant_stalls();
+            ApplyClasses {
+                flags: classes.flags,
+                goods: false,
+                ledger: false,
+            }
+        };
+
+        let observed = self.snapshot(io, settled);
         // A good we can SEE is a good that landed: forget any attempts against it and un-park it.
         // This is what keeps the save-scum self-heal intact — the healing re-grant lands, is
         // observed, and its counter is gone long before it could reach the cap.
@@ -1086,7 +1130,8 @@ impl Reconciler {
             return TickOutcome {
                 applied: Vec::new(),
                 skipped_unstable: false,
-                converged: true,
+                // Honest: a pre-settle tick has only done the flags half, so it has NOT converged.
+                converged: settled,
                 newly_stalled: Vec::new(),
                 newly_stalled_flags: Vec::new(),
             };
@@ -1356,8 +1401,30 @@ impl MockGame {
         MockGame::default()
     }
 
-    /// A game that is NOT stable yet (loading; before the settle window, no real pickup).
+    /// A LOAD SCREEN: not in-world at all.
+    ///
+    /// FIXED 2026-08-01: this used to say `in_game: true, player_valid: true, dwell 0`, which is a
+    /// state the live client cannot produce -- `LiveGame::stability` sources BOTH fields from the same
+    /// `in_world` read, so a real load screen is `false, false`. The old shape only happened to behave
+    /// because `stable()` also demanded dwell; under the `flags_ready` tier it would have modelled a
+    /// load screen as a place where flags may be written. Use [`MockGame::in_world_presettle`] for the
+    /// genuinely-in-world-but-not-settled state.
     pub fn loading() -> Self {
+        MockGame {
+            stability: WorldStability {
+                in_game: false,
+                player_valid: false,
+                dwell_ms: 0,
+                real_pickup_seen: false,
+                now_ms: 0,
+            },
+            ..MockGame::default()
+        }
+    }
+
+    /// IN-WORLD but before the inventory settle: `flags_ready()` is true, `stable()` is false. This is
+    /// the opening-cutscene tick the map-reveal fix exists for.
+    pub fn in_world_presettle() -> Self {
         MockGame {
             stability: WorldStability {
                 in_game: true,
@@ -1383,9 +1450,10 @@ impl MockGame {
                 now_ms,
             };
         } else {
+            // A load screen, matching the live seam: both fields come from one `in_world` read.
             self.stability = WorldStability {
-                in_game: true,
-                player_valid: true,
+                in_game: false,
+                player_valid: false,
                 dwell_ms: 0,
                 real_pickup_seen: false,
                 now_ms,
@@ -1738,6 +1806,106 @@ mod tests {
             g.ledger_count(2008),
             1,
             "the Torch grants exactly once once stable"
+        );
+    }
+
+    // ---- tiered stability: flags before settle (the OK-per-map fix) ---------------------
+
+    /// THE MOTIVATING CASE (2026-08-01). A player learned to sit in the opening cutscene until the
+    /// client delivered its first batch, because a map revealed while you hold control makes you
+    /// click OK for every map. Cause: map-reveal FLAGS were gated on `stable()`, an INVENTORY-settle
+    /// predicate, so they landed ~8s in -- after control on an immediate skip. Flags must apply on
+    /// the FIRST in-world tick.
+    #[test]
+    fn flags_apply_on_first_in_world_tick_before_settle_replay() {
+        let mut g = MockGame::in_world_presettle();
+        assert!(g.stability().flags_ready(), "in-world: flags may apply");
+        assert!(!g.stability().stable(), "but the inventory has NOT settled");
+
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![map_piece(0, "Limgrave Map", &[62010, 62011, 62012])],
+            vec![],
+        ));
+        let out = r.tick(&mut g, TickBudget::default());
+
+        assert!(!out.skipped_unstable, "an in-world tick is not 'unstable'");
+        for f in [62010, 62011, 62012] {
+            assert!(
+                g.get_flag(f),
+                "map-reveal flag {f} must land on the first in-world tick, not 8s later"
+            );
+        }
+    }
+
+    /// The other half of the tier: the settle window still protects the inventory. Goods and ledger
+    /// wait; flags do not. (This is what makes dropping the flag wait safe rather than a revert of
+    /// the Torch-clobber / mass-grant-CTD guard.)
+    #[test]
+    fn goods_and_ledger_hold_until_settle_while_flags_flow() {
+        let mut g = MockGame::in_world_presettle();
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![
+                region(0, "Limgrave Lock", &[76971]),
+                great_rune(1, "Godrick's Great Rune", 191, 6901),
+                consumable(2, "Torch", 2008, 1),
+            ],
+            vec![],
+        ));
+
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(g.get_flag(76971), "region flag flows before settle");
+        assert!(
+            !g.has_good(191),
+            "a unique good must WAIT for the inventory settle"
+        );
+        assert_eq!(
+            g.ledger_count(2008),
+            0,
+            "a ledgered consumable must WAIT too"
+        );
+        assert!(
+            !r.tick(&mut g, TickBudget::default()).converged,
+            "a pre-settle tick has only done the flags half -- it must not claim convergence"
+        );
+
+        // Settle: the held classes drain, exactly as they did before the tier existed.
+        g.set_stable(true);
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(
+            g.has_good(191),
+            "the good lands once the inventory is trustworthy"
+        );
+        assert_eq!(
+            g.ledger_count(2008),
+            1,
+            "and the consumable grants exactly once"
+        );
+    }
+
+    /// Why the 8s wait is not needed: the read-back IS the clobber detector. A flag written early and
+    /// then eaten by the save-data load is observed wrong on a later tick and rewritten -- which is
+    /// strictly better than avoiding the write with a timer, because it also heals a clobber that
+    /// lands AFTER the timer would have expired.
+    #[test]
+    fn early_flag_clobbered_after_write_self_heals_replay() {
+        let mut g = MockGame::in_world_presettle();
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![map_piece(0, "Limgrave Map", &[62010])],
+            vec![],
+        ));
+        r.tick(&mut g, TickBudget::default());
+        assert!(g.get_flag(62010), "landed on the first in-world tick");
+
+        // The save-data load replaces the flag block: our write is gone, and nothing told us.
+        g.set_flag(62010, false);
+
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(
+            g.get_flag(62010),
+            "the every-frame re-observe must notice the clobber and rewrite it"
         );
     }
 

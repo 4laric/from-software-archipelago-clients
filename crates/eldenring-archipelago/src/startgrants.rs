@@ -102,10 +102,34 @@ pub fn parse(sd: &Value) -> StartConfig {
 }
 
 /// Set start graces + (if requested) all map-reveal flags. Idempotent. Returns false if the flag
-/// holder isn't up yet (caller retries next tick), true once everything is set.
+/// holder isn't up yet OR if any write did not STICK (caller retries next tick), true once
+/// everything is set and read back at its desired value.
+///
+/// # Per-flag read-back (2026-08-01)
+///
+/// This is the `RECONCILE_APPLY=none` fallback path; the reconciler's flags class carries its own
+/// same-tick read-back and every-frame re-observe. The caller's sentinel check in `core.rs` reads
+/// back only `start_graces.first()`, which vouches for exactly one flag and is VACUOUSLY TRUE on a
+/// seed with no start graces -- so this path had no clobber detection at all for map-reveal flags.
+/// Reading each flag back here is non-vacuous by construction: `UNDERGROUND_MAP_VIEW_UNLOCK` is set
+/// unconditionally, so even a zero-start-grace seed exercises it.
+fn set_and_verify(flag: u32, what: &str) -> bool {
+    if !flags::try_set_event_flag(flag, true) {
+        return false; // flag holder not up yet -- caller retries, nothing to report
+    }
+    if !flags::get_event_flag(flag) {
+        // ASCII only (every_toast_is_ascii); this is a log line, but keep one alphabet.
+        log::warn!(
+            "start flags: {what} flag {flag} read back FALSE after write (clobbered by save load?) -- retrying next tick"
+        );
+        return false;
+    }
+    true
+}
+
 pub fn apply_start_flags(cfg: &StartConfig) -> bool {
     for &f in &cfg.start_graces {
-        if !flags::try_set_event_flag(f, true) {
+        if !set_and_verify(f, "start grace") {
             return false;
         }
     }
@@ -115,7 +139,7 @@ pub fn apply_start_flags(cfg: &StartConfig) -> bool {
     // Set unconditionally at connect: it only makes the underground map viewable (the fill still
     // gates on the per-region fragment flags), so it covers BOTH reveal_all_maps and the
     // progressive per-region unlock path. See memory er-underground-map-quadrant-flags.
-    if !flags::try_set_event_flag(UNDERGROUND_MAP_VIEW_UNLOCK, true) {
+    if !set_and_verify(UNDERGROUND_MAP_VIEW_UNLOCK, "underground map view-unlock") {
         return false;
     }
     // DLC (Realm of Shadow) map VIEW unlock -- same class of bug as the underground: the Land of
@@ -123,18 +147,18 @@ pub fn apply_start_flags(cfg: &StartConfig) -> bool {
     // is in play so the layer is viewable for BOTH reveal_all_maps and the progressive DLC-region
     // unlock path. (This was the "DLC map not granted" bug -- it only ever "worked" because a forced
     // start-warp into the DLC set 82002 natively.)
-    if cfg.enable_dlc && !flags::try_set_event_flag(DLC_MAP_VIEW_UNLOCK, true) {
+    if cfg.enable_dlc && !set_and_verify(DLC_MAP_VIEW_UNLOCK, "DLC map view-unlock") {
         return false;
     }
     if cfg.reveal_all_maps {
         for &f in MAP_REVEAL_FLAGS_BASE {
-            if !flags::try_set_event_flag(f, true) {
+            if !set_and_verify(f, "base map reveal") {
                 return false;
             }
         }
         if cfg.enable_dlc {
             for &f in MAP_REVEAL_FLAGS_DLC {
-                if !flags::try_set_event_flag(f, true) {
+                if !set_and_verify(f, "DLC map reveal") {
                     return false;
                 }
             }
