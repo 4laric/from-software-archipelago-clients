@@ -176,6 +176,12 @@ pub struct Core {
     /// Last OBSERVED flask-upgrade count. `None` until primed: the count is history-agnostic, so
     /// the first observation after a connect is a baseline, not news.
     flask_seen: Option<usize>,
+    /// Whether the region-unlock TOAST is live yet. `false` until the first dispatch pass after a
+    /// connect has run: AP replays the whole received stream on connect, so that pass reports every
+    /// lock the player already holds as freshly "unlocked". The console line can afford to repeat
+    /// (it always has); six toasts on every reconnect cannot. Same shape and same reason as
+    /// `flask_seen` -- the first observation after a connect is a baseline, not news.
+    region_toast_primed: bool,
     /// ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker): per-region gate data
     /// {threshold, member_ap_ids, bloom_flags}. Empty => feature off. Parsed once per seed.
     region_attunement: HashMap<String, RegionAttunement>,
@@ -476,6 +482,7 @@ impl shared::Core for Core {
             toasts: er_logic::toast::Deck::new(4, 6000),
             toast_clock: std::time::Instant::now(),
             flask_seen: None,
+            region_toast_primed: false,
             region_attunement: HashMap::new(),
             boss_payout_pending: HashMap::new(),
             attuned_regions: HashSet::new(),
@@ -1771,9 +1778,26 @@ impl shared::Core for Core {
         }
         self.dispatched_through = dispatched.max(0) as usize;
         self.received_through = pushed.max(0) as usize;
+        // Announce the EFFECT, not the receipt (the flask reconciler's rule, and for the same
+        // reason): "you received Liurnia Lock" is a receipt the player must translate, while
+        // "Region unlocked: Liurnia" is the thing that actually changed about their run. The
+        // console line keeps its exact wording so there is ONE phrasing to learn, not two.
+        //
+        // ASCII only -- this goes through the FMG path (`every_toast_is_ascii`); region names are
+        // already ASCII by construction, and an em-dash here drew as `?` in v0.2.18.
+        let region_toast_live = self.region_toast_primed;
         for region in unlocked {
             self.log(ap::Print::message(format!("Region unlocked: {region}")));
+            if region_toast_live {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(format!("Region unlocked: {region}"), now);
+            }
         }
+        // Prime AFTER the loop, so the connect replay is the baseline and everything later is news.
+        // Deliberate cost: a lock that lands inside that first pass is logged but not toasted. It is
+        // the only pass where a real arrival is indistinguishable from a replayed one, and silence
+        // there is better than six false toasts on every reconnect.
+        self.region_toast_primed = true;
         // BOSS_LOCKS_PATCH: overlay line on boss-lock receipt -- the lock item is otherwise
         // invisible in the console (no region apparatus, so "Region unlocked" never fires for
         // it). Mirrors that line's semantics, including the reconnect replay (name-dispatch
@@ -2984,6 +3008,7 @@ impl Core {
         // flags the new seed never earned.
         self.sweep_flag_pending.clear();
         self.flask_seen = None;
+        self.region_toast_primed = false;
         self.received_through = 0;
         self.dispatched_through = 0;
         self.item_map = None;
