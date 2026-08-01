@@ -189,6 +189,48 @@ pub fn blessing_target(mode: i32, frag_qty: i32, floor: i32) -> Option<i32> {
     Some(target.clamp(0, SCADU_MAX_LEVEL))
 }
 
+/// Must the blessing applier skip this tick because the player is dead or dying?
+///
+/// WHY IT IS A FUNCTION. `scadu_blessing::drive` walks `chr_ins.special_effect` to find the vanilla
+/// rung the engine has live. That list TEARS DOWN at the death-cam transition and iterating it
+/// there CTDs -- `no_equip_load.rs:78-83` is the shipped instance. The guard existed as a bare
+/// inline `if` with no test, which is precisely the case SPEC §7 called out ("the death guard ...
+/// must be called directly with synthetic input, not assumed covered") and which shipped uncovered
+/// anyway.
+///
+/// 🛑 ONE RULE, ONE IMPLEMENTATION. This delegates to
+/// [`crate::death_guard::lists_unsafe_to_touch`]; it is a NAME at the blessing's call site, not a
+/// second copy. I first wrote this as its own `hp <= 0` and documented "four sites" -- the real
+/// count was FIVE (`no_equip_load`, `no_fall_damage`, `scaling`, this, plus DeathLink's two
+/// unrelated uses), which is how a miscount in a comment becomes folklore.
+///
+/// DeathLink's `hp <= 0` tests are deliberately NOT unified -- see `death_guard`'s module docs.
+pub fn blessing_blocked_by_death(player_hp: i32) -> bool {
+    crate::death_guard::lists_unsafe_to_touch(player_hp)
+}
+
+/// The rates to write this tick, or `None` if the applier must not write at all.
+///
+/// Folds the two refusals that were unreachable from any seed corpus into one decision with a
+/// production caller: the clone row missing from `SpEffectParam` (`row_present == false`), and
+/// [`clone_rates`] returning its no-op pair. A `(1.0, 1.0)` write is not harmless -- it is a
+/// pointless param mutation every tick and it makes "we wrote nothing" indistinguishable from "we
+/// wrote a neutral value" in any later readback.
+pub fn blessing_write_or_skip(
+    a_target: f32,
+    a_active: f32,
+    row_present: bool,
+) -> Option<(f32, f32)> {
+    if !row_present {
+        return None;
+    }
+    let (attack, cut) = clone_rates(a_target, a_active);
+    if attack == 1.0 && cut == 1.0 {
+        return None;
+    }
+    Some((attack, cut))
+}
+
 /// Blessing-clone rate pair: `(attack, cut)` to write into our repurposed `SpEffectParam` row.
 ///
 /// WHY A RATIO AND NOT `A(t)` DIRECTLY. The vanilla Scadutree ladder is ONE scalar: every level row
@@ -568,6 +610,52 @@ mod tests {
     }
 
     // ============================================================================================
+
+    // ---- SPEC §7 bullet 5: guards no corpus reaches, called DIRECTLY -------------------------
+
+    #[test]
+    fn the_death_guard_blocks_exactly_at_and_below_zero_hp() {
+        assert!(
+            blessing_blocked_by_death(0),
+            "hp 0 is the death-cam edge: the list is tearing down"
+        );
+        assert!(
+            blessing_blocked_by_death(-1),
+            "negative hp is observed before the respawn edge"
+        );
+        assert!(!blessing_blocked_by_death(1));
+        assert!(!blessing_blocked_by_death(i32::MAX));
+    }
+
+    #[test]
+    fn a_missing_clone_row_refuses_to_write() {
+        // The row is absent from SpEffectParam (a modded regulation, a future patch renumbering).
+        assert_eq!(blessing_write_or_skip(2.0, 1.0, false), None);
+    }
+
+    #[test]
+    fn a_noop_rate_pair_is_not_written() {
+        // a_active >= a_target -> clone_rates returns (1.0, 1.0). Writing that every tick is a
+        // pointless mutation AND erases the difference between "skipped" and "wrote neutral".
+        assert_eq!(blessing_write_or_skip(1.5, 1.5, true), None);
+        assert_eq!(blessing_write_or_skip(1.0, 2.0, true), None);
+    }
+
+    #[test]
+    fn a_real_raise_is_written_through() {
+        let got = blessing_write_or_skip(2.0, 1.0, true).expect("a genuine raise must write");
+        assert!(
+            (got.0 - 2.0).abs() < 1e-6,
+            "attack {} should be A(t)/A(k) = 2.0",
+            got.0
+        );
+        assert!(
+            (got.1 - 0.5).abs() < 1e-6,
+            "cut {} should be its reciprocal",
+            got.1
+        );
+    }
+
     // apply_blessing_cap
     // ============================================================================================
 

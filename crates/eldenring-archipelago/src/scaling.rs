@@ -243,8 +243,10 @@ pub fn tick() -> Option<String> {
         return None;
     };
     let player = wcm.main_player.as_ref()?;
-    // DEATH GUARD (2026-07-30, generalizing the guard no_fall_damage / no_equip_load / deathlink
-    // have each carried for the player's OWN SpEffect list): at the death-cam transition the
+    // DEATH GUARD (2026-07-30, generalizing the guard no_fall_damage / no_equip_load have each
+    // carried for the player's OWN SpEffect list -- NOT deathlink's, whose two `hp <= 0` tests are
+    // "is the player dead" and "don't re-kill", different rules that must not be unified with this
+    // one; see er_logic::death_guard): at the death-cam transition the
     // engine tears chr_ins + special_effect lists down, and mutating one mid-teardown is a native
     // CTD. A death in place raises no signal this sweep's gates can see -- no warp request, no
     // region change, and the in-world edge only fires AFTER teardown -- yet scale_one mutates the
