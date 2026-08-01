@@ -1381,6 +1381,12 @@ impl shared::Core for Core {
                         .collect(),
                     st.progressive_high_index,
                 );
+                // NOTE(I3, 2026-08-01): this latch IS the (seed, slot)-keyed inheritance that
+                // denies a NEW character its start items. It is NOT removed here: `start_items_ok`
+                // is in-memory only, so this boolean is the plain drain's ONLY cross-session dedup,
+                // and clearing it re-grants every start item each session in exactly the configs
+                // where the drain is the sole path (RECONCILE_APPLY=flags/none, and the unarmed
+                // sessions I3 just handed back to it). Needs a per-character key, not a deletion.
                 self.start_items_granted = st.start_items_granted;
                 // Reuse the once-captured fresh-save baseline ACROSS reconnects
                 // (gf-flagpoll-newsave-default-flags / "picked it up, got nothing"):
@@ -1426,7 +1432,10 @@ impl shared::Core for Core {
             let already_items = self.start_items_granted;
             // Same in_world tightening as can_grant (SWEEP H3): the inventory pointer never
             // resets on quit-to-menu, so menu-time start grants would write through a stale one.
-            let has_inv = crate::detour::has_inventory() && crate::flags::in_world();
+            // I3 FIX (a): a refused save must not receive start grants either (see `can_grant`).
+            let has_inv = crate::detour::has_inventory()
+                && crate::flags::in_world()
+                && !crate::reconcile_io::is_refused();
             // Start-ITEMS clobber guard (patch_greenfield_start_item_clobber.py): the static
             // inventory prime lets grants fire during the load screen, before the save/new-game
             // inventory finishes loading -- which then CLOBBERS the just-granted item (the Torch
@@ -1604,6 +1613,82 @@ impl shared::Core for Core {
         // is turned on; the detour still captures the game's own pointer on a real pickup regardless.
         crate::detour::prime_inventory_if_needed();
 
+        // I3 FIX (b), 2026-08-01: THIS BLOCK WAS HOISTED from the end of `update_live` (it used to
+        // run after steps 3-5). `owns_*` now tells the truth about whether a Driver exists, and the
+        // reconciler was armed AFTER the receive step that asks -- so on the first eligible tick
+        // `armed()` was false while step 4 ran, and the OLD path granted the whole post-watermark
+        // backlog UNPACED in one frame (the mass-grant CTD class the paced budget exists for), then
+        // the reconciler re-owed the ledgered consumables when it armed a section later. Arming
+        // before the step that asks removes the window; the block is otherwise UNCHANGED. It reads
+        // only step-2 state (`slot_data_parsed`, `save_path`, `received_through`, the seed tables)
+        // and rebuilds `recv` from the client every frame, so it never needed step 3/4 output.
+        // ---- RECONCILER (strangler). DRY-RUN (`RECONCILE_DRYRUN=1`) computes + LOGS the desired-state
+        //      diff WITHOUT applying; APPLY mode (`RECONCILE_APPLY` names a class, default `flags`)
+        //      applies the owned classes via `reconcile_io::tick`, and the OLD handlers above skip
+        //      whatever the reconciler owns (see the `owns_*` gates). Widened from the dry-run-only
+        //      gate: `tick()` was previously unreachable in apply mode (the cutover wiring gap). The
+        //      whole block is a no-op only when neither dry-run nor any apply class is active.
+        //
+        //      THE SHAPE, named (issue #237), because both halves look like something you could
+        //      skip and neither is:
+        //        * DESIRED side  -- rebuilt from scratch EVERY frame (the cumulative `recv` below),
+        //          then handed to `set_inputs`, which EQUALITY-GUARDS it in the pure layer. The
+        //          rebuild is cheap-ish and unconditional; the swap is guarded. Do not move that
+        //          guard out here -- `reconcile_io::set_inputs` also re-stamps `d.slot`.
+        //        * OBSERVED side -- `tick()` polls EVERY frame, unconditionally. The game emits no
+        //          event when it diverges from what we wrote, so there is nothing to subscribe to
+        //          and convergence is not a reason to stop looking. There is no dirty flag and no
+        //          nudge; a gate here would break four already-healed bug classes. ----
+        if (crate::reconcile_io::dry_run_enabled() || crate::reconcile_io::apply_active())
+            && self.slot_data_parsed
+        {
+            // Snapshot the FULL received stream (not just the tail) -- DesiredInputs is the CUMULATIVE
+            // set, and the reconciler derives idempotency from the whole set, not per-event deltas.
+            let mut recv: Vec<(i64, String, i64, bool)> = Vec::new();
+            if let Some(client) = self.client() {
+                let my_slot = client.this_player().slot();
+                for (idx, ri) in client.received_items().iter().enumerate() {
+                    // ECHO-DEDUP (Gap 2): same predicate the live receive loop uses -- an echo of our
+                    // own check whose rewritten shop row already sold the reward natively.
+                    let echo_skip = ri.sender().slot() == my_slot
+                        && crate::shop_sell::echo_skip(ri.location().id());
+                    recv.push((
+                        idx as i64,
+                        ri.item().name().to_string(),
+                        ri.item().id(),
+                        echo_skip,
+                    ));
+                }
+            }
+            let inputs = self.build_desired_inputs(&recv);
+            // Defer reconciler init to the first STABLE IN-WORLD tick: `reconcile_io::init` reads the
+            // ER save_slot + play_time to key the per-character watermark (er-startitems-newchar-no-
+            // regrant), and those are only valid once a character is loaded. The reconciler is inert
+            // before world-stability anyway, so nothing is lost by waiting; received items accumulate
+            // in `recv` (rebuilt each tick) and are applied in full once init runs.
+            let world_loaded = crate::detour::has_inventory() && crate::flags::in_world();
+            if !self.reconcile_inited {
+                if world_loaded {
+                    let path = self
+                        .save_path
+                        .as_ref()
+                        .and_then(|p| p.parent().map(|d| d.join("reconcile.json")))
+                        .unwrap_or_else(|| std::path::PathBuf::from("reconcile.json"));
+                    // `received_through` (this save's persisted `last_received_index`) is passed to
+                    // init for the positive-frontier cross-check; the per-character keying inside init
+                    // decides fresh-vs-resume (see reconcile_io::init / er_logic::reconcile::seed_trust).
+                    crate::reconcile_io::init(inputs, path, self.received_through as i64);
+                    self.reconcile_inited = true;
+                }
+                // else: world not loaded yet -- wait; recv keeps accumulating for the eventual init.
+            } else {
+                crate::reconcile_io::set_inputs(inputs);
+            }
+            // POLL. Unconditional, every frame, converged or not (see `reconcile_io::tick`).
+            // In dry-run it computes + logs the per-action diff and applies nothing.
+            crate::reconcile_io::tick();
+        }
+
         // 3. Snapshot the received-item stream in one client borrow (RecvItem mirrors for the
         //    seam, plus the cumulative name set the reconcile ticks need). Under own_world:true
         //    this stream ALSO carries the echoes of our own self-found checks.
@@ -1611,7 +1696,14 @@ impl shared::Core for Core {
         // SWEEP H3 (verified watermark, via er_logic::receive below): both name-dispatch and
         // grants only run with a loaded world + live inventory pointer — menu-time writes go
         // through a stale pointer / get discarded, and used to advance the watermark on faith.
-        let can_grant = crate::detour::has_inventory() && crate::flags::in_world();
+        // I3 FIX (a), 2026-08-01: REFUSED means QUARANTINED, not merely un-owned. Before I3 a
+        // refused session stood down because `owns_*` read config-true; now that they read false,
+        // the OLD grant paths would happily mutate the very save the marker guard just refused to
+        // touch. Holding the cursor here is also the right H3 behaviour: reconnect the correct save
+        // and the whole stream replays.
+        let can_grant = crate::detour::has_inventory()
+            && crate::flags::in_world()
+            && !crate::reconcile_io::is_refused();
         // Cumulative set of ALL received item names — natural-key triggers need the full history
         // (a clause may require an item received many ticks ago), not just this tick's new names.
         let mut received_all: HashSet<String> = HashSet::new();
@@ -2750,6 +2842,18 @@ impl shared::Core for Core {
                 let now = self.toast_clock.elapsed().as_millis() as u64;
                 self.toasts.push(refusal, now);
             }
+            // I4 (2026-08-01): the OTHER silent no-delivery state. A session configured to let the
+            // reconciler grant, whose Driver never armed (the inventory pointer never captured --
+            // a foreign AddItemFunc hook does this), used to look identical to a healthy one: checks
+            // still reported, nothing ever arrived, no warn, no toast. I3 hands granting back to the
+            // old path here; this says so out loud. Same re-push-every-tick rationale as above.
+            if crate::flags::in_world() {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                crate::reconcile_io::note_in_world(now);
+                if let Some(notice) = crate::reconcile_io::suspension_toast(now) {
+                    self.toasts.push(notice, now);
+                }
+            }
             // Anti-stuck: keep the FieldArea fast-travel gate open so a dungeon/catacomb can never
             // strand the player (SELF-CALIBRATING field overwrite; see fast_travel.rs). Game-thread.
             crate::fast_travel::tick();
@@ -2776,73 +2880,6 @@ impl shared::Core for Core {
             }
         }
 
-        // ---- RECONCILER (strangler). DRY-RUN (`RECONCILE_DRYRUN=1`) computes + LOGS the desired-state
-        //      diff WITHOUT applying; APPLY mode (`RECONCILE_APPLY` names a class, default `flags`)
-        //      applies the owned classes via `reconcile_io::tick`, and the OLD handlers above skip
-        //      whatever the reconciler owns (see the `owns_*` gates). Widened from the dry-run-only
-        //      gate: `tick()` was previously unreachable in apply mode (the cutover wiring gap). The
-        //      whole block is a no-op only when neither dry-run nor any apply class is active.
-        //
-        //      THE SHAPE, named (issue #237), because both halves look like something you could
-        //      skip and neither is:
-        //        * DESIRED side  -- rebuilt from scratch EVERY frame (the cumulative `recv` below),
-        //          then handed to `set_inputs`, which EQUALITY-GUARDS it in the pure layer. The
-        //          rebuild is cheap-ish and unconditional; the swap is guarded. Do not move that
-        //          guard out here -- `reconcile_io::set_inputs` also re-stamps `d.slot`.
-        //        * OBSERVED side -- `tick()` polls EVERY frame, unconditionally. The game emits no
-        //          event when it diverges from what we wrote, so there is nothing to subscribe to
-        //          and convergence is not a reason to stop looking. There is no dirty flag and no
-        //          nudge; a gate here would break four already-healed bug classes. ----
-        if (crate::reconcile_io::dry_run_enabled() || crate::reconcile_io::apply_active())
-            && self.slot_data_parsed
-        {
-            // Snapshot the FULL received stream (not just the tail) -- DesiredInputs is the CUMULATIVE
-            // set, and the reconciler derives idempotency from the whole set, not per-event deltas.
-            let mut recv: Vec<(i64, String, i64, bool)> = Vec::new();
-            if let Some(client) = self.client() {
-                let my_slot = client.this_player().slot();
-                for (idx, ri) in client.received_items().iter().enumerate() {
-                    // ECHO-DEDUP (Gap 2): same predicate the live receive loop uses -- an echo of our
-                    // own check whose rewritten shop row already sold the reward natively.
-                    let echo_skip = ri.sender().slot() == my_slot
-                        && crate::shop_sell::echo_skip(ri.location().id());
-                    recv.push((
-                        idx as i64,
-                        ri.item().name().to_string(),
-                        ri.item().id(),
-                        echo_skip,
-                    ));
-                }
-            }
-            let inputs = self.build_desired_inputs(&recv);
-            // Defer reconciler init to the first STABLE IN-WORLD tick: `reconcile_io::init` reads the
-            // ER save_slot + play_time to key the per-character watermark (er-startitems-newchar-no-
-            // regrant), and those are only valid once a character is loaded. The reconciler is inert
-            // before world-stability anyway, so nothing is lost by waiting; received items accumulate
-            // in `recv` (rebuilt each tick) and are applied in full once init runs.
-            let world_loaded = crate::detour::has_inventory() && crate::flags::in_world();
-            if !self.reconcile_inited {
-                if world_loaded {
-                    let path = self
-                        .save_path
-                        .as_ref()
-                        .and_then(|p| p.parent().map(|d| d.join("reconcile.json")))
-                        .unwrap_or_else(|| std::path::PathBuf::from("reconcile.json"));
-                    // `received_through` (this save's persisted `last_received_index`) is passed to
-                    // init for the positive-frontier cross-check; the per-character keying inside init
-                    // decides fresh-vs-resume (see reconcile_io::init / er_logic::reconcile::seed_trust).
-                    crate::reconcile_io::init(inputs, path, self.received_through as i64);
-                    self.reconcile_inited = true;
-                }
-                // else: world not loaded yet -- wait; recv keeps accumulating for the eventual init.
-            } else {
-                crate::reconcile_io::set_inputs(inputs);
-            }
-            // POLL. Unconditional, every frame, converged or not (see `reconcile_io::tick`).
-            // In dry-run it computes + logs the per-action diff and applies nothing.
-            crate::reconcile_io::tick();
-        }
-
         // Inventory-verified startItems backstop: after the world has SETTLED (so the reconciler /
         // drain have had their pass), grant any startItems still absent from the bag (self-latches
         // once done). Gated on settle, NOT on `start_items_granted` -- that boolean never latches
@@ -2851,7 +2888,10 @@ impl shared::Core for Core {
             || self
                 .in_world_since
                 .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(10));
-        crate::start_item_backfill::tick(start_backfill_settled);
+        // I3 FIX (a): a refused save is QUARANTINED -- the backstop must not write to it either.
+        crate::start_item_backfill::tick(
+            start_backfill_settled && !crate::reconcile_io::is_refused(),
+        );
 
         Ok(())
     }

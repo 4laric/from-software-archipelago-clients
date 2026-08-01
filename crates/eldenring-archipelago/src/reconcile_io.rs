@@ -21,11 +21,12 @@
 //! Everything below is straight-line glue; the decisions all live in the pure crate.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use er_logic::marker::{self, FlagBand};
+use er_logic::ownership::{Class, OwnerState, Suspended};
 use er_logic::reconcile::{
     ApplyClasses, CharLedger, DesiredInputs, GameIo, Reconciler, TickBudget, WorldStability,
     legacy_adopt, seed_trust, stamp_playtime,
@@ -609,14 +610,78 @@ pub fn apply_active() -> bool {
 /// reconciler owns the class, so the two never both mutate (no double-grant), and `RECONCILE_APPLY`
 /// (or `RECONCILE_DRYRUN=1`) is a runtime fallback to the old path with no rebuild.
 pub fn owns_flags() -> bool {
-    !dry_run() && apply_classes().flags
+    owner_state().owns(Class::Flags)
 }
 pub fn owns_goods() -> bool {
-    !dry_run() && apply_classes().goods
+    owner_state().owns(Class::Goods)
 }
 pub fn owns_ledger() -> bool {
-    !dry_run() && apply_classes().ledger
+    owner_state().owns(Class::Ledger)
 }
+
+/// I3 (2026-08-01): is a `Driver` actually built for this session?
+///
+/// `init` only builds one at the first STABLE IN-WORLD tick, which never arrives if the inventory
+/// pointer is never captured (a foreign AddItemFunc hook, or the static prime being off). Before I3
+/// the `owns_*` predicates never asked, so `core.rs` stood down for an owner that did not exist.
+fn armed() -> bool {
+    DRIVER.get().is_some()
+}
+
+/// The live ownership facts, in one snapshot, for the pure `er_logic::ownership` seam.
+fn owner_state() -> OwnerState {
+    OwnerState {
+        configured: apply_classes(),
+        dry_run: dry_run(),
+        armed: armed(),
+        refused: is_refused(),
+    }
+}
+
+/// Wall-clock ms at which this session first observed an in-world tick, or `NOT_YET`. Feeds the
+/// never-armed grace period — arming legitimately takes a load screen, so the notice must not fire
+/// during one.
+static FIRST_IN_WORLD_MS: AtomicU64 = AtomicU64::new(NOT_YET);
+const NOT_YET: u64 = u64::MAX;
+
+/// Called from `core`'s tick whenever the world is loaded, so the never-armed grace can be measured
+/// in IN-WORLD time rather than process time (a player sitting in the main menu is not stuck).
+pub fn note_in_world(now_ms: u64) {
+    let _ =
+        FIRST_IN_WORLD_MS.compare_exchange(NOT_YET, now_ms, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// The on-screen notice owed when an owner is configured but is not going to deliver (I4).
+///
+/// Returns `None` for a healthy session AND for the deliberate baseline/dry-run modes. `Refused`
+/// defers to [`refusal_toast`], which carries the per-refusal actionable text; this covers the
+/// NEVER-ARMED state that had no symptom at all before I3.
+pub fn suspension_toast(now_ms: u64) -> Option<&'static str> {
+    let first = FIRST_IN_WORLD_MS.load(Ordering::Relaxed);
+    if first == NOT_YET {
+        return None; // never been in-world: nothing is expected to have armed yet
+    }
+    let in_world_ms = now_ms.saturating_sub(first);
+    match owner_state().suspended(in_world_ms)? {
+        Suspended::Refused => None, // refusal_toast owns this message
+        s => {
+            if !SUSPENSION_LOGGED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "[reattach] delivery SUSPENDED ({s:?}) after {in_world_ms}ms in-world -- \
+                     configured={:?} armed={} refused={} -- the old grant path is now authoritative \
+                     and holds its watermark on any failed placement",
+                    apply_classes(),
+                    armed(),
+                    is_refused()
+                );
+            }
+            Some(er_logic::ownership::suspended_toast(s))
+        }
+    }
+}
+
+/// One-shot guard for the suspension warn (the toast itself re-pushes every tick by design).
+static SUSPENSION_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// One-line summary of the active reconcile mode for the startup log, so a test session's log states
 /// exactly what the reconciler is doing rather than leaving it to be inferred: `dry-run`, the owned
@@ -751,9 +816,19 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
             )
         }
     };
+    // [reattach] ONE-BLOCK STATE DUMP (2026-08-01). Every reattach incident so far has cost three
+    // rounds of theory because the log carried the inputs to the decision but not the decision's
+    // whole context. This is every fact that governs "what has already been delivered to THIS
+    // character", in one grep-able block, so a player's log alone closes the triage.
     log::info!(
-        "[reconcile] ledger seed: save_slot={save_slot:?} play_time={play_time} marker={decision:?} entry={entry:?} received_through={received_through} identity={identity:#010x} -> watermark {}",
-        reconciler.applied_watermark()
+        "[reattach] identity={identity:#010x} marker={decision:?} slot={slot:?} save_slot={save_slot:?} \
+         play_time={play_time} legacy_entry={entry:?} ap_recv_watermark={received_through} \
+         ledger_watermark={} mode={} armed=true refused={} has_inventory={} band={}",
+        reconciler.applied_watermark(),
+        mode_desc(),
+        is_refused(),
+        crate::detour::has_inventory(),
+        MARKER_BAND.base
     );
     // Re-stamp the ledger NOW with the correctly-read seed-time play_time. The tick-tail persist
     // (below) can run when `read_play_time_ms()` momentarily reads 0, freezing the stamp and

@@ -40,6 +40,7 @@ pub mod marker;
 pub mod marker_replay;
 pub mod name_override;
 pub mod options;
+pub mod ownership;
 pub mod progressive;
 pub mod receive;
 pub mod receive_watermark_replay;
