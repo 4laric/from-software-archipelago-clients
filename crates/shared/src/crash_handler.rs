@@ -101,7 +101,12 @@ pub fn install(report_dir: PathBuf) {
     );
 }
 
-/// The unhandled filter — the process is dying. Report, then chain to the previous filter.
+/// The unhandled filter — nothing claimed this exception. Report, then chain to the previous
+/// filter.
+///
+/// 🛑 "Unhandled" is NOT the same as "fatal", and conflating the two is what made this module
+/// lie. The report still happens for every code (a breakpoint in OUR dll is worth knowing
+/// about); [`classify`] decides only how it is FRAMED and at what severity.
 unsafe extern "system" fn top_level_filter(info: *const EXCEPTION_POINTERS) -> i32 {
     report(info as usize, "UNHANDLED — process dying");
     match PREV_FILTER.get() {
@@ -147,7 +152,7 @@ unsafe extern "system" fn first_chance_handler(info: *mut EXCEPTION_POINTERS) ->
             .map(|r| r.ExceptionCode.0 as u32)
     };
     if let Some(code) = code
-        && is_fatal_class(code)
+        && classify(code) == CrashClass::Fatal
         && take_first_chance_budget()
     {
         report(
@@ -158,24 +163,75 @@ unsafe extern "system" fn first_chance_handler(info: *mut EXCEPTION_POINTERS) ->
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// Fatal-class exception codes worth a first-chance record. Everything else — C++ exceptions
-/// (0xE06D7363), breakpoints, guard pages, the 0x406D1388 thread-name convention — is normal
-/// control flow somewhere and none of our business.
-fn is_fatal_class(code: u32) -> bool {
-    matches!(
-        code,
-        0xC000_0005 // ACCESS_VIOLATION
-            | 0xC000_0006 // IN_PAGE_ERROR
-            | 0xC000_001D // ILLEGAL_INSTRUCTION
-            | 0xC000_0025 // NONCONTINUABLE_EXCEPTION
-            | 0xC000_008C // ARRAY_BOUNDS_EXCEEDED
-            | 0xC000_0094 // INT_DIVIDE_BY_ZERO
-            | 0xC000_0096 // PRIV_INSTRUCTION
-            | 0xC000_00FD // STACK_OVERFLOW
-            | 0xC000_0374 // HEAP_CORRUPTION
-    )
+/// How an exception code should be REPORTED. Classification only — it never affects dispatch;
+/// both handlers still continue the search / chain to the previous filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashClass {
+    /// A memory or CPU fault. The process is genuinely dying: this is a CTD, report it as one.
+    Fatal,
+    /// `int3`. Normal control flow somewhere — debugger conventions, and the case that cost us
+    /// a wrong verdict: Elden Ring's own Alt-F4 teardown. Record it, never call it a crash.
+    Breakpoint,
+    /// Everything else — C++ EH unwind (0xE06D7363), the 0x406D1388 thread-name convention,
+    /// guard-page traps. Someone's normal control flow, and none of our business.
+    Benign,
 }
 
+/// Classify an exception code for REPORTING.
+///
+/// 🛑 This is a function, and not an `if` inside the filter, because of a real false positive:
+/// `top_level_filter` used to call `report(...)` UNCONDITIONALLY, while `first_chance_handler`
+/// gated on an `is_fatal_class` whose own doc comment said breakpoints were "normal control
+/// flow somewhere and none of our business". The knowledge was already in this file, on the
+/// path that did not consult it.
+///
+/// What that cost: Elden Ring executes an `int3` on its Alt-F4 teardown path. With no debugger
+/// attached nothing handles it, so it reaches the unhandled filter and was written out as
+/// `=== NATIVE CRASH [UNHANDLED — process dying] ===` with a full backtrace. In the 2026-07-31
+/// playtest log that turned five ordinary sessions into an apparent "four CTDs at
+/// eldenring.exe+0xc57676", all four in fact the player closing the game — and produced a
+/// confident wrong verdict about #198, the very bug this module was written to diagnose. The
+/// only tell was that `code_name` did not know 0x80000003 either, so each line read
+/// `exception 0x80000003 ?`.
+///
+/// **Reclassify, do not silence.** A `__debugbreak` inside OUR dll is still worth a record, so
+/// a breakpoint is still written to the crash file and the log — only the banner and the
+/// severity change. A version of this that returned early would trade a false positive for a
+/// false negative in the same instrument.
+pub fn classify(code: u32) -> CrashClass {
+    match code {
+        0xC000_0005 // ACCESS_VIOLATION
+        | 0xC000_0006 // IN_PAGE_ERROR
+        | 0xC000_001D // ILLEGAL_INSTRUCTION
+        | 0xC000_0025 // NONCONTINUABLE_EXCEPTION
+        | 0xC000_008C // ARRAY_BOUNDS_EXCEEDED
+        | 0xC000_0094 // INT_DIVIDE_BY_ZERO
+        | 0xC000_0096 // PRIV_INSTRUCTION
+        | 0xC000_00FD // STACK_OVERFLOW
+        | 0xC000_0374 // HEAP_CORRUPTION
+        => CrashClass::Fatal,
+        // The Alt-F4 case. 0x8000_0004 (SINGLE_STEP) rides along: same "a debugger convention
+        // reached a process with no debugger" shape, same wrong conclusion if reported as a CTD.
+        0x8000_0003 | 0x8000_0004 => CrashClass::Breakpoint,
+        _ => CrashClass::Benign,
+    }
+}
+
+/// The banner for a report of this class. `Fatal` keeps the exact wording every existing crash
+/// log and triage note greps for (`=== NATIVE CRASH`); the other two must NOT match it.
+fn banner(class: CrashClass, phase: &str) -> String {
+    match class {
+        CrashClass::Fatal => format!("=== NATIVE CRASH [{phase}] ==="),
+        CrashClass::Breakpoint => format!(
+            "=== BREAKPOINT [{phase}] — NOT a crash: this is what closing the game looks like ==="
+        ),
+        CrashClass::Benign => format!("=== non-fatal exception [{phase}] — not a crash ==="),
+    }
+}
+
+/// Human name for an exception code. 🛑 Every code [`classify`] names must appear here: a report
+/// that prints `?` is a report nobody can triage, and that `?` is precisely what got misread on
+/// 2026-07-31. `test_every_classified_code_has_a_name` fails if the two lists drift.
 fn code_name(code: u32) -> &'static str {
     match code {
         0xC000_0005 => "ACCESS_VIOLATION",
@@ -187,6 +243,10 @@ fn code_name(code: u32) -> &'static str {
         0xC000_0096 => "PRIV_INSTRUCTION",
         0xC000_00FD => "STACK_OVERFLOW",
         0xC000_0374 => "HEAP_CORRUPTION",
+        0x8000_0003 => "BREAKPOINT",
+        0x8000_0004 => "SINGLE_STEP",
+        0xE06D_7363 => "CXX_EXCEPTION",
+        0x406D_1388 => "THREAD_NAME",
         _ => "?",
     }
 }
@@ -239,9 +299,11 @@ fn report_inner(info: usize, phase: &str) {
         }
     }
 
+    let class = classify(code);
     let mut out = String::with_capacity(1024);
     out.push_str(&format!(
-        "=== NATIVE CRASH [{phase}] ===\nexception {code:#010x} {}{av_detail}\n",
+        "{}\nexception {code:#010x} {}{av_detail}\n",
+        banner(class, phase),
         code_name(code)
     ));
     out.push_str(&format!("at  {}\n", format_addr(fault_addr)));
@@ -318,7 +380,12 @@ fn report_inner(info: usize, phase: &str) {
         );
         let _ = f.sync_all();
     }
-    log::error!("{out}");
+    // Severity follows the class: a CTD must be findable with a grep for ERROR, and an Alt-F4
+    // must not be. Both still reach the log and the crash file.
+    match class {
+        CrashClass::Fatal => log::error!("{out}"),
+        _ => log::info!("{out}"),
+    }
     log::logger().flush();
 }
 
@@ -479,4 +546,101 @@ fn module_offset(addr: usize) -> Option<(String, usize, usize)> {
         .unwrap_or(full.as_str())
         .to_string();
     Some((name, base, addr - base))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 2026-07-31 case, by name and by number. Elden Ring's Alt-F4 teardown executes an
+    /// `int3`; nothing handles it, so it reaches the unhandled filter. Reporting that as a CTD
+    /// turned five ordinary sessions into "four crashes at eldenring.exe+0xc57676" and a wrong
+    /// verdict on #198.
+    #[test]
+    fn alt_f4_teardown_breakpoint_is_not_reported_as_a_crash() {
+        assert_eq!(classify(0x8000_0003), CrashClass::Breakpoint);
+        let b = banner(classify(0x8000_0003), "UNHANDLED — process dying");
+        assert!(
+            !b.contains("NATIVE CRASH"),
+            "a breakpoint must not wear the crash banner: {b}"
+        );
+        assert!(b.contains("NOT a crash"), "{b}");
+    }
+
+    /// Reclassify, do not silence: the record must still be produced, and still be identifiable.
+    #[test]
+    fn a_breakpoint_is_still_named_and_still_reported() {
+        assert_eq!(code_name(0x8000_0003), "BREAKPOINT");
+        assert_ne!(
+            code_name(0x8000_0003),
+            "?",
+            "an unnamed code is an untriageable report -- the `?` is what got misread"
+        );
+    }
+
+    /// The other half of the guard (CONTRIBUTING rule 8: what would make this pass while the
+    /// bug is present?). Silencing breakpoints must not cost us a real fault.
+    #[test]
+    fn every_fatal_code_still_reports_as_a_crash() {
+        for code in [
+            0xC000_0005u32,
+            0xC000_0006,
+            0xC000_001D,
+            0xC000_0025,
+            0xC000_008C,
+            0xC000_0094,
+            0xC000_0096,
+            0xC000_00FD,
+            0xC000_0374,
+        ] {
+            assert_eq!(classify(code), CrashClass::Fatal, "code {code:#010x}");
+            assert!(
+                banner(classify(code), "UNHANDLED — process dying").contains("NATIVE CRASH"),
+                "code {code:#010x} lost the crash banner"
+            );
+        }
+    }
+
+    /// The access violation the FMG work is actually chasing must be unaffected by this change.
+    #[test]
+    fn the_ctd_we_are_hunting_is_still_fatal() {
+        assert_eq!(classify(0xC000_0005), CrashClass::Fatal);
+        assert_eq!(code_name(0xC000_0005), "ACCESS_VIOLATION");
+    }
+
+    /// A report that prints `?` cannot be triaged. Any code `classify` treats specially must
+    /// have a name, or the two lists have drifted.
+    #[test]
+    fn every_classified_code_has_a_name() {
+        for code in [
+            0xC000_0005u32,
+            0xC000_0006,
+            0xC000_001D,
+            0xC000_0025,
+            0xC000_008C,
+            0xC000_0094,
+            0xC000_0096,
+            0xC000_00FD,
+            0xC000_0374,
+            0x8000_0003,
+            0x8000_0004,
+        ] {
+            assert_ne!(code_name(code), "?", "code {code:#010x} has no name");
+            assert_ne!(
+                classify(code),
+                CrashClass::Benign,
+                "code {code:#010x} named but unclassified"
+            );
+        }
+    }
+
+    /// Unknown codes stay benign and stay honest: no crash banner, and `?` is the correct
+    /// answer for a code we genuinely do not know.
+    #[test]
+    fn an_unknown_code_is_benign_and_says_so() {
+        assert_eq!(classify(0xE06D_7363), CrashClass::Benign);
+        assert_eq!(classify(0x1234_5678), CrashClass::Benign);
+        assert_eq!(code_name(0x1234_5678), "?");
+        assert!(!banner(CrashClass::Benign, "x").contains("NATIVE CRASH"));
+    }
 }
