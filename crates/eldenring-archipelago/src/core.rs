@@ -1381,6 +1381,12 @@ impl shared::Core for Core {
                         .collect(),
                     st.progressive_high_index,
                 );
+                // NOTE(I3, 2026-08-01): this latch IS the (seed, slot)-keyed inheritance that
+                // denies a NEW character its start items. It is NOT removed here: `start_items_ok`
+                // is in-memory only, so this boolean is the plain drain's ONLY cross-session dedup,
+                // and clearing it re-grants every start item each session in exactly the configs
+                // where the drain is the sole path (RECONCILE_APPLY=flags/none, and the unarmed
+                // sessions I3 just handed back to it). Needs a per-character key, not a deletion.
                 self.start_items_granted = st.start_items_granted;
                 // Reuse the once-captured fresh-save baseline ACROSS reconnects
                 // (gf-flagpoll-newsave-default-flags / "picked it up, got nothing"):
@@ -2749,6 +2755,18 @@ impl shared::Core for Core {
             if let Some(refusal) = crate::reconcile_io::refusal_toast() {
                 let now = self.toast_clock.elapsed().as_millis() as u64;
                 self.toasts.push(refusal, now);
+            }
+            // I4 (2026-08-01): the OTHER silent no-delivery state. A session configured to let the
+            // reconciler grant, whose Driver never armed (the inventory pointer never captured --
+            // a foreign AddItemFunc hook does this), used to look identical to a healthy one: checks
+            // still reported, nothing ever arrived, no warn, no toast. I3 hands granting back to the
+            // old path here; this says so out loud. Same re-push-every-tick rationale as above.
+            if crate::flags::in_world() {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                crate::reconcile_io::note_in_world(now);
+                if let Some(notice) = crate::reconcile_io::suspension_toast(now) {
+                    self.toasts.push(notice, now);
+                }
             }
             // Anti-stuck: keep the FieldArea fast-travel gate open so a dungeon/catacomb can never
             // strand the player (SELF-CALIBRATING field overwrite; see fast_travel.rs). Game-thread.
