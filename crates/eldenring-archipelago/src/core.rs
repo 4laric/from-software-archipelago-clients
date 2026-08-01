@@ -1777,13 +1777,12 @@ impl shared::Core for Core {
                     GrantAction::Enqueue {
                         full_id, qty, name, ..
                     } => {
-                        // auto_equip: queue a received WEAPON to be equipped once it's in the bag.
-                        // Independent of the grant path below (reconciler may own the actual grant),
-                        // so this fires for every recognized weapon receive. No-op unless enabled.
-                        if crate::auto_equip::enabled() && er_logic::auto_equip::is_weapon(full_id)
-                        {
-                            crate::auto_equip::enqueue(full_id);
-                        }
+                        // auto_equip: queue a received WEAPON or PROTECTOR to be equipped once it's
+                        // in the bag. Independent of the grant path below (reconciler may own the
+                        // actual grant), so this fires for every recognized receive.
+                        // `enqueue` self-gates on the option AND on the category -- do NOT re-add an
+                        // `is_weapon` filter here, which is what previously excluded armour.
+                        crate::auto_equip::enqueue(full_id);
                         // STRANGLER (goods+ledger, THE ATOMIC FLIP): this ONE call grants every
                         // received item — key items/runes (goods) AND consumables (ledger). Once the
                         // reconciler owns BOTH classes it is the sole received-item grant path (goods
