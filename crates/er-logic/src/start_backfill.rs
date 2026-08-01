@@ -228,7 +228,7 @@ impl BackfillState {
     /// Fold the NEXT snapshot into the delivered set: an item we attempted and can now SEE is
     /// delivered; one we attempted and still cannot see is not, whatever the call returned.
     pub fn confirm(&mut self, present: &HashSet<u32>) {
-        for (&fid, _) in self.attempts.iter() {
+        for &fid in self.attempts.keys() {
             if present.contains(&(fid as u32)) && !self.confirmed.contains(&fid) {
                 self.confirmed.push(fid);
             }
