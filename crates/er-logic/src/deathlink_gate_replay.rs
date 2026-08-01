@@ -1,6 +1,6 @@
 //! `deathlink_gate_replay` — headless timeline replay for the INCOMING-DeathLink opt-out gate.
 //!
-//! Replay-tier sibling of [`crate::start_grant_replay`] / [`crate::region_lock_replay`], for
+//! Replay-tier sibling of [`crate::start_backfill`] / [`crate::region_lock_replay`], for
 //! SWEEP H2: the client advertises the DeathLink tag unconditionally (room visibility), so a slot
 //! with `death_link: 0` still RECEIVES other players' death bounces — and the pre-sweep client
 //! APPLIED them, killing a player who had explicitly opted out. The per-call decision fix already

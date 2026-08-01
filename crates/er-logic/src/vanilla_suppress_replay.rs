@@ -1,6 +1,6 @@
 //! `vanilla_suppress_replay` — headless timeline replay for the vanilla-pickup SUPPRESSION seam.
 //!
-//! Twin of [`crate::start_grant_replay`] and [`crate::region_lock_replay`], for the shared-flag
+//! Twin of [`crate::start_backfill`] and [`crate::region_lock_replay`], for the shared-flag
 //! re-pickup class. The suppression DECISION already lives, pure and host-tested, in
 //! [`crate::vanilla_suppress::should_suppress`] (`fn(mapped_flags: &[u32], collected: &HashSet<u32>)
 //! -> bool`). What that single-tick test can't show is the SEQUENCING failure: a shared acquisition

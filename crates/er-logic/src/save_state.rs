@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveState {
     pub last_received_index: i64,
-    pub start_items_granted: bool,
     pub notify_granted: BTreeSet<i32>,
     /// Fresh-save flag-poll baseline (gf-flagpoll-baseline-persist): the guarding acquisition
     /// flags that already read SET on the FIRST in-world poll of a genuinely fresh save. Persisted
@@ -34,7 +33,6 @@ impl SaveState {
             .collect();
         serde_json::json!({
             "last_received_index":    self.last_received_index,
-            "start_items_granted":    self.start_items_granted,
             "notify_granted":         notify,
             "flag_poll_baseline":     flag_poll_baseline,
             "progressive_counter":    serde_json::Value::Object(counter),
@@ -79,10 +77,6 @@ impl SaveState {
                 .get("last_received_index")
                 .and_then(|x| x.as_i64())
                 .unwrap_or(0),
-            start_items_granted: v
-                .get("start_items_granted")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(false),
             notify_granted: notify,
             flag_poll_baseline,
             progressive_counter: counter,
@@ -99,7 +93,6 @@ impl Default for SaveState {
     fn default() -> Self {
         SaveState {
             last_received_index: 0,
-            start_items_granted: false,
             notify_granted: std::collections::BTreeSet::new(),
             flag_poll_baseline: std::collections::BTreeSet::new(),
             progressive_counter: std::collections::BTreeMap::new(),
@@ -127,7 +120,6 @@ mod tests {
 
         let before = SaveState {
             last_received_index: 17,
-            start_items_granted: true,
             notify_granted: notify,
             flag_poll_baseline,
             progressive_counter: counter,
@@ -146,7 +138,6 @@ mod tests {
         let legacy = r#"{"last_received_index": 5}"#;
         let s = SaveState::from_json(legacy);
         assert_eq!(s.last_received_index, 5);
-        assert!(!s.start_items_granted);
         assert!(s.notify_granted.is_empty());
         assert!(
             s.flag_poll_baseline.is_empty(),

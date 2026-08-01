@@ -6,7 +6,7 @@
 //! [`crate::reconcile::MockGame`], so the marker codec + the init wiring are proven on any host — only
 //! the real flag-band audit and the Windows persist verify remain (they cannot be host-tested).
 //!
-//! Sibling of [`crate::reconciler_replay`] / [`crate::flask_grant_replay`]: the decision logic lives in
+//! Sibling of [`crate::reconciler_replay`] / [`crate::start_backfill`]: the decision logic lives in
 //! [`crate::marker`]; the pure init wiring is [`reconciler_for`]; the timelines are the tests.
 
 use crate::marker::InitDecision;

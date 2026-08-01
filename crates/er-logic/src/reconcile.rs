@@ -83,7 +83,7 @@ pub struct CharLedger {
 ///   * entry present but live `play_time` REWOUND below the stamp -> **fresh**: a delete+recreate in
 ///     the same slot (or a restored pre-grant backup) -- the stamp can't be this character's.
 ///   * entry present and live `play_time >= stamp` -> **trust**: same character, resume from its
-///     watermark (never re-grants -- the flask-double-grant guard, [`crate::flask_grant_replay`]).
+///     watermark (never re-grants -- the flask-double-grant guard, [`crate::start_backfill`]).
 pub fn seed_trust(entry: Option<CharLedger>, live_play_time_ms: u32) -> (bool, Option<ItemIndex>) {
     match entry {
         // Resume when the live play_time is at/above the stamp OR within a wide margin below it. We
@@ -595,7 +595,7 @@ pub fn diff(desired: &DesiredState, observed: &ObservedState) -> Vec<Action> {
 // ---------------------------------------------------------------------------------------------
 
 /// The world-loaded-and-stable predicate. Generalizes the Torch-fix gate
-/// ([`crate::start_grant_replay::start_items_settled`]) to EVERY reconciler mutation AND snapshot:
+/// ([`crate::start_backfill::start_items_settled`]) to EVERY reconciler mutation AND snapshot:
 /// nothing is read or written until the world is genuinely live, so a load-screen or bulk-inventory
 /// clobber can never race a grant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -912,7 +912,7 @@ impl Reconciler {
     /// signal the Windows glue supplies -- never a slot-keyed persisted value), re-owe everything
     /// from the ledger floor, exactly like [`new`](Self::new). `fresh_character=false` keeps the full
     /// distrust policy below, so a same-character tutorial-death RELOAD still trusts the watermark and
-    /// never re-grants (the flask-double-grant guard, [`crate::flask_grant_replay`], is intact).
+    /// never re-grants (the flask-double-grant guard, [`crate::start_backfill`], is intact).
     ///
     /// GOODS start items were briefly presence-diffed (never on this watermark) to dodge exactly this
     /// stranding; that over-granted depletables (a flask/pot at 0 charge reads absent), so build step
@@ -3007,7 +3007,7 @@ mod tests {
     fn seeded_established_reload_does_not_double_grant_start_items() {
         // The other side of the re-arm: a SAME-character tutorial-death reload (fresh_character=false)
         // must still TRUST the negative-band watermark and NOT re-grant -- the flask-double-grant guard
-        // (flask_grant_replay) stays intact. Same stale watermark as the test above; only the signal
+        // (start_backfill::flask_dedup_survives_a_reload_via_the_bag_replay) stays intact. Same stale watermark as the test above; only the signal
         // differs, and it flips the outcome.
         let whistle = crate::progressive::GOODS_FULLID | 130;
         let sd = SlotData {
@@ -3288,7 +3288,7 @@ mod tests {
     fn seeded_first_cutover_on_an_existing_save_owes_only_the_tail() {
         // No reconcile.json yet, but the OLD path already granted the prefix (received_through = 2)
         // plus the start items: seed THERE so the deep-save consumable stream is NOT re-granted, and
-        // a NON-goods start item (negative band, granted via the old start_items_granted latch) stays
+        // a NON-goods start item (negative band; possession-deduped since #267) stays
         // behind the frontier.
         let longsword = 1030000; // weapon-category FullID (nibble 0) -> negative-band ledgered
         let mut inputs = seeded_inputs();

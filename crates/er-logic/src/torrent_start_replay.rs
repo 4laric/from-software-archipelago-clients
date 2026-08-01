@@ -1,7 +1,7 @@
 //! `torrent_start_replay` — headless timeline replay for the TORRENT (mount) grant on a
 //! region-lock / rolled (num_regions) start.
 //!
-//! Sibling of [`crate::start_grant_replay`] and [`crate::region_lock_replay`], for the next
+//! Sibling of [`crate::start_backfill`] and [`crate::region_lock_replay`], for the next
 //! start-sequencing bug. On a NORMAL (vanilla) start the player receives Torrent + the Spectral
 //! Steed Whistle from the Melina hand-off at the first grace (the vanilla EMEVD reactor). On a
 //! ROLLED / region-lock start (`randomStartAreaId` / num_regions) the player is warped out of the

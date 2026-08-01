@@ -1,6 +1,6 @@
 //! `unique_grants` — the flag-idempotent UNIQUE start-grant decision + its timeline replay.
 //!
-//! Sibling of [`crate::start_grant_replay`] / [`crate::torrent_start_replay`], for the next
+//! Sibling of [`crate::start_backfill`] / [`crate::torrent_start_replay`], for the next
 //! start-grant class. The plain `startItems` drain is once-per-save by LEDGER (an index set /
 //! persisted latch): correct for capacity grants (Torch, pot vessels) where a duplicate is
 //! harmless, but wrong for UNIQUE key items (Spectral Steed Whistle, Spirit Calling Bell, Flask

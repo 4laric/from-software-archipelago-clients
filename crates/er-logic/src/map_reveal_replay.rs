@@ -1,6 +1,6 @@
 //! `map_reveal_replay` — headless timeline replay for the map-reveal-on-connect bug.
 //!
-//! Twin of [`crate::start_grant_replay`] / [`crate::region_lock_replay`], for the map-reveal timing
+//! Twin of [`crate::start_backfill`] / [`crate::region_lock_replay`], for the map-reveal timing
 //! bug. When a region unlocks (on connect, or on receiving its `<Region> Lock`), the client must
 //! SET that region's map-REVEAL FLAGS — never GRANT the map-piece ITEM. The buggy path fired
 //! `lockNotifyItems` REGION_MAP_ITEM grants on connect, so map-piece items materialized in the
