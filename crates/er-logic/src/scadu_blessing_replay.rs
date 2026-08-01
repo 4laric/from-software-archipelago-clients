@@ -42,6 +42,11 @@ enum Ev {
     Reconnect,
     /// The game itself set a blessing (e.g. the player consumed real Revered Ash outside our path).
     GameSetBlessing(i32),
+    /// The player RESTED AND REVERED for real at a DLC grace: the engine now refreshes vanilla
+    /// rung `k` under us every tick. Outside the Land of Shadow this is 0 (no refresh loop runs).
+    Revere(i32),
+    /// The seed's `scaduBlessingCap` arrived on connect.
+    Cap(i32),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -50,6 +55,22 @@ enum Policy {
     FragmentsOnly,
     /// SHIPPED: fragments and floor compose as max.
     FloorComposed,
+    /// SHIPPED, and the terms this tier did not cover until 2026-08-01: the seed CAP
+    /// (`apply_blessing_cap`) and the player's own EARNED blessing, composed through the clone
+    /// RATIO (`clone_rates`) rather than added. SPEC §3.4's double-dip rule lives here.
+    CapAndEarned,
+}
+
+/// Stand-in for the vanilla ladder's attack scalar `A(n)`, strictly increasing, `A(0) = 1.0`.
+///
+/// 🛑 NOT FromSoft's numbers, and deliberately not a copy of them. The real `A(n)` is READ FROM THE
+/// PARAM ROWS at runtime (`clone_rates` takes both values as arguments precisely so no table of
+/// theirs is ever carried here -- `er-foreign-list-provenance-rule`). What this tier tests is
+/// COMPOSITION: that our clone times the engine's live rung equals `A(target)` and never
+/// `A(target) * A(rung)`. Any strictly-increasing curve with `A(0) = 1.0` proves or refutes that,
+/// so this one is arbitrary on purpose.
+fn a(n: i32) -> f32 {
+    1.0 + 0.05 * n as f32
 }
 
 /// Minimal model of the stored blessing byte + the writer's raise-only rule.
@@ -60,6 +81,11 @@ struct Sim {
     floor: i32,
     bag_ok: bool,
     writes: Vec<i32>,
+    /// Seed cap (`scaduBlessingCap`). 0 = absent => the ladder ceiling, never 0.
+    cap: i32,
+    /// The vanilla rung the ENGINE is refreshing under us. Non-zero only inside the Land of
+    /// Shadow, and only once the player has revered for real. This is `k` in `A(t)/A(k)`.
+    rung: i32,
 }
 
 impl Sim {
@@ -71,7 +97,25 @@ impl Sim {
             floor: 0,
             bag_ok: true,
             writes: vec![],
+            cap: 0,
+            rung: 0,
         }
+    }
+
+    /// The power our CLONE actually delivers on top of whatever the engine is already applying.
+    ///
+    /// Effective attack = (what our row carries) x (what the engine's live rung carries). The
+    /// double-dip rule is exactly the claim that this product equals `A(target)` and never
+    /// `A(target) * A(rung)`.
+    fn effective_attack(&self, policy: Policy) -> f32 {
+        let target = self.stored;
+        let (clone_attack, _cut) = match policy {
+            // PRE-FIX shape: the clone carries the FULL A(t), so inside the DLC it multiplies with
+            // the engine's live rung. This is the bug §3.4 forbids.
+            Policy::FragmentsOnly | Policy::FloorComposed => (a(target), 1.0 / a(target)),
+            Policy::CapAndEarned => crate::upgrades::clone_rates(a(target), a(self.rung)),
+        };
+        clone_attack * a(self.rung)
     }
 
     /// One throttle window. Mirrors `upgrades::tick_global_scadu`: bail when off / bag unreadable,
@@ -81,6 +125,8 @@ impl Sim {
             return;
         }
         let target = match policy {
+            Policy::CapAndEarned => blessing_target(self.mode, self.frags, self.floor)
+                .map(|t| crate::upgrades::apply_blessing_cap(t, self.cap)),
             Policy::FloorComposed => blessing_target(self.mode, self.frags, self.floor),
             Policy::FragmentsOnly => {
                 if self.mode == 0 {
@@ -110,6 +156,14 @@ fn replay(mode: i32, events: &[Ev], policy: Policy) -> Sim {
             Ev::BagUnreadable => s.bag_ok = false,
             Ev::Reconnect => { /* slot_data re-applied; stored byte survives in the save */ }
             Ev::GameSetBlessing(v) => s.stored = v,
+            Ev::Revere(k) => {
+                s.rung = k;
+                // Revering for real also raises the stored byte: the player EARNED that level.
+                if k > s.stored {
+                    s.stored = k;
+                }
+            }
+            Ev::Cap(c) => s.cap = c,
         }
         s.tick(policy);
     }
@@ -307,5 +361,114 @@ fn level_for_fragments_matches_the_vanilla_curve() {
         level_for_fragments(1000),
         20,
         "never past the top of the curve"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// SPEC §3.4 -- the double-dip rule, and the seed CAP. Added 2026-08-01: this file modelled the
+// FLOOR term and nothing else, so two of the three terms in
+// `max(curve(fragments), region floor, stored blessing)` -- plus the cap -- had no timeline.
+// ---------------------------------------------------------------------------------------------
+
+/// THE DOUBLE-DIP. Inside the Land of Shadow the engine refreshes a REAL rung under us. If our
+/// clone carried the full `A(t)` the two would MULTIPLY and the player would silently get
+/// `A(t) * A(k)`.
+///
+/// Timeline: collect fragments in the base game, walk into the DLC, then REVERE FOR REAL at a
+/// grace -- the exact sequence a DLC seed produces. Pre-fix (clone carries `A(t)`) the effective
+/// power overshoots; shipped (`clone_rates` -> `A(t)/A(k)`) it lands exactly on `A(t)`.
+#[test]
+fn revering_for_real_while_we_hold_a_clone_never_double_dips() {
+    // 🛑 THE RUNG MUST SIT BELOW OUR TARGET, or this test is vacuous. `clone_rates` short-circuits
+    // to NOOP when `a_active >= a_target` (raise-only), so a timeline where the player has already
+    // revered TO our target never reaches the ratio at all -- the first version of this test did
+    // exactly that, stayed green under a mutation that made the clone carry the full `A(t)`, and
+    // only the unit test caught it. Fragments buy 12; the player has revered to 5.
+    let events = [
+        Ev::Cap(12),
+        Ev::Fragments(26), // -> level 12, the cap
+        Ev::EnterRegion(0),
+        Ev::Revere(5), // the player has earned rung 5 for real; the engine refreshes THAT
+    ];
+
+    let broken = replay(2, &events, Policy::FloorComposed);
+    let fixed = replay(2, &events, Policy::CapAndEarned);
+    assert_eq!(
+        broken.stored, fixed.stored,
+        "both reach the same LEVEL; only the rate differs"
+    );
+    assert_eq!(fixed.stored, 12, "fragments buy the cap");
+    assert_eq!(
+        fixed.rung, 5,
+        "and the engine is refreshing a LOWER real rung underneath"
+    );
+
+    let want = a(fixed.stored);
+    let got_fixed = fixed.effective_attack(Policy::CapAndEarned);
+    let got_broken = broken.effective_attack(Policy::FloorComposed);
+
+    assert!(
+        (got_fixed - want).abs() < 1e-4,
+        "shipped: effective attack {got_fixed} should equal A(target) {want}"
+    );
+    assert!(
+        got_broken > want + 1e-3,
+        "pre-fix must OVERSHOOT (that is the double-dip): {got_broken} vs A(target) {want}"
+    );
+}
+
+/// The composition is `max`, never a subtraction: a player whose OWN blessing already beats our
+/// target must never be debuffed by our clone.
+#[test]
+fn a_real_blessing_above_our_target_is_never_debuffed() {
+    let events = [Ev::Cap(12), Ev::Fragments(1), Ev::Revere(15)];
+    let s = replay(2, &events, Policy::CapAndEarned);
+    let eff = s.effective_attack(Policy::CapAndEarned);
+    assert!(
+        eff >= a(15) - 1e-4,
+        "player earned rung 15; our clone must not pull them below it (got {eff}, want >= {})",
+        a(15)
+    );
+}
+
+/// The seed CAP had unit tests (`upgrades::apply_blessing_cap`) but never entered a timeline.
+/// Fragments enough for level 20, cap 12 -> the writer stops at 12 and stays there.
+#[test]
+fn the_seed_cap_binds_over_a_timeline() {
+    let events = [Ev::Cap(12), Ev::Fragments(50), Ev::EnterRegion(0)];
+    let s = replay(2, &events, Policy::CapAndEarned);
+    assert_eq!(
+        s.stored, 12,
+        "cap 12 must bind even though 50 fragments buy level 20"
+    );
+    assert!(
+        s.writes.iter().all(|&w| w <= 12),
+        "no write may exceed the seed cap: {:?}",
+        s.writes
+    );
+}
+
+/// 🛑 An ABSENT cap must mean "the ladder ceiling", never 0 -- the failure that would ship the
+/// whole feature inert for the second time. `apply_blessing_cap` pins this as a unit; here it is
+/// over a timeline, because absence arrives on the wire (an old apworld sends no key at all).
+#[test]
+fn an_absent_cap_does_not_pin_the_blessing_to_zero() {
+    let events = [Ev::Fragments(26), Ev::EnterRegion(0)]; // no Ev::Cap at all -> cap stays 0
+    let s = replay(2, &events, Policy::CapAndEarned);
+    assert_eq!(
+        s.stored, 12,
+        "an absent cap must fall back to the ceiling, not clamp to 0"
+    );
+}
+
+/// The floor still composes under the new policy -- the term this file already covered must not
+/// regress when the cap and earned terms join it.
+#[test]
+fn the_floor_still_lifts_a_fragmentless_player_under_the_new_policy() {
+    let events = [Ev::Cap(12), Ev::EnterRegion(12), Ev::Fragments(0)];
+    let s = replay(2, &events, Policy::CapAndEarned);
+    assert_eq!(
+        s.stored, 12,
+        "floor 12 with zero fragments must still lift to 12"
     );
 }

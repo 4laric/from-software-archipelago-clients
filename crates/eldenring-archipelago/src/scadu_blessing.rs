@@ -131,7 +131,7 @@ pub fn drive(level: i32) {
     let Some(player) = wcm.main_player.as_mut() else {
         return;
     };
-    if player.chr_ins.modules.data.hp <= 0 {
+    if er_logic::upgrades::blessing_blocked_by_death(player.chr_ins.modules.data.hp) {
         return;
     }
     let chr = &mut player.chr_ins;
@@ -193,15 +193,19 @@ fn sync_clone_row(base: i32, target: i32, active_level: i32) -> bool {
         (a_target, act.atk_enemy_dmg_correct_rate_physics())
     };
 
-    // THE arithmetic, in er-logic so CI can test it (including the branches no corpus reaches:
-    // a_active == 0, a_active > a_target, NaN).
-    let (attack, cut) = er_logic::upgrades::clone_rates(a_target, a_active);
-
+    // THE arithmetic AND both refusals, in er-logic so CI can test them (including the branches no
+    // corpus reaches: a_active == 0, a_active > a_target, NaN, and the clone row missing entirely).
+    // `blessing_write_or_skip` is the production caller SPEC §7 bullet 5 asked for -- the row-absent
+    // leg is reached by passing `row.is_some()`, not by a hardcoded `true`, so that branch is live
+    // rather than decorative.
+    //
     // SAFETY: FD4 singleton; only mutated on the single-threaded FrameBegin tick.
     let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
         return false;
     };
-    let Some(dst) = repo.get_mut::<SpEffectParam>(SCADU_BLESSING as u32) else {
+    let row = repo.get_mut::<SpEffectParam>(SCADU_BLESSING as u32);
+    let rates = er_logic::upgrades::blessing_write_or_skip(a_target, a_active, row.is_some());
+    let (Some(dst), Some((attack, cut))) = (row, rates) else {
         return false;
     };
 
