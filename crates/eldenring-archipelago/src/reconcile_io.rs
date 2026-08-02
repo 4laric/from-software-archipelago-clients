@@ -6,6 +6,24 @@
 //! `crate::detour::grant_full_id`), owns the poll-thread tick, and persists the per-save ledger
 //! watermark to a file next to the client.
 //!
+//! ## Possession is NO LONGER bag-only (2026-08-02)
+//!
+//! [`GameIo::has_good`] reads the three bag lists UNION the GREAT-RUNE EQUIP SLOT. Equipping a
+//! Great Rune is believed to detach its row from those lists while the game still counts it
+//! possessed; a bag-only readback then reports it absent forever and the reconciler re-grants it
+//! forever. That is the 2026-07-29 six-session flood (4525 grants, six CTDs, two lost saves),
+//! replayed in `er_logic::reconciler_replay`.
+//!
+//! The hypothesis is UNCONFIRMED IN GAME — [`inventory_forensics`] is still the instrument that
+//! decides it, and its `great_rune_slot[..]` line stays in place for that reason. The widening is
+//! deliberately the conservative direction: it can only make the readback MORE permissive (it can
+//! suppress a re-grant, never cause one), and `er_logic::reconcile::MAX_GRANT_ATTEMPTS` remains the
+//! backstop if the real cause turns out to be elsewhere — the code's own ranked candidate is still
+//! the `key_items_accessor` switch, which this change does not touch.
+//!
+//! STORAGE stays OUT of the union on purpose: a good sitting in the box is not held, so it must not
+//! satisfy possession.
+//!
 //! ## Build / wiring status
 //!
 //! * This module compiles ONLY on Windows (it depends on `eldenring` / `fromsoftware-shared`), same
@@ -157,6 +175,11 @@ impl Default for LiveGame {
 ///
 /// DO NOT silently "fix" the mask: if a change is needed, keep the original masked compare in a
 /// comment. The proposed alternative (double-mask) is noted inline below.
+///
+/// GREAT-RUNE EQUIP SLOT (2026-08-02). The bag walk is no longer the whole predicate: a good that
+/// is absent from all three lists but sitting in the great-rune equip slot counts as HELD. See the
+/// module docstring for why, and [`great_rune_slot_row`] for how the slot's `GaitemHandle` is
+/// resolved to a goods row. Storage is still excluded.
 fn inventory_has_goods(goods: i32) -> bool {
     use eldenring::cs::{GameDataMan, ItemCategory};
     use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
@@ -190,7 +213,46 @@ fn inventory_has_goods(goods: i32) -> bool {
         // the compare above without a set->readback proving this one is the correct form:
         //   if (entry.item_id.param_id() as i32 & 0x0FFF_FFFF) == want_row { return true; }
     }
-    false
+    // Not in any bag list. Before declaring the good ABSENT — which is what re-emits `GrantUnique`
+    // every tick — check the great-rune equip slot, where an equipped rune may be the only place
+    // the row is still visible.
+    great_rune_slot_row(pgd.equipment.equip_item_data.great_rune.gaitem_handle) == Some(want_row)
+}
+
+/// The goods param row currently sitting in the player's GREAT-RUNE equip slot, or `None` when the
+/// slot is empty / holds something that is not a goods row.
+///
+/// HOW THE HANDLE IS RESOLVED (derived from the pinned crate source, `Cargo.lock`:
+/// `fromsoftware-rs` @ `8c67a84`, `crates/eldenring/src/cs/gaitem.rs` — NOT guessed, and NOT
+/// compiled here, since this crate is Windows-only):
+///
+/// * the GAITEM TABLE is a dead end. `CSGaitemImp::gaitem_ins_by_handle` returns `None` for any
+///   handle whose `is_indexed()` is false, and the crate documents that bit as "true for
+///   Protectors, Weapons and Gems" — goods are never indexed. So the row must come out of the
+///   handle itself.
+/// * for a NON-indexed handle, `selector()` (bits 23..0, with `is_indexed` at bit 23 clear) is the
+///   bare param row. That is the same field `GaitemHandle::from_parts(selector, category)` packs,
+///   and the same one the crate's `Display` prints as `GaitemHandle(-1,{selector},{category})`.
+/// * `category()` is the GAITEM category (`GaitemCategory::Goods == 3`), which is a DIFFERENT enum
+///   from the `ItemId` category used by the bag walk above (`ItemCategory::Goods == 4`). Both an
+///   all-zero handle (reads as `Weapon`) and an all-ones handle (reads as an error) fail this
+///   guard, so an EMPTY slot can never match.
+/// * `selector == 0` is rejected explicitly as well: "nothing equipped" must read as NOT PRESENT,
+///   never as a match on row 0.
+///
+/// NOTE(windows-verify): confirm in game with a set->readback — equip a Great Rune, then check that
+/// the reconciler still sees it (no `INERT`/stall line naming a rune the player is wearing).
+fn great_rune_slot_row(handle: eldenring::cs::GaitemHandle) -> Option<i32> {
+    use eldenring::cs::GaitemCategory;
+
+    if handle.is_indexed() {
+        return None;
+    }
+    if handle.category().ok()? != GaitemCategory::Goods {
+        return None;
+    }
+    let row = handle.selector();
+    if row == 0 { None } else { Some(row as i32) }
 }
 
 /// Why a grant could not be observed, read from the game's OWN inventory bookkeeping.
@@ -207,7 +269,9 @@ fn inventory_has_goods(goods: i32) -> bool {
 ///   switched to the pots-only multiplay list is the leading candidate for a refused key-item add.
 ///   That is a HYPOTHESIS, not a finding — this line is here to confirm or kill it from one log;
 /// * `in_storage` answers whether the good is sitting in the storage box, which
-///   `inventory_has_goods` deliberately does not read (it walks the held bag only).
+///   `inventory_has_goods` deliberately does not read: a good in the BOX is not held, so it must
+///   not satisfy possession. (The great-rune EQUIP slot is the opposite case — an equipped rune IS
+///   held — and is part of the predicate as of 2026-08-02.)
 ///
 /// Returns a plain sentence on any failure to read rather than a partial line implying a fact.
 fn inventory_forensics(goods: i32) -> String {
@@ -233,6 +297,12 @@ fn inventory_forensics(goods: i32) -> String {
     // fits -- the flood began LIVE at 01:36:10, ~50s after arriving at Roundtable with a
     // just-received Morgott's Great Rune, with no world edge -- but it is UNPROVEN, and this line is
     // what proves or kills it. `selector == 0` with an empty handle means nothing is equipped.
+    //
+    // KEEP THIS LINE. `inventory_has_goods` now UNIONS this slot into the possession predicate
+    // (2026-08-02), which stops the flood whether or not the hypothesis is the true cause -- but it
+    // also means a fixed client can no longer demonstrate the blindness. This log line is the only
+    // thing that still reports the slot's contents at the moment of a stall, so it is what tells us
+    // whether the widening was the right fix or merely masked the `key_items_accessor` candidate.
     let gr = &pgd.equipment.equip_item_data.great_rune;
     // NB: `GaitemHandle`'s inner u32 is NOT pub outside the crate (bitfield tuple struct), so read
     // it through its accessors + derived Debug rather than `.0`.
