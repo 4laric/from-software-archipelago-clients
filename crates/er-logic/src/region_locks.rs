@@ -113,7 +113,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
     BakedRegionLock {
         region: "Leyndell",
         lock_item: "Leyndell Lock",
-        open_flag: Some(71102),
+        open_flag: Some(76980),
         play_regions: &[11000, 11050, 19000],
     },
     BakedRegionLock {
@@ -155,7 +155,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
     BakedRegionLock {
         region: "Raya Lucaria Academy",
         lock_item: "Raya Lucaria Academy Lock",
-        open_flag: Some(71402),
+        open_flag: Some(76981),
         play_regions: &[14000],
     },
     BakedRegionLock {
@@ -167,7 +167,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
     BakedRegionLock {
         region: "Sewer",
         lock_item: "Sewer Lock",
-        open_flag: Some(73501),
+        open_flag: Some(76982),
         play_regions: &[35000],
     },
     BakedRegionLock {
