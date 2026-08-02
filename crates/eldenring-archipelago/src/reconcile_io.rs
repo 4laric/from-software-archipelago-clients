@@ -6,6 +6,52 @@
 //! `crate::detour::grant_full_id`), owns the poll-thread tick, and persists the per-save ledger
 //! watermark to a file next to the client.
 //!
+//! ## Possession is NO LONGER bag-only (2026-08-02)
+//!
+//! [`GameIo::has_good`] reads the three bag lists UNION the GREAT-RUNE EQUIP SLOT UNION the
+//! STORAGE BOX. Equipping a Great Rune is believed to detach its row from those lists while the
+//! game still counts it possessed; a bag-only readback then reports it absent forever and the
+//! reconciler re-grants it forever. That is the 2026-07-29 six-session flood (4525 grants, six
+//! CTDs, two lost saves), replayed in `er_logic::reconciler_replay`.
+//!
+//! The equip-slot hypothesis is UNCONFIRMED IN GAME — [`inventory_forensics`] is still the
+//! instrument that decides it, and its `great_rune_slot[..]` line stays in place for that reason.
+//! The widening is deliberately the conservative direction: it can only make the readback MORE
+//! permissive (it can suppress a re-grant, never cause one), and
+//! `er_logic::reconcile::MAX_GRANT_ATTEMPTS` remains the backstop if the real cause turns out to be
+//! elsewhere — the code's own ranked candidate is still the `key_items_accessor` switch, which
+//! neither term touches.
+//!
+//! ### STORAGE is IN the union, and here is what that costs
+//!
+//! 🛑 This REVERSES a documented deliberate choice. Until the second commit on
+//! `fix/possession-includes-equip-slot` this file said, in three places, that storage stays OUT
+//! because "a good sitting in the box is not held". **Alaric's instruction (2026-08-02) is to
+//! include it**, and these comments were rewritten rather than left contradicting the code.
+//!
+//! STATE THE CONSEQUENCE PLAINLY: a good sitting in the storage box now reads as POSSESSED, so the
+//! reconciler will NOT re-grant it. An item the player deliberately stashed is never re-delivered
+//! while it is in the box, and nothing tells the player why. That is the intended trade — it stops
+//! an unbounded re-grant loop for any stored good, and the good is not lost, it is in the box — but
+//! it is a real, silent behaviour change.
+//!
+//! Two things make the trade SMALLER than it sounds, one makes it LARGER:
+//!
+//! * SMALLER — the self-heal is suspended, not deleted. Withdraw the good and then lose it (drop,
+//!   save-scum, bulk-load clobber) and it is absent from all three stores again, so the next tick
+//!   re-grants it exactly as it did before.
+//! * SMALLER — today's presence-diffed set is `DesiredInputs::unique_goods`: key items, Great
+//!   Runes, and OWNED progressive rungs, which are all KEY items in game. The recorded finding is
+//!   that the storage box does not take key items, so on a shipped seed this term should never
+//!   fire. It is a guard for the class, not a fix for the motivating case — and the day it DOES
+//!   fire, that is itself the finding: a good we believed unstoreable is storable.
+//! * LARGER — the storage walk used to be reached only from [`inventory_forensics`], which runs at
+//!   most once per stalled good. It now sits on the per-tick readback path (behind a short-circuit:
+//!   only a good MISSING from every bag list gets that far). Anything unsound about reading
+//!   `pgd.storage` — a non-null but not-yet-populated box mid-load, a capacity the slice
+//!   constructor trusts — is now exercised orders of magnitude more often than it was.
+//!   NOTE(windows-verify): watch for a first-load CTD/hang that the equip-slot commit did not have.
+//!
 //! ## Build / wiring status
 //!
 //! * This module compiles ONLY on Windows (it depends on `eldenring` / `fromsoftware-shared`), same
@@ -157,6 +203,13 @@ impl Default for LiveGame {
 ///
 /// DO NOT silently "fix" the mask: if a change is needed, keep the original masked compare in a
 /// comment. The proposed alternative (double-mask) is noted inline below.
+///
+/// BEYOND THE BAG (2026-08-02). The bag walk is no longer the whole predicate. A good absent from
+/// all three lists still counts as POSSESSED when it is in the GREAT-RUNE EQUIP SLOT (see
+/// [`great_rune_slot_row`] for how that slot's `GaitemHandle` is resolved to a goods row) or in the
+/// STORAGE BOX (see [`storage_has_goods_row`]). Storage was excluded when the equip-slot term first
+/// shipped and is now IN, on Alaric's instruction; the module docstring states the trade — a
+/// stashed good reads as possessed and is therefore never re-granted while it sits in the box.
 fn inventory_has_goods(goods: i32) -> bool {
     use eldenring::cs::{GameDataMan, ItemCategory};
     use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
@@ -190,7 +243,87 @@ fn inventory_has_goods(goods: i32) -> bool {
         // the compare above without a set->readback proving this one is the correct form:
         //   if (entry.item_id.param_id() as i32 & 0x0FFF_FFFF) == want_row { return true; }
     }
-    false
+    // Not in any bag list. Before declaring the good ABSENT — which is what re-emits `GrantUnique`
+    // every tick — check the two other places the game keeps a good the player owns.
+    //
+    // 1. the great-rune equip slot, where an equipped rune may be the only place the row is visible.
+    if great_rune_slot_row(pgd.equipment.equip_item_data.great_rune.gaitem_handle) == Some(want_row)
+    {
+        return true;
+    }
+    // 2. the STORAGE BOX. `None` == no readable box, which is NOT a match. See the module docstring:
+    // a stashed good reads as possessed, so the reconciler stops re-granting it. That is the whole
+    // point and the whole cost.
+    storage_has_goods_row(pgd, want_row).unwrap_or(false)
+}
+
+/// Whether the STORAGE BOX holds `want_row`. `None` means there is no box to read (`pgd.storage`
+/// is `None`), which is NOT the same answer as "read it, the row is not in there" (`Some(false)`).
+/// [`inventory_forensics`] prints the difference; [`inventory_has_goods`] treats both as "not
+/// possessed here" and moves on.
+///
+/// THE SHARED STORAGE WALK. [`inventory_forensics`] had this walk first, as a diagnostic; as of
+/// 2026-08-02 [`inventory_has_goods`] needs the same answer, so both go through here rather than
+/// keeping two copies that could drift apart. Same masked compare as the bag walk above
+/// (`category() == Goods` plus `param_id() == want_row`) — keep it that way: a storage hit and a
+/// bag hit must mean the same thing or the forensics line stops describing the predicate.
+///
+/// `normal_entries()` + `key_entries()` only. The multiplay key list is the online pots/tears
+/// mirror of the HELD key list; it has no meaning for a storage box, and walking a third head on a
+/// struct the game may only partly populate for storage buys nothing.
+fn storage_has_goods_row(pgd: &eldenring::cs::PlayerGameData, want_row: i32) -> Option<bool> {
+    use eldenring::cs::ItemCategory;
+    use fromsoftware_shared::NonEmptyIteratorExt;
+
+    let storage = pgd.storage.as_ref()?;
+    Some(
+        storage
+            .items_data
+            .normal_entries()
+            .iter()
+            .chain(storage.items_data.key_entries().iter())
+            .non_empty()
+            .any(|e| {
+                e.item_id.category() == ItemCategory::Goods
+                    && e.item_id.param_id() as i32 == want_row
+            }),
+    )
+}
+
+/// The goods param row currently sitting in the player's GREAT-RUNE equip slot, or `None` when the
+/// slot is empty / holds something that is not a goods row.
+///
+/// HOW THE HANDLE IS RESOLVED (derived from the pinned crate source, `Cargo.lock`:
+/// `fromsoftware-rs` @ `8c67a84`, `crates/eldenring/src/cs/gaitem.rs` — NOT guessed, and NOT
+/// compiled here, since this crate is Windows-only):
+///
+/// * the GAITEM TABLE is a dead end. `CSGaitemImp::gaitem_ins_by_handle` returns `None` for any
+///   handle whose `is_indexed()` is false, and the crate documents that bit as "true for
+///   Protectors, Weapons and Gems" — goods are never indexed. So the row must come out of the
+///   handle itself.
+/// * for a NON-indexed handle, `selector()` (bits 23..0, with `is_indexed` at bit 23 clear) is the
+///   bare param row. That is the same field `GaitemHandle::from_parts(selector, category)` packs,
+///   and the same one the crate's `Display` prints as `GaitemHandle(-1,{selector},{category})`.
+/// * `category()` is the GAITEM category (`GaitemCategory::Goods == 3`), which is a DIFFERENT enum
+///   from the `ItemId` category used by the bag walk above (`ItemCategory::Goods == 4`). Both an
+///   all-zero handle (reads as `Weapon`) and an all-ones handle (reads as an error) fail this
+///   guard, so an EMPTY slot can never match.
+/// * `selector == 0` is rejected explicitly as well: "nothing equipped" must read as NOT PRESENT,
+///   never as a match on row 0.
+///
+/// NOTE(windows-verify): confirm in game with a set->readback — equip a Great Rune, then check that
+/// the reconciler still sees it (no `INERT`/stall line naming a rune the player is wearing).
+fn great_rune_slot_row(handle: eldenring::cs::GaitemHandle) -> Option<i32> {
+    use eldenring::cs::GaitemCategory;
+
+    if handle.is_indexed() {
+        return None;
+    }
+    if handle.category().ok()? != GaitemCategory::Goods {
+        return None;
+    }
+    let row = handle.selector();
+    if row == 0 { None } else { Some(row as i32) }
 }
 
 /// Why a grant could not be observed, read from the game's OWN inventory bookkeeping.
@@ -206,13 +339,18 @@ fn inventory_has_goods(goods: i32) -> bool {
 ///   the READ across all three lists but left the WRITE on the game's accessor, so an accessor
 ///   switched to the pots-only multiplay list is the leading candidate for a refused key-item add.
 ///   That is a HYPOTHESIS, not a finding — this line is here to confirm or kill it from one log;
-/// * `in_storage` answers whether the good is sitting in the storage box, which
-///   `inventory_has_goods` deliberately does not read (it walks the held bag only).
+/// * `in_storage` answers whether the good is sitting in the storage box. As of 2026-08-02 this is
+///   no longer a store the predicate ignores: `inventory_has_goods` reads the SAME box through the
+///   SAME helper ([`storage_has_goods_row`]), so `in_storage=true` at a stall now means the
+///   reconciler is treating the good as POSSESSED and has stopped re-granting it. The great-rune
+///   EQUIP slot below is in the union for the same reason.
 ///
 /// Returns a plain sentence on any failure to read rather than a partial line implying a fact.
 fn inventory_forensics(goods: i32) -> String {
-    use eldenring::cs::{GameDataMan, ItemCategory};
-    use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
+    // `ItemCategory` / `NonEmptyIteratorExt` are no longer imported here: the only walk that needed
+    // them was the storage one, which moved into the shared `storage_has_goods_row`.
+    use eldenring::cs::GameDataMan;
+    use fromsoftware_shared::FromStatic;
 
     let Ok(gdm) = (unsafe { GameDataMan::instance() }) else {
         return "inventory unreadable (no GameDataMan) -- cause UNKNOWN".to_string();
@@ -233,6 +371,13 @@ fn inventory_forensics(goods: i32) -> String {
     // fits -- the flood began LIVE at 01:36:10, ~50s after arriving at Roundtable with a
     // just-received Morgott's Great Rune, with no world edge -- but it is UNPROVEN, and this line is
     // what proves or kills it. `selector == 0` with an empty handle means nothing is equipped.
+    //
+    // KEEP THIS LINE. `inventory_has_goods` now UNIONS this slot (and the storage box) into the
+    // possession predicate (2026-08-02), which stops the flood whether or not the hypothesis is the
+    // true cause -- but it also means a fixed client can no longer demonstrate the blindness. This
+    // log line and `in_storage` are the only things that still report those two stores at the moment
+    // of a stall, so they are what tell us whether the widening was the right fix or merely masked
+    // the `key_items_accessor` candidate.
     let gr = &pgd.equipment.equip_item_data.great_rune;
     // NB: `GaitemHandle`'s inner u32 is NOT pub outside the crate (bitfield tuple struct), so read
     // it through its accessors + derived Debug rather than `.0`.
@@ -245,21 +390,11 @@ fn inventory_forensics(goods: i32) -> String {
         gr.gaitem_handle.category(),
     );
 
-    let in_storage = match pgd.storage.as_ref() {
+    // Shared with the possession predicate as of 2026-08-02 -- see `storage_has_goods_row`. `None`
+    // is "no box to read", which must NOT be printed as `false`.
+    let in_storage = match storage_has_goods_row(pgd, want_row) {
         None => "n/a".to_string(),
-        Some(st) => {
-            let found = st
-                .items_data
-                .normal_entries()
-                .iter()
-                .chain(st.items_data.key_entries().iter())
-                .non_empty()
-                .any(|e| {
-                    e.item_id.category() == ItemCategory::Goods
-                        && e.item_id.param_id() as i32 == want_row
-                });
-            found.to_string()
-        }
+        Some(found) => found.to_string(),
     };
 
     format!(

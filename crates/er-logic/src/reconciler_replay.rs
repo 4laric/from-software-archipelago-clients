@@ -943,4 +943,306 @@ mod replay {
             "the whole wild evening is bounded at 3 grants per world edge -- 24, not 4525"
         );
     }
+
+    // ---- possession = bag lists UNION the great-rune EQUIP SLOT UNION the STORAGE BOX ----
+
+    /// Which OUT-OF-BAG stores [`PossessionGame`]'s readback consults. Flipping one to `false` is
+    /// how the two acceptance tests below VERIFY BY BREAKING: it drops exactly that term from the
+    /// predicate and changes nothing else about the timeline.
+    #[derive(Clone, Copy)]
+    struct PossessionReads {
+        equip_slot: bool,
+        storage: bool,
+    }
+
+    /// A [`GameIo`] that models the live possession readback as the THREE STORES it really is: the
+    /// bag lists (the inner [`MockGame`]'s goods set, which is all
+    /// `reconcile_io::inventory_has_goods` walked before 2026-08-02), the GREAT-RUNE EQUIP SLOT,
+    /// and the STORAGE BOX.
+    ///
+    /// [`Self::equip_great_rune`] and [`Self::store_good`] are each the whole hypothesis in three
+    /// lines: the row moves OUT of every bag list, and the game keeps counting the good possessed,
+    /// so a re-grant is REFUSED -- accepted by `AddItemFunc`, landing nothing, indistinguishable
+    /// from success to the client. Nothing else in the mock has to know about it.
+    struct PossessionGame {
+        inner: MockGame,
+        /// The goods row in the great-rune equip slot. `None` == nothing equipped, which must read
+        /// as ABSENT rather than matching anything.
+        equipped_great_rune: Option<GoodsId>,
+        /// The goods rows sitting in the storage box.
+        stored_goods: BTreeSet<GoodsId>,
+        reads: PossessionReads,
+    }
+
+    impl PossessionGame {
+        fn new(reads: PossessionReads) -> Self {
+            PossessionGame {
+                inner: MockGame::stable(),
+                equipped_great_rune: None,
+                stored_goods: BTreeSet::new(),
+                reads,
+            }
+        }
+
+        /// The player action at the Roundtable grace, 2026-07-29 ~01:36:10: equip the rune.
+        fn equip_great_rune(&mut self, goods: GoodsId) {
+            self.inner.drop_good(goods);
+            self.equipped_great_rune = Some(goods);
+            self.inner.refuse_unique_adds = true;
+        }
+
+        /// The player puts the good in the STORAGE BOX. Modelled exactly like equipping, and for
+        /// the same reason: the row leaves every bag list while the game still counts the good
+        /// owned, so a re-add is refused ("the maximum allowed in inventory" -- the message
+        /// `keyitems.rs` already notes for a double-granted rune) and the client cannot tell that
+        /// refusal from a success.
+        fn store_good(&mut self, goods: GoodsId) {
+            self.inner.drop_good(goods);
+            self.stored_goods.insert(goods);
+            self.inner.refuse_unique_adds = true;
+        }
+    }
+
+    impl GameIo for PossessionGame {
+        fn stability(&self) -> WorldStability {
+            self.inner.stability()
+        }
+        fn get_flag(&self, f: FlagId) -> bool {
+            self.inner.get_flag(f)
+        }
+        fn set_flag(&mut self, f: FlagId, on: bool) -> bool {
+            self.inner.set_flag(f, on)
+        }
+        fn has_good(&self, g: GoodsId) -> bool {
+            // THE PREDICATE UNDER TEST, mirroring `reconcile_io::inventory_has_goods`: bag lists
+            // UNION the great-rune equip slot UNION the storage box. Drop either out-of-bag term
+            // (that is what `PossessionReads` is for) and the matching acceptance test below reds.
+            self.inner.has_good(g)
+                || (self.reads.equip_slot && self.equipped_great_rune == Some(g))
+                || (self.reads.storage && self.stored_goods.contains(&g))
+        }
+        fn grant_good(&mut self, g: GoodsId, comp: &[FlagId]) -> bool {
+            self.inner.grant_good(g, comp)
+        }
+        fn grant_ledgered(&mut self, full_id: GoodsId, qty: i32) -> bool {
+            self.inner.grant_ledgered(full_id, qty)
+        }
+    }
+
+    /// Morgott's Great Rune exactly as the live mapper builds it (`core.rs` -> `KeyItem` via
+    /// `keyitems::acquire_flags`): goods row 193 -- the RESTORED row, not the 8150 vanilla drop that
+    /// shares its display name -- with restored flag 193.
+    fn morgott_rune_inputs() -> DesiredInputs {
+        DesiredInputs {
+            seed: SEED.into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![ReceivedItem {
+                index: 0,
+                name: "Morgott's Great Rune".into(),
+                semantics: ItemSemantics::KeyItem {
+                    goods: 193,
+                    obtained_flags: vec![193],
+                },
+            }],
+            slot_data: SlotData::default(),
+        }
+    }
+
+    /// THE ACCEPTANCE TEST for `possession = bag lists UNION great-rune equip slot`
+    /// (`reconcile_io::inventory_has_goods`, 2026-08-02).
+    ///
+    /// The motivating case, in the order the 2026-07-29 player log records it: the rune is RECEIVED
+    /// at 01:32:53 and granted -- it reads back present at 01:32:54, 01:33:33 and 01:34:37, so the
+    /// grant path is fine and nine earlier Roundtable warps were clean. The player then EQUIPS it at
+    /// a Roundtable grace around 01:36:10: live, no load screen, no world edge, no input to the
+    /// reconciler. From that instant the readback says absent and the client re-grants at ~6.6/s for
+    /// the rest of the evening -- 4525 grants, six sessions, six CTDs, two lost saves.
+    ///
+    /// Both arms drive the SAME reconciler over the SAME timeline and differ ONLY in the readback:
+    ///
+    /// * bag-only (PRE-FIX): the good goes blind, the re-grant is refused, and it is only
+    ///   `MAX_GRANT_ATTEMPTS` that stops a flood -- at the cost of PARKING a rune the player is
+    ///   visibly wearing;
+    /// * bag UNION equip slot (FIX): the equipped rune reads as possessed, the diff is empty, and
+    ///   the grant count stays at the ONE grant that actually landed.
+    ///
+    /// 🛑 Scope, stated so nobody over-reads a green: the mechanism (equipping detaches the row) is
+    /// UNCONFIRMED IN GAME, and the real predicate lives in the Windows-only `eldenring-archipelago`
+    /// crate, which cannot be built or tested on a host. What this proves is the half that IS
+    /// testable and that the flood actually turned on: GIVEN a readback that includes the equip
+    /// slot, the reconciler emits zero re-grants for an equipped rune.
+    #[test]
+    fn an_equipped_great_rune_reads_as_possessed_and_never_re_grants_replay() {
+        const MORGOTT: GoodsId = 193;
+        const TICKS_AFTER_EQUIP: usize = 400;
+
+        for reads_equip_slot in [false, true] {
+            let mut g = PossessionGame::new(PossessionReads {
+                equip_slot: reads_equip_slot,
+                storage: true,
+            });
+            let mut r = Reconciler::new(morgott_rune_inputs());
+
+            // 01:32:53 -- received, granted, observable in the bag.
+            r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+            assert_eq!(
+                g.inner.unique_grant_calls.len(),
+                1,
+                "the rune is granted exactly once while it is still in the bag"
+            );
+            assert!(g.has_good(MORGOTT), "and reads back present, either way");
+
+            // ~01:36:10 -- the player equips it. The ONLY thing that changes is where the row lives.
+            g.equip_great_rune(MORGOTT);
+            assert!(
+                !g.inner.has_good(MORGOTT),
+                "equipping detaches the row from every bag list -- the modelled mechanism"
+            );
+            assert!(
+                g.stored_goods.is_empty(),
+                "the equip slot is the ONLY out-of-bag store in play here"
+            );
+
+            let mut last = TickOutcome::default();
+            for _ in 0..TICKS_AFTER_EQUIP {
+                last = r.tick(&mut g, TickBudget::default());
+            }
+            let regrants = g.inner.unique_grant_calls.len() - 1;
+
+            if reads_equip_slot {
+                assert_eq!(
+                    regrants, 0,
+                    "FIX: an equipped rune is POSSESSED -- zero re-grants over {TICKS_AFTER_EQUIP} \
+                     ticks, not {regrants}"
+                );
+                assert!(
+                    r.stalled_goods().is_empty(),
+                    "FIX: nothing is parked, so the client never warns about a rune the player is \
+                     wearing"
+                );
+                assert!(
+                    last.converged && last.applied.is_empty(),
+                    "FIX: the tick sits converged with nothing to do"
+                );
+            } else {
+                assert_eq!(
+                    regrants, MAX_GRANT_ATTEMPTS as usize,
+                    "PRE-FIX: a bag-only readback MUST go blind and re-grant -- the wild bug is \
+                     reproduced, bounded only by the stall guard"
+                );
+                assert!(
+                    r.stalled_goods().contains(&MORGOTT),
+                    "PRE-FIX: the backstop parks a rune the player is holding -- a bound, not a fix"
+                );
+            }
+        }
+    }
+    /// The Rold Medallion exactly as the live mapper builds it (`core.rs` -> `KeyItem` via
+    /// `keyitems::acquire_flags`): goods row 9000 with obtained flag 400001, the same shape the
+    /// invariance corpus above uses. Deliberately NOT a Great Rune -- the storage term guards the
+    /// whole presence-diffed class, not one item.
+    fn rold_medallion_inputs() -> DesiredInputs {
+        DesiredInputs {
+            seed: SEED.into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![ReceivedItem {
+                index: 0,
+                name: "Rold Medallion".into(),
+                semantics: ItemSemantics::KeyItem {
+                    goods: 9000,
+                    obtained_flags: vec![400001],
+                },
+            }],
+            slot_data: SlotData::default(),
+        }
+    }
+
+    /// THE ACCEPTANCE TEST for the STORAGE half of `possession = bag lists UNION great-rune equip
+    /// slot UNION storage box` (`reconcile_io::inventory_has_goods`, 2026-08-02, on Alaric's
+    /// instruction -- it REVERSES the exclusion the first commit on this branch argued for).
+    ///
+    /// A good visible ONLY in the storage box must read as POSSESSED and produce ZERO re-grants.
+    /// Same shape as the equipped-rune case above and for the same reason: the row leaves every bag
+    /// list while the game still counts the good owned, so a readback that skips the box goes blind
+    /// and the diff re-emits `GrantUnique` forever. Both arms drive the SAME reconciler over the
+    /// SAME timeline and differ ONLY in whether the readback consults the box.
+    ///
+    /// 🛑 Three things a green here does NOT prove, said plainly so nobody over-reads it:
+    ///
+    /// * the real predicate lives in the Windows-only `eldenring-archipelago` crate, which cannot
+    ///   be built or tested on a host. This pins the LOGIC given such a readback, nothing more;
+    /// * this state may not be reachable in game at all. Everything in
+    ///   `DesiredInputs::unique_goods` today -- key items, Great Runes, OWNED progressive rungs --
+    ///   is a KEY item, and the recorded finding is that the storage box does not take key items.
+    ///   So the storage term is a guard for the class, not a fix for the 2026-07-29 flood;
+    /// * the trade it buys is real and silent: a good the player deliberately STASHED reads as
+    ///   possessed, so it is never re-delivered while it sits in the box. What that replaces is the
+    ///   `PRE-FIX` arm below -- an unbounded re-grant loop, bounded only by `MAX_GRANT_ATTEMPTS`
+    ///   parking a good the player owns.
+    #[test]
+    fn a_good_only_in_the_storage_box_reads_as_possessed_and_never_re_grants_replay() {
+        const ROLD: GoodsId = 9000;
+        const TICKS_AFTER_STORING: usize = 400;
+
+        for reads_storage in [false, true] {
+            let mut g = PossessionGame::new(PossessionReads {
+                equip_slot: true,
+                storage: reads_storage,
+            });
+            let mut r = Reconciler::new(rold_medallion_inputs());
+
+            // Received, granted, observable in the bag.
+            r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+            assert_eq!(
+                g.inner.unique_grant_calls.len(),
+                1,
+                "the key item is granted exactly once while it is still in the bag"
+            );
+            assert!(g.has_good(ROLD), "and reads back present, either way");
+
+            // The player boxes it. The ONLY thing that changes is where the row lives.
+            g.store_good(ROLD);
+            assert!(
+                !g.inner.has_good(ROLD),
+                "storing detaches the row from every bag list -- the modelled mechanism"
+            );
+            assert!(
+                g.equipped_great_rune.is_none(),
+                "the storage box is the ONLY out-of-bag store in play here"
+            );
+
+            let mut last = TickOutcome::default();
+            for _ in 0..TICKS_AFTER_STORING {
+                last = r.tick(&mut g, TickBudget::default());
+            }
+            let regrants = g.inner.unique_grant_calls.len() - 1;
+
+            if reads_storage {
+                assert_eq!(
+                    regrants, 0,
+                    "FIX: a good in the storage box is POSSESSED -- zero re-grants over \
+                     {TICKS_AFTER_STORING} ticks, not {regrants}"
+                );
+                assert!(
+                    r.stalled_goods().is_empty(),
+                    "FIX: nothing is parked, so the client never warns about a good the player is \
+                     keeping in the box"
+                );
+                assert!(
+                    last.converged && last.applied.is_empty(),
+                    "FIX: the tick sits converged with nothing to do"
+                );
+            } else {
+                assert_eq!(
+                    regrants, MAX_GRANT_ATTEMPTS as usize,
+                    "PRE-FIX: a readback that skips the storage box MUST go blind and re-grant -- \
+                     bounded only by the stall guard"
+                );
+                assert!(
+                    r.stalled_goods().contains(&ROLD),
+                    "PRE-FIX: the backstop parks a good the player owns -- a bound, not a fix"
+                );
+            }
+        }
+    }
 }
