@@ -18,6 +18,7 @@ mod error_display;
 pub mod foreign_blocks;
 mod game;
 mod input_blocker;
+pub mod log_collapse;
 mod overlay;
 mod section_profiler;
 pub mod utils;
@@ -105,7 +106,19 @@ fn start_logger_for_dir(dir: impl AsRef<Path>) -> Result<()> {
     if let Ok(logger) = create_write_logger(&dir) {
         loggers.push(logger);
     }
-    CombinedLogger::init(loggers)?;
+    // Same wiring `CombinedLogger::init` does (max level from the sub-loggers, then install), with
+    // the duplicate collapser spliced in front of the sinks.
+    //
+    // WHY: hudhook's DX12 present hook logs TWO ERROR lines every single frame for as long as the
+    // game window is minimised -- `renderer/pipeline.rs:150` bails on a 0x0 swapchain and
+    // `hooks/dx12.rs:235` reports the HRESULT that bail returns. Neither has a rate limit and
+    // hudhook offers no way to quiet them. One player's five logs held 612,842 of those lines,
+    // which buried every real line and turned "please upload your log" into a 200 MB request. We
+    // cannot fix the dependency's logging, but this is the seam where its records reach our file.
+    // See `log_collapse` -- it collapses ANY repeated record, not those two strings.
+    let combined = CombinedLogger::new(loggers);
+    log::set_max_level(combined.level());
+    log::set_boxed_logger(Box::new(log_collapse::CollapseDuplicates::new(combined)))?;
     // Native crash telemetry, armed as soon as a logger exists so its "armed" line is captured.
     // A native fault (the 2026-07-24 warp CTD) previously ended the log with NO record at all;
     // this names the faulting module+offset in crash-<pid>.txt beside the log + the log itself.
