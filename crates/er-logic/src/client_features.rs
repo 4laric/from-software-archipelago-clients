@@ -39,6 +39,9 @@
 pub const SUPPORTED: &[&str] = &[
     // options.completion_scaling_ceiling -> er_logic::scaling::ceiling_tier (2026-07-27).
     "scaling_ceiling",
+    // options.auto_equip -> er_logic::auto_equip (routing) + eldenring_archipelago::auto_equip
+    // (the four-rep equip, wired connect -> receive -> tick) (2026-08-02).
+    "auto_equip",
 ];
 
 /// Feature tags the seed requires that this build does not know.
@@ -120,6 +123,33 @@ mod tests {
             msg.contains("update"),
             "the message must say what to do: {msg}"
         );
+    }
+
+    /// THE CASE THIS TAG WAS ADDED FOR: a seed rolled with `auto_equip` on declares the tag, and
+    /// this build carries the behaviour (`er_logic::auto_equip` routing + the game-side module
+    /// driven from the receive loop), so it must connect. If the tag is ever dropped from
+    /// `SUPPORTED` while the behaviour still ships, this reds -- which is the point: the list is
+    /// only worth having if something asserts it matches reality in BOTH directions.
+    #[test]
+    fn a_seed_requiring_auto_equip_is_accepted() {
+        let sd = json!({ "requiresClientFeatures": ["auto_equip"] });
+        assert!(
+            unsupported(&required_from_slot_data(&sd)).is_empty(),
+            "this build implements auto_equip, so the tag must be in SUPPORTED"
+        );
+        // Alongside the other tag, too -- a seed may need several.
+        let sd = json!({ "requiresClientFeatures": ["auto_equip", "scaling_ceiling"] });
+        assert!(unsupported(&required_from_slot_data(&sd)).is_empty());
+    }
+
+    /// ...and knowing `auto_equip` must not make the handshake soft: an unknown tag sitting next to
+    /// a known one is still refused and still named.
+    #[test]
+    fn an_unknown_tag_beside_auto_equip_is_still_refused() {
+        let sd = json!({ "requiresClientFeatures": ["auto_equip", "auto_equip_v2"] });
+        let missing = unsupported(&required_from_slot_data(&sd));
+        assert_eq!(missing, vec!["auto_equip_v2".to_string()]);
+        assert!(refusal_message(&missing).contains("auto_equip_v2"));
     }
 
     #[test]
