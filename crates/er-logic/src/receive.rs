@@ -38,7 +38,16 @@ pub enum GrantAction {
     SkipUnmapped { ap_item_id: i64 },
     /// ECHO-DEDUP: the rewritten shop row already delivered this item at purchase time; the
     /// echo grant is skipped so the buy doesn't double. Watermark advances (it IS delivered).
-    SkipNativelySold { name: String },
+    ///
+    /// 🛑 `full_id` IS CARRIED, and that is the whole of this variant's history. "Skip" here means
+    /// skip the GRANT, not skip the ITEM: the shop handed the player the real thing at purchase, so
+    /// it is in the bag exactly as if it had been granted. A caller with a side effect that keys off
+    /// delivery rather than granting -- `auto_equip` is the one that exists -- still has to see it.
+    /// Dropping the id was how buying anything from a shop silently disabled auto_equip.
+    ///
+    /// `None` when the ap item id is not in `apIdsToItemIds`; an echo of an unmapped item is not a
+    /// thing we can name an ER row for, and the caller simply has nothing to do.
+    SkipNativelySold { name: String, full_id: Option<i32> },
     /// Below the `pushed_through` watermark — already granted on a previous connect; do nothing.
     AlreadyPushed,
 }
@@ -84,8 +93,11 @@ pub fn process_received_item(
     if idx >= *pushed_through {
         let action = if ri.echo_skip {
             // ECHO-DEDUP: the native shop sale already delivered this exact item at purchase.
+            // Resolve the FullID anyway -- the caller needs it for delivery-keyed side effects even
+            // though the grant is redundant. Looked up the same way the Enqueue arm does.
             GrantAction::SkipNativelySold {
                 name: ri.name.clone(),
+                full_id: item_map.get(&ri.ap_item_id).map(|&f| f as i32),
             }
         } else if is_progressive {
             GrantAction::SkipProgressive
@@ -376,6 +388,67 @@ mod tests {
         assert_eq!(hook.dispatched, vec!["Mystery"]);
     }
 
+    /// 🛑 THE MOTIVATING CASE (rule 11): buying your own item from a repointed shop row silently
+    /// disabled `auto_equip` for the whole session.
+    ///
+    /// Alaric, 2026-08-03, client 0.3.2 (`59420f32f445`), `auto_equip: 1`: he bought **Godfrey
+    /// Icon** (a talisman) from the Twin Maiden Husks and it did not equip. The echo arrives with
+    /// `echo_skip`, and this variant used to carry only a `name` -- so the caller logged
+    /// ECHO-DEDUP and had no id to hand `auto_equip::enqueue`. Every one of that session's 13
+    /// receives was a shop purchase, so nothing equipped all run while the client logged
+    /// `auto_equip: enabled`.
+    ///
+    /// "Skip" means skip the GRANT, not skip the ITEM: the shop already handed it over, which is
+    /// exactly why the watermark advances. Anything keyed off DELIVERY still needs the id.
+    /// Fails on the `SkipNativelySold { name }` shape, which is the bug.
+    #[test]
+    fn a_natively_sold_echo_still_carries_the_full_id_for_delivery_side_effects() {
+        const GODFREY_ICON: i32 = 536_874_002; // item_ids.py: category 2 (accessory), row 10002
+        let im = HashMap::from([(7777i64, GODFREY_ICON as i64)]);
+        let ic = HashMap::new();
+        let mut hook = MockHook::default();
+        let (mut dispatched, mut pushed) = (0i64, 0i64);
+
+        let mut ri = item(0, 7777, "Godfrey Icon");
+        ri.echo_skip = true;
+        let a = process_received_item(&ri, &mut dispatched, &mut pushed, &im, &ic, &mut hook);
+
+        match a {
+            GrantAction::SkipNativelySold { full_id, .. } => assert_eq!(
+                full_id,
+                Some(GODFREY_ICON),
+                "a natively-sold echo must carry its FullID -- without it the caller cannot tell \
+                 auto_equip that a shop purchase was delivered, and nothing bought from a shop \
+                 ever equips"
+            ),
+            other => panic!("expected SkipNativelySold, got {other:?}"),
+        }
+        // and the grant is still skipped: the watermark advances without a second delivery.
+        assert_eq!(pushed, 1);
+    }
+
+    /// An echo of an item with no `apIdsToItemIds` entry has no ER row to name, so there is
+    /// nothing for a delivery side effect to do. `None`, not a panic and not a guessed id.
+    #[test]
+    fn an_unmapped_natively_sold_echo_carries_no_id() {
+        let im = HashMap::new();
+        let ic = HashMap::new();
+        let mut hook = MockHook::default();
+        let (mut dispatched, mut pushed) = (0i64, 0i64);
+
+        let mut ri = item(0, 999_999, "Some Foreign Thing");
+        ri.echo_skip = true;
+        let a = process_received_item(&ri, &mut dispatched, &mut pushed, &im, &ic, &mut hook);
+
+        assert_eq!(
+            a,
+            GrantAction::SkipNativelySold {
+                name: "Some Foreign Thing".into(),
+                full_id: None,
+            }
+        );
+    }
+
     #[test]
     fn natively_sold_echo_skips_grant_but_advances_watermark() {
         // ECHO-DEDUP contract: the buy already delivered the item via the rewritten shop row,
@@ -393,7 +466,8 @@ mod tests {
         assert_eq!(
             a,
             GrantAction::SkipNativelySold {
-                name: "Cerulean Crystal Tear".into()
+                name: "Cerulean Crystal Tear".into(),
+                full_id: im.get(&7777).map(|&f| f as i32),
             }
         );
         assert_eq!(pushed, 1);
