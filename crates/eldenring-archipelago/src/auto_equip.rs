@@ -94,10 +94,33 @@ pub fn set_enabled(on: bool) {
 /// Queue a received FullID for equipping. Called from the received-item loop. Self-gating: no-op
 /// if the option is off, or if the category is not something we equip. The caller deliberately
 /// does NOT pre-filter -- it used to gate on `is_weapon`, which silently excluded armour.
+///
+/// 🛑 #296 / #302 / #303 -- QUEUE THE ID THAT ACTUALLY ENTERS THE BAG.
+///
+/// `detour::grant_full_id_outcome` runs `upgrades::apply_auto_upgrade` on every grant, so with
+/// `auto_upgrade` ON an upgradeable weapon lands in the inventory as `base + N` while the receive
+/// loop handed us `base + 0`. `tick()` below looks the queued id up in `owned` by EXACT FullID, so
+/// that lookup missed, the id went back on `still_pending`, and it retried forever. Protectors are
+/// unaffected -- `apply_auto_upgrade` is identity for them -- which is precisely the asymmetry
+/// boblerrr reported: "armor still auto-equips fine -- it's specifically weapons that fail."
+/// His 2026-08-03 log has 8 successful equips: 7 protectors, and one weapon (param 52080000,
+/// Lordsworn's Bolt) which is AMMUNITION and therefore has no reinforce run for auto_upgrade to
+/// raise. Zero upgradeable weapons ever equipped.
+///
+/// The upgrade is applied HERE rather than at the call site so there is ONE enqueue path and a
+/// future caller cannot reintroduce the mismatch. `apply_auto_upgrade` is raise-only and therefore
+/// idempotent, so the second application inside the grant is a no-op, and both calls share the
+/// 1500ms `UPGRADE_TARGETS` cache -- within a tick they cannot disagree.
+///
+/// ⚠️ NOT total: if the grant is deferred (`GrantOutcome::NotReady`) across a target refresh, the
+/// bagged id can still differ from the queued one. That window is bounded by the retry, and closing
+/// it properly means matching on the base row in `tick()` -- deliberately left out of this fix so
+/// the change stays one line of behaviour.
 pub fn enqueue(full_id: i32) {
     if !ENABLED.load(Ordering::Relaxed) || er_logic::auto_equip::equipable(full_id).is_none() {
         return;
     }
+    let full_id = crate::upgrades::apply_auto_upgrade(full_id);
     if let Ok(mut q) = PENDING.lock()
         && !q.contains(&full_id)
     {

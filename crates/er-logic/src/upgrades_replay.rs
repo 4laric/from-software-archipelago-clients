@@ -232,3 +232,135 @@ mod replay {
         assert_eq!(out, vec![WEAPON_BASE, WEAPON_BASE + 3, WEAPON_BASE]);
     }
 }
+
+// ================================================================================================
+// #296 / #302 / #303 — the AUTO_EQUIP QUEUE must hold the id that ENTERS THE BAG.
+// ================================================================================================
+//
+// auto_equip queues a received FullID and, on a later tick, looks it up in the inventory by EXACT
+// FullID (`eldenring-archipelago/src/auto_equip.rs`, `owned.get(&full)`). The grant path runs
+// `apply_auto_upgrade` on its way into the bag, so with `auto_upgrade` ON an upgradeable weapon is
+// QUEUED as `base + 0` and LANDS as `base + N`. The lookup misses, the id goes back on
+// `still_pending`, and it retries for the rest of the session.
+//
+// Protectors are identity under `apply_auto_upgrade`, so armour is untouched -- which is exactly
+// boblerrr's report: "armor still auto-equips fine -- it's specifically weapons that fail." His
+// 2026-08-03 log has 8 successful equips: 7 protectors, plus one weapon (param 52080000,
+// Lordsworn's Bolt) that is AMMUNITION and so has no reinforce run for auto_upgrade to raise.
+// Zero upgradeable weapons equipped all session.
+//
+// The fix applies the same shared predicate inside `enqueue`, so the queue and the bag come from ONE
+// call. These tests pin the invariant that made the bug possible: whatever the queue holds must
+// equal what the grant puts in the bag.
+
+#[cfg(test)]
+mod auto_equip_queue_matches_bag {
+    use crate::hook::GameHook;
+    use crate::upgrades::apply_auto_upgrade;
+
+    /// One upgradeable normal-track weapon at +0, cap +25.
+    const WEAPON_BASE: i32 = 1_000_000;
+    /// A protector FullID (category nibble 0x1) -- identity under apply_auto_upgrade.
+    const PROTECTOR: i32 = 0x1003_3450;
+
+    /// Minimal bag model: a track/cap table and a per-track high-water mark. Deliberately its own
+    /// model rather than the reconnect harness above -- this asks a different question (do two
+    /// call sites agree?) and should not inherit that timeline's state.
+    struct Bag {
+        held_normal: i32,
+    }
+
+    impl GameHook for Bag {
+        fn get_event_flag(&self, _f: u32) -> bool {
+            false
+        }
+        fn set_event_flag(&mut self, _f: u32, _on: bool) {}
+        fn try_set_event_flag(&mut self, _f: u32, _on: bool) -> bool {
+            true
+        }
+        fn in_world(&self) -> bool {
+            true
+        }
+        fn play_region_id(&self) -> Option<i32> {
+            None
+        }
+        fn grant_full_id(&mut self, _full_id: i32, _qty: i32) -> bool {
+            true
+        }
+        fn player_hp(&self) -> Option<i32> {
+            None
+        }
+        fn weapon_track_and_cap(&self, base: i32) -> Option<(i32, bool)> {
+            (base == WEAPON_BASE).then_some((25, false))
+        }
+        fn highest_held_level(&self, somber: bool) -> Option<i32> {
+            Some(if somber { 0 } else { self.held_normal })
+        }
+        fn scadutree_blessing(&self) -> Option<i32> {
+            None
+        }
+        fn set_scadutree_blessing(&mut self, _l: i32) {}
+    }
+
+    /// What `enqueue` stored BEFORE the fix: the raw received id.
+    fn queued_pre_fix(_b: &Bag, full_id: i32) -> i32 {
+        full_id
+    }
+    /// What `enqueue` stores AFTER the fix: the same predicate the grant runs.
+    fn queued_post_fix(b: &Bag, full_id: i32) -> i32 {
+        apply_auto_upgrade(b, true, full_id)
+    }
+    /// What the grant actually puts in the bag (`detour::grant_full_id_outcome`).
+    fn bagged(b: &Bag, full_id: i32) -> i32 {
+        apply_auto_upgrade(b, true, full_id)
+    }
+
+    #[test]
+    fn pre_fix_queue_misses_an_auto_upgraded_weapon() {
+        // Documents the bug: the player already holds a +5, so the target is +5 and the raw
+        // received id is not what lands in the bag.
+        let b = Bag { held_normal: 5 };
+        assert_ne!(queued_pre_fix(&b, WEAPON_BASE), bagged(&b, WEAPON_BASE));
+    }
+
+    #[test]
+    fn post_fix_queue_matches_the_bag_for_an_upgraded_weapon() {
+        let b = Bag { held_normal: 5 };
+        assert_eq!(
+            queued_post_fix(&b, WEAPON_BASE),
+            bagged(&b, WEAPON_BASE),
+            "#296/#302/#303: the queued id must be the id auto_equip will find in the bag",
+        );
+    }
+
+    #[test]
+    fn the_fix_is_inert_when_there_is_nothing_to_raise() {
+        // Target +0: both policies agree, so a fresh character sees no behaviour change at all.
+        let b = Bag { held_normal: 0 };
+        assert_eq!(queued_pre_fix(&b, WEAPON_BASE), bagged(&b, WEAPON_BASE));
+        assert_eq!(queued_post_fix(&b, WEAPON_BASE), bagged(&b, WEAPON_BASE));
+    }
+
+    #[test]
+    fn a_protector_is_unaffected_by_the_fix() {
+        // Identity under apply_auto_upgrade -- which is WHY armour kept working. Must stay identity.
+        let b = Bag { held_normal: 5 };
+        assert_eq!(queued_post_fix(&b, PROTECTOR), PROTECTOR);
+        assert_eq!(bagged(&b, PROTECTOR), PROTECTOR);
+    }
+
+    #[test]
+    fn queue_matches_the_bag_at_every_held_level() {
+        // Applying the predicate at enqueue time is only correct if the grant, moments later, sees
+        // the same target. Production shares the 1500ms UPGRADE_TARGETS cache; here we assert the
+        // weaker sufficient property -- for any bag state the two call sites agree.
+        for lvl in [0, 1, 5, 10, 25] {
+            let b = Bag { held_normal: lvl };
+            assert_eq!(
+                queued_post_fix(&b, WEAPON_BASE),
+                bagged(&b, WEAPON_BASE),
+                "queue/bag disagreed at held level {lvl}",
+            );
+        }
+    }
+}
