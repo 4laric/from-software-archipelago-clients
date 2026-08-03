@@ -111,6 +111,26 @@ static CONFIGURED_SET: AtomicBool = AtomicBool::new(false);
 /// check's stock (all 484 — goods AND equipment), not just the 45 rewrite rows, by matching on it.
 static CHECK_FLAGS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
+/// Re-arm BOTH once-latches. Called from core.rs's `in_world` false->true edge. ShopLineupParam is
+/// the param whose stream-in revert cost shop_sell (2026-07-24), shop_repoint and shop_stock
+/// (2026-07-29): a map load puts back the vanilla `eventFlag_forStock` on every rewrite row (so the
+/// flag poll watches a flag the purchase never sets, and the check silently stops firing), the
+/// vanilla `sellQuantity` on every check row (so a one-time check becomes re-buyable -- the
+/// duplication exploit the 2026-07-14 clamp exists to close), and the vanilla `eventFlag_forRelease`
+/// on the capital re-key rows.
+///
+/// Clears the LATCHES ONLY. `CONFIGURED` / `CONFIGURED_SET` / `CHECK_FLAGS` / `CAPITAL_RELEASE` are
+/// connect-scoped slot_data and must survive the edge -- clearing them would make the next pass fall
+/// back to the embedded `REUSE_ROW_FLAGS` table and skip the stock clamp entirely.
+///
+/// Safe to re-run: every write here is read-then-write-if-different (`write_stock_flag`,
+/// `set_sell_quantity_one`, and the `live == to` / `live != from` guards in `run_capital_release`),
+/// so a pass over rows a load did NOT revert writes nothing and logs `injected 0`.
+pub fn reset() {
+    DONE.store(false, Ordering::Relaxed);
+    CAPITAL_RELEASE_DONE.store(false, Ordering::Relaxed);
+}
+
 /// Called by net.rs once slot_data is parsed. `rows` = (ShopLineupParam row id, AP tracking flag).
 pub fn configure(rows: Vec<(u32, u32)>) {
     log::info!(

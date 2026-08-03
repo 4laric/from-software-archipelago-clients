@@ -22,6 +22,16 @@ pub fn set_enabled(on: bool) {
     }
 }
 
+/// Re-arm the once-per-session zeroing. Called from core.rs's `in_world` false->true edge: a map
+/// load streams EquipParamWeapon / Magic back in and restores the vanilla requirements, and APPLIED
+/// would otherwise stop `tick()` ever re-zeroing them -- the option would work until the player's
+/// first load and then quietly stop, which reads as "the option does nothing". Clears the LATCH
+/// ONLY: `ENABLED` comes from slot_data at connect and must survive the edge. Safe to re-run --
+/// zeroing only ever LOWERS a requirement, which the module doc already relies on for reconnects.
+pub fn reset() {
+    APPLIED.store(false, Ordering::Relaxed);
+}
+
 /// Per-tick until applied: zero all weapon/spell stat requirements. Needs the param repo
 /// populated (in-world); retries until rows are visible, then latches for the session.
 pub fn tick() {

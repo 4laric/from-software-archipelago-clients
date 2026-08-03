@@ -41,6 +41,16 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Re-arm the once-per-session apply. Called from core.rs's `in_world` false->true edge: a map load
+/// streams the five equip param files back in, which reverts `showDialogCondType` on every row, and
+/// APPLIED would otherwise keep us from ever re-writing them (the shop_sell / shop_icon / shop_stock
+/// / shop_preview bug). Clears the LATCH ONLY -- `ENABLED` is connect-scoped configuration and must
+/// survive the edge. Cheap and idempotent to re-run: `tick()` writes the same constant to the same
+/// rows and self-gates on the repo being populated, so the cost is one pass per load.
+pub fn reset() {
+    APPLIED.store(false, Ordering::Relaxed);
+}
+
 /// Per-tick until applied: set `showDialogCondType = 0` on every row of the five grantable equip
 /// param types, leaving `showLogCondType` (the ticker) alone. Needs the param repo populated
 /// (in-world); retries until rows are visible, then latches for the session.
