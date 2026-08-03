@@ -30,9 +30,71 @@ pub fn should_suppress(mapped_flags: &[u32], collected: &HashSet<u32>) -> bool {
     mapped_flags.iter().any(|f| !collected.contains(f))
 }
 
+/// `should_suppress`, plus the FLAG-SET DISARM (#321).
+///
+/// A flag also counts as released once it is LIVE-SET on the game, not only once the server reports
+/// it collected. Suppress if ANY mapped flag is neither collected NOR live-set.
+///
+/// ## Why this is not the leak we removed in July
+///
+/// The old, deleted policy keyed on the live flag INSTEAD of the collected-set, and it leaked
+/// because ~224 acquisition flags cover 605 locations: picking up Traveler's Clothes set the shared
+/// flag, and every OTHER id on that flag then read as an already-done re-pickup and passed its
+/// vanilla ware through. This is a UNION, not a replacement -- collected still releases on its own
+/// -- and, decisively, it is only enabled for a slot_data whose `checkItemFlags` maps **no flag to
+/// two ids**. See [`flags_are_unshared`]. Under that precondition a live-set mapped flag can only
+/// have been set by THIS id's own check, so releasing on it releases nothing else.
+///
+/// ## What it buys, and what it does not
+///
+/// The residue after the world-side lot-coverage drop is the LOT-LESS checks (EMEVD awards), which
+/// have no item lot to neutralise at the source, so the id-keyed suppressor is all they have. Today
+/// they stay armed from connect until their check is collected -- and forever if the player never
+/// does that check -- eating every copy from every other source in between (#321, boblerrr's
+/// 2026-08-03 weapon `0x6acfc0`). The disarm caps that exposure at the window BEFORE the award
+/// fires. 🛑 It does NOT eliminate it: a farmed copy picked up before you reach the check is still
+/// eaten. Do not describe this as closing #321.
+pub fn should_suppress_with_flag_disarm(
+    mapped_flags: &[u32],
+    collected: &HashSet<u32>,
+    disarm_on_flag_set: bool,
+    flag_set: &dyn Fn(u32) -> bool,
+) -> bool {
+    mapped_flags
+        .iter()
+        .any(|f| !collected.contains(f) && !(disarm_on_flag_set && flag_set(*f)))
+}
+
+/// PRECONDITION for [`should_suppress_with_flag_disarm`]: no acquisition flag in the whole
+/// `checkItemFlags` table is mapped by more than ONE item id.
+///
+/// Checked against the LIVE slot_data at connect rather than assumed from the apworld version, so
+/// an older seed -- rolled before the world-side drop that makes this true -- degrades to
+/// collected-set-only instead of silently reopening the shared-flag leak. The world carries the
+/// same assertion as a regen gate; this is the belt to that pair of braces.
+pub fn flags_are_unshared<'a, I>(entries: I) -> bool
+where
+    I: IntoIterator<Item = &'a [u32]>,
+{
+    let mut seen: HashSet<u32> = HashSet::new();
+    for flags in entries {
+        // A repeat WITHIN one id's list is fine -- it is still that one id's flag.
+        let mut this: HashSet<u32> = HashSet::new();
+        for &f in flags {
+            if !this.insert(f) {
+                continue;
+            }
+            if !seen.insert(f) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_suppress;
+    use super::{flags_are_unshared, should_suppress, should_suppress_with_flag_disarm};
     use std::collections::HashSet;
 
     fn set(flags: &[u32]) -> HashSet<u32> {
@@ -90,5 +152,105 @@ mod tests {
     fn empty_mapped_flags_passes() {
         // Degenerate: an id with no mapped flags is not a check -> never suppress.
         assert!(!should_suppress(&[], &set(&[])));
+    }
+
+    // ---- #321: the FLAG-SET DISARM and its precondition -------------------------------------
+
+    #[test]
+    fn disarm_off_is_byte_for_byte_the_old_policy() {
+        // The union must be inert when the disarm is off, whatever the live flags say.
+        let collected = set(&[]);
+        let all_set = |_f: u32| true;
+        assert_eq!(
+            should_suppress_with_flag_disarm(&[15007980], &collected, false, &all_set),
+            should_suppress(&[15007980], &collected),
+        );
+    }
+
+    #[test]
+    fn a_live_set_flag_releases_when_the_disarm_is_on() {
+        // The lot-less check has fired: its award set the flag. A later copy from any source must
+        // now pass, instead of waiting on a collected-set entry that may never come.
+        let collected = set(&[]);
+        let fired = |f: u32| f == 220550;
+        assert!(should_suppress_with_flag_disarm(
+            &[220550],
+            &collected,
+            false,
+            &fired
+        ));
+        assert!(!should_suppress_with_flag_disarm(
+            &[220550],
+            &collected,
+            true,
+            &fired
+        ));
+    }
+
+    #[test]
+    fn an_unset_flag_still_suppresses_under_the_disarm() {
+        // 🛑 The bounded half of #321. Before the award fires, a non-check copy is STILL eaten.
+        // The disarm caps the window; it does not close it. This test exists so nobody reads the
+        // feature as a fix.
+        let collected = set(&[]);
+        let never = |_f: u32| false;
+        assert!(should_suppress_with_flag_disarm(
+            &[220550],
+            &collected,
+            true,
+            &never
+        ));
+    }
+
+    #[test]
+    fn collected_still_releases_on_its_own() {
+        // Union, not replacement: a collected flag passes even with nothing live-set.
+        let collected = set(&[220550]);
+        let never = |_f: u32| false;
+        assert!(!should_suppress_with_flag_disarm(
+            &[220550],
+            &collected,
+            true,
+            &never
+        ));
+    }
+
+    #[test]
+    fn every_mapped_flag_must_be_released_not_just_one() {
+        // Multi-check ware: one released flag is not enough, exactly as in the base policy.
+        let collected = set(&[100]);
+        let fired = |_f: u32| false;
+        assert!(should_suppress_with_flag_disarm(
+            &[100, 200],
+            &collected,
+            true,
+            &fired
+        ));
+    }
+
+    #[test]
+    fn unshared_precondition_accepts_a_disjoint_table() {
+        let a: Vec<u32> = vec![220550];
+        let b: Vec<u32> = vec![220560, 220570];
+        assert!(flags_are_unshared(vec![a.as_slice(), b.as_slice()]));
+    }
+
+    #[test]
+    fn unshared_precondition_rejects_the_travelers_clothes_shape() {
+        // Two DISTINCT ids on one flag -- the exact shape that made live-flag keying leak. A seed
+        // like this must fall back to collected-set-only.
+        let clothes: Vec<u32> = vec![15007980];
+        let manchettes: Vec<u32> = vec![15007980, 15007981];
+        assert!(!flags_are_unshared(vec![
+            clothes.as_slice(),
+            manchettes.as_slice()
+        ]));
+    }
+
+    #[test]
+    fn unshared_precondition_tolerates_a_repeat_within_one_id() {
+        // A duplicated flag inside ONE id's list is still that one id's flag, not sharing.
+        let dup: Vec<u32> = vec![220550, 220550];
+        assert!(flags_are_unshared(vec![dup.as_slice()]));
     }
 }
