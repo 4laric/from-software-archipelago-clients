@@ -41,6 +41,7 @@ pub mod marker_replay;
 pub mod name_override;
 pub mod options;
 pub mod ownership;
+pub mod physick;
 pub mod progressive;
 pub mod receive;
 pub mod receive_probe;

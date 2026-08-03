@@ -2814,6 +2814,11 @@ impl shared::Core for Core {
         // 8b3. auto_equip: drain queued received weapons into a primary hand (once each is in the bag).
         crate::auto_equip::tick();
 
+        // 8b4. physick_probe (#334 phase 2): READ-ONLY RE diagnostic, hard no-op unless
+        // ER_PHYSICK_PROBE is set. Placed after auto_equip because it reads the same inventory the
+        // auto-equip pass has just finished with, and self-throttles to one scan per 500ms.
+        crate::physick_probe::tick();
+
         // 8c. Ticker-only pickup notifs: set showDialogCondType=0 game-wide so AP grants show the
         //     native right-side ticker, not the blocking "NEW Y:OK" modal (was a retired-baker
         //     regulation edit; ported to runtime, latched once applied).
