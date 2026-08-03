@@ -140,9 +140,8 @@ pub fn drive(level: i32) -> Option<String> {
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
         return None;
     };
-    let Some(cfg) = repo.get::<GameSystemCommonParam>(0) else {
-        return None; // param file not populated yet — retry next tick
-    };
+    // param file not populated yet -> retry next tick (same `?` reasoning as `player` below)
+    let cfg = repo.get::<GameSystemCommonParam>(0)?;
     let base = cfg.base_scadu_blessing_sp_effect_id();
     if base <= 0 {
         return None; // nothing sane to index off
@@ -161,9 +160,9 @@ pub fn drive(level: i32) -> Option<String> {
     let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
         return None;
     };
-    let Some(player) = wcm.main_player.as_mut() else {
-        return None;
-    };
+    // `?` rather than `let...else`: now that this returns Option, clippy::question_mark is right
+    // that they are the same thing, and the shorter form does not hide the early exit.
+    let player = wcm.main_player.as_mut()?;
     if er_logic::upgrades::blessing_blocked_by_death(player.chr_ins.modules.data.hp) {
         return None;
     }
