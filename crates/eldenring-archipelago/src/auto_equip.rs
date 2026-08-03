@@ -46,19 +46,40 @@
 //! target slot is not a function of the item alone: it depends on how many slots the player has
 //! unlocked and on what is already worn, both read live below.
 //!
-//! 🛑 PHYSICK TEARS ARE NOT HERE, and the other half of boblerrr's sentence is not an oversight.
-//! Tears are `EQUIP_PARAM_GOODS` and never enter `chr_asm` -- the Flask of Wondrous Physick is a
-//! separate two-slot mixture with its own UI and persistence, so every paragraph above is
-//! inapplicable to them. Building them on this module's reps would be writing an equipment slot
-//! for something the game does not store as equipment.
+//! PHYSICK TEARS (#334) ride NONE of the four reps above, and that is the point. Tears are
+//! `EQUIP_PARAM_GOODS` and never enter `chr_asm` -- the Flask of Wondrous Physick is a separate
+//! two-slot mixture, so the tear branch in `tick()` returns before any of the machinery above.
+//!
+//! What the mixture is, MEASURED by `physick_probe` on 2.6.2.0 (2026-08-03, two runs):
+//!
+//!   * `[OptionalItemId; 2]` at [`PHYSICK_MIXTURE_OFF`], the 16 bytes straight after
+//!     `equipment_entries`. The crate types the region as `unk3e0: usize, unk3e8: usize`.
+//!   * PLAIN, NOT REFCOUNTED. Both slots hold bare GOODS FullIDs (`0x40002AFA`), the same
+//!     representation as `equipment_entries`, which the crate documents as unrefcounted and
+//!     directly written. So there is no `ChrAsm::operator=` equivalent to go through and no
+//!     reference to leak -- a plain dword write is the whole operation.
+//!   * An UNOCCUPIED slot is `0xFFFFFFFF`, which is exactly `OptionalItemId::NONE`. That is the
+//!     structural confirmation that these are ids and not two dwords that happen to hold ids.
+//!   * ONE rep, not four. A whole-`PlayerGameData` dword diff across three mix/unmix events found
+//!     ZERO other words moving, with zero suppressed by the noise filter -- including across
+//!     `EquipGameData.unk60/unk68`, the only plausible home for a menu-index rep by analogy with
+//!     `unk8`.
+//!
+//! 🛑 What that measurement CANNOT rule out, and what the in-game acceptance test is for: a rep
+//! living OUTSIDE `PlayerGameData`. That is the [flask potency] shape, where ER mirrored flask
+//! state into the global GaItem table and a half-updated state CTD'd on death. The question
+//! collapses to "does a WRITTEN mixture actually fire when you drink?" -- which is a flask, not a
+//! probe.
+//!
+//! [flask potency]: crate::flask
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eldenring::cs::{
-    ChrAsm, ChrAsmEquipEntries, EquipGameData, EquipParamAccessory, EquipParamProtector,
-    EquipParamWeapon, GaitemHandle, GameDataMan, SoloParamRepository,
+    ChrAsm, ChrAsmEquipEntries, EquipGameData, EquipParamAccessory, EquipParamGoods,
+    EquipParamProtector, EquipParamWeapon, GaitemHandle, GameDataMan, SoloParamRepository,
 };
 use er_logic::auto_equip::Equipable;
 use fromsoftware_shared::FromStatic;
@@ -93,6 +114,56 @@ const _: () = assert!(std::mem::offset_of!(EquipGameData, chr_asm) == 0x6C);
 /// this fails the build instead of silently writing the wrong field.
 const _: () = assert!(size_of::<ChrAsmEquipEntries>() == 38 * 4);
 
+/// Byte offset of the Flask of Wondrous Physick's two-tear mixture inside `EquipGameData`.
+///
+/// MEASURED, not guessed (see the module docs). The crate keeps the region private and mistyped
+/// (`unk3e0: usize, unk3e8: usize`), so it has to be reached by raw offset. The assert below pins
+/// it to the END of `equipment_entries` -- which IS public -- so a crate reshape fails the build
+/// instead of letting us write into whatever moved there. Same guard shape as `EQUIP_INDEX_OFF`.
+const PHYSICK_MIXTURE_OFF: usize = 0x3E4;
+const _: () = assert!(
+    std::mem::offset_of!(EquipGameData, equipment_entries) + size_of::<ChrAsmEquipEntries>() + 4
+        == PHYSICK_MIXTURE_OFF
+);
+const _: () = assert!(
+    PHYSICK_MIXTURE_OFF + 4 * er_logic::physick::MIXTURE_SLOTS <= size_of::<EquipGameData>()
+);
+
+/// The two mixture slots as the game holds them: [`er_logic::physick::EMPTY_SLOT`] for empty,
+/// otherwise a GOODS FullID.
+///
+/// SAFETY: `equipment` is a live `EquipGameData` and the pair sits wholly inside it (asserted
+/// above), so both reads stay in the object.
+fn physick_mixture(equipment: &EquipGameData) -> [u32; er_logic::physick::MIXTURE_SLOTS] {
+    let base = equipment as *const EquipGameData as usize + PHYSICK_MIXTURE_OFF;
+    std::array::from_fn(|i| unsafe { ((base + i * 4) as *const u32).read_unaligned() })
+}
+
+/// Write one mixture slot. A plain dword store IS the whole operation: the slots are unrefcounted
+/// (module docs), so unlike `chr_asm.gaitem_handles` there is no handle to acquire or release.
+///
+/// SAFETY: as [`physick_mixture`]; `slot` is bounded by the caller
+/// ([`er_logic::physick::slot_for_tear`] only ever returns a valid index).
+fn write_physick_slot(equipment: &mut EquipGameData, slot: usize, value: u32) {
+    debug_assert!(slot < er_logic::physick::MIXTURE_SLOTS);
+    let base = equipment as *mut EquipGameData as usize + PHYSICK_MIXTURE_OFF;
+    unsafe { ((base + slot * 4) as *mut u32).write_unaligned(value) };
+}
+
+/// Is this received FullID a physick tear? Reads the game's OWN `EquipParamGoods` row, so no
+/// hardcoded id list can go stale -- the same instrument `wep_type` and `protectorCategory` use.
+fn is_physick_tear(full_id: i32) -> bool {
+    let Some(row) = er_logic::physick::goods_row(full_id) else {
+        return false;
+    };
+    // SAFETY: FD4 singleton, read on the game thread like every other param read in this module.
+    let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+        return false;
+    };
+    repo.get::<EquipParamGoods>(row)
+        .is_some_and(|g| er_logic::physick::is_tear(g.goods_type(), g.sort_id()))
+}
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PENDING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
@@ -101,8 +172,8 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
     if on {
         log::info!(
-            "auto_equip: enabled (received weapons, armour and talismans equip on arrival; \
-             physick tears and spells are NOT covered)"
+            "auto_equip: enabled (received weapons, armour, talismans and physick tears are \
+             equipped/mixed on arrival; spells are NOT covered)"
         );
     }
 }
@@ -135,7 +206,18 @@ pub fn set_enabled(on: bool) {
 /// it properly means matching on the base row in `tick()` -- deliberately left out of this fix so
 /// the change stays one line of behaviour.
 pub fn enqueue(full_id: i32) {
-    if !ENABLED.load(Ordering::Relaxed) || er_logic::auto_equip::equipable(full_id).is_none() {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    // Tears are classified HERE and not in `er_logic::auto_equip::equipable`, which is pure and
+    // cannot read a param row (its doc comment says so, and that stays true).
+    //
+    // 🛑 The classification has to happen at ENQUEUE, not in `tick()`. Widening the queue to every
+    // GOODS id would park each non-tear good in `still_pending` forever: a Golden Rune the player
+    // drinks on pickup never appears in the bag, so the "not granted yet -- retry next tick" arm
+    // would retry it every tick for the rest of the session. That is the #308 shape -- a bag walk
+    // cannot tell "never arrived" from "already consumed".
+    if er_logic::auto_equip::equipable(full_id).is_none() && !is_physick_tear(full_id) {
         return;
     }
     let full_id = crate::upgrades::apply_auto_upgrade(full_id);
@@ -209,19 +291,42 @@ pub fn tick() {
     // mutate chr_asm. Both values come off the entry this loop already visits; the index is the
     // entry's position in the normal-items list, biased by `key_items_capacity` the way the game
     // biases it (indices below the capacity address the key-item list instead).
+    //
+    // 🛑 THE KEY-ITEM LIST IS NOT OPTIONAL. This walked `normal_entries()` alone until #334, which
+    // was correct for as long as auto_equip only handled weapons, protectors and talismans -- none
+    // of which are key items. PHYSICK TEARS ARE: the pinned crate documents
+    // `multiplay_key_items` as holding the `REGENERATIVE_MATERIAL` and `WONDROUS_PHYSICK_TEAR`
+    // copies of the KEY items list. A delivered tear would therefore never resolve here, would go
+    // back on `still_pending`, and would retry forever -- and in a log that is indistinguishable
+    // from #296.
+    //
+    // The index for a key entry is its raw position (the game addresses key items with indices
+    // BELOW `key_items_capacity`); it is carried for symmetry only, because the one category that
+    // can appear in this list -- goods -- takes the physick branch below and never reaches the
+    // four-rep commit that consumes the index.
     let inventory = &pgd.equipment.equip_inventory_data.items_data;
     let key_items_capacity = inventory.key_items_capacity;
     let owned: HashMap<u32, (GaitemHandle, u32)> = inventory
-        .normal_entries()
+        .current_key_entries()
         .iter()
         .enumerate()
         .filter_map(|(i, slot)| {
             let e = slot.as_option()?;
-            Some((
-                e.item_id.into_inner(),
-                (e.gaitem_handle, key_items_capacity + i as u32),
-            ))
+            Some((e.item_id.into_inner(), (e.gaitem_handle, i as u32)))
         })
+        .chain(
+            inventory
+                .normal_entries()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, slot)| {
+                    let e = slot.as_option()?;
+                    Some((
+                        e.item_id.into_inner(),
+                        (e.gaitem_handle, key_items_capacity + i as u32),
+                    ))
+                }),
+        )
         .collect();
 
     let mut still_pending: Vec<i32> = Vec::new();
@@ -232,6 +337,31 @@ pub fn tick() {
             continue;
         };
         let param_id = full & 0x0FFF_FFFF;
+
+        // PHYSICK TEARS branch out here, before any of the four-rep machinery. They are not a
+        // `ChrAsmSlot`, there is no handle to acquire and no commit to call: the mixture is a plain
+        // `[OptionalItemId; 2]` and a dword store is the entire write.
+        if er_logic::auto_equip::equipable(fid).is_none() {
+            if !is_physick_tear(fid) {
+                continue; // `enqueue` gates this; belt and braces
+            }
+            let equipment = &mut pgd.equipment;
+            let mixture = physick_mixture(equipment);
+            let Some(slot) = er_logic::physick::slot_for_tear(mixture, fid) else {
+                // Already mixed. Idempotent on purpose -- the reconciler replays the whole received
+                // set on reconnect, and a slot rotation per replay would be a feature that eats
+                // itself.
+                continue;
+            };
+            let before = mixture[slot];
+            write_physick_slot(equipment, slot, full);
+            log::info!(
+                "auto_equip: physick tear {full:#010x} -> mixture slot {slot} \
+                 (was {before:#010x}, mixture now {:#010x?})",
+                physick_mixture(equipment)
+            );
+            continue;
+        }
 
         let slot = match er_logic::auto_equip::equipable(fid) {
             Some(Equipable::Weapon) => {
