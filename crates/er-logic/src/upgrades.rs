@@ -344,11 +344,26 @@ mod tests {
         assert_eq!(apply_auto_upgrade(&g, true, 1_000_000), 1_000_000);
     }
 
+    /// Every category that is NOT a weapon is identity here. The ACCESSORY case became
+    /// load-bearing with #295: `auto_equip::enqueue` runs `apply_auto_upgrade` on everything it
+    /// queues, so a talisman now passes through this function on its way to the pending queue.
+    /// If it did not come out unchanged, `tick()` would look the wrong FullID up in the bag, miss,
+    /// and retry forever -- which is exactly the failure #296 was.
     #[test]
     fn non_weapon_passes_through() {
         let g = weapon_hook(false, 12, 25);
         let goods = (er_codec::CATEGORY_GOODS | 2_010_000) as i32;
         assert_eq!(apply_auto_upgrade(&g, true, goods), goods);
+
+        // Ailment Talisman, as item_ids.py ships it (536879032 = category 2, row 10104). Rows in
+        // the reinforce band would otherwise decode as `base + level` -- the guard is the CATEGORY
+        // check in `decode_weapon_id`, not the row range.
+        let talisman = (er_codec::CATEGORY_ACCESSORY | 10_104) as i32;
+        assert_eq!(apply_auto_upgrade(&g, true, talisman), talisman);
+        assert_eq!(decode_weapon_id(talisman), None);
+
+        let protector = (er_codec::CATEGORY_PROTECTOR | 10_000) as i32;
+        assert_eq!(apply_auto_upgrade(&g, true, protector), protector);
     }
 
     #[test]

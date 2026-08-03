@@ -680,7 +680,8 @@ impl shared::Core for Core {
                 // Absent/empty ladder => feature OFF. No ledger; re-runs upward every tick.
                 crate::flask::set_ladder(er_logic::flask_reconcile::parse(sd));
                 // auto_equip: received weapons get equipped into a primary hand (same option name on
-                // both apworlds). The receive loop queues weapon FullIDs; auto_equip::tick drains them.
+                // both apworlds). The receive loop queues equipable FullIDs -- weapons, armour and
+                // talismans; auto_equip::tick drains them.
                 crate::auto_equip::set_enabled(er_logic::options::parse_auto_equip(sd));
                 // Accepts our `no_weapon_requirements` OR Bedrock/fswap's
                 // `remove_weapon_and_spell_requirements` (same client feature, two apworld names).
@@ -1789,11 +1790,15 @@ impl shared::Core for Core {
                     GrantAction::Enqueue {
                         full_id, qty, name, ..
                     } => {
-                        // auto_equip: queue a received WEAPON or PROTECTOR to be equipped once it's
-                        // in the bag. Independent of the grant path below (reconciler may own the
-                        // actual grant), so this fires for every recognized receive.
-                        // `enqueue` self-gates on the option AND on the category -- do NOT re-add an
-                        // `is_weapon` filter here, which is what previously excluded armour.
+                        // auto_equip: queue a received WEAPON, PROTECTOR or TALISMAN to be
+                        // equipped once it's in the bag. Independent of the grant path below
+                        // (reconciler may own the actual grant), so this fires for every
+                        // recognized receive.
+                        // `enqueue` self-gates on the option AND on the category -- do NOT re-add
+                        // an `is_weapon` filter here, which is what previously excluded armour.
+                        // The category set lives in ONE place (`er_logic::auto_equip::equipable`)
+                        // for the same reason: #295 was fixed by adding an arm there and nothing
+                        // else, because there is no second filter to keep in step.
                         crate::auto_equip::enqueue(full_id);
                         // STRANGLER (goods+ledger, THE ATOMIC FLIP): this ONE call grants every
                         // received item — key items/runes (goods) AND consumables (ledger). Once the
