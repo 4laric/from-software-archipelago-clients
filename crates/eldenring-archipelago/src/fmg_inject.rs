@@ -241,10 +241,20 @@ unsafe fn write_u32(a: usize, v: u32) {
     (a as *mut u32).write_unaligned(v);
 }
 
-/// Build a fresh MsgData block = vanilla content + one new single-id group per `injects` entry
-/// (`injects` MUST be sorted by id, and all ids > every vanilla id so group order stays ascending).
+/// Build a fresh MsgData block = vanilla content + a new group per RUN of `injects` ids (`injects`
+/// MUST be sorted by id and hold no vanilla-covered id; they may sit ANYWHERE in the id range).
 /// Header copied verbatim; groups + offset table + (deduped vanilla + injected) string data are laid
 /// out fresh, all base-relative. `injects` empty => exact identity rebuild. Returns the new block.
+///
+/// 🔥 THE INJECTED GROUPS ARE SORTED INTO PLACE, not appended (2026-08-03, issue #300). Until now
+/// this required every injected id to sort ABOVE every vanilla id, which is true of the synthetic
+/// goods ids (~3.78M) and false of a spare goods row at ~9350 -- so `extend_swap_overrides` could
+/// only ever REDIRECT an existing entry, and an id with no entry in the category was unwritable.
+/// GoodsInfo(20)/GoodsCaption(24) cover far fewer ids than GoodsName(10), which is exactly how
+/// boblerrr's `0.3.1` log got `names=53 infos=25 captions=25`. The game BINARY SEARCHES the group
+/// array, so the only real constraint is that it stays ascending and disjoint -- checked here by
+/// `er_logic::fmg_groups::is_ordered_disjoint` (host-tested), and a failure aborts the build rather
+/// than handing the game an array whose search result depends on the array length.
 unsafe fn build_block(
     vanilla: usize,
     groups: &[Group],
@@ -266,28 +276,59 @@ unsafe fn build_block(
             ovr.push(((*id - g.first_id + g.string_index_base) as usize, s));
         }
     }
-    // Merge contiguous inject ids into RUNS -> one group per run (sorted; ids > all vanilla ids). This
-    // keeps groups few + non-overlapping so the game's binary search is boundary-safe (4777 single-id
-    // groups created an edge case on the lowest ids). String indices stay sequential per inject.
-    let mut inj_groups: Vec<Group> = Vec::new();
-    let mut k = 0usize;
-    while k < injects.len() {
-        let start = injects[k].0;
-        let base_idx = (num_vanilla + k) as u32;
-        let mut end = start;
-        let mut j = k;
-        while j + 1 < injects.len() && injects[j + 1].0 == injects[j].0 + 1 {
-            j += 1;
-            end = injects[j].0;
+    // Merge contiguous inject ids into RUNS -> one group per run. This keeps groups few (28 spare ids
+    // cost 4 records) so the game's binary search is boundary-safe (4777 single-id groups created an
+    // edge case on the lowest ids). String indices stay sequential per inject, which is why the run
+    // merge and the index assignment are ONE host-tested function rather than two loops that agree
+    // by inspection.
+    let inj_ids: Vec<u32> = injects.iter().map(|(id, _)| *id).collect();
+    let Some(runs) = er_logic::fmg_groups::runs_from_ids(&inj_ids, num_vanilla as u32) else {
+        log::warn!(
+            "FMG build_block: the {} injected id(s) are not strictly ascending; NOT building. A \
+             run's ids must map to CONSECUTIVE offset-table slots, so an unsorted/duplicated input \
+             would point records at the wrong strings.",
+            inj_ids.len()
+        );
+        return None;
+    };
+    // The final record array: vanilla + injected, ASCENDING BY ID. Sorted, not appended -- an
+    // injected id may sit in the middle of the vanilla range (see the header).
+    //
+    // 🛑 BOTH the merge and the ordering gate are skipped when there is nothing to inject, so the
+    // block this produces for the identity / redirect-only path is BYTE-IDENTICAL to the one it has
+    // been producing in production. A new gate belongs on the new shape: if the vanilla array ever
+    // turned out not to be strictly ascending, checking it unconditionally would take down the
+    // override path that has been shipping for weeks, and re-SORTING it unconditionally would hand
+    // the game a different array than it had. Insertion is the only caller that needs either.
+    let mut all_groups: Vec<Group> = groups.to_vec();
+    if !runs.is_empty() {
+        all_groups.extend(runs.iter().map(|r| Group {
+            string_index_base: r.string_index_base,
+            first_id: r.first_id,
+            last_id: r.last_id,
+        }));
+        all_groups.sort_by_key(|g| g.first_id);
+        let spans: Vec<er_logic::fmg_groups::Span> = all_groups
+            .iter()
+            .map(|g| er_logic::fmg_groups::Span::new(g.first_id, g.last_id))
+            .collect();
+        if !er_logic::fmg_groups::is_ordered_disjoint(&spans) {
+            // Two records claiming one id give the game's binary search two answers, and WHICH it
+            // returns is a function of the array length -- an intermittent wrong string or an
+            // out-of-range offset-table index, not an obvious break. Refuse to allocate it. (The
+            // check covers the vanilla records too, since they are in the merged array.)
+            log::warn!(
+                "FMG build_block: the rebuilt group array ({} vanilla + {} injected record(s)) is \
+                 not ascending/disjoint; NOT building (the game binary-searches it). An injected id \
+                 that a vanilla group already covers is the usual cause -- it wants a REDIRECT, not \
+                 a new entry.",
+                groups.len(),
+                runs.len()
+            );
+            return None;
         }
-        inj_groups.push(Group {
-            string_index_base: base_idx,
-            first_id: start,
-            last_id: end,
-        });
-        k = j + 1;
     }
-    let count = groups.len() + inj_groups.len();
+    let count = all_groups.len();
     let offtab_off = ((MD_GROUPS + count * 16) + 7) & !7;
     let strings_off = ((offtab_off + num_out * 8) + 1) & !1;
 
@@ -309,16 +350,9 @@ unsafe fn build_block(
     let block = valloc(total)?;
     // header (0..0x28) verbatim
     std::ptr::copy_nonoverlapping(vanilla as *const u8, block as *mut u8, MD_GROUPS);
-    // group records: vanilla, then one single-id group per inject (stringIndexBase = num_vanilla + i)
-    for (i, g) in groups.iter().enumerate() {
+    // group records, in the ascending/disjoint order validated above (vanilla and injected merged).
+    for (i, g) in all_groups.iter().enumerate() {
         let gr = block + MD_GROUPS + i * 16;
-        write_u32(gr, g.string_index_base);
-        write_u32(gr + 4, g.first_id);
-        write_u32(gr + 8, g.last_id);
-        write_u32(gr + 12, 0);
-    }
-    for (i, g) in inj_groups.iter().enumerate() {
-        let gr = block + MD_GROUPS + (groups.len() + i) * 16;
         write_u32(gr, g.string_index_base);
         write_u32(gr + 4, g.first_id);
         write_u32(gr + 8, g.last_id);
@@ -561,12 +595,184 @@ pub fn read_goods_string(category: u32, id: u32) -> Option<String> {
     read_string(ptr)
 }
 
-/// Extend-swap OVERRIDES: replace the strings of EXISTING ids in `base_array[0][category]` with longer
-/// AP strings, rebuilding from the LIVE block so any prior swap (e.g. this module's synthetic-goods
-/// appends) is preserved. Used by shop_preview for names/info/captions that don't fit the packed vanilla
-/// entry in place. Validated in OUR memory before the swap (a sample of non-overridden ids round-trips +
-/// every override resolves to exactly what we wrote); any mismatch aborts (game untouched). No-op on
-/// empty / category-not-up. Returns how many overrides landed.
+/// One rebuild of a category block: what goes in, and whether the result must be proved against the
+/// GAME's own lookup before we keep it. Bundled into a struct so `build_validate_swap` stays under
+/// clippy's argument limit and so no caller can silently transpose `injects` and `overrides`.
+struct Rebuild<'a> {
+    /// The LIVE block we parsed from, and the block we revert to if the read-back fails.
+    md: usize,
+    groups: &'a [Group],
+    offsets: &'a [u64],
+    /// Ids in NO vanilla group: a new record + a new offset-table slot is CREATED for each.
+    injects: &'a [(u32, Vec<u16>)],
+    /// Ids already in a group: their existing string slot is redirected.
+    overrides: &'a [(u32, Vec<u16>)],
+    /// Read every written id back through `SearchStringTable` AFTER the swap and revert on any
+    /// mismatch. Set only when `injects` is non-empty -- see the call site.
+    verify_live: bool,
+}
+
+/// Build one category block, validate it in OUR memory, swap it in, and (optionally) prove the GAME
+/// reads it correctly. Returns how many entries landed, or `None` with the game left untouched
+/// (either never swapped, or swapped and reverted).
+unsafe fn build_validate_swap(base: usize, category: u32, r: &Rebuild<'_>) -> Option<usize> {
+    let block = match build_block(r.md, r.groups, r.offsets, r.injects, r.overrides) {
+        Some(b) => b,
+        None => {
+            log::warn!("FMG extend-swap(cat {category}): build_block failed (alloc/ordering?)");
+            return None;
+        }
+    };
+    let (g2, o2) = match parse(block) {
+        Some(p) => p,
+        None => {
+            log::warn!(
+                "FMG extend-swap(cat {category}): rebuilt block failed re-parse; NOT swapping"
+            );
+            return None;
+        }
+    };
+
+    // A SAMPLE of ids we did NOT write, which must still resolve to exactly their vanilla string.
+    // The first 16 groups are the historical sample; on their own they are useless for an INSERT,
+    // because a spare goods row sits ~9000 ids in and a mis-sorted record corrupts the lookups of
+    // its NEIGHBOURS, not of the lowest ids in the file. So the records either side of every
+    // inserted id are sampled too -- the guard has to be able to fail when the bug is present.
+    let mut sample: Vec<u32> = r.groups.iter().take(16).map(|g| g.first_id).collect();
+    for (id, _) in r.injects.iter() {
+        if let Some(g) = r.groups.iter().rev().find(|g| g.last_id < *id) {
+            sample.push(g.first_id);
+            sample.push(g.last_id);
+        }
+        if let Some(g) = r.groups.iter().find(|g| g.first_id > *id) {
+            sample.push(g.first_id);
+            sample.push(g.last_id);
+        }
+    }
+    sample.sort_unstable();
+    sample.dedup();
+
+    let written: std::collections::HashSet<u32> = r
+        .overrides
+        .iter()
+        .chain(r.injects.iter())
+        .map(|(id, _)| *id)
+        .collect();
+    let mut mismatch = 0;
+    for id in sample.iter().copied() {
+        if written.contains(&id) {
+            continue; // written on purpose; checked below
+        }
+        if my_lookup(r.md, r.groups, r.offsets, id) != my_lookup(block, &g2, &o2, id) {
+            mismatch += 1;
+        }
+    }
+    for (id, txt) in r.overrides.iter().chain(r.injects.iter()) {
+        let want = String::from_utf16_lossy(txt);
+        if my_lookup(block, &g2, &o2, *id).as_deref() != Some(want.as_str()) {
+            mismatch += 1;
+        }
+    }
+    if mismatch != 0 {
+        log::warn!(
+            "FMG extend-swap(cat {category}): rebuilt block mismatch on {mismatch} id(s); NOT swapping (safe)"
+        );
+        return None;
+    }
+
+    if !swap_category(base, category, block) {
+        // The repo pointer stopped being plausible between the parse and here. Nothing was written,
+        // so say so rather than returning a count for a swap that did not happen.
+        log::warn!(
+            "FMG extend-swap(cat {category}): swap REFUSED (repo pointer not plausible); the block \
+             was built and validated but nothing was published"
+        );
+        return None;
+    }
+    if !r.verify_live {
+        return Some(r.overrides.len() + r.injects.len());
+    }
+
+    // POST-SWAP READ-BACK THROUGH THE GAME'S OWN LOOKUP. Everything above is our parser agreeing
+    // with our builder -- it cannot detect a group array the GAME walks differently, which is the
+    // one thing a mid-array insert newly risks (it binary-searches; we scan). `SearchStringTable`
+    // takes the repo, not a block, so this is only possible AFTER the swap; the window is a few
+    // microseconds on the game thread and a failure reverts to the block we parsed from.
+    let repo_addr = read_usize(base + REPO_RVA);
+    if !sig_ok(base + SEARCH_RVA) || !plausible(repo_addr) {
+        // Verification was PROMISED (verify_live) and cannot be delivered, so the swap does not get
+        // to stand on "probably fine". Revert; the caller falls back to redirect-only.
+        log::error!(
+            "FMG extend-swap(cat {category}): swapped a block with {} inserted record(s) but the \
+             read-back is unavailable (SearchStringTable sig / repo pointer); REVERTING to {:#x}",
+            r.injects.len(),
+            r.md
+        );
+        swap_category(base, category, r.md);
+        return None;
+    }
+    let search: SearchFn = std::mem::transmute::<usize, SearchFn>(base + SEARCH_RVA);
+    let repo = repo_addr as *mut c_void;
+    let mut bad: Vec<u32> = Vec::new();
+    for (id, txt) in r.injects.iter().chain(r.overrides.iter()) {
+        let want = String::from_utf16_lossy(txt);
+        if read_string(search(repo, 0, category, *id) as usize).as_deref() != Some(want.as_str()) {
+            bad.push(*id);
+        }
+    }
+    for id in sample.iter().copied() {
+        if written.contains(&id) {
+            continue;
+        }
+        let vanilla = my_lookup(r.md, r.groups, r.offsets, id);
+        if vanilla.is_some() && read_string(search(repo, 0, category, id) as usize) != vanilla {
+            bad.push(id);
+        }
+    }
+    if !bad.is_empty() {
+        let head: Vec<u32> = bad.iter().copied().take(8).collect();
+        log::error!(
+            "FMG extend-swap(cat {category}): the GAME reads {} of the ids in the swapped block \
+             wrongly (ids: {head:?}); REVERTING to the previous block {:#x}. The block was built \
+             with {} NEW record(s) sorted into the vanilla array -- that is the shape being \
+             blamed. Nothing is lost that was working before this call.",
+            bad.len(),
+            r.md,
+            r.injects.len()
+        );
+        swap_category(base, category, r.md);
+        return None;
+    }
+    Some(r.overrides.len() + r.injects.len())
+}
+
+/// Insertion (CREATING an FMG entry for an id no vanilla group covers) is the one shape here whose
+/// correctness depends on the game's binary search over a record array we reordered. It is proved
+/// per swap by a read-back; the first failure disables it for the session so we do not build, swap
+/// and revert a block on every world edge for the rest of the run.
+static INSERT_UNSAFE: AtomicBool = AtomicBool::new(false);
+
+/// Extend-swap OVERRIDES: give a set of ids in `base_array[0][category]` new AP strings, rebuilding
+/// from the LIVE block so any prior swap (e.g. this module's synthetic-goods appends) is preserved.
+/// Used by shop_preview / check_lots for names, info lines and captions that don't fit the packed
+/// vanilla entry in place. Returns how many entries landed. No-op on empty / category-not-up.
+///
+/// TWO shapes, and the second one is new (2026-08-03, issue #300):
+///
+///   * REDIRECT -- the id already lives in a vanilla group, so it has a string slot; point that slot
+///     at our longer string. An EMPTY vanilla entry is fine (that is the `[ERROR]` render).
+///   * INSERT   -- the id is in NO group, so it has no slot and the menu renders the `?GoodsInfo?`
+///     tag. Create a record for it, sorted into place. This USED to be impossible ("build_block's
+///     inject path cannot take it either, injected ids must sort above every vanilla id" -- the
+///     apworld's own datamine script says so), and the cost was that the three goods categories
+///     have DIFFERENT id sets: boblerrr's `0.3.1` log named 53 shop slots and described 25 of them,
+///     because GoodsInfo(20)/GoodsCaption(24) carry no entry for 28 of those spare goods rows.
+///     Refusing to name them could never have fixed those 28 -- the tag renders whether or not we
+///     write anything -- so the writer had to learn to CREATE an entry.
+///
+/// Validated in OUR memory before the swap (a sample of untouched ids round-trips + every written id
+/// resolves), and when anything was INSERTED, re-read through the game's own `SearchStringTable`
+/// after it, reverting on any disagreement.
 pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> usize {
     if overrides.is_empty() {
         return 0;
@@ -586,81 +792,97 @@ pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> us
             return 0;
         }
     };
-    // keep only ids that exist in a group (others have no slot to redirect)
-    let resolvable: Vec<(u32, Vec<u16>)> = overrides
+    // REDIRECT vs INSERT, decided by the category's existing coverage (er-logic, host-tested against
+    // the 25/28 split from the log).
+    let spans: Vec<er_logic::fmg_groups::Span> = groups
         .iter()
-        .filter(|(id, _)| groups.iter().any(|g| *id >= g.first_id && *id <= g.last_id))
-        .cloned()
+        .map(|g| er_logic::fmg_groups::Span::new(g.first_id, g.last_id))
         .collect();
-    // SAY WHAT WAS DROPPED. An id outside every group has no string slot to redirect, and `injects`
-    // cannot take it either -- build_block requires injected ids to sort ABOVE every vanilla id, and
-    // a spare goods row sits in the middle of the range. So it is genuinely unwritable here, and
-    // until 2026-07-25 it was unwritable SILENTLY: the caller saw a smaller count and nothing named
-    // the ids, so a shop slot repointed at such a row rendered the game's `?GoodsName?` tag and the
-    // log said only that fewer overrides landed than were asked for. That is the whole "absence of
-    // behavior is indistinguishable from off" failure this project keeps paying for.
-    // (Alaric, playtest 2026-07-25: shop slots reading `?GoodsName?` / `?GoodsInfo?`.)
-    let dropped = overrides.len() - resolvable.len();
-    if dropped > 0 {
-        let sample: Vec<u32> = overrides
+    let ids: Vec<u32> = overrides.iter().map(|(id, _)| *id).collect();
+    let split = er_logic::fmg_groups::split_by_coverage(&spans, &ids);
+    let text = |want: u32| -> Vec<u16> {
+        overrides
             .iter()
-            .map(|(id, _)| *id)
-            .filter(|id| !groups.iter().any(|g| *id >= g.first_id && *id <= g.last_id))
-            .take(8)
-            .collect();
+            .find(|(id, _)| *id == want)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default()
+    };
+    let resolvable: Vec<(u32, Vec<u16>)> =
+        split.redirect.iter().map(|&id| (id, text(id))).collect();
+    let mut injects: Vec<(u32, Vec<u16>)> = split.insert.iter().map(|&id| (id, text(id))).collect();
+
+    // FAIL CLOSED on the new shape. An insert is only kept if the game could be CAUGHT reading it
+    // wrongly, and that read-back needs `SearchStringTable`; without the signature (a game patch
+    // moved it) we cannot check, so we do not insert. Same once an insert has already been caught.
+    if !injects.is_empty() {
+        let latched = INSERT_UNSAFE.load(Ordering::Relaxed);
+        if latched || !sig_ok(base + SEARCH_RVA) {
+            let sample: Vec<u32> = injects.iter().map(|(id, _)| *id).take(8).collect();
+            log::warn!(
+                "FMG extend-swap(cat {category}): {} of {} id(s) are in NO vanilla group and entry \
+                 INSERTION is unavailable ({}), so they have no string slot and will render the \
+                 `?GoodsName?` / `?GoodsInfo?` tag in game. ids: {sample:?}",
+                injects.len(),
+                overrides.len(),
+                if latched {
+                    "disabled after a failed read-back earlier this session"
+                } else {
+                    "SearchStringTable signature mismatch, so a swap cannot be verified"
+                }
+            );
+            injects.clear();
+        }
+    }
+    if resolvable.is_empty() && injects.is_empty() {
+        return 0;
+    }
+
+    if !injects.is_empty() {
+        let inserted = injects.len();
+        let redirected = resolvable.len();
+        let r = Rebuild {
+            md,
+            groups: &groups,
+            offsets: &offsets,
+            injects: &injects,
+            overrides: &resolvable,
+            verify_live: true,
+        };
+        if let Some(n) = unsafe { build_validate_swap(base, category, &r) } {
+            log::info!(
+                "FMG extend-swap(cat {category}): swapped (+{redirected} redirected, \
+                 +{inserted} NEW entries created for ids in no vanilla group; \
+                 read-back through the game's own lookup OK)"
+            );
+            return n;
+        }
+        INSERT_UNSAFE.store(true, Ordering::Relaxed);
         log::warn!(
-            "FMG extend-swap(cat {category}): {dropped} of {} id(s) are in NO vanilla group, so they              have no string slot to redirect and CANNOT be named here -- they will render as              `?GoodsName?` in game. Pick rows that already carry an FMG entry (an EMPTY one is fine              -- that is the `[ERROR]` render). ids: {sample:?}",
+            "FMG extend-swap(cat {category}): entry INSERTION did not verify; DISABLED for the rest \
+             of the session and retrying redirect-only. {inserted} of {} id(s) keep rendering the \
+             `?GoodsInfo?`-style tag; the other {redirected} are unaffected.",
             overrides.len()
         );
-    }
-    if resolvable.is_empty() {
-        return 0;
-    }
-    let block = match unsafe { build_block(md, &groups, &offsets, &[], &resolvable) } {
-        Some(b) => b,
-        None => {
-            log::warn!("FMG extend-swap(cat {category}): build_block failed (alloc?)");
+        if resolvable.is_empty() {
             return 0;
         }
+    }
+
+    let r = Rebuild {
+        md,
+        groups: &groups,
+        offsets: &offsets,
+        injects: &[],
+        overrides: &resolvable,
+        verify_live: false,
     };
-    let (g2, o2) = match unsafe { parse(block) } {
-        Some(p) => p,
-        None => {
-            log::warn!(
-                "FMG extend-swap(cat {category}): rebuilt block failed re-parse; NOT swapping"
-            );
-            return 0;
+    match unsafe { build_validate_swap(base, category, &r) } {
+        Some(n) => {
+            log::info!("FMG extend-swap(cat {category}): swapped (+{n} overrides)");
+            n
         }
-    };
-    let ovr_ids: std::collections::HashSet<u32> = resolvable.iter().map(|(id, _)| *id).collect();
-    let mut mismatch = 0;
-    for g in groups.iter().take(16) {
-        let id = g.first_id;
-        if ovr_ids.contains(&id) {
-            continue; // overridden on purpose; checked below
-        }
-        if my_lookup(md, &groups, &offsets, id) != my_lookup(block, &g2, &o2, id) {
-            mismatch += 1;
-        }
+        None => 0,
     }
-    for (id, s) in &resolvable {
-        let want = String::from_utf16_lossy(s);
-        if my_lookup(block, &g2, &o2, *id).as_deref() != Some(want.as_str()) {
-            mismatch += 1;
-        }
-    }
-    if mismatch != 0 {
-        log::warn!(
-            "FMG extend-swap(cat {category}): rebuilt block mismatch on {mismatch} id(s); NOT swapping (safe)"
-        );
-        return 0;
-    }
-    unsafe { swap_category(base, category, block) };
-    log::info!(
-        "FMG extend-swap(cat {category}): swapped (+{} overrides)",
-        resolvable.len()
-    );
-    resolvable.len()
 }
 
 pub fn run() -> bool {
