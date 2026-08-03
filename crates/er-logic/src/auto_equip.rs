@@ -58,23 +58,50 @@ pub fn is_weapon(full_id: i32) -> bool {
     (full_id as u32) & CATEGORY_MASK == CATEGORY_WEAPON
 }
 
-/// `EQUIP_PARAM_WEAPON_ST.wep_type` values that are LEFT-hand only (shields).
+/// `EQUIP_PARAM_WEAPON_ST.wep_type` values that auto-equip to the LEFT hand.
 ///
-/// DATAMINE-CONFIRMED 2026-08-03 against `EquipParamWeapon` joined to `WeaponName.fmg` (base +
-/// both DLC msgbnds): 65 = Small Shield (197 named rows), 67 = Medium Shield (339), 69 =
-/// Greatshield (230). Those three are exactly the shield population -- no shield sits outside
-/// them and nothing else sits inside them. The previous note called this list RUNTIME-UNCONFIRMED
-/// and said "if a shield lands in the right hand the fix is this list"; it is not, the list is
-/// complete. (Datamine-confirmed is still not runtime-confirmed -- no live equip has been read.)
+/// THE RULESET (Alaric's call, 2026-08-03): follow the community "French Challenge" format --
+/// randomizer + auto-equip + permadeath + all bosses + region lock. Its equipment rule reads:
 ///
-/// Catalysts and torches are deliberately NOT here: they are routinely main-handed, so they
-/// default RIGHT like any weapon. 🛑 The staff/seal ids in that sentence used to read
-/// "staff 57 / seal 59". **`wep_type` 59 has ZERO rows.** Seals are **61** (Clawmark, Dragon
-/// Communion, Erdtree...); staffs are 57. The 59 was never load-bearing here -- it appeared only
-/// in prose and in a vacuous test -- but it would have gone straight into the #301 "do not equip a
-/// catalyst the player cannot cast with" classifier, which would then have matched every staff and
-/// no seal, and passed its own test.
-const LEFT_HAND_WEP_TYPES: &[u16] = &[65, 67, 69];
+///   "Weapons auto-equip in right hand; shields/staves/seals/bows/crossbows in left hand."
+///   "All auto-equipped gear must stay equipped ... No unequipping allowed."
+///
+/// That rules out the two alternatives considered for #301 -- never equipping catalysts, or
+/// equipping them only when the player has a castable spell. The format's whole point is that you
+/// do not get to opt out of what you are given; the fix is WHERE it lands, not WHETHER.
+///
+/// 🛑 SOURCING, stated because it is thinner than the rest of this file. The left-hand clause rests
+/// on a SINGLE written transcription (a community playlist description). There is no French
+/// primary document -- the rules circulate as Twitch chat commands (`!french`). The reference
+/// implementation, LukeYui's item randomiser, documents only "shields will always go in your
+/// left hand slot 1" -- shields ONLY -- which is exactly why staves and seals landed in the
+/// main hand and disarmed the player (#301). The community rule is broader than the mod.
+///
+/// DATAMINE-CONFIRMED 2026-08-03 against `EquipParamWeapon` joined to `WeaponName.fmg` (base + both
+/// DLC msgbnds). Named-row counts in brackets:
+///
+///   shields    65 Small [197] · 67 Medium [339] · 69 Greatshield [230] -- exactly the
+///              shield population: no shield outside these three, nothing else inside
+///   catalysts  57 Glintstone Staff [19] · 61 Sacred Seal [10]           -- #301
+///   bows       50 Light Bow [5] · 51 Bow [7] · 53 Greatbow [4]
+///   crossbows  55 Crossbow [8] · 56 Ballista [2]  -- Hand Ballista, Jar Cannon
+///
+/// Bows and crossbows are in the ruleset and are NOT a reported bug: they have the identical
+/// "received item disarms you in melee" failure mode as catalysts, and following the ruleset
+/// pre-empts it rather than waiting for the report. 56 (Ballista) is a judgement call -- the rule
+/// says "crossbows" and a Hand Ballista is a two-handed siege crossbow; it is grouped here.
+///
+/// TORCH (87) STAYS RIGHT. The ruleset mentions a torch exactly once, as a narrow exception --
+/// "you may equip the Sentinel Torch (left-hand slot 2) only to fight the Invisible Black Knife
+/// Assassin" -- which is a permission during a fight, not an auto-equip rule. Left where it was.
+///
+/// ⚠️ ONE SLOT, LAST WRITER WINS. There is a single `SLOT_WEAPON_LEFT_1`, so a received staff
+/// clobbers a received shield. That is faithful to "no unequipping allowed" and is not a bug here.
+/// The ruleset's torch clause shows a left-hand slot 2 exists in their model, but its `ChrAsmSlot`
+/// index is NOT verified and this file will not guess one (same reason ammo returns `None`).
+///
+/// (Datamine-confirmed is still not runtime-confirmed -- no live equip has been read back.)
+const LEFT_HAND_WEP_TYPES: &[u16] = &[50, 51, 53, 55, 56, 57, 61, 65, 67, 69];
 
 /// `wep_type` values that are AMMUNITION, not a held weapon.
 ///
@@ -179,9 +206,9 @@ mod tests {
         assert_eq!(hand_for_wep_type(67), Hand::Left); // medium shield
         assert_eq!(hand_for_wep_type(69), Hand::Left); // greatshield
         assert_eq!(hand_for_wep_type(1), Hand::Right); // straight sword
-        assert_eq!(hand_for_wep_type(57), Hand::Right); // glintstone staff
-        assert_eq!(hand_for_wep_type(61), Hand::Right); // sacred seal (61, NOT 59: 59 has 0 rows)
-        assert_eq!(hand_for_wep_type(87), Hand::Right); // torch (main-hand default)
+        assert_eq!(hand_for_wep_type(57), Hand::Left); // glintstone staff -- French Challenge
+        assert_eq!(hand_for_wep_type(61), Hand::Left); // sacred seal (61, NOT 59: 59 has 0 rows)
+        assert_eq!(hand_for_wep_type(87), Hand::Right); // torch stays main-hand (see the const)
     }
 
     #[test]
@@ -207,6 +234,36 @@ mod tests {
         assert_eq!(slot_for_wep_type(87), Some(SLOT_WEAPON_RIGHT_1)); // torch
         assert_eq!(slot_for_wep_type(69), Some(SLOT_WEAPON_LEFT_1)); // greatshield
         assert!(!is_ammo(57) && !is_ammo(61)); // staff / seal are held, not ammo
+    }
+
+    /// The #301 motivating case, by name (rule 11): boblerrr received a staff/seal, it went to the
+    /// MAIN hand, and with no sorceries he was effectively unarmed. Under the French Challenge
+    /// ruleset every one of these belongs in the LEFT hand. Fails on the pre-2026-08-03 list
+    /// `[65, 67, 69]`, which is exactly what shipped the bug.
+    #[test]
+    fn catalysts_bows_and_crossbows_go_to_the_left_hand_like_shields() {
+        for (t, what) in [
+            (57u16, "glintstone staff"),
+            (61, "sacred seal"),
+            (50, "light bow"),
+            (51, "bow"),
+            (53, "greatbow"),
+            (55, "crossbow"),
+            (56, "ballista"),
+        ] {
+            assert_eq!(
+                hand_for_wep_type(t),
+                Hand::Left,
+                "wep_type {t} ({what}) must auto-equip LEFT -- main-handing it takes the player's \
+                 weapon away and leaves them unable to fight (#301)"
+            );
+            assert_eq!(slot_for_wep_type(t), Some(SLOT_WEAPON_LEFT_1));
+        }
+        // and the classes that must NOT have moved
+        assert_eq!(hand_for_wep_type(1), Hand::Right); // straight sword
+        assert_eq!(hand_for_wep_type(41), Hand::Right); // colossal weapon
+        assert_eq!(hand_for_wep_type(87), Hand::Right); // torch -- ruleset does not move it
+        assert_eq!(slot_for_wep_type(85), None); // ammo still not equipped at all (#294)
     }
 
     #[test]
