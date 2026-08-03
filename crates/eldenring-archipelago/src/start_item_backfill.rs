@@ -144,15 +144,42 @@ pub fn tick(settled: bool) {
             // Bag empty or still changing between ticks. Do NOT latch, do NOT read absences off it.
         }
         ScanVerdict::Converged => {
-            log::info!(
-                "start-item backfill: CONVERGED -- all {} startItems present in bag ({} inventory id(s) scanned: {} normal, {} key, {} multiplay). granted {} this session",
-                items.len(),
-                present.len(),
-                counts.0,
-                counts.1,
-                counts.2,
-                st.confirmed_count()
-            );
+            // #308 -- CONVERGED IS NOT UNCONDITIONALLY GOOD NEWS.
+            //
+            // The scan is PRESENCE-based on purpose: counting quantity would re-grant a stack the
+            // player has merely used (`present_stack_is_not_topped_up`). But that means one
+            // delivered copy makes N requested copies look satisfied, and a grant the pot cap ate
+            // is invisible to it. Alaric's 2026-08-03 log, timestamps unedited:
+            //
+            //   16:54:29 9/40 startItems absent -> attempting ["0x401ea99c" x9]
+            //   16:54:29 grant 0x401ea99c -> Placed
+            //   16:54:29 CONVERGED -- all 40 startItems present in bag. granted 1 this session
+            //   16:54:30 [WARN] pot-cap: grant of 1 CAPPED to 0 (held 10, cap 10)
+            //
+            // Converged in the same second, after one grant of nine. `GrantOutcome::Capped` is the
+            // ONLY evidence the rest never landed, so say so here rather than reporting a clean
+            // success the bag cannot contradict.
+            let shortfall = st.capped_shortfall();
+            if shortfall.is_empty() {
+                log::info!(
+                    "start-item backfill: CONVERGED -- all {} startItems present in bag ({} inventory id(s) scanned: {} normal, {} key, {} multiplay). granted {} this session",
+                    items.len(),
+                    present.len(),
+                    counts.0,
+                    counts.1,
+                    counts.2,
+                    st.confirmed_count()
+                );
+            } else {
+                log::warn!(
+                    "start-item backfill: converged with a SHORTFALL -- every startItem is PRESENT, \
+                     but {} id(s) hit a delivery cap and the extra copies were never added: {:02x?}. \
+                     The server counts them delivered. This is a SEED issue, not a client one: the \
+                     start-item list asks for more of a capped good than the game will hold (#308).",
+                    shortfall.len(),
+                    shortfall
+                );
+            }
             DONE.store(true, Ordering::Relaxed);
         }
         ScanVerdict::Grant(missing) => {

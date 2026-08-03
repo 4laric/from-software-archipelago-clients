@@ -211,6 +211,12 @@ pub struct BackfillState {
     last_round: HashMap<i32, u64>,
     round: u64,
     prev_snapshot: Option<HashSet<u32>>,
+    /// FullIDs whose grant came back [`GrantOutcome::Capped`] -- the call succeeded and the game
+    /// added nothing. Recorded because the BAG CANNOT SHOW THIS: the scan is presence-based on
+    /// purpose (see `present_stack_is_not_topped_up` -- counting quantity would re-grant a stack
+    /// the player has simply used), so one arrived pot makes nine requested pots look satisfied.
+    /// The cap outcome is the only evidence that the rest never landed.
+    capped: Vec<i32>,
     /// Items delivered AND confirmed present by a later snapshot — the only ones we may report.
     confirmed: Vec<i32>,
 }
@@ -264,6 +270,9 @@ impl BackfillState {
         }
         self.last_round.insert(fid, self.round);
         *self.attempts.entry(fid).or_insert(0) += 1;
+        if outcome == GrantOutcome::Capped && !self.capped.contains(&fid) {
+            self.capped.push(fid);
+        }
     }
 
     /// Fold the NEXT snapshot into the delivered set: an item we attempted and can now SEE is
@@ -274,6 +283,17 @@ impl BackfillState {
                 self.confirmed.push(fid);
             }
         }
+    }
+
+    /// FullIDs the game refused to add because a delivery cap was already met. Non-empty means the
+    /// player is owed items that CANNOT arrive, and a convergence report that does not say so is a
+    /// false success (#308).
+    ///
+    /// 🛑 Deliberately NOT folded into `Exhausted`. Exhausted means "we ran out of attempts and do
+    /// not know why"; this means "the game told us it would never take them". Different facts, and
+    /// the second one is actionable -- it points at the seed's start-item list, not at the client.
+    pub fn capped_shortfall(&self) -> &[i32] {
+        &self.capped
     }
 
     /// The count we are entitled to report as granted. Bag-verified, never call-verified.
@@ -324,6 +344,57 @@ mod honesty_tests {
             st.observe(&snap(&[LANTERN, POT]), &[POT]),
             ScanVerdict::Converged
         );
+    }
+
+    /// THE MOTIVATING CASE (rule 11). Alaric, 2026-08-03, client 0.3.2 -- nine Hefty Cracked Pots
+    /// requested, the first Placed, the rest eaten by the pot delivery cap, and the loop reported
+    /// CONVERGED **in the same second**:
+    ///
+    ///   16:54:29 9/40 startItems absent -> attempting ["0x401ea99c" x9]
+    ///   16:54:29 grant 0x401ea99c -> Placed
+    ///   16:54:29 CONVERGED -- all 40 startItems present in bag. granted 1 this session
+    ///   16:54:30 [WARN] pot-cap: grant of 1 CAPPED to 0 (held 10, cap 10)
+    ///
+    /// 🛑 The scan is right to say Converged: the bag DOES hold the id, and asking it for
+    /// quantities instead would re-grant a stack the player has merely used
+    /// (`present_stack_is_not_topped_up` pins that, and it is why the obvious fix is wrong).
+    /// `GrantOutcome::Capped` is the only evidence the other eight never landed, so it has to be
+    /// remembered rather than re-derived from a bag that cannot show it.
+    #[test]
+    fn a_capped_grant_is_remembered_even_though_the_bag_looks_satisfied() {
+        let mut st = BackfillState::new();
+        // one copy arrived, eight were capped -- all in the same round
+        st.record(POT, GrantOutcome::Placed);
+        st.round += 1; // `record` allows one attempt per fid per round
+        st.record(POT, GrantOutcome::Capped);
+
+        // the bag now shows the pot, so the scan converges -- correctly
+        assert_eq!(
+            st.observe(&snap(&[POT]), &[POT, POT]),
+            ScanVerdict::Unsettled
+        );
+        assert_eq!(
+            st.observe(&snap(&[POT]), &[POT, POT]),
+            ScanVerdict::Converged
+        );
+
+        assert_eq!(
+            st.capped_shortfall(),
+            &[POT],
+            "converging while a grant was capped is a false success -- the player is owed copies \
+             that CANNOT arrive, and only the cap outcome knows it (#308)"
+        );
+    }
+
+    /// ...and a clean run reports nothing, so the warn cannot become boilerplate.
+    #[test]
+    fn a_placed_grant_leaves_no_shortfall() {
+        let mut st = BackfillState::new();
+        st.record(POT, GrantOutcome::Placed);
+        assert!(st.capped_shortfall().is_empty());
+        // NotReady is not an attempt at all, so it cannot manufacture one either
+        st.record(LANTERN, GrantOutcome::NotReady);
+        assert!(st.capped_shortfall().is_empty());
     }
 
     #[test]
