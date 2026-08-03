@@ -310,7 +310,22 @@ const POT_DELIVERY_CAPS: &[(i32, i32)] = &[
     (0x4000_0000 | 9500, 19), // Cracked Pot        (event 1460, threshold 20)
     (0x4000_0000 | 9501, 9),  // Ritual Pot         (event 1461, threshold 10)
     (0x4000_0000 | 9510, 9),  // Perfume Bottle     (event 1462, threshold 10)
-    (0x4000_0000 | 2_009_500, 9), // Hefty Cracked Pot (DLC; threshold 10, flags 669xx)
+    // Hefty Cracked Pot. 🛑 NOT one-below-a-threshold like the three above -- there is no
+    // threshold. Its entry read `9` with the comment "DLC; threshold 10, flags 669xx" until
+    // 2026-08-03. That comment was EXTRAPOLATED from the base-game pattern, not derived, and it
+    // cost the player an item: Alaric's 2026-08-02 log has
+    //     pot-cap: goods 0x401ea99c grant of 1 CAPPED to 0 (held 9, cap 9)
+    // i.e. an AP delivery reported to the server and never given to the player (#308).
+    // SEARCHED and absent: the full 589-file decompiled EMEVD corpus -- which DOES include the
+    // Land of Shadow maps (m20/m21/m22/m25/m28) -- contains no
+    // `StoreItemAmountHeldInEventValue(ItemType.Goods, 2009...)` and never `SetEventFlagID(66900`.
+    // The base-game three are all right there and greppable; their DLC analogue is not.
+    // The DLC ships EXACTLY 10 Hefty Cracked Pots (Alaric, in-game) and the world carries exactly
+    // 10 checks on 66900..66990, so a cap of 9 made holding the full set impossible for no reason.
+    // `EquipParamGoods.maxNum` for row 2009500 is itself 10, so this entry can no longer bind --
+    // it is kept as a documented no-op rather than deleted, so the next person asking "why is
+    // there no cap on the hefty pot?" finds this paragraph instead of re-deriving it.
+    (0x4000_0000 | 2_009_500, 10), // Hefty Cracked Pot (no EMEVD threshold; maxNum is 10)
 ];
 
 /// Total held quantity of a bare GOODS row (sums stacks). None if the inventory isn't reachable this
