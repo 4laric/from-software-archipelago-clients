@@ -2812,6 +2812,15 @@ impl shared::Core for Core {
             // on Nexus. Must run AFTER shop_repoint (same ordering as the rest): repoint decides
             // WHICH rows are ours, icon dresses them.
             crate::shop_icon::reset();
+            // shop_preview was MISSING until 2026-08-03 -- the FOURTH writer, and the only
+            // FMG writer with no reset() at all, so the gate could not even see it (
+            // test_gf_client_resets_are_called enumerates modules that DEFINE reset()). Its name/
+            // info/caption overrides applied once on connect; the first load reverted the category
+            // pointer and check_lots' own correct re-dress then republished a block with only
+            // the placeholder, discarding these. Measured in the 2026-08-02 log: 153 placeholder
+            // swaps across 51 edges vs 3 preview swaps across one. Must run AFTER shop_repoint,
+            // same as shop_icon: repoint decides WHICH rows are ours, preview names them.
+            crate::shop_preview::reset();
             // CTD guard (2026-07-24): a load just completed — re-arm the enemy-scaling settle
             // window too. A SAME-REGION reload (death respawn) never trips the sweep's
             // region-change reset (LAST_REGION is unchanged), yet the ChrIns sets were just torn
