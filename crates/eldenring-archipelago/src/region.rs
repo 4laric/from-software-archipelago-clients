@@ -290,6 +290,12 @@ fn parse_natural_keys(v: Option<&Value>) -> HashMap<String, Vec<NkClause>> {
 /// sealed-region entry and re-arms once the warp lands the player back in an open region.
 /// KICK_FLAG still set for bake-compat. Returns a player-facing overlay message when the kick
 /// fires (the caller logs it -- players otherwise get relocated with no explanation).
+///
+/// The WORDS of that message live in `er_logic::region_lock::sealed_region_message`
+/// (host-tested + ASCII-swept, house split: er-logic owns the words, this owns the state). All
+/// this function contributes is the state -- which region, and which of the two exits ran. See
+/// that module's MOTIVATING CASE note for why the message names the region and, for the three
+/// vanilla-gated regions, the vanilla key.
 pub fn tick_kick(cfg: &RegionConfig) -> Option<String> {
     let pr = flags::play_region_id()?;
     let kick = er_logic::region_lock::kick_decision(
@@ -335,22 +341,34 @@ pub fn tick_kick(cfg: &RegionConfig) -> Option<String> {
         // retires the kick rune-loss wart (P1 kick-keep-runes). Kill remains only as the
         // fallback when the warp primitive is unavailable (stale RVA on a new game build).
         flags::set_event_flag(KICK_FLAG, true);
+        // Resolve the region ONCE, from config we already hold (areaLockFlags range -> open flag
+        // -> regionOpenFlags name, baked table as the fallback). No new slot_data key.
+        let lock_item = er_logic::region_lock::sealed_lock_item(
+            pr,
+            &cfg.area_lock_flags,
+            &cfg.region_open_flags,
+        );
+        let named = lock_item.unwrap_or("<unresolved>");
         match crate::warp::warp_to_grace(ROUNDTABLE_GRACE_ID) {
             Ok(()) => {
                 log::info!(
-                    "RegionLock: area {pr} LOCKED -> kick warp to Roundtable (flag {KICK_FLAG} set)"
+                    "RegionLock: area {pr} ({named}) LOCKED -> kick warp to Roundtable (flag {KICK_FLAG} set)"
                 );
-                return Some(format!(
-                    "SEALED REGION (area {pr}) -- lock not received yet. Returning to Roundtable Hold."
+                return Some(er_logic::region_lock::sealed_region_message(
+                    pr,
+                    lock_item,
+                    er_logic::region_lock::SealedOutcome::WarpedToHub,
                 ));
             }
             Err(e) => {
                 let killed = crate::deathlink::kill_local_player();
                 log::warn!(
-                    "RegionLock: area {pr} LOCKED -> kick warp FAILED ({e}); fallback kill (direct={killed})"
+                    "RegionLock: area {pr} ({named}) LOCKED -> kick warp FAILED ({e}); fallback kill (direct={killed})"
                 );
-                return Some(format!(
-                    "SEALED REGION (area {pr}) -- lock not received yet. Kicked."
+                return Some(er_logic::region_lock::sealed_region_message(
+                    pr,
+                    lock_item,
+                    er_logic::region_lock::SealedOutcome::KickFallback,
                 ));
             }
         }
