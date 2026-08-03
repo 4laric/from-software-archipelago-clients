@@ -66,6 +66,14 @@ static CHECK_ITEM_FLAGS: Mutex<Option<HashMap<u32, Vec<u32>>>> = Mutex::new(None
 /// prior, separate event) PASSES. `None` until the first poll → suppress-by-default (never leaks).
 static KNOWN_COLLECTED_FLAGS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 
+/// #321 -- is the FLAG-SET DISARM legal for THIS seed's `checkItemFlags`?
+///
+/// Set at connect from the live table, never from the apworld version: a seed rolled before the
+/// world-side lot-coverage drop still maps some flags to two ids, and enabling the disarm there
+/// would reopen the shared-flag leak (Traveler's Clothes, 2026-07-03). Such a seed simply keeps the
+/// collected-set-only policy it was rolled for.
+static FLAG_DISARM_LEGAL: AtomicBool = AtomicBool::new(false);
+
 pub fn configure_check_item_flags(map: HashMap<u32, Vec<u32>>) {
     // Armed-or-inert (house rule): one line at configure time says which state the suppressor
     // is in, so a missing/empty checkItemFlags in slot_data is visible instead of silent.
@@ -73,6 +81,27 @@ pub fn configure_check_item_flags(map: HashMap<u32, Vec<u32>>) {
         log::info!("vanilla suppressor INERT: checkItemFlags empty/absent in slot_data");
     } else {
         log::info!("vanilla suppressor ARMED for {} check item ids", map.len());
+    }
+    // PRECONDITION CHECK, on the live table. Same rule the world asserts as a regen gate
+    // (test_gf_check_item_flags_lot_covered::test_no_emitted_flag_is_mapped_by_two_ids); checking
+    // it here too means a stale or hand-rolled slot_data cannot turn the disarm on by accident.
+    let legal = er_logic::vanilla_suppress::flags_are_unshared(
+        map.values().map(|v| v.as_slice()).collect::<Vec<_>>(),
+    );
+    FLAG_DISARM_LEGAL.store(legal, Ordering::Relaxed);
+    // Armed-or-inert again: the disarm is the difference between "a lot-less check's ware is eaten
+    // until you collect it" and "until its award fires", so which one is live must be in the log.
+    if legal {
+        log::info!(
+            "vanilla-suppress: flag-set DISARM enabled -- no flag is mapped by two ids, so an id \
+             releases as soon as its own check's acquisition flag fires (#321)"
+        );
+    } else {
+        log::info!(
+            "vanilla-suppress: flag-set disarm OFF -- this seed maps at least one flag to two item \
+             ids, so releasing on a live flag could free a neighbour whose check never fired. \
+             Collected-set only (the pre-#321 policy this seed was rolled for)."
+        );
     }
     *CHECK_ITEM_FLAGS.lock().unwrap() = Some(map);
 }
@@ -525,12 +554,21 @@ unsafe extern "C" fn add_item_detour(
             let guard = KNOWN_COLLECTED_FLAGS.lock().unwrap();
             // No poll yet (None) -> treat as "nothing collected" -> suppress by default (never leaks).
             let suppress = match guard.as_ref() {
-                Some(collected) => er_logic::vanilla_suppress::should_suppress(&flags, collected),
+                // #321: a mapped flag also counts as released once it is LIVE-SET, but only for a
+                // seed whose table maps no flag to two ids (see FLAG_DISARM_LEGAL). Union with the
+                // collected-set, never a replacement for it.
+                Some(collected) => er_logic::vanilla_suppress::should_suppress_with_flag_disarm(
+                    &flags,
+                    collected,
+                    FLAG_DISARM_LEGAL.load(Ordering::Relaxed),
+                    &|f| crate::flags::get_event_flag(f),
+                ),
                 None => true,
             };
             if suppress {
                 log::info!(
-                    "vanilla-suppress: pickup {raw_id:#x} suppressed (check not yet collected)"
+                    "vanilla-suppress: pickup {raw_id:#x} suppressed (check not yet collected, \
+                     and its acquisition flag has not fired)"
                 );
                 return 0;
             }
