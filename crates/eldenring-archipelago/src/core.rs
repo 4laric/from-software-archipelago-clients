@@ -46,6 +46,11 @@ pub struct Core {
     detour_installed: bool,
     received_through: usize,
     dispatched_through: usize,
+    /// DIAGNOSTIC ONLY (2026-08-02, issues #293 / #296). Throttles the receive-path state line and
+    /// owns the F2 "cursor ahead of stream" alarm. See `er_logic::receive_probe` for why the
+    /// stream length beside the cursor is the line that discriminates the three freeze causes.
+    /// Changes no delivery behaviour.
+    recv_probe: er_logic::receive_probe::Probe,
     item_map: Option<HashMap<i64, i64>>,
     item_counts: HashMap<i64, i64>,
     region: Option<crate::region::RegionConfig>,
@@ -427,6 +432,7 @@ impl shared::Core for Core {
             detour_installed: false,
             received_through: 0,
             dispatched_through: 0,
+            recv_probe: er_logic::receive_probe::Probe::default(),
             item_map: None,
             item_counts: HashMap::new(),
             region: None,
@@ -1684,8 +1690,14 @@ impl shared::Core for Core {
         // counts — a name match would fail silently on exactly the seeds we cannot test.
         let mut scadu_fragment_units: i32 = 0;
         let mut snapshot: Vec<RecvItem> = Vec::new();
+        // DIAGNOSTIC (#293): `received_items().len()` -- the number that appeared in NO log line
+        // anywhere, and without which "the cursor is stuck" and "the stream is stuck" read the
+        // same. `None` means no client this tick, which is NOT the same as a stream of length 0
+        // (see the probe call at 4d). Carried out of the borrow; nothing else reads it.
+        let mut stream_len: Option<usize> = None;
         if let Some(client) = self.client() {
             let items = client.received_items();
+            stream_len = Some(items.len());
             if items.len() < disp {
                 disp = 0; // reconnect shrank the stream -> replay name dispatch from index 0
             }
@@ -1932,6 +1944,58 @@ impl shared::Core for Core {
         if self.received_through as i64 != self.last_persisted_index {
             self.write_save();
             self.last_persisted_index = self.received_through as i64;
+        }
+
+        // 4d. RECEIVE-PATH PROBE -- diagnostic only, changes nothing (2026-08-02).
+        //
+        // RULE 11, the motivating cases:
+        //   * #293 -- Hazel's receive cursor sat at 172 for three days across seven sessions while
+        //     her checks kept sending. "Sends work, receives dead" has exactly three causes in this
+        //     client (F1 `can_grant` false all session / F2 cursor ahead of the stream / F3 the
+        //     unbounded H3 hold), and on that build ALL THREE PRINT THE SAME LOG -- because
+        //     `received_items().len()` was logged nowhere, so nothing could tell "the cursor is
+        //     stuck" from "the stream is stuck". This is that line.
+        //   * #296 -- delivery reported converged while owing ~14 items, sat dead 18s, then applied
+        //     all 14 the instant the player crossed a world edge. Whether those items were in the
+        //     stream during the dead window was unanswerable because nothing timestamped the
+        //     stream GROWING. The probe emits on any change, so it does.
+        //
+        // Read AFTER the step-4 advance, so a healthy tick reads `stream == cursor` and a held
+        // watermark is visible as the gap. Only when a client exists: with none there is no stream
+        // to compare, and a fabricated 0 would look exactly like F2.
+        if let Some(stream_len) = stream_len {
+            let now = self.toast_clock.elapsed().as_millis() as u64;
+            let report = self.recv_probe.observe(
+                er_logic::receive_probe::RecvState {
+                    stream_len,
+                    cursor: self.received_through,
+                    // The three `can_grant` inputs, BROKEN OUT. The conjunction alone cannot say
+                    // which bug it is: no inventory pointer is a foreign AddItemFunc hook, refused
+                    // is the marker guard, not-in-world is a menu tick.
+                    has_inventory: crate::detour::has_inventory(),
+                    in_world: crate::flags::in_world(),
+                    refused: crate::reconcile_io::is_refused(),
+                },
+                now,
+            );
+            if let Some(line) = report.line {
+                log::info!("{line}");
+            }
+            // F2. 🛑 REPORTED, NOT REPAIRED. Clamping `received_through` down to the stream length
+            // would re-grant every item from there on (~172 of them in #293) -- that is a product
+            // decision, not a diagnostic one, and it is Alaric's call. Nothing here writes a
+            // watermark.
+            if let Some(warning) = report.warning {
+                log::warn!("{warning}");
+            }
+            // I4: a log line is invisible from the player's chair -- which is exactly how the
+            // REFUSED guard went unnoticed for ~55 minutes of boblerrr's session. F2 suspends
+            // delivery permanently, so it owes the same on-screen notice. Re-pushed every tick on
+            // purpose: the deck refreshes identical text instead of stacking, so it is free after
+            // the first frame, and the condition persists until the player acts.
+            if let Some(notice) = report.toast {
+                self.toasts.push(notice, now);
+            }
         }
 
         // 5. Shop / NPC / offline discovery: synthetic placeholders that bypassed the detour are in

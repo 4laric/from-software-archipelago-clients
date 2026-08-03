@@ -42,6 +42,7 @@ pub mod options;
 pub mod ownership;
 pub mod progressive;
 pub mod receive;
+pub mod receive_probe;
 pub mod receive_watermark_replay;
 pub mod reconcile;
 pub mod reconciler_replay;
