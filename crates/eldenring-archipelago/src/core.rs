@@ -1866,10 +1866,29 @@ impl shared::Core for Core {
                             warn_unmapped_once(&ri.name, ap_item_id);
                         }
                     }
-                    GrantAction::SkipNativelySold { name } => {
+                    GrantAction::SkipNativelySold { name, full_id } => {
                         log::info!(
                             "shop-sell: echo grant skipped -- {name} was sold natively at purchase (ECHO-DEDUP)"
                         );
+                        // 🛑 THE ITEM IS IN THE BAG. Only the GRANT is redundant here -- the
+                        // rewritten shop row handed the player the real item at purchase time, and
+                        // the watermark advances precisely because it IS delivered. auto_equip keys
+                        // off DELIVERY, not off granting, so it has to be told either way.
+                        //
+                        // MOTIVATING CASE (rule 11): Alaric, 2026-08-03, client 0.3.2
+                        // (59420f32f445), `auto_equip: 1`. He bought Godfrey Icon -- a talisman --
+                        // from the Twin Maiden Husks and it did not equip. The log shows why:
+                        //   [APS] Alaric found their Godfrey Icon (Roundtable Hold :: Battle Axe)
+                        //   shop-sell: echo grant skipped -- Godfrey Icon ... (ECHO-DEDUP)
+                        // and then nothing, because this arm logged and returned. Every one of that
+                        // session's 13 receives was a shop purchase, so auto_equip was inert for
+                        // the entire run while reporting itself enabled.
+                        //
+                        // Not talisman-specific and never was: weapons and armour bought from a
+                        // repointed shop row went the same way.
+                        if let Some(fid) = full_id {
+                            crate::auto_equip::enqueue(fid);
+                        }
                     }
                     GrantAction::AlreadyPushed => {}
                 }
