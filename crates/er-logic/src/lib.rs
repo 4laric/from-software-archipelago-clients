@@ -28,6 +28,7 @@ pub mod fast_travel;
 pub mod fast_travel_replay;
 pub mod flagpoll_baseline_replay;
 pub mod flask_reconcile;
+pub mod fmg_groups;
 pub mod grace;
 pub mod grace_flush_replay;
 pub mod grants;

@@ -9,6 +9,15 @@
 //! LIVE pointer so any length fits; validated before the atomic swap). Runs AFTER fmg_inject. The
 //! override is GLOBAL per good id, so we dedup by good id (the shared FMG entry shows one reward).
 //!
+//! THREE CATEGORIES, THREE ID SETS -- not one id set read three times. A goods row that has a
+//! GoodsName(10) entry very often has no GoodsInfo(20) / GoodsCaption(24) entry, and the world's
+//! spare-preview pool only has 25 rows with all three (`greenfield/spare_goods.tsv`, `fmg_full`
+//! column). A seed needing more distinct previews than that spends them and falls through to
+//! name-only rows, whose description panel renders `?GoodsInfo?` -- whether or not this module
+//! writes anything, because the entry does not exist to be redirected. Since 2026-08-03
+//! `extend_swap_overrides` CREATES the missing entry rather than dropping the id; the completeness
+//! check at the bottom of `run()` is what makes a regression to the old behaviour audible.
+//!
 //! TWO bugs fixed here (2026-07-12):
 //!
 //!  1. WRONG KEY -- it keyed the FMG override by the ER FullID (`good as u32`, category nibble and
@@ -245,6 +254,32 @@ pub fn run() -> bool {
          -> extend-swap names={n} infos={i} captions={c}",
         names.len()
     );
+    // A PARTIAL WRITE IS A FAILURE, NOT A CLEAN RUN. All three maps are built from ONE key set, so
+    // anything short of `want` in any category means some shop row got a NAME and no DESCRIPTION.
+    // That is exactly what boblerrr's `0.3.1` log carried for 100 minutes -- `names=53 infos=25
+    // captions=25` -- while this pass reported success, because the counts were printed and nothing
+    // ever COMPARED them. Compare them, name the shortfall per category, and say what the player
+    // sees.
+    //
+    // WARN, not retry: a short count means the block WAS built and swapped, and
+    // `extend_swap_overrides` leaks each block by design (the game may still hold the old pointer).
+    // Re-running it for the whole retry budget would leak ~600 GoodsCaption blocks -- that category
+    // is lore text, megabytes apiece. The retryable case is the `n == 0` one handled above, where
+    // nothing was built because the MSG repo was not up.
+    let want = names.len();
+    if n < want || i < want || c < want {
+        log::warn!(
+            "shop-preview: INCOMPLETE -- of {want} distinct preview good(s): names={n} infos={i} \
+             captions={c}. {} row(s) are short an info line and {} short a caption; those render \
+             `?GoodsInfo?` / `?GoodsCaption?` in the item panel. The FMG extend-swap line above \
+             names the ids and the reason. Root cause when the shortfall is in {GOODS_INFO_CAT}/\
+             {GOODS_CAPTION_CAT} only: those goods rows carry NO entry in those categories, so the \
+             client must CREATE one -- if entry insertion reported itself unavailable, the apworld \
+             has to spend a spare row with full FMG coverage instead (issue #300).",
+            want.saturating_sub(i),
+            want.saturating_sub(c)
+        );
+    }
     DONE.store(true, Ordering::Relaxed);
     true
 }
