@@ -1,31 +1,64 @@
 //! Auto-equip decision logic (pure).
 //!
-//! When the `auto_equip` option is on, a received WEAPON or PROTECTOR is equipped immediately --
+//! When the `auto_equip` option is on, a received WEAPON, PROTECTOR or TALISMAN is equipped
+//! immediately --
 //! including mid-boss-fight. That is deliberate: the motivating case is the French Challenge
 //! (Wretch start + randomizer + Use What You Get + permadeath + all bosses + region lock), whose
 //! whole premise is that you do not choose your build. Clobbering the weapon in your hand at the
 //! worst possible moment IS the feature, not a bug to guard against.
 //!
-//! Everything here is host-testable and holds no game state. The caller supplies the two param
-//! fields we cannot read without the game: `EQUIP_PARAM_WEAPON_ST.wep_type` and
-//! `EQUIP_PARAM_PROTECTOR_ST.protectorCategory`.
+//! Everything here is host-testable and holds no game state. The caller supplies the game-side
+//! facts we cannot read without the game: `EQUIP_PARAM_WEAPON_ST.wep_type`,
+//! `EQUIP_PARAM_PROTECTOR_ST.protectorCategory`, and -- for talismans --
+//! `PlayerGameData.unlocked_talisman_slots` plus what the four accessory slots currently hold.
 
 /// Category nibble of a FullID (`(category << 28) | row`), matching the encoding used across the
-/// client. `ItemCategory::Weapon = 0`, `Protector = 1`.
+/// client. Source is `eldenring::cs::ItemCategory`: `Weapon = 0`, `Protector = 1`, `Accessory = 2`,
+/// `Goods = 4`, `Gem = 8`.
 const CATEGORY_MASK: u32 = 0xF000_0000;
 const CATEGORY_WEAPON: u32 = 0x0000_0000;
 const CATEGORY_PROTECTOR: u32 = 0x1000_0000;
+const CATEGORY_ACCESSORY: u32 = 0x2000_0000;
 
-/// `ChrAsmSlot` indices we can target. The full enum is 0..=21; these are the six that auto-equip
+/// `ChrAsmSlot` indices we can target. The full enum is 0..=21; these are the ten that auto-equip
 /// ever writes. Confirmed against a live `chr_asm` dump on 2.6.2.0: slots 0/2/3/4/5 held unarmed
 /// (`110000`) for the five idle hand slots, and 12..=15 held protector entries `0x10002710`,
 /// `0x10002774`, `0x100027D8`, `0x1000283C` -- head, chest, hands, legs, in that order.
+///
+/// The accessory indices are read off the `ChrAsmSlot` enum in the PINNED `eldenring` crate
+/// (`fromsoftware-rs` `8c67a84`, `crates/eldenring/src/cs/player_game_data.rs`), not inferred:
+/// `Accessory1 = 17 .. Accessory4 = 20`. `Unused16 = 16` sits between the protectors and them --
+/// which is exactly why these are NOT `15 + n`.
 pub const SLOT_WEAPON_LEFT_1: u32 = 0;
 pub const SLOT_WEAPON_RIGHT_1: u32 = 1;
 pub const SLOT_PROTECTOR_HEAD: u32 = 12;
 pub const SLOT_PROTECTOR_CHEST: u32 = 13;
 pub const SLOT_PROTECTOR_HANDS: u32 = 14;
 pub const SLOT_PROTECTOR_LEGS: u32 = 15;
+pub const SLOT_ACCESSORY_1: u32 = 17;
+pub const SLOT_ACCESSORY_2: u32 = 18;
+pub const SLOT_ACCESSORY_3: u32 = 19;
+pub const SLOT_ACCESSORY_4: u32 = 20;
+
+/// The four talisman slots in unlock order. Index `i` is unlocked once the player has `i + 1`
+/// talisman slots.
+///
+/// 🛑 `ChrAsmSlot::AccessoryCovenant = 21` is DELIBERATELY ABSENT and must never be added here.
+/// It is the Great Rune slot, not a fifth talisman slot. Nothing in this module can reach it:
+/// every accessory write indexes THIS array. That structural exclusion is the guard -- there is
+/// no `accessoryCategory` check below, because a value-based guard would need a mapping this
+/// repo has not datamined, and inventing one is the mistake `wep_type 59` already cost us.
+///
+/// It is also unreachable from the item pool: the apworld ships Great Runes as GOODS, not
+/// accessories. `greenfield/eldenring/item_ids.py` on world `main` has all six as nibble 4
+/// (`Godrick's Great Rune` = `1073742015`, rows 191..196), while all 147 nibble-2 entries are
+/// talismans (rows 1000..8240). Both facts have to break before slot 21 is in play.
+pub const ACCESSORY_SLOTS: [u32; 4] = [
+    SLOT_ACCESSORY_1,
+    SLOT_ACCESSORY_2,
+    SLOT_ACCESSORY_3,
+    SLOT_ACCESSORY_4,
+];
 
 /// Which primary hand a received weapon should occupy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,13 +68,21 @@ pub enum Hand {
 }
 
 /// What kind of thing a received FullID is, and therefore which param table the caller must read
-/// to resolve the target slot. Anything else (goods, gems, accessories) is not auto-equipped.
+/// to resolve the target slot. Anything else (goods, gems) is not auto-equipped.
+///
+/// 🛑 GOODS stays out on purpose, and that is the OTHER half of #295: physick tears are
+/// `EQUIP_PARAM_GOODS` and do not live in `chr_asm` at all -- they go into the Flask of Wondrous
+/// Physick, a separate two-slot mixture with its own persistence. None of the four-rep commit
+/// this module is built on applies to them. That half is split out rather than half-built here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Equipable {
     /// Read `EQUIP_PARAM_WEAPON_ST.wep_type`, then [`slot_for_wep_type`].
     Weapon,
     /// Read `EQUIP_PARAM_PROTECTOR_ST.protectorCategory`, then [`slot_for_protector_category`].
     Protector,
+    /// A TALISMAN. Read `PlayerGameData.unlocked_talisman_slots` and the current occupants of
+    /// [`ACCESSORY_SLOTS`], then [`slot_for_accessory`].
+    Accessory,
 }
 
 /// Is this received FullID something auto-equip handles at all?
@@ -49,6 +90,7 @@ pub fn equipable(full_id: i32) -> Option<Equipable> {
     match (full_id as u32) & CATEGORY_MASK {
         CATEGORY_WEAPON => Some(Equipable::Weapon),
         CATEGORY_PROTECTOR => Some(Equipable::Protector),
+        CATEGORY_ACCESSORY => Some(Equipable::Accessory),
         _ => None,
     }
 }
@@ -175,6 +217,72 @@ pub fn slot_for_protector_category(protector_category: u8) -> Option<u32> {
     }
 }
 
+/// How many of the four talisman slots the player has actually unlocked.
+///
+/// `raw` is `PlayerGameData.unlocked_talisman_slots` read straight off the live character -- we do
+/// NOT track Talisman Pouch pickups ourselves, because the game already tracks them and a mod that
+/// counts pouches independently is a second source of truth waiting to disagree.
+///
+/// ⚠️ CLAMPED, and the clamp is load-bearing in BOTH directions:
+///
+/// * Lower bound 1 -- every character has talisman slot 1 from the first minute, so a `0` (a field
+///   not yet initialised, an unexpected build) still yields a legal slot rather than no slot.
+/// * Upper bound 4 -- writing `ChrAsmSlot` 21 would put the item in the GREAT RUNE slot.
+///
+/// 🛑 The field's ZERO POINT IS NOT VERIFIED. The name says "unlocked slots" (so 1..=4, since the
+/// player starts with one), but it could count POUCHES (0..=3). We have not read it off a live
+/// character. The clamp makes both readings safe -- the worst case under the pouch reading is that
+/// the fourth slot goes unused, which is a wasted slot and not a bad write. The caller logs the raw
+/// value on every accessory equip so the first real session settles it; when it does, delete this
+/// paragraph rather than leaving a resolved caveat in the file.
+pub fn usable_accessory_slots(raw: u8) -> usize {
+    (raw as usize).clamp(1, ACCESSORY_SLOTS.len())
+}
+
+/// The `ChrAsmSlot` index a received TALISMAN should occupy, or `None` when there is nothing to do.
+///
+/// `slots[i]` is the accessory param row currently in `ACCESSORY_SLOTS[i]`, or `None` if that slot
+/// is empty. The caller decides "empty" by asking the param table, not by testing a sentinel: the
+/// empty-accessory value in `equipment_param_ids` is not verified here, so a slot counts as empty
+/// whenever its entry does not resolve to an `EQUIP_PARAM_ACCESSORY_ST` row. That is correct for
+/// `-1`, for `0`, and for any other sentinel FromSoft might use, without this file guessing which.
+///
+/// THE POLICY, and where it comes from. #295 called the choice of slot "a design decision, not an
+/// implementation detail". It is -- but it is a decision the French Challenge ruling already made
+/// (see [`LEFT_HAND_WEP_TYPES`]), so this is that ruling applied, not a new one:
+///
+/// 1. **Already worn -> `None`.** Not an optimisation: ER refuses duplicate talismans, so writing
+///    the same row into a second slot builds a loadout the player could not have made in the menu.
+/// 2. **First EMPTY unlocked slot.** Fills 1, 2, 3, 4 as they come, so a player who has never
+///    touched the menu ends up with the four most recent talismans rather than one.
+/// 3. **All unlocked slots full -> the LOWEST unlocked slot, clobbering it.** Last writer wins,
+///    exactly as `SLOT_WEAPON_LEFT_1` already does when a staff lands on a shield. "All auto-
+///    equipped gear must stay equipped ... no unequipping allowed" means the answer to a full
+///    loadout is WHERE the new item lands, never WHETHER it is equipped -- so "keep the ones you
+///    have and leave the new talisman in the bag" is not available, and neither is a wear-value
+///    comparison, which is just choosing your build with extra steps.
+///
+/// Only `usable_accessory_slots(unlocked_talisman_slots)` slots are considered, so a locked slot is
+/// never read for occupancy nor written. Returning `Some` for every talisman is deliberate and is
+/// why this does not mirror the `Option` on [`slot_for_wep_type`]: ammunition has no hand at all,
+/// whereas every talisman has a slot. The one `None` here means "already equipped", not "refused".
+pub fn slot_for_accessory(
+    unlocked_talisman_slots: u8,
+    slots: [Option<i32>; 4],
+    param_id: i32,
+) -> Option<u32> {
+    let n = usable_accessory_slots(unlocked_talisman_slots);
+    let visible = &slots[..n];
+
+    if visible.contains(&Some(param_id)) {
+        return None;
+    }
+    match visible.iter().position(Option::is_none) {
+        Some(i) => Some(ACCESSORY_SLOTS[i]),
+        None => Some(ACCESSORY_SLOTS[0]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +291,12 @@ mod tests {
     const GOODS_FLASK: i32 = 0x4000_03E9; // category 4 (goods), row 1001
     const PROTECTOR_HELM: i32 = 0x1000_2710; // category 1 (armor)
     const GEM_ASH: i32 = 0x8000_0064u32 as i32; // category 8 (ash of war)
+    /// Ailment Talisman -- `greenfield/eldenring/item_ids.py` ships it as 536879032, i.e.
+    /// category 2, row 10104. A real entry from the real pool, not a constructed one.
+    const ACCESSORY_TALISMAN: i32 = 0x2000_2778;
+    /// Godrick's Great Rune as the apworld actually sends it: 1073742015 = category 4, row 191.
+    /// GOODS, not accessory -- which is why no Great Rune ever reaches the accessory arm.
+    const GOODS_GREAT_RUNE: i32 = 0x4000_00BF;
 
     #[test]
     fn only_weapons_are_weapons() {
@@ -193,11 +307,37 @@ mod tests {
     }
 
     #[test]
-    fn weapons_and_protectors_are_equipable_nothing_else_is() {
+    fn weapons_protectors_and_talismans_are_equipable_nothing_else_is() {
         assert_eq!(equipable(WEAPON_DAGGER), Some(Equipable::Weapon));
         assert_eq!(equipable(PROTECTOR_HELM), Some(Equipable::Protector));
+        assert_eq!(equipable(ACCESSORY_TALISMAN), Some(Equipable::Accessory));
         assert_eq!(equipable(GOODS_FLASK), None);
         assert_eq!(equipable(GEM_ASH), None);
+    }
+
+    /// THE MOTIVATING CASE (rule 11), twice reported by the same player and named in his words:
+    ///
+    ///   2026-08-02, on 0.3.1: "however talismans and crystal tears are not changing"
+    ///   2026-08-03, on 0.3.2: "talisman didn't swap after killing a boss"
+    ///
+    /// A talisman FullID reached `equipable()` and got `None`, so `enqueue` dropped it on the
+    /// floor and nothing downstream ever ran. This fails on the two-arm classifier that shipped
+    /// 0.3.2. The GOODS half of his sentence -- crystal tears -- is still `None` here ON PURPOSE
+    /// and is a separate issue: they are not in `chr_asm` at all.
+    #[test]
+    fn a_received_talisman_is_no_longer_dropped_on_the_floor() {
+        assert_eq!(
+            equipable(536_879_032),
+            Some(Equipable::Accessory),
+            "Ailment Talisman (item_ids.py 536879032) must classify as an accessory -- \
+             returning None here is the whole of #295"
+        );
+        assert_eq!(
+            equipable(GOODS_GREAT_RUNE),
+            None,
+            "a Great Rune ships as GOODS and must NOT enter the accessory arm"
+        );
+        assert_eq!(equipable(GOODS_FLASK), None); // physick tear: separate issue, still None
     }
 
     #[test]
@@ -264,6 +404,143 @@ mod tests {
         assert_eq!(hand_for_wep_type(41), Hand::Right); // colossal weapon
         assert_eq!(hand_for_wep_type(87), Hand::Right); // torch -- ruleset does not move it
         assert_eq!(slot_for_wep_type(85), None); // ammo still not equipped at all (#294)
+    }
+
+    /// This module keeps its OWN copy of the category nibbles rather than importing `er_codec`'s.
+    /// That duplication predates #295, but adding a third arm to it makes a silent split more
+    /// expensive, so pin the two together behaviourally: if either table is ever edited alone,
+    /// this fails instead of one classifier quietly disagreeing with the other.
+    #[test]
+    fn the_local_category_nibbles_agree_with_er_codec() {
+        assert_eq!(
+            equipable((er_codec::CATEGORY_WEAPON | 10_000) as i32),
+            Some(Equipable::Weapon)
+        );
+        assert_eq!(
+            equipable((er_codec::CATEGORY_PROTECTOR | 10_000) as i32),
+            Some(Equipable::Protector)
+        );
+        assert_eq!(
+            equipable((er_codec::CATEGORY_ACCESSORY | 1_000) as i32),
+            Some(Equipable::Accessory)
+        );
+        assert_eq!(equipable((er_codec::CATEGORY_GOODS | 1_000) as i32), None);
+        assert_eq!(equipable((er_codec::CATEGORY_GEM | 1_000) as i32), None);
+    }
+
+    /// ⚠️ THE INDICES ARE NOT `15 + n`. `ChrAsmSlot::Unused16 = 16` sits between the protector
+    /// block and the accessories, so an off-by-one derived from "armour ends at 15" writes the
+    /// unused slot and then walks one short of `Accessory4`. Pinned against the enum in the
+    /// `eldenring` crate this workspace actually builds against.
+    #[test]
+    fn accessory_slots_are_the_pinned_chrasm_indices() {
+        assert_eq!(ACCESSORY_SLOTS, [17, 18, 19, 20]);
+        assert_eq!(SLOT_ACCESSORY_1, 17);
+        assert_eq!(SLOT_PROTECTOR_LEGS + 1, 16); // Unused16 -- NOT an accessory
+    }
+
+    /// 🛑 The one write this module must never make. `AccessoryCovenant = 21` is the GREAT RUNE
+    /// slot; an off-by-one at the top of the range puts a talisman in it. Nothing reads a slot
+    /// index from anywhere but `ACCESSORY_SLOTS`, so asserting the array is asserting the bound.
+    #[test]
+    fn the_great_rune_slot_is_never_a_target() {
+        const ACCESSORY_COVENANT: u32 = 21;
+        assert!(!ACCESSORY_SLOTS.contains(&ACCESSORY_COVENANT));
+        for unlocked in 0..=255u8 {
+            let all_full = [Some(1), Some(2), Some(3), Some(4)];
+            let slot = slot_for_accessory(unlocked, all_full, 9999).unwrap();
+            assert!(
+                ACCESSORY_SLOTS.contains(&slot),
+                "unlocked={unlocked} produced slot {slot}, outside the four talisman slots"
+            );
+        }
+    }
+
+    /// The unlock count is progression-gated by Talisman Pouches, so the resolver must never
+    /// consider a slot the player has not earned. Both readings of the field (slots or pouches)
+    /// are clamped into 1..=4, and a garbage value cannot widen the range.
+    #[test]
+    fn locked_slots_are_never_written() {
+        assert_eq!(usable_accessory_slots(0), 1); // uninitialised / pouch-count reading
+        assert_eq!(usable_accessory_slots(1), 1);
+        assert_eq!(usable_accessory_slots(4), 4);
+        assert_eq!(usable_accessory_slots(9), 4); // clamped, not wrapped
+        assert_eq!(usable_accessory_slots(255), 4);
+
+        // One slot unlocked and it is empty -> slot 1, and NOT slot 2 even though 2 is also empty.
+        assert_eq!(
+            slot_for_accessory(1, [None, None, None, None], 1000),
+            Some(SLOT_ACCESSORY_1)
+        );
+        // One slot unlocked and it is full -> clobber it. The locked empties stay untouched.
+        assert_eq!(
+            slot_for_accessory(1, [Some(1000), None, None, None], 2000),
+            Some(SLOT_ACCESSORY_1)
+        );
+        // Two unlocked, first full -> the second, never the third.
+        assert_eq!(
+            slot_for_accessory(2, [Some(1000), None, None, None], 2000),
+            Some(SLOT_ACCESSORY_2)
+        );
+    }
+
+    /// The stated policy, slot by slot: fill empties in order, then last-writer-wins on slot 1 --
+    /// the same rule `SLOT_WEAPON_LEFT_1` already applies when a staff lands on a shield.
+    #[test]
+    fn talismans_fill_empty_slots_then_clobber_the_lowest() {
+        let full = 4u8;
+        assert_eq!(
+            slot_for_accessory(full, [None, None, None, None], 1000),
+            Some(SLOT_ACCESSORY_1)
+        );
+        assert_eq!(
+            slot_for_accessory(full, [Some(1000), None, None, None], 1010),
+            Some(SLOT_ACCESSORY_2)
+        );
+        assert_eq!(
+            slot_for_accessory(full, [Some(1000), Some(1010), None, None], 1020),
+            Some(SLOT_ACCESSORY_3)
+        );
+        assert_eq!(
+            slot_for_accessory(full, [Some(1000), Some(1010), Some(1020), None], 1030),
+            Some(SLOT_ACCESSORY_4)
+        );
+        // All four worn: the fifth talisman still gets equipped. Refusing it would be "you may
+        // keep the build you have", which is the one thing the ruleset forbids.
+        assert_eq!(
+            slot_for_accessory(full, [Some(1000), Some(1010), Some(1020), Some(1030)], 1040),
+            Some(SLOT_ACCESSORY_1)
+        );
+    }
+
+    /// A gap in the middle is filled before anything is clobbered -- the player unequipped slot 2
+    /// by hand, or a pouch arrived after slots 1 and 3 were written.
+    #[test]
+    fn the_first_empty_slot_wins_even_out_of_order() {
+        assert_eq!(
+            slot_for_accessory(4, [Some(1000), None, Some(1020), None], 1030),
+            Some(SLOT_ACCESSORY_2)
+        );
+    }
+
+    /// ER does not let you wear the same talisman twice, so re-equipping one already worn would
+    /// build a loadout the menu cannot produce. This is the case a plain "first empty slot" policy
+    /// gets wrong: with slot 2 free it would happily put a second copy there.
+    #[test]
+    fn a_talisman_already_worn_is_not_equipped_a_second_time() {
+        assert_eq!(
+            slot_for_accessory(4, [Some(1000), None, None, None], 1000),
+            None
+        );
+        assert_eq!(
+            slot_for_accessory(4, [Some(1000), Some(1010), Some(1020), Some(1030)], 1020),
+            None
+        );
+        // ...but a copy sitting in a LOCKED slot is not "worn" -- it cannot be, so slot 1 it is.
+        assert_eq!(
+            slot_for_accessory(1, [None, Some(1010), None, None], 1010),
+            Some(SLOT_ACCESSORY_1)
+        );
     }
 
     #[test]

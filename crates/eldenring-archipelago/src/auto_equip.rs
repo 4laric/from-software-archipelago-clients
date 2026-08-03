@@ -1,4 +1,5 @@
-//! auto_equip -- when `options.auto_equip` is on, equip a received WEAPON or PROTECTOR immediately.
+//! auto_equip -- when `options.auto_equip` is on, equip a received WEAPON, PROTECTOR or TALISMAN
+//! immediately.
 //!
 //! ## How equipping actually works on 2.6.2.0
 //!
@@ -38,14 +39,26 @@
 //! Equips unconditionally, including mid-boss-fight, and clobbers whatever occupies the slot.
 //! See `er_logic::auto_equip` for why that is the intended behaviour and not an oversight.
 //! `arm_style` is deliberately not written: the live probe equipped correctly without touching it.
+//!
+//! TALISMANS (#295) ride the SAME four reps -- they are `ChrAsmSlot` 17..=20 like any other
+//! equipment, so rep (1)'s refcount is acquired by the same `ChrAsm::operator=` and rep (4) is the
+//! same inventory index. Nothing new was reverse-engineered for them. What IS new is that the
+//! target slot is not a function of the item alone: it depends on how many slots the player has
+//! unlocked and on what is already worn, both read live below.
+//!
+//! 🛑 PHYSICK TEARS ARE NOT HERE, and the other half of boblerrr's sentence is not an oversight.
+//! Tears are `EQUIP_PARAM_GOODS` and never enter `chr_asm` -- the Flask of Wondrous Physick is a
+//! separate two-slot mixture with its own UI and persistence, so every paragraph above is
+//! inapplicable to them. Building them on this module's reps would be writing an equipment slot
+//! for something the game does not store as equipment.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eldenring::cs::{
-    ChrAsm, ChrAsmEquipEntries, EquipGameData, EquipParamProtector, EquipParamWeapon, GaitemHandle,
-    GameDataMan, SoloParamRepository,
+    ChrAsm, ChrAsmEquipEntries, EquipGameData, EquipParamAccessory, EquipParamProtector,
+    EquipParamWeapon, GaitemHandle, GameDataMan, SoloParamRepository,
 };
 use er_logic::auto_equip::Equipable;
 use fromsoftware_shared::FromStatic;
@@ -87,13 +100,18 @@ static PENDING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
     if on {
-        log::info!("auto_equip: enabled (received weapons and armour equip on arrival)");
+        log::info!(
+            "auto_equip: enabled (received weapons, armour and talismans equip on arrival; \
+             physick tears and spells are NOT covered)"
+        );
     }
 }
 
 /// Queue a received FullID for equipping. Called from the received-item loop. Self-gating: no-op
 /// if the option is off, or if the category is not something we equip. The caller deliberately
-/// does NOT pre-filter -- it used to gate on `is_weapon`, which silently excluded armour.
+/// does NOT pre-filter -- it used to gate on `is_weapon`, which silently excluded armour, and
+/// widening `equipable` to talismans (#295) was the whole of that fix precisely because this is
+/// the only gate.
 ///
 /// 🛑 #296 / #302 / #303 -- QUEUE THE ID THAT ACTUALLY ENTERS THE BAG.
 ///
@@ -180,6 +198,13 @@ pub fn tick() {
     // inventory.rs / no_equip_load.rs).
     let pgd = &mut *gdm.main_player_game_data;
 
+    // Read ONCE per tick, before anything borrows `pgd.equipment` mutably. This is the game's own
+    // Talisman Pouch progression -- we do not count pouch pickups ourselves, because the game
+    // already does and a second tally is a second source of truth. The raw value is logged on
+    // every accessory equip: its zero point (slots vs pouches) is NOT verified, and
+    // `usable_accessory_slots` clamps to 1..=4 so both readings stay inside the four legal slots.
+    let unlocked_talisman_slots = pgd.unlocked_talisman_slots;
+
     // Snapshot id -> (handle, inventory index) first, so the inventory borrow is released before we
     // mutate chr_asm. Both values come off the entry this loop already visits; the index is the
     // entry's position in the normal-items list, biased by `key_items_capacity` the way the game
@@ -235,6 +260,45 @@ pub fn tick() {
                     // dropping the item on the floor.
                     None => er_logic::auto_equip::SLOT_WEAPON_RIGHT_1,
                 }
+            }
+            Some(Equipable::Accessory) => {
+                // Talismans are not upgradeable -- no `(param_id / 100) * 100` rounding, same as
+                // protectors. A row the param table does not know is skipped rather than defaulted
+                // into a slot: unlike the weapon arm there is no "main hand" to fall back to, and
+                // an unknown accessory row is far more likely to be a bad id than a real talisman.
+                if repo.get::<EquipParamAccessory>(param_id).is_none() {
+                    log::debug!(
+                        "auto_equip: accessory {full:#010x} has no EquipParamAccessory row -- \
+                         skipped"
+                    );
+                    continue;
+                }
+
+                // What is in the four talisman slots RIGHT NOW. A slot counts as empty when its
+                // entry does not resolve to an accessory row -- deliberately NOT a comparison
+                // against a hard-coded empty sentinel, because the empty value in
+                // `equipment_param_ids` has never been read off a live character here and
+                // inventing one is how `wep_type 59` shipped a classifier that matched nothing.
+                let worn = &pgd.equipment.chr_asm.equipment_param_ids;
+                let slots: [Option<i32>; 4] = std::array::from_fn(|i| {
+                    let id = worn[er_logic::auto_equip::ACCESSORY_SLOTS[i] as usize];
+                    (id > 0 && repo.get::<EquipParamAccessory>(id as u32).is_some()).then_some(id)
+                });
+
+                let Some(slot) = er_logic::auto_equip::slot_for_accessory(
+                    unlocked_talisman_slots,
+                    slots,
+                    param_id as i32,
+                ) else {
+                    // Already worn. ER refuses duplicate talismans, so equipping a second copy
+                    // would build a loadout the menu cannot produce.
+                    continue;
+                };
+                log::info!(
+                    "auto_equip: talisman {full:#010x} -> slot {slot} \
+                     (unlocked_talisman_slots raw={unlocked_talisman_slots}, worn={slots:?})"
+                );
+                slot
             }
             Some(Equipable::Protector) => {
                 // Protectors are not upgradeable -- no rounding.
