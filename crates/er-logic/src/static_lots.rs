@@ -207,6 +207,113 @@ pub fn blank_tables_for(
     (m, e)
 }
 
+/// Every lot the STATIC table associates with a flag in `seed_flags`, across both param tables and
+/// both the primary and co-check overlays. The set of lots this seed can prove belong to a check
+/// it actually has.
+fn lots_for_flags(lots: &StaticLots, seed_flags: &[u32]) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    for f in seed_flags {
+        for rows in [lots.map_v2.get(f), lots.enemy_v2.get(f)]
+            .into_iter()
+            .flatten()
+        {
+            out.extend(rows.iter().map(|(lot, _)| *lot));
+        }
+        for one in [lots.map.get(f), lots.enemy.get(f)].into_iter().flatten() {
+            out.insert(one.0);
+        }
+    }
+    out
+}
+
+/// An `ItemLotParam` row id -> the slot indices this pass rewrites in it. The shape both the
+/// apworld's `checkLot*` tables and `check_lots::configure` speak.
+pub type LotSlots = HashMap<u32, Vec<u8>>;
+
+/// What [`scope_sent_lots`] decided: the two tables to hand on, and how many rows it could PROVE
+/// belong to a check this seed does not have. `dropped` is logged, not just counted -- a scoping
+/// pass that silently removes rows is the same class of thing as the bug it fixes.
+pub struct ScopedLots {
+    pub map: LotSlots,
+    pub enemy: LotSlots,
+    pub dropped: usize,
+}
+
+/// Drop the lots our apworld sent that provably belong to a check this seed does NOT have (#329).
+///
+/// THE BUG. `features/check_lots.py` sends EVERY check lot -- it says so, and says why: *"we can
+/// only scope by region here, so send every lot. A lot whose check is out of scope sits in a sealed
+/// region the player cannot reach, and rewriting it is inert."* The premise is an inference about
+/// GEOMETRY, and it is false. The lot is repointed at the placeholder, `detour.rs` suppresses that
+/// placeholder unconditionally and correctly, and with no AP location behind the flag nothing is
+/// granted either. **Reachable lot + repointed slot + suppressed placeholder + no check = the
+/// player gets NOTHING.**
+///
+/// MOTIVATING CASE (rule 11). Two reporters, two seeds, same boss: the Summonwater Village Tibia
+/// Mariner pays out nothing on a Limgrave seed. Its Deathroot reward is `f530170`, and `data.py`
+/// tags that flag **Caelid** while the boss stands in Mistwood. Measured against a real seed's
+/// 2090 locations: all 8 Caelid-tagged Summonwater flags absent, all 8 Limgrave-tagged ones
+/// present -- a clean 8/8 split across one tile boundary (m60_45_39 vs m60_45_38).
+///
+/// ⭐ THE ARGUMENT IS ALREADY IN THE TREE, applied to the other apworld. The static-fallback path
+/// scopes its table with `blank_tables_for(&sl, &seed_flags)` under the comment *"Scoped, NOT
+/// global: blanking a lot the seed does not check would eat a legitimate vanilla pickup."* That is
+/// this hazard, named, and our own path is the one that skips it.
+///
+/// 🛑 FAILS TOWARD TODAY'S BEHAVIOUR, and the direction is deliberate. A lot the static table does
+/// not know is KEPT, not dropped, because the two errors are not symmetric:
+///
+///   * keep a lot we should have dropped -> the status quo, this bug, no worse than yesterday;
+///   * drop a lot we should have kept    -> the check hands out its vanilla ware as well as the AP
+///     item, a double-dip that `check_lots` exists to kill.
+///
+/// So only a lot we can PROVE belongs to an out-of-scope flag is dropped. `is_empty()` on the
+/// static table means we can prove nothing about anything: pass both tables through untouched.
+pub fn scope_sent_lots(
+    lots: &StaticLots,
+    seed_flags: &[u32],
+    sent_map: LotSlots,
+    sent_enemy: LotSlots,
+) -> ScopedLots {
+    if lots.map.is_empty() && lots.enemy.is_empty() {
+        // Nothing to prove anything with -> change nothing.
+        return ScopedLots {
+            map: sent_map,
+            enemy: sent_enemy,
+            dropped: 0,
+        };
+    }
+    // Every lot the static table knows AT ALL. A sent lot outside this set is unprovable, not
+    // out-of-scope -- see the failure-direction note above.
+    let mut known: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for t in [&lots.map, &lots.enemy] {
+        known.extend(t.values().map(|(lot, _)| *lot));
+    }
+    for t in [&lots.map_v2, &lots.enemy_v2] {
+        for rows in t.values() {
+            known.extend(rows.iter().map(|(lot, _)| *lot));
+        }
+    }
+    let kept = lots_for_flags(lots, seed_flags);
+    let mut dropped = 0usize;
+    let mut keep = |m: LotSlots| -> LotSlots {
+        m.into_iter()
+            .filter(|(lot, _)| {
+                let out_of_scope = known.contains(lot) && !kept.contains(lot);
+                dropped += usize::from(out_of_scope);
+                !out_of_scope
+            })
+            .collect()
+    };
+    let map = keep(sent_map);
+    let enemy = keep(sent_enemy);
+    ScopedLots {
+        map,
+        enemy,
+        dropped,
+    }
+}
+
 /// Build `checkItemFlags` ({item id -> the check flags that hand it out}) for THIS seed. This is the
 /// INVERSE of the shipped `items` map, which is keyed by flag.
 pub fn check_item_flags_for(lots: &StaticLots, seed_flags: &[u32]) -> HashMap<u32, Vec<u32>> {
@@ -226,6 +333,92 @@ pub fn check_item_flags_for(lots: &StaticLots, seed_flags: &[u32]) -> HashMap<u3
 
 #[cfg(test)]
 mod tests {
+    /// THE MOTIVATING CASE (rule 11), with the real ids. #329: the Summonwater Village Tibia
+    /// Mariner pays out NOTHING on a Limgrave seed, because its Deathroot reward `f530170` is
+    /// tagged **Caelid** in `data.py` while the boss stands in Mistwood. On a seed that keeps
+    /// Limgrave and not Caelid the location is never created, so the flag has no check -- but the
+    /// lot is repointed at the placeholder anyway and the placeholder is suppressed.
+    ///
+    /// Fails on the pass-everything behaviour, which is what shipped.
+    #[test]
+    fn an_out_of_scope_boss_lot_is_not_repointed() {
+        const F_DEATHROOT_CAELID: u32 = 530_170; // out of scope on a Limgrave seed
+        const F_COOKBOOK_LIMGRAVE: u32 = 68_200; // in scope, same village
+        const LOT_DEATHROOT: u32 = 5_301_700;
+        const LOT_COOKBOOK: u32 = 682_000;
+
+        let mut lots = StaticLots::default();
+        lots.map
+            .insert(F_DEATHROOT_CAELID, (LOT_DEATHROOT, vec![1]));
+        lots.map
+            .insert(F_COOKBOOK_LIMGRAVE, (LOT_COOKBOOK, vec![1]));
+
+        // what check_lots.py sends today: BOTH lots, regardless of scope
+        let sent = HashMap::from([(LOT_DEATHROOT, vec![1u8]), (LOT_COOKBOOK, vec![1u8])]);
+        // what the seed actually has
+        let seed_flags = [F_COOKBOOK_LIMGRAVE];
+
+        let out = scope_sent_lots(&lots, &seed_flags, sent, HashMap::new());
+        let (m, dropped) = (out.map, out.dropped);
+
+        assert_eq!(dropped, 1);
+        assert!(
+            !m.contains_key(&LOT_DEATHROOT),
+            "the Tibia Mariner's lot has no check on this seed -- repointing it means the player \
+             kills a reachable boss and receives nothing (#329)"
+        );
+        assert!(
+            m.contains_key(&LOT_COOKBOOK),
+            "an IN-SCOPE lot in the same village must still be repointed, or its vanilla ware \
+             double-dips alongside the AP item"
+        );
+    }
+
+    /// 🛑 The failure direction. A lot the static table has never heard of is KEPT: we cannot prove
+    /// it is out of scope, and the two errors are not symmetric -- keeping one wrongly is today's
+    /// behaviour, dropping one wrongly resurrects the vanilla double-dip.
+    #[test]
+    fn an_unprovable_lot_is_kept_not_dropped() {
+        let mut lots = StaticLots::default();
+        lots.map.insert(1, (100, vec![1]));
+        let sent = HashMap::from([(100, vec![1u8]), (999_999, vec![1u8])]);
+
+        let out = scope_sent_lots(&lots, &[1], sent, HashMap::new());
+        let (m, dropped) = (out.map, out.dropped);
+        assert_eq!(dropped, 0);
+        assert!(m.contains_key(&999_999), "unknown lot must survive");
+        assert!(m.contains_key(&100));
+    }
+
+    /// No static table -> we can prove nothing about anything, so change nothing. Going inert here
+    /// would hand out the vanilla ware at EVERY check.
+    #[test]
+    fn without_the_static_table_both_tables_pass_through_untouched() {
+        let sent = HashMap::from([(1u32, vec![1u8]), (2, vec![2])]);
+        let sent_e = HashMap::from([(3u32, vec![3u8])]);
+        let out = scope_sent_lots(&StaticLots::default(), &[7], sent.clone(), sent_e.clone());
+        assert_eq!((out.map, out.enemy, out.dropped), (sent, sent_e, 0));
+    }
+
+    /// A co-check flag drives SEVERAL lots. Scoping must keep every one of them, or the sibling
+    /// leaks its vanilla ware -- the same reason `blank_tables_for` consults the overlay.
+    #[test]
+    fn a_co_check_flags_sibling_lots_are_all_in_scope() {
+        let mut lots = StaticLots::default();
+        lots.map.insert(42, (1000, vec![1]));
+        lots.map_v2
+            .insert(42, vec![(1000, vec![1]), (1001, vec![1]), (1002, vec![1])]);
+        let sent = HashMap::from([(1000, vec![1u8]), (1001, vec![1u8]), (1002, vec![1u8])]);
+
+        let out = scope_sent_lots(&lots, &[42], sent, HashMap::new());
+        assert_eq!(
+            out.dropped, 0,
+            "every sibling lot of a kept flag stays in scope"
+        );
+        let m = out.map;
+        assert_eq!(m.len(), 3);
+    }
+
     use super::*;
 
     const T: &str = r#"{

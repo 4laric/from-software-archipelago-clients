@@ -970,6 +970,52 @@ impl shared::Core for Core {
                         && non_goods_map.is_empty()
                         && non_goods_enemy.is_empty());
                     if ph != 0 && has_lots {
+                        // #329 -- SCOPE THE REWRITE TO CHECKS THIS SEED ACTUALLY HAS.
+                        //
+                        // `features/check_lots.py` sends EVERY check lot and says why: "we can only
+                        // scope by region here ... a lot whose check is out of scope sits in a
+                        // sealed region the player cannot reach, and rewriting it is inert." That
+                        // premise is an inference about GEOMETRY and it is false. Two reporters hit
+                        // the same case: the Summonwater Village Tibia Mariner pays out NOTHING on a
+                        // Limgrave seed, because its Deathroot reward (f530170) is tagged Caelid
+                        // while the boss stands in Mistwood. Repointed lot + unconditionally
+                        // suppressed placeholder + no AP location = the player gets nothing.
+                        //
+                        // The static table is flag-keyed GAME data, identical for every apworld, and
+                        // the FOREIGN path below already scopes with it under the comment "Scoped,
+                        // NOT global: blanking a lot the seed does not check would eat a legitimate
+                        // vanilla pickup". Ours is the path that skipped it. Fails toward today's
+                        // behaviour: a lot the table cannot place is KEPT, never dropped.
+                        let sl = load_static_lots();
+                        let seed_flags: Vec<u32> = loc_flags.values().copied().collect();
+                        let goods = er_logic::static_lots::scope_sent_lots(
+                            &sl,
+                            &seed_flags,
+                            blank_map,
+                            blank_enemy,
+                        );
+                        let non_goods = er_logic::static_lots::scope_sent_lots(
+                            &sl,
+                            &seed_flags,
+                            non_goods_map,
+                            non_goods_enemy,
+                        );
+                        let (blank_map, blank_enemy) = (goods.map, goods.enemy);
+                        let (non_goods_map, non_goods_enemy) = (non_goods.map, non_goods.enemy);
+                        let (dropped_goods, dropped_non_goods) = (goods.dropped, non_goods.dropped);
+                        if dropped_goods + dropped_non_goods > 0 {
+                            log::info!(
+                                "check-lots: SCOPED OUT {dropped_goods} goods + {dropped_non_goods} \
+                                 non-goods lot(s) whose check is not in this seed -- rewriting them \
+                                 would leave a reachable pickup paying nothing (#329)"
+                            );
+                        } else if sl.map.is_empty() && sl.enemy.is_empty() {
+                            log::warn!(
+                                "check-lots: check_lots_table.json missing beside the DLL -- cannot \
+                                 tell which lots belong to this seed, so every lot is rewritten as \
+                                 before. An out-of-scope check will pay out nothing (#329)."
+                            );
+                        }
                         crate::check_lots::configure(
                             blank_map,
                             blank_enemy,
