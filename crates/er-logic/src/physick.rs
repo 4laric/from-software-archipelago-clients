@@ -107,6 +107,60 @@ pub fn canonical_row(row: u32) -> u32 {
     row
 }
 
+/// The value an UNOCCUPIED mixture slot holds: `OptionalItemId::NONE`, i.e. `u32::MAX`.
+///
+/// MEASURED, not assumed (probe v2, 2026-08-03 22:33): both slots read `0xFFFFFFFF` on a fresh
+/// load, and slot A returned to `0xFFFFFFFF` on an unmix. It also happens to be exactly the pinned
+/// crate's `OptionalItemId::NONE`, which is the structural confirmation that the field is
+/// `[OptionalItemId; 2]` and not two loose dwords that happen to hold ids.
+pub const EMPTY_SLOT: u32 = u32::MAX;
+
+/// The Flask of Wondrous Physick holds exactly two tears.
+pub const MIXTURE_SLOTS: usize = 2;
+
+/// Which mixture slot a received tear should occupy, given the two slots as read from the game.
+///
+/// `mixture` is raw: [`EMPTY_SLOT`] for an unoccupied slot, otherwise a GOODS FullID.
+///
+/// Returns `None` when the tear is ALREADY mixed. That is not a courtesy -- re-writing a slot with
+/// the value it already holds would churn the menu for no behaviour change, and worse, it would
+/// make the operation non-idempotent against the reconciler, which replays the whole received set
+/// on every reconnect.
+///
+/// ## The policy, and why it is not up for debate here
+///
+/// `auto_equip` follows the community **French Challenge** ruleset (Alaric's ruling, 2026-08-03),
+/// which names flask contents among the things that auto-equip and must STAY equipped. So the fix
+/// for an unwanted mixture is **WHERE the tear lands, never WHETHER it is mixed**. By the precedent
+/// already set for talismans and the left hand: **first empty slot, else clobber the lowest**
+/// (last writer wins). Clobbering the tear you were saving IS the feature -- the whole premise of
+/// the ruleset is that you do not choose your build.
+///
+/// Comparison is by [`canonical_row`], so a near-duplicate row cannot slip past the
+/// already-mixed check and mix the same tear twice under two ids.
+pub fn slot_for_tear(mixture: [u32; MIXTURE_SLOTS], incoming_full_id: i32) -> Option<usize> {
+    let incoming = canonical_row(goods_row(incoming_full_id)?);
+
+    let occupant = |slot: u32| -> Option<u32> {
+        if slot == EMPTY_SLOT {
+            None
+        } else {
+            goods_row(slot as i32).map(canonical_row)
+        }
+    };
+
+    // Already mixed -> nothing to do.
+    if mixture.iter().any(|&s| occupant(s) == Some(incoming)) {
+        return None;
+    }
+    // First empty slot.
+    if let Some(i) = mixture.iter().position(|&s| occupant(s).is_none()) {
+        return Some(i);
+    }
+    // Both occupied -> clobber the lowest.
+    Some(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +216,63 @@ mod tests {
         assert_eq!(canonical_row(canonical_row(11003)), 11002);
         assert_eq!(canonical_row(11011), 11011);
         assert_eq!(canonical_row(2_011_070), 2_011_070);
+    }
+
+    #[test]
+    fn empty_flask_fills_the_first_slot() {
+        let m = [EMPTY_SLOT, EMPTY_SLOT];
+        assert_eq!(slot_for_tear(m, goods_full_id(11002)), Some(0));
+    }
+
+    #[test]
+    fn one_occupied_slot_fills_the_other() {
+        let m = [goods_full_id(11002) as u32, EMPTY_SLOT];
+        assert_eq!(slot_for_tear(m, goods_full_id(11004)), Some(1));
+        // ...and the reverse, in case the game ever fills B first.
+        let m = [EMPTY_SLOT, goods_full_id(11004) as u32];
+        assert_eq!(slot_for_tear(m, goods_full_id(11002)), Some(0));
+    }
+
+    #[test]
+    fn a_full_flask_clobbers_the_lowest() {
+        let m = [goods_full_id(11002) as u32, goods_full_id(11004) as u32];
+        assert_eq!(slot_for_tear(m, goods_full_id(11011)), Some(0));
+    }
+
+    /// Idempotence is load-bearing: the reconciler replays the whole received set on every
+    /// reconnect, so a tear that is already mixed must be a no-op and not a slot rotation.
+    #[test]
+    fn an_already_mixed_tear_is_a_no_op() {
+        let m = [goods_full_id(11002) as u32, goods_full_id(11004) as u32];
+        assert_eq!(slot_for_tear(m, goods_full_id(11002)), None);
+        assert_eq!(slot_for_tear(m, goods_full_id(11004)), None);
+        // Also when the other slot is free -- "first empty" must not win over "already mixed".
+        let m = [goods_full_id(11002) as u32, EMPTY_SLOT];
+        assert_eq!(slot_for_tear(m, goods_full_id(11002)), None);
+    }
+
+    /// A near-duplicate row must not mix the same tear twice under two ids.
+    #[test]
+    fn near_duplicates_count_as_already_mixed() {
+        let m = [goods_full_id(11003) as u32, EMPTY_SLOT];
+        assert_eq!(slot_for_tear(m, goods_full_id(11002)), None);
+        let m = [goods_full_id(11002) as u32, EMPTY_SLOT];
+        assert_eq!(slot_for_tear(m, goods_full_id(11003)), None);
+    }
+
+    #[test]
+    fn a_non_goods_id_is_never_mixed() {
+        let m = [EMPTY_SLOT, EMPTY_SLOT];
+        assert_eq!(slot_for_tear(m, 0x0000_2710), None); // weapon
+        assert_eq!(slot_for_tear(m, 0x1000_2710), None); // protector
+    }
+
+    /// The empty sentinel is a MEASURED value; pin it so a future edit cannot quietly swap it for
+    /// a plausible-looking 0 or -1-as-i32.
+    #[test]
+    fn empty_slot_is_optional_item_id_none() {
+        assert_eq!(EMPTY_SLOT, 0xFFFF_FFFF);
+        assert_eq!(EMPTY_SLOT, u32::MAX);
     }
 
     /// The aliases must never also appear as canonical targets, or folding would not terminate.
