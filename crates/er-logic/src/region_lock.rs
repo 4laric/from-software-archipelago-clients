@@ -4,7 +4,7 @@
 //! get covered later via the `GameHook` seam (PR-C). Here we lock the pure rules: when a region
 //! counts as locked (→ kick), and when a natural-key clause set fires.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Decide whether the player should be KICKED this tick: the current region is in a locked range
 /// AND the random-start guard allows it (non-random seed, or the random-start warp already done).
@@ -105,6 +105,353 @@ impl EnforcementLatch {
 /// `region_lock_replay`.
 pub fn region_bloom_settled(open_flag: u32, flags: &[u32], get_flag: &dyn Fn(u32) -> bool) -> bool {
     get_flag(open_flag) && flags.iter().all(|&f| get_flag(f))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The SEALED-REGION message (legibility only -- nothing here decides whether a kick happens).
+//
+// MOTIVATING CASE (CONTRIBUTING rule 11). Alaric, in game, 2026-08-02: holding the Academy
+// Glintstone Key he walked into Raya Lucaria and was ejected with
+//
+//     kick-watch: play_region 6200000 -> 1400011 (sub 14000); range [14000,14000] flag 76981
+//                 = false | kick = true
+//     [APC] SEALED REGION (area 1400011) -- lock not received yet. Returning to Roundtable Hold.
+//
+// He held five Locks but not "Raya Lucaria Academy Lock", so the kick was CORRECT: the two
+// vanilla-flavoured gates (Raya Lucaria's Academy Glintstone Key, Leyndell/Sewer's Great Runes)
+// are layered ON TOP of a region's own Lock, never in place of it. The defect was the WORDS.
+// `area 1400011` is a play_region id no player can map to a place, and the message said nothing
+// about the key in his inventory -- so "I am holding the key" and "lock not received yet" read
+// as a contradiction rather than as two different seals.
+//
+// House split (same as `marker::refusal_toast`): er-logic owns the WORDS, the caller owns the
+// STATE. `region.rs::tick_kick` resolves the region from config it already holds and passes it
+// in; every string a player reads is built here, where it is host-tested and ASCII-swept.
+
+/// A region that ALSO carries one of the base game's own seals, layered on top of its Lock.
+/// Naming the vanilla key is the whole point: holding it is exactly what makes a correct kick
+/// feel like a bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VanillaGate {
+    /// Region name, spelled as in [`crate::region_locks::REGION_LOCKS`] (drift-guarded below).
+    pub region: &'static str,
+    /// The vanilla key by name, e.g. "Academy Glintstone Key".
+    pub key: &'static str,
+    /// The sentence that goes into the message. Written out per gate rather than templated
+    /// because the plural ("the Great Runes open") and the singular ("the Academy Glintstone
+    /// Key opens") do not share a verb. A test pins that it still names `key`.
+    pub note: &'static str,
+}
+
+/// The regions with a vanilla seal on top of their Lock.
+///
+/// STATIC VANILLA GEOMETRY, not seed state -- which is why this needs no slot_data key, no
+/// contract change and no feature tag. The apworld never swaps a region's Lock FOR the game's
+/// own gate; the gate is layered over it. Mirrors the world's
+/// `features/natural_progression.py::GAME_NATIVE_GATE` (`{"Leyndell", "Sewer"}` -- the capital
+/// fogwall, the one genuinely hard vanilla boundary) plus Raya Lucaria Academy, whose Academy
+/// Glintstone Key seal is physically present in game even though logic does not lean on it.
+///
+/// This is a hand-written mirror, so it can go stale if a region is ever renamed; the guard is
+/// `every_vanilla_gate_names_a_real_region`, which re-checks each name against the GENERATED
+/// `region_locks` table.
+pub const VANILLA_GATED_REGIONS: &[VanillaGate] = &[
+    VanillaGate {
+        region: "Leyndell",
+        key: "Great Runes",
+        note: "The Great Runes open the game's own seal here, not the region Lock.",
+    },
+    VanillaGate {
+        region: "Raya Lucaria Academy",
+        key: "Academy Glintstone Key",
+        note: "The Academy Glintstone Key opens the game's own seal here, not the region Lock.",
+    },
+    VanillaGate {
+        region: "Sewer",
+        key: "Great Runes",
+        note: "The Great Runes open the game's own seal here, not the region Lock.",
+    },
+];
+
+/// The vanilla gate layered over `region`, if it has one. `region` is the bare region name
+/// ("Raya Lucaria Academy"), not the lock item -- see [`region_of_lock_item`].
+pub fn vanilla_gate(region: &str) -> Option<&'static VanillaGate> {
+    VANILLA_GATED_REGIONS.iter().find(|g| g.region == region)
+}
+
+/// "REGION" from "REGION Lock" (the naming convention the generated table enforces and
+/// `region_locks::lock_items_follow_the_naming_convention` pins). A name that does not carry the
+/// suffix is returned unchanged rather than mangled.
+pub fn region_of_lock_item(lock_item: &str) -> &str {
+    lock_item.strip_suffix(" Lock").unwrap_or(lock_item)
+}
+
+/// The lock item that seals play region `pr`, resolved from config the caller ALREADY holds --
+/// this is the reverse of the lookup the client does at receipt time, and needs no new wire.
+///
+///  1. the `areaLockFlags` range covering `pr` names an open flag, and `regionOpenFlags` maps
+///     lock item name -> that same flag, so the flag is the join key. Live seed data wins.
+///  2. failing that (a seed running off the baked fallback before it merges, or a range whose
+///     flag has no name), the GENERATED `region_locks` table maps a play_region id to its
+///     region. Static game geometry, the same source the fallback derive already uses.
+///
+/// `pr` is the RAW play_region id; a 7-digit interior id is folded to its 5-digit bucket by the
+/// SAME rule [`kick_decision`] applies, so the message and the gate can never disagree about
+/// which range covered the tick.
+pub fn sealed_lock_item<'a>(
+    pr: i32,
+    area_lock_flags: &[[i32; 3]],
+    region_open_flags: &'a HashMap<String, u32>,
+) -> Option<&'a str> {
+    let sub = if pr >= 1_000_000 { pr / 100 } else { pr };
+    if let Some(e) = area_lock_flags.iter().find(|e| sub >= e[0] && sub <= e[1]) {
+        // `.min()` only to stay deterministic if a seed ever gives two locks one open flag;
+        // normally the filter yields exactly one name.
+        let named = region_open_flags
+            .iter()
+            .filter(|(_, &f)| f == e[2] as u32)
+            .map(|(n, _)| n.as_str())
+            .min();
+        if let Some(name) = named {
+            return Some(name);
+        }
+    }
+    crate::region_locks::REGION_LOCKS
+        .iter()
+        .find(|r| r.play_regions.contains(&sub))
+        .map(|r| r.lock_item)
+}
+
+/// What the client actually DID about the kick this tick. The caller owns this state; the words
+/// for it live here so the whole message is one testable string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealedOutcome {
+    /// The warp-out landed: the player is back at Roundtable Hold.
+    WarpedToHub,
+    /// The warp primitive was unavailable and the fallback ran instead.
+    KickFallback,
+}
+
+impl SealedOutcome {
+    const fn tail(self) -> &'static str {
+        match self {
+            SealedOutcome::WarpedToHub => "Returning to Roundtable Hold.",
+            SealedOutcome::KickFallback => "Kicked out.",
+        }
+    }
+}
+
+/// The player-facing SEALED REGION message.
+///
+///  - `pr` -- the raw play_region id, printed ONLY when the region cannot be named (never name a
+///    place we could not resolve).
+///  - `lock_item` -- whatever [`sealed_lock_item`] resolved.
+///  - `outcome` -- what the caller did.
+///
+/// ASCII by construction (the in-game font draws `?` for anything else -- the v0.2.18 em-dash
+/// escape lived in the CONSTANT part of a format string, so `every_sealed_message_is_ascii`
+/// sweeps the whole baked table rather than asserting one literal).
+pub fn sealed_region_message(pr: i32, lock_item: Option<&str>, outcome: SealedOutcome) -> String {
+    let tail = outcome.tail();
+    let Some(lock_item) = lock_item else {
+        return format!(
+            "SEALED REGION (area {pr}). Come back once you receive this region's Lock. {tail}"
+        );
+    };
+    let region = region_of_lock_item(lock_item);
+    match vanilla_gate(region) {
+        Some(g) => format!(
+            "SEALED REGION: {region}. Come back once you receive \"{lock_item}\". {} {tail}",
+            g.note
+        ),
+        None => {
+            format!("SEALED REGION: {region}. Come back once you receive \"{lock_item}\". {tail}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod sealed_message_tests {
+    use super::*;
+
+    /// Alaric's tick, verbatim from the kick-watch line: raw 7-digit play_region 1400011,
+    /// covered by range [14000, 14000] on open flag 76981.
+    const RAYA_PR: i32 = 1_400_011;
+    const RAYA_RANGE: [i32; 3] = [14000, 14000, 76981];
+
+    fn open_flags(pairs: &[(&str, u32)]) -> HashMap<String, u32> {
+        pairs.iter().map(|(n, f)| (n.to_string(), *f)).collect()
+    }
+
+    /// The five locks Alaric actually held, plus the one he did not -- scope is the SEED's lock
+    /// set, so the sealed region's name is resolvable even while its lock is unreceived.
+    fn alarics_seed() -> HashMap<String, u32> {
+        open_flags(&[
+            ("Leyndell Lock", 76980),
+            ("Limgrave Lock", 73100),
+            ("Liurnia Lock", 73101),
+            ("Stormveil Lock", 71003),
+            ("Weeping Lock", 73102),
+            ("Raya Lucaria Academy Lock", 76981),
+        ])
+    }
+
+    // --- rule 11: the case this change was built for -----------------------------------------
+
+    #[test]
+    fn alarics_raya_lucaria_kick_names_the_region_the_lock_and_the_key() {
+        let cfg = alarics_seed();
+        let lock = sealed_lock_item(RAYA_PR, &[RAYA_RANGE], &cfg);
+        assert_eq!(lock, Some("Raya Lucaria Academy Lock"));
+        let msg = sealed_region_message(RAYA_PR, lock, SealedOutcome::WarpedToHub);
+        assert!(
+            msg.contains("Raya Lucaria Academy"),
+            "names the region: {msg}"
+        );
+        assert!(
+            msg.contains("Raya Lucaria Academy Lock"),
+            "names the Lock item: {msg}"
+        );
+        assert!(
+            msg.contains("Academy Glintstone Key"),
+            "names the vanilla key he was holding: {msg}"
+        );
+        assert!(
+            !msg.contains("1400011") && !msg.contains("14000"),
+            "the bare area id is REPLACED, not merely decorated: {msg}"
+        );
+        assert!(msg.is_ascii(), "in-game font is ASCII-only: {msg}");
+    }
+
+    #[test]
+    fn an_ordinary_region_names_its_lock_and_mentions_no_key() {
+        let msg = sealed_region_message(
+            30000,
+            sealed_lock_item(30000, &[[30000, 30010, 73102]], &alarics_seed()),
+            SealedOutcome::WarpedToHub,
+        );
+        assert!(msg.contains("Weeping"), "{msg}");
+        assert!(msg.contains("Weeping Lock"), "{msg}");
+        assert!(
+            !msg.contains("Key"),
+            "no vanilla key on an ungated region: {msg}"
+        );
+        assert!(!msg.contains("Great Rune"), "{msg}");
+        assert!(
+            !msg.contains("30000"),
+            "area id replaced by the name: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_gated_region_says_the_vanilla_key_is_not_enough() {
+        for g in VANILLA_GATED_REGIONS {
+            let lock = format!("{} Lock", g.region);
+            let msg = sealed_region_message(0, Some(&lock), SealedOutcome::WarpedToHub);
+            assert!(msg.contains(g.region), "{msg}");
+            assert!(msg.contains(&lock), "{msg}");
+            assert!(msg.contains(g.key), "must name {}: {msg}", g.key);
+            assert!(msg.contains(g.note), "{msg}");
+        }
+    }
+
+    // --- ASCII: sweep the RANGE, never one literal (v0.2.18) ---------------------------------
+
+    #[test]
+    fn every_sealed_message_is_ascii() {
+        for outcome in [SealedOutcome::WarpedToHub, SealedOutcome::KickFallback] {
+            // unresolved region, over a spread of raw ids
+            for pr in [0, 14000, 1_400_011, 6_200_000, i32::MAX, i32::MIN] {
+                let m = sealed_region_message(pr, None, outcome);
+                assert!(m.is_ascii(), "{m}");
+            }
+            // every region the game has, gated and ungated alike
+            for r in crate::region_locks::REGION_LOCKS {
+                let m = sealed_region_message(0, Some(r.lock_item), outcome);
+                assert!(m.is_ascii(), "{m}");
+                assert!(m.contains(r.region), "{m}");
+            }
+            for g in VANILLA_GATED_REGIONS {
+                assert!(g.note.is_ascii() && g.key.is_ascii() && g.region.is_ascii());
+            }
+            assert!(outcome.tail().is_ascii());
+        }
+    }
+
+    // --- resolution ---------------------------------------------------------------------------
+
+    #[test]
+    fn a_seven_digit_interior_id_folds_the_same_way_kick_decision_folds_it() {
+        let cfg = alarics_seed();
+        assert_eq!(
+            sealed_lock_item(1_400_011, &[RAYA_RANGE], &cfg),
+            sealed_lock_item(14000, &[RAYA_RANGE], &cfg),
+        );
+        // and the fold agrees with the gate that produced the kick
+        assert!(kick_decision(1_400_011, &[RAYA_RANGE], 0, &|_| false));
+    }
+
+    #[test]
+    fn an_unnamed_flag_falls_back_to_the_baked_table() {
+        // areaLockFlags covers the range but regionOpenFlags has no name for the flag.
+        let empty = HashMap::new();
+        let lock = sealed_lock_item(RAYA_PR, &[RAYA_RANGE], &empty);
+        assert_eq!(lock, Some("Raya Lucaria Academy Lock"));
+    }
+
+    #[test]
+    fn an_unknown_area_keeps_the_id_and_still_names_the_action() {
+        let cfg = alarics_seed();
+        let lock = sealed_lock_item(99999, &[RAYA_RANGE], &cfg);
+        assert_eq!(lock, None);
+        let msg = sealed_region_message(99999, lock, SealedOutcome::KickFallback);
+        assert!(msg.contains("area 99999"), "{msg}");
+        assert!(msg.contains("Lock"), "still names what is missing: {msg}");
+        assert!(msg.is_ascii(), "{msg}");
+    }
+
+    #[test]
+    fn the_outcome_is_the_callers_state_and_shows_in_the_words() {
+        let warped = sealed_region_message(0, Some("Caelid Lock"), SealedOutcome::WarpedToHub);
+        let kicked = sealed_region_message(0, Some("Caelid Lock"), SealedOutcome::KickFallback);
+        assert!(
+            warped.ends_with("Returning to Roundtable Hold."),
+            "{warped}"
+        );
+        assert!(kicked.ends_with("Kicked out."), "{kicked}");
+        assert_ne!(warped, kicked);
+    }
+
+    #[test]
+    fn region_of_lock_item_strips_only_the_suffix() {
+        assert_eq!(
+            region_of_lock_item("Raya Lucaria Academy Lock"),
+            "Raya Lucaria Academy"
+        );
+        assert_eq!(region_of_lock_item("Lockstone"), "Lockstone");
+        assert_eq!(region_of_lock_item("Lock"), "Lock");
+    }
+
+    // --- drift guard for the hand-written mirror ----------------------------------------------
+
+    #[test]
+    fn every_vanilla_gate_names_a_real_region() {
+        for g in VANILLA_GATED_REGIONS {
+            assert!(
+                crate::region_locks::by_lock_item(&format!("{} Lock", g.region)).is_some(),
+                "VANILLA_GATED_REGIONS names {:?}, which the generated region_locks table does \
+                 not have -- the region was renamed or removed",
+                g.region
+            );
+            assert!(
+                g.note.contains(g.key),
+                "the sentence for {:?} must still name its key",
+                g.region
+            );
+            assert_eq!(vanilla_gate(g.region), Some(g));
+        }
+        assert_eq!(vanilla_gate("Limgrave"), None);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
