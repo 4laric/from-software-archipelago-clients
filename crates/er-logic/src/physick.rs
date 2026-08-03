@@ -118,27 +118,61 @@ pub const EMPTY_SLOT: u32 = u32::MAX;
 /// The Flask of Wondrous Physick holds exactly two tears.
 pub const MIXTURE_SLOTS: usize = 2;
 
-/// Which mixture slot a received tear should occupy, given the two slots as read from the game.
+/// Which mixture slot a received tear should occupy, given the two slots as read from the game and
+/// the tear's position in the AP RECEIVED STREAM.
 ///
 /// `mixture` is raw: [`EMPTY_SLOT`] for an unoccupied slot, otherwise a GOODS FullID.
 ///
 /// Returns `None` when the tear is ALREADY mixed. That is not a courtesy -- re-writing a slot with
-/// the value it already holds would churn the menu for no behaviour change, and worse, it would
-/// make the operation non-idempotent against the reconciler, which replays the whole received set
-/// on every reconnect.
+/// the value it already holds would churn the menu for no behaviour change.
 ///
-/// ## The policy, and why it is not up for debate here
+/// ## The policy
 ///
 /// `auto_equip` follows the community **French Challenge** ruleset (Alaric's ruling, 2026-08-03),
 /// which names flask contents among the things that auto-equip and must STAY equipped. So the fix
-/// for an unwanted mixture is **WHERE the tear lands, never WHETHER it is mixed**. By the precedent
-/// already set for talismans and the left hand: **first empty slot, else clobber the lowest**
-/// (last writer wins). Clobbering the tear you were saving IS the feature -- the whole premise of
-/// the ruleset is that you do not choose your build.
+/// for an unwanted mixture is **WHERE the tear lands, never WHETHER it is mixed**.
 ///
-/// Comparison is by [`canonical_row`], so a near-duplicate row cannot slip past the
-/// already-mixed check and mix the same tear twice under two ids.
-pub fn slot_for_tear(mixture: [u32; MIXTURE_SLOTS], incoming_full_id: i32) -> Option<usize> {
+/// 1. **Already mixed -> `None`.**
+/// 2. **First empty slot.**
+/// 3. **Both full -> alternate**, `ordinal % 2`.
+///
+/// Rule 3 was `slot 0, always` when this shipped, mirroring [`crate::auto_equip::slot_for_accessory`].
+/// Alaric played it and reported the tell: the fourth tear clobbered slot 0 like the third, so
+/// **slot 1 froze permanently** on whatever arrived second and only one of the two ever changed
+/// again. That is the opposite of what the talisman policy's own rationale asks for ("ends up with
+/// the four most recent talismans rather than one").
+///
+/// ## 🛑 Why the ordinal, and not a flip-flop counter
+///
+/// The reconciler replays the WHOLE received set on every reconnect, so the policy has to be a pure
+/// function of things that replay identically. A local "which slot did I clobber last" flag is not:
+/// it resets at connect and desyncs from its live phase. With three tears A, B, C:
+///
+/// ```text
+/// live    A -> slot 0 (empty)   B -> slot 1 (empty)   C -> clobber(flag=0) = slot 0   => {C, B}
+/// replay  A -> clobber(flag=0) = slot 0 => {A, B}
+///         B -> already mixed, no-op
+///         C -> clobber(flag=1) = slot 1 => {A, C}     <-- the flask silently rearranged
+/// ```
+///
+/// The AP received stream, by contrast, is replayed in the same order every time, so a tear's
+/// ORDINAL in it is stable -- the same property `flask_reconcile` already leans on to run with no
+/// ledger at all. Keying rule 3 off the ordinal alternates AND converges:
+///
+/// ```text
+/// live    A(0) -> 0   B(1) -> 1   C(2) -> 2%2 = 0     => {C, B}
+/// replay  A(0) -> 0%2 = 0 => {A, B}   B(1) -> no-op   C(2) -> 0 => {C, B}   <-- same
+/// ```
+///
+/// `replaying_the_received_set_converges` is the acceptance test, and it FAILS for a flip-flop.
+///
+/// Comparison is by [`canonical_row`], so a near-duplicate row cannot slip past the already-mixed
+/// check and mix the same tear twice under two ids.
+pub fn slot_for_tear(
+    mixture: [u32; MIXTURE_SLOTS],
+    incoming_full_id: i32,
+    ordinal: u64,
+) -> Option<usize> {
     let incoming = canonical_row(goods_row(incoming_full_id)?);
 
     let occupant = |slot: u32| -> Option<u32> {
@@ -157,8 +191,8 @@ pub fn slot_for_tear(mixture: [u32; MIXTURE_SLOTS], incoming_full_id: i32) -> Op
     if let Some(i) = mixture.iter().position(|&s| occupant(s).is_none()) {
         return Some(i);
     }
-    // Both occupied -> clobber the lowest.
-    Some(0)
+    // Both occupied -> alternate by received-stream position, so neither slot freezes.
+    Some((ordinal % MIXTURE_SLOTS as u64) as usize)
 }
 
 #[cfg(test)]
@@ -218,25 +252,75 @@ mod tests {
         assert_eq!(canonical_row(2_011_070), 2_011_070);
     }
 
+    /// Apply a whole received stream to a starting mixture, the way `auto_equip::tick` does:
+    /// ordinal `i` for the `i`th tear in the stream.
+    fn run(start: [u32; MIXTURE_SLOTS], stream: &[u32]) -> [u32; MIXTURE_SLOTS] {
+        let mut m = start;
+        for (i, &row) in stream.iter().enumerate() {
+            let full = goods_full_id(row);
+            if let Some(slot) = slot_for_tear(m, full, i as u64) {
+                m[slot] = full as u32;
+            }
+        }
+        m
+    }
+
+    const EMPTY: [u32; MIXTURE_SLOTS] = [EMPTY_SLOT, EMPTY_SLOT];
+
     #[test]
     fn empty_flask_fills_the_first_slot() {
-        let m = [EMPTY_SLOT, EMPTY_SLOT];
-        assert_eq!(slot_for_tear(m, goods_full_id(11002)), Some(0));
+        assert_eq!(slot_for_tear(EMPTY, goods_full_id(11002), 0), Some(0));
     }
 
     #[test]
     fn one_occupied_slot_fills_the_other() {
         let m = [goods_full_id(11002) as u32, EMPTY_SLOT];
-        assert_eq!(slot_for_tear(m, goods_full_id(11004)), Some(1));
+        assert_eq!(slot_for_tear(m, goods_full_id(11004), 1), Some(1));
         // ...and the reverse, in case the game ever fills B first.
         let m = [EMPTY_SLOT, goods_full_id(11004) as u32];
-        assert_eq!(slot_for_tear(m, goods_full_id(11002)), Some(0));
+        assert_eq!(slot_for_tear(m, goods_full_id(11002), 1), Some(0));
     }
 
+    /// 🛑 THE MOTIVATING CASE (rule 11). Alaric played the always-clobber-slot-0 build and reported
+    /// it: the third tear took slot 0, and so did the FOURTH, so slot 1 froze forever on whatever
+    /// arrived second. Both slots must churn.
     #[test]
-    fn a_full_flask_clobbers_the_lowest() {
-        let m = [goods_full_id(11002) as u32, goods_full_id(11004) as u32];
-        assert_eq!(slot_for_tear(m, goods_full_id(11011)), Some(0));
+    fn a_full_flask_alternates_instead_of_freezing_slot_one() {
+        // Four tears into an empty flask: 0 and 1 fill, then 2 and 3 clobber ALTERNATELY.
+        let m = run(EMPTY, &[11002, 11004, 11001, 11012]);
+        assert_eq!(
+            m,
+            [goods_full_id(11001) as u32, goods_full_id(11012) as u32]
+        );
+        // Neither of the first two survives -- under the old policy 11004 would still be in slot 1.
+        assert_ne!(m[1], goods_full_id(11004) as u32);
+    }
+
+    /// 🛑 THE ACCEPTANCE TEST for keying rule 3 off the received-stream ordinal instead of a local
+    /// flip-flop. The reconciler replays the WHOLE received set on every reconnect, so replaying it
+    /// from the state it produced must be a fixed point. A flip-flop counter FAILS this at n = 3.
+    #[test]
+    fn replaying_the_received_set_converges() {
+        let streams: [&[u32]; 6] = [
+            &[11002],
+            &[11002, 11004],
+            &[11002, 11004, 11001],
+            &[11002, 11004, 11001, 11012],
+            &[11002, 11004, 11001, 11012, 11011],
+            &[11002, 11004, 11001, 11012, 11011, 11025],
+        ];
+        for stream in streams {
+            let live = run(EMPTY, stream);
+            let replayed = run(live, stream);
+            assert_eq!(
+                live,
+                replayed,
+                "reconnect rearranged the flask for a {}-tear stream",
+                stream.len()
+            );
+            // And replaying twice more must not drift either.
+            assert_eq!(live, run(run(live, stream), stream));
+        }
     }
 
     /// Idempotence is load-bearing: the reconciler replays the whole received set on every
@@ -244,27 +328,26 @@ mod tests {
     #[test]
     fn an_already_mixed_tear_is_a_no_op() {
         let m = [goods_full_id(11002) as u32, goods_full_id(11004) as u32];
-        assert_eq!(slot_for_tear(m, goods_full_id(11002)), None);
-        assert_eq!(slot_for_tear(m, goods_full_id(11004)), None);
+        assert_eq!(slot_for_tear(m, goods_full_id(11002), 7), None);
+        assert_eq!(slot_for_tear(m, goods_full_id(11004), 8), None);
         // Also when the other slot is free -- "first empty" must not win over "already mixed".
         let m = [goods_full_id(11002) as u32, EMPTY_SLOT];
-        assert_eq!(slot_for_tear(m, goods_full_id(11002)), None);
+        assert_eq!(slot_for_tear(m, goods_full_id(11002), 3), None);
     }
 
     /// A near-duplicate row must not mix the same tear twice under two ids.
     #[test]
     fn near_duplicates_count_as_already_mixed() {
         let m = [goods_full_id(11003) as u32, EMPTY_SLOT];
-        assert_eq!(slot_for_tear(m, goods_full_id(11002)), None);
+        assert_eq!(slot_for_tear(m, goods_full_id(11002), 0), None);
         let m = [goods_full_id(11002) as u32, EMPTY_SLOT];
-        assert_eq!(slot_for_tear(m, goods_full_id(11003)), None);
+        assert_eq!(slot_for_tear(m, goods_full_id(11003), 0), None);
     }
 
     #[test]
     fn a_non_goods_id_is_never_mixed() {
-        let m = [EMPTY_SLOT, EMPTY_SLOT];
-        assert_eq!(slot_for_tear(m, 0x0000_2710), None); // weapon
-        assert_eq!(slot_for_tear(m, 0x1000_2710), None); // protector
+        assert_eq!(slot_for_tear(EMPTY, 0x0000_2710, 0), None); // weapon
+        assert_eq!(slot_for_tear(EMPTY, 0x1000_2710, 1), None); // protector
     }
 
     /// The empty sentinel is a MEASURED value; pin it so a future edit cannot quietly swap it for
