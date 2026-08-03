@@ -34,6 +34,7 @@ mod no_fall_damage;
 mod no_weapon_reqs;
 mod notif_ticker;
 mod params;
+mod physick_probe;
 mod reconcile_io;
 mod region;
 mod scadu_blessing;
