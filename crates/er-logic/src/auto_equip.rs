@@ -223,20 +223,33 @@ pub fn slot_for_protector_category(protector_category: u8) -> Option<u32> {
 /// NOT track Talisman Pouch pickups ourselves, because the game already tracks them and a mod that
 /// counts pouches independently is a second source of truth waiting to disagree.
 ///
-/// ⚠️ CLAMPED, and the clamp is load-bearing in BOTH directions:
+/// ⭐ MEASURED 2026-08-03: THE FIELD COUNTS POUCHES, NOT SLOTS -- hence the `+ 1`.
 ///
-/// * Lower bound 1 -- every character has talisman slot 1 from the first minute, so a `0` (a field
-///   not yet initialised, an unexpected build) still yields a legal slot rather than no slot.
-/// * Upper bound 4 -- writing `ChrAsmSlot` 21 would put the item in the GREAT RUNE slot.
+/// It shipped clamped to `1..=4` with the zero point explicitly unverified, and the client logged
+/// the raw value on every accessory equip so the first real session would settle it. It did, on the
+/// first try. Alaric's log, client 0.3.2, six talisman equips:
 ///
-/// 🛑 The field's ZERO POINT IS NOT VERIFIED. The name says "unlocked slots" (so 1..=4, since the
-/// player starts with one), but it could count POUCHES (0..=3). We have not read it off a live
-/// character. The clamp makes both readings safe -- the worst case under the pouch reading is that
-/// the fourth slot goes unused, which is a wasted slot and not a bad write. The caller logs the raw
-/// value on every accessory equip so the first real session settles it; when it does, delete this
-/// paragraph rather than leaving a resolved caveat in the file.
+///   auto_equip: talisman 0x20000fc8 -> slot 17 (unlocked_talisman_slots raw=0, worn=[Some(5050), ...])
+///
+/// **`raw=0` on a character who demonstrably has a working slot 1.** Under the "unlocked slots"
+/// reading that field would have to be `1`. So it is a count of EXTRA slots earned -- i.e. Talisman
+/// Pouches -- and the usable count is `raw + 1`.
+///
+/// What the old clamp cost: from the FIRST pouch onward it under-counted by one, so a player with
+/// two slots only ever used one and a fully-upgraded player used three of four. Never an illegal
+/// write -- the failure direction the clamp was chosen for held -- just a wasted slot.
+///
+/// ⚠️ ONE data point, at `raw = 0`. It is decisive against "slots" (a working slot cannot coexist
+/// with a count of zero) but a reading at 1+ pouches would confirm `+ 1` directly rather than by
+/// elimination. If that reading ever contradicts this, the log line is still there to catch it.
+///
+/// The clamp stays, and both ends still earn their keep:
+///
+/// * lower bound 1 -- every character has slot 1 from the first minute;
+/// * upper bound 4 -- `ChrAsmSlot` 21 is the GREAT RUNE slot, and three pouches is the vanilla
+///   maximum, so a larger value is a modded or garbage read and must not widen the range.
 pub fn usable_accessory_slots(raw: u8) -> usize {
-    (raw as usize).clamp(1, ACCESSORY_SLOTS.len())
+    (raw as usize + 1).clamp(1, ACCESSORY_SLOTS.len())
 }
 
 /// The `ChrAsmSlot` index a received TALISMAN should occupy, or `None` when there is nothing to do.
@@ -461,26 +474,61 @@ mod tests {
     /// are clamped into 1..=4, and a garbage value cannot widen the range.
     #[test]
     fn locked_slots_are_never_written() {
-        assert_eq!(usable_accessory_slots(0), 1); // uninitialised / pouch-count reading
-        assert_eq!(usable_accessory_slots(1), 1);
-        assert_eq!(usable_accessory_slots(4), 4);
+        // MEASURED (Alaric, 0.3.2, 2026-08-03): the field counts POUCHES. `raw=0` was logged on a
+        // character with a working slot 1, which is impossible under the "unlocked slots" reading.
+        assert_eq!(usable_accessory_slots(0), 1); // no pouches -> the one slot everyone starts with
+        assert_eq!(usable_accessory_slots(1), 2);
+        assert_eq!(usable_accessory_slots(2), 3);
+        assert_eq!(usable_accessory_slots(3), 4); // three pouches = the vanilla maximum
+        assert_eq!(usable_accessory_slots(4), 4); // clamped: ChrAsmSlot 21 is the GREAT RUNE slot
         assert_eq!(usable_accessory_slots(9), 4); // clamped, not wrapped
         assert_eq!(usable_accessory_slots(255), 4);
 
-        // One slot unlocked and it is empty -> slot 1, and NOT slot 2 even though 2 is also empty.
+        // NO POUCHES (raw=0) = ONE slot. Empty -> slot 1, and NOT slot 2 even though 2 is empty
+        // too. This is the state Alaric's whole session ran in: six talismans, all to slot 17.
         assert_eq!(
-            slot_for_accessory(1, [None, None, None, None], 1000),
+            slot_for_accessory(0, [None, None, None, None], 1000),
             Some(SLOT_ACCESSORY_1)
         );
-        // One slot unlocked and it is full -> clobber it. The locked empties stay untouched.
+        // ...and once that one slot is full, clobber it. The LOCKED empties stay untouched, which
+        // is the assertion that matters: a locked slot is neither read for occupancy nor written.
+        assert_eq!(
+            slot_for_accessory(0, [Some(1000), None, None, None], 2000),
+            Some(SLOT_ACCESSORY_1)
+        );
+        // ONE pouch = two slots; first full -> the second, never the third.
         assert_eq!(
             slot_for_accessory(1, [Some(1000), None, None, None], 2000),
-            Some(SLOT_ACCESSORY_1)
-        );
-        // Two unlocked, first full -> the second, never the third.
-        assert_eq!(
-            slot_for_accessory(2, [Some(1000), None, None, None], 2000),
             Some(SLOT_ACCESSORY_2)
+        );
+        assert_eq!(
+            slot_for_accessory(1, [Some(1000), Some(1010), None, None], 2000),
+            Some(SLOT_ACCESSORY_1),
+            "both unlocked slots full -> clobber the lowest; slot 3 is still locked"
+        );
+    }
+
+    /// 🛑 THE BUG THE MEASUREMENT FOUND. Shipped, `usable_accessory_slots` clamped the raw field to
+    /// `1..=4` on the assumption it might already BE a slot count. It is a POUCH count, so from the
+    /// first pouch onward the player had one fewer usable slot than they had earned -- two slots
+    /// filled one, and a fully-upgraded four filled three. Never an illegal write; just a slot that
+    /// silently went unused for the rest of the run.
+    ///
+    /// Fails on the shipped `(raw).clamp(1, 4)`.
+    #[test]
+    fn a_pouch_earns_a_slot_and_the_slot_gets_used() {
+        // one pouch = two slots: the second talisman must NOT clobber the first
+        assert_eq!(
+            slot_for_accessory(1, [Some(1000), None, None, None], 2000),
+            Some(SLOT_ACCESSORY_2),
+            "with one Talisman Pouch the player has two slots -- filling one and clobbering it is \
+             the old off-by-one"
+        );
+        // three pouches = all four slots reachable
+        assert_eq!(
+            slot_for_accessory(3, [Some(1000), Some(1010), Some(1020), None], 1030),
+            Some(SLOT_ACCESSORY_4),
+            "three pouches is the vanilla maximum; slot 4 must be usable"
         );
     }
 
@@ -537,8 +585,10 @@ mod tests {
             None
         );
         // ...but a copy sitting in a LOCKED slot is not "worn" -- it cannot be, so slot 1 it is.
+        // raw=0 (no pouches) => ONE unlocked slot, so the `Some(1010)` in slot 2 is unreachable
+        // state the game could not have produced and must not suppress the equip.
         assert_eq!(
-            slot_for_accessory(1, [None, Some(1010), None, None], 1010),
+            slot_for_accessory(0, [None, Some(1010), None, None], 1010),
             Some(SLOT_ACCESSORY_1)
         );
     }
