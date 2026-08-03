@@ -84,10 +84,19 @@ pub fn set_cap(cap: i32) {
     CAP.store(cap, Ordering::Relaxed);
 }
 
-/// Reset the "what did we last write" memory. Call on disconnect/seed change so a reconnect
-/// re-syncs the row instead of trusting a cached level from a different seed
-/// (`er-seed-change-bypasses-the-marker-guard` — a stale cross-seed cache is exactly how 229 checks
-/// crossed seeds).
+/// Reset the "what did we last write" memory. TWO callers, and they are not interchangeable:
+///
+///  1. the slot_data parse (disconnect / seed change), so a reconnect re-syncs the row instead of
+///     trusting a cached level from a different seed (`er-seed-change-bypasses-the-marker-guard` —
+///     a stale cross-seed cache is exactly how 229 checks crossed seeds);
+///  2. core.rs's `in_world` false->true edge. A map load streams SpEffectParam back in and restores
+///     the vanilla contents of the clone row (20012081) — including `effectEndurance`, the
+///     load-bearing -1 — while LAST_TARGET/LAST_ACTIVE still equal the target, so `dirty` is false,
+///     `sync_clone_row` never re-runs and the blessing is silently gone for the rest of the session.
+///     The memo is a DONE latch by another name; this module is the reason the gate scopes its scan
+///     to the edge block, because caller (1) alone used to read as an edge re-arm.
+///
+/// Clears the MEMO ONLY: `CAP` is the seed's `scaduBlessingCap` and must survive the edge.
 pub fn reset() {
     LAST_TARGET.store(-1, Ordering::Relaxed);
     LAST_ACTIVE.store(-1, Ordering::Relaxed);

@@ -53,6 +53,18 @@ pub fn set_flatten(n: i64) {
     }
 }
 
+/// Re-arm the one-shot clamp. Called from core.rs's `in_world` false->true edge, IN ADDITION to the
+/// re-arm `set_flatten` already does at slot_data parse: a map load streams EquipMtrlSetParam back
+/// in and restores the vanilla 2/4/6 ladder, and APPLIED still equals the cap, so `maybe_apply()`
+/// short-circuits forever and the flattened curve is gone for the rest of the session (a connect-
+/// scoped re-arm is exactly the shop_stock 2026-07-29 bug). Clears the LATCH ONLY: `FLAT_N` is the
+/// seed's option value and must survive the edge. Safe to re-run -- `clamp_count` is lower-only, so
+/// a pass over rows that were NOT reverted changes nothing and logs `clamped 0`, which is also the
+/// measurement of whether this param is re-streamed at all.
+pub fn reset() {
+    APPLIED.store(-1, Ordering::SeqCst);
+}
+
 /// Idempotent in-world one-shot: clamp every regular-stone material count DOWN to the resolved cap N.
 /// Read-then-act and lower-only; no-op if disabled, already applied at this cap, or the repo isn't up
 /// yet (retried next tick). Returns the number of material slots changed.

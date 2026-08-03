@@ -34,6 +34,16 @@ pub fn set_enabled(on: bool) {
     }
 }
 
+/// Re-arm the one-time param edit. Called from core.rs's `in_world` false->true edge: a map load
+/// streams SpEffectParam back in, which restores our repurposed row's vanilla `fallDamageRate`, and
+/// PARAM_PATCHED would otherwise stop `tick()` ever re-zeroing it -- the player would keep carrying
+/// a row that no longer does anything, silently. Clears the LATCH ONLY: `ENABLED` is slot_data
+/// configuration set once at connect. Re-running costs ONE row write (`get_mut` + one setter); the
+/// player-side apply is already idempotent (it only applies when the entry is absent).
+pub fn reset() {
+    PARAM_PATCHED.store(false, Ordering::Relaxed);
+}
+
 /// Per-tick. When enabled + in-world: patch our SpEffect row to `fallDamageRate = 0` once, then keep
 /// the player carrying it. When disabled: strip it. Idempotent -- apply only when absent so entries
 /// don't stack. Same gating/pattern as `no_equip_load`.

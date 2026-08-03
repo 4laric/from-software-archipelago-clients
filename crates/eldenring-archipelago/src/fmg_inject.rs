@@ -14,6 +14,42 @@
 //! build mismatch aborts the swap (game untouched). The new block is VirtualAlloc'd RW and leaked for
 //! the process. Identity stage makes NO visible change if correct — that's the proof.
 //!
+//! ## 🛑 MODE_INJECT IS INERT ON A PURE-RUNTIME INSTALL (measured 2026-08-04)
+//!
+//! The injection half of this module names SYNTHETIC goods rows -- rows whose category-stripped id
+//! exceeds `er_codec::SYNTHETIC_GOODS_MIN_ID` (3,780,000), carrying their AP location id in the two
+//! `vagrant*` carrier fields. `params::synthetic_goods_ids()` only ever SCANS the live table for
+//! such rows; the setters that would CREATE one (`set_vagrant_*`) are called NOWHERE in this crate
+//! -- the whole scheme was, in `check_lots.rs`'s words, "a baker-era relic of a client that
+//! identified a check from the pickup itself", and the baker retired 2026-07-01. So:
+//!
+//!   * nothing bakes rows (README: "a pure-runtime client: nothing is baked into game files"), and
+//!   * vanilla ships none. `EquipParamGoods` (gen_inputs.db `vanilla_er/EquipParamGoods.csv`, 2326
+//!     rows) tops out at the real id 2,220,010 -- exactly the bound `SYNTHETIC_GOODS_MIN_ID`'s
+//!     comment claims -- plus the sentinel row 999999999, which `is_synthetic_goods` REJECTS because
+//!     `CATEGORY_GOODS | 999999999` = 0x7B9AC9FF carries a 0x7 category nibble, not 0x4.
+//!
+//! `ids` is therefore always empty, `injects`/`descs` are always empty, `run_descriptions` never
+//! fires, and `build_block` produces an IDENTITY rebuild of the vanilla GoodsName block -- validated
+//! against the game's own lookup on `CHECK_IDS` before the swap, which is what makes "identity" a
+//! proof rather than a hope.
+//!
+//! ⭐ THAT is why this module is NOT re-armed on core.rs's `in_world` edge, and it is the only
+//! writer in the crate with that answer. A map load streaming the FMG block back in reverts an
+//! IDENTITY swap, which costs nothing; every FMG write the player can actually SEE is published by
+//! `check_lots::dress_placeholder` and `shop_preview`, through `extend_swap_overrides`, and BOTH of
+//! those are re-armed on the edge. Re-arming here would instead leak one VirtualAlloc'd GoodsName
+//! block (4302 entries) per map load for no behavioural change.
+//!
+//! The failure this project keeps paying for is a permanently-zero path that reports success, so
+//! `run()` now SAYS "INERT" at warn level and the completion line reports the count instead of
+//! asserting "synthetic goods named". If that warning ever stops appearing, someone has started
+//! creating synthetic rows again -- and this module needs an edge re-arm at that moment, because the
+//! swap stops being an identity swap. The world repo's reset gate holds the other half of this
+//! ruling: `_EDGE_EXEMPT["fmg_inject"]` carries the measurement, and `test_fmg_inject_is_still_inert`
+//! re-derives all three of its clauses -- including the presence of the INERT warn below -- on every
+//! run (greenfield/eldenring/tests/test_gf_client_resets_are_called.py).
+//!
 //! 🔥 THE BLOCK NEEDS PADDING BELOW IT (`GUARD_BELOW`). The game reads an allocator header 8
 //! bytes under the MsgData pointer, and a bare `VirtualAlloc` base has nothing mapped there. That
 //! was the CTD: boblerrr crashed 14/14 sessions on 2026-07-30, every fault 8 bytes below a 64 KB
@@ -953,11 +989,27 @@ pub fn run() -> bool {
             return false; // retry next tick once LocationScouts has populated the cache
         }
         let (names, caps) = resolve_synth_injects(&ids);
-        log::info!(
-            "FMG-inject: {} synthetic goods ids; {} resolved to real name+caption from scout cache (rest -> AP#<id>)",
-            ids.len(),
-            caps.len()
-        );
+        if ids.is_empty() {
+            // TOLERANCE REQUIRES TELEMETRY. Zero is the EXPECTED count on a pure-runtime install
+            // (nothing calls set_vagrant_*, so no synthetic row is ever created; see the module
+            // doc). Say so in the log rather than reporting "0 ... 0" and then "synthetic goods
+            // named": a permanently-zero path that reads as success is how this codebase loses
+            // features silently. warn, not info, because the reader needs to see it without
+            // grepping -- and because its DISAPPEARANCE is the signal that the injection scheme is
+            // live again and this module needs an in-world-edge re-arm.
+            log::warn!(
+                "FMG-inject: INERT -- 0 synthetic goods ids in EquipParamGoods, so nothing to \
+                 inject and the GoodsName swap below is an IDENTITY rebuild. Expected on a \
+                 pure-runtime install; visible AP names/captions come from check_lots and \
+                 shop_preview via extend_swap_overrides, which ARE re-armed on the in_world edge."
+            );
+        } else {
+            log::info!(
+                "FMG-inject: {} synthetic goods ids; {} resolved to real name+caption from scout cache (rest -> AP#<id>)",
+                ids.len(),
+                caps.len()
+            );
+        }
         descs = caps;
         names
     } else {
@@ -1016,7 +1068,15 @@ pub fn run() -> bool {
             let theirs = read_string(unsafe { search(repo, 0, GOODS_CATEGORY, *id) as usize });
             log::info!("FMG-inject:   post-swap SYNTH id={id} game={theirs:?}");
         }
-        log::info!("FMG-inject: === GoodsName swap done (MODE={MODE}); synthetic goods named ===");
+        log::info!(
+            "FMG-inject: === GoodsName swap done (MODE={MODE}); {} synthetic goods named{} ===",
+            injects.len(),
+            if injects.is_empty() {
+                " (IDENTITY rebuild -- no visible change; see the INERT warning above)"
+            } else {
+                ""
+            }
+        );
     }
     // GoodsCaption (cat 24): write each resolved synthetic good's description (game / owner / class).
     // Independent allocate-extend-swap; no-op if nothing resolved (e.g. solo seed) or category unpinned.

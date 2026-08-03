@@ -34,6 +34,16 @@ pub fn set_enabled(on: bool) {
     }
 }
 
+/// Re-arm the one-time param edit. Called from core.rs's `in_world` false->true edge: a map load
+/// streams SpEffectParam back in, which restores our repurposed row's vanilla
+/// `allItemWeightChangeRate`, and PARAM_PATCHED would otherwise stop `tick()` ever re-zeroing it --
+/// the player keeps carrying a row that no longer makes anything weightless. Clears the LATCH ONLY:
+/// `ENABLED` is slot_data configuration set once at connect. Re-running costs ONE row write; the
+/// player-side apply is already idempotent (it only applies when the entry is absent).
+pub fn reset() {
+    PARAM_PATCHED.store(false, Ordering::Relaxed);
+}
+
 /// Per-tick. When enabled + in-world: patch our SpEffect row to weightless once, then keep the
 /// player carrying it. When disabled: strip it from the player. Idempotent -- applying only when
 /// the player doesn't already have it avoids stacking duplicate entries.

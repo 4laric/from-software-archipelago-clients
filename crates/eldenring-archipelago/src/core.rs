@@ -2821,6 +2821,53 @@ impl shared::Core for Core {
             // swaps across 51 edges vs 3 preview swaps across one. Must run AFTER shop_repoint,
             // same as shop_icon: repoint decides WHICH rows are ours, preview names them.
             crate::shop_preview::reset();
+            // --- 2026-08-04: the rest of the latched game-state writers, ruled on together. ------
+            // Alaric: "resets for everything should be handled in the same way". These seven sat in
+            // the world gate's _UNRULED_WRITERS debt ledger -- each writes game state, latches, and
+            // had no re-arm here, which is the shop_sell / shop_icon / shop_stock / shop_preview
+            // shape with nobody having checked yet. Every one is read-then-write-if-different or
+            // lower-only, so a pass over rows a load did NOT revert writes nothing; the ones that
+            // log a count therefore also MEASURE whether their param is re-streamed.
+            //
+            // ShopLineupParam again -- the same table that cost three of the four. A load restores
+            // the vanilla eventFlag_forStock on the 45 rewrite rows (the flag poll then watches a
+            // flag the purchase never sets, so the check stops firing), the vanilla sellQuantity on
+            // every check row (a one-time check becomes re-buyable: the duplication exploit the
+            // 2026-07-14 clamp closes), and the vanilla eventFlag_forRelease on the capital re-key
+            // rows. Both of this module's latches are cleared; its slot_data config is not.
+            crate::shop_flags::reset();
+            // EquipMtrlSetParam: APPLIED holds the cap it applied and its only other clearer is
+            // set_flatten() at slot_data parse -- a CONNECT-scoped re-arm, which is the shop_stock
+            // bug with the latch one scope out. A reverted ladder leaves APPLIED == cap, so
+            // maybe_apply() short-circuits forever and the flattened upgrade curve is gone.
+            crate::upgrade_cost::reset();
+            // showDialogCondType=0 across the five grantable equip param types. If a load reverts
+            // it, every AP grant from that point on shows the BLOCKING "NEW Y:OK" modal instead of
+            // the ticker -- loud, player-visible, and easy to mis-attribute to the receive path.
+            crate::notif_ticker::reset();
+            // EquipParamWeapon.proper_* / Magic.requirement_*. Opt-in option, so a post-load revert
+            // is quiet and reads to the player as the option simply not working.
+            crate::no_weapon_reqs::reset();
+            // The SpEffectParam pair, ruled on together as their docs ask: one row write each
+            // (20012080 allItemWeightChangeRate, 20010827 fallDamageRate). The player keeps
+            // carrying the row across a load, so a reverted row is a buff that is present and does
+            // nothing -- the least audible failure of the eight.
+            crate::no_equip_load::reset();
+            crate::no_fall_damage::reset();
+            // The clone row (20012081) is SpEffectParam too, including the load-bearing
+            // effectEndurance = -1. reset() was already called from the slot_data parse; that is a
+            // SEED-scoped re-arm and it is why this gate scopes its scan to this block. Its
+            // LAST_TARGET/LAST_ACTIVE memo is a DONE latch by another name: after a load reverts the
+            // row the memo still equals the target, drive() sees !dirty and the blessing is gone.
+            crate::scadu_blessing::reset();
+            // NOT here on purpose: fmg_inject. It is the one writer a load cannot break -- its
+            // MODE_INJECT path has nothing to inject (nothing in this crate creates a synthetic
+            // goods row; vanilla EquipParamGoods tops out at 2,220,010), so its swap is an IDENTITY
+            // rebuild and a revert costs nothing. Re-arming it would leak one VirtualAlloc'd
+            // GoodsName block per load for no behavioural change. Every FMG write the player can
+            // SEE goes through check_lots::dress_placeholder / shop_preview, both re-armed above.
+            // See the module doc and the fmg_inject row in the world repo's _UNRULED_WRITERS.
+            // ------------------------------------------------------------------------------------
             // CTD guard (2026-07-24): a load just completed — re-arm the enemy-scaling settle
             // window too. A SAME-REGION reload (death respawn) never trips the sweep's
             // region-change reset (LAST_REGION is unchanged), yet the ChrIns sets were just torn
