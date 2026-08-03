@@ -79,6 +79,15 @@ static LAST_ACTIVE: AtomicI32 = AtomicI32::new(-1);
 /// Set once we have logged the resolved base id, so the log line appears exactly once per session.
 static LOGGED_BASE: AtomicBool = AtomicBool::new(false);
 
+/// The level the PLAYER has been told about, `-1` = not yet this session.
+///
+/// 🛑 DELIBERATELY NOT `LAST_TARGET`. That memo is cleared on every `in_world` edge (caller 2 of
+/// [`reset`]) because a map load streams the param file back and the clone row must be re-synced --
+/// so a toast keyed off it would re-announce the same level on every load screen. What the player
+/// has been TOLD is a different fact with a different lifetime: it survives map loads and is
+/// cleared only by [`reset_announced`] on a reconnect or seed change.
+static ANNOUNCED: AtomicI32 = AtomicI32::new(-1);
+
 /// Set from slot_data `scaduBlessingCap` at connect. Absent/0 => no extra cap.
 pub fn set_cap(cap: i32) {
     CAP.store(cap, Ordering::Relaxed);
@@ -102,26 +111,40 @@ pub fn reset() {
     LAST_ACTIVE.store(-1, Ordering::Relaxed);
 }
 
+/// Forget what the player has been told, so the next drive re-announces the level.
+///
+/// ⚠️ ONE caller, and it is NOT the `in_world` edge: the slot_data parse (reconnect / seed change),
+/// alongside [`reset`]'s caller (1). Adding the edge as a second caller would put this toast on
+/// every load screen, which is the whole reason it is a separate memo and a separate function.
+pub fn reset_announced() {
+    ANNOUNCED.store(-1, Ordering::Relaxed);
+}
+
 /// Drive the applier for a computed blessing `level`.
 ///
 /// Called from `upgrades::tick_global_scadu()` AFTER the mode gate, the `in_world()` gate and the
 /// throttle, with the level `er_logic::upgrades::blessing_target` decided. Returns quietly on every
 /// transient failure (param file not populated, player not placed, dead) — the caller re-runs next
 /// throttle window.
-pub fn drive(level: i32) {
+///
+/// Returns the toast to show when the EFFECTIVE level changed, else `None`. Emitted from the very
+/// end, after the clone row is in sync AND applied: the player is told the blessing changed only
+/// once it actually has. A transient bail returns `None` and re-runs, so nothing is announced that
+/// did not land.
+#[must_use]
+pub fn drive(level: i32) -> Option<String> {
     let target = er_logic::upgrades::apply_blessing_cap(level, CAP.load(Ordering::Relaxed));
 
     // ---- 1. Resolve the vanilla ladder's base id. Never hardcoded. -----------------------------
     // SAFETY: FD4 singleton; read-only; only touched on the single-threaded FrameBegin tick.
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
-        return;
+        return None;
     };
-    let Some(cfg) = repo.get::<GameSystemCommonParam>(0) else {
-        return; // param file not populated yet — retry next tick
-    };
+    // param file not populated yet -> retry next tick (same `?` reasoning as `player` below)
+    let cfg = repo.get::<GameSystemCommonParam>(0)?;
     let base = cfg.base_scadu_blessing_sp_effect_id();
     if base <= 0 {
-        return; // nothing sane to index off
+        return None; // nothing sane to index off
     }
     if !LOGGED_BASE.swap(true, Ordering::Relaxed) {
         log::info!(
@@ -135,13 +158,13 @@ pub fn drive(level: i32) {
     // => dead/dying => do nothing until respawn; the drive re-runs once hp > 0.
     // SAFETY: FD4 singleton; single-threaded tick.
     let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
-        return;
+        return None;
     };
-    let Some(player) = wcm.main_player.as_mut() else {
-        return;
-    };
+    // `?` rather than `let...else`: now that this returns Option, clippy::question_mark is right
+    // that they are the same thing, and the shorter form does not hide the early exit.
+    let player = wcm.main_player.as_mut()?;
     if er_logic::upgrades::blessing_blocked_by_death(player.chr_ins.modules.data.hp) {
-        return;
+        return None;
     }
     let chr = &mut player.chr_ins;
 
@@ -164,7 +187,7 @@ pub fn drive(level: i32) {
     let dirty = LAST_TARGET.load(Ordering::Relaxed) != target
         || LAST_ACTIVE.load(Ordering::Relaxed) != active_level;
     if dirty && !sync_clone_row(base, target, active_level) {
-        return; // a source row wasn't readable this tick; try again next window
+        return None; // a source row wasn't readable this tick; try again next window
     }
     if dirty {
         LAST_TARGET.store(target, Ordering::Relaxed);
@@ -176,6 +199,16 @@ pub fn drive(level: i32) {
         chr.apply_speffect(SCADU_BLESSING, false);
         log::info!("scadu_blessing: applied clone row {SCADU_BLESSING} (level {target})");
     }
+
+    // ---- 5. Tell the player. -------------------------------------------------------------------
+    // Last, and only here: by this point the row carries `target` and is on the character, so the
+    // toast reports a blessing that IS in effect rather than one we intended. Every bail above
+    // returns None and re-runs next window.
+    let toast = er_logic::upgrades::blessing_toast(ANNOUNCED.load(Ordering::Relaxed), target);
+    if toast.is_some() {
+        ANNOUNCED.store(target, Ordering::Relaxed);
+    }
+    toast
 }
 
 /// Copy the 18 rate fields from the vanilla rungs into our clone, as the RATIO `A(target)/A(active)`,

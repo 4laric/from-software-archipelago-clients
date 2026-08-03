@@ -704,6 +704,10 @@ impl shared::Core for Core {
                 // A reconnect / seed change must re-sync the clone row rather than trust a level
                 // cached from a different seed.
                 crate::scadu_blessing::reset();
+                // ...and re-announce it. Separate memo, separate lifetime: `reset()` is ALSO called
+                // on the `in_world` edge, and clearing the announcement there would re-toast the
+                // same level on every load screen.
+                crate::scadu_blessing::reset_announced();
                 crate::upgrades::set_dlc_blessing_floors(
                     er_logic::scaling::parse_triple_ranges(sd.get("dlcScadutreeFloorRanges")),
                 );
@@ -2726,7 +2730,12 @@ impl shared::Core for Core {
         }
 
         // 8. Scadutree blessing writer.
-        crate::upgrades::tick_global_scadu();
+        // The blessing is applied SILENTLY -- a repurposed SpEffect row on the player -- so until
+        // now the only evidence it worked was a log line. Toast the level when it CHANGES.
+        if let Some(blessing) = crate::upgrades::tick_global_scadu() {
+            let now = self.toast_clock.elapsed().as_millis() as u64;
+            self.toasts.push(blessing, now);
+        }
 
         // 8b. no_weapon_requirements runtime param zeroing (latched once applied).
         crate::no_weapon_reqs::tick();
