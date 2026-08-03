@@ -100,6 +100,33 @@ pub fn configure_locks(names: HashSet<String>) {
     *LOCK_NAMES.lock().unwrap() = Some(names);
 }
 
+/// Re-arm after a map load (or a reconnect / new seed).
+///
+/// 🛑 THE FOURTH WRITER TO MAKE THIS MISTAKE -- after shop_sell (2026-07-24), shop_icon and
+/// shop_stock (2026-07-29). Until 2026-08-03 this module had NO reset() at all, so its FMG name /
+/// info / caption overrides applied once on connect and never again.
+///
+/// The mechanism is worth stating, because it is NOT "a load reverts our write and we do not
+/// re-apply" -- it is worse. `fmg_inject::extend_swap_overrides` rebuilds the category block from
+/// whatever the category CURRENTLY points at. A load reverts that pointer to vanilla; `check_lots`
+/// then re-dresses its placeholder (it IS re-armed) and publishes a fresh block containing ONLY the
+/// placeholder -- actively discarding these overrides. So a sibling's correct re-arm is what erases
+/// us, and the busier the session the more reliably it happens.
+///
+/// MEASURED, Alaric's playtest 2026-08-02 (`0.3.1 (f2ef85d3c920)`, 1h40m, 6769 lines):
+///   153x `swapped (+1 overrides)`  <- check_lots, 51 world edges x 3 categories
+///     3x `FMG extend-swap ... swapped (+5 overrides)`   <- this module, ONE edge x 3 categories
+/// Named at 22:13:46. Session ran to 23:52. Fifty more edges, zero re-applications: every
+/// foreign/gem shop slot rendered `[ERROR]` for 96 of the session's 100 minutes.
+///
+/// Clears the LATCHES only. `CONFIGURED` / `CONFIGURED_SET` / `REAL_GOODS` / `LOCK_NAMES` are
+/// seed-scoped (set from slot_data at connect) and a map load does not invalidate them -- clearing
+/// them here would make `run()` wait forever on `is_configured()`.
+pub fn reset() {
+    DONE.store(false, Ordering::Relaxed);
+    NAME_RETRIES.store(0, Ordering::Relaxed);
+}
+
 pub fn run() -> bool {
     if DONE.load(Ordering::Relaxed) {
         return true;
