@@ -329,25 +329,29 @@ const SCADU_THROTTLE: Duration = Duration::from_millis(1000);
 /// here — exactly as the C++ `TickGlobalScaduBlessing` does (it gates on `g_globalScaduBlessing`
 /// being non-zero and applies the player byte for both; the "scaled" variant is a future apworld
 /// concern with no extra client write, so mode 2 is a documented no-extra-op alias of mode 1).
-pub fn tick_global_scadu() {
+/// Returns the Scadutree-blessing toast when the effective level changed, for the caller's deck.
+/// `None` on every gate, throttle and transient failure -- an off seed still makes zero new game
+/// accesses and says nothing.
+#[must_use]
+pub fn tick_global_scadu() -> Option<String> {
     if scadu_mode() == 0 {
-        return;
+        return None;
     }
     // GATE: only touch game memory in-world (params + inventory loaded). Same gate the param probe
     // uses (mod.rs `tick()` gates `spike_log_goods_rowcount` on `flags::in_world()`).
     if !crate::flags::in_world() {
-        return;
+        return None;
     }
     // Throttle (~1s). Cheap watchdog cadence; keeps the bag walk off the hot path.
     {
         let mut last = match SCADU_LAST_TICK.lock() {
             Ok(g) => g,
-            Err(_) => return,
+            Err(_) => return None,
         };
         if let Some(t) = *last
             && t.elapsed() < SCADU_THROTTLE
         {
-            return;
+            return None;
         }
         *last = Some(Instant::now());
     }
@@ -376,7 +380,7 @@ pub fn tick_global_scadu() {
     let Some(level) =
         er_logic::upgrades::blessing_target(scadu_mode(), frag_qty, dlc_blessing_floor_here())
     else {
-        return; // mode off -> never touch the byte
+        return None; // mode off -> never touch the byte
     };
 
     // LEVER D — the game-wide half. The stored byte below is DLC-only (the engine declines to apply
@@ -385,7 +389,7 @@ pub fn tick_global_scadu() {
     // own and applies that, which works everywhere. It is driven from here, and not from its own
     // tick, so that an `off` seed makes zero new game accesses: the mode gate, the `in_world()`
     // gate, the throttle and the bag walk above are all shared.
-    crate::scadu_blessing::drive(level);
+    let toast = crate::scadu_blessing::drive(level);
 
     // Read the current stored blessing, then ONLY raise it (never stomp a higher real DLC revere,
     // never down-flicker). The read+write share one mutable PlayerGameData borrow inside
@@ -402,6 +406,8 @@ pub fn tick_global_scadu() {
         Some(None) => {} // already >= target; nothing written
         None => {}       // PlayerGameData unreachable this tick; retry next throttle window
     }
+
+    toast
 }
 
 // `held_scadu_fragments()` lived here and walked the bag for goods 2010000. REMOVED 2026-07-31: the

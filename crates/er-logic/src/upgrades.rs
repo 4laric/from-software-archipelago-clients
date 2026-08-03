@@ -278,6 +278,41 @@ pub fn clone_rates(a_target: f32, a_active: f32) -> (f32, f32) {
 
 /// Clamp a blessing target to the seed's cap (`scaduBlessingCap` from slot_data).
 ///
+/// The toast to show when the game-wide Scadutree blessing level changes, or `None` for "say
+/// nothing". `announced` is the level the player was last TOLD about (`-1` = not yet this session).
+///
+/// WHY THIS EXISTS. The blessing is invisible: it is a repurposed SpEffect row applied silently to
+/// the player, and the only trace it was ever working was a `log::info!` nobody reads mid-run. A
+/// feature whose success looks exactly like its absence is the shape this repo keeps paying for --
+/// the REFUSED session, the inert `fmg_inject`, the dark `auto_equip`. This one is cheap to say out
+/// loud, so say it.
+///
+/// 🛑 `announced` is NOT `LAST_TARGET`. That memo is cleared on every `in_world` edge (a map load
+/// streams the param file back and the clone row has to be re-synced), so keying the toast off it
+/// would fire on every load screen. What the player has been told survives map loads and resets
+/// only on a reconnect or seed change.
+///
+/// A DECREASE names the previous level. It is not expected -- `blessing_target` composes as a MAX
+/// and the stored-blessing writer is raise-only -- but a silently shrinking buff is precisely the
+/// thing a player would report as "the mod broke my damage", so it gets words rather than silence.
+pub fn blessing_toast(announced: i32, target: i32) -> Option<String> {
+    if target == announced {
+        return None;
+    }
+    if announced < 0 {
+        // First sighting this session. "+0" on a fresh character is noise, not news.
+        return (target > 0).then(|| format!("Scadutree Blessing +{target}"));
+    }
+    if target > announced {
+        return Some(format!("Scadutree Blessing +{target}"));
+    }
+    Some(if target <= 0 {
+        format!("Scadutree Blessing removed (was +{announced})")
+    } else {
+        format!("Scadutree Blessing +{target} (was +{announced})")
+    })
+}
+
 /// Separate from [`blessing_target`] on purpose: the cap is a SEED fact that arrives over the wire,
 /// while `blessing_target` is the per-tick decision. A cap <= 0 or absent means "no extra cap" and
 /// falls back to [`SCADU_MAX_LEVEL`] -- an absent key must never silently pin the blessing to 0
@@ -364,6 +399,67 @@ mod tests {
 
         let protector = (er_codec::CATEGORY_PROTECTOR | 10_000) as i32;
         assert_eq!(apply_auto_upgrade(&g, true, protector), protector);
+    }
+
+    /// The blessing is applied SILENTLY -- a repurposed SpEffect row and a log line. These pin the
+    /// only thing the player ever sees about it.
+    #[test]
+    fn a_blessing_level_up_is_announced() {
+        assert_eq!(
+            blessing_toast(3, 7).as_deref(),
+            Some("Scadutree Blessing +7")
+        );
+        // First sighting this session (announced = -1) still tells them what they have.
+        assert_eq!(
+            blessing_toast(-1, 5).as_deref(),
+            Some("Scadutree Blessing +5")
+        );
+    }
+
+    /// 🛑 THE ONE THAT KEEPS THIS OFF THE LOAD SCREEN. `LAST_TARGET` is cleared on every `in_world`
+    /// edge so the clone row gets re-synced; if the toast keyed off THAT, every map load would
+    /// re-announce the same level. Keyed on what the player was TOLD, an unchanged level is silent
+    /// no matter how many times the drive re-runs.
+    #[test]
+    fn an_unchanged_level_says_nothing_however_often_it_is_driven() {
+        assert_eq!(blessing_toast(7, 7), None);
+        assert_eq!(blessing_toast(0, 0), None);
+        for _ in 0..50 {
+            assert_eq!(blessing_toast(12, 12), None);
+        }
+    }
+
+    /// A fresh character with no fragments is at 0. Announcing "+0" would make the feature look
+    /// like it fired when nothing happened -- the inverse of the problem the toast exists for.
+    #[test]
+    fn a_first_sighting_of_zero_is_not_worth_saying() {
+        assert_eq!(blessing_toast(-1, 0), None);
+    }
+
+    /// Not expected -- `blessing_target` composes as a MAX and the stored writer is raise-only --
+    /// but a buff that silently shrinks reads to a player as "the mod broke my damage". Name the
+    /// old level so the report is actionable.
+    #[test]
+    fn a_decrease_names_the_level_it_fell_from() {
+        assert_eq!(
+            blessing_toast(9, 4).as_deref(),
+            Some("Scadutree Blessing +4 (was +9)")
+        );
+        assert_eq!(
+            blessing_toast(6, 0).as_deref(),
+            Some("Scadutree Blessing removed (was +6)")
+        );
+    }
+
+    /// 🛑 IN-GAME TEXT IS ASCII ONLY -- the overlay's font atlas has nothing else, and a stray
+    /// non-ASCII byte renders as a box or drops the glyph.
+    #[test]
+    fn every_toast_string_is_ascii() {
+        for (a, t) in [(-1, 20), (0, 1), (3, 7), (9, 4), (6, 0), (-1, 1)] {
+            if let Some(s) = blessing_toast(a, t) {
+                assert!(s.is_ascii(), "toast {s:?} for ({a} -> {t}) is not ASCII");
+            }
+        }
     }
 
     #[test]
