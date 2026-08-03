@@ -192,7 +192,22 @@ pub fn tick() {
                     .get::<EquipParamWeapon>((param_id / 100) * 100)
                     .map(|w| w.wep_type());
                 match wep_type {
-                    Some(t) => er_logic::auto_equip::slot_for_wep_type(t),
+                    Some(t) => {
+                        // None = it does not belong in a hand at all (AMMUNITION). Skipping is
+                        // deliberate and is better than the old fall-through: boblerrr's
+                        // 2026-08-03 log has param 52080000 (wep_type 85, Lordsworn's Bolt)
+                        // landing in SLOT_WEAPON_RIGHT_1, i.e. the player's main hand replaced by
+                        // a crossbow bolt (#294). The ammo still arrives in the bag; it is only
+                        // not auto-equipped.
+                        let Some(slot) = er_logic::auto_equip::slot_for_wep_type(t) else {
+                            log::info!(
+                                "auto_equip: weapon {full:#010x} wepType={t} is ammunition -- \
+                                 delivered to the bag, not equipped (no verified quiver slot)"
+                            );
+                            continue;
+                        };
+                        slot
+                    }
                     // A row the param table does not know: default to the main hand rather than
                     // dropping the item on the floor.
                     None => er_logic::auto_equip::SLOT_WEAPON_RIGHT_1,

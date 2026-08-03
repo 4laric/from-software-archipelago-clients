@@ -58,12 +58,41 @@ pub fn is_weapon(full_id: i32) -> bool {
     (full_id as u32) & CATEGORY_MASK == CATEGORY_WEAPON
 }
 
-/// `EQUIP_PARAM_WEAPON_ST.wep_type` values that are LEFT-hand only (shields). ER weaponCategory:
-/// 65 = Small Shield, 67 = Medium/Standard Shield, 69 = Greatshield. RUNTIME-UNCONFIRMED against a
-/// live equip -- if a shield lands in the right hand the fix is this list, and the failure is benign
-/// (the player re-hands it manually; no crash). Catalysts (staff 57 / seal 59) and torches (87) are
-/// deliberately NOT here: they're routinely main-handed, so they default RIGHT like any weapon.
+/// `EQUIP_PARAM_WEAPON_ST.wep_type` values that are LEFT-hand only (shields).
+///
+/// DATAMINE-CONFIRMED 2026-08-03 against `EquipParamWeapon` joined to `WeaponName.fmg` (base +
+/// both DLC msgbnds): 65 = Small Shield (197 named rows), 67 = Medium Shield (339), 69 =
+/// Greatshield (230). Those three are exactly the shield population -- no shield sits outside
+/// them and nothing else sits inside them. The previous note called this list RUNTIME-UNCONFIRMED
+/// and said "if a shield lands in the right hand the fix is this list"; it is not, the list is
+/// complete. (Datamine-confirmed is still not runtime-confirmed -- no live equip has been read.)
+///
+/// Catalysts and torches are deliberately NOT here: they are routinely main-handed, so they
+/// default RIGHT like any weapon. 🛑 The staff/seal ids in that sentence used to read
+/// "staff 57 / seal 59". **`wep_type` 59 has ZERO rows.** Seals are **61** (Clawmark, Dragon
+/// Communion, Erdtree...); staffs are 57. The 59 was never load-bearing here -- it appeared only
+/// in prose and in a vacuous test -- but it would have gone straight into the #301 "do not equip a
+/// catalyst the player cannot cast with" classifier, which would then have matched every staff and
+/// no seal, and passed its own test.
 const LEFT_HAND_WEP_TYPES: &[u16] = &[65, 67, 69];
+
+/// `wep_type` values that are AMMUNITION, not a held weapon.
+///
+/// DATAMINE-CONFIRMED 2026-08-03, same join: 81 = Arrow (35 named rows), 83 = Great Arrow (8),
+/// 85 = Bolt (25), 86 = Ballista Bolt (5).
+///
+/// MOTIVATING CASE (rule 11): boblerrr's 2026-08-03 log, client `0.3.1 (f2ef85d3c920)` --
+///   `auto_equip: slot 1 <- 0x031aad80 (param 52080000 ...)`
+/// Param 52080000 is `wep_type` 85, "Lordsworn's Bolt", written to `SLOT_WEAPON_RIGHT_1`. Ammo is
+/// `CATEGORY_WEAPON`, so it reached `hand_for_wep_type`, which had no arm for it and fell through
+/// to RIGHT -- putting a crossbow bolt in the player's main hand and disarming them. The bug is an
+/// UNHANDLED CLASS, not a mis-slot (#294).
+pub const AMMO_WEP_TYPES: &[u16] = &[81, 83, 85, 86];
+
+/// Is this `wep_type` ammunition?
+pub fn is_ammo(wep_type: u16) -> bool {
+    AMMO_WEP_TYPES.contains(&wep_type)
+}
 
 /// The primary hand a weapon of this `wep_type` should occupy. Shields -> LEFT; everything else ->
 /// RIGHT (the main-hand slot).
@@ -75,12 +104,26 @@ pub fn hand_for_wep_type(wep_type: u16) -> Hand {
     }
 }
 
-/// The `ChrAsmSlot` index a weapon of this `wep_type` should occupy.
-pub fn slot_for_wep_type(wep_type: u16) -> u32 {
-    match hand_for_wep_type(wep_type) {
+/// The `ChrAsmSlot` index a weapon of this `wep_type` should occupy, or `None` when it does not
+/// belong in a hand at all.
+///
+/// Returns `None` for AMMUNITION. 🛑 Deliberately `None` rather than "the quiver slot": the arrow
+/// and bolt `ChrAsmSlot` indices are NOT verified here, and inventing one would write a live
+/// character's equipment array from a guessed offset. Not equipping ammo is strictly better than
+/// main-handing it -- the player keeps their weapon and the ammo sits in the bag exactly as it
+/// would with the feature off. Routing ammo to its real quiver slot is a follow-up that needs
+/// those indices read out of the pinned crate source first.
+///
+/// Mirrors [`slot_for_protector_category`], which has returned `Option` for the same reason since
+/// the dummy-protector category was found.
+pub fn slot_for_wep_type(wep_type: u16) -> Option<u32> {
+    if is_ammo(wep_type) {
+        return None;
+    }
+    Some(match hand_for_wep_type(wep_type) {
         Hand::Left => SLOT_WEAPON_LEFT_1,
         Hand::Right => SLOT_WEAPON_RIGHT_1,
-    }
+    })
 }
 
 /// The `ChrAsmSlot` index for a protector, from `EQUIP_PARAM_PROTECTOR_ST.protectorCategory`.
@@ -137,14 +180,33 @@ mod tests {
         assert_eq!(hand_for_wep_type(69), Hand::Left); // greatshield
         assert_eq!(hand_for_wep_type(1), Hand::Right); // straight sword
         assert_eq!(hand_for_wep_type(57), Hand::Right); // glintstone staff
-        assert_eq!(hand_for_wep_type(59), Hand::Right); // sacred seal
+        assert_eq!(hand_for_wep_type(61), Hand::Right); // sacred seal (61, NOT 59: 59 has 0 rows)
         assert_eq!(hand_for_wep_type(87), Hand::Right); // torch (main-hand default)
     }
 
     #[test]
     fn weapon_slots_follow_the_hand() {
-        assert_eq!(slot_for_wep_type(67), SLOT_WEAPON_LEFT_1);
-        assert_eq!(slot_for_wep_type(1), SLOT_WEAPON_RIGHT_1);
+        assert_eq!(slot_for_wep_type(67), Some(SLOT_WEAPON_LEFT_1));
+        assert_eq!(slot_for_wep_type(1), Some(SLOT_WEAPON_RIGHT_1));
+    }
+
+    /// The bug, by name: a bolt reached SLOT_WEAPON_RIGHT_1 in boblerrr's 2026-08-03 log because
+    /// ammo is CATEGORY_WEAPON and nothing claimed it. Fails without the AMMO arm.
+    #[test]
+    fn ammo_is_never_routed_to_a_hand() {
+        for &t in AMMO_WEP_TYPES {
+            assert!(is_ammo(t), "wep_type {t} should be ammo");
+            assert_eq!(
+                slot_for_wep_type(t),
+                None,
+                "wep_type {t} is ammunition and must not be equipped to a hand -- \
+                 param 52080000 (wep_type 85, Lordsworn's Bolt) reached the MAIN HAND this way"
+            );
+        }
+        // and the classes either side of it stay in a hand
+        assert_eq!(slot_for_wep_type(87), Some(SLOT_WEAPON_RIGHT_1)); // torch
+        assert_eq!(slot_for_wep_type(69), Some(SLOT_WEAPON_LEFT_1)); // greatshield
+        assert!(!is_ammo(57) && !is_ammo(61)); // staff / seal are held, not ammo
     }
 
     #[test]
