@@ -75,7 +75,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use eldenring::cs::{
     ChrAsm, ChrAsmEquipEntries, EquipGameData, EquipParamAccessory, EquipParamGoods,
@@ -165,11 +165,35 @@ fn is_physick_tear(full_id: i32) -> bool {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static PENDING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// Queued FullIDs, each with the position of that TEAR in the AP received stream (`0` for
+/// everything else, which never reads it). The ordinal rides the queue rather than being recomputed
+/// in `tick()` because `tick()` runs whenever the item happens to reach the bag, which is not the
+/// order it was received in.
+static PENDING: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+
+/// How many physick tears have been enqueued since CONNECT. Reset in [`set_enabled`], which is the
+/// whole trick: AP replays the entire received set on every connect, so re-counting the same stream
+/// from zero reproduces the same ordinals -- and therefore the same mixture. See
+/// `er_logic::physick::slot_for_tear` for why a "which slot did I clobber last" flag does not.
+static TEAR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Set from slot_data `options.auto_equip` at connect.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
+    // Called from the slot_data handler, i.e. once per CONNECT and before the received set replays.
+    // Resetting both here is what makes the tear ordinals reproducible: the queue cannot carry an
+    // entry from the previous connection into the new numbering, and the counter starts where the
+    // replay starts. Nothing is lost by clearing -- AP replays everything we are about to drop.
+    TEAR_SEQ.store(0, Ordering::Relaxed);
+    if let Ok(mut q) = PENDING.lock()
+        && !q.is_empty()
+    {
+        log::info!(
+            "auto_equip: dropping {} queued item(s) at connect -- the received set replays them",
+            q.len()
+        );
+        q.clear();
+    }
     if on {
         log::info!(
             "auto_equip: enabled (received weapons, armour, talismans and physick tears are \
@@ -217,14 +241,23 @@ pub fn enqueue(full_id: i32) {
     // drinks on pickup never appears in the bag, so the "not granted yet -- retry next tick" arm
     // would retry it every tick for the rest of the session. That is the #308 shape -- a bag walk
     // cannot tell "never arrived" from "already consumed".
-    if er_logic::auto_equip::equipable(full_id).is_none() && !is_physick_tear(full_id) {
+    let tear = is_physick_tear(full_id);
+    if er_logic::auto_equip::equipable(full_id).is_none() && !tear {
         return;
     }
+    // The ordinal is consumed per RECEIVE, before the dedup below, so it is the tear's position in
+    // the stream and not its position among the pushes. A duplicate that gets deduped here is
+    // deduped identically on replay, so the numbering stays reproducible either way.
+    let ordinal = if tear {
+        TEAR_SEQ.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
     let full_id = crate::upgrades::apply_auto_upgrade(full_id);
     if let Ok(mut q) = PENDING.lock()
-        && !q.contains(&full_id)
+        && !q.iter().any(|&(id, _)| id == full_id)
     {
-        q.push(full_id);
+        q.push((full_id, ordinal));
     }
 }
 
@@ -259,7 +292,7 @@ pub fn tick() {
     if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
         return;
     }
-    let pending: Vec<i32> = match PENDING.lock() {
+    let pending: Vec<(i32, u64)> = match PENDING.lock() {
         Ok(q) if !q.is_empty() => q.clone(),
         _ => return,
     };
@@ -329,11 +362,11 @@ pub fn tick() {
         )
         .collect();
 
-    let mut still_pending: Vec<i32> = Vec::new();
-    for fid in pending {
+    let mut still_pending: Vec<(i32, u64)> = Vec::new();
+    for (fid, ordinal) in pending {
         let full = fid as u32;
         let Some(&(handle, inv_index)) = owned.get(&full) else {
-            still_pending.push(fid); // not granted yet -- retry next tick
+            still_pending.push((fid, ordinal)); // not granted yet -- retry next tick
             continue;
         };
         let param_id = full & 0x0FFF_FFFF;
@@ -347,7 +380,7 @@ pub fn tick() {
             }
             let equipment = &mut pgd.equipment;
             let mixture = physick_mixture(equipment);
-            let Some(slot) = er_logic::physick::slot_for_tear(mixture, fid) else {
+            let Some(slot) = er_logic::physick::slot_for_tear(mixture, fid, ordinal) else {
                 // Already mixed. Idempotent on purpose -- the reconciler replays the whole received
                 // set on reconnect, and a slot rotation per replay would be a feature that eats
                 // itself.
@@ -356,8 +389,8 @@ pub fn tick() {
             let before = mixture[slot];
             write_physick_slot(equipment, slot, full);
             log::info!(
-                "auto_equip: physick tear {full:#010x} -> mixture slot {slot} \
-                 (was {before:#010x}, mixture now {:#010x?})",
+                "auto_equip: physick tear {full:#010x} (stream #{ordinal}) -> mixture slot \
+                 {slot} (was {before:#010x}, mixture now {:#010x?})",
                 physick_mixture(equipment)
             );
             continue;
