@@ -104,6 +104,15 @@ impl shared::Core for Core {
         Ok(())
     }
 
+    /// The slot's `death_link` option, or `None` before the connection exists to read it from.
+    ///
+    /// Deliberately NOT `allow_death_link()`: that also folds in [DEATH_LINK_GRACE_PERIOD], which
+    /// is rate limiting. The tag answers "does this slot take part at all", and it must not
+    /// flicker off and back on every time a death starts the grace clock.
+    fn death_link_enabled(&self) -> Option<bool> {
+        Some(self.client()?.slot_data().options.death_link != DeathLinkOption::Off)
+    }
+
     fn handle_command(&mut self, command: &str, arg: Option<&str>) -> bool {
         let mut arg_error = |usage: &str| {
             self.log(vec![

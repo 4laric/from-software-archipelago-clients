@@ -55,6 +55,12 @@ pub struct CoreBase<G: Game, S: DeserializeOwned + Send + 'static> {
     /// mod take to run.
     profiler: SectionProfiler,
 
+    /// Whether the server currently believes this slot carries the `DeathLink` tag.
+    ///
+    /// We connect UNTAGGED, so this starts `false` on every new connection and only becomes `true`
+    /// after a successful [`Core::reconcile_death_link_tag`] send. See [`next_tag_advertisement`].
+    advertised_death_link: bool,
+
     /// CHAT-RELAY (2026-07-02): commands queued from server chat ("@<slot> <cmd> [args]"),
     /// dispatched through the game core's `handle_command` by [Core::update]. Exists because a
     /// game whose InputBlocker hasn't been RE'd (ER) can't take keyboard focus in the overlay
@@ -78,6 +84,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
             event_buffer: vec![],
             load_time: None,
             error: None,
+            advertised_death_link: false,
             profiler: Default::default(),
             pending_chat_commands: vec![],
         })
@@ -94,12 +101,28 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
             return None;
         }
 
-        let mut options = ap::ConnectionOptions::new()
-            .receive_items(ap::ItemHandling::OtherWorlds {
+        // NO TAGS AT CONNECT -- deliberately.
+        //
+        // This used to be `.tags(vec!["DeathLink"])`, unconditionally, for every game. The server
+        // therefore routed every other player's death to this slot whatever the slot's own
+        // `death_link` option said (observed twice in `archipelago-2026-08-01.log` on a slot with
+        // the option OFF), and it did so for Sekiro too, which has no DeathLink implementation at
+        // all -- those deaths were delivered and dropped on the floor.
+        //
+        // It cannot be fixed here: the tag set is decided BEFORE the socket opens, and
+        // `death_link` lives in SLOT DATA, which does not exist until after the server accepts the
+        // connection. So we connect advertising nothing and add the tag afterwards, once the
+        // answer is actually known -- see [`Core::reconcile_death_link_tag`].
+        //
+        // Untagged is the FAIL-CLOSED direction. If the option is never resolved (slot data never
+        // parses, the update send fails), a slot with DeathLink on quietly misses deaths, which is
+        // this client's problem alone. The other order -- advertise, then retract -- fails by
+        // consuming other players' deaths during the window, which is everyone's problem.
+        let mut options =
+            ap::ConnectionOptions::new().receive_items(ap::ItemHandling::OtherWorlds {
                 own_world: G::OWN_WORLD,
                 starting_inventory: true,
-            })
-            .tags(vec!["DeathLink"]);
+            });
         if let Some(password) = config.password() {
             options = options.password(password);
         }
@@ -136,6 +159,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         }
 
         self.connection = Self::new_connection(self.game, &self.config);
+        self.advertised_death_link = false; // a fresh socket carries no tags
     }
 
     /// Updates the full set of connection info (server URL, slot, and optional
@@ -170,6 +194,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.config.set_password(password);
         self.config.save()?;
         self.connection = Self::new_connection(self.game, &self.config);
+        self.advertised_death_link = false; // a fresh socket carries no tags
         Ok(())
     }
 
@@ -350,6 +375,28 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
     }
 }
 
+/// Whether to send a `ConnectUpdate` this tick, and what it should say.
+///
+/// * `desired` — what the slot's own option says: `Some(true)` participate, `Some(false)` do not,
+///   `None` **not yet known** (slot data has not parsed). `None` must send NOTHING: guessing here
+///   is exactly the bug this replaced.
+/// * `advertised` — what the server currently believes. `false` on every fresh socket, because
+///   [`CoreBase::new_connection`] connects with no tags at all.
+///
+/// Returns `Some(want)` to send tags for `want`, or `None` to stay quiet. Note that the common
+/// case — option off, connected untagged — is `None`: a slot with DeathLink disabled never sends
+/// a single tag packet.
+///
+/// The retract path (`Some(false)` while `advertised`) is not hypothetical: ER re-parses slot data
+/// on a genuine SEED CHANGE without reopening the socket, so a reconnect to a different seed with
+/// the option off has to take the tag back.
+fn next_tag_advertisement(desired: Option<bool>, advertised: bool) -> Option<bool> {
+    match desired {
+        Some(d) if d != advertised => Some(d),
+        _ => None,
+    }
+}
+
 /// A trait for the core runners of FromSoftware game mods. This encapsulates
 /// the interface that the shared overlay logic needs to interact with these
 /// games.
@@ -380,6 +427,55 @@ pub trait Core: Send + Sized {
     /// By default, this doesn't handle any commands.
     fn handle_command(&mut self, _command: &str, _arg: Option<&str>) -> bool {
         false
+    }
+
+    /// Whether this slot participates in DeathLink, or `None` while the answer is not yet known.
+    ///
+    /// Drives the `DeathLink` connection tag (see [`Self::reconcile_death_link_tag`]). The tag is
+    /// what makes the server route other players' deaths here, so this must be the SLOT's answer,
+    /// not a guess: return `None` until slot data has actually been read. Returning `Some(false)`
+    /// early is fine; returning `Some(true)` early is how deaths get delivered to a slot that
+    /// never asked for them.
+    ///
+    /// **The default is `None`, and a game with no DeathLink implementation must keep it.** Sekiro
+    /// is exactly that case: it advertised the tag for its whole life and had nowhere to put the
+    /// deaths the server duly sent it.
+    fn death_link_enabled(&self) -> Option<bool> {
+        None
+    }
+
+    /// Converges the server's idea of our tags onto [`Self::death_link_enabled`].
+    ///
+    /// Runs every tick while connected and is a no-op once the two agree, so it costs one
+    /// comparison in the steady state. A failed send deliberately does NOT move the latch, which
+    /// makes the next tick retry it.
+    fn reconcile_death_link_tag(&mut self) {
+        let Some(want) =
+            next_tag_advertisement(self.death_link_enabled(), self.base().advertised_death_link)
+        else {
+            return;
+        };
+        let tags: &[&str] = if want { &["DeathLink"] } else { &[] };
+        // Take the send's result before touching `base_mut` -- `client_mut` holds a mutable borrow
+        // of `self` for as long as `client` is alive.
+        let result = match self.client_mut() {
+            Some(client) => client.update_connection(None, Some(tags.iter().copied())),
+            None => return,
+        };
+        match result {
+            Ok(()) => {
+                self.base_mut().advertised_death_link = want;
+                info!(
+                    "DeathLink tag {} the server",
+                    if want {
+                        "advertised to"
+                    } else {
+                        "retracted from"
+                    }
+                );
+            }
+            Err(e) => warn!("DeathLink tag: ConnectUpdate failed ({e}) -- retrying next tick"),
+        }
     }
 
     /// Lets a game add its own items to the overlay menu bar. Default: nothing.
@@ -429,6 +525,11 @@ pub trait Core: Send + Sized {
             return;
         }
 
+        // Tell the server whether we take DeathLink, now that slot data can answer it. Cheap and
+        // idempotent; see the "NO TAGS AT CONNECT" note in `new_connection` for why it is here and
+        // not there.
+        self.reconcile_death_link_tag();
+
         // CHAT-RELAY dispatch: run commands queued from server chat through the same
         // handle_command path as overlay say input. Before the load/grace gating so
         // diagnostics work from the main menu too (flag writers degrade gracefully there).
@@ -465,5 +566,37 @@ pub trait Core: Send + Sized {
             Err(err) => Some(err),
             Ok(_) => self.update_live().err(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_tag_advertisement;
+
+    /// Slot data has not landed yet. Any guess is wrong, so say nothing.
+    #[test]
+    fn unknown_never_sends() {
+        assert_eq!(next_tag_advertisement(None, false), None);
+        assert_eq!(next_tag_advertisement(None, true), None);
+    }
+
+    /// The motivating case (#258): the option is OFF and we connected untagged, so the server
+    /// already believes the right thing. Not one packet.
+    #[test]
+    fn disabled_on_a_fresh_socket_is_silent() {
+        assert_eq!(next_tag_advertisement(Some(false), false), None);
+    }
+
+    #[test]
+    fn enabled_advertises_once_and_then_stays_quiet() {
+        assert_eq!(next_tag_advertisement(Some(true), false), Some(true));
+        assert_eq!(next_tag_advertisement(Some(true), true), None);
+    }
+
+    /// ER re-parses slot data on a seed change without reopening the socket, so the tag has to be
+    /// takeable back.
+    #[test]
+    fn a_seed_change_to_death_link_off_retracts() {
+        assert_eq!(next_tag_advertisement(Some(false), true), Some(false));
     }
 }

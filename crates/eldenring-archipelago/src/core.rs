@@ -499,6 +499,17 @@ impl shared::Core for Core {
         &mut self.base
     }
 
+    /// The slot's `death_link` option, or `None` until slot data has actually been parsed.
+    ///
+    /// `deathlink::is_enabled()` alone cannot answer this: its static defaults to `false`, so
+    /// before the parse it reports "off" indistinguishably from a slot that really is off. Gating
+    /// on `slot_data_parsed` is what makes the difference legible to the tag reconciler -- and the
+    /// latch is re-armed on a genuine seed change, so this correctly goes back to `None` while a
+    /// new seed's options are being read.
+    fn death_link_enabled(&self) -> Option<bool> {
+        self.slot_data_parsed.then(crate::deathlink::is_enabled)
+    }
+
     /// Overlay menu-bar hook (SPEC-item-tracker.md): a "Tracker" item that toggles the window.
     fn render_overlay_menu_items(&mut self, ui: &imgui::Ui) {
         if ui.menu_item("Tracker") {
