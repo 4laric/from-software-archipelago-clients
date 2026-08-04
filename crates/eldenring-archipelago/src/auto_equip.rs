@@ -165,17 +165,49 @@ fn is_physick_tear(full_id: i32) -> bool {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-/// Queued FullIDs, each with the position of that TEAR in the AP received stream (`0` for
-/// everything else, which never reads it). The ordinal rides the queue rather than being recomputed
-/// in `tick()` because `tick()` runs whenever the item happens to reach the bag, which is not the
-/// order it was received in.
-static PENDING: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+/// One queued receive: the FullID, its position among items of its OWN kind in the AP received
+/// stream, and (talismans only) how many talisman slots the stream says the player has earned by
+/// that point. Everything else carries zeroes and never reads them.
+///
+/// Both numbers ride the queue rather than being recomputed in `tick()` because `tick()` runs
+/// whenever the item happens to reach the bag, which is not the order it was received in.
+#[derive(Clone, Copy)]
+struct Queued {
+    full_id: i32,
+    ordinal: u64,
+    stream_slots: usize,
+}
+
+static PENDING: Mutex<Vec<Queued>> = Mutex::new(Vec::new());
 
 /// How many physick tears have been enqueued since CONNECT. Reset in [`set_enabled`], which is the
 /// whole trick: AP replays the entire received set on every connect, so re-counting the same stream
 /// from zero reproduces the same ordinals -- and therefore the same mixture. See
 /// `er_logic::physick::slot_for_tear` for why a "which slot did I clobber last" flag does not.
 static TEAR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The same trick one category over: how many TALISMANS have been enqueued since connect.
+static ACCESSORY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How many Talisman Pouches have been RECEIVED since connect.
+///
+/// 🛑 Counted here and not read off the game because the game's field is live state: on a reconnect
+/// it reads whatever the character has NOW, so a talisman received before the second pouch would be
+/// replayed against a different modulus than it was applied with, and the loadout would silently
+/// rearrange itself. Counting pouches off the stream makes the slot count a pure function of stream
+/// POSITION, which replays identically. That is issue #342, and it is why #48's ordinal ports after
+/// all. `er_logic::auto_equip::slot_for_accessory` carries the full argument.
+///
+/// This is deliberately a SECOND reading of a quantity the game already tracks. The two are used
+/// for different things and fail in different directions: this one picks WHICH earned slot, the
+/// game's field bounds WHICH slots may be written at all, and `slot_for_accessory` clamps this to
+/// that. See [`POUCH_CLAMP_LOGGED`].
+static POUCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Latch so the "stream and game disagree about pouches" warning is logged ONCE per connect rather
+/// than once per talisman. Silence is not an option here -- a clamp that quietly swallows the
+/// disagreement is exactly the polite `false` that CONTRIBUTING's *Runtime visibility* forbids.
+static POUCH_CLAMP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Set from slot_data `options.auto_equip` at connect.
 pub fn set_enabled(on: bool) {
@@ -185,6 +217,9 @@ pub fn set_enabled(on: bool) {
     // entry from the previous connection into the new numbering, and the counter starts where the
     // replay starts. Nothing is lost by clearing -- AP replays everything we are about to drop.
     TEAR_SEQ.store(0, Ordering::Relaxed);
+    ACCESSORY_SEQ.store(0, Ordering::Relaxed);
+    POUCH_SEQ.store(0, Ordering::Relaxed);
+    POUCH_CLAMP_LOGGED.store(false, Ordering::Relaxed);
     if let Ok(mut q) = PENDING.lock()
         && !q.is_empty()
     {
@@ -241,23 +276,50 @@ pub fn enqueue(full_id: i32) {
     // drinks on pickup never appears in the bag, so the "not granted yet -- retry next tick" arm
     // would retry it every tick for the rest of the session. That is the #308 shape -- a bag walk
     // cannot tell "never arrived" from "already consumed".
+    // 🛑 The Talisman Pouch is GOODS, so `equipable()` returns `None` for it and the gate below
+    // would drop it. Count it FIRST -- it is not equipped, it is what makes a slot exist. Missing
+    // one here does not lose an item; it silently shifts the modulus for every talisman after it.
+    if full_id == er_logic::auto_equip::TALISMAN_POUCH_FULL_ID {
+        let n = POUCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        log::info!(
+            "auto_equip: Talisman Pouch #{n} received (stream-derived slot count now {})",
+            er_logic::auto_equip::stream_accessory_slots(n as u32)
+        );
+        return;
+    }
     let tear = is_physick_tear(full_id);
-    if er_logic::auto_equip::equipable(full_id).is_none() && !tear {
+    let equipable = er_logic::auto_equip::equipable(full_id);
+    if equipable.is_none() && !tear {
         return;
     }
     // The ordinal is consumed per RECEIVE, before the dedup below, so it is the tear's position in
     // the stream and not its position among the pushes. A duplicate that gets deduped here is
     // deduped identically on replay, so the numbering stays reproducible either way.
+    let accessory = matches!(equipable, Some(er_logic::auto_equip::Equipable::Accessory));
     let ordinal = if tear {
         TEAR_SEQ.fetch_add(1, Ordering::Relaxed)
+    } else if accessory {
+        ACCESSORY_SEQ.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    // Snapshot the pouch count AT RECEIPT. Reading it in `tick()` instead would reintroduce exactly
+    // the live-state dependency this exists to remove: `tick()` can run arbitrarily later, after
+    // another pouch has arrived.
+    let stream_slots = if accessory {
+        er_logic::auto_equip::stream_accessory_slots(POUCH_SEQ.load(Ordering::Relaxed) as u32)
     } else {
         0
     };
     let full_id = crate::upgrades::apply_auto_upgrade(full_id);
     if let Ok(mut q) = PENDING.lock()
-        && !q.iter().any(|&(id, _)| id == full_id)
+        && !q.iter().any(|e| e.full_id == full_id)
     {
-        q.push((full_id, ordinal));
+        q.push(Queued {
+            full_id,
+            ordinal,
+            stream_slots,
+        });
     }
 }
 
@@ -292,7 +354,7 @@ pub fn tick() {
     if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
         return;
     }
-    let pending: Vec<(i32, u64)> = match PENDING.lock() {
+    let pending: Vec<Queued> = match PENDING.lock() {
         Ok(q) if !q.is_empty() => q.clone(),
         _ => return,
     };
@@ -362,11 +424,16 @@ pub fn tick() {
         )
         .collect();
 
-    let mut still_pending: Vec<(i32, u64)> = Vec::new();
-    for (fid, ordinal) in pending {
+    let mut still_pending: Vec<Queued> = Vec::new();
+    for queued in pending {
+        let Queued {
+            full_id: fid,
+            ordinal,
+            stream_slots,
+        } = queued;
         let full = fid as u32;
         let Some(&(handle, inv_index)) = owned.get(&full) else {
-            still_pending.push((fid, ordinal)); // not granted yet -- retry next tick
+            still_pending.push(queued); // not granted yet -- retry next tick
             continue;
         };
         let param_id = full & 0x0FFF_FFFF;
@@ -448,18 +515,34 @@ pub fn tick() {
                     (id > 0 && repo.get::<EquipParamAccessory>(id as u32).is_some()).then_some(id)
                 });
 
+                // The GAME's field bounds what may be written; the STREAM picks among the slots
+                // it allows. They disagree only when a pouch was sent but never granted, which is
+                // a real bug elsewhere -- say so rather than clamping in silence.
+                let earned = er_logic::auto_equip::usable_accessory_slots(unlocked_talisman_slots);
+                if stream_slots > earned && !POUCH_CLAMP_LOGGED.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "auto_equip: the received stream says {stream_slots} talisman slot(s) but \
+                         the character has earned {earned} (unlocked_talisman_slots \
+                         raw={unlocked_talisman_slots}) -- a Talisman Pouch was sent and never \
+                         landed. Clamping to the game; talisman placement will not match a replay \
+                         until the pouch is granted."
+                    );
+                }
                 let Some(slot) = er_logic::auto_equip::slot_for_accessory(
                     unlocked_talisman_slots,
+                    stream_slots,
                     slots,
                     param_id as i32,
+                    ordinal,
                 ) else {
                     // Already worn. ER refuses duplicate talismans, so equipping a second copy
                     // would build a loadout the menu cannot produce.
                     continue;
                 };
                 log::info!(
-                    "auto_equip: talisman {full:#010x} -> slot {slot} \
-                     (unlocked_talisman_slots raw={unlocked_talisman_slots}, worn={slots:?})"
+                    "auto_equip: talisman {full:#010x} (stream #{ordinal}, stream slots \
+                     {stream_slots}) -> slot {slot} (unlocked_talisman_slots \
+                     raw={unlocked_talisman_slots}, worn={slots:?})"
                 );
                 slot
             }

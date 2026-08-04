@@ -13,6 +13,7 @@
 pub mod attunement;
 pub mod attunement_replay;
 pub mod auto_equip;
+pub mod auto_equip_replay;
 pub mod boss_felled;
 pub mod boss_key_replay;
 pub mod capital;
