@@ -268,23 +268,61 @@ pub fn usable_accessory_slots(raw: u8) -> usize {
 ///    the same row into a second slot builds a loadout the player could not have made in the menu.
 /// 2. **First EMPTY unlocked slot.** Fills 1, 2, 3, 4 as they come, so a player who has never
 ///    touched the menu ends up with the four most recent talismans rather than one.
-/// 3. **All unlocked slots full -> the LOWEST unlocked slot, clobbering it.** Last writer wins,
-///    exactly as `SLOT_WEAPON_LEFT_1` already does when a staff lands on a shield. "All auto-
+/// 3. **All unlocked slots full -> alternate**, `ordinal % n`. Last writer wins -- "all auto-
 ///    equipped gear must stay equipped ... no unequipping allowed" means the answer to a full
-///    loadout is WHERE the new item lands, never WHETHER it is equipped -- so "keep the ones you
-///    have and leave the new talisman in the bag" is not available, and neither is a wear-value
-///    comparison, which is just choosing your build with extra steps.
+///    loadout is WHERE the new item lands, never WHETHER it is equipped, so "leave the new talisman
+///    in the bag" is not available and neither is a wear-value comparison, which is just choosing
+///    your build with extra steps. WHICH slot it lands in is the part this rule decides.
 ///
-/// Only `usable_accessory_slots(unlocked_talisman_slots)` slots are considered, so a locked slot is
-/// never read for occupancy nor written. Returning `Some` for every talisman is deliberate and is
+/// ## What happens AFTER the slots fill -- issue #342
+///
+/// Rule 3 was `the LOWEST unlocked slot, always`. That made **slot 1 the only slot that ever
+/// changed again**: slots 2, 3 and 4 froze on whatever happened to arrive 2nd, 3rd and 4th, for the
+/// rest of the run. Rule 2's own rationale above argues against exactly that outcome -- it holds
+/// during the fill and inverts the moment the slots are full, leaving the player with ONE recent
+/// talisman and three stale ones. Alaric hit the two-slot version on the physick flask (#334) and
+/// it is more pronounced with four slots, not less.
+///
+/// ## 🛑 Why `n` comes from the STREAM, not from the live field
+///
+/// The reconciler replays the WHOLE received set on every reconnect, so the policy must be a pure
+/// function of things that replay identically. #48 established that for physick with `ordinal % 2`.
+/// The obvious port -- `ordinal % usable_accessory_slots(raw)` -- **does not work**, because that
+/// `n` grows from 1 to 4 as the player finds Talisman Pouches, so live it is evaluated against a
+/// different modulus than on replay. MEASURED over 329,760 interleaved pouch/talisman streams: the
+/// live-`n` form fails to be a replay fixed point in **8.9%** of them. #342 read that as proof the
+/// mechanism does not port.
+///
+/// It ports. `n` is only live because it was being read at the wrong MOMENT. The Talisman Pouch is
+/// itself an AP item ([`TALISMAN_POUCH_FULL_ID`]), so "pouches earned by stream position `i`" is a
+/// pure function of the stream -- captured at RECEIVE, exactly like the ordinal, it replays
+/// identically. Same 329,760 streams, `n` stream-derived: **0** failures.
+///
+/// `stream_slots` is that count ([`stream_accessory_slots`]); `unlocked_talisman_slots` remains the
+/// authority on what may be WRITTEN. Keeping both is the answer to the objection recorded on
+/// [`usable_accessory_slots`] -- "a mod that counts pouches independently is a second source of
+/// truth waiting to disagree". They can disagree in exactly one direction that matters: a pouch
+/// SENT but never granted (the #308 capped-grant shape) would have the stream claim a slot the
+/// player has not earned. The `clamp` resolves that toward the GAME, so a locked slot is still
+/// never read for occupancy nor written -- and the caller logs when it fires, because a silent
+/// clamp is the "polite `false`" that *Runtime visibility* forbids.
+///
+/// ⚠️ What this does NOT promise is `live == replay`. Rule 2 is state-dependent, so replaying a
+/// stream onto the state it produced can land a talisman differently (5.6% of the streams above).
+/// **#48 has the identical property at 2.0%** and for the identical reason; the guarantee both make
+/// is that replay is a FIXED POINT -- it settles in one pass and never drifts again. Returning `Some` for every talisman is deliberate and is
 /// why this does not mirror the `Option` on [`slot_for_wep_type`]: ammunition has no hand at all,
 /// whereas every talisman has a slot. The one `None` here means "already equipped", not "refused".
 pub fn slot_for_accessory(
     unlocked_talisman_slots: u8,
+    stream_slots: usize,
     slots: [Option<i32>; 4],
     param_id: i32,
+    ordinal: u64,
 ) -> Option<u32> {
-    let n = usable_accessory_slots(unlocked_talisman_slots);
+    // The GAME's field is the hard bound on what may be written; the STREAM only picks among the
+    // slots the game already allows. In agreement (the normal case) the min is the stream value.
+    let n = stream_slots.clamp(1, usable_accessory_slots(unlocked_talisman_slots));
     let visible = &slots[..n];
 
     if visible.contains(&Some(param_id)) {
@@ -292,8 +330,30 @@ pub fn slot_for_accessory(
     }
     match visible.iter().position(Option::is_none) {
         Some(i) => Some(ACCESSORY_SLOTS[i]),
-        None => Some(ACCESSORY_SLOTS[0]),
+        // All unlocked slots full -> alternate by received-stream position, so no slot freezes.
+        // `ordinal % n < n <= usable_accessory_slots(..)`, so this cannot name a locked slot.
+        None => Some(ACCESSORY_SLOTS[(ordinal % n as u64) as usize]),
     }
+}
+
+/// How many talisman slots the received STREAM says the player has earned, given how many Talisman
+/// Pouches have been seen in it so far. See [`slot_for_accessory`] for why this exists alongside
+/// [`usable_accessory_slots`] rather than replacing it.
+///
+/// The Talisman Pouch is a real AP item in this world -- three checks, `7770025/26/27`, all
+/// awarding GOODS row **10040** (FullID `1073751864`), flags 60500/60510/60520. Cited to
+/// `greenfield/eldenring/item_ids.py` and independently to `greenfield/shop_rows.tsv:463`, which
+/// names row 10040 `Talisman Pouch` at the Twin Maiden Husks. No id is guessed here.
+pub const TALISMAN_POUCH_FULL_ID: i32 = 1_073_751_864;
+
+/// Slots earned after seeing `pouches` Talisman Pouches in the received stream.
+///
+/// Deliberately the same shape as [`usable_accessory_slots`] -- both are "pouches + 1, clamped" --
+/// because they are two measurements of the SAME quantity from two sources. They agree except when
+/// a pouch was sent but never landed; [`slot_for_accessory`] resolves that disagreement toward the
+/// game.
+pub fn stream_accessory_slots(pouches: u32) -> usize {
+    (pouches as usize + 1).clamp(1, ACCESSORY_SLOTS.len())
 }
 
 #[cfg(test)]
@@ -460,12 +520,22 @@ mod tests {
         const ACCESSORY_COVENANT: u32 = 21;
         assert!(!ACCESSORY_SLOTS.contains(&ACCESSORY_COVENANT));
         for unlocked in 0..=255u8 {
-            let all_full = [Some(1), Some(2), Some(3), Some(4)];
-            let slot = slot_for_accessory(unlocked, all_full, 9999).unwrap();
-            assert!(
-                ACCESSORY_SLOTS.contains(&slot),
-                "unlocked={unlocked} produced slot {slot}, outside the four talisman slots"
-            );
+            for ordinal in 0..16u64 {
+                let all_full = [Some(1), Some(2), Some(3), Some(4)];
+                let n = stream_accessory_slots(unlocked as u32);
+                let slot = slot_for_accessory(unlocked, n, all_full, 9999, ordinal).unwrap();
+                assert!(
+                    ACCESSORY_SLOTS.contains(&slot),
+                    "unlocked={unlocked} ordinal={ordinal} produced slot {slot}, outside the four \
+                     talisman slots"
+                );
+                // ...and inside the slots this character has actually EARNED.
+                let earned = &ACCESSORY_SLOTS[..usable_accessory_slots(unlocked)];
+                assert!(
+                    earned.contains(&slot),
+                    "unlocked={unlocked} ordinal={ordinal} produced slot {slot}, which is locked"
+                );
+            }
         }
     }
 
@@ -487,24 +557,34 @@ mod tests {
         // NO POUCHES (raw=0) = ONE slot. Empty -> slot 1, and NOT slot 2 even though 2 is empty
         // too. This is the state Alaric's whole session ran in: six talismans, all to slot 17.
         assert_eq!(
-            slot_for_accessory(0, [None, None, None, None], 1000),
+            slot_for_accessory(0, 1, [None, None, None, None], 1000, 0),
             Some(SLOT_ACCESSORY_1)
         );
         // ...and once that one slot is full, clobber it. The LOCKED empties stay untouched, which
         // is the assertion that matters: a locked slot is neither read for occupancy nor written.
-        assert_eq!(
-            slot_for_accessory(0, [Some(1000), None, None, None], 2000),
-            Some(SLOT_ACCESSORY_1)
-        );
+        // With ONE usable slot the alternation has nowhere to go: `ordinal % 1` is 0 for every
+        // ordinal, so rule 3 degenerates to "clobber slot 1" and never names slot 2.
+        for ordinal in 0..8u64 {
+            assert_eq!(
+                slot_for_accessory(0, 1, [Some(1000), None, None, None], 2000, ordinal),
+                Some(SLOT_ACCESSORY_1),
+                "ordinal {ordinal} escaped the single unlocked slot"
+            );
+        }
         // ONE pouch = two slots; first full -> the second, never the third.
         assert_eq!(
-            slot_for_accessory(1, [Some(1000), None, None, None], 2000),
+            slot_for_accessory(1, 2, [Some(1000), None, None, None], 2000, 0),
             Some(SLOT_ACCESSORY_2)
         );
+        // Both unlocked slots full -> alternate between them. Slot 3 is still locked and must not
+        // be named by EITHER parity.
         assert_eq!(
-            slot_for_accessory(1, [Some(1000), Some(1010), None, None], 2000),
-            Some(SLOT_ACCESSORY_1),
-            "both unlocked slots full -> clobber the lowest; slot 3 is still locked"
+            slot_for_accessory(1, 2, [Some(1000), Some(1010), None, None], 2000, 2),
+            Some(SLOT_ACCESSORY_1)
+        );
+        assert_eq!(
+            slot_for_accessory(1, 2, [Some(1000), Some(1010), None, None], 2000, 3),
+            Some(SLOT_ACCESSORY_2)
         );
     }
 
@@ -519,46 +599,87 @@ mod tests {
     fn a_pouch_earns_a_slot_and_the_slot_gets_used() {
         // one pouch = two slots: the second talisman must NOT clobber the first
         assert_eq!(
-            slot_for_accessory(1, [Some(1000), None, None, None], 2000),
+            slot_for_accessory(1, 2, [Some(1000), None, None, None], 2000, 0),
             Some(SLOT_ACCESSORY_2),
             "with one Talisman Pouch the player has two slots -- filling one and clobbering it is \
              the old off-by-one"
         );
         // three pouches = all four slots reachable
         assert_eq!(
-            slot_for_accessory(3, [Some(1000), Some(1010), Some(1020), None], 1030),
+            slot_for_accessory(3, 4, [Some(1000), Some(1010), Some(1020), None], 1030, 0),
             Some(SLOT_ACCESSORY_4),
             "three pouches is the vanilla maximum; slot 4 must be usable"
         );
     }
 
-    /// The stated policy, slot by slot: fill empties in order, then last-writer-wins on slot 1 --
-    /// the same rule `SLOT_WEAPON_LEFT_1` already applies when a staff lands on a shield.
+    /// The stated policy, slot by slot: fill empties in order, then ALTERNATE by stream position.
     #[test]
-    fn talismans_fill_empty_slots_then_clobber_the_lowest() {
+    fn talismans_fill_empty_slots_then_alternate() {
         let full = 4u8;
-        assert_eq!(
-            slot_for_accessory(full, [None, None, None, None], 1000),
-            Some(SLOT_ACCESSORY_1)
-        );
-        assert_eq!(
-            slot_for_accessory(full, [Some(1000), None, None, None], 1010),
-            Some(SLOT_ACCESSORY_2)
-        );
-        assert_eq!(
-            slot_for_accessory(full, [Some(1000), Some(1010), None, None], 1020),
-            Some(SLOT_ACCESSORY_3)
-        );
-        assert_eq!(
-            slot_for_accessory(full, [Some(1000), Some(1010), Some(1020), None], 1030),
-            Some(SLOT_ACCESSORY_4)
-        );
+        let worn = [Some(1000), Some(1010), Some(1020), Some(1030)];
+        for (ordinal, expect) in [
+            (0, SLOT_ACCESSORY_1),
+            (1, SLOT_ACCESSORY_2),
+            (2, SLOT_ACCESSORY_3),
+            (3, SLOT_ACCESSORY_4),
+        ] {
+            let mut slots = worn;
+            for s in slots.iter_mut().skip(ordinal as usize) {
+                *s = None;
+            }
+            assert_eq!(
+                slot_for_accessory(full, 4, slots, 1040, ordinal),
+                Some(expect),
+                "fill phase: ordinal {ordinal} should take the first empty slot"
+            );
+        }
         // All four worn: the fifth talisman still gets equipped. Refusing it would be "you may
-        // keep the build you have", which is the one thing the ruleset forbids.
+        // keep the build you have", which is the one thing the ruleset forbids. WHERE it lands now
+        // walks the slots instead of pinning slot 1.
+        for (ordinal, expect) in [
+            (4u64, SLOT_ACCESSORY_1),
+            (5, SLOT_ACCESSORY_2),
+            (6, SLOT_ACCESSORY_3),
+            (7, SLOT_ACCESSORY_4),
+            (8, SLOT_ACCESSORY_1),
+        ] {
+            assert_eq!(
+                slot_for_accessory(full, 4, worn, 1040, ordinal),
+                Some(expect),
+                "full loadout: ordinal {ordinal} landed in the wrong slot"
+            );
+        }
+    }
+
+    /// 🛑 THE MOTIVATING CASE for #342 (CONTRIBUTING rule 11), stated as the freeze itself rather
+    /// than as one call: run eight talismans into a fully-unlocked character and every slot must
+    /// have churned. Under the shipped `clobber the lowest` rule this ends
+    /// `[H, B, C, D]` -- slots 2, 3 and 4 frozen on the 2nd, 3rd and 4th arrivals for the rest of
+    /// the run, which is the opposite of rule 2's own stated rationale.
+    ///
+    /// Fails on `None => Some(ACCESSORY_SLOTS[0])`.
+    #[test]
+    fn a_full_loadout_churns_every_slot_instead_of_freezing_three() {
+        let stream: [i32; 8] = [1000, 1010, 1020, 1030, 1040, 1050, 1060, 1070];
+        let mut slots = [None; 4];
+        for (ordinal, &param_id) in stream.iter().enumerate() {
+            if let Some(slot) = slot_for_accessory(3, 4, slots, param_id, ordinal as u64) {
+                let i = ACCESSORY_SLOTS.iter().position(|&x| x == slot).unwrap();
+                slots[i] = Some(param_id);
+            }
+        }
         assert_eq!(
-            slot_for_accessory(full, [Some(1000), Some(1010), Some(1020), Some(1030)], 1040),
-            Some(SLOT_ACCESSORY_1)
+            slots,
+            [Some(1040), Some(1050), Some(1060), Some(1070)],
+            "the four most recent talismans should be worn, not the 1st, 2nd, 3rd and last"
         );
+        // The specific tell Alaric would see: nothing from the first four survives.
+        for stale in [1000, 1010, 1020, 1030] {
+            assert!(
+                !slots.contains(&Some(stale)),
+                "talisman {stale} froze in its slot"
+            );
+        }
     }
 
     /// A gap in the middle is filled before anything is clobbered -- the player unequipped slot 2
@@ -566,7 +687,7 @@ mod tests {
     #[test]
     fn the_first_empty_slot_wins_even_out_of_order() {
         assert_eq!(
-            slot_for_accessory(4, [Some(1000), None, Some(1020), None], 1030),
+            slot_for_accessory(4, 4, [Some(1000), None, Some(1020), None], 1030, 7),
             Some(SLOT_ACCESSORY_2)
         );
     }
@@ -577,18 +698,24 @@ mod tests {
     #[test]
     fn a_talisman_already_worn_is_not_equipped_a_second_time() {
         assert_eq!(
-            slot_for_accessory(4, [Some(1000), None, None, None], 1000),
+            slot_for_accessory(4, 4, [Some(1000), None, None, None], 1000, 0),
             None
         );
         assert_eq!(
-            slot_for_accessory(4, [Some(1000), Some(1010), Some(1020), Some(1030)], 1020),
+            slot_for_accessory(
+                4,
+                4,
+                [Some(1000), Some(1010), Some(1020), Some(1030)],
+                1020,
+                5
+            ),
             None
         );
         // ...but a copy sitting in a LOCKED slot is not "worn" -- it cannot be, so slot 1 it is.
         // raw=0 (no pouches) => ONE unlocked slot, so the `Some(1010)` in slot 2 is unreachable
         // state the game could not have produced and must not suppress the equip.
         assert_eq!(
-            slot_for_accessory(0, [None, Some(1010), None, None], 1010),
+            slot_for_accessory(0, 1, [None, Some(1010), None, None], 1010, 0),
             Some(SLOT_ACCESSORY_1)
         );
     }
