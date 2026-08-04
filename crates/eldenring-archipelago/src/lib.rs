@@ -37,6 +37,7 @@ mod params;
 mod physick_probe;
 mod reconcile_io;
 mod region;
+mod runes;
 mod scadu_blessing;
 mod scaling;
 mod scout_proof;

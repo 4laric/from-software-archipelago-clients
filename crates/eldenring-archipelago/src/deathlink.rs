@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::sync::Mutex;
 
-use eldenring::cs::{GameDataMan, WorldChrMan};
+use eldenring::cs::WorldChrMan;
 use er_logic::deathlink::KeepRunes;
 use fromsoftware_shared::FromStatic;
 
@@ -61,8 +61,13 @@ pub fn drive_kill() {
     if let Ok(mut keep) = KEEP_RUNES.lock()
         && let Some(runes) = keep.poll_restore(crate::flags::in_world(), read_local_hp())
     {
-        write_rune_count(runes);
-        log::info!("DeathLink: keep-runes restored {runes} runes after respawn");
+        // Every rune write in this crate goes through `crate::runes`, which logs before -> after
+        // with the cause named and READ-BACK verifies it (world issue #259). The line this
+        // replaces -- "keep-runes restored N runes after respawn" -- claimed a success it never
+        // checked for, and it printed the value we asked for rather than the one the game kept.
+        // `write_if_changed` because this leg re-asserts across RESTORE_REASSERT_TICKS ticks: one
+        // restore is one line, and a second line means the engine zeroed us late.
+        crate::runes::write_if_changed(runes, "keep-runes restore after DeathLink respawn");
     }
 
     // R2 (SWEEP H2): belt-and-braces -- a stale latched kill must never fire once death_link is
@@ -76,10 +81,12 @@ pub fn drive_kill() {
     // right after, so the (late -- observed "way after YOU DIED") bloodstain bank sees 0 and drops
     // nothing. The restore leg above pays the snapshot back on respawn.
     if KILL_PENDING.load(Ordering::Relaxed) && crate::flags::in_world() {
-        let snapshot = read_rune_count(); // BEFORE the kill; None if GameDataMan is down -> vanilla drop
+        let snapshot = crate::runes::read(); // BEFORE the kill; None if GameDataMan is down -> vanilla drop
         if kill_local_player() {
             if let Some(runes) = snapshot {
-                write_rune_count(0);
+                // Unconditional (not `write_if_changed`): this is a one-shot transition, and a
+                // player who died holding 0 runes is a fact worth having in the log too.
+                crate::runes::write(0, "keep-runes withhold (incoming DeathLink kill)");
                 if let Ok(mut keep) = KEEP_RUNES.lock() {
                     keep.arm(Some(runes));
                 }
@@ -95,20 +102,6 @@ pub fn drive_kill() {
                 ),
             }
         }
-    }
-}
-
-/// Read the local player's held rune count (`GameDataMan -> main_player_game_data -> rune_count`),
-/// or None before the player game data is up. Same singleton idiom as `inventory`/`upgrades`.
-fn read_rune_count() -> Option<u32> {
-    let gdm = unsafe { GameDataMan::instance() }.ok()?;
-    Some(gdm.main_player_game_data.as_ref().rune_count)
-}
-
-/// Write the local player's held rune count. No-op before the player game data is up.
-fn write_rune_count(value: u32) {
-    if let Ok(gdm) = unsafe { GameDataMan::instance_mut() } {
-        gdm.main_player_game_data.as_mut().rune_count = value;
     }
 }
 

@@ -265,11 +265,16 @@ pub fn prime_inventory_if_needed() {
 /// during the load, and a pointer that outlives its world is a native crash the moment the
 /// reconciler grants through it. The next tick re-primes from the static slot (or the player's
 /// next pickup), so this costs at most a tick or two of deferred grants.
-pub fn on_world_edge() {
+///
+/// Returns the world epoch it just bumped to, so the caller can stamp its own edge lines with the
+/// same number (`runes::log_sample`, world issue #259). Two edges that read the same rune count are
+/// otherwise indistinguishable in a log.
+pub fn on_world_edge() -> u64 {
     let e = WORLD_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
         "inventory-ptr: retired at world edge (epoch {e}) -- re-priming before the next grant"
     );
+    e
 }
 
 /// Called from the LuaWarp detour the moment ANY warp (menu or client) is REQUESTED -- the
