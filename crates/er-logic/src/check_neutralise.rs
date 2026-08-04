@@ -143,13 +143,48 @@ mod tests {
         // check_lots.rs branched on RepointToPlaceholder and called zero_slot() inside it, so the
         // flag flip would have emptied every non-goods check slot -- no pickup, no acquisition
         // flag, no check. An id of 0 must be unreachable from any input.
+        //
+        // Stated over ALL FOUR inputs, existence before payload. This test used to quantify
+        // through `if let Some(w)` and silently skip the `None` arm, so "the write never empties
+        // a slot" could not see "the write never happens at all": a `slot_write` that refused
+        // every goods input kept it green (2026-08-04 inert-test audit, mutation M2). Don't
+        // filter the gate's output -- pin WHICH inputs write, then WHAT they write.
+        let mut writes = 0;
         for goods in [false, true] {
             for cat in [false, true] {
-                if let Some(w) = slot_write(goods, cat, 8852) {
+                let w = slot_write(goods, cat, 8852);
+                assert_eq!(
+                    w.is_some(),
+                    goods || cat,
+                    "write existence must match plan(): goods={goods} cat={cat}"
+                );
+                if let Some(w) = w {
+                    writes += 1;
                     assert_ne!(w.item_id, 0, "a repoint must never write an empty item id");
                     assert_eq!(w.item_id, 8852);
                 }
             }
+        }
+        assert_eq!(
+            writes, 3,
+            "exactly 3 of the 4 (goods, cat) inputs repoint; only (false, false) leaves vanilla"
+        );
+    }
+
+    #[test]
+    fn a_goods_slot_write_always_exists_and_carries_the_id_alone() {
+        // The goods write path used to have no NAMED coverage: its only guard was an incidental
+        // `.expect("goods always repoints")` inside a test about non-goods CATEGORY travel
+        // (2026-08-04 audit, F2). This is that path's own test, so losing the goods write fails
+        // here by name and not as collateral in a differently-titled assertion.
+        for cat in [false, true] {
+            let w = slot_write(true, cat, 8852)
+                .expect("a goods slot must ALWAYS repoint -- vanilla suppression depends on it");
+            assert_eq!(w.item_id, 8852);
+            assert_eq!(
+                w.category, None,
+                "a goods slot is already goods: the id alone is the write"
+            );
         }
     }
 
