@@ -1111,9 +1111,10 @@ pub fn tick() {
     for g in &out.newly_stalled {
         log::warn!(
             "[reconcile] INERT: goods {g:#x} accepted {} grant(s) and was never observable -- \
-             no longer re-granting until the next load. {}",
+             no longer re-granting until the next load. {} | {}",
             er_logic::reconcile::MAX_GRANT_ATTEMPTS,
-            inventory_forensics(*g)
+            inventory_forensics(*g),
+            crate::detour::add_item_return_for(*g)
         );
     }
     for f in &out.newly_stalled_flags {
