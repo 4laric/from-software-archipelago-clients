@@ -32,6 +32,46 @@ static LAST_INVENTORY_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// captured in an older epoch is DEAD -- handing it to the game's AddItemFunc is a use-after-free,
 /// and it is what crashed the 2026-07-24 playtest twice (er_logic::inv_ptr, replay-tested).
 static WORLD_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Raw `AddItemFunc` return values, keyed by the good the grant was FOR.
+///
+/// `grant_item` used to drop the game's `u64` on the floor, so `grant_full_id_outcome` reported
+/// `Placed` for every call it dispatched -- including the ones the game refused and dropped at the
+/// player's feet. The reconciler then re-granted the good until `MAX_GRANT_ATTEMPTS` parked it, and
+/// re-armed after every world edge, forever (bobler 2026-08-04, goods 0x4000230c). This records
+/// what the call actually returned so the stall log can NAME it.
+///
+/// It deliberately does not interpret the value -- see `er_logic::add_item_probe` for why, and for
+/// the keyed-by-good rule that stops a stall quoting some other grant's return.
+static ADD_ITEM_PROBE: Mutex<Option<er_logic::add_item_probe::AddItemProbe>> = Mutex::new(None);
+/// World epoch the probe's records belong to; a bump clears them, so a post-load stall never
+/// quotes a pre-load return.
+static ADD_ITEM_PROBE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Remember a DISPATCHED call's raw return. Never called for a grant that did not reach the game.
+fn record_add_item_return(full_id: i32, ret: u64) {
+    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
+    let Ok(mut guard) = ADD_ITEM_PROBE.lock() else {
+        return;
+    };
+    let probe = guard.get_or_insert_with(er_logic::add_item_probe::AddItemProbe::new);
+    if ADD_ITEM_PROBE_EPOCH.swap(epoch, Ordering::Relaxed) != epoch {
+        probe.clear();
+    }
+    probe.record(full_id, ret);
+}
+
+/// What `AddItemFunc` last returned for `full_id`, rendered for the stall log. `NEVER DISPATCHED`
+/// is a distinct and meaningful answer: it means the grant never reached the game at all, which
+/// indicts the inventory pointer / hook / pot cap rather than a refusal.
+pub fn add_item_return_for(full_id: i32) -> String {
+    match ADD_ITEM_PROBE.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(p) => er_logic::add_item_probe::describe(p, full_id),
+            None => "add_item_ret=NEVER DISPATCHED".to_string(),
+        },
+        Err(_) => "add_item_ret=UNAVAILABLE (probe lock poisoned)".to_string(),
+    }
+}
 /// `now_ms()` timestamp of the most recent warp REQUEST (LuaWarp detour), or
 /// [`er_logic::inv_ptr::NEVER_WARPED`] if none yet. From the request until
 /// `inv_ptr::PRIME_HOLDOFF_MS` later, the static-slot primer sits out: the slot still points at
@@ -465,6 +505,9 @@ pub fn grant_full_id_outcome(full_id: i32, qty: i32) -> er_logic::start_backfill
         // NOT delivered for anyone verifying against the bag.
         return GrantOutcome::Capped;
     }
+    // The id the CALLER asked for. auto_upgrade may re-map a weapon below, but the reconciler
+    // stalls on (and logs) the id it requested, so the probe must be keyed on that one.
+    let requested_full_id = full_id;
     // Stage 6a: raise granted weapons to the player's current max reinforce tier (inert if off).
     let full_id = crate::upgrades::apply_auto_upgrade(full_id);
     let inv = LAST_INVENTORY.load(Ordering::Relaxed);
@@ -478,7 +521,13 @@ pub fn grant_full_id_outcome(full_id: i32, qty: i32) -> er_logic::start_backfill
         // prime_inventory_if_needed re-seeds within a tick or two of the world coming back.
         return GrantOutcome::NotReady;
     }
-    grant_item(inv as *mut c_void, full_id, qty);
+    if let Some(ret) = grant_item(inv as *mut c_void, full_id, qty) {
+        record_add_item_return(requested_full_id, ret);
+    }
+    // STILL `Placed`, deliberately. Nobody has RE'd what the return value means, so turning it
+    // into a `Refused` outcome would bake an unverified root cause into the reconciler. This
+    // change makes the datum VISIBLE; interpreting it is the follow-up, gated on a log that shows
+    // what a refusal actually returns.
     GrantOutcome::Placed
 }
 
@@ -604,9 +653,9 @@ unsafe extern "C" fn add_item_detour(
 }
 
 /// Port of the standalone `GrantItem`: 0x50-byte descriptor, entry at buf+0x20.
-fn grant_item(inventory: *mut c_void, id_with_category: i32, quantity: i32) {
+fn grant_item(inventory: *mut c_void, id_with_category: i32, quantity: i32) -> Option<u64> {
     if id_with_category == 0 || inventory.is_null() {
-        return;
+        return None;
     }
     let mut buf = [0u64; 0x50 / 8];
     let base = buf.as_mut_ptr() as *mut u8;
@@ -620,9 +669,10 @@ fn grant_item(inventory: *mut c_void, id_with_category: i32, quantity: i32) {
         (base.add(0x4C) as *mut i32).write_unaligned(-1);
         let entry = base.add(ITEMBUF_ENTRY_OFF) as *mut c_void;
         let itembuf = base as *mut c_void;
-        if let Some(h) = HOOK.get() {
-            h.call(inventory, entry, itembuf, 0);
-        }
+        // The return value is the whole point of this function's signature: dropping it is what
+        // let a REFUSED add be scored as an accepted grant.
+        let h = HOOK.get()?;
+        Some(h.call(inventory, entry, itembuf, 0))
     }
 }
 

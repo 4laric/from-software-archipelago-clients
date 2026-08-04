@@ -799,8 +799,9 @@ pub struct Reconciler {
 ///
 /// This is the bound the reconciler never had. `diff` re-emits `GrantUnique` for any desired good a
 /// snapshot cannot see, `tick` polls every frame, and `grant_good`
-/// reports success for any call it dispatched — because `grant_item` discards `AddItemFunc`'s
-/// result. Compose those three and a good the game REFUSES (it is dropped on the floor with
+/// reports success for any call it dispatched — `grant_item` now CAPTURES `AddItemFunc`'s result
+/// (`add_item_probe`, named in the stall log) but nobody has RE'd what it means, so the outcome is
+/// still `Placed` either way. Compose those three and a good the game REFUSES (it is dropped on the floor with
 /// "would exceed the maximum storage") is re-granted ~6x/second for the rest of the session while
 /// the log cheerfully reports `converged=true`. That is the 2026-07-30 player softlock, and it is
 /// the third instance of one class: the 2026-07-12 flask ladder and the 2026-07-19 co-op

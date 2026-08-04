@@ -766,7 +766,9 @@ mod replay {
     ///
     /// THE BUG: `diff` re-emits `GrantUnique` for any desired good a snapshot cannot see;
     /// `tick` polls every frame regardless of convergence; and `grant_good` reports success for
-    /// anything it dispatched, because `grant_item` throws away `AddItemFunc`'s result. When the
+    /// anything it dispatched, because `grant_item`'s result is captured but not yet INTERPRETED
+    /// (`add_item_probe` records it for the stall log; `grant_full_id_outcome` still says
+    /// `Placed`). When the
     /// game REFUSES the add — inventory at cap, "would exceed the maximum storage", item dropped on
     /// the floor — those three compose into an unbounded re-grant at ~6/second for the rest of the
     /// session, logged as `converged=true`. Two players lost saves to it on 2026-07-30; it is the
