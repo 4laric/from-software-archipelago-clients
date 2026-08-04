@@ -189,6 +189,28 @@ pub fn apply_auto_upgrade(full_id: i32) -> i32 {
     up
 }
 
+/// The FullID auto_equip must QUEUE for a received item. Live-hook wrapper over the host-tested
+/// enqueue decision (`er_logic::auto_equip::enqueue_id`), which delegates to the SAME
+/// `apply_auto_upgrade` predicate the grant runs -- so the #296/#302/#303 invariant ("whatever
+/// the queue holds must equal what the grant puts in the bag") is ONE call in er-logic, where
+/// `upgrades_replay::auto_equip_queue_matches_bag` exercises the function production calls.
+/// Before this wrapper existed the upgrade was applied inline in `auto_equip::enqueue`, a crate
+/// with no test targets: deleting that line kept the whole workspace green while the bug
+/// returned (2026-08-04 inert-test audit, F1).
+///
+/// CALL SITE: auto_equip.rs `enqueue` (the only enqueue path).
+pub fn enqueue_upgrade_id(full_id: i32) -> i32 {
+    let up = er_logic::auto_equip::enqueue_id(
+        &crate::hook_impl::EldenRingHook,
+        auto_upgrade_on(),
+        full_id,
+    );
+    if up != full_id {
+        log::info!("auto_upgrade: {:#x} -> {:#x} (enqueue)", full_id, up);
+    }
+    up
+}
+
 /// ER category nibble mask / weapon-category constant (er_codec mirror; weapons are category 0x0).
 const ROW_ID_MASK: u32 = er_codec::ROW_ID_MASK;
 

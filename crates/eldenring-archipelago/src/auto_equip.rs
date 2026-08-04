@@ -221,7 +221,11 @@ pub fn set_enabled(on: bool) {
 /// raise. Zero upgradeable weapons ever equipped.
 ///
 /// The upgrade is applied HERE rather than at the call site so there is ONE enqueue path and a
-/// future caller cannot reintroduce the mismatch. `apply_auto_upgrade` is raise-only and therefore
+/// future caller cannot reintroduce the mismatch -- and it is applied through the host-tested
+/// er-logic seam (`crate::upgrades::enqueue_upgrade_id` -> `er_logic::auto_equip::enqueue_id`)
+/// rather than inline, because the inline call was the one line of the #296/#302/#303 fix no test
+/// could reach (2026-08-04 inert-test audit, F1); `upgrades_replay::auto_equip_queue_matches_bag`
+/// now pins the seam against the grant path. The predicate is raise-only and therefore
 /// idempotent, so the second application inside the grant is a no-op, and both calls share the
 /// 1500ms `UPGRADE_TARGETS` cache -- within a tick they cannot disagree.
 ///
@@ -253,7 +257,7 @@ pub fn enqueue(full_id: i32) {
     } else {
         0
     };
-    let full_id = crate::upgrades::apply_auto_upgrade(full_id);
+    let full_id = crate::upgrades::enqueue_upgrade_id(full_id);
     if let Ok(mut q) = PENDING.lock()
         && !q.iter().any(|&(id, _)| id == full_id)
     {

@@ -249,12 +249,21 @@ mod replay {
 // Lordsworn's Bolt) that is AMMUNITION and so has no reinforce run for auto_upgrade to raise.
 // Zero upgradeable weapons equipped all session.
 //
-// The fix applies the same shared predicate inside `enqueue`, so the queue and the bag come from ONE
-// call. These tests pin the invariant that made the bug possible: whatever the queue holds must
-// equal what the grant puts in the bag.
+// The fix routes `enqueue` through the same predicate the grant runs, so the queue and the bag
+// come from ONE call. Since the 2026-08-04 inert-test audit (F1) that routing is a NAMED er-logic
+// seam -- `crate::auto_equip::enqueue_id` -- because the first version of this module compared two
+// local aliases of `apply_auto_upgrade` and could not fail: deleting the fix at the Windows enqueue
+// site left the whole workspace green. These tests now put the two PRODUCTION paths on the two
+// sides of every assert: `queued` is `enqueue_id` (what `auto_equip::enqueue` stores, via
+// `upgrades.rs enqueue_upgrade_id`) and `bagged` is `apply_auto_upgrade` (what `detour.rs
+// grant_full_id` puts in the bag) -- plus the EXACT expected id, so agreement cannot be satisfied
+// by both sides drifting together. Neutralise the upgrade application inside `enqueue_id` and
+// `post_fix_queue_matches_the_bag_for_an_upgraded_weapon` and
+// `queue_matches_the_bag_at_every_held_level` go red (mutation-verified before landing).
 
 #[cfg(test)]
 mod auto_equip_queue_matches_bag {
+    use crate::auto_equip::enqueue_id;
     use crate::hook::GameHook;
     use crate::upgrades::apply_auto_upgrade;
 
@@ -302,32 +311,41 @@ mod auto_equip_queue_matches_bag {
         fn set_scadutree_blessing(&mut self, _l: i32) {}
     }
 
-    /// What `enqueue` stored BEFORE the fix: the raw received id.
+    /// What `enqueue` stored BEFORE the fix: the raw received id. Kept as the documented bug shape.
     fn queued_pre_fix(_b: &Bag, full_id: i32) -> i32 {
         full_id
     }
-    /// What `enqueue` stores AFTER the fix: the same predicate the grant runs.
-    fn queued_post_fix(b: &Bag, full_id: i32) -> i32 {
-        apply_auto_upgrade(b, true, full_id)
+    /// What production `enqueue` QUEUES: the er-logic seam the Windows crate calls
+    /// (`auto_equip.rs enqueue` -> `upgrades.rs enqueue_upgrade_id` -> this fn).
+    fn queued(b: &Bag, full_id: i32) -> i32 {
+        enqueue_id(b, true, full_id)
     }
-    /// What the grant actually puts in the bag (`detour::grant_full_id_outcome`).
+    /// What the grant actually puts in the bag (`detour.rs grant_full_id` -> `apply_auto_upgrade`).
     fn bagged(b: &Bag, full_id: i32) -> i32 {
         apply_auto_upgrade(b, true, full_id)
     }
 
     #[test]
     fn pre_fix_queue_misses_an_auto_upgraded_weapon() {
-        // Documents the bug: the player already holds a +5, so the target is +5 and the raw
-        // received id is not what lands in the bag.
+        // Documents the bug in EXACT values. (The earlier form was a bare `assert_ne!` -- a
+        // negative with two causes, which stayed green under a wrong-constant mutation of the
+        // whole mechanism.) Holding a +5: the pre-fix queue stored base+0 while the grant landed
+        // base+5, so the exact-FullID lookup could never hit.
         let b = Bag { held_normal: 5 };
-        assert_ne!(queued_pre_fix(&b, WEAPON_BASE), bagged(&b, WEAPON_BASE));
+        assert_eq!(queued_pre_fix(&b, WEAPON_BASE), WEAPON_BASE);
+        assert_eq!(bagged(&b, WEAPON_BASE), WEAPON_BASE + 5);
     }
 
     #[test]
     fn post_fix_queue_matches_the_bag_for_an_upgraded_weapon() {
         let b = Bag { held_normal: 5 };
         assert_eq!(
-            queued_post_fix(&b, WEAPON_BASE),
+            queued(&b, WEAPON_BASE),
+            WEAPON_BASE + 5,
+            "the enqueue seam must raise the queued id to the held level",
+        );
+        assert_eq!(
+            queued(&b, WEAPON_BASE),
             bagged(&b, WEAPON_BASE),
             "#296/#302/#303: the queued id must be the id auto_equip will find in the bag",
         );
@@ -335,17 +353,25 @@ mod auto_equip_queue_matches_bag {
 
     #[test]
     fn the_fix_is_inert_when_there_is_nothing_to_raise() {
-        // Target +0: both policies agree, so a fresh character sees no behaviour change at all.
+        // Target +0: pre-fix and post-fix agree, so a fresh character sees no behaviour change.
         let b = Bag { held_normal: 0 };
-        assert_eq!(queued_pre_fix(&b, WEAPON_BASE), bagged(&b, WEAPON_BASE));
-        assert_eq!(queued_post_fix(&b, WEAPON_BASE), bagged(&b, WEAPON_BASE));
+        assert_eq!(queued(&b, WEAPON_BASE), WEAPON_BASE);
+        assert_eq!(bagged(&b, WEAPON_BASE), WEAPON_BASE);
+    }
+
+    #[test]
+    fn the_enqueue_seam_is_identity_when_auto_upgrade_is_off() {
+        // Off means off: with auto_upgrade off the queue holds exactly the received id, even
+        // with a higher weapon in the bag.
+        let b = Bag { held_normal: 5 };
+        assert_eq!(enqueue_id(&b, false, WEAPON_BASE), WEAPON_BASE);
     }
 
     #[test]
     fn a_protector_is_unaffected_by_the_fix() {
         // Identity under apply_auto_upgrade -- which is WHY armour kept working. Must stay identity.
         let b = Bag { held_normal: 5 };
-        assert_eq!(queued_post_fix(&b, PROTECTOR), PROTECTOR);
+        assert_eq!(queued(&b, PROTECTOR), PROTECTOR);
         assert_eq!(bagged(&b, PROTECTOR), PROTECTOR);
     }
 
@@ -353,11 +379,17 @@ mod auto_equip_queue_matches_bag {
     fn queue_matches_the_bag_at_every_held_level() {
         // Applying the predicate at enqueue time is only correct if the grant, moments later, sees
         // the same target. Production shares the 1500ms UPGRADE_TARGETS cache; here we assert the
-        // weaker sufficient property -- for any bag state the two call sites agree.
+        // weaker sufficient property -- for any bag state the two production paths agree, AND on
+        // the exact id, so the assert cannot be satisfied by both sides drifting together.
         for lvl in [0, 1, 5, 10, 25] {
             let b = Bag { held_normal: lvl };
             assert_eq!(
-                queued_post_fix(&b, WEAPON_BASE),
+                queued(&b, WEAPON_BASE),
+                WEAPON_BASE + lvl,
+                "queued id wrong at held level {lvl}",
+            );
+            assert_eq!(
+                queued(&b, WEAPON_BASE),
                 bagged(&b, WEAPON_BASE),
                 "queue/bag disagreed at held level {lvl}",
             );

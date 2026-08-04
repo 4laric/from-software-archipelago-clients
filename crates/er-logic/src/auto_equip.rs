@@ -12,6 +12,8 @@
 //! `EQUIP_PARAM_PROTECTOR_ST.protectorCategory`, and -- for talismans --
 //! `PlayerGameData.unlocked_talisman_slots` plus what the four accessory slots currently hold.
 
+use crate::hook::GameHook;
+
 /// Category nibble of a FullID (`(category << 28) | row`), matching the encoding used across the
 /// client. Source is `eldenring::cs::ItemCategory`: `Weapon = 0`, `Protector = 1`, `Accessory = 2`,
 /// `Goods = 4`, `Gem = 8`.
@@ -93,6 +95,32 @@ pub fn equipable(full_id: i32) -> Option<Equipable> {
         CATEGORY_ACCESSORY => Some(Equipable::Accessory),
         _ => None,
     }
+}
+
+/// The FullID the auto_equip queue must HOLD for a received item: the id the grant will put in
+/// the bag, not the raw received id.
+///
+/// This is the #296/#302/#303 fix as a production seam. The Windows crate's `auto_equip::enqueue`
+/// stores this return value, and its `tick()` later looks it up in the inventory by EXACT FullID;
+/// the grant path independently runs [`crate::upgrades::apply_auto_upgrade`] on the item's way
+/// into the bag. With `auto_upgrade` ON, an upgradeable weapon received as `base + 0` lands as
+/// `base + N` -- queue the raw id and the lookup misses every tick for the rest of the session
+/// (boblerrr: armour auto-equips fine, weapons never do). Delegating to the same predicate the
+/// grant runs makes the queue and the bag agree by construction.
+///
+/// Why a named seam instead of the Windows crate calling `apply_auto_upgrade` inline (as the
+/// first version of the fix did): the inline call lived in a crate with no test targets, and the
+/// er-logic tests memorialising it compared two local aliases of one call -- deleting the inline
+/// call kept the whole workspace green while the bug returned (2026-08-04 inert-test audit, F1).
+/// Same repair as [`crate::check_neutralise::slot_write`]: the decision is the return value of a
+/// host-tested function that production calls, so there is nothing left to disagree with.
+/// `upgrades_replay`'s `auto_equip_queue_matches_bag` pins THIS function against the grant path
+/// (exact ids, every held level) and goes red if either side stops applying the upgrade.
+///
+/// CALL SITE: `eldenring-archipelago/src/upgrades.rs enqueue_upgrade_id` (live-hook wrapper),
+/// called by that crate's `auto_equip.rs enqueue` -- the only enqueue path.
+pub fn enqueue_id(hook: &dyn GameHook, auto_upgrade_on: bool, full_id: i32) -> i32 {
+    crate::upgrades::apply_auto_upgrade(hook, auto_upgrade_on, full_id)
 }
 
 /// Is this received FullID a weapon? Retained for callers that only care about the weapon case.
