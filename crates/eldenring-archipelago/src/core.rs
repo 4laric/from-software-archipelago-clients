@@ -1225,6 +1225,12 @@ impl shared::Core for Core {
                     region.area_lock_flags.len()
                 );
 
+                // RUNE COUNT AT CONNECT (world issue #259), the other half of the pair the
+                // world-edge line makes. Unreadable here when connecting from the main menu, which
+                // is normal and says so at WARN rather than going quiet; the first world edge then
+                // supplies the opening bracket.
+                crate::runes::log_sample(er_logic::rune_log::Sample::Connect);
+
                 // Prime the fast-travel gate's known-good flag from the start graces. The client SETS
                 // these at spawn, so they are really on and pointing the gate field at one is inert.
                 // This removes the only case the old destructive fallback existed for -- booting
@@ -2879,7 +2885,13 @@ impl shared::Core for Core {
             // (eldenring.exe+0x560714, AV read at 0x1ffa585e148, reached via
             // grant_full_id <- Reconciler::tick_with_classes <- classify_received). Retire it here
             // and let the next tick re-prime. See er_logic::inv_ptr (replay-tested).
-            crate::detour::on_world_edge();
+            let world_epoch = crate::detour::on_world_edge();
+            // RUNE COUNT AT THE EDGE (world issue #259). A rollback, a keep-runes restore, a
+            // save-load clobber and a legitimate boss payout are identical in a single sample --
+            // they are only distinguishable as a PAIR of readings either side of an edge. One line
+            // here, one at connect, and an Alt-F4/reconnect report stops being unfalsifiable.
+            // Deliberately not per tick: rune count moves constantly in normal play.
+            crate::runes::log_sample(er_logic::rune_log::Sample::WorldEdge { epoch: world_epoch });
             // shop_sell was MISSING from this edge (2026-07-24): the same stream-in reverts
             // ShopLineupParam, so every rewritten check row went back to selling its VANILLA
             // ware after the session's first load -- while ECHO_SKIP survived and kept eating
