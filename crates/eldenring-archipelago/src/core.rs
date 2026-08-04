@@ -500,8 +500,12 @@ impl shared::Core for Core {
     }
 
     /// Overlay menu-bar hook (SPEC-item-tracker.md): a "Tracker" item that toggles the window.
+    ///
+    /// The label carries its hotkey (as the shared overlay's "Hide (F5)" does) because F6 lived
+    /// only in this file: it was in no README, no guide and no menu label, so the one feature that
+    /// answers "how do I get this off my screen" was undiscoverable by design.
     fn render_overlay_menu_items(&mut self, ui: &imgui::Ui) {
-        if ui.menu_item("Tracker") {
+        if ui.menu_item("Tracker (F6)") {
             self.tracker_visible = !self.tracker_visible;
         }
     }

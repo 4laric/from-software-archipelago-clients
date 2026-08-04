@@ -81,6 +81,10 @@ pub struct Overlay<G: Game> {
     /// The unfocused window opacity for the overlay UI.
     unfocused_window_opacity: f32,
 
+    /// Whether the client's own windows (main + settings + console) are drawn. Toggled by F5;
+    /// forced back on whenever we are not connected. The rule is [`next_main_window_visible`].
+    main_window_visible: bool,
+
     /// Whether the settings window is currently visible.
     settings_window_visible: bool,
 
@@ -126,6 +130,38 @@ pub struct Overlay<G: Game> {
 // is not a real concern.
 unsafe impl<G: Game> Sync for Overlay<G> {}
 
+/// The F5 hide/show rule for the client's own windows, as a pure function so it can be tested
+/// without a game, a frame, or a Windows machine.
+///
+/// F5 hides the main window, the settings window and the dev console. It deliberately does NOT
+/// touch the game-specific windows (`Core::render_overlay_windows`): the ER item tracker has its
+/// own F6, and the toasts are the ONLY feedback channel for grants the game itself cannot announce
+/// (flask rungs and friends — see `er_logic::toast`), so hiding them would turn a working feature
+/// back into an invisible one. The fatal-error modal is drawn by `ErrorDisplay`, outside this
+/// type, and is likewise unaffected.
+///
+/// Two things constrain this beyond a bool flip:
+///
+/// * **Disconnected FORCES visible.** The fresh-install auto-prompt and the menu bar's
+///   "Connection" item both open `#connect-modal` from inside the main window's body, at its root
+///   ID scope. Skip the main window and there is no way to connect and no prompt on a fresh
+///   install — the overlay is not merely hidden, it is unreachable. (Collapsing the window instead
+///   of skipping it does not help: imgui does not run a collapsed window's body either.) So F5 is
+///   a "get this out of my screenshot" key for an established session, and is inert while
+///   disconnected.
+/// * **Hiding must stay cosmetic, and is.** The mod's logic runs on the recurring task spawned in
+///   [`crate::initialize`], not from the render loop, so a hidden overlay still reconciles, grants
+///   and reports checks. Nothing may be gated on this flag except drawing.
+///
+/// F5 is a function key for the same reason the tracker's F6 is: a plain letter would fight the
+/// say input, which is a live text field whenever the overlay has focus.
+fn next_main_window_visible(current: bool, f5_pressed: bool, disconnected: bool) -> bool {
+    // `^` is the toggle: a frame with no F5 leaves `current` alone.
+    (current ^ f5_pressed)
+        // Never leave the player without the connect UI.
+        || disconnected
+}
+
 impl<G: Game> Overlay<G> {
     /// Creates a new instance of the overlay and the core mod logic.
     pub fn new() -> Self {
@@ -133,6 +169,7 @@ impl<G: Game> Overlay<G> {
             font_scale: 1.8,
             unfocused_window_opacity: 0.4,
             was_compact_mode: true,
+            main_window_visible: true,
 
             // Default values. We can't use [Default::default] because G doesn't
             // require `Default`.
@@ -167,17 +204,25 @@ impl<G: Game> Overlay<G> {
     /// its mutex is only locked once per render.
     pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
         prof!(core.base_mut().profiler(), "AP overlay", {
-            prof!(core.base_mut().profiler(), "main window", {
-                self.render_main_window(ui, core);
-            });
+            self.main_window_visible = next_main_window_visible(
+                self.main_window_visible,
+                ui.is_key_pressed(Key::F5),
+                core.base().is_disconnected(),
+            );
 
-            prof!(core.base_mut().profiler(), "settings window", {
-                self.render_settings_window(ui);
-            });
+            if self.main_window_visible {
+                prof!(core.base_mut().profiler(), "main window", {
+                    self.render_main_window(ui, core);
+                });
 
-            prof!(core.base_mut().profiler(), "console window", {
-                self.render_console_window(ui, core);
-            });
+                prof!(core.base_mut().profiler(), "settings window", {
+                    self.render_settings_window(ui);
+                });
+
+                prof!(core.base_mut().profiler(), "console window", {
+                    self.render_console_window(ui, core);
+                });
+            }
 
             // Game-specific overlay windows (e.g. the ER item tracker). Called at
             // frame scope — the hook opens its own `ui.window(...)`.
@@ -427,6 +472,13 @@ impl<G: Game> Overlay<G> {
             if ui.menu_item("Console") {
                 self.console_window_visible = true;
                 self.focus_console_input_next_frame = true;
+            }
+
+            // The hide hotkey has to be discoverable from the UI itself: a player who never
+            // reads the guide would otherwise not know F5 exists, and — worse — could not guess
+            // it after hiding the overlay by accident, at which point the mod looks dead.
+            if ui.menu_item("Hide (F5)") {
+                self.main_window_visible = false;
             }
 
             // Game-specific menu items (e.g. the ER item tracker toggle).
@@ -754,5 +806,31 @@ fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
     // stays aligned.
     if first_word {
         ui.new_line();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_main_window_visible;
+
+    #[test]
+    fn f5_toggles_while_connected() {
+        assert!(!next_main_window_visible(true, true, false));
+        assert!(next_main_window_visible(false, true, false));
+    }
+
+    #[test]
+    fn other_frames_leave_visibility_alone() {
+        assert!(next_main_window_visible(true, false, false));
+        assert!(!next_main_window_visible(false, false, false));
+    }
+
+    /// The motivating case: a hidden overlay must not be able to swallow the connect UI. Whatever
+    /// the player last pressed, losing the connection brings the window back.
+    #[test]
+    fn disconnected_forces_the_window_back() {
+        assert!(next_main_window_visible(false, false, true));
+        assert!(next_main_window_visible(true, true, true));
+        assert!(next_main_window_visible(false, true, true));
     }
 }
