@@ -13,6 +13,7 @@ mod contract_gen;
 mod core;
 mod deathlink;
 mod detour;
+mod downstate_probe;
 mod enemy_drops;
 mod fast_travel;
 mod flagpoll;

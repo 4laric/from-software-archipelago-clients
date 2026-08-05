@@ -2840,6 +2840,11 @@ impl shared::Core for Core {
         // auto-equip pass has just finished with, and self-throttles to one scan per 500ms.
         crate::physick_probe::tick();
 
+        // 8b5. downstate_probe (#346 phase 1b): the one live measurement the down-states are gated
+        // on. Hard no-op unless ER_DOWNSTATE_PROBE is set, and read-only unless ER_DOWNSTATE_PROBE_ARM
+        // is set too. Latches after a single subject.
+        crate::downstate_probe::tick();
+
         // 8c. Ticker-only pickup notifs: set showDialogCondType=0 game-wide so AP grants show the
         //     native right-side ticker, not the blocking "NEW Y:OK" modal (was a retired-baker
         //     regulation edit; ported to runtime, latched once applied).
