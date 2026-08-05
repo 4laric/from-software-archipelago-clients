@@ -76,6 +76,45 @@ static DONE: AtomicBool = AtomicBool::new(false);
 /// The subject we are waiting to find, once `last_hit_by` has named one.
 static SUBJECT: Mutex<Option<FieldInsHandle>> = Mutex::new(None);
 
+/// 🛑 v1 READ TOO EARLY, AND THAT IS THE WHOLE REASON FOR v2.
+///
+/// The 2026-08-05 run answered the question this probe was built for -- **both ids landed**:
+///
+/// ```text
+/// BEFORE: npc_id=4480 chr_type=Npc hp=4162 speffects=[.., 7060, ..]
+/// applied 20018004   AFTER: hp=4162 speffects=[.., 20018004]
+/// applied 20018002   AFTER: hp=4162 speffects=[.., 20018004, 20018002]
+/// ```
+///
+/// So the engine accepts a DLC-block `20018xxx` row on a base-game enemy and keeps it in the list.
+/// But `hp` did not move -- and v1 could not tell you whether that means anything, for two reasons
+/// it built in itself:
+///
+///   1. it dumped in the SAME tick as the apply, and the engine recalculates derived stats on a
+///      later frame, so the read was simply too early; and
+///   2. it logged `hp` -- the CURRENT value -- while `maxHpRate` changes `max_hp`. A full-health
+///      enemy's current hp need not move at all until something re-clamps it.
+///
+/// v2 fixes both: it logs `max_hp` beside `hp`, reports whether each entry's `param_data` actually
+/// resolved to a param row (a carried id with a NULL row would mean the id is not in this player's
+/// table), and re-reads the subject on a schedule instead of once. Latching now happens when the
+/// WATCH finishes, not when the apply returns.
+static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
+
+/// Post-apply observation state. `frames` counts ticks since the apply; `dumps` counts how many
+/// scheduled re-reads have been emitted.
+struct Watch {
+    subject: FieldInsHandle,
+    frames: u32,
+    dumps: u32,
+}
+
+/// Re-read the subject every this many ticks (~1s at 60fps) ...
+const WATCH_INTERVAL: u32 = 60;
+/// ... this many times, then latch. Four reads over ~4s is long enough that "the engine had not
+/// recalculated yet" stops being an available excuse for a flat number.
+const WATCH_DUMPS: u32 = 4;
+
 fn enabled() -> bool {
     std::env::var_os("ER_DOWNSTATE_PROBE").is_some()
 }
@@ -91,14 +130,85 @@ fn armed() -> bool {
 /// than infer it later.
 fn dump(chr: &ChrIns, tag: &str) {
     let ids: Vec<i32> = chr.special_effect.entries().map(|e| e.param_id).collect();
+    // Ids whose `param_data` is NULL: the entry exists but resolved to no param row. That is the
+    // difference between "the game took our id" and "the game has that row", and v1 could not tell
+    // them apart because it logged only the id.
+    let unresolved: Vec<i32> = chr
+        .special_effect
+        .entries()
+        .filter(|e| e.param_data.is_none())
+        .map(|e| e.param_id)
+        .collect();
     log::info!(
-        "[downstate-probe] {tag}: npc_id={} chr_type={:?} team={} hp={} speffects={:?}",
+        "[downstate-probe] {tag}: npc_id={} chr_type={:?} team={} hp={}/{} speffects={:?} \
+         unresolved={:?}",
         chr.npc_id,
         chr.chr_type,
         chr.team_type,
         chr.modules.data.hp,
+        chr.modules.data.max_hp,
         ids,
+        unresolved,
     );
+}
+
+/// Locate a subject in the sets the sweep covers.
+///
+/// Reusing `sweepable_characters` deliberately: it carries the `chr_load_status` history and the
+/// "walk the ENTRY, never the `ChrIns` behind it" discipline that the 2026-07-27 CTD taught us, and
+/// a probe is not the place to reinvent that.
+fn find_subject(
+    wcm: &mut eldenring::cs::WorldChrMan,
+    target: FieldInsHandle,
+) -> Option<&mut ChrIns> {
+    for chr in crate::scaling::sweepable_characters(&wcm.open_field_chr_set.base) {
+        if chr.field_ins_handle == target {
+            return Some(chr);
+        }
+    }
+    for slot in wcm.chr_sets.iter().flatten() {
+        for chr in crate::scaling::sweepable_characters(slot) {
+            if chr.field_ins_handle == target {
+                return Some(chr);
+            }
+        }
+    }
+    None
+}
+
+/// The post-apply watch: re-read the subject on a schedule, then latch.
+///
+/// Returns true when it handled this tick (so `tick` must not fall through into the apply path).
+/// A subject that has unloaded simply stops producing reads and the watch still latches on schedule
+/// -- a probe that waited forever for a corpse would be worse than one that says what it saw.
+fn watch_step(wcm: &mut eldenring::cs::WorldChrMan) -> bool {
+    let Ok(mut guard) = WATCH.lock() else {
+        return false;
+    };
+    let Some(w) = guard.as_mut() else {
+        return false;
+    };
+    w.frames += 1;
+    if !w.frames.is_multiple_of(WATCH_INTERVAL) {
+        return true;
+    }
+    w.dumps += 1;
+    let (subject, dumps, secs) = (w.subject, w.dumps, w.frames / WATCH_INTERVAL);
+    let finished = dumps >= WATCH_DUMPS;
+    if finished {
+        *guard = None;
+    }
+    drop(guard);
+
+    match find_subject(wcm, subject) {
+        Some(chr) => dump(chr, &format!("WATCH +{secs}s")),
+        None => log::info!("[downstate-probe] WATCH +{secs}s: subject not loaded this tick"),
+    }
+    if finished {
+        DONE.store(true, Ordering::Relaxed);
+        log::info!("[downstate-probe] watch complete -- latched for this session");
+    }
+    true
 }
 
 /// Per-tick entry point. Call from `update_live` while in-world; self-latching and env-gated.
@@ -109,6 +219,11 @@ pub fn tick() {
     let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {
         return;
     };
+    // The watch owns the tick once an apply has happened -- see WATCH for why v1's single
+    // same-tick read could not answer its own question.
+    if watch_step(wcm) {
+        return;
+    }
     let Some(player) = wcm.main_player.as_ref() else {
         return;
     };
@@ -133,31 +248,8 @@ pub fn tick() {
         return;
     };
 
-    // Find it in the sets the sweep covers. Reusing `sweepable_characters` deliberately: it carries
-    // the chr_load_status history and the "walk the ENTRY, never the ChrIns behind it" discipline
-    // that the 2026-07-27 CTD taught us, and a probe is not the place to reinvent that.
     let player_handle = player.field_ins_handle;
-    let mut found: Option<&mut ChrIns> = None;
-    for chr in crate::scaling::sweepable_characters(&wcm.open_field_chr_set.base) {
-        if chr.field_ins_handle == target {
-            found = Some(chr);
-            break;
-        }
-    }
-    if found.is_none() {
-        for slot in wcm.chr_sets.iter().flatten() {
-            for chr in crate::scaling::sweepable_characters(slot) {
-                if chr.field_ins_handle == target {
-                    found = Some(chr);
-                    break;
-                }
-            }
-            if found.is_some() {
-                break;
-            }
-        }
-    }
-    let Some(chr) = found else {
+    let Some(chr) = find_subject(wcm, target) else {
         return; // not loaded this tick; try again next one
     };
     if chr.field_ins_handle == player_handle {
@@ -180,13 +272,24 @@ pub fn tick() {
     for id in DOWNSTATE_PAIR {
         chr.apply_speffect(id, false);
         log::info!("[downstate-probe] applied {id}");
-        dump(chr, "AFTER");
+        dump(
+            chr,
+            "AFTER (same tick -- too early to mean anything, see WATCH)",
+        );
     }
 
-    // 🛑 Latch BEFORE anything else can re-enter. The sweep re-derives an enemy's state from what it
-    // currently carries and will happily strip these on its next pass (they are outside its clear
-    // range, so it will not -- but that is a property of today's ranges, not a guarantee), so a probe
-    // that could fire twice would make its own result unreadable.
-    DONE.store(true, Ordering::Relaxed);
-    log::info!("[downstate-probe] done -- latched for this session");
+    // Do NOT latch here. v1 did, and it threw away the only reads that could have shown an effect:
+    // the engine recalculates derived stats on a later frame. Hand off to the watch instead.
+    if let Ok(mut w) = WATCH.lock() {
+        *w = Some(Watch {
+            subject: target,
+            frames: 0,
+            dumps: 0,
+        });
+    }
+    log::info!(
+        "[downstate-probe] applied both -- watching max_hp for {} reads at {}-tick intervals",
+        WATCH_DUMPS,
+        WATCH_INTERVAL
+    );
 }
