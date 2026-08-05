@@ -18,7 +18,8 @@ use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrM
 use er_logic::scaling::{
     NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind, band_native_tier,
     is_dlc_bucket, is_scaling_speffect, native_tier, raw_target_for_region, region_name_for_bucket,
-    scale_action, scaling_kind, speffect_id_for_tier, tier_for_region, tier_rates,
+    scale_action, scaling_kind, settled_on_target, speffect_id_for_tier, tier_for_region,
+    tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -258,12 +259,12 @@ struct SweepTally {
     /// shows the band routinely BELOW the table, the band is not a strength statement and the ruling
     /// does not survive -- so this pair is the thing to read first, not the counts.
     band_vs_table: Vec<(usize, usize)>,
-    /// Entities that ALREADY carry our target rung and still carry some other scaling effect.
+    /// Entities found carrying our target rung AND something else in the clear space.
     ///
-    /// Non-zero means the unidentified mechanism RE-APPLIES a band after we swept -- and because
-    /// `scale_one` returns early once the target is present, we never clear it, so it stacks under
-    /// our rung indefinitely. Counted before that early return, which is the only place it is
-    /// visible. Behaviour is unchanged; this only measures.
+    /// These are now CLEARED rather than skipped (see `scale_one`), so this is a CONVERGENCE
+    /// counter, not a standing defect: expect it non-zero on a region's first sweep and **0 on every
+    /// sweep after**. If it stays non-zero once a region has settled, something really is
+    /// re-applying an effect behind us, and that is a different bug.
     residue: u32,
     /// Distinct non-ladder ids found inside the clear range, capped. WITHOUT this the census says
     /// "199 of 240 enemies carried something we stripped" and cannot say WHAT -- and only 20 rows in
@@ -656,19 +657,23 @@ fn scale_one(
         .map(|e| e.param_id)
         .filter(|&id| is_scaling_speffect(id))
         .collect();
+    if settled_on_target(&carried, target) {
+        return; // carrying the tier and NOTHING else -- the only state worth leaving alone
+    }
+    // 🛑 CARRYING THE TARGET IS NOT THE SAME AS BEING DONE. This used to return on
+    // `carried.contains(&target)`, before the clear -- so an enemy holding the target rung PLUS
+    // anything else in the clear space kept the extra forever, because every later sweep took the
+    // same short-circuit. Invisible at floor 0 (target `7010`, which almost nothing carries
+    // natively); the 2026-08-05 floor-25 smoke test made the target `7060`, exactly Liurnia's native
+    // rung, and 306 enemies in one sweep kept their band at 4.18x while every peer on the same tier
+    // sat at 2.266x. Such an enemy now falls through and is cleared like any other.
     if carried.contains(&target) {
-        // Already on the right tier. Behaviour unchanged (we still return), but count anything ELSE
-        // in the clear range that is riding along: that is an effect applied AFTER our sweep, and
-        // this early return is the reason it never gets cleared.
-        if carried.iter().any(|&id| id != target) {
-            tally.residue += 1;
-            for &id in &carried {
-                if id != target {
-                    tally.note_other(id);
-                }
+        tally.residue += 1;
+        for &id in &carried {
+            if id != target {
+                tally.note_other(id);
             }
         }
-        return;
     }
     let stale = carried;
 

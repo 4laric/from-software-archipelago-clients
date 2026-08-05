@@ -401,6 +401,25 @@ pub fn skip_unrunged_at_floor(carried_ladder_rung: bool, target_tier: usize) -> 
     !carried_ladder_rung && target_tier == 0
 }
 
+/// Is this enemy ALREADY in the state the sweep wants, i.e. carrying `target` and nothing else in
+/// the clear space?
+///
+/// 🛑 THE `AND NOTHING ELSE` IS THE WHOLE POINT, and it was missing. `scale_one` used to return as
+/// soon as the enemy *contained* the target, before the clear -- so an enemy carrying the target rung
+/// PLUS anything else in `7000..8000` kept the extra forever, because every later sweep took the same
+/// short-circuit.
+///
+/// It hid because it is invisible at floor 0. The target was `7010`, which almost nothing carries
+/// natively, so the census read `residue 0`. Raising the default floor to tier 5 made the target
+/// `7060` -- exactly what Liurnia's enemies carry natively -- and **306 of them** short-circuited in
+/// one sweep, keeping their band: `7060 x 7460` = 2.266 x 1.845 = **4.18x** against the 2.266x every
+/// peer on the same tier got. Not a stacking bug in the applier; a convergence bug in the skip.
+///
+/// The invariant `scale_one` documents is "carries EXACTLY `target`". This is that sentence, executable.
+pub fn settled_on_target(carried: &[i32], target: i32) -> bool {
+    !carried.is_empty() && carried.iter().all(|&id| id == target)
+}
+
 /// What the sweep should do with one enemy (#346, phase 1a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleAction {
@@ -1701,6 +1720,32 @@ mod tests {
                 "an unclassified enemy was scaled at tier {tier}"
             );
         }
+    }
+
+    #[test]
+    fn an_enemy_carrying_the_target_and_a_band_is_not_settled() {
+        // THE MOTIVATING CASE, straight off the 2026-08-05 floor-25 smoke test: target 7060 (the new
+        // default floor tier) on a Liurnia enemy whose vanilla rung IS 7060, still carrying its band.
+        // `contains` says leave it alone; that is how it kept 4.18x while its peers sat at 2.266x.
+        assert!(!settled_on_target(&[7060, 7460], 7060));
+        // ...and the state that IS settled: the target, alone.
+        assert!(settled_on_target(&[7060], 7060));
+        // Order must not matter.
+        assert!(!settled_on_target(&[7460, 7060], 7060));
+        // Nothing carried at all is NOT settled -- the enemy still needs the tier applied.
+        assert!(!settled_on_target(&[], 7060));
+        // A different rung is not the target.
+        assert!(!settled_on_target(&[7010], 7060));
+        // Duplicates of the target only are still settled (the engine can list one twice).
+        assert!(settled_on_target(&[7060, 7060], 7060));
+    }
+
+    #[test]
+    fn settling_is_invisible_at_the_old_floor_which_is_why_this_hid() {
+        // Regression-proof the reason it went unnoticed: at floor 0 the target is 7010 and an enemy
+        // carrying its own native rung plus a band never contains the target at all, so it took the
+        // NORMAL path and was cleared correctly. The bug needed a floor above 0 to appear.
+        assert!(!settled_on_target(&[7060, 7460], 7010));
     }
 
     #[test]
