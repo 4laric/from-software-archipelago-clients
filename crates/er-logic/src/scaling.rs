@@ -217,6 +217,60 @@ pub fn is_scaling_speffect(param_id: i32) -> bool {
     SCALING_ID_RANGE.contains(&param_id) || DLC_SCALING_ID_RANGE.contains(&param_id)
 }
 
+/// A rung of the area-scaling LADDER proper — base `7010..7200` (the `SCALING_TIERS` ids) or its DLC
+/// re-emission `20007xxx`. Narrower than `is_scaling_speffect` on purpose; see `ScalingKind`.
+pub fn is_ladder_rung(param_id: i32) -> bool {
+    DLC_SCALING_ID_RANGE.contains(&param_id)
+        || SCALING_TIERS.iter().any(|t| t.speffect_id == param_id)
+}
+
+/// Which half of the clear space a carried scaling SpEffect belongs to.
+///
+/// 🛑 THIS DISTINCTION IS THE WHOLE DIAGNOSTIC (#346). `is_scaling_speffect` is deliberately WIDE —
+/// `SCALING_ID_RANGE` is `7000..8000`, the entire block. That is correct for CLEARING (anything in
+/// there is `spCategory 0` and would stack with our rung) and WRONG for DIAGNOSIS: `7210..7280` (a
+/// separate 5.3-5.8x run) and `7800..7902` (`spCategory 140`) sit in the range but are not ladder
+/// rungs. An enemy carrying only one of those has no vanilla AREA-scaling tier at all, yet the
+/// obvious test — "was the cleared set non-empty?" — reports that it did.
+///
+/// Issue #346 prescribed exactly that test. It would have misclassified part of the very class it
+/// was written to find, and the log would have read as evidence. Classify, then count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalingKind {
+    /// Vanilla assigned this enemy an area difficulty, and we re-tier against it.
+    Ladder,
+    /// In the clear range, so we strip it — but it says nothing about the enemy's native tier.
+    OtherInRange,
+}
+
+/// Classify one carried `param_id`. `None` = not ours to clear.
+pub fn scaling_kind(param_id: i32) -> Option<ScalingKind> {
+    if is_ladder_rung(param_id) {
+        Some(ScalingKind::Ladder)
+    } else if is_scaling_speffect(param_id) {
+        Some(ScalingKind::OtherInRange)
+    } else {
+        None
+    }
+}
+
+/// Leave an UNRUNGED enemy vanilla at the bottom of the ladder (#346, phase 0).
+///
+/// An enemy vanilla ships without any ladder rung is hand-tuned: its base stats already ARE its
+/// difficulty. Every named boss is in that class, and so are the named/invader NPCs the Nexus report
+/// was about. The ladder has no rung below 1.0, so the *weakest* thing we can say to such an enemy is
+/// `7010` = **1.141x HP** — a 14% BUFF, applied in the course of trying to make it easier. That is not
+/// a normalization, so at the bottom we say nothing and leave it alone.
+///
+/// 🛑 Bottom rung ONLY, and this is not the fix. A player who raised `minimum_enemy_difficulty` asked
+/// for a floor above vanilla and still gets it (`target_tier > 0` is an instruction, not an artefact
+/// of the ladder's shape). An unrunged enemy in a DEEP sphere still scales up — that half of #346
+/// already works. The wall — an endgame-tuned NPC holding a check in a shallow sphere — needs a
+/// native-tier notion and a sub-1.0 primitive, and survives this change.
+pub fn skip_unrunged_at_floor(carried_ladder_rung: bool, target_tier: usize) -> bool {
+    !carried_ladder_rung && target_tier == 0
+}
+
 /// Connect-time config, parsed from slot_data by the client (`regionSphereTargets` etc.).
 #[derive(Debug, Clone)]
 pub struct ScalingConfig {
@@ -1375,5 +1429,70 @@ mod tests {
             .unwrap()
             .on_region(&c, 60000, Some("Limgrave"))
             .is_some());
+    }
+
+    // ---- #346: unrunged enemies (the ladder has no rung below 1.0) ---------------------------
+
+    #[test]
+    fn a_speffect_the_clear_catches_is_not_automatically_a_ladder_rung() {
+        // THE MOTIVATING CASE for `ScalingKind`. `7850` is `spCategory 140`, sits inside
+        // `SCALING_ID_RANGE` (7000..8000) and so is cleared -- but it is not an area-scaling rung.
+        // The discriminator #346 prescribed, `!stale.is_empty()`, would read this enemy as RUNGED
+        // and hide it from the very census meant to find it.
+        assert_eq!(scaling_kind(7850), Some(ScalingKind::OtherInRange));
+        assert!(!is_ladder_rung(7850));
+        // Same trap, other block: the 5.3-5.8x run at 7210..7280.
+        assert_eq!(scaling_kind(7240), Some(ScalingKind::OtherInRange));
+        // And the identity row, which declares a native multiplier of exactly 1.0.
+        assert_eq!(scaling_kind(7000), Some(ScalingKind::OtherInRange));
+    }
+
+    #[test]
+    fn the_ladder_and_its_dlc_re_emission_both_count_as_rungs() {
+        assert_eq!(scaling_kind(7010), Some(ScalingKind::Ladder));
+        assert_eq!(scaling_kind(7200), Some(ScalingKind::Ladder));
+        assert_eq!(scaling_kind(20007010), Some(ScalingKind::Ladder));
+        // Every shipped tier id must classify as a rung, or the census under-counts silently.
+        for t in SCALING_TIERS {
+            assert_eq!(
+                scaling_kind(t.speffect_id),
+                Some(ScalingKind::Ladder),
+                "tier {} is not recognised as a rung",
+                t.speffect_id
+            );
+        }
+    }
+
+    #[test]
+    fn effects_outside_the_clear_space_are_not_ours() {
+        assert_eq!(scaling_kind(6999), None);
+        assert_eq!(scaling_kind(8000), None);
+        assert_eq!(scaling_kind(20008000), None);
+        // The DLC ally-tuning block -- candidate down-state ids, deliberately NOT in the clear
+        // space today. If a future change arms them it must widen this deliberately, by allowlist.
+        assert_eq!(scaling_kind(20018004), None);
+    }
+
+    #[test]
+    fn an_unrunged_enemy_is_left_vanilla_at_the_bottom_rung() {
+        // The reported case: a hand-tuned entity with no vanilla rung, in a tier-0 region. Applying
+        // `7010` would BUFF it 1.141x, so we apply nothing.
+        assert!(skip_unrunged_at_floor(false, 0));
+    }
+
+    #[test]
+    fn a_raised_difficulty_floor_still_reaches_unrunged_enemies() {
+        // `minimum_enemy_difficulty` resolves to a floor tier above 0. That is a player instruction,
+        // not an artefact of the ladder's shape, so the skip must not swallow it.
+        assert!(!skip_unrunged_at_floor(false, 1));
+    }
+
+    #[test]
+    fn a_runged_enemy_is_never_skipped_and_deep_spheres_still_scale_up() {
+        // Runged mobs keep working exactly as before -- the half of the feature that is not broken.
+        assert!(!skip_unrunged_at_floor(true, 0));
+        assert!(!skip_unrunged_at_floor(true, NUM_TIERS - 1));
+        // And an unrunged enemy in a deep sphere still scales UP; the skip is bottom-rung only.
+        assert!(!skip_unrunged_at_floor(false, NUM_TIERS - 1));
     }
 }
