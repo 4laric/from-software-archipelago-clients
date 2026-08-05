@@ -172,6 +172,44 @@ def main() -> int:
         if as_int(r, "getSoul") > 0
     )
 
+    # THE AREA FALLBACK'S EXCLUSION SET (issue #346), keyed PER CHARACTER.
+    #
+    # `nameId` is the healthbar name: ordinary enemies have none (6323 of 7039 rows are nameId 0),
+    # while bosses and named NPCs do -- and their rune reward lives in GameAreaParam, per arena, so
+    # they read `getSoul == 0` here.
+    #
+    # WHY IT IS EMITTED. The client may attribute a strength to an unrunged enemy from the AREA it
+    # stands in, which is right for trash tuned to that ground and WRONG for these: their base
+    # already assumes you meet them late, so an area-derived delta multiplies on top of endgame
+    # tuning. Measured 2026-08-05: a Vyke row and Vyke's Finger Maiden, area-placed at tier 11 in a
+    # Liurnia whose ground is index 5, came out "crazy strong" in play.
+    #
+    # ⭐⭐⭐ WHY PER CHARACTER AND NOT PER ROW. One character owns several rows and they DISAGREE:
+    # Vyke has a 500-reward row and three reward-less ones; Gideon has three at 4000 and one at 0.
+    # Keyed per row, which variant the game happens to instantiate decides whether that character is
+    # placed by its own reward or left vanilla -- two encounters with "Vyke" scaling two ways, with
+    # nothing in the data marking them as the same character. Keyed per nameId, one character has one
+    # behaviour, which is the thing a player (or a bug report) can actually reason about.
+    #
+    # THE COST, PAID DELIBERATELY: 136 rows carrying a REAL reward are excluded with their siblings
+    # (Gideon 4000, Dung Eater 3000, Arghanthy 5040, Blaidd/Fia/Latenna 2000). Those are measurements
+    # taken on the enemy itself and we are choosing not to use them. It lands in the UNDER-scaled
+    # direction -- a blemish, never a wall -- which is the side of the asymmetry this issue keeps.
+    # It does not widen the character set at all: 137 characters either way, 275 rows -> 411.
+    by_name: dict[int, list[dict]] = defaultdict(list)
+    for row in unrunged:
+        name_id = as_int(row, "nameId")
+        if name_id:
+            by_name[name_id].append(row)
+    carved_names = {
+        name_id
+        for name_id, rs in by_name.items()
+        if any(as_int(r, "getSoul") <= 0 for r in rs)
+    }
+    area_excluded = sorted(
+        as_int(r, "ID") for r in unrunged if as_int(r, "nameId") in carved_names
+    )
+
     n_zero = sum(1 for r in unrunged if as_int(r, "getSoul") <= 0)
     n_runged = sum(len(v) for v in runged.values())
 
@@ -186,15 +224,23 @@ def main() -> int:
         w(f"// game build:  {args.game_build}\n")
         w(f"// population:  {len(rows)} rows -- {n_runged} runged (calibration set),\n")
         w(f"//              {len(derived)} unrunged with a rune reward (emitted below),\n")
-        w(f"//              {n_zero} unrunged without one (ABSENT on purpose = never touched).\n")
+        w(f"//              {n_zero} unrunged without one (ABSENT on purpose = never touched),\n")
+        w(f"//              {len(area_excluded)} rows across {len(carved_names)} NAMED characters are excluded\n")
+        w("//              from the AREA fallback (below) -- a set that CROSSES the split above,\n")
+        w("//              since a carved character's rewarded rows go with its reward-less ones.\n")
         w("\n")
         w("//! Native scaling tiers for enemies vanilla ships WITHOUT a ladder rung (issue #346).\n")
         w("//!\n")
-        w("//! An `npc_id` present here has a derived NATIVE ladder index: how strong the game's own\n")
-        w("//! designers thought it was, read off the rune reward. An `npc_id` ABSENT here has no\n")
-        w("//! native tier we can defend, and is never scaled at any depth -- see `native_tier`.\n")
+        w("//! An `npc_param_id` present here has a derived NATIVE ladder index: how strong the game's\n")
+        w("//! own designers thought it was, read off the rune reward. An `npc_param_id` ABSENT here\n")
+        w("//! has no native tier we can defend from its OWN stats -- see `native_tier`, and see\n")
+        w("//! `NAMED_UNREWARDED` for the subset the area may not speak for either.\n")
+        w("//!\n")
+        w("//! The key is `ChrIns::npc_param_id` (8-9 digits), NOT `ChrIns::npc_id` (the 4-digit\n")
+        w("//! chr/model id). The two id spaces OVERLAP, so keying this on the wrong one resolves a\n")
+        w("//! few rows to confident WRONG answers rather than to nothing.\n")
         w("\n")
-        w("/// `(npc_id, native ladder index)`, sorted by `npc_id` so lookup can binary-search.\n")
+        w("/// `(npc_param_id, native ladder index)`, sorted so lookup can binary-search.\n")
         w("pub const NATIVE_TIERS: &[(i32, u8)] = &[\n")
         for npc_id, soul, idx in derived:
             w(f"    ({npc_id}, {idx}), // getSoul {soul}\n")
@@ -206,6 +252,25 @@ def main() -> int:
             w(f"    ({edge:.3f}, {idx}),\n")
         w("];\n\n")
         w(f"/// Index taken by any reward above the last band.\npub const TOP_BAND_INDEX: u8 = {top_index};\n")
+        w("\n")
+        w("/// Rows the AREA fallback may not speak for, keyed PER CHARACTER (`nameId`).\n")
+        w("///\n")
+        w("/// A named character with ANY unrunged, reward-less row has ALL of its unrunged rows here.\n")
+        w("/// 🛑 Their bases already assume a late encounter, so an area-derived delta multiplies on top\n")
+        w("/// of endgame tuning -- measured in play 2026-08-05, when a Vyke row and Vyke's Finger Maiden\n")
+        w("/// were area-placed at tier 11 in a Liurnia whose ground reads index 5.\n")
+        w("///\n")
+        w("/// ⭐⭐⭐ PER CHARACTER, NOT PER ROW, because a character's rows disagree: Vyke has a\n")
+        w("/// 500-reward row and three reward-less ones, Gideon three at 4000 and one at 0. Keyed per\n")
+        w("/// row, which variant spawned would decide how that character scales. The cost is paid\n")
+        w("/// knowingly: rows with a REAL reward are excluded alongside their siblings, which lands in\n")
+        w("/// the UNDER-scaled direction -- a blemish, never a wall.\n")
+        w("///\n")
+        w("/// Sorted, for binary search.\n")
+        w("pub const AREA_EXCLUDED: &[i32] = &[\n")
+        for npc_id in area_excluded:
+            w(f"    {npc_id},\n")
+        w("];\n")
 
     print(f"rows={len(rows)} runged={n_runged} derived={len(derived)} absent={n_zero}")
     print(f"bands={len(bounds)} top_index={top_index}")

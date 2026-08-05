@@ -580,13 +580,37 @@ pub fn scale_action(
 /// 🛑 `None` area tier keeps the old behaviour exactly: too few untouched neighbours to say, so
 /// nothing is attributed and the enemy stays vanilla.
 pub fn presumed_native_tier(npc_param_id: i32, area_tier: Option<usize>) -> Option<usize> {
-    native_tier(npc_param_id).or(area_tier)
+    native_tier(npc_param_id).or_else(|| area_tier.filter(|_| area_may_vouch_for(npc_param_id)))
+}
+
+/// May the AREA speak for this enemy's strength? False for the named, unrewarded rows.
+///
+/// 🛑🛑 THE CARVE-OUT, ADDED FROM PLAY (2026-08-05). Vyke is unrunged and `getSoul`-less, so the
+/// area placed him -- tier 11 in a Liurnia whose ground reads index 5 -- and in play he came out
+/// "crazy strong". That is the v0.3.4 failure exactly: an area-derived delta multiplied on top of
+/// tuning that already assumes you meet him late. The ground is a fair statement about the trash
+/// standing on it and a false one about the thing vanilla deliberately parked there.
+///
+/// ⭐ `AREA_EXCLUDED` is keyed PER CHARACTER (`nameId`), not per row: a named character with ANY
+/// unrunged, reward-less row has all of its unrunged rows in the set. Vyke owns a 500-reward row and
+/// three reward-less ones; Gideon three at 4000 and one at 0 — keyed per row, which variant the game
+/// instantiated would decide how that character scales, and nothing in the data marks them as the
+/// same character. 411 rows across 137 characters.
+///
+/// 🛑 It is NOT a general boss exclusion, and the difference is load-bearing: a named enemy carrying
+/// a rung still takes `Replace`, in both directions. Only the AREA's vouching is refused.
+/// ⭐ Nor is it a class ban: ordinary enemies are NAMELESS (6323 of 7039 rows have `nameId` 0), so
+/// every trash enemy the fallback exists for is untouched.
+pub fn area_may_vouch_for(npc_param_id: i32) -> bool {
+    crate::native_tiers::AREA_EXCLUDED
+        .binary_search(&npc_param_id)
+        .is_err()
 }
 
 /// Did this enemy reach the region's tier only because the AREA vouched for it? The sweep logs these
 /// by id; see `presumed_native_tier` for why that census matters more than the count.
 pub fn placed_by_area(npc_param_id: i32, area_tier: Option<usize>) -> bool {
-    native_tier(npc_param_id).is_none() && area_tier.is_some()
+    native_tier(npc_param_id).is_none() && area_tier.is_some() && area_may_vouch_for(npc_param_id)
 }
 
 /// Connect-time config, parsed from slot_data by the client (`regionSphereTargets` etc.).
@@ -1885,6 +1909,74 @@ mod tests {
         // drag every region back to vanilla geography, which is the thing the mod exists to override).
         assert_eq!(presumed_native_tier(unplaceable, Some(1)), Some(1));
         assert!(placed_by_area(unplaceable, Some(1)));
+    }
+
+    #[test]
+    fn the_area_does_not_speak_for_a_carved_out_character() {
+        // 🛑 THE VYKE CASE, from play (2026-08-05). Liurnia region 62010: target tier 11, area index
+        // 5, and the area placed two NAMED rows -- 523040020 (nameId 130400) and 523360012
+        // (nameId 133600). Alaric fought the result: "crazy strong". Their bases already assume a
+        // late encounter, so an area-derived delta lands on top of endgame tuning.
+        let named = crate::native_tiers::AREA_EXCLUDED;
+        assert!(!named.is_empty(), "the exclusion set must not be empty");
+        let vyke_shaped = named[0];
+        assert!(!area_may_vouch_for(vyke_shaped));
+        assert_eq!(presumed_native_tier(vyke_shaped, Some(5)), None);
+        assert_eq!(scale_action(false, vyke_shaped, 11, Some(5)), ScaleAction::NoTouch);
+        assert!(!placed_by_area(vyke_shaped, Some(5)));
+    }
+
+    #[test]
+    fn a_carved_out_character_is_carved_out_in_ALL_of_its_rows() {
+        // ⭐⭐⭐ PER CHARACTER, NOT PER ROW. Gideon owns four unrunged rows: 523240070 has no reward,
+        // and 523240000 / 523240079 / 523240179 each carry getSoul 4000. Keyed per row, the first
+        // would be left vanilla and the other three placed by their own derived tier -- so which
+        // Gideon you met would decide how Gideon scaled. All four are in the set.
+        for id in [523240000, 523240070, 523240079, 523240179] {
+            assert!(
+                !area_may_vouch_for(id),
+                "{id} is a Gideon row; the character is carved out, so every row is"
+            );
+        }
+        // The cost, asserted so it cannot be quietly reverted: a REWARDED row is excluded here even
+        // though `native_tier` could place it. That is deliberate -- it lands in the under-scaled
+        // direction, a blemish rather than a wall.
+        assert!(native_tier(523240000).is_some(), "fixture must still carry its own tier");
+        assert_eq!(presumed_native_tier(523240000, Some(5)), native_tier(523240000));
+    }
+
+    #[test]
+    fn the_carve_out_does_not_swallow_ordinary_enemies() {
+        // ⭐ THE WHOLE POINT of keying on nameId: ordinary enemies are NAMELESS (6323 of 7039 rows
+        // have nameId 0), so this excludes 275 rows and not the class. A gate that kept only NAMED
+        // enemies would have excluded ~90% of the game -- the exact trash the fallback exists for.
+        let unnamed_unrewarded = -1; // absent from NATIVE_TIERS and from the exclusion set
+        assert!(area_may_vouch_for(unnamed_unrewarded));
+        assert_eq!(scale_action(false, unnamed_unrewarded, 11, Some(1)), ScaleAction::Apply);
+        assert!(crate::native_tiers::AREA_EXCLUDED.len() < 600, "this is a carve-out, not a class ban");
+    }
+
+    #[test]
+    fn the_exclusion_set_is_sorted_so_binary_search_is_valid() {
+        // area_may_vouch_for binary-searches it; an unsorted table would return silent WRONG
+        // answers for most ids rather than failing, which is the same shape as the npc_id/
+        // npc_param_id bug in #63.
+        let named = crate::native_tiers::AREA_EXCLUDED;
+        assert!(named.windows(2).all(|w| w[0] < w[1]), "must be sorted and duplicate-free");
+    }
+
+    #[test]
+    fn a_carved_out_enemy_still_scales_when_it_can_be_placed_WITHOUT_the_area() {
+        // 🛑 NOT A GENERAL BOSS EXCLUSION. The carve-out refuses the AREA's vouching, nothing else:
+        // a named enemy that carries a rung is still a true re-tier, in both directions.
+        let named = crate::native_tiers::AREA_EXCLUDED;
+        let vyke_shaped = named[0];
+        for tier in 0..NUM_TIERS {
+            assert_eq!(
+                scale_action(true, vyke_shaped, tier, Some(5)),
+                ScaleAction::Replace
+            );
+        }
     }
 
     #[test]
