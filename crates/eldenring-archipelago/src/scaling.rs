@@ -18,9 +18,8 @@ use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrM
 use er_logic::scaling::{
     NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
     area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect, ladder_tier,
-    placed_by_area,
-    native_tier, raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
-    settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
+    native_tier, placed_by_area, raw_target_for_region, region_name_for_bucket, scale_action,
+    scaling_kind, settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -356,15 +355,18 @@ impl SweepTally {
         }
     }
 
-    /// Count one vanilla-shaped neighbour toward the area signal. Base-game rungs only -- a DLC rung
-    /// sits on a much steeper curve at the same index and would overstate the area (`ladder_tier`).
+    /// Record an enemy that reached the tier only because the AREA vouched for it. Deduplicated and
+    /// capped like every other census list -- this one is meant to be READ, not counted.
     fn note_area_moved(&mut self, npc_param_id: i32) {
-        if self.area_moved_ids.len() < UNRUNGED_ID_CAP && !self.area_moved_ids.contains(&npc_param_id)
+        if self.area_moved_ids.len() < UNRUNGED_ID_CAP
+            && !self.area_moved_ids.contains(&npc_param_id)
         {
             self.area_moved_ids.push(npc_param_id);
         }
     }
 
+    /// Count one vanilla-shaped neighbour toward the area signal. Base-game rungs only -- a DLC rung
+    /// sits on a much steeper curve at the same index and would overstate the area (`ladder_tier`).
     fn note_area_sample(&mut self, rung: i32) {
         if let Some(idx) = ladder_tier(rung) {
             self.area_hist[idx] = self.area_hist[idx].saturating_add(1);
@@ -770,7 +772,11 @@ fn is_hostile_phantom(t: ChrType) -> bool {
 ///
 /// Only vanilla-shaped enemies (rung AND band) count; see `SweepTally::area_hist` for why that gate
 /// is the measurement rather than an optimisation.
-fn area_sample_one(chr: &ChrIns, player_handle: &eldenring::cs::FieldInsHandle, tally: &mut SweepTally) {
+fn area_sample_one(
+    chr: &ChrIns,
+    player_handle: &eldenring::cs::FieldInsHandle,
+    tally: &mut SweepTally,
+) {
     if &chr.field_ins_handle == player_handle {
         return;
     }
@@ -813,7 +819,15 @@ fn scale_hostile_phantom(
     }
     let (ty, team, npc_id) = (chr.chr_type, chr.team_type, chr.npc_id);
     let before = tally.scaled;
-    scale_one(chr, target, target_tier, player_handle, tally, sample_on, area_tier);
+    scale_one(
+        chr,
+        target,
+        target_tier,
+        player_handle,
+        tally,
+        sample_on,
+        area_tier,
+    );
     if tally.scaled > before {
         log::info!(
             "enemy-scaling: scaled hostile phantom (chr_type={ty:?} team={team} npc_id={npc_id})"
@@ -930,7 +944,12 @@ fn scale_one(
     // in a shallow sphere is a multiplier stacked on stats that already assume you meet it at the
     // end of the game. Leaving it vanilla is under-scaled in deep spheres -- a blemish -- and that
     // trade is deliberate.
-    match scale_action(carried_ladder_rung, chr.npc_param_id, target_tier, area_tier) {
+    match scale_action(
+        carried_ladder_rung,
+        chr.npc_param_id,
+        target_tier,
+        area_tier,
+    ) {
         ScaleAction::NoTouch => {
             tally.left_vanilla += 1;
             return;

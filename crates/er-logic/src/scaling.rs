@@ -1848,8 +1848,14 @@ mod tests {
         // Do not "fix" this test by making NoTouch scale something.
         let unplaceable = -1; // absent from NATIVE_TIERS, like every getSoul-less named boss
         for tier in 0..NUM_TIERS {
-            assert_eq!(scale_action(true, unplaceable, tier, None), ScaleAction::Replace);
-            assert_eq!(scale_action(false, unplaceable, tier, None), ScaleAction::NoTouch);
+            assert_eq!(
+                scale_action(true, unplaceable, tier, None),
+                ScaleAction::Replace
+            );
+            assert_eq!(
+                scale_action(false, unplaceable, tier, None),
+                ScaleAction::NoTouch
+            );
         }
     }
 
@@ -1870,7 +1876,10 @@ mod tests {
         // enemies with no rung and no getSoul sitting at vanilla while 523 neighbours carry the
         // tier. With the area vouching for them they take the same path as everything else.
         let unplaceable = -1; // absent from NATIVE_TIERS
-        assert_eq!(scale_action(false, unplaceable, 11, Some(1)), ScaleAction::Apply);
+        assert_eq!(
+            scale_action(false, unplaceable, 11, Some(1)),
+            ScaleAction::Apply
+        );
         // ...and the region's own level is what they reach -- the area index is the enemy's PRESUMED
         // NATIVE strength, never a cap on the region (clamping the tier toward the area index would
         // drag every region back to vanilla geography, which is the thing the mod exists to override).
@@ -2175,7 +2184,10 @@ mod tests {
         // native difficulty, so swapping rungs is a true re-tier and works downward already.
         for tier in 0..NUM_TIERS {
             assert_eq!(scale_action(true, -1, tier, None), ScaleAction::Replace);
-            assert_eq!(scale_action(true, 40000000, tier, None), ScaleAction::Replace);
+            assert_eq!(
+                scale_action(true, 40000000, tier, None),
+                ScaleAction::Replace
+            );
         }
     }
 
