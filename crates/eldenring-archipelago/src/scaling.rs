@@ -232,19 +232,33 @@ struct SweepTally {
     scaled_by_native: u32,
     /// Carried something the clear catches that is not a rung (`7210..`, `7800..`).
     other_in_range: u32,
-    /// Distinct `npc_id`s of unrunged entities, capped -- enough to NAME the offender in one log
-    /// without turning a per-sweep line into a wall of ids.
+    /// Distinct `npc_param_id`s of unrunged entities, capped -- enough to NAME the offender in one
+    /// log without turning a per-sweep line into a wall of ids. 🛑 `npc_param_id`, not `npc_id`:
+    /// only the former joins to `NpcParam`, and the first version of this census logged the latter,
+    /// which is why it named ids like `8000` that do not exist in the table at all.
     unrunged_ids: Vec<i32>,
+    /// Distinct non-ladder ids found inside the clear range, capped. WITHOUT this the census says
+    /// "199 of 240 enemies carried something we stripped" and cannot say WHAT -- and only 20 rows in
+    /// all of `NpcParam` carry a non-ladder in-range effect innately, so nearly all of those 199 are
+    /// applied at RUNTIME by something we have not identified. Naming them is how that stops being a
+    /// mystery (candidates: the `7800..7902` spCategory-140 block, the `7400..7680` co-op ladder).
+    other_ids: Vec<i32>,
 }
 
 /// Cap on `SweepTally::unrunged_ids`. A census, not a dump.
 const UNRUNGED_ID_CAP: usize = 12;
 
 impl SweepTally {
-    fn note_unrunged(&mut self, npc_id: i32) {
+    fn note_unrunged(&mut self, npc_param_id: i32) {
         self.unrunged += 1;
-        if self.unrunged_ids.len() < UNRUNGED_ID_CAP && !self.unrunged_ids.contains(&npc_id) {
-            self.unrunged_ids.push(npc_id);
+        if self.unrunged_ids.len() < UNRUNGED_ID_CAP && !self.unrunged_ids.contains(&npc_param_id) {
+            self.unrunged_ids.push(npc_param_id);
+        }
+    }
+
+    fn note_other(&mut self, param_id: i32) {
+        if self.other_ids.len() < UNRUNGED_ID_CAP && !self.other_ids.contains(&param_id) {
+            self.other_ids.push(param_id);
         }
     }
 }
@@ -506,7 +520,7 @@ pub fn tick() -> Option<String> {
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
-                 vanilla {}, npc_ids {:?}), other-in-range {}",
+                 vanilla {}, npc_param_ids {:?}), other-in-range {} {:?}",
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
@@ -515,6 +529,7 @@ pub fn tick() -> Option<String> {
                 tally.left_vanilla,
                 tally.unrunged_ids,
                 tally.other_in_range,
+                tally.other_ids,
             );
         }
     }
@@ -600,7 +615,10 @@ fn scale_one(
     for &id in &stale {
         match scaling_kind(id) {
             Some(ScalingKind::Ladder) => carried_ladder_rung = true,
-            Some(ScalingKind::OtherInRange) => carried_other = true,
+            Some(ScalingKind::OtherInRange) => {
+                carried_other = true;
+                tally.note_other(id);
+            }
             None => {}
         }
     }
@@ -608,7 +626,7 @@ fn scale_one(
         tally.other_in_range += 1;
     }
     if !carried_ladder_rung {
-        tally.note_unrunged(chr.npc_id);
+        tally.note_unrunged(chr.npc_param_id);
     }
 
     // ...THEN decide, before anything is mutated.
@@ -618,7 +636,7 @@ fn scale_one(
     // in a shallow sphere is a multiplier stacked on stats that already assume you meet it at the
     // end of the game. Leaving it vanilla is under-scaled in deep spheres -- a blemish -- and that
     // trade is deliberate.
-    match scale_action(carried_ladder_rung, chr.npc_id, target_tier) {
+    match scale_action(carried_ladder_rung, chr.npc_param_id, target_tier) {
         ScaleAction::NoTouch => {
             tally.left_vanilla += 1;
             return;
