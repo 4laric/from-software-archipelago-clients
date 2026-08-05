@@ -172,6 +172,24 @@ def main() -> int:
         if as_int(r, "getSoul") > 0
     )
 
+    # THE AREA FALLBACK'S EXCLUSION SET (issue #346). Unrunged, no rune reward, but NAMED.
+    #
+    # `nameId` is the healthbar name: ordinary enemies have none (6323 of 7039 rows are nameId 0),
+    # while bosses and named NPCs do -- and their rune reward lives in GameAreaParam, per arena, so
+    # they read `getSoul == 0` here. That intersection is therefore close to the named-boss class.
+    #
+    # WHY IT IS EMITTED. The client may attribute a strength to an unrunged enemy from the AREA it
+    # stands in, which is right for trash tuned to that ground and WRONG for these: their base
+    # already assumes you meet them late, so an area-derived delta multiplies on top of endgame
+    # tuning. Measured 2026-08-05: Vyke, placed by the area at tier 11 in a Liurnia whose ground is
+    # index 5, came out "crazy strong" in play. Absence from the area fallback returns them to
+    # vanilla, which is the state this whole issue defends.
+    named_unrewarded = sorted(
+        as_int(r, "ID")
+        for r in unrunged
+        if as_int(r, "getSoul") <= 0 and as_int(r, "nameId") != 0
+    )
+
     n_zero = sum(1 for r in unrunged if as_int(r, "getSoul") <= 0)
     n_runged = sum(len(v) for v in runged.values())
 
@@ -186,15 +204,21 @@ def main() -> int:
         w(f"// game build:  {args.game_build}\n")
         w(f"// population:  {len(rows)} rows -- {n_runged} runged (calibration set),\n")
         w(f"//              {len(derived)} unrunged with a rune reward (emitted below),\n")
-        w(f"//              {n_zero} unrunged without one (ABSENT on purpose = never touched).\n")
+        w(f"//              {n_zero} unrunged without one (ABSENT on purpose = never touched),\n")
+        w(f"//              of which {len(named_unrewarded)} are NAMED (below: the area may not vouch for them).\n")
         w("\n")
         w("//! Native scaling tiers for enemies vanilla ships WITHOUT a ladder rung (issue #346).\n")
         w("//!\n")
-        w("//! An `npc_id` present here has a derived NATIVE ladder index: how strong the game's own\n")
-        w("//! designers thought it was, read off the rune reward. An `npc_id` ABSENT here has no\n")
-        w("//! native tier we can defend, and is never scaled at any depth -- see `native_tier`.\n")
+        w("//! An `npc_param_id` present here has a derived NATIVE ladder index: how strong the game's\n")
+        w("//! own designers thought it was, read off the rune reward. An `npc_param_id` ABSENT here\n")
+        w("//! has no native tier we can defend from its OWN stats -- see `native_tier`, and see\n")
+        w("//! `NAMED_UNREWARDED` for the subset the area may not speak for either.\n")
+        w("//!\n")
+        w("//! The key is `ChrIns::npc_param_id` (8-9 digits), NOT `ChrIns::npc_id` (the 4-digit\n")
+        w("//! chr/model id). The two id spaces OVERLAP, so keying this on the wrong one resolves a\n")
+        w("//! few rows to confident WRONG answers rather than to nothing.\n")
         w("\n")
-        w("/// `(npc_id, native ladder index)`, sorted by `npc_id` so lookup can binary-search.\n")
+        w("/// `(npc_param_id, native ladder index)`, sorted so lookup can binary-search.\n")
         w("pub const NATIVE_TIERS: &[(i32, u8)] = &[\n")
         for npc_id, soul, idx in derived:
             w(f"    ({npc_id}, {idx}), // getSoul {soul}\n")
@@ -206,6 +230,18 @@ def main() -> int:
             w(f"    ({edge:.3f}, {idx}),\n")
         w("];\n\n")
         w(f"/// Index taken by any reward above the last band.\npub const TOP_BAND_INDEX: u8 = {top_index};\n")
+        w("\n")
+        w("/// Unrunged AND unrewarded AND **named** -- bosses and named NPCs, whose rune reward lives\n")
+        w("/// in `GameAreaParam` per arena rather than in `NpcParam`, so `getSoul` cannot place them.\n")
+        w("///\n")
+        w("/// 🛑 THE AREA MAY NOT VOUCH FOR THESE. Attributing the ground's strength to them multiplies\n")
+        w("/// an area-derived delta on top of tuning that already assumes a late encounter -- measured\n")
+        w("/// in play 2026-08-05, when Vyke was area-placed at tier 11 in a Liurnia whose ground reads\n")
+        w("/// index 5 and came out far too strong. Sorted, for binary search.\n")
+        w("pub const NAMED_UNREWARDED: &[i32] = &[\n")
+        for npc_id in named_unrewarded:
+            w(f"    {npc_id},\n")
+        w("];\n")
 
     print(f"rows={len(rows)} runged={n_runged} derived={len(derived)} absent={n_zero}")
     print(f"bands={len(bounds)} top_index={top_index}")
