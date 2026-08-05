@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
-    NUM_TIERS, RegionToastLedger, ScalingConfig, ScalingKind, is_dlc_bucket, is_scaling_speffect,
-    raw_target_for_region, region_name_for_bucket, scaling_kind, skip_unrunged_at_floor,
+    NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind, is_dlc_bucket,
+    is_scaling_speffect, raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
     speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
@@ -225,8 +225,11 @@ struct SweepTally {
     scaled: u32,
     /// Swept, carried NO ladder rung: hand-tuned. The class #346 is about.
     unrunged: u32,
-    /// Unrunged AND left completely untouched by the bottom-rung skip.
+    /// Unrunged AND left completely untouched -- either we have no native tier for it, or the
+    /// target is not stronger than the one we have.
     left_vanilla: u32,
+    /// Unrunged, but we HAD a native tier and the target beat it, so it scaled up.
+    scaled_by_native: u32,
     /// Carried something the clear catches that is not a rung (`7210..`, `7800..`).
     other_in_range: u32,
     /// Distinct `npc_id`s of unrunged entities, capped -- enough to NAME the offender in one log
@@ -467,7 +470,7 @@ pub fn tick() -> Option<String> {
     // once a region settles the numbers stop moving and the line stops repeating, which the old
     // condition did not guarantee. Same idiom as the phantom census above.
     {
-        type ScaleLine = (i32, i32, u32, u32, u32, u32);
+        type ScaleLine = (i32, i32, u32, u32, u32, u32, u32);
         static LAST: Mutex<Option<ScaleLine>> = Mutex::new(None);
         let line: ScaleLine = (
             region,
@@ -476,6 +479,7 @@ pub fn tick() -> Option<String> {
             tally.unrunged,
             tally.left_vanilla,
             tally.other_in_range,
+            tally.scaled_by_native,
         );
         let changed = match LAST.lock() {
             Ok(mut last) => {
@@ -501,12 +505,13 @@ pub fn tick() -> Option<String> {
             log::info!(
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
-                 atk{}); (re)scaled {} enemy(ies); unrunged {} (left vanilla {}, npc_ids {:?}), \
-                 other-in-range {}",
+                 atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
+                 vanilla {}, npc_ids {:?}), other-in-range {}",
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
                 tally.unrunged,
+                tally.scaled_by_native,
                 tally.left_vanilla,
                 tally.unrunged_ids,
                 tally.other_in_range,
@@ -606,10 +611,20 @@ fn scale_one(
         tally.note_unrunged(chr.npc_id);
     }
 
-    // ...THEN skip, before anything is mutated.
-    if skip_unrunged_at_floor(carried_ladder_rung, target_tier) {
-        tally.left_vanilla += 1;
-        return;
+    // ...THEN decide, before anything is mutated.
+    //
+    // 🛑 `NoTouch` is the DEFAULT for anything we cannot place, and it is the whole point. What
+    // shipped resolved an unplaceable enemy to the region's rung, which on a hand-tuned endgame NPC
+    // in a shallow sphere is a multiplier stacked on stats that already assume you meet it at the
+    // end of the game. Leaving it vanilla is under-scaled in deep spheres -- a blemish -- and that
+    // trade is deliberate.
+    match scale_action(carried_ladder_rung, chr.npc_id, target_tier) {
+        ScaleAction::NoTouch => {
+            tally.left_vanilla += 1;
+            return;
+        }
+        ScaleAction::Apply => tally.scaled_by_native += 1,
+        ScaleAction::Replace => {}
     }
 
     for id in stale {

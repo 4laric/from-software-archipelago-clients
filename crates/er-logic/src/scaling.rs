@@ -24,7 +24,9 @@
 //! # What is NOT in the ladder, and why
 //!
 //! * `7210..7280` — a separate ascending sub-run (5.3x..5.8x). Different purpose; not sphere depth.
-//! * `7400..7680` — DESCENDING (3.43x down to 1.0x): the co-op/rune set. Not usable as difficulty.
+//! * `7400..7680` — DESCENDING (3.43x down to 1.0x): the co-op GUEST-COUNT set — `haveSoulRate`
+//!   steps 5→4→3→2 as the multiplier falls, so the top of the band is the fullest session, not the
+//!   emptiest. Not usable as difficulty, and cleared deliberately (param-verified 2026-08-05).
 //! * `7800..7902` — `spCategory 140`, a different stacking class entirely.
 //! * `20007000..20007150` — the DLC block, and the literal CONTINUATION of this one: `7170` is
 //!   `7.047` and `20007000` is `7.046875`, the same rung. It runs on to **16.64x**, but its `attack`
@@ -269,6 +271,55 @@ pub fn scaling_kind(param_id: i32) -> Option<ScalingKind> {
 /// native-tier notion and a sub-1.0 primitive, and survives this change.
 pub fn skip_unrunged_at_floor(carried_ladder_rung: bool, target_tier: usize) -> bool {
     !carried_ladder_rung && target_tier == 0
+}
+
+/// What the sweep should do with one enemy (#346, phase 1a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleAction {
+    /// It carries a vanilla ladder rung, so the rung IS its declared native difficulty and swapping
+    /// one rung for another is a true re-tier. Clear and apply, in both directions. This is the
+    /// 4,214-row mainline population and its behaviour is exactly what shipped.
+    Replace,
+    /// No vanilla rung, but we have a defensible native tier for it, and the target is STRONGER.
+    Apply,
+    /// Leave it exactly as vanilla shipped it.
+    NoTouch,
+}
+
+/// Native ladder index for an `npc_id`, or `None` if we have no defensible answer.
+///
+/// Derived offline from `getSoul` — the rune reward — calibrated against the 4,214 rows that carry
+/// both a reward and a rung (Spearman 0.996). See `tools/derive_native_tiers.py` for the method and
+/// for why `hp` is not the signal.
+pub fn native_tier(npc_id: i32) -> Option<usize> {
+    crate::native_tiers::NATIVE_TIERS
+        .binary_search_by_key(&npc_id, |&(id, _)| id)
+        .ok()
+        .map(|i| crate::native_tiers::NATIVE_TIERS[i].1 as usize)
+}
+
+/// THE PHASE 1a DECISION. Supersedes `skip_unrunged_at_floor`, which only declined at the bottom
+/// rung; this declines wherever we cannot show the target is an increase.
+///
+/// ⭐ **Absence is the safe state, and it is load-bearing.** An `npc_id` we have no native tier for
+/// is never touched at ANY depth. 2,440 unrunged rows are in that class — every named boss among
+/// them, because boss rune rewards live in `GameAreaParam` per arena, not in `NpcParam`. So does any
+/// row a future patch adds. The failure mode of "absent" is an enemy that stays vanilla in a deep
+/// sphere: under-scaled, a balance blemish. The failure mode of the alternative — defaulting to the
+/// floor, which is what shipped — is a rung applied on top of hand-tuned endgame stats in a shallow
+/// sphere, which is a progression WALL. That asymmetry decides every open question in this file.
+///
+/// 🛑 UP ONLY for derived entities. The ladder has no rung below 1.0, so "scale this hand-tuned
+/// enemy DOWN" is not expressible yet; `Apply` fires only when `target_tier` exceeds the native one.
+/// The down half needs the off-label `20018xxx` pair and is gated on a live probe.
+pub fn scale_action(carried_ladder_rung: bool, npc_id: i32, target_tier: usize) -> ScaleAction {
+    if carried_ladder_rung {
+        return ScaleAction::Replace;
+    }
+    match native_tier(npc_id) {
+        Some(native) if target_tier > native => ScaleAction::Apply,
+        _ => ScaleAction::NoTouch,
+    }
 }
 
 /// Connect-time config, parsed from slot_data by the client (`regionSphereTargets` etc.).
@@ -864,7 +915,13 @@ mod tests {
     #[test]
     fn scaling_range_membership() {
         assert!(is_scaling_speffect(7010));
-        assert!(is_scaling_speffect(7500)); // vanilla baked scaling we must clear
+        // 7500 is in the CO-OP GUEST-COUNT ladder (`7400..7680`): `haveSoulRate` steps 5->4->3->2
+        // as the multiplier falls, so the STRONGEST rows fire in the FULLEST sessions -- 7400 is
+        // 3.434x HP / 1.902x atk. Clearing it is DELIBERATE and must stay: these are spCategory 0,
+        // so not clearing them would stack up to 3.4x underneath a tier that already reaches 7.4x.
+        // (Stripping it does cost co-op its player-count compensation -- tracked separately, and
+        // under-scaling, so it blocks nothing here.)
+        assert!(is_scaling_speffect(7500));
         assert!(is_scaling_speffect(7999));
         assert!(!is_scaling_speffect(6999));
         assert!(!is_scaling_speffect(8000));
@@ -1485,6 +1542,114 @@ mod tests {
         // `minimum_enemy_difficulty` resolves to a floor tier above 0. That is a player instruction,
         // not an artefact of the ladder's shape, so the skip must not swallow it.
         assert!(!skip_unrunged_at_floor(false, 1));
+    }
+
+    // ---- #346 phase 1a: native tiers, and absence as the safe state -------------------------
+
+    #[test]
+    fn an_enemy_we_have_no_native_tier_for_is_never_touched_at_any_depth() {
+        // THE MOTIVATING CASE. 2,440 unrunged rows have no rune reward in NpcParam -- every named
+        // boss among them -- so they are absent from the table. Defaulting them to the floor is what
+        // shipped, and it is what puts a rung on top of hand-tuned endgame stats in a shallow
+        // sphere. Absence must mean "leave it alone", at EVERY tier, or the wall comes back.
+        let absent = -1; // no npc_id is negative; stands in for "not in the table"
+        assert!(native_tier(absent).is_none());
+        for tier in 0..NUM_TIERS {
+            assert_eq!(
+                scale_action(false, absent, tier),
+                ScaleAction::NoTouch,
+                "an unclassified enemy was scaled at tier {tier}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_derived_enemy_scales_up_but_never_down() {
+        // Up-only: the ladder has no rung below 1.0, so "weaker than native" is not expressible and
+        // must resolve to leaving the enemy alone rather than to the nearest thing we can say.
+        let (npc, native) = crate::native_tiers::NATIVE_TIERS[0];
+        let native = native as usize;
+        for tier in 0..NUM_TIERS {
+            let want = if tier > native {
+                ScaleAction::Apply
+            } else {
+                ScaleAction::NoTouch
+            };
+            assert_eq!(
+                scale_action(false, npc, tier),
+                want,
+                "npc {npc} at tier {tier}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_runged_enemy_is_always_replaced_in_both_directions() {
+        // The 4,214-row mainline population is untouched by phase 1a: its rung IS its declared
+        // native difficulty, so swapping rungs is a true re-tier and works downward already.
+        for tier in 0..NUM_TIERS {
+            assert_eq!(scale_action(true, -1, tier), ScaleAction::Replace);
+            assert_eq!(scale_action(true, 40000000, tier), ScaleAction::Replace);
+        }
+    }
+
+    #[test]
+    fn the_native_table_is_sorted_and_in_range() {
+        // Sorted is a CORRECTNESS requirement, not tidiness: `native_tier` binary-searches, so an
+        // unsorted table silently returns None for real entries -- which reads exactly like the
+        // safe "absent" case and would hide itself.
+        let t = crate::native_tiers::NATIVE_TIERS;
+        assert!(!t.is_empty());
+        for w in t.windows(2) {
+            assert!(w[0].0 < w[1].0, "not sorted / duplicate at npc {}", w[0].0);
+        }
+        for &(npc, idx) in t {
+            assert!(
+                (idx as usize) < NUM_TIERS,
+                "npc {npc} has out-of-range tier {idx}"
+            );
+        }
+        // Every entry must be findable through the public lookup, not just present in the slice.
+        for &(npc, idx) in t {
+            assert_eq!(native_tier(npc), Some(idx as usize));
+        }
+    }
+
+    #[test]
+    fn the_calibration_bands_are_strictly_increasing() {
+        // A non-increasing band list would make the emitted assignment order meaningless.
+        let b = crate::native_tiers::GETSOUL_BANDS;
+        for w in b.windows(2) {
+            assert!(
+                w[0].0 < w[1].0,
+                "bands not increasing: {} then {}",
+                w[0].0,
+                w[1].0
+            );
+            assert!(w[0].1 < w[1].1, "band indices not increasing");
+        }
+        assert!(b.last().unwrap().1 < crate::native_tiers::TOP_BAND_INDEX);
+    }
+
+    #[test]
+    fn every_emitted_entry_agrees_with_the_curve_it_came_from() {
+        // Guards the emitter: re-derive each npc's index from its recorded getSoul band and check
+        // it matches what was written. Catches a table emitted from a stale curve.
+        let bands = crate::native_tiers::GETSOUL_BANDS;
+        let n_top = crate::native_tiers::NATIVE_TIERS
+            .iter()
+            .filter(|&&(_, idx)| idx == crate::native_tiers::TOP_BAND_INDEX)
+            .count();
+        // Sanity: the top band is not swallowing the table (that would mean a collapsed curve).
+        assert!(n_top < crate::native_tiers::NATIVE_TIERS.len() / 2);
+        for &(_, idx) in crate::native_tiers::NATIVE_TIERS {
+            let known =
+                bands.iter().any(|&(_, b)| b == idx) || idx == crate::native_tiers::TOP_BAND_INDEX;
+            assert!(
+                known,
+                "emitted index {idx} is not one the curve can produce"
+            );
+        }
     }
 
     #[test]
