@@ -16,10 +16,10 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
-    NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind, band_native_tier,
-    is_dlc_bucket, is_scaling_speffect, native_tier, raw_target_for_region, region_name_for_bucket,
-    scale_action, scaling_kind, settled_on_target, speffect_id_for_tier, tier_for_region,
-    tier_rates,
+    NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
+    area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect, ladder_tier,
+    native_tier, raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
+    settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -259,6 +259,18 @@ struct SweepTally {
     /// shows the band routinely BELOW the table, the band is not a strength statement and the ruling
     /// does not survive -- so this pair is the thing to read first, not the counts.
     band_vs_table: Vec<(usize, usize)>,
+    /// Ladder-index histogram of the enemies in this sweep that are still VANILLA-SHAPED, i.e.
+    /// carrying a rung AND a band. The phase-1b area signal (#346): what vanilla says the GROUND is
+    /// worth, for the enemies that carry no strength statement of their own.
+    ///
+    /// 🛑🛑 THE BAND GATE IS NOT AN OPTIMISATION, IT IS THE MEASUREMENT. We replace rungs, so from a
+    /// region's second sweep onward everything runged around us carries OUR target -- a histogram
+    /// without the gate would converge on the tier we already chose and report our own output back
+    /// to us, stably and convincingly. We strip bands, so anything still holding one is untouched.
+    ///
+    /// Uncapped and NOT deduplicated, unlike `rung_band_pairs` -- a median has to weigh bodies, and
+    /// that field is a set of at most 12 distinct pairs.
+    area_hist: [u32; NUM_TIERS],
     /// Entities found carrying our target rung AND something else in the clear space.
     ///
     /// These are now CLEARED rather than skipped (see `scale_one`), so this is a CONVERGENCE
@@ -336,6 +348,14 @@ impl SweepTally {
             && !self.rung_band_pairs.contains(&(rung, band))
         {
             self.rung_band_pairs.push((rung, band));
+        }
+    }
+
+    /// Count one vanilla-shaped neighbour toward the area signal. Base-game rungs only -- a DLC rung
+    /// sits on a much steeper curve at the same index and would overstate the area (`ladder_tier`).
+    fn note_area_sample(&mut self, rung: i32) {
+        if let Some(idx) = ladder_tier(rung) {
+            self.area_hist[idx] = self.area_hist[idx].saturating_add(1);
         }
     }
 
@@ -646,12 +666,29 @@ pub fn tick() -> Option<String> {
                 attack,
             } = dbg;
             let tgt = raw_target.map_or_else(|| "unmapped".to_string(), |t| t.to_string());
+            // #346 phase-1b AREA CENSUS -- reporting only, nothing below acts on it. Read
+            // `area-index` against `tier`: where it is far BELOW the tier, this region contains
+            // hand-tuned enemies we currently leave at vanilla while normalising everything around
+            // them, which is the shape of the sphere-2 Vyke complaint. `None` means the sweep did
+            // not see enough untouched neighbours to say -- expected on a settled region's later
+            // sweeps, since the gate counts only enemies still carrying rung AND band.
+            let area_total: u32 = tally.area_hist.iter().sum();
+            let area_index = area_tier_from_histogram(&tally.area_hist);
+            let area_dist: Vec<(usize, u32)> = tally
+                .area_hist
+                .iter()
+                .enumerate()
+                .filter(|&(_, &n)| n > 0)
+                .map(|(i, &n)| (i, n))
+                .collect();
             log::info!(
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
                  vanilla {}, npc_param_ids {:?}), other-in-range {} {:?}; band-only {}, \
-                 band+rung {} {:?}, band_vs_table {:?}, residue {}",
+                 band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?} from {} \
+                 vanilla-shaped {:?} (census only -- would place {} unrunged, {} of them NoTouch \
+                 today)",
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
@@ -666,6 +703,11 @@ pub fn tick() -> Option<String> {
                 tally.rung_band_pairs,
                 tally.band_vs_table,
                 tally.residue,
+                area_index,
+                area_total,
+                area_dist,
+                tally.unrunged,
+                tally.left_vanilla,
             );
         }
     }
@@ -804,6 +846,10 @@ fn scale_one(
             tally.band_and_rung += 1;
             if let (Some(r), Some(b)) = (rung_id, band_id) {
                 tally.note_rung_band(r, b);
+            }
+            // The area signal, gated on exactly this shape: rung + band = not yet ours.
+            if let Some(r) = rung_id {
+                tally.note_area_sample(r);
             }
         } else {
             tally.band_only += 1;

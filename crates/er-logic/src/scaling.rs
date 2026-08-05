@@ -401,6 +401,58 @@ pub fn skip_unrunged_at_floor(carried_ladder_rung: bool, target_tier: usize) -> 
     !carried_ladder_rung && target_tier == 0
 }
 
+/// The ladder index a carried BASE-GAME rung stands for, or `None`. The inverse of
+/// `speffect_id_for_tier`.
+///
+/// 🛑 BASE GAME ONLY, ON PURPOSE. The DLC re-emission (`20007000..20007350`) is a far STEEPER curve
+/// at the same indices -- `20007010` is 7.84x where base index 0 is 1.141x -- so folding a DLC rung
+/// into a base-indexed statistic would silently overstate the area it was read from. A DLC rung is
+/// not a sample; a DLC region simply reports a smaller one.
+pub fn ladder_tier(param_id: i32) -> Option<usize> {
+    SCALING_TIERS.iter().position(|t| t.speffect_id == param_id)
+}
+
+/// Fewest vanilla-shaped neighbours that may stand in for an AREA.
+pub const MIN_AREA_SAMPLE: u32 = 8;
+
+/// The area's own declared difficulty, read off the enemies vanilla placed in it (#346, phase 1b).
+///
+/// ⭐⭐⭐ THE SIGNAL IS THE NEIGHBOURS, because the enemy we care about has nothing to read. An
+/// unrunged, reward-less enemy -- Vyke, Gideon, every hand-tuned NPC -- is absent from `NATIVE_TIERS`
+/// by construction (it is derived from `getSoul`, which they do not have) and carries no band of its
+/// own. Nothing ON such an enemy declares a strength. What vanilla DOES declare is how hard it
+/// considered the ground the enemy is standing on.
+///
+/// 🛑🛑 IT MUST BE FED ONLY VANILLA-SHAPED ENEMIES, AND THAT IS THE WHOLE TRAP. We REPLACE rungs, so
+/// from a region's second sweep onward the enemies around us carry OUR target rather than vanilla's.
+/// A statistic over them is a statistic over our own output: it converges on the tier we already
+/// chose and looks beautifully stable while measuring nothing at all. The discriminator is the BAND
+/// -- we strip it, and vanilla pairs it with a rung essentially always (band+rung was 198 of 198 and
+/// 153 of 153 in the 2026-08-05 census) -- so an enemy carrying BOTH is one we have not yet
+/// processed, and only those may be counted. See the same failure in a different costume:
+/// a generator whose input contains its own output.
+///
+/// Weighted MEDIAN, not mean: an area is allowed to contain one outlier without the outlier becoming
+/// the area -- which is exactly the Vyke case, an endgame invader parked in a mid-game field.
+/// Returns `None` below `MIN_AREA_SAMPLE`: a handful of enemies inside a fog gate is not an area, and
+/// declining to answer is far cheaper than answering wrongly, because the answer's whole purpose is
+/// to license touching something we currently leave alone.
+pub fn area_tier_from_histogram(hist: &[u32]) -> Option<usize> {
+    let total: u32 = hist.iter().sum();
+    if total < MIN_AREA_SAMPLE {
+        return None;
+    }
+    let half = total / 2;
+    let mut seen = 0u32;
+    for (idx, &n) in hist.iter().enumerate() {
+        seen += n;
+        if seen > half {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 /// The phase-1b DOWN-STATE pair: the only rows measured to scale an enemy BELOW vanilla.
 ///
 /// `20018004` = 0.25x HP, `20018002` = 0.30x all-element attack. `spCategory 0` (so they stack),
@@ -1781,6 +1833,60 @@ mod tests {
         for tier in 0..NUM_TIERS {
             assert_eq!(scale_action(false, -1, tier), ScaleAction::NoTouch);
         }
+    }
+
+    #[test]
+    fn ladder_tier_is_the_inverse_of_speffect_id_for_tier() {
+        for tier in 0..NUM_TIERS {
+            assert_eq!(ladder_tier(speffect_id_for_tier(tier)), Some(tier));
+        }
+        // A BAND id is not a rung and must not answer -- band and ladder ids differ by exactly 400,
+        // so an off-by-one-family bug here would read as a plausible tier rather than as nothing.
+        assert_eq!(ladder_tier(7460), None);
+        // Nor may the DLC ladder answer on the base index: 20007010 is 7.84x, base index 0 is 1.141x.
+        assert_eq!(ladder_tier(20007010), None);
+        assert_eq!(ladder_tier(0), None);
+    }
+
+    #[test]
+    fn an_area_needs_enough_neighbours_to_be_an_area() {
+        let mut hist = [0u32; NUM_TIERS];
+        // One fog-gated room's worth of enemies is not a statement about a region.
+        hist[6] = MIN_AREA_SAMPLE - 1;
+        assert_eq!(area_tier_from_histogram(&hist), None);
+        hist[6] = MIN_AREA_SAMPLE;
+        assert_eq!(area_tier_from_histogram(&hist), Some(6));
+        assert_eq!(area_tier_from_histogram(&[0u32; NUM_TIERS]), None);
+    }
+
+    #[test]
+    fn the_area_is_the_median_so_one_outlier_is_not_the_area() {
+        // 🛑 THE MOTIVATING SHAPE, and the reason this is not a mean. Vyke is an endgame-tuned
+        // invader standing in a mid-game field: a lone index-19 entry among twenty index-5
+        // neighbours. A mean would drag the field toward him -- i.e. the outlier would license
+        // scaling the field UP to meet the outlier, which is the wall direction. The median leaves
+        // the field at 5, which is the answer that makes him the thing that stands out.
+        let mut hist = [0u32; NUM_TIERS];
+        hist[5] = 20;
+        hist[NUM_TIERS - 1] = 1;
+        assert_eq!(area_tier_from_histogram(&hist), Some(5));
+    }
+
+    #[test]
+    fn the_area_median_is_weighted_by_population() {
+        // Two rungs, unequal populations: the answer follows the bodies, not the distinct ids. (The
+        // existing `rung_band_pairs` sample is DEDUPLICATED and capped at 12, so a median over it
+        // would be a median over distinct rungs -- which is why the census carries its own
+        // histogram instead of reusing that field.)
+        let mut hist = [0u32; NUM_TIERS];
+        hist[3] = 3;
+        hist[9] = 30;
+        assert_eq!(area_tier_from_histogram(&hist), Some(9));
+        // Exactly balanced: the upper half wins, deliberately. Ties resolve toward NOT weakening.
+        let mut tie = [0u32; NUM_TIERS];
+        tie[4] = 10;
+        tie[8] = 10;
+        assert_eq!(area_tier_from_histogram(&tie), Some(8));
     }
 
     #[test]
