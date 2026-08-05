@@ -789,15 +789,12 @@ fn area_sample_one(
         }
         match scaling_kind(id) {
             Some(ScalingKind::Ladder) => rung = Some(id),
-            Some(ScalingKind::OtherInRange) => {
-                if band_native_tier(id).is_some() {
-                    has_band = true;
-                }
-            }
-            None => {}
+            Some(ScalingKind::OtherInRange) if band_native_tier(id).is_some() => has_band = true,
+            _ => {}
         }
     }
-    if let (Some(r), true) = (rung, has_band) {
+    // Rung AND band, or nothing: a rung on its own is an enemy we have already processed.
+    if let Some(r) = rung.filter(|_| has_band) {
         tally.note_area_sample(r);
     }
 }
