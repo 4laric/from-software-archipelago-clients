@@ -242,7 +242,18 @@ struct SweepTally {
     /// Carried a BAND row AND a ladder rung -- these take the Replace path today, which strips the
     /// band. Where the band is the stronger of the two, that is a DOWN-scale nobody ordered.
     band_and_rung: u32,
-    /// 🛑 THE FALSIFIER. Samples of `(band-implied tier, getSoul-table tier)` for entities that have
+    /// Samples of `(ladder rung id, band id)` for entities carrying BOTH -- which the census showed
+    /// is essentially every scaled enemy (198 of 198, 153 of 153).
+    ///
+    /// 🛑 THIS IS A CALIBRATION MEASUREMENT, NOT A DEFECT HUNT. The band is area difficulty and
+    /// stripping it is the feature working as designed; that is settled. What is NOT settled is
+    /// whether our ladder's top end (7.422x) is strong enough, because vanilla's effective
+    /// multiplier is the PRODUCT of the two (up to ~7.4 x ~3.4). This pair is how we find out.
+    ///
+    /// ⭐ Report BOTH ENDS of this distribution when the time comes. Quoting one end of a band is how
+    /// `7400..7680` got misidentified twice.
+    rung_band_pairs: Vec<(i32, i32)>,
+    /// Samples of `(band-implied tier, getSoul-table tier)` for entities that have
     /// both. The band-as-native-tier ruling PREDICTS band >= table for most carriers. If this log
     /// shows the band routinely BELOW the table, the band is not a strength statement and the ruling
     /// does not survive -- so this pair is the thing to read first, not the counts.
@@ -276,6 +287,14 @@ impl SweepTally {
     fn note_pair(&mut self, band: usize, table: usize) {
         if self.band_vs_table.len() < UNRUNGED_ID_CAP {
             self.band_vs_table.push((band, table));
+        }
+    }
+
+    fn note_rung_band(&mut self, rung: i32, band: i32) {
+        if self.rung_band_pairs.len() < UNRUNGED_ID_CAP
+            && !self.rung_band_pairs.contains(&(rung, band))
+        {
+            self.rung_band_pairs.push((rung, band));
         }
     }
 
@@ -547,7 +566,7 @@ pub fn tick() -> Option<String> {
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
                  vanilla {}, npc_param_ids {:?}), other-in-range {} {:?}; band-only {}, \
-                 band+rung {}, band_vs_table {:?}, residue {}",
+                 band+rung {} {:?}, band_vs_table {:?}, residue {}",
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
@@ -559,6 +578,7 @@ pub fn tick() -> Option<String> {
                 tally.other_ids,
                 tally.band_only,
                 tally.band_and_rung,
+                tally.rung_band_pairs,
                 tally.band_vs_table,
                 tally.residue,
             );
@@ -657,14 +677,22 @@ fn scale_one(
     let mut carried_ladder_rung = false;
     let mut carried_other = false;
     let mut band_tier: Option<usize> = None;
+    let mut rung_id: Option<i32> = None;
+    let mut band_id: Option<i32> = None;
     for &id in &stale {
         match scaling_kind(id) {
-            Some(ScalingKind::Ladder) => carried_ladder_rung = true,
+            Some(ScalingKind::Ladder) => {
+                carried_ladder_rung = true;
+                rung_id = Some(id);
+            }
             Some(ScalingKind::OtherInRange) => {
                 carried_other = true;
                 tally.note_other(id);
                 // Keep the STRONGEST band row if an entity somehow carries several.
                 if let Some(t) = band_native_tier(id) {
+                    if band_tier.is_none_or(|cur: usize| t > cur) {
+                        band_id = Some(id);
+                    }
                     band_tier = Some(band_tier.map_or(t, |cur: usize| cur.max(t)));
                 }
             }
@@ -677,6 +705,9 @@ fn scale_one(
     if let Some(band) = band_tier {
         if carried_ladder_rung {
             tally.band_and_rung += 1;
+            if let (Some(r), Some(b)) = (rung_id, band_id) {
+                tally.note_rung_band(r, b);
+            }
         } else {
             tally.band_only += 1;
         }

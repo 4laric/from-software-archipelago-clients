@@ -358,6 +358,16 @@ pub fn is_band_rung(param_id: i32) -> bool {
 
 /// The native ladder tier a carried band row implies: the LOWEST rung at least as strong as it.
 ///
+/// 🛑 **SHELVED, DELIBERATELY — do not wire this into `scale_action`.** It was built to give the
+/// UNRUNGED class a native tier, on my reading of a log as "527 unrunged, 303 band carriers". The
+/// split census refuted that outright: `band-only` is **~1 per region**, and the unrunged class
+/// carries no band rows at all (`band+rung` equalled the scaled count exactly, 198 of 198 and 153 of
+/// 153). A native-tier source that reaches one enemy per region is not worth a wire.
+///
+/// It stays in the tree as the thing that named the family and caught the DLC-range bug in
+/// `is_ladder_rung`, and because the census still uses it. If you are reading this while considering
+/// connecting it: the reason not to is measured, not forgotten.
+///
 /// Ceiling, not nearest. Rounding to the nearest rung could land BELOW the multiplier the enemy
 /// actually carries, and the whole point of a native tier is to be a floor we must clear before we
 /// touch anything. Every ambiguity in this file resolves toward not touching.
@@ -1690,6 +1700,37 @@ mod tests {
                 ScaleAction::NoTouch,
                 "an unclassified enemy was scaled at tier {tier}"
             );
+        }
+    }
+
+    #[test]
+    fn a_band_only_enemy_still_goes_down_the_unrunged_path() {
+        // The motivating case for SHELVING `band_native_tier`: region 10010's lone band-only entity.
+        // It must resolve exactly like any other unrunged enemy -- through the getSoul table, or to
+        // NoTouch -- and the band must NOT quietly become its native tier.
+        let band_only_unknown_npc = -1; // absent from NATIVE_TIERS
+        assert!(native_tier(band_only_unknown_npc).is_none());
+        for tier in 0..NUM_TIERS {
+            assert_eq!(
+                scale_action(false, band_only_unknown_npc, tier),
+                ScaleAction::NoTouch,
+                "a band-only enemy was scaled at tier {tier}"
+            );
+        }
+        // `band_native_tier` has an answer for 7460 -- the point is that nothing consults it.
+        assert!(band_native_tier(7460).is_some());
+    }
+
+    #[test]
+    fn the_clear_range_covers_the_band_ids_actually_seen_in_play() {
+        // Every band id observed live on 2026-08-05, asserted by direct call. The clear is what makes
+        // the strip deliberate rather than incidental, and these are the rows it must keep catching.
+        for id in [7430, 7440, 7460, 7500] {
+            assert!(
+                is_scaling_speffect(id),
+                "observed band id {id} is not cleared"
+            );
+            assert!(is_band_rung(id));
         }
     }
 
