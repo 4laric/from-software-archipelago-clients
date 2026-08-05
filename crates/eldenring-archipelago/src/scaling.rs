@@ -301,9 +301,27 @@ const UNRUNGED_ID_CAP: usize = 12;
 /// Cap on `SweepTally::sample`. Enough tuples to see a pattern, few enough to read.
 const SAMPLE_CAP: usize = 24;
 
-/// Gate for the per-enemy sample. Absent = hard no-op, and no cost beyond one env lookup per sweep.
+/// Gate for the per-enemy sample.
+///
+/// 🛑🛑 THIS BRANCH DEFAULTS IT **ON**. DO NOT MERGE.
+///
+/// `probe/sample-always-on` exists for exactly one measurement: the matt's-enemy-randomizer
+/// comparison, where the game is launched THROUGH another launcher and environment inheritance
+/// across that chain is not something anyone should have to be confident about. A probe that
+/// silently no-ops because a variable did not survive two process spawns is worse than no probe --
+/// it looks like a clean result.
+///
+/// So the polarity is inverted here and here only: sampling is ON unless `ER_SCALING_SAMPLE=0`.
+/// `main` keeps the opt-in form (PR #70), because this is a wide log line in a hot path and no
+/// ordinary session should pay for it.
+///
+/// If you are reading this on `main`, something went wrong: revert to
+/// `std::env::var_os("ER_SCALING_SAMPLE").is_some()`.
 fn sampling() -> bool {
-    std::env::var_os("ER_SCALING_SAMPLE").is_some()
+    !matches!(
+        std::env::var("ER_SCALING_SAMPLE").as_deref(),
+        Ok("0") | Ok("false")
+    )
 }
 
 impl SweepTally {
