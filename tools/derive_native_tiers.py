@@ -172,22 +172,42 @@ def main() -> int:
         if as_int(r, "getSoul") > 0
     )
 
-    # THE AREA FALLBACK'S EXCLUSION SET (issue #346). Unrunged, no rune reward, but NAMED.
+    # THE AREA FALLBACK'S EXCLUSION SET (issue #346), keyed PER CHARACTER.
     #
     # `nameId` is the healthbar name: ordinary enemies have none (6323 of 7039 rows are nameId 0),
     # while bosses and named NPCs do -- and their rune reward lives in GameAreaParam, per arena, so
-    # they read `getSoul == 0` here. That intersection is therefore close to the named-boss class.
+    # they read `getSoul == 0` here.
     #
     # WHY IT IS EMITTED. The client may attribute a strength to an unrunged enemy from the AREA it
     # stands in, which is right for trash tuned to that ground and WRONG for these: their base
     # already assumes you meet them late, so an area-derived delta multiplies on top of endgame
-    # tuning. Measured 2026-08-05: Vyke, placed by the area at tier 11 in a Liurnia whose ground is
-    # index 5, came out "crazy strong" in play. Absence from the area fallback returns them to
-    # vanilla, which is the state this whole issue defends.
-    named_unrewarded = sorted(
-        as_int(r, "ID")
-        for r in unrunged
-        if as_int(r, "getSoul") <= 0 and as_int(r, "nameId") != 0
+    # tuning. Measured 2026-08-05: a Vyke row and Vyke's Finger Maiden, area-placed at tier 11 in a
+    # Liurnia whose ground is index 5, came out "crazy strong" in play.
+    #
+    # ⭐⭐⭐ WHY PER CHARACTER AND NOT PER ROW. One character owns several rows and they DISAGREE:
+    # Vyke has a 500-reward row and three reward-less ones; Gideon has three at 4000 and one at 0.
+    # Keyed per row, which variant the game happens to instantiate decides whether that character is
+    # placed by its own reward or left vanilla -- two encounters with "Vyke" scaling two ways, with
+    # nothing in the data marking them as the same character. Keyed per nameId, one character has one
+    # behaviour, which is the thing a player (or a bug report) can actually reason about.
+    #
+    # THE COST, PAID DELIBERATELY: 136 rows carrying a REAL reward are excluded with their siblings
+    # (Gideon 4000, Dung Eater 3000, Arghanthy 5040, Blaidd/Fia/Latenna 2000). Those are measurements
+    # taken on the enemy itself and we are choosing not to use them. It lands in the UNDER-scaled
+    # direction -- a blemish, never a wall -- which is the side of the asymmetry this issue keeps.
+    # It does not widen the character set at all: 137 characters either way, 275 rows -> 411.
+    by_name: dict[int, list[dict]] = defaultdict(list)
+    for row in unrunged:
+        name_id = as_int(row, "nameId")
+        if name_id:
+            by_name[name_id].append(row)
+    carved_names = {
+        name_id
+        for name_id, rs in by_name.items()
+        if any(as_int(r, "getSoul") <= 0 for r in rs)
+    }
+    area_excluded = sorted(
+        as_int(r, "ID") for r in unrunged if as_int(r, "nameId") in carved_names
     )
 
     n_zero = sum(1 for r in unrunged if as_int(r, "getSoul") <= 0)
@@ -205,7 +225,9 @@ def main() -> int:
         w(f"// population:  {len(rows)} rows -- {n_runged} runged (calibration set),\n")
         w(f"//              {len(derived)} unrunged with a rune reward (emitted below),\n")
         w(f"//              {n_zero} unrunged without one (ABSENT on purpose = never touched),\n")
-        w(f"//              of which {len(named_unrewarded)} are NAMED (below: the area may not vouch for them).\n")
+        w(f"//              {len(area_excluded)} rows across {len(carved_names)} NAMED characters are excluded\n")
+        w("//              from the AREA fallback (below) -- a set that CROSSES the split above,\n")
+        w("//              since a carved character's rewarded rows go with its reward-less ones.\n")
         w("\n")
         w("//! Native scaling tiers for enemies vanilla ships WITHOUT a ladder rung (issue #346).\n")
         w("//!\n")
@@ -231,15 +253,22 @@ def main() -> int:
         w("];\n\n")
         w(f"/// Index taken by any reward above the last band.\npub const TOP_BAND_INDEX: u8 = {top_index};\n")
         w("\n")
-        w("/// Unrunged AND unrewarded AND **named** -- bosses and named NPCs, whose rune reward lives\n")
-        w("/// in `GameAreaParam` per arena rather than in `NpcParam`, so `getSoul` cannot place them.\n")
+        w("/// Rows the AREA fallback may not speak for, keyed PER CHARACTER (`nameId`).\n")
         w("///\n")
-        w("/// 🛑 THE AREA MAY NOT VOUCH FOR THESE. Attributing the ground's strength to them multiplies\n")
-        w("/// an area-derived delta on top of tuning that already assumes a late encounter -- measured\n")
-        w("/// in play 2026-08-05, when Vyke was area-placed at tier 11 in a Liurnia whose ground reads\n")
-        w("/// index 5 and came out far too strong. Sorted, for binary search.\n")
-        w("pub const NAMED_UNREWARDED: &[i32] = &[\n")
-        for npc_id in named_unrewarded:
+        w("/// A named character with ANY unrunged, reward-less row has ALL of its unrunged rows here.\n")
+        w("/// 🛑 Their bases already assume a late encounter, so an area-derived delta multiplies on top\n")
+        w("/// of endgame tuning -- measured in play 2026-08-05, when a Vyke row and Vyke's Finger Maiden\n")
+        w("/// were area-placed at tier 11 in a Liurnia whose ground reads index 5.\n")
+        w("///\n")
+        w("/// ⭐⭐⭐ PER CHARACTER, NOT PER ROW, because a character's rows disagree: Vyke has a\n")
+        w("/// 500-reward row and three reward-less ones, Gideon three at 4000 and one at 0. Keyed per\n")
+        w("/// row, which variant spawned would decide how that character scales. The cost is paid\n")
+        w("/// knowingly: rows with a REAL reward are excluded alongside their siblings, which lands in\n")
+        w("/// the UNDER-scaled direction -- a blemish, never a wall.\n")
+        w("///\n")
+        w("/// Sorted, for binary search.\n")
+        w("pub const AREA_EXCLUDED: &[i32] = &[\n")
+        for npc_id in area_excluded:
             w(f"    {npc_id},\n")
         w("];\n")
 
