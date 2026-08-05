@@ -50,7 +50,12 @@ jobs:
     # so its unit tests ran nowhere -- including the 7 in `foreign_blocks.rs`, the module whose
     # HIT/MISS verdict the FMG CTD diagnosis rests on, and every test in `crash_handler.rs`.
     # An instrument whose own tests never run is the shape of #244: a gate that reports nothing.
-    - run: cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago -p shared
+    #
+    # `archipelago_rs` ADDED 2026-08-04, when it was vendored in. Same lesson a third time: a
+    # vendored crate that CI builds but never tests is a crate whose tests run nowhere. Its
+    # suite is the regression gate for the ReceivedItems batch drop -- omit it here and the
+    # gate reports nothing.
+    - run: cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago -p shared -p archipelago_rs
 
     - run: cargo fmt -- --check
     # RE-ARMED 2026-07-12. eldenring-archipelago had 44 accumulated lints -- the whole backlog of a crate

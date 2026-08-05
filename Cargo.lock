@@ -56,7 +56,6 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "archipelago_rs"
 version = "3.0.1"
-source = "git+https://github.com/nex3/archipelago_rs#33ddae62697d2432b2d623a667e18a67e09bf567"
 dependencies = [
  "bitflags 2.11.1",
  "log",
