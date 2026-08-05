@@ -285,8 +285,8 @@ struct SweepTally {
     /// belong to the `npc_param_id` it is standing on is a SWAPPED enemy, which is matt's rando
     /// signing its own work.
     ///
-    /// 🛑 OFF BY DEFAULT and capped. This is a wide log line in a hot path; it exists for one
-    /// experiment, not for every session.
+    /// Capped, and emitted only when the census line changes -- a settled region prints nothing.
+    /// ON by default (`ER_SCALING_SAMPLE=0` silences it); see `sampling` for why.
     sample: Vec<(i32, i32, i32, i32, Vec<i32>)>,
     /// Distinct non-ladder ids found inside the clear range, capped. WITHOUT this the census says
     /// "199 of 240 enemies carried something we stripped" and cannot say WHAT -- and only 20 rows in
@@ -301,9 +301,20 @@ const UNRUNGED_ID_CAP: usize = 12;
 /// Cap on `SweepTally::sample`. Enough tuples to see a pattern, few enough to read.
 const SAMPLE_CAP: usize = 24;
 
-/// Gate for the per-enemy sample. Absent = hard no-op, and no cost beyond one env lookup per sweep.
+/// Gate for the per-enemy sample. **ON by default**; set `ER_SCALING_SAMPLE=0` to silence it.
+///
+/// ⭐ ON, not opt-in, and the reason is the launcher chain. This measurement is taken with the game
+/// started THROUGH matt's randomizer, so the env would have to survive two process spawns to reach
+/// us. A probe that silently no-ops because a variable did not make that journey is worse than no
+/// probe: it looks like a clean result. Defaulting on removes the failure mode entirely.
+///
+/// The cost is bounded by construction -- capped at `SAMPLE_CAP` per sweep, and emitted only when
+/// the census line itself changes, so a settled region prints nothing at all.
 fn sampling() -> bool {
-    std::env::var_os("ER_SCALING_SAMPLE").is_some()
+    !matches!(
+        std::env::var("ER_SCALING_SAMPLE").as_deref(),
+        Ok("0") | Ok("false")
+    )
 }
 
 impl SweepTally {
