@@ -96,7 +96,7 @@ fn now_ms() -> u64 {
 ///
 /// The histogram is the part that stops this recurring: the next build's logs will say what states
 /// enemies are ACTUALLY in, and only then can this be narrowed on evidence instead of on a name.
-fn sweepable_characters<T>(set: &ChrSet<T>) -> impl Iterator<Item = &mut T>
+pub(crate) fn sweepable_characters<T>(set: &ChrSet<T>) -> impl Iterator<Item = &mut T>
 where
     T: Subclass<ChrIns> + 'static,
 {
