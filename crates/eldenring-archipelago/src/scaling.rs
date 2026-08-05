@@ -271,9 +271,17 @@ struct SweepTally {
     /// Uncapped and NOT deduplicated, unlike `rung_band_pairs` -- a median has to weigh bodies, and
     /// that field is a set of at most 12 distinct pairs.
     area_hist: [u32; NUM_TIERS],
+    /// How many ENTITIES reached the tier only because the area vouched for them.
+    ///
+    /// 🛑 SEPARATE FROM `area_moved_ids` ON PURPOSE, and the reason is a bug this line already
+    /// caused: the log used to print `area_moved_ids.len()`, which is a DEDUPLICATED list CAPPED at
+    /// `UNRUNGED_ID_CAP`. Weeping logged `area-placed 5` for a sweep that moved an unknown number of
+    /// entities across 5 distinct rows -- a number that reads like a count, caps at 12, and cannot
+    /// be reasoned from. A census that cannot be reasoned from is worse than no census.
+    area_moved: u32,
     /// Distinct `npc_param_id`s that reached the tier ONLY because the area vouched for them --
-    /// capped, like every other census list. The population whose strength we inferred rather than
-    /// measured, so it is the first place a wrongly-buffed hand-tuned entity becomes visible.
+    /// capped and deduplicated, like every other census list. This one is for READING (which rows
+    /// did we infer a strength for), never for counting; `area_moved` is the count.
     area_moved_ids: Vec<i32>,
     /// Entities found carrying our target rung AND something else in the clear space.
     ///
@@ -358,6 +366,7 @@ impl SweepTally {
     /// Record an enemy that reached the tier only because the AREA vouched for it. Deduplicated and
     /// capped like every other census list -- this one is meant to be READ, not counted.
     fn note_area_moved(&mut self, npc_param_id: i32) {
+        self.area_moved = self.area_moved.saturating_add(1);
         if self.area_moved_ids.len() < UNRUNGED_ID_CAP
             && !self.area_moved_ids.contains(&npc_param_id)
         {
@@ -717,7 +726,8 @@ pub fn tick() -> Option<String> {
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
                  vanilla {}, npc_param_ids {:?}), other-in-range {} {:?}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?} from {} \
-                 vanilla-shaped {:?}; area-placed {} unrunged {:?}, still NoTouch {}",
+                 vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {:?}, \
+                 still NoTouch {}",
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
@@ -735,6 +745,7 @@ pub fn tick() -> Option<String> {
                 area_index,
                 area_total,
                 area_dist,
+                tally.area_moved,
                 tally.area_moved_ids.len(),
                 tally.area_moved_ids,
                 tally.left_vanilla,
