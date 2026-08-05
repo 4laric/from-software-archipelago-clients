@@ -266,6 +266,28 @@ struct SweepTally {
     /// sweep after**. If it stays non-zero once a region has settled, something really is
     /// re-applying an effect behind us, and that is a different bug.
     residue: u32,
+    /// Per-enemy SAMPLE, for the matt's-enemy-randomizer interaction (`ER_SCALING_SAMPLE=1`).
+    ///
+    /// ⭐ THE POINT IS THAT IT ASSUMES NOTHING ABOUT MATT'S IMPLEMENTATION. Each tuple is
+    /// `(npc_param_id, npc_id, hp, max_hp, [scaling ids carried])`. Offline we already know the
+    /// VANILLA base HP for any `npc_param_id` (it is a column in `NpcParam`, which is in the
+    /// datamine bundle) and the HP rate of every scaling id (`SpEffectParam`). So the expected
+    /// `max_hp` is `base x product(rates)`, and the RESIDUAL between that and the observed value is
+    /// the whole instrument:
+    ///
+    ///   * residual ~= 1.0 for every sample  -> we are the only thing scaling this enemy.
+    ///   * residual is a consistent constant -> something applies a uniform extra multiplier we do
+    ///     not model, and the constant names it.
+    ///   * residual is unrelated to base     -> the enemy's BASE STATS were edited (a baked param
+    ///     change), which no runtime clear can undo and which our tier then rides on top of.
+    ///
+    /// `npc_id` is the second half: it is the 4-digit chr/model id, so an enemy whose model does not
+    /// belong to the `npc_param_id` it is standing on is a SWAPPED enemy, which is matt's rando
+    /// signing its own work.
+    ///
+    /// 🛑 OFF BY DEFAULT and capped. This is a wide log line in a hot path; it exists for one
+    /// experiment, not for every session.
+    sample: Vec<(i32, i32, i32, i32, Vec<i32>)>,
     /// Distinct non-ladder ids found inside the clear range, capped. WITHOUT this the census says
     /// "199 of 240 enemies carried something we stripped" and cannot say WHAT -- and only 20 rows in
     /// all of `NpcParam` carry a non-ladder in-range effect innately, so nearly all of those 199 are
@@ -276,6 +298,13 @@ struct SweepTally {
 
 /// Cap on `SweepTally::unrunged_ids`. A census, not a dump.
 const UNRUNGED_ID_CAP: usize = 12;
+/// Cap on `SweepTally::sample`. Enough tuples to see a pattern, few enough to read.
+const SAMPLE_CAP: usize = 24;
+
+/// Gate for the per-enemy sample. Absent = hard no-op, and no cost beyond one env lookup per sweep.
+fn sampling() -> bool {
+    std::env::var_os("ER_SCALING_SAMPLE").is_some()
+}
 
 impl SweepTally {
     fn note_unrunged(&mut self, npc_param_id: i32) {
@@ -296,6 +325,18 @@ impl SweepTally {
             && !self.rung_band_pairs.contains(&(rung, band))
         {
             self.rung_band_pairs.push((rung, band));
+        }
+    }
+
+    fn note_sample(&mut self, chr: &ChrIns, carried: &[i32]) {
+        if self.sample.len() < SAMPLE_CAP {
+            self.sample.push((
+                chr.npc_param_id,
+                chr.npc_id,
+                chr.modules.data.hp,
+                chr.modules.data.max_hp,
+                carried.to_vec(),
+            ));
         }
     }
 
@@ -417,15 +458,30 @@ pub fn tick() -> Option<String> {
     };
     let target_tier = dbg.tier;
 
+    let sample_on = sampling();
     let mut tally = SweepTally::default();
     // Overworld enemies.
     for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
-        scale_one(chr, target, target_tier, &player_handle, &mut tally);
+        scale_one(
+            chr,
+            target,
+            target_tier,
+            &player_handle,
+            &mut tally,
+            sample_on,
+        );
     }
     // Legacy-dungeon / block chr sets.
     for slot in wcm.chr_sets.iter().flatten() {
         for chr in sweepable_characters(slot) {
-            scale_one(chr, target, target_tier, &player_handle, &mut tally);
+            scale_one(
+                chr,
+                target,
+                target_tier,
+                &player_handle,
+                &mut tally,
+                sample_on,
+            );
         }
     }
     // HOSTILE-PHANTOM SWEEP -- revised 2026-07-19 (Alaric: "scaling works for mobs/bosses; NPC
@@ -477,10 +533,18 @@ pub fn tick() -> Option<String> {
             target_tier,
             &player_handle,
             &mut tally,
+            sample_on,
         );
     }
     for c in sweepable_characters(&wcm.summon_buddy_chr_set) {
-        scale_hostile_phantom(c, target, target_tier, &player_handle, &mut tally);
+        scale_hostile_phantom(
+            c,
+            target,
+            target_tier,
+            &player_handle,
+            &mut tally,
+            sample_on,
+        );
     }
 
     // ---- SETTLE RELEASE TELEMETRY (one line per transition) ------------------------------------
@@ -552,6 +616,15 @@ pub fn tick() -> Option<String> {
             // A poisoned lock costs telemetry, never the sweep.
             Err(_) => false,
         };
+        if changed && sample_on && !tally.sample.is_empty() {
+            // Its own line: wide, experiment-only, and it must not make the census line unreadable
+            // for the sessions that are not running the experiment.
+            log::info!(
+                "enemy-scaling: SAMPLE region {region} target {target} \
+                 (npc_param_id, npc_id, hp, max_hp, carried): {:?}",
+                tally.sample
+            );
+        }
         if changed && (tally.scaled > 0 || tally.unrunged > 0) {
             let RegionScaleDbg {
                 tier,
@@ -616,13 +689,14 @@ fn scale_hostile_phantom(
     target_tier: usize,
     player_handle: &eldenring::cs::FieldInsHandle,
     tally: &mut SweepTally,
+    sample_on: bool,
 ) {
     if !is_hostile_phantom(chr.chr_type) {
         return;
     }
     let (ty, team, npc_id) = (chr.chr_type, chr.team_type, chr.npc_id);
     let before = tally.scaled;
-    scale_one(chr, target, target_tier, player_handle, tally);
+    scale_one(chr, target, target_tier, player_handle, tally, sample_on);
     if tally.scaled > before {
         log::info!(
             "enemy-scaling: scaled hostile phantom (chr_type={ty:?} team={team} npc_id={npc_id})"
@@ -645,6 +719,7 @@ fn scale_one(
     target_tier: usize,
     player_handle: &eldenring::cs::FieldInsHandle,
     tally: &mut SweepTally,
+    sample_on: bool,
 ) {
     if &chr.field_ins_handle == player_handle {
         return; // never scale the player
@@ -657,6 +732,12 @@ fn scale_one(
         .map(|e| e.param_id)
         .filter(|&id| is_scaling_speffect(id))
         .collect();
+    if sample_on {
+        // BEFORE any early return: a settled enemy is still a data point, and once a region
+        // converges the settled ones are the majority. Sampling only the mutated ones would show us
+        // the population we changed rather than the population that is there.
+        tally.note_sample(chr, &carried);
+    }
     if settled_on_target(&carried, target) {
         return; // carrying the tier and NOTHING else -- the only state worth leaving alone
     }
