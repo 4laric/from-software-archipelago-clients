@@ -16,9 +16,9 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
-    NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind, is_dlc_bucket,
-    is_scaling_speffect, raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
-    speffect_id_for_tier, tier_for_region, tier_rates,
+    NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind, band_native_tier,
+    is_dlc_bucket, is_scaling_speffect, native_tier, raw_target_for_region, region_name_for_bucket,
+    scale_action, scaling_kind, speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -237,6 +237,23 @@ struct SweepTally {
     /// only the former joins to `NpcParam`, and the first version of this census logged the latter,
     /// which is why it named ids like `8000` that do not exist in the table at all.
     unrunged_ids: Vec<i32>,
+    /// Carried a BAND row and NO ladder rung. The class the band-as-native-tier ruling is about.
+    band_only: u32,
+    /// Carried a BAND row AND a ladder rung -- these take the Replace path today, which strips the
+    /// band. Where the band is the stronger of the two, that is a DOWN-scale nobody ordered.
+    band_and_rung: u32,
+    /// 🛑 THE FALSIFIER. Samples of `(band-implied tier, getSoul-table tier)` for entities that have
+    /// both. The band-as-native-tier ruling PREDICTS band >= table for most carriers. If this log
+    /// shows the band routinely BELOW the table, the band is not a strength statement and the ruling
+    /// does not survive -- so this pair is the thing to read first, not the counts.
+    band_vs_table: Vec<(usize, usize)>,
+    /// Entities that ALREADY carry our target rung and still carry some other scaling effect.
+    ///
+    /// Non-zero means the unidentified mechanism RE-APPLIES a band after we swept -- and because
+    /// `scale_one` returns early once the target is present, we never clear it, so it stacks under
+    /// our rung indefinitely. Counted before that early return, which is the only place it is
+    /// visible. Behaviour is unchanged; this only measures.
+    residue: u32,
     /// Distinct non-ladder ids found inside the clear range, capped. WITHOUT this the census says
     /// "199 of 240 enemies carried something we stripped" and cannot say WHAT -- and only 20 rows in
     /// all of `NpcParam` carry a non-ladder in-range effect innately, so nearly all of those 199 are
@@ -253,6 +270,12 @@ impl SweepTally {
         self.unrunged += 1;
         if self.unrunged_ids.len() < UNRUNGED_ID_CAP && !self.unrunged_ids.contains(&npc_param_id) {
             self.unrunged_ids.push(npc_param_id);
+        }
+    }
+
+    fn note_pair(&mut self, band: usize, table: usize) {
+        if self.band_vs_table.len() < UNRUNGED_ID_CAP {
+            self.band_vs_table.push((band, table));
         }
     }
 
@@ -484,7 +507,7 @@ pub fn tick() -> Option<String> {
     // once a region settles the numbers stop moving and the line stops repeating, which the old
     // condition did not guarantee. Same idiom as the phantom census above.
     {
-        type ScaleLine = (i32, i32, u32, u32, u32, u32, u32);
+        type ScaleLine = (i32, i32, u32, u32, u32, u32, u32, u32, u32, u32);
         static LAST: Mutex<Option<ScaleLine>> = Mutex::new(None);
         let line: ScaleLine = (
             region,
@@ -494,6 +517,9 @@ pub fn tick() -> Option<String> {
             tally.left_vanilla,
             tally.other_in_range,
             tally.scaled_by_native,
+            tally.band_only,
+            tally.band_and_rung,
+            tally.residue,
         );
         let changed = match LAST.lock() {
             Ok(mut last) => {
@@ -520,7 +546,8 @@ pub fn tick() -> Option<String> {
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
-                 vanilla {}, npc_param_ids {:?}), other-in-range {} {:?}",
+                 vanilla {}, npc_param_ids {:?}), other-in-range {} {:?}; band-only {}, \
+                 band+rung {}, band_vs_table {:?}, residue {}",
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
@@ -530,6 +557,10 @@ pub fn tick() -> Option<String> {
                 tally.unrunged_ids,
                 tally.other_in_range,
                 tally.other_ids,
+                tally.band_only,
+                tally.band_and_rung,
+                tally.band_vs_table,
+                tally.residue,
             );
         }
     }
@@ -597,33 +628,61 @@ fn scale_one(
     if &chr.field_ins_handle == player_handle {
         return; // never scale the player
     }
-    if chr.special_effect.entries().any(|e| e.param_id == target) {
-        return; // already on the right tier
-    }
-    // Collect first (entries() borrows immutably) then remove (borrows mutably).
-    let stale: Vec<i32> = chr
+    // Collect first (entries() borrows immutably) then remove (borrows mutably). Collected BEFORE
+    // the already-on-target check so that path can be measured -- see `SweepTally::residue`.
+    let carried: Vec<i32> = chr
         .special_effect
         .entries()
         .map(|e| e.param_id)
         .filter(|&id| is_scaling_speffect(id))
         .collect();
+    if carried.contains(&target) {
+        // Already on the right tier. Behaviour unchanged (we still return), but count anything ELSE
+        // in the clear range that is riding along: that is an effect applied AFTER our sweep, and
+        // this early return is the reason it never gets cleared.
+        if carried.iter().any(|&id| id != target) {
+            tally.residue += 1;
+            for &id in &carried {
+                if id != target {
+                    tally.note_other(id);
+                }
+            }
+        }
+        return;
+    }
+    let stale = carried;
 
     // CLASSIFY. `!stale.is_empty()` is NOT "this enemy had a vanilla tier" -- the clear range is the
     // whole 7000..8000 block and only some of it is the ladder (er_logic::scaling::ScalingKind).
     let mut carried_ladder_rung = false;
     let mut carried_other = false;
+    let mut band_tier: Option<usize> = None;
     for &id in &stale {
         match scaling_kind(id) {
             Some(ScalingKind::Ladder) => carried_ladder_rung = true,
             Some(ScalingKind::OtherInRange) => {
                 carried_other = true;
                 tally.note_other(id);
+                // Keep the STRONGEST band row if an entity somehow carries several.
+                if let Some(t) = band_native_tier(id) {
+                    band_tier = Some(band_tier.map_or(t, |cur: usize| cur.max(t)));
+                }
             }
             None => {}
         }
     }
     if carried_other {
         tally.other_in_range += 1;
+    }
+    if let Some(band) = band_tier {
+        if carried_ladder_rung {
+            tally.band_and_rung += 1;
+        } else {
+            tally.band_only += 1;
+        }
+        if let Some(table) = native_tier(chr.npc_param_id) {
+            tally.note_pair(band, table);
+        }
     }
     if !carried_ladder_rung {
         tally.note_unrunged(chr.npc_param_id);

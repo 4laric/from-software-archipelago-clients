@@ -24,9 +24,10 @@
 //! # What is NOT in the ladder, and why
 //!
 //! * `7210..7280` — a separate ascending sub-run (5.3x..5.8x). Different purpose; not sphere depth.
-//! * `7400..7680` — DESCENDING (3.43x down to 1.0x): the co-op GUEST-COUNT set — `haveSoulRate`
-//!   steps 5→4→3→2 as the multiplier falls, so the top of the band is the fullest session, not the
-//!   emptiest. Not usable as difficulty, and cleared deliberately (param-verified 2026-08-05).
+//! * `7400..7680` — the BAND. 3.434x down to ~1.0x, `haveSoulRate` 2-5. 🛑 I called this the co-op
+//!   guest-count set and that was WRONG: a solo log (2026-08-05) showed SEVEN distinct band ids on
+//!   one player at once, and guest count is a single session-wide value. It is per-ENEMY. See
+//!   `BAND_TIERS` — it is a native-strength SOURCE, not a rung, and it is still cleared.
 //! * `7800..7902` — `spCategory 140`, a different stacking class entirely.
 //! * `20007000..20007150` — the DLC block, and the literal CONTINUATION of this one: `7170` is
 //!   `7.047` and `20007000` is `7.046875`, the same rung. It runs on to **16.64x**, but its `attack`
@@ -220,9 +221,16 @@ pub fn is_scaling_speffect(param_id: i32) -> bool {
 }
 
 /// A rung of the area-scaling LADDER proper — base `7010..7200` (the `SCALING_TIERS` ids) or its DLC
-/// re-emission `20007xxx`. Narrower than `is_scaling_speffect` on purpose; see `ScalingKind`.
+/// re-emission. Narrower than `is_scaling_speffect` on purpose; see `ScalingKind`.
+///
+/// 🛑 THE DLC ARM MUST EXCLUDE THE BAND. It used to be a blanket `DLC_SCALING_ID_RANGE.contains()`,
+/// and the DLC block carries BOTH families: `20007000..20007350` is the ladder (`haveSoulRate 1`) and
+/// `20007400..20007750` is the band (`haveSoulRate 2`). So every DLC band carrier was classified as a
+/// rung and sent down the `ScaleAction::Replace` path — which is BIDIRECTIONAL, and applies the
+/// region tier absolutely. A test in this file failed on `20007400` the moment the band table
+/// existed; without the table the range read as obviously correct.
 pub fn is_ladder_rung(param_id: i32) -> bool {
-    DLC_SCALING_ID_RANGE.contains(&param_id)
+    (DLC_SCALING_ID_RANGE.contains(&param_id) && !is_band_rung(param_id))
         || SCALING_TIERS.iter().any(|t| t.speffect_id == param_id)
 }
 
@@ -254,6 +262,116 @@ pub fn scaling_kind(param_id: i32) -> Option<ScalingKind> {
     } else {
         None
     }
+}
+
+/// The BAND: a second family of `spCategory 0` scaling rows, distinct from the ladder.
+///
+/// ⭐⭐⭐ **The discriminator is `haveSoulRate`, not the id range.** Every ladder row is
+/// `haveSoulRate 1`; every band row is 2-5. The base game has both (`7010..7200` ladder,
+/// `7400..7680` band) and so does the DLC block (`20007000..20007350` ladder in two identical
+/// copies, `20007400..20007750` band in two). That parallel structure is why this is a family and
+/// not a curiosity.
+///
+/// 🛑 WHAT IT IS NOT. I identified this as the co-op guest-count ladder, from `haveSoulRate` stepping
+/// 5 -> 4 -> 3 -> 2 as the multiplier falls. A solo log (2026-08-05) refuted it outright: seven
+/// distinct band ids were live on one player at once, and guest count is a single session-wide value.
+/// It is applied per-ENEMY, at runtime, by a mechanism we have not identified -- nothing carries a
+/// band id innately in `NpcParam` (all 7,039 rows checked; the only non-ladder in-range id found
+/// innately is `7000`, on 20 rows).
+///
+/// 🛑 WHAT WE USE IT FOR, AND WHY THAT IS SAFE WITHOUT KNOWING WHAT IT IS. Only what it measurably
+/// DOES: an unconditional (`conditionHp -1`), indefinite (`effectEndurance -1`) `maxHpRate`
+/// multiplier in the ladder's own units. If its purpose turns out to be something else entirely, the
+/// worst case is that we under-scale relative to an intent we could not see -- a blemish. Nothing
+/// here reasons from what it is FOR.
+///
+/// `(speffect_id, maxHpRate)`. Not monotone: `7520` sits above `7510`, and the `7560..7680` tail is
+/// flat at 1.015 above `7550`'s 1.001. Do not assert descending.
+pub const BAND_TIERS: &[(i32, f32)] = &[
+    (7400, 3.434),         // 1.902x atk, haveSoulRate 5
+    (7410, 3.122),         // 1.965x atk, haveSoulRate 5
+    (7420, 2.857),         // 1.768x atk, haveSoulRate 5
+    (7430, 2.355),         // 1.680x atk, haveSoulRate 5
+    (7440, 2.146),         // 1.609x atk, haveSoulRate 4
+    (7450, 2.099),         // 1.483x atk, haveSoulRate 4
+    (7460, 1.845),         // 1.400x atk, haveSoulRate 4
+    (7470, 1.523),         // 1.314x atk, haveSoulRate 3
+    (7480, 1.479),         // 1.239x atk, haveSoulRate 3
+    (7490, 1.461),         // 1.200x atk, haveSoulRate 3
+    (7500, 1.296),         // 1.150x atk, haveSoulRate 3
+    (7510, 1.253),         // 1.141x atk, haveSoulRate 3
+    (7520, 1.264),         // 1.135x atk, haveSoulRate 2
+    (7530, 1.191),         // 1.134x atk, haveSoulRate 2
+    (7540, 1.008),         // 1.122x atk, haveSoulRate 2
+    (7550, 1.001),         // 1.094x atk, haveSoulRate 2
+    (7560, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7570, 1.001),         // 1.094x atk, haveSoulRate 2
+    (7580, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7590, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7600, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7610, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7620, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7630, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7640, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7650, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7660, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7670, 1.015),         // 1.134x atk, haveSoulRate 2
+    (7680, 1.015),         // 1.134x atk, haveSoulRate 2
+    (20007400, 1.0981221), // 1.024x atk, haveSoulRate 2
+    (20007410, 1.0839258), // 1.023x atk, haveSoulRate 2
+    (20007420, 1.0779487), // 1.022x atk, haveSoulRate 2
+    (20007430, 1.0781562), // 1.020x atk, haveSoulRate 2
+    (20007440, 1.0782156), // 1.020x atk, haveSoulRate 2
+    (20007450, 1.0768288), // 1.020x atk, haveSoulRate 2
+    (20007460, 1.0770154), // 1.018x atk, haveSoulRate 2
+    (20007470, 1.0771002), // 1.017x atk, haveSoulRate 2
+    (20007480, 1.0693364), // 1.016x atk, haveSoulRate 2
+    (20007490, 1.0541972), // 1.015x atk, haveSoulRate 2
+    (20007500, 1.0456709), // 1.014x atk, haveSoulRate 2
+    (20007510, 1.0388143), // 1.013x atk, haveSoulRate 2
+    (20007520, 1.0313383), // 1.012x atk, haveSoulRate 2
+    (20007530, 1.0206945), // 1.011x atk, haveSoulRate 2
+    (20007540, 1.017251),  // 1.011x atk, haveSoulRate 2
+    (20007550, 1.01),      // 1.010x atk, haveSoulRate 2
+    (20007600, 1.0981221), // 1.024x atk, haveSoulRate 2
+    (20007610, 1.0839258), // 1.023x atk, haveSoulRate 2
+    (20007620, 1.0779487), // 1.022x atk, haveSoulRate 2
+    (20007630, 1.0781562), // 1.020x atk, haveSoulRate 2
+    (20007640, 1.0782156), // 1.020x atk, haveSoulRate 2
+    (20007650, 1.0768288), // 1.020x atk, haveSoulRate 2
+    (20007660, 1.0770154), // 1.018x atk, haveSoulRate 2
+    (20007670, 1.0771002), // 1.017x atk, haveSoulRate 2
+    (20007680, 1.0693364), // 1.016x atk, haveSoulRate 2
+    (20007690, 1.0541972), // 1.015x atk, haveSoulRate 2
+    (20007700, 1.0456709), // 1.014x atk, haveSoulRate 2
+    (20007710, 1.0388143), // 1.013x atk, haveSoulRate 2
+    (20007720, 1.0313383), // 1.012x atk, haveSoulRate 2
+    (20007730, 1.0206945), // 1.011x atk, haveSoulRate 2
+    (20007740, 1.017251),  // 1.011x atk, haveSoulRate 2
+    (20007750, 1.01),      // 1.010x atk, haveSoulRate 2
+];
+
+/// Whether `param_id` is a band row (see [`BAND_TIERS`]).
+pub fn is_band_rung(param_id: i32) -> bool {
+    BAND_TIERS.iter().any(|&(id, _)| id == param_id)
+}
+
+/// The native ladder tier a carried band row implies: the LOWEST rung at least as strong as it.
+///
+/// Ceiling, not nearest. Rounding to the nearest rung could land BELOW the multiplier the enemy
+/// actually carries, and the whole point of a native tier is to be a floor we must clear before we
+/// touch anything. Every ambiguity in this file resolves toward not touching.
+pub fn band_native_tier(param_id: i32) -> Option<usize> {
+    let hp = BAND_TIERS
+        .iter()
+        .find(|&&(id, _)| id == param_id)
+        .map(|&(_, hp)| hp)?;
+    Some(
+        SCALING_TIERS
+            .iter()
+            .position(|t| t.hp >= hp)
+            .unwrap_or(NUM_TIERS - 1),
+    )
 }
 
 /// Leave an UNRUNGED enemy vanilla at the bottom of the ladder (#346, phase 0).
@@ -1571,6 +1689,60 @@ mod tests {
                 scale_action(false, absent, tier),
                 ScaleAction::NoTouch,
                 "an unclassified enemy was scaled at tier {tier}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_band_row_is_not_a_ladder_rung() {
+        // An unfired guard is untested: direct calls, both families, both id blocks.
+        for id in [7400, 7430, 7550, 7680, 20007400, 20007750] {
+            assert!(!is_ladder_rung(id), "{id} classified as a ladder rung");
+            assert!(is_band_rung(id), "{id} not recognised as a band row");
+            assert_eq!(scaling_kind(id), Some(ScalingKind::OtherInRange));
+        }
+        for id in [7010, 7200, 20007000] {
+            assert!(is_ladder_rung(id));
+            assert!(!is_band_rung(id), "{id} misfiled as a band row");
+        }
+    }
+
+    #[test]
+    fn a_band_row_implies_the_lowest_rung_at_least_as_strong() {
+        // BOTH ENDS, deliberately. Quoting only one end of this band is exactly how it got
+        // misidentified twice -- once as "floors at 1.001x" (it tops at 3.434x), once as the co-op
+        // guest ladder.
+        //
+        // 7400 = 3.434x -> the first rung with hp >= 3.434 is 7100 (3.703), index 9.
+        assert_eq!(band_native_tier(7400), Some(9));
+        // 7550 = 1.001x -> below the bottom rung (1.141), so tier 0.
+        assert_eq!(band_native_tier(7550), Some(0));
+        // The flat tail is 1.015x -- still under the bottom rung.
+        assert_eq!(band_native_tier(7680), Some(0));
+        // Ceiling, never nearest: 7430 = 2.355x sits between 7060 (2.266) and 7070 (2.406);
+        // nearest would pick 2.266 and UNDERSTATE the enemy. We must pick 7070.
+        assert_eq!(band_native_tier(7430), Some(6));
+        assert_eq!(tier_rates(6).speffect_id, 7070);
+        assert!(tier_rates(6).hp >= 2.355);
+        assert!(tier_rates(5).hp < 2.355);
+        // Not a band row.
+        assert_eq!(band_native_tier(7010), None);
+    }
+
+    #[test]
+    fn every_band_row_maps_somewhere_and_none_is_a_rung() {
+        for &(id, hp) in BAND_TIERS {
+            assert!(
+                is_scaling_speffect(id),
+                "band row {id} is outside the clear range"
+            );
+            assert!(!is_ladder_rung(id), "band row {id} would be Replaced");
+            let t = band_native_tier(id).expect("band row maps");
+            assert!(t < NUM_TIERS);
+            // The implied rung is genuinely at least as strong, unless we clamped at the top.
+            assert!(
+                tier_rates(t).hp >= hp || t == NUM_TIERS - 1,
+                "band {id} ({hp}x) mapped to a WEAKER rung {t}"
             );
         }
     }
