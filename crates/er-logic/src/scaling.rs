@@ -286,14 +286,22 @@ pub enum ScaleAction {
     NoTouch,
 }
 
-/// Native ladder index for an `npc_id`, or `None` if we have no defensible answer.
+/// Native ladder index for an **`npc_param_id`**, or `None` if we have no defensible answer.
+///
+/// 🛑 THE KEY IS `ChrIns::npc_param_id`, NOT `ChrIns::npc_id`. They are different fields and the
+/// crate documents both: `npc_param_id` is "NPC param ID for this character", an 8-9 digit
+/// `NpcParam` row; `npc_id` is "4 number identifier for this npc, eg. 8000 for Torrent" — a
+/// character/model id. This table is built from `NpcParam` row ids, so keying it on `npc_id` looks
+/// entirely reasonable, compiles, runs, and misses EVERY row. Caught from a live log
+/// (2026-08-05): the census reported unrunged `npc_ids [0, 100, 1000, 3010, 6001, 8000]`, all four
+/// digits, and only three of them exist in `NpcParam` at all.
 ///
 /// Derived offline from `getSoul` — the rune reward — calibrated against the 4,214 rows that carry
 /// both a reward and a rung (Spearman 0.996). See `tools/derive_native_tiers.py` for the method and
 /// for why `hp` is not the signal.
-pub fn native_tier(npc_id: i32) -> Option<usize> {
+pub fn native_tier(npc_param_id: i32) -> Option<usize> {
     crate::native_tiers::NATIVE_TIERS
-        .binary_search_by_key(&npc_id, |&(id, _)| id)
+        .binary_search_by_key(&npc_param_id, |&(id, _)| id)
         .ok()
         .map(|i| crate::native_tiers::NATIVE_TIERS[i].1 as usize)
 }
@@ -312,11 +320,15 @@ pub fn native_tier(npc_id: i32) -> Option<usize> {
 /// 🛑 UP ONLY for derived entities. The ladder has no rung below 1.0, so "scale this hand-tuned
 /// enemy DOWN" is not expressible yet; `Apply` fires only when `target_tier` exceeds the native one.
 /// The down half needs the off-label `20018xxx` pair and is gated on a live probe.
-pub fn scale_action(carried_ladder_rung: bool, npc_id: i32, target_tier: usize) -> ScaleAction {
+pub fn scale_action(
+    carried_ladder_rung: bool,
+    npc_param_id: i32,
+    target_tier: usize,
+) -> ScaleAction {
     if carried_ladder_rung {
         return ScaleAction::Replace;
     }
-    match native_tier(npc_id) {
+    match native_tier(npc_param_id) {
         Some(native) if target_tier > native => ScaleAction::Apply,
         _ => ScaleAction::NoTouch,
     }
@@ -1561,6 +1573,46 @@ mod tests {
                 "an unclassified enemy was scaled at tier {tier}"
             );
         }
+    }
+
+    #[test]
+    fn the_table_is_keyed_on_npc_param_id_not_the_four_digit_npc_id() {
+        // THE MOTIVATING CASE for this fix. `ChrIns` carries BOTH `npc_param_id` (the `NpcParam`
+        // row) and `npc_id` ("4 number identifier ... eg. 8000 for Torrent" -- a chr/model id).
+        // Keying on the wrong one compiles and runs. A live log exposed it: the census named
+        // unrunged ids [0, 100, 1000, 3010, 6001, 8000], every one of them four digits.
+        //
+        // 🛑 THE TWO ID SPACES OVERLAP, so this was never merely inert. Most chr ids miss the table
+        // entirely -- but `NpcParam` also has low-numbered rows, so a handful of chr ids land on a
+        // REAL and completely unrelated row and come back with a confident wrong answer. That is the
+        // dangerous half, and it is why this test asserts the overlap exists rather than asserting
+        // "small ids never resolve" (which is what I first wrote here, and the data refuted it).
+        let miss = [3010i32, 6001, 6060, 6090, 6100, 8000];
+        for id in miss {
+            assert_eq!(
+                native_tier(id),
+                None,
+                "chr id {id} resolved to a native tier"
+            );
+        }
+        let collide: Vec<i32> = [0i32, 1, 100, 540, 1000, 9999]
+            .into_iter()
+            .filter(|&id| native_tier(id).is_some())
+            .collect();
+        assert!(
+            !collide.is_empty(),
+            "the id spaces were expected to OVERLAP -- if they no longer do, this test's premise \
+             (and the danger it documents) has changed and the comment above needs rewriting"
+        );
+
+        // And a real NpcParam row id, far outside chr-id space, resolves.
+        let row_id = crate::native_tiers::NATIVE_TIERS
+            .iter()
+            .map(|&(id, _)| id)
+            .max()
+            .expect("table is not empty");
+        assert!(row_id > 9999, "table is not keyed on NpcParam row ids");
+        assert!(native_tier(row_id).is_some());
     }
 
     #[test]
