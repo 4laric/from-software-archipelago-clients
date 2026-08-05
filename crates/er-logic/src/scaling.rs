@@ -1894,7 +1894,8 @@ mod tests {
         // A getSoul-derived tier is measured ON the enemy; the area index is measured on its
         // neighbours. When both exist the enemy's own wins, at whatever value -- including when that
         // makes it NoTouch and the area would have moved it.
-        let placed = NATIVE_TIERS[NATIVE_TIERS.len() - 1].0; // a real, high-index row
+        let table = crate::native_tiers::NATIVE_TIERS;
+        let placed = table[table.len() - 1].0; // a real, high-index row
         let own = native_tier(placed).expect("fixture must be in the table");
         assert_eq!(presumed_native_tier(placed, Some(0)), Some(own));
         assert!(!placed_by_area(placed, Some(0)));
