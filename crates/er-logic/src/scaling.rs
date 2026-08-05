@@ -1927,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn a_carved_out_character_is_carved_out_in_ALL_of_its_rows() {
+    fn a_carved_out_character_is_carved_out_in_all_of_its_rows() {
         // ⭐⭐⭐ PER CHARACTER, NOT PER ROW. Gideon owns four unrunged rows: 523240070 has no reward,
         // and 523240000 / 523240079 / 523240179 each carry getSoul 4000. Keyed per row, the first
         // would be left vanilla and the other three placed by their own derived tier -- so which
@@ -1966,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn a_carved_out_enemy_still_scales_when_it_can_be_placed_WITHOUT_the_area() {
+    fn a_carved_out_enemy_still_scales_when_placed_without_the_area() {
         // 🛑 NOT A GENERAL BOSS EXCLUSION. The carve-out refuses the AREA's vouching, nothing else:
         // a named enemy that carries a rung is still a true re-tier, in both directions.
         let named = crate::native_tiers::AREA_EXCLUDED;
