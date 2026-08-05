@@ -1902,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn the_area_does_not_scale_an_enemy_DOWN_yet() {
+    fn the_area_does_not_scale_an_enemy_down_yet() {
         // Altus at sphere 0 (2026-08-05): target 5, area index 7. The enemy is presumed STRONGER
         // than the tier, so it is left alone -- the down half needs the 20018xxx pair, and applying
         // a lower rung would only ADD a multiplier, never subtract one.
