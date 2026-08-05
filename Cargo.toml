@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/archipelago-rs",
     "crates/ds3-archipelago",
     "crates/sdt-archipelago",
     "crates/shared",
@@ -20,7 +21,7 @@ repository = "https://github.com/fswap/fromsoftware-archipelago"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
-archipelago_rs = { git = "https://github.com/nex3/archipelago_rs" }
+archipelago_rs = { path = "crates/archipelago-rs" }
 bincode = "2.0.0"
 fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs" }
 fromsoftware-extra-shared = { git = "https://github.com/nex3/fromsoftware-extra", branch = "sekiro-save" }
