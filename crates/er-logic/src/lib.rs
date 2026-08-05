@@ -40,6 +40,7 @@ pub mod map_reveal_replay;
 pub mod marker;
 pub mod marker_replay;
 pub mod name_override;
+pub mod native_tiers;
 pub mod options;
 pub mod ownership;
 pub mod physick;

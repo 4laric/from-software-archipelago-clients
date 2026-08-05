@@ -36,7 +36,10 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Altus",
         lock_item: "Altus Lock",
         open_flag: Some(73204),
-        play_regions: &[30070, 30080, 30100, 30120, 30130, 31180, 31190, 32040, 32050, 34120, 34140, 63000, 63010],
+        play_regions: &[
+            30070, 30080, 30100, 30120, 30130, 31180, 31190, 32040, 32050, 34120, 34140, 63000,
+            63010,
+        ],
     },
     BakedRegionLock {
         region: "Ancient Ruins",
@@ -54,7 +57,10 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Caelid",
         lock_item: "Caelid Lock",
         open_flag: Some(73207),
-        play_regions: &[30140, 30150, 30160, 31100, 31110, 31200, 31210, 32070, 32080, 34130, 64000, 64010, 64020],
+        play_regions: &[
+            30140, 30150, 30160, 31100, 31110, 31200, 31210, 32070, 32080, 34130, 64000, 64010,
+            64020,
+        ],
     },
     BakedRegionLock {
         region: "Cerulean",
@@ -120,13 +126,17 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Limgrave",
         lock_item: "Limgrave Lock",
         open_flag: Some(73100),
-        play_regions: &[30020, 30040, 30110, 31000, 31030, 31150, 31170, 32010, 34100, 61000, 61010],
+        play_regions: &[
+            30020, 30040, 30110, 31000, 31030, 31150, 31170, 32010, 34100, 61000, 61010,
+        ],
     },
     BakedRegionLock {
         region: "Liurnia",
         lock_item: "Liurnia Lock",
         open_flag: Some(73202),
-        play_regions: &[30030, 30050, 30060, 31040, 31050, 31060, 32020, 34110, 39200, 62000, 62010, 62020],
+        play_regions: &[
+            30030, 30050, 30060, 31040, 31050, 31060, 32020, 34110, 39200, 62000, 62010, 62020,
+        ],
     },
     BakedRegionLock {
         region: "Mohgwyn",
@@ -138,7 +148,9 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Mountaintops of the Giants",
         lock_item: "Mountaintops of the Giants Lock",
         open_flag: Some(73017),
-        play_regions: &[30170, 30180, 30190, 30200, 31120, 31220, 32110, 65000, 65010, 65020, 65030],
+        play_regions: &[
+            30170, 30180, 30190, 30200, 31120, 31220, 32110, 65000, 65010, 65020, 65030,
+        ],
     },
     BakedRegionLock {
         region: "Mt. Gelmir",
@@ -215,7 +227,10 @@ mod generated_tests {
     fn nonempty_sorted_unique() {
         assert!(!REGION_LOCKS.is_empty());
         assert!(REGION_LOCKS.windows(2).all(|w| w[0].region < w[1].region));
-        let mut ids: Vec<i32> = REGION_LOCKS.iter().flat_map(|r| r.play_regions.iter().copied()).collect();
+        let mut ids: Vec<i32> = REGION_LOCKS
+            .iter()
+            .flat_map(|r| r.play_regions.iter().copied())
+            .collect();
         let n = ids.len();
         ids.sort_unstable();
         ids.dedup();

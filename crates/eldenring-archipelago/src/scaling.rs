@@ -16,9 +16,9 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
-    NUM_TIERS, RegionToastLedger, ScalingConfig, is_dlc_bucket, is_scaling_speffect,
-    raw_target_for_region, region_name_for_bucket, speffect_id_for_tier, tier_for_region,
-    tier_rates,
+    NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind, is_dlc_bucket,
+    is_scaling_speffect, raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
+    speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -209,6 +209,46 @@ pub fn configure(sd: &Value) {
 /// What drove the tier for a region this sweep -- captured while `CONFIG` is locked so the emit can
 /// explain the applied speffect (raw sphere target, normalization ceiling, resolved tier + its HP/atk
 /// rates, and whether this is a DLC region -- a bucket with a blessing floor). Diagnostic only.
+/// Per-sweep census of WHAT WE FOUND, not just what we changed (#346).
+///
+/// Three different failures look identical in play -- (a) the entity is never swept because it lives
+/// in a `ChrSet` we don't walk, (b) it is swept but carried no vanilla ladder rung so the rung we
+/// apply is a buff, (c) it is swept and the tier is simply wrong -- and until now no log line told
+/// them apart. `scale_one` already computed the answer to (b) and threw it away.
+///
+/// 🛑 The classification is `ScalingKind`, NOT "was the cleared set empty". The clear range is the
+/// whole of `7000..8000`, so a `7800`-block effect makes the cleared set non-empty while the enemy
+/// still has no area-scaling tier. See `er_logic::scaling::ScalingKind`.
+#[derive(Default)]
+struct SweepTally {
+    /// (Re)applied the tier -- the number the log line has always printed.
+    scaled: u32,
+    /// Swept, carried NO ladder rung: hand-tuned. The class #346 is about.
+    unrunged: u32,
+    /// Unrunged AND left completely untouched -- either we have no native tier for it, or the
+    /// target is not stronger than the one we have.
+    left_vanilla: u32,
+    /// Unrunged, but we HAD a native tier and the target beat it, so it scaled up.
+    scaled_by_native: u32,
+    /// Carried something the clear catches that is not a rung (`7210..`, `7800..`).
+    other_in_range: u32,
+    /// Distinct `npc_id`s of unrunged entities, capped -- enough to NAME the offender in one log
+    /// without turning a per-sweep line into a wall of ids.
+    unrunged_ids: Vec<i32>,
+}
+
+/// Cap on `SweepTally::unrunged_ids`. A census, not a dump.
+const UNRUNGED_ID_CAP: usize = 12;
+
+impl SweepTally {
+    fn note_unrunged(&mut self, npc_id: i32) {
+        self.unrunged += 1;
+        if self.unrunged_ids.len() < UNRUNGED_ID_CAP && !self.unrunged_ids.contains(&npc_id) {
+            self.unrunged_ids.push(npc_id);
+        }
+    }
+}
+
 struct RegionScaleDbg {
     tier: usize,
     raw_target: Option<i32>,
@@ -318,16 +358,17 @@ pub fn tick() -> Option<String> {
             .and_then(|mut l| l.on_region(cfg, region, region_name_for_bucket(region)));
         (speffect_id_for_tier(tier), dbg, entry_toast)
     };
+    let target_tier = dbg.tier;
 
-    let mut scaled = 0u32;
+    let mut tally = SweepTally::default();
     // Overworld enemies.
     for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
-        scaled += scale_one(chr, target, &player_handle);
+        scale_one(chr, target, target_tier, &player_handle, &mut tally);
     }
     // Legacy-dungeon / block chr sets.
     for slot in wcm.chr_sets.iter().flatten() {
         for chr in sweepable_characters(slot) {
-            scaled += scale_one(chr, target, &player_handle);
+            scale_one(chr, target, target_tier, &player_handle, &mut tally);
         }
     }
     // HOSTILE-PHANTOM SWEEP -- revised 2026-07-19 (Alaric: "scaling works for mobs/bosses; NPC
@@ -373,10 +414,16 @@ pub fn tick() -> Option<String> {
     // (ghost_chr_set is cosmetic bloodstain/message/replay playback -- non-interactive, left alone;
     // the census still watches it in case that assumption is ever wrong.)
     for p in sweepable_characters(&wcm.player_chr_set) {
-        scaled += scale_hostile_phantom(&mut p.chr_ins, target, &player_handle);
+        scale_hostile_phantom(
+            &mut p.chr_ins,
+            target,
+            target_tier,
+            &player_handle,
+            &mut tally,
+        );
     }
     for c in sweepable_characters(&wcm.summon_buddy_chr_set) {
-        scaled += scale_hostile_phantom(c, target, &player_handle);
+        scale_hostile_phantom(c, target, target_tier, &player_handle, &mut tally);
     }
 
     // ---- SETTLE RELEASE TELEMETRY (one line per transition) ------------------------------------
@@ -399,11 +446,12 @@ pub fn tick() -> Option<String> {
             .collect();
         log::info!(
             "enemy-scaling: settle release after {}ms (region stable {}ms, flaps {}); swept \
-             {scaled}; chr_load_status seen unloaded={} init={} active={} netinit={} ready={} \
+             {}; chr_load_status seen unloaded={} init={} active={} netinit={} ready={} \
              unloading={}",
             diag.since_transition_ms,
             diag.since_region_change_ms,
             diag.flaps,
+            tally.scaled,
             hist[0],
             hist[1],
             hist[2],
@@ -413,23 +461,62 @@ pub fn tick() -> Option<String> {
         );
     }
 
-    if scaled > 0 {
-        let RegionScaleDbg {
-            tier,
-            raw_target,
-            max_target,
-            dlc_region,
-            hp,
-            attack,
-        } = dbg;
-        let tgt = raw_target.map_or_else(|| "unmapped".to_string(), |t| t.to_string());
-        log::info!(
-            "enemy-scaling: region {region} -> speffect {target} \
-             (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x atk{}); \
-             (re)scaled {scaled} enemy(ies)",
-            NUM_TIERS - 1,
-            if dlc_region { ", DLC region" } else { "" },
+    // Emit on CHANGE, not on `scaled > 0`.
+    //
+    // Two reasons, and the first one is a trap. (1) Unrunged entities that the bottom-rung skip
+    // leaves alone never converge -- they are re-examined and re-counted every sweep and NEVER
+    // scaled -- so a `scaled > 0` gate would hide the census in exactly the region the census was
+    // written for. (2) Gating on the whole tuple instead is strictly QUIETER than what shipped:
+    // once a region settles the numbers stop moving and the line stops repeating, which the old
+    // condition did not guarantee. Same idiom as the phantom census above.
+    {
+        type ScaleLine = (i32, i32, u32, u32, u32, u32, u32);
+        static LAST: Mutex<Option<ScaleLine>> = Mutex::new(None);
+        let line: ScaleLine = (
+            region,
+            target,
+            tally.scaled,
+            tally.unrunged,
+            tally.left_vanilla,
+            tally.other_in_range,
+            tally.scaled_by_native,
         );
+        let changed = match LAST.lock() {
+            Ok(mut last) => {
+                let changed = *last != Some(line);
+                if changed {
+                    *last = Some(line);
+                }
+                changed
+            }
+            // A poisoned lock costs telemetry, never the sweep.
+            Err(_) => false,
+        };
+        if changed && (tally.scaled > 0 || tally.unrunged > 0) {
+            let RegionScaleDbg {
+                tier,
+                raw_target,
+                max_target,
+                dlc_region,
+                hp,
+                attack,
+            } = dbg;
+            let tgt = raw_target.map_or_else(|| "unmapped".to_string(), |t| t.to_string());
+            log::info!(
+                "enemy-scaling: region {region} -> speffect {target} \
+                 (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
+                 atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
+                 vanilla {}, npc_ids {:?}), other-in-range {}",
+                NUM_TIERS - 1,
+                if dlc_region { ", DLC region" } else { "" },
+                tally.scaled,
+                tally.unrunged,
+                tally.scaled_by_native,
+                tally.left_vanilla,
+                tally.unrunged_ids,
+                tally.other_in_range,
+            );
+        }
     }
 
     entry_toast
@@ -454,34 +541,49 @@ fn is_hostile_phantom(t: ChrType) -> bool {
 }
 
 /// Scale one phantom-set entry ONLY if it is an actual hostile (see `is_hostile_phantom`); otherwise a
-/// no-op. Returns 1 if it (re)applied the tier. Logs once per hostile that gets scaled (scale_one
-/// no-ops once the entry already carries the tier), so a co-op session's log names exactly what landed.
+/// no-op. Logs once per hostile that gets scaled (scale_one no-ops once the entry already carries the
+/// tier), so a co-op session's log names exactly what landed.
 fn scale_hostile_phantom(
     chr: &mut ChrIns,
     target: i32,
+    target_tier: usize,
     player_handle: &eldenring::cs::FieldInsHandle,
-) -> u32 {
+    tally: &mut SweepTally,
+) {
     if !is_hostile_phantom(chr.chr_type) {
-        return 0;
+        return;
     }
     let (ty, team, npc_id) = (chr.chr_type, chr.team_type, chr.npc_id);
-    let applied = scale_one(chr, target, player_handle);
-    if applied > 0 {
+    let before = tally.scaled;
+    scale_one(chr, target, target_tier, player_handle, tally);
+    if tally.scaled > before {
         log::info!(
             "enemy-scaling: scaled hostile phantom (chr_type={ty:?} team={team} npc_id={npc_id})"
         );
     }
-    applied
 }
 
 /// Ensure one enemy carries exactly `target` as its scaling SpEffect: skip if it already has it, else
-/// clear any baked/stale scaling SpEffect (`70xx`) and apply `target`. Returns 1 if it (re)applied.
-fn scale_one(chr: &mut ChrIns, target: i32, player_handle: &eldenring::cs::FieldInsHandle) -> u32 {
+/// clear any baked/stale scaling SpEffect and apply `target` -- and record what we found on the way
+/// through (`SweepTally`).
+///
+/// 🛑 THE CLASSIFY-THEN-SKIP ORDER IS LOAD-BEARING. The bottom-rung skip returns BEFORE the remove
+/// loop. Stripping an enemy's vanilla state and then declining to replace it would be worse than
+/// either doing the whole thing or none of it -- and, because the sweep re-derives everything from
+/// what the enemy currently carries, it would also be irreversible: the evidence of what the enemy
+/// natively was is gone, so the next pass sees an unrunged enemy that genuinely has no rung.
+fn scale_one(
+    chr: &mut ChrIns,
+    target: i32,
+    target_tier: usize,
+    player_handle: &eldenring::cs::FieldInsHandle,
+    tally: &mut SweepTally,
+) {
     if &chr.field_ins_handle == player_handle {
-        return 0; // never scale the player
+        return; // never scale the player
     }
     if chr.special_effect.entries().any(|e| e.param_id == target) {
-        return 0; // already on the right tier
+        return; // already on the right tier
     }
     // Collect first (entries() borrows immutably) then remove (borrows mutably).
     let stale: Vec<i32> = chr
@@ -490,9 +592,44 @@ fn scale_one(chr: &mut ChrIns, target: i32, player_handle: &eldenring::cs::Field
         .map(|e| e.param_id)
         .filter(|&id| is_scaling_speffect(id))
         .collect();
+
+    // CLASSIFY. `!stale.is_empty()` is NOT "this enemy had a vanilla tier" -- the clear range is the
+    // whole 7000..8000 block and only some of it is the ladder (er_logic::scaling::ScalingKind).
+    let mut carried_ladder_rung = false;
+    let mut carried_other = false;
+    for &id in &stale {
+        match scaling_kind(id) {
+            Some(ScalingKind::Ladder) => carried_ladder_rung = true,
+            Some(ScalingKind::OtherInRange) => carried_other = true,
+            None => {}
+        }
+    }
+    if carried_other {
+        tally.other_in_range += 1;
+    }
+    if !carried_ladder_rung {
+        tally.note_unrunged(chr.npc_id);
+    }
+
+    // ...THEN decide, before anything is mutated.
+    //
+    // 🛑 `NoTouch` is the DEFAULT for anything we cannot place, and it is the whole point. What
+    // shipped resolved an unplaceable enemy to the region's rung, which on a hand-tuned endgame NPC
+    // in a shallow sphere is a multiplier stacked on stats that already assume you meet it at the
+    // end of the game. Leaving it vanilla is under-scaled in deep spheres -- a blemish -- and that
+    // trade is deliberate.
+    match scale_action(carried_ladder_rung, chr.npc_id, target_tier) {
+        ScaleAction::NoTouch => {
+            tally.left_vanilla += 1;
+            return;
+        }
+        ScaleAction::Apply => tally.scaled_by_native += 1,
+        ScaleAction::Replace => {}
+    }
+
     for id in stale {
         chr.remove_speffect(id);
     }
     chr.apply_speffect(target, false);
-    1
+    tally.scaled += 1;
 }
