@@ -550,14 +550,43 @@ pub fn scale_action(
     carried_ladder_rung: bool,
     npc_param_id: i32,
     target_tier: usize,
+    area_tier: Option<usize>,
 ) -> ScaleAction {
     if carried_ladder_rung {
         return ScaleAction::Replace;
     }
-    match native_tier(npc_param_id) {
+    match presumed_native_tier(npc_param_id, area_tier) {
         Some(native) if target_tier > native => ScaleAction::Apply,
         _ => ScaleAction::NoTouch,
     }
+}
+
+/// The strength we are willing to attribute to an enemy that carries no rung: its own `getSoul`
+/// tier if it has one, otherwise **the ground it is standing on**.
+///
+/// ⭐⭐⭐ ONE LEVEL PER REGION IS THE GOAL, and the area index is what makes the leftovers reachable.
+/// The 2026-08-05 Weeping census is the case: target tier 11, area index 1, **523 enemies at the tier
+/// and 69 left at vanilla in the same field**. Those 69 have no rung and no rune reward, so
+/// `native_tier` cannot place them and they sat out the region's difficulty entirely. The area index
+/// places them the way it places anything else vanilla put on that ground.
+///
+/// 🛑🛑 THIS ATTRIBUTES A STRENGTH WE DID NOT MEASURE ON THE ENEMY ITSELF, and for a hand-tuned boss
+/// that attribution is wrong in the dangerous direction: its base already assumes the end of the
+/// game, so a delta computed from the ground multiplies on top of endgame stats. That is the shape of
+/// the v0.3.4 one-shotting reports. Shipped deliberately and without a boss carve-out (Alaric,
+/// 2026-08-05: "all as a class"), with the sweep NAMING what it moves this way so the first log says
+/// which entities were picked up — rather than a player saying it.
+///
+/// 🛑 `None` area tier keeps the old behaviour exactly: too few untouched neighbours to say, so
+/// nothing is attributed and the enemy stays vanilla.
+pub fn presumed_native_tier(npc_param_id: i32, area_tier: Option<usize>) -> Option<usize> {
+    native_tier(npc_param_id).or(area_tier)
+}
+
+/// Did this enemy reach the region's tier only because the AREA vouched for it? The sweep logs these
+/// by id; see `presumed_native_tier` for why that census matters more than the count.
+pub fn placed_by_area(npc_param_id: i32, area_tier: Option<usize>) -> bool {
+    native_tier(npc_param_id).is_none() && area_tier.is_some()
 }
 
 /// Connect-time config, parsed from slot_data by the client (`regionSphereTargets` etc.).
@@ -1794,7 +1823,7 @@ mod tests {
         assert!(native_tier(absent).is_none());
         for tier in 0..NUM_TIERS {
             assert_eq!(
-                scale_action(false, absent, tier),
+                scale_action(false, absent, tier, None),
                 ScaleAction::NoTouch,
                 "an unclassified enemy was scaled at tier {tier}"
             );
@@ -1819,8 +1848,8 @@ mod tests {
         // Do not "fix" this test by making NoTouch scale something.
         let unplaceable = -1; // absent from NATIVE_TIERS, like every getSoul-less named boss
         for tier in 0..NUM_TIERS {
-            assert_eq!(scale_action(true, unplaceable, tier), ScaleAction::Replace);
-            assert_eq!(scale_action(false, unplaceable, tier), ScaleAction::NoTouch);
+            assert_eq!(scale_action(true, unplaceable, tier, None), ScaleAction::Replace);
+            assert_eq!(scale_action(false, unplaceable, tier, None), ScaleAction::NoTouch);
         }
     }
 
@@ -1831,8 +1860,53 @@ mod tests {
         // rune reward in NpcParam, so both resolve here -- and the sponge and the one-shots came from
         // the same multiplier, applied to stats that already assumed the end of the game.
         for tier in 0..NUM_TIERS {
-            assert_eq!(scale_action(false, -1, tier), ScaleAction::NoTouch);
+            assert_eq!(scale_action(false, -1, tier, None), ScaleAction::NoTouch);
         }
+    }
+
+    #[test]
+    fn the_area_places_an_enemy_its_own_reward_cannot() {
+        // THE MOTIVATING CASE (Weeping, 2026-08-05): region target tier 11, area index 1, and 69
+        // enemies with no rung and no getSoul sitting at vanilla while 523 neighbours carry the
+        // tier. With the area vouching for them they take the same path as everything else.
+        let unplaceable = -1; // absent from NATIVE_TIERS
+        assert_eq!(scale_action(false, unplaceable, 11, Some(1)), ScaleAction::Apply);
+        // ...and the region's own level is what they reach -- the area index is the enemy's PRESUMED
+        // NATIVE strength, never a cap on the region (clamping the tier toward the area index would
+        // drag every region back to vanilla geography, which is the thing the mod exists to override).
+        assert_eq!(presumed_native_tier(unplaceable, Some(1)), Some(1));
+        assert!(placed_by_area(unplaceable, Some(1)));
+    }
+
+    #[test]
+    fn no_area_reading_means_the_old_behaviour_exactly() {
+        // `None` is not "assume weak" -- it is "we did not see enough untouched neighbours to say".
+        // Attributing a strength on no evidence is how the unrunged class got buffed in v0.3.4.
+        for tier in 0..NUM_TIERS {
+            assert_eq!(scale_action(false, -1, tier, None), ScaleAction::NoTouch);
+        }
+        assert_eq!(presumed_native_tier(-1, None), None);
+        assert!(!placed_by_area(-1, None));
+    }
+
+    #[test]
+    fn an_enemys_own_reward_outranks_the_ground_it_stands_on() {
+        // A getSoul-derived tier is measured ON the enemy; the area index is measured on its
+        // neighbours. When both exist the enemy's own wins, at whatever value -- including when that
+        // makes it NoTouch and the area would have moved it.
+        let placed = NATIVE_TIERS[NATIVE_TIERS.len() - 1].0; // a real, high-index row
+        let own = native_tier(placed).expect("fixture must be in the table");
+        assert_eq!(presumed_native_tier(placed, Some(0)), Some(own));
+        assert!(!placed_by_area(placed, Some(0)));
+    }
+
+    #[test]
+    fn the_area_does_not_scale_an_enemy_DOWN_yet() {
+        // Altus at sphere 0 (2026-08-05): target 5, area index 7. The enemy is presumed STRONGER
+        // than the tier, so it is left alone -- the down half needs the 20018xxx pair, and applying
+        // a lower rung would only ADD a multiplier, never subtract one.
+        assert_eq!(scale_action(false, -1, 5, Some(7)), ScaleAction::NoTouch);
+        assert_eq!(scale_action(false, -1, 7, Some(7)), ScaleAction::NoTouch);
     }
 
     #[test]
@@ -1958,7 +2032,7 @@ mod tests {
         assert!(native_tier(band_only_unknown_npc).is_none());
         for tier in 0..NUM_TIERS {
             assert_eq!(
-                scale_action(false, band_only_unknown_npc, tier),
+                scale_action(false, band_only_unknown_npc, tier, None),
                 ScaleAction::NoTouch,
                 "a band-only enemy was scaled at tier {tier}"
             );
@@ -2087,7 +2161,7 @@ mod tests {
                 ScaleAction::NoTouch
             };
             assert_eq!(
-                scale_action(false, npc, tier),
+                scale_action(false, npc, tier, None),
                 want,
                 "npc {npc} at tier {tier}"
             );
@@ -2099,8 +2173,8 @@ mod tests {
         // The 4,214-row mainline population is untouched by phase 1a: its rung IS its declared
         // native difficulty, so swapping rungs is a true re-tier and works downward already.
         for tier in 0..NUM_TIERS {
-            assert_eq!(scale_action(true, -1, tier), ScaleAction::Replace);
-            assert_eq!(scale_action(true, 40000000, tier), ScaleAction::Replace);
+            assert_eq!(scale_action(true, -1, tier, None), ScaleAction::Replace);
+            assert_eq!(scale_action(true, 40000000, tier, None), ScaleAction::Replace);
         }
     }
 

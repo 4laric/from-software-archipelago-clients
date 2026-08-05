@@ -18,6 +18,7 @@ use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrM
 use er_logic::scaling::{
     NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
     area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect, ladder_tier,
+    placed_by_area,
     native_tier, raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
     settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
 };
@@ -271,6 +272,10 @@ struct SweepTally {
     /// Uncapped and NOT deduplicated, unlike `rung_band_pairs` -- a median has to weigh bodies, and
     /// that field is a set of at most 12 distinct pairs.
     area_hist: [u32; NUM_TIERS],
+    /// Distinct `npc_param_id`s that reached the tier ONLY because the area vouched for them --
+    /// capped, like every other census list. The population whose strength we inferred rather than
+    /// measured, so it is the first place a wrongly-buffed hand-tuned entity becomes visible.
+    area_moved_ids: Vec<i32>,
     /// Entities found carrying our target rung AND something else in the clear space.
     ///
     /// These are now CLEARED rather than skipped (see `scale_one`), so this is a CONVERGENCE
@@ -353,6 +358,13 @@ impl SweepTally {
 
     /// Count one vanilla-shaped neighbour toward the area signal. Base-game rungs only -- a DLC rung
     /// sits on a much steeper curve at the same index and would overstate the area (`ladder_tier`).
+    fn note_area_moved(&mut self, npc_param_id: i32) {
+        if self.area_moved_ids.len() < UNRUNGED_ID_CAP && !self.area_moved_ids.contains(&npc_param_id)
+        {
+            self.area_moved_ids.push(npc_param_id);
+        }
+    }
+
     fn note_area_sample(&mut self, rung: i32) {
         if let Some(idx) = ladder_tier(rung) {
             self.area_hist[idx] = self.area_hist[idx].saturating_add(1);
@@ -491,7 +503,20 @@ pub fn tick() -> Option<String> {
 
     let sample_on = sampling();
     let mut tally = SweepTally::default();
-    // Overworld enemies.
+
+    // PASS ONE -- read the region before deciding anything about it. Mutates nothing; the whole
+    // point is that every enemy in pass two is judged against the SAME, COMPLETE area reading.
+    for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
+        area_sample_one(chr, &player_handle, &mut tally);
+    }
+    for slot in wcm.chr_sets.iter().flatten() {
+        for chr in sweepable_characters(slot) {
+            area_sample_one(chr, &player_handle, &mut tally);
+        }
+    }
+    let area_tier = area_tier_from_histogram(&tally.area_hist);
+
+    // PASS TWO -- decide and apply.
     for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
         scale_one(
             chr,
@@ -500,9 +525,9 @@ pub fn tick() -> Option<String> {
             &player_handle,
             &mut tally,
             sample_on,
+            area_tier,
         );
     }
-    // Legacy-dungeon / block chr sets.
     for slot in wcm.chr_sets.iter().flatten() {
         for chr in sweepable_characters(slot) {
             scale_one(
@@ -512,6 +537,7 @@ pub fn tick() -> Option<String> {
                 &player_handle,
                 &mut tally,
                 sample_on,
+                area_tier,
             );
         }
     }
@@ -565,6 +591,7 @@ pub fn tick() -> Option<String> {
             &player_handle,
             &mut tally,
             sample_on,
+            area_tier,
         );
     }
     for c in sweepable_characters(&wcm.summon_buddy_chr_set) {
@@ -575,6 +602,7 @@ pub fn tick() -> Option<String> {
             &player_handle,
             &mut tally,
             sample_on,
+            area_tier,
         );
     }
 
@@ -666,7 +694,7 @@ pub fn tick() -> Option<String> {
                 attack,
             } = dbg;
             let tgt = raw_target.map_or_else(|| "unmapped".to_string(), |t| t.to_string());
-            // #346 phase-1b AREA CENSUS -- reporting only, nothing below acts on it. Read
+            // #346 AREA SIGNAL -- now LOAD-BEARING (it places unrunged enemies), not just reported. Read
             // `area-index` against `tier`: where it is far BELOW the tier, this region contains
             // hand-tuned enemies we currently leave at vanilla while normalising everything around
             // them, which is the shape of the sphere-2 Vyke complaint. `None` means the sweep did
@@ -687,8 +715,7 @@ pub fn tick() -> Option<String> {
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
                  vanilla {}, npc_param_ids {:?}), other-in-range {} {:?}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?} from {} \
-                 vanilla-shaped {:?} (census only -- would place {} unrunged, {} of them NoTouch \
-                 today)",
+                 vanilla-shaped {:?}; area-placed {} unrunged {:?}, still NoTouch {}",
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
@@ -706,7 +733,8 @@ pub fn tick() -> Option<String> {
                 area_index,
                 area_total,
                 area_dist,
-                tally.unrunged,
+                tally.area_moved_ids.len(),
+                tally.area_moved_ids,
                 tally.left_vanilla,
             );
         }
@@ -733,6 +761,41 @@ fn is_hostile_phantom(t: ChrType) -> bool {
     )
 }
 
+/// PASS ONE: count this enemy toward the region's area index, mutating nothing.
+///
+/// 🛑 THE SWEEP HAS TO BE TWO PASSES NOW, and this is why. The area index is a property of the whole
+/// region, but `scale_one` decides one enemy at a time -- so the decision for the FIRST enemy needs a
+/// statistic that is only complete after the LAST one. Sampling as we went would mean early enemies
+/// were judged against a partial region and late ones against a fuller one, from the same sweep.
+///
+/// Only vanilla-shaped enemies (rung AND band) count; see `SweepTally::area_hist` for why that gate
+/// is the measurement rather than an optimisation.
+fn area_sample_one(chr: &ChrIns, player_handle: &eldenring::cs::FieldInsHandle, tally: &mut SweepTally) {
+    if &chr.field_ins_handle == player_handle {
+        return;
+    }
+    let mut rung: Option<i32> = None;
+    let mut has_band = false;
+    for e in chr.special_effect.entries() {
+        let id = e.param_id;
+        if !is_scaling_speffect(id) {
+            continue;
+        }
+        match scaling_kind(id) {
+            Some(ScalingKind::Ladder) => rung = Some(id),
+            Some(ScalingKind::OtherInRange) => {
+                if band_native_tier(id).is_some() {
+                    has_band = true;
+                }
+            }
+            None => {}
+        }
+    }
+    if let (Some(r), true) = (rung, has_band) {
+        tally.note_area_sample(r);
+    }
+}
+
 /// Scale one phantom-set entry ONLY if it is an actual hostile (see `is_hostile_phantom`); otherwise a
 /// no-op. Logs once per hostile that gets scaled (scale_one no-ops once the entry already carries the
 /// tier), so a co-op session's log names exactly what landed.
@@ -743,13 +806,14 @@ fn scale_hostile_phantom(
     player_handle: &eldenring::cs::FieldInsHandle,
     tally: &mut SweepTally,
     sample_on: bool,
+    area_tier: Option<usize>,
 ) {
     if !is_hostile_phantom(chr.chr_type) {
         return;
     }
     let (ty, team, npc_id) = (chr.chr_type, chr.team_type, chr.npc_id);
     let before = tally.scaled;
-    scale_one(chr, target, target_tier, player_handle, tally, sample_on);
+    scale_one(chr, target, target_tier, player_handle, tally, sample_on, area_tier);
     if tally.scaled > before {
         log::info!(
             "enemy-scaling: scaled hostile phantom (chr_type={ty:?} team={team} npc_id={npc_id})"
@@ -773,6 +837,7 @@ fn scale_one(
     player_handle: &eldenring::cs::FieldInsHandle,
     tally: &mut SweepTally,
     sample_on: bool,
+    area_tier: Option<usize>,
 ) {
     if &chr.field_ins_handle == player_handle {
         return; // never scale the player
@@ -847,10 +912,6 @@ fn scale_one(
             if let (Some(r), Some(b)) = (rung_id, band_id) {
                 tally.note_rung_band(r, b);
             }
-            // The area signal, gated on exactly this shape: rung + band = not yet ours.
-            if let Some(r) = rung_id {
-                tally.note_area_sample(r);
-            }
         } else {
             tally.band_only += 1;
         }
@@ -869,12 +930,20 @@ fn scale_one(
     // in a shallow sphere is a multiplier stacked on stats that already assume you meet it at the
     // end of the game. Leaving it vanilla is under-scaled in deep spheres -- a blemish -- and that
     // trade is deliberate.
-    match scale_action(carried_ladder_rung, chr.npc_param_id, target_tier) {
+    match scale_action(carried_ladder_rung, chr.npc_param_id, target_tier, area_tier) {
         ScaleAction::NoTouch => {
             tally.left_vanilla += 1;
             return;
         }
-        ScaleAction::Apply => tally.scaled_by_native += 1,
+        ScaleAction::Apply => {
+            tally.scaled_by_native += 1;
+            // 🛑 NAME what only the AREA vouched for. These are the enemies whose strength we
+            // attributed from their neighbours rather than measuring on them, so this list is where
+            // a wrongly-buffed hand-tuned entity shows up FIRST -- in our log, not in a report.
+            if placed_by_area(chr.npc_param_id, area_tier) {
+                tally.note_area_moved(chr.npc_param_id);
+            }
+        }
         ScaleAction::Replace => {}
     }
 
