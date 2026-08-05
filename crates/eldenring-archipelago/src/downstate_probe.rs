@@ -157,10 +157,7 @@ fn dump(chr: &ChrIns, tag: &str) {
 /// Reusing `sweepable_characters` deliberately: it carries the `chr_load_status` history and the
 /// "walk the ENTRY, never the `ChrIns` behind it" discipline that the 2026-07-27 CTD taught us, and
 /// a probe is not the place to reinvent that.
-fn find_subject(
-    wcm: &mut eldenring::cs::WorldChrMan,
-    target: FieldInsHandle,
-) -> Option<&mut ChrIns> {
+fn find_subject(wcm: &eldenring::cs::WorldChrMan, target: FieldInsHandle) -> Option<&mut ChrIns> {
     for chr in crate::scaling::sweepable_characters(&wcm.open_field_chr_set.base) {
         if chr.field_ins_handle == target {
             return Some(chr);
@@ -181,7 +178,7 @@ fn find_subject(
 /// Returns true when it handled this tick (so `tick` must not fall through into the apply path).
 /// A subject that has unloaded simply stops producing reads and the watch still latches on schedule
 /// -- a probe that waited forever for a corpse would be worse than one that says what it saw.
-fn watch_step(wcm: &mut eldenring::cs::WorldChrMan) -> bool {
+fn watch_step(wcm: &eldenring::cs::WorldChrMan) -> bool {
     let Ok(mut guard) = WATCH.lock() else {
         return false;
     };
