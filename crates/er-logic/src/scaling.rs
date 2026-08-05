@@ -401,6 +401,33 @@ pub fn skip_unrunged_at_floor(carried_ladder_rung: bool, target_tier: usize) -> 
     !carried_ladder_rung && target_tier == 0
 }
 
+/// The phase-1b DOWN-STATE pair: the only rows measured to scale an enemy BELOW vanilla.
+///
+/// `20018004` = 0.25x HP, `20018002` = 0.30x all-element attack. `spCategory 0` (so they stack),
+/// `effectEndurance -1`, `conditionHp -1`. No single row in the game's 11,325 does both, which is
+/// why the down primitive has to be a composition.
+///
+/// 🛑 **DECLARED HERE, NOT YET ARMED.** Nothing in production applies these; only `downstate_probe`
+/// does, behind two env gates. They exist in this file so the CLEAR can learn them in the same
+/// change that arms them — see `downstates_are_not_yet_cleared`, which is a tripwire, not a
+/// preference.
+pub const DOWNSTATE_IDS: [i32; 2] = [20018004, 20018002];
+
+/// Whether `param_id` is one of the down-state rows.
+pub fn is_downstate_id(param_id: i32) -> bool {
+    DOWNSTATE_IDS.contains(&param_id)
+}
+
+/// What `is_scaling_speffect` must become when phase 1b arms: the ranges, OR the explicit pair.
+///
+/// 🛑 AN ALLOWLIST, NEVER A WIDENED RANGE. `20018xxx` is the DLC's ally-tuning block; widening
+/// `DLC_SCALING_ID_RANGE` to swallow it would strip legitimate effects off DLC summons. Written and
+/// tested now so that arming 1b is a one-line swap against a predicate that already has direct-call
+/// coverage, rather than a new predicate written under time pressure.
+pub fn is_scaling_speffect_with_downstates(param_id: i32) -> bool {
+    is_scaling_speffect(param_id) || is_downstate_id(param_id)
+}
+
 /// Is this enemy ALREADY in the state the sweep wants, i.e. carrying `target` and nothing else in
 /// the clear space?
 ///
@@ -1718,6 +1745,74 @@ mod tests {
                 scale_action(false, absent, tier),
                 ScaleAction::NoTouch,
                 "an unclassified enemy was scaled at tier {tier}"
+            );
+        }
+    }
+
+    // ---- the Nexus thread, made executable (2026-08-04/05) --------------------------------------
+
+    #[test]
+    fn two_bosses_in_one_fight_no_longer_get_wildly_different_scaling() {
+        // THE MOTIVATING CASE, and the thread's cleanest complaint -- lizzymagala, 2026-08-05:
+        // "2 bosses that are part of the same fight can have wildly different scaling with one being
+        // super squishy and weak and the other being insanely tanky and straight up one shotting".
+        //
+        // That is a duo where one member carries a vanilla rung and one does not. Under v0.3.4 the
+        // runged one was normalised to the region tier while the unrunged one had the SAME tier
+        // multiplied on top of hand-tuned, near-endgame base stats -- so one got weaker and the other
+        // got far stronger, from one line of code.
+        //
+        // 🛑 What this pins is that they no longer diverge THAT way. It does NOT pin that they feel
+        // alike: the unrunged one keeps vanilla strength, which is the residual phase 1b exists for.
+        // Do not "fix" this test by making NoTouch scale something.
+        let unplaceable = -1; // absent from NATIVE_TIERS, like every getSoul-less named boss
+        for tier in 0..NUM_TIERS {
+            assert_eq!(scale_action(true, unplaceable, tier), ScaleAction::Replace);
+            assert_eq!(scale_action(false, unplaceable, tier), ScaleAction::NoTouch);
+        }
+    }
+
+    #[test]
+    fn a_hand_tuned_npc_is_never_multiplied_at_any_depth() {
+        // lavakoala6, 2026-08-04: Gideon "1 shots from 50 vigor and he has soo much health", and
+        // Vyke "definitely Mountaintop scaling while still in sphere 2". Both are unrunged with no
+        // rune reward in NpcParam, so both resolve here -- and the sponge and the one-shots came from
+        // the same multiplier, applied to stats that already assumed the end of the game.
+        for tier in 0..NUM_TIERS {
+            assert_eq!(scale_action(false, -1, tier), ScaleAction::NoTouch);
+        }
+    }
+
+    #[test]
+    fn downstates_are_not_yet_cleared() {
+        // 🛑 TRIPWIRE, NOT A PREFERENCE. The down-state pair sits OUTSIDE both clear ranges, so the
+        // sweep cannot see it: once 1b applies these, stale down-effects would strand across
+        // reconnects and seed changes, because the clear that removes everything else would walk
+        // straight past them.
+        //
+        // It is deliberately un-armed today -- `downstate_probe` applies the pair, and a clear that
+        // knew about them would strip the probe's own subject before it could be measured.
+        //
+        // ⭐ ARMING 1b MEANS INVERTING THIS TEST IN THE SAME CHANGE. If it fails, either someone
+        // armed the down-states without teaching the clear, or someone widened a range far enough to
+        // swallow the DLC ally-tuning block -- and the second is worse than the first.
+        for id in DOWNSTATE_IDS {
+            assert!(is_downstate_id(id));
+            assert!(
+                !is_scaling_speffect(id),
+                "the clear can now see {id} -- see this test's note"
+            );
+            assert!(is_scaling_speffect_with_downstates(id));
+        }
+        // The successor predicate must be a strict extension: everything cleared today stays cleared.
+        for id in [7010, 7200, 7460, 7850, 20007000, 20007400] {
+            assert!(is_scaling_speffect_with_downstates(id));
+        }
+        // ...and must NOT have become a range that swallows the block the pair lives in.
+        for id in [20018000, 20018001, 20018008, 20018010] {
+            assert!(
+                !is_scaling_speffect_with_downstates(id),
+                "{id} is not ours to clear"
             );
         }
     }
