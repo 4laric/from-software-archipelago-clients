@@ -110,7 +110,8 @@ pub fn is_rykard(npc_param_id: i32) -> bool {
 
 /// THE DECISION. `Some(full_id)` = grant now; `None` = do nothing.
 ///
-/// `present` = is the character loaded, `holds` = does the player already have one. Either input
+/// `present` = is a LIVING instance of the character loaded (the caller reads hp, so this goes
+/// false on the death frame and the fight is over), `holds` = does the player already have one. Either input
 /// being `None` means the read failed this tick, and both failure modes resolve to "do nothing"
 /// (property 3).
 pub fn boss_grant_action(present: Option<bool>, holds: Option<bool>) -> Option<i32> {

@@ -98,34 +98,67 @@ fn now_ms() -> u64 {
 ///
 /// The histogram is the part that stops this recurring: the next build's logs will say what states
 /// enemies are ACTUALLY in, and only then can this be narrowed on evidence instead of on a name.
-/// Is a character of chr `chr_id` loaded right now?
+/// Like [`sweepable_characters`] but yields ONLY `Active` entries.
 ///
-/// `None` = WorldChrMan was not reachable this tick. The caller must treat that as "don't know",
-/// NEVER as "no" -- see `er_logic::boss_grants` property 3.
-///
-/// Walks the SAME two sets the sweep does (open-field base + every block slot), because that is
-/// where mobs and bosses live; phantom sets are deliberately not consulted.
-///
-/// 🛑 `ChrIns` does NOT implement `AsRef`. The set iterators yield `&mut T: Subclass<ChrIns>`, and
-/// the way this file already gets a `&ChrIns` out of one is to PASS IT to a fn taking `&ChrIns`
-/// (see `area_sample_one`) and let the coercion happen at the call. `chr.as_ref()` does not
-/// compile; that cost a CI round.
-fn chr_is(chr: &ChrIns, chr_id: i32) -> bool {
-    er_logic::boss_grants::is_character(chr.npc_param_id, chr_id)
+/// 🛑🛑 A SEPARATE ITERATOR, ON PURPOSE. `sweepable_characters` counts statuses rather than
+/// filtering on them, and that is deliberate -- a status filter there once rejected every enemy in
+/// the game and was reverted the same day. This one exists for callers that DEREFERENCE DEEPER
+/// than `npc_param_id`: reading `modules.data.hp` off an entry that has not finished initializing
+/// is a CTD. Under-firing is the safe direction for a grant; it is not for the sweep. Do not merge
+/// the two.
+fn active_characters<T>(set: &ChrSet<T>) -> impl Iterator<Item = &mut T>
+where
+    T: Subclass<ChrIns> + 'static,
+{
+    let mut current = set.entries;
+    let end = unsafe { current.add(set.capacity as usize) };
+    std::iter::from_fn(move || {
+        while current != end {
+            // Read the ENTRY (flat array slot) -- never the ChrIns behind it.
+            let entry = unsafe { current.as_ref() };
+            let (chr_ins, status) = (entry.chr_ins, entry.chr_load_status);
+            current = unsafe { current.add(1) };
+            if !matches!(status, ChrLoadStatus::Active) {
+                continue;
+            }
+            let Some(mut chr_ins) = chr_ins else {
+                continue;
+            };
+            return Some(unsafe { chr_ins.as_mut() });
+        }
+        None
+    })
 }
 
-pub(crate) fn any_character_present(chr_id: i32) -> Option<bool> {
+/// Id first, HP second: the id test is a shallow field read on an entry the sweep already touches
+/// every tick, so the deep `modules.data` deref only ever happens for a handful of matched
+/// entities.
+fn chr_is_live(chr: &ChrIns, chr_id: i32) -> bool {
+    er_logic::boss_grants::is_character(chr.npc_param_id, chr_id) && chr.modules.data.hp > 0
+}
+
+/// Is a LIVING character of chr `chr_id` loaded right now?
+///
+/// ⭐⭐⭐ ALIVE, not merely loaded -- that distinction is the end of the fight. A dead boss's entry
+/// can linger in the character set after the kill, and keying on mere presence would hold weapon
+/// equips while the player loots the arena and walks out. `hp > 0` goes false on the death frame,
+/// which is exactly when the fight is over. It also means walking past a corpse later re-triggers
+/// nothing.
+///
+/// `None` = WorldChrMan was not reachable this tick. The caller must treat that as "don't know",
+/// NEVER as "no" -- see `er_logic::boss_grants`.
+pub(crate) fn any_character_alive(chr_id: i32) -> Option<bool> {
     let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {
         return None;
     };
-    for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
-        if chr_is(chr, chr_id) {
+    for chr in active_characters(&wcm.open_field_chr_set.base) {
+        if chr_is_live(chr, chr_id) {
             return Some(true);
         }
     }
     for slot in wcm.chr_sets.iter().flatten() {
-        for chr in sweepable_characters(slot) {
-            if chr_is(chr, chr_id) {
+        for chr in active_characters(slot) {
+            if chr_is_live(chr, chr_id) {
                 return Some(true);
             }
         }

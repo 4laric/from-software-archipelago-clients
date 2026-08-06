@@ -2818,8 +2818,10 @@ impl shared::Core for Core {
         //     is driven from it, and if a lost `can_grant` simply skipped this block the hold would
         //     STRAND at true and block every weapon equip for the rest of the session. `None`
         //     resolves to "not paused", so losing the ability to act releases the hold instead.
+        // ALIVE, not merely loaded: a dead boss's entry can linger, and the hold must lift at
+        //     the kill rather than whenever the map gets round to dropping him.
         let boss_present = if can_grant {
-            crate::scaling::any_character_present(er_logic::boss_grants::RYKARD_CHR_ID)
+            crate::scaling::any_character_alive(er_logic::boss_grants::RYKARD_CHR_ID)
         } else {
             None
         };
