@@ -19,7 +19,7 @@ use er_logic::scaling::{
     NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
     area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect,
     is_scaling_speffect_with_downstates, ladder_tier, native_tier, placed_by_area,
-    raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
+    placed_by_area_down, raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
     settled_on_downstate, settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
@@ -237,6 +237,15 @@ struct SweepTally {
     /// `left_vanilla`, which is the exact opposite of what happened to them. First log, region 0:
     /// 23 down-scaled, then 5 settled and 18 silently counted as untouched.
     kept_down: u32,
+    /// Down-scaled on the AREA's evidence rather than its own rune reward. 🛑 READ THIS FIRST WHEN A
+    /// DOWN-SCALE LOOKS WRONG: since 2026-08-06 the area vouches DOWNWARD even for the named,
+    /// unrewarded characters `AREA_EXCLUDED` refuses upward -- Okina, Ancient Dragon Man, Vyke. They
+    /// are the population moved on their neighbours' evidence, so a bad one surfaces here first.
+    area_down: u32,
+    /// Distinct `npc_param_id`s of the above, capped. Deliberately NOT merged into
+    /// `area_moved_ids`: up-placement and down-placement obey different rules now, and one list
+    /// would hide which rule moved a given enemy.
+    area_down_ids: Vec<i32>,
     /// Carried a down state that is no longer warranted -- stripped, with nothing applied in its
     /// place. Non-zero here means a region's target moved up under enemies we had cut.
     cleared_down: u32,
@@ -381,6 +390,14 @@ impl SweepTally {
 
     /// Record an enemy that reached the tier only because the AREA vouched for it. Deduplicated and
     /// capped like every other census list -- this one is meant to be READ, not counted.
+    fn note_area_down(&mut self, npc_param_id: i32) {
+        self.area_down = self.area_down.saturating_add(1);
+        if self.area_down_ids.len() < UNRUNGED_ID_CAP && !self.area_down_ids.contains(&npc_param_id)
+        {
+            self.area_down_ids.push(npc_param_id);
+        }
+    }
+
     fn note_area_moved(&mut self, npc_param_id: i32) {
         self.area_moved = self.area_moved.saturating_add(1);
         if self.area_moved_ids.len() < UNRUNGED_ID_CAP
@@ -758,7 +775,7 @@ pub fn tick() -> Option<String> {
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
                  vanilla {}, npc_param_ids {:?}), down-scaled {} (settled {}, kept {}, cleared {}), \
-                 other-in-range {} {:?}; band-only {}, \
+                 area-down {} across {} row(s) {:?}; other-in-range {} {:?}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?} from {} \
                  vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {:?}, \
                  still NoTouch {}",
@@ -773,6 +790,9 @@ pub fn tick() -> Option<String> {
                 tally.settled_down,
                 tally.kept_down,
                 tally.cleared_down,
+                tally.area_down,
+                tally.area_down_ids.len(),
+                tally.area_down_ids,
                 tally.other_in_range,
                 tally.other_ids,
                 tally.band_only,
@@ -1076,8 +1096,11 @@ fn scale_one(
                 chr.apply_speffect(id, false);
             }
             tally.scaled_down += 1;
-            if placed_by_area(chr.npc_param_id, area_tier) {
-                tally.note_area_moved(chr.npc_param_id);
+            // 🛑 `_down`, NOT `placed_by_area`. The up census refuses the named/unrewarded rows by
+            // design; using it here would silently omit exactly the enemies this path was widened
+            // to reach, and the log would read as though nothing new was happening.
+            if placed_by_area_down(chr.npc_param_id, area_tier) {
+                tally.note_area_down(chr.npc_param_id);
             }
             // 🛑🛑 NO `apply_speffect(target)` ON THIS PATH, AND THAT IS THE POINT. This enemy
             // carries no rung, so its base ALREADY encodes its native tier; putting the region's
