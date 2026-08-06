@@ -2810,6 +2810,20 @@ impl shared::Core for Core {
         //     the burn-done flag is set). Holds 9116 matched to the capital the player is
         //     standing in, so the Erdtree burn never permanently strands the Royal checks.
         crate::region::tick_capital();
+        // 6c. ARENA GRANTS (#413): hand the player the tool the arena assumes they walked in
+        //     holding. Gated on `can_grant` because the grant needs a live inventory pointer, and
+        //     because the possession latch IS a bag read, which is unresolvable before then.
+        //     The latch is possession, never the Serpent-Hunter's obtained-flag: that flag is what
+        //     check 7771816 is keyed on, so latching on it would collect a check the player never
+        //     found -- the "start grant flags are check flags" defect, deliberately not repeated.
+        if can_grant {
+            let holds =
+                crate::upgrades::holds_weapon_base(er_logic::arena_grants::SERPENT_HUNTER_BASE);
+            let mut game = EldenRingHook;
+            if let Some(m) = er_logic::arena_grants::tick(&mut game, holds) {
+                self.log(ap::Print::message(m));
+            }
+        }
         for g in graces_lit {
             self.log(ap::Print::message(format!("{g} unlocked")));
         }
