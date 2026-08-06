@@ -1,5 +1,6 @@
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{cmp, ffi::OsString, io, mem, mem::MaybeUninit, sync::LazyLock};
 
 use anyhow::{Context, Error, Result};
@@ -32,6 +33,53 @@ pub fn mod_directory<'a>() -> Result<&'a Path> {
     }
 }
 
+/// Which loader brought this DLL into the process.
+///
+/// Recorded as a side effect of [load_mod_directory], which already has to distinguish the two
+/// cases to decide where `apconfig.json` and `log/` live. It used to report that distinction with
+/// `println!` from inside `start_logger` -- i.e. before any logger existed -- so the answer went to
+/// stdout and never reached the log file users actually send us. See `crate::mod_stack`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loader {
+    /// me3: `me3_mod_host.dll` is in the process.
+    Me3,
+    /// Some other loader -- ModEngine2, or a host randomizer using its own load-DLL option. We fell
+    /// back to the directory containing this DLL.
+    DllDirectory,
+    /// [load_mod_directory] has not run yet, or failed outright.
+    Unknown,
+}
+
+impl Loader {
+    /// One-line description for the log.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Loader::Me3 => "me3 (me3_mod_host.dll present)",
+            Loader::DllDirectory => {
+                "non-me3 (ModEngine2 or a host randomizer); using this DLL's own directory"
+            }
+            Loader::Unknown => "unknown (mod directory never resolved)",
+        }
+    }
+}
+
+const LOADER_UNKNOWN: u8 = 0;
+const LOADER_ME3: u8 = 1;
+const LOADER_DLL_DIR: u8 = 2;
+
+static LOADER: AtomicU8 = AtomicU8::new(LOADER_UNKNOWN);
+
+/// The loader recorded by the most recent [load_mod_directory] call.
+///
+/// Returns [Loader::Unknown] until [mod_directory] has been called at least once.
+pub fn loader() -> Loader {
+    match LOADER.load(Ordering::Relaxed) {
+        LOADER_ME3 => Loader::Me3,
+        LOADER_DLL_DIR => Loader::DllDirectory,
+        _ => Loader::Unknown,
+    }
+}
+
 /// Loads [mod_directory] without caching.
 ///
 /// Prefers the ME3-based discovery (looks for `me3_mod_host.dll` in the process). When that DLL
@@ -41,9 +89,13 @@ pub fn mod_directory<'a>() -> Result<&'a Path> {
 fn load_mod_directory() -> Result<PathBuf> {
     println!("Locating mod directory...");
     match locate_me3_mod_directory() {
-        Ok(path) => Ok(path),
+        Ok(path) => {
+            LOADER.store(LOADER_ME3, Ordering::Relaxed);
+            Ok(path)
+        }
         Err(me3_err) => match current_module_directory() {
             Ok(dir) => {
+                LOADER.store(LOADER_DLL_DIR, Ordering::Relaxed);
                 println!("  me3 not detected; using AP DLL directory: {:?}", dir);
                 Ok(dir)
             }
