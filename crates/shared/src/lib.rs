@@ -19,6 +19,7 @@ pub mod foreign_blocks;
 mod game;
 mod input_blocker;
 pub mod log_collapse;
+pub mod mod_stack;
 mod overlay;
 mod section_profiler;
 pub mod utils;
@@ -93,6 +94,11 @@ pub fn start_logger() {
             info!("Failed to determine mod directory, logging to current directory instead.");
         }
     }
+
+    // Provenance, emitted only now because it CANNOT be emitted earlier: resolving the mod
+    // directory is what starts the logger, so `load_mod_directory`'s own println! lines land on
+    // stdout with no logger to catch them. Every path that reaches here has a live logger.
+    mod_stack::log_provenance();
 }
 
 /// Starts a logger for the given directory.
