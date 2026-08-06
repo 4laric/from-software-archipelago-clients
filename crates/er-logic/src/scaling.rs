@@ -776,8 +776,18 @@ pub fn scale_action(
     if carried_ladder_rung {
         return ScaleAction::Replace;
     }
-    match presumed_native_tier(npc_param_id, area_tier) {
-        Some(native) if target_tier > native => ScaleAction::Apply,
+    // ⭐ TWO ATTRIBUTIONS, BECAUSE THE CARVE-OUT IS DIRECTIONAL. `up` is what we are willing to
+    // claim when the move would strengthen the enemy (conservative — `AREA_EXCLUDED` applies);
+    // `down` is what we claim when it would weaken it (the area vouches for anyone). They differ
+    // only for a named, unrewarded character with no rune reward, which is exactly the hand-tuned
+    // class this whole issue is about.
+    let up = presumed_native_tier(npc_param_id, area_tier);
+    let down = presumed_native_tier_down(npc_param_id, area_tier);
+    match up {
+        Some(native) if target_tier > native => return ScaleAction::Apply,
+        _ => {}
+    }
+    match down {
         // 🛑 THE DOWN HALF, ARMED 2026-08-06. Ground ABOVE target used to fall to `NoTouch` and the
         // comment below said so; that is the Altus reading (target 5, area index 7, 61 unrunged left
         // at full Altus strength beside neighbours normalised to 2.266x). `None` here still means
@@ -823,6 +833,31 @@ pub fn presumed_native_tier(npc_param_id: i32, area_tier: Option<usize>) -> Opti
     native_tier(npc_param_id).or_else(|| area_tier.filter(|_| area_may_vouch_for(npc_param_id)))
 }
 
+/// The same attribution, for a move that would make the enemy **WEAKER** — and here the area may
+/// vouch for ANYONE, including the named, unrewarded characters `AREA_EXCLUDED` refuses upward.
+///
+/// ⭐⭐⭐ THE CARVE-OUT WAS DIRECTION-BLIND, AND ITS OWN JUSTIFICATION IS NOT. `area_may_vouch_for`
+/// exists because an area-derived delta multiplied on top of tuning that already assumes the endgame
+/// is the v0.3.4 one-shotting bug — Vyke came out "crazy strong". Every word of that reasoning is
+/// about scaling UP. Downward the sign flips: attributing the ground to a hand-tuned character makes
+/// it weaker, and this file's axiom is that under-scaling is a balance blemish where over-scaling is
+/// a progression WALL. Refusing to move it down does not protect anything; it just leaves the wall.
+///
+/// 🛑 THE CASE THAT DECIDES IT IS NOT VYKE (Alaric, 2026-08-06). Vyke sits in Liurnia and comes out
+/// merely reasonable, which is the mild end of the distribution and a bad place to set the rule.
+/// Set it at **Okina in a sphere-0 Mountaintops**, or **Ancient Dragon Man on a Gravesite Plain
+/// start** — a hand-tuned endgame duel that a randomised spine can hand you with starting gear, and
+/// which `AREA_EXCLUDED` was pinning at full strength precisely because it is named and carries no
+/// rune reward. **275 of the 411 excluded rows have no `getSoul` tier either**, so before this they
+/// were `NoTouch` in BOTH directions: unreachable by every mechanism we have.
+///
+/// ⭐ The Vyke guard is untouched. Upward attribution still goes through `presumed_native_tier`, so
+/// nothing here can reproduce the bug the carve-out was added for — that bug was an up-scale, and
+/// this function is only ever consulted when the answer would be a cut.
+pub fn presumed_native_tier_down(npc_param_id: i32, area_tier: Option<usize>) -> Option<usize> {
+    native_tier(npc_param_id).or(area_tier)
+}
+
 /// May the AREA speak for this enemy's strength? False for the named, unrewarded rows.
 ///
 /// 🛑🛑 THE CARVE-OUT, ADDED FROM PLAY (2026-08-05). Vyke is unrunged and `getSoul`-less, so the
@@ -851,6 +886,16 @@ pub fn area_may_vouch_for(npc_param_id: i32) -> bool {
 /// by id; see `presumed_native_tier` for why that census matters more than the count.
 pub fn placed_by_area(npc_param_id: i32, area_tier: Option<usize>) -> bool {
     native_tier(npc_param_id).is_none() && area_tier.is_some() && area_may_vouch_for(npc_param_id)
+}
+
+/// The same question for the DOWN path, where the area vouches for everyone.
+///
+/// 🛑 THE CENSUS MATTERS MORE HERE THAN IT DOES UPWARD. These are the named, hand-tuned characters
+/// we are now moving on their neighbours' evidence rather than their own — the population that was
+/// deliberately untouchable until 2026-08-06. If a down-scale ever lands wrong, this list is where
+/// it shows up first, in our log rather than in a report.
+pub fn placed_by_area_down(npc_param_id: i32, area_tier: Option<usize>) -> bool {
+    native_tier(npc_param_id).is_none() && area_tier.is_some()
 }
 
 /// Connect-time config, parsed from slot_data by the client (`regionSphereTargets` etc.).
@@ -2448,6 +2493,77 @@ mod tests {
         assert_eq!(
             acted, 156,
             "the tolerance changed COVERAGE, which it must not"
+        );
+    }
+
+    #[test]
+    fn a_named_hand_tuned_enemy_comes_down_on_the_area_but_never_up() {
+        // ⭐⭐⭐ THE CASE ALARIC SET THE RULE ON (2026-08-06): "imagine this is a mountaintops fight
+        // and I have to fight Okina. or a gravesite plain start and I'm fighting Ancient Dragon
+        // Man." Vyke in Liurnia came out merely reasonable, which is the mild end of the
+        // distribution and the wrong place to calibrate. A randomised spine can open on a region
+        // whose hand-tuned duels assume the endgame, and `AREA_EXCLUDED` was pinning every one of
+        // them at full strength.
+        let excluded = *crate::native_tiers::AREA_EXCLUDED
+            .iter()
+            .find(|&&id| native_tier(id).is_none())
+            .expect("the affected class is the excluded rows with no getSoul tier");
+
+        // The guard that carve-out exists for, UNCHANGED: the area may never make it stronger.
+        assert!(!area_may_vouch_for(excluded));
+        assert_eq!(presumed_native_tier(excluded, Some(5)), None);
+        for tier in 6..NUM_TIERS {
+            assert_eq!(
+                scale_action(false, false, excluded, tier, Some(5)),
+                ScaleAction::NoTouch,
+                "the area must never up-scale a named unrewarded enemy (tier {tier})"
+            );
+        }
+
+        // ...and the half that changed: deep ground, shallow target, so it comes DOWN.
+        assert_eq!(presumed_native_tier_down(excluded, Some(11)), Some(11));
+        let down = match scale_action(false, false, excluded, 0, Some(11)) {
+            ScaleAction::Down(s) => s,
+            other => panic!("Okina in a sphere-0 region must come down, got {other:?}"),
+        };
+        assert!(down.attack < 1.0);
+        // 🛑 And it must be NAMED in the census -- these are moved on their neighbours' evidence,
+        // not their own, so the log is where a bad one has to surface first.
+        assert!(placed_by_area_down(excluded, Some(11)));
+        assert!(
+            !placed_by_area(excluded, Some(11)),
+            "the UP census must still refuse it, or the two lists stop meaning different things"
+        );
+    }
+
+    #[test]
+    fn letting_the_area_vouch_downward_changes_nothing_for_an_ordinary_enemy() {
+        // ⭐ NON-VACUITY IN THE OTHER DIRECTION. If `presumed_native_tier_down` had simply replaced
+        // the guarded one everywhere, this test would still pass -- so it also pins that an enemy
+        // the area ALREADY vouched for is decided identically by both, and that a row with its own
+        // getSoul tier ignores the area entirely.
+        let ordinary = 7100; // not in AREA_EXCLUDED, no table tier
+        assert!(area_may_vouch_for(ordinary));
+        assert_eq!(native_tier(ordinary), None);
+        assert_eq!(
+            presumed_native_tier(ordinary, Some(9)),
+            presumed_native_tier_down(ordinary, Some(9))
+        );
+
+        let (own, tier) = *crate::native_tiers::NATIVE_TIERS
+            .iter()
+            .find(|&&(_, t)| t > 0)
+            .expect("need a table row");
+        assert_eq!(
+            presumed_native_tier_down(own, Some(19)),
+            Some(tier as usize)
+        );
+
+        // No area reading at all: still nothing to attribute, in either direction.
+        assert_eq!(presumed_native_tier_down(-1, None), None);
+        assert_eq!(
+            scale_action(false, false, -1, 0, None),
+            ScaleAction::NoTouch
         );
     }
 

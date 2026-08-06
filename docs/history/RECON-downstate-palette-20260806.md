@@ -178,3 +178,55 @@ Every region in the log read `sphere target 0` or `unmapped`, so every one resol
 session Liurnia's RUNGED enemies went `[7060, 7460]` -> `[7010]`, 382 -> 192 HP. **Liurnia is being
 cut from both directions at once**, and neither half is 1b's doing. 1b only made the stuck sphere
 target impossible to ignore.
+
+---
+
+# Follow-up 2: the area carve-out was direction-blind
+
+From the second live log the same day. Both Liurnia buckets read `sphere target 0`, so tier 0
+(`7010`, 1.141x HP) applied, while the census measured the ground at index **5** off 432
+vanilla-shaped enemies, 422 of them agreeing. In bucket 62010 that produced:
+
+- **216 runged enemies at ~0.50x vanilla** (1.141 / 2.266) — the floor, via `Replace`
+- **312 of 355 unrunged untouched at 1.00x vanilla**
+- 22 down-scaled, 20 area-placed
+
+The floor was scaling ordinary trash *down* while the hand-tuned NPCs stayed at full strength — the
+gap widening rather than closing, which is the "one super squishy, the other insanely tanky" report
+arriving from the other direction.
+
+The reason so few moved: `AREA_EXCLUDED` refuses the area's vouching for named, unrewarded
+characters. **275 of its 411 rows have no `getSoul` tier either**, so they were `NoTouch` in BOTH
+directions — unreachable by every mechanism the client has.
+
+## The asymmetry
+
+`area_may_vouch_for` exists because an area-derived delta multiplied on top of tuning that already
+assumes the endgame is the v0.3.4 one-shotting bug — Vyke came out "crazy strong". Every word of that
+justification is about scaling **up**. Downward the sign flips: attributing the ground to a
+hand-tuned character makes it weaker, and this file's axiom is that under-scaling is a balance
+blemish where over-scaling is a progression wall. Refusing to move it down protects nothing; it
+leaves the wall standing.
+
+So `presumed_native_tier_down` lets the area vouch for anyone, and `scale_action` consults the
+guarded attribution for `Apply` and the permissive one for `Down`. The Vyke guard is untouched:
+upward attribution still goes through `presumed_native_tier`, and nothing on the down path can
+reproduce an up-scale.
+
+## Why Vyke is the wrong case to calibrate on
+
+Alaric set the rule, 2026-08-06: *"Vyke is fine but imagine this is a mountaintops fight and I have to
+fight Okina. Or a gravesite plain start and I'm fighting Ancient Dragon Man."*
+
+Vyke sits in Liurnia and came out merely reasonable — the mild end of the distribution, and a bad
+place to set a rule. A randomised spine can open on a region whose hand-tuned duels assume the
+endgame, and the carve-out was pinning every one of them at full strength precisely *because* they
+are named and carry no rune reward. The trade is real and accepted: Vyke now takes a cut he does not
+strictly need, so that Okina takes one he does.
+
+## Census
+
+`area-down N across M row(s) [ids]`, kept deliberately separate from `area-placed`. Up-placement and
+down-placement now obey different rules, and one merged list would hide which rule moved a given
+enemy. These are the enemies moved on their neighbours' evidence rather than their own, so this is
+where a bad down-scale surfaces first — in our log rather than in a report.
