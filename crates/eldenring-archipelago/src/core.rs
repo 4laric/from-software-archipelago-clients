@@ -2817,16 +2817,14 @@ impl shared::Core for Core {
         //     latch IS a bag read. The latch is possession, never the Serpent-Hunter's
         //     obtained-flag: that flag is what check 7771816 is keyed on.
         if can_grant {
-            let present = crate::scaling::any_character_present(
-                er_logic::boss_grants::RYKARD_NPC_PARAM_IDS,
-            );
+            let present =
+                crate::scaling::any_character_present(er_logic::boss_grants::RYKARD_NPC_PARAM_IDS);
             let holds =
                 crate::upgrades::holds_weapon_base(er_logic::boss_grants::SERPENT_HUNTER_BASE);
             let mut game = EldenRingHook;
             if let Some(m) = er_logic::boss_grants::tick(&mut game, present, holds) {
                 self.log(ap::Print::message(m));
             }
-        }
         }
         for g in graces_lit {
             self.log(ap::Print::message(format!("{g} unlocked")));
