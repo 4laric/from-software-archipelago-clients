@@ -164,7 +164,8 @@ pub fn fragment_units_for(
 
 /// THE blessing decision, as one pure function.
 ///
-/// `mode`: 0 = off (never write), 1 = player_only (level from held fragments), 2 = scaled (ALSO floor
+/// `mode`: 0 = off (never write), 1 = anywhere (level from received fragments), 2 = anywhere + DLC
+/// catch-up (ALSO floor
 /// to the DLC area's expected blessing, so a DLC region you unlock with no fragments still meets its
 /// enemies' assumption). `floor` is the per-region floor for the player's CURRENT play_region -- 0
 /// outside a DLC bucket, so mode 2 is naturally inert in the base game.
@@ -177,16 +178,28 @@ pub fn fragment_units_for(
 /// 2026-07-11 (the option had been frozen OFF, which meant the floor wire was never even emitted and
 /// the client's floor path was dead code) -- it had no test at all until this one.
 pub fn blessing_target(mode: i32, frag_qty: i32, floor: i32) -> Option<i32> {
-    if mode != 1 && mode != 2 {
-        return None;
-    }
-    let from_frags = level_for_fragments(frag_qty);
-    let target = if mode == 2 {
-        from_frags.max(floor)
-    } else {
-        from_frags
+    let target = match mode {
+        1 => level_for_fragments(frag_qty),
+        2 => level_for_fragments(frag_qty).max(floor),
+        // MODE 3 (dlc_only scope + catch-up), 2026-08-06. The GAME still owns the fragment ladder
+        // here -- you revere at a grace exactly as in vanilla -- so we contribute ONLY the floor,
+        // and `raise_stored_blessing` makes it raise-only against whatever the game already gave
+        // you. Folding the received-fragment count in would smuggle `anywhere`'s semantics
+        // (blessing without revering) into the one mode whose entire promise is "vanilla, but the
+        // DLC does not brutalise you for where the fill put your fragments".
+        3 => floor,
+        _ => return None,
     };
     Some(target.clamp(0, SCADU_MAX_LEVEL))
+}
+
+/// Does this mode apply the blessing GAME-WIDE (the Lever D clone row), or only through the stored
+/// byte, which the engine honours inside the Land of Shadow and nowhere else?
+///
+/// The two questions the old single Choice conflated are exactly this predicate and `floor != 0`.
+/// Mode 3 is the combination that Choice could not express: floor on, global off.
+pub fn applies_globally(mode: i32) -> bool {
+    matches!(mode, 1 | 2)
 }
 
 /// Must the blessing applier skip this tick because the player is dead or dying?

@@ -42,6 +42,11 @@ pub const SUPPORTED: &[&str] = &[
     // options.auto_equip -> er_logic::auto_equip (routing) + eldenring_archipelago::auto_equip
     // (the four-rep equip, wired connect -> receive -> tick) (2026-08-02).
     "auto_equip",
+    // dlc_blessing_catchup with scadutree_blessing_scope = dlc_only, i.e. blessing mode 3
+    // -> er_logic::upgrades::{blessing_target, applies_globally} (2026-08-06). Only mode 3 needs
+    // the tag: 0/1/2 mean exactly what they always meant, and a build without this arm clamps an
+    // unrecognised 3 to 0 in set_global_scadu_blessing, so the catch-up would vanish in silence.
+    "dlc_blessing_catchup",
 ];
 
 /// Feature tags the seed requires that this build does not know.
@@ -139,6 +144,24 @@ mod tests {
         );
         // Alongside the other tag, too -- a seed may need several.
         let sd = json!({ "requiresClientFeatures": ["auto_equip", "scaling_ceiling"] });
+        assert!(unsupported(&required_from_slot_data(&sd)).is_empty());
+    }
+
+    /// THE CASE THIS TAG WAS ADDED FOR: blessing mode 3 (`dlc_only` scope + `dlc_blessing_catchup`)
+    /// is the only NEW wire value the 2026-08-06 option split introduced. A build without the arm
+    /// clamps an unrecognised 3 to 0 in `set_global_scadu_blessing`, so the player's catch-up would
+    /// evaporate while the version check still said OK -- the contract hash folds CONTRACT, not
+    /// OPTIONS_SUBKEYS, so nothing else would have noticed. This build HAS the arm
+    /// (`blessing_target` mode 3 + `applies_globally`), so the tag must be accepted.
+    #[test]
+    fn a_seed_requiring_dlc_blessing_catchup_is_accepted() {
+        let sd = json!({ "requiresClientFeatures": ["dlc_blessing_catchup"] });
+        assert!(
+            unsupported(&required_from_slot_data(&sd)).is_empty(),
+            "this build implements blessing mode 3, so the tag must be in SUPPORTED"
+        );
+        // A seed may cap the enemy ceiling AND ask for catch-up; both must pass together.
+        let sd = json!({ "requiresClientFeatures": ["scaling_ceiling", "dlc_blessing_catchup"] });
         assert!(unsupported(&required_from_slot_data(&sd)).is_empty());
     }
 

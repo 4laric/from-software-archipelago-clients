@@ -27,7 +27,7 @@
 
 #![cfg(test)]
 
-use crate::upgrades::{blessing_target, level_for_fragments, SCADU_MAX_LEVEL};
+use crate::upgrades::{applies_globally, blessing_target, level_for_fragments, SCADU_MAX_LEVEL};
 
 /// What the client does each throttle window.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -345,6 +345,48 @@ fn blessing_target_is_max_of_fragments_and_floor_and_is_clamped() {
         None,
         "an unknown mode must not write"
     );
+}
+
+/// MODE 3 -- the combination the single `global_scadutree_blessing` Choice could not express, and
+/// the reason the option was split: vanilla SCOPE with the DLC catch-up floor.
+///
+/// THE MOTIVATING CASE, stated as the acceptance test (CONTRIBUTING rule 11): the fill scatters
+/// Scadutree Fragments across the multiworld, so a player can be handed Shadow Keep holding none of
+/// them and be brutalised for a decision that was never theirs. Mode 3 says "fix that, and nothing
+/// else" -- no Limgrave power curve.
+#[test]
+fn mode_3_is_the_floor_alone_and_never_global() {
+    assert_eq!(
+        blessing_target(3, 0, 10),
+        Some(10),
+        "arriving at Shadow Keep with zero fragments must still meet its floor"
+    );
+    // 🛑 THE FRAGMENTS ARE NOT OURS TO COUNT IN THIS MODE. The game still runs its own ladder --
+    // you revere at a grace and it applies the rung -- so folding the received count in would give
+    // blessing WITHOUT revering, which is `anywhere`'s semantics smuggled into the mode whose whole
+    // promise is that it does not do that. Outside a DLC bucket the floor is 0, so this is also
+    // what makes mode 3 inert in the base game.
+    assert_eq!(
+        blessing_target(3, 50, 7),
+        Some(7),
+        "a full fragment purse does not raise mode 3's contribution above the floor"
+    );
+    assert_eq!(
+        blessing_target(3, 50, 0),
+        Some(0),
+        "no floor here (a base-game bucket) => mode 3 contributes nothing"
+    );
+    assert_eq!(
+        blessing_target(3, 0, 999),
+        Some(SCADU_MAX_LEVEL),
+        "a nonsense floor from foreign slot_data is still clamped to the curve"
+    );
+
+    // The predicate the tick reads to decide whether to touch the clone row at all.
+    assert!(!applies_globally(3), "mode 3 must NEVER drive the clone row");
+    assert!(!applies_globally(0));
+    assert!(applies_globally(1));
+    assert!(applies_globally(2));
 }
 
 #[test]
