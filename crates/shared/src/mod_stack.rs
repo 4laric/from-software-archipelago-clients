@@ -94,11 +94,17 @@ pub struct Entry {
 
 impl Entry {
     pub fn dir(name: &str) -> Self {
-        Self { name: name.to_string(), is_dir: true }
+        Self {
+            name: name.to_string(),
+            is_dir: true,
+        }
     }
 
     pub fn file(name: &str) -> Self {
-        Self { name: name.to_string(), is_dir: false }
+        Self {
+            name: name.to_string(),
+            is_dir: false,
+        }
     }
 }
 
@@ -166,7 +172,10 @@ pub fn probe(dir: &Path) -> std::io::Result<Report> {
         // A `file_type` failure on one entry must not lose the whole probe; assume "file", which
         // only affects the logged shape, never the bucket.
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-        entries.push(Entry { name: entry.file_name().to_string_lossy().into_owned(), is_dir });
+        entries.push(Entry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir,
+        });
     }
     Ok(classify(&entries))
 }
@@ -238,7 +247,10 @@ mod tests {
             Entry::dir("map"),
         ]);
         assert!(report.data_mod_present());
-        assert_eq!(report.foreign, vec!["event/", "map/", "msg/", "regulation.bin", "script/"]);
+        assert_eq!(
+            report.foreign,
+            vec!["event/", "map/", "msg/", "regulation.bin", "script/"]
+        );
     }
 
     /// The NEGATIVE CONTROL, and the one that decides whether this is worth shipping: our own
