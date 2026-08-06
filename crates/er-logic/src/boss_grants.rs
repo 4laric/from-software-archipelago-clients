@@ -120,6 +120,31 @@ pub fn boss_grant_action(present: Option<bool>, holds: Option<bool>) -> Option<i
     }
 }
 
+/// Should WEAPON auto-equips be held while this fight is on?
+///
+/// ⭐⭐⭐ THE SEQUENCING IS THE WHOLE FUNCTION. Pausing on the same tick the spear is enqueued
+/// would hold the spear too, and the player would end up fighting Rykard with the grant sitting
+/// unequipped in the bag -- the exact outcome the grant exists to prevent. So the pause waits for
+/// an EMPTY queue: the spear drains on one tick, the gate closes on the next. `paused` is fed back
+/// in so that once closed it STAYS closed as the queue refills with incoming weapons.
+///
+/// 🛑 `None` (we could not read the character set, or could not act at all this tick) resolves to
+/// NOT paused. Resuming early is the status quo behaviour and costs a clobber; staying paused on a
+/// stale read would silently block every weapon equip for the rest of the session.
+///
+/// WEAPONS ONLY, and NARROW ON PURPOSE. `auto_equip`'s own module doc says clobbering the weapon
+/// in your hand mid-boss "IS the feature, not a bug to guard against" -- the French Challenge
+/// premise. The carve-out is therefore scoped to exactly the fight where WE handed the player a
+/// tool, and to the one category that can lose it for them: armour and talismans arriving mid-fight
+/// are harmless and keep flowing. Nothing is dropped either way -- a held weapon equips the moment
+/// the fight ends.
+pub fn should_pause_weapon_equips(present: Option<bool>, queue_empty: bool, paused: bool) -> bool {
+    match present {
+        Some(true) => queue_empty || paused,
+        _ => false,
+    }
+}
+
 /// Production adapter. A `false` from `grant_full_id` means no inventory pointer this tick; we say
 /// nothing and the next tick retries, which is why the POSSESSION latch and not a "we tried" flag
 /// is what stops the second copy.
@@ -213,5 +238,35 @@ mod tests {
             }
         }
         assert_eq!(grants, 1);
+    }
+
+    /// THE SEQUENCING, as a timeline: the spear must get out of the queue before the gate shuts.
+    #[test]
+    fn the_granted_spear_drains_before_the_pause_closes() {
+        let mut paused = false;
+        // Tick 1: Rykard loads, the spear was just enqueued -> queue NOT empty -> do not pause.
+        paused = should_pause_weapon_equips(Some(true), false, paused);
+        assert!(!paused, "pausing here would hold the spear we just granted");
+        // Tick 2: the spear equipped, queue drained -> now close the gate.
+        paused = should_pause_weapon_equips(Some(true), true, paused);
+        assert!(paused);
+        // Tick 3+: a weapon arrives from another world; the queue is no longer empty, and the gate
+        // must STAY shut -- this is the case `paused` is fed back in for.
+        paused = should_pause_weapon_equips(Some(true), false, paused);
+        assert!(paused, "an incoming weapon reopened the gate mid-fight");
+    }
+
+    #[test]
+    fn the_pause_lifts_when_the_fight_ends_or_the_read_fails() {
+        assert!(!should_pause_weapon_equips(Some(false), true, true), "boss gone -> resume");
+        assert!(!should_pause_weapon_equips(None, true, true), "unknown -> resume, never latch");
+    }
+
+    #[test]
+    fn the_pause_never_starts_without_the_boss() {
+        for q in [true, false] {
+            assert!(!should_pause_weapon_equips(Some(false), q, false));
+            assert!(!should_pause_weapon_equips(None, q, false));
+        }
     }
 }
