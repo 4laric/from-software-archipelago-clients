@@ -2497,7 +2497,7 @@ mod tests {
     }
 
     #[test]
-    fn a_named_hand_tuned_enemy_comes_DOWN_on_the_area_but_never_UP() {
+    fn a_named_hand_tuned_enemy_comes_down_on_the_area_but_never_up() {
         // ⭐⭐⭐ THE CASE ALARIC SET THE RULE ON (2026-08-06): "imagine this is a mountaintops fight
         // and I have to fight Okina. or a gravesite plain start and I'm fighting Ancient Dragon
         // Man." Vyke in Liurnia came out merely reasonable, which is the mild end of the
