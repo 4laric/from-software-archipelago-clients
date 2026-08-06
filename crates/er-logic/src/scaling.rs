@@ -934,9 +934,17 @@ pub fn tier_for_target(
 /// "absence is the safe state, and it is load-bearing". A region we cannot identify is the same fact
 /// about a bigger object, and it now gets the same answer.
 ///
-/// 🛑 CONSEQUENCE, STATED OUT LOUD: a region the seed does not wire is left VANILLA. Sealed and
-/// unkept regions are still physically walkable, so this is reachable in ordinary play. Making no
-/// statement about a region the seed does not cover is the point, not a side effect.
+/// ⭐⭐⭐ THE EXPOSED POPULATION IS SMALL, AND CHECKED. It is NOT "sealed regions" -- those are not
+/// walkable. The apworld emits `areaLockFlags` for **all 30 regions / 116 buckets**, and a SEALED
+/// region's range is keyed to an open flag that is never received and never lit, so the kick-watch
+/// permanently ejects the player (`features/area_locks.py`, the 2026-07-08 dead-drop fix). And the
+/// scaling wire loops `for pid in REGION_PLAY_IDS[region]`, so a KEPT region has **every** one of
+/// its buckets wired -- there are no unscaled pockets inside a region you can fight through.
+///
+/// What is left is the space outside `REGION_PLAY_IDS` entirely: Roundtable Hold, the Chapel of
+/// Anticipation (`sub 10010`, verified absent from the table), and the transient `sub 0` at connect
+/// before the game resolves a region. Those are exactly the places that should never have carried a
+/// difficulty statement, which is why this is a fix and not a trade.
 pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> Option<usize> {
     if let Some(&target) = cfg.region_targets.get(&region) {
         Some(tier_for_target(
