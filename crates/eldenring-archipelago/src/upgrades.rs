@@ -301,7 +301,7 @@ pub(crate) fn holds_weapon_base(base: i32) -> Option<bool> {
         }
         // param_id() strips the category nibble -> the resolved weapon row (base + level).
         let row = entry.item_id.param_id() as i32;
-        if er_logic::arena_grants::is_level_of(row, base) {
+        if er_logic::boss_grants::is_level_of(row, base) {
             return Some(true);
         }
     }

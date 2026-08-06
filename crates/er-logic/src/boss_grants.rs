@@ -50,20 +50,35 @@ pub const SERPENT_HUNTER_BASE: i32 = 17030000;
 /// duplicated because that crate does not build off Windows.
 pub const REINFORCE_STEP: i32 = 100;
 
-/// PlaceName id "Rykard, Lord of Blasphemy" -- the boss-healthbar label `NpcParam.nameId` points
-/// at. Recorded so the derivation below can be re-run rather than trusted.
-pub const RYKARD_PLACE_NAME_ID: i32 = 160000;
+/// Rykard's CHR id. Both phases are this one character: `NpcName` **904710000**
+/// ("God-Devouring Serpent") and **904710001** ("Rykard, Lord of Blasphemy") are name index 0 and
+/// 1 of chr `c4710`, and `c4700` has **no `NpcParam` rows at all**. So the serpent is not a second
+/// character and this key covers the whole fight -- which matters, because the spear is the answer
+/// to BOTH phases, not just the second (Alaric, 2026-08-06).
+pub const RYKARD_CHR_ID: i32 = 4710;
 
-/// Every `NpcParam` row whose `nameId` is [`RYKARD_PLACE_NAME_ID`]. Derived from the vanilla
-/// `NpcParam.csv` in `gen_inputs.db`, 2026-08-06: exactly ONE row of 7,039.
+/// 🛑🛑 HOW I GOT THIS WRONG THE FIRST TIME, because the same trap is one keystroke away.
 ///
-/// 🔎 OPEN, and cheap to settle: the phase-1 God-Devouring Serpent has an `NpcName` entry
-/// (904710000) but NO PlaceName row, so it is either the same character or a row with `nameId 0`
-/// that this cannot see. If it is separate, the grant lands at the phase transition instead of at
-/// the encounter start -- still in time to matter, since phase 2 is what the spear is for. The
-/// scaling census already prints `npc_param_id`s per region, so ONE log from that fight names
-/// every row in the arena and closes this.
-pub const RYKARD_NPC_PARAM_IDS: &[i32] = &[500020079];
+/// I keyed this on `NpcParam.nameId`, having found that row `500020079` carries `nameId 160000`
+/// and that **PlaceName** 160000 is "Rykard, Lord of Blasphemy". Both facts are true and the
+/// conclusion was still wrong: `nameId` indexes **NpcName**, not PlaceName, and NpcName 160000 is
+/// the **Twin Maiden Husks**. Two id spaces, one collision, and the shipped build granted the
+/// spear in Roundtable Hold.
+///
+/// The check that would have caught it in one line: resolve the SAME id in both tables and see
+/// that they disagree, or resolve a handful of OTHER `nameId`s (134800 Millicent, 121600 Blaidd,
+/// 130900 Patches -- all NpcName, none in PlaceName). A single id that resolves in the table you
+/// expected is not evidence that the table is the right one.
+///
+/// Boss rows carry `nameId 0`; a boss healthbar name comes from the EMEVD `DisplayBossHealthBar`
+/// call, not from `NpcParam`. So there was never going to be a name-keyed answer here.
+///
+/// What replaced it is structural: `NpcParam` ids are CHR-ENCODED, `CCCC____`. Verified on two
+/// independent characters -- `c4710` has 6 rows (47100000, 47100038, 47101000, 47101038, 47102000,
+/// 47109000) and Torrent `c8000` has exactly one (80000000).
+pub const RYKARD_NPC_PARAM_ROWS: &[i32] = &[
+    47100000, 47100038, 47101000, 47101038, 47102000, 47109000,
+];
 
 /// 🛑 THE FLAG THIS MODULE MUST NEVER TOUCH -- see property 1.
 pub const SERPENT_HUNTER_CHECK_FLAG: u32 = 16007690;
@@ -73,9 +88,22 @@ pub fn is_level_of(row: i32, base: i32) -> bool {
     row - (row % REINFORCE_STEP) == base
 }
 
-/// Is `npc_param_id` one of the character's rows?
+/// Does this `NpcParam` row belong to chr `chr_id`? Ids are chr-encoded `CCCC____`.
+///
+/// ⭐ A PREFIX test, not a membership test in [`RYKARD_NPC_PARAM_ROWS`]: a patch that adds a
+/// seventh `c4710` row should be covered automatically, and the enumerated list is documentation
+/// of what exists today rather than the gate.
+///
+/// 🛑 `npc_param_id`, NEVER `npc_id`. `npc_id` is the 4-digit CHR id (4710 here) and the two id
+/// spaces OVERLAP -- passing one where the other belongs is how phase 1a shipped a silently wrong
+/// native tier.
+pub fn is_character(npc_param_id: i32, chr_id: i32) -> bool {
+    npc_param_id / 10_000 == chr_id
+}
+
+/// Is this row one of Rykard's, in either phase?
 pub fn is_rykard(npc_param_id: i32) -> bool {
-    RYKARD_NPC_PARAM_IDS.contains(&npc_param_id)
+    is_character(npc_param_id, RYKARD_CHR_ID)
 }
 
 /// THE DECISION. `Some(full_id)` = grant now; `None` = do nothing.
@@ -107,12 +135,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rykard_is_one_known_character_row() {
-        assert_eq!(RYKARD_NPC_PARAM_IDS, &[500020079]);
-        assert_eq!(RYKARD_PLACE_NAME_ID, 160000);
-        assert!(is_rykard(500020079));
-        assert!(!is_rykard(500020078));
+    fn every_known_rykard_row_matches_and_neighbours_do_not() {
+        for &row in RYKARD_NPC_PARAM_ROWS {
+            assert!(is_rykard(row), "{row} is a c4710 row");
+        }
+        // Torrent (c8000, row 80000000) is the second character the CCCC____ convention was
+        // verified on; it must never match.
+        assert!(!is_rykard(80000000));
+        assert!(is_character(80000000, 8000));
+        assert!(!is_rykard(47110000), "c4711 is a different character");
         assert!(!is_rykard(0));
+    }
+
+    /// THE REGRESSION. 500020079 is the Twin Maiden Husks -- the row a PlaceName/NpcName id
+    /// collision put here first, which granted the spear in Roundtable Hold.
+    #[test]
+    fn the_twin_maiden_husks_row_is_not_rykard() {
+        assert!(!is_rykard(500020079));
     }
 
     #[test]

@@ -2818,7 +2818,7 @@ impl shared::Core for Core {
         //     obtained-flag: that flag is what check 7771816 is keyed on.
         if can_grant {
             let present =
-                crate::scaling::any_character_present(er_logic::boss_grants::RYKARD_NPC_PARAM_IDS);
+                crate::scaling::any_character_present(er_logic::boss_grants::RYKARD_CHR_ID);
             let holds =
                 crate::upgrades::holds_weapon_base(er_logic::boss_grants::SERPENT_HUNTER_BASE);
             let mut game = EldenRingHook;
