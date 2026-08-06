@@ -2823,6 +2823,20 @@ impl shared::Core for Core {
                 crate::upgrades::holds_weapon_base(er_logic::boss_grants::SERPENT_HUNTER_BASE);
             let mut game = EldenRingHook;
             if let Some(m) = er_logic::boss_grants::tick(&mut game, present, holds) {
+                // EQUIP IT. Without this the spear lands in the bag and the player opens a menu
+                // mid-fight -- which for an auto_equip player is backwards, since everything they
+                // are SENT gets equipped and the one thing handed to them for the fight does not.
+                //
+                // `enqueue` self-gates on the auto_equip option AND on the category, so this is a
+                // no-op for anyone who turned auto_equip off (their choice stands) and does the
+                // right thing for everyone else. 🛑 Do NOT add a filter here -- the receive path's
+                // comment says the same thing, and re-adding one is what previously excluded
+                // armour (#295).
+                //
+                // Pass the BASE id, exactly as the receive path passes its raw full_id: the
+                // auto_equip::enqueue_id seam is what applies auto_upgrade, and duplicating that
+                // mapping at the call site is how the +N lookup missed the bag before.
+                crate::auto_equip::enqueue(er_logic::boss_grants::SERPENT_HUNTER_BASE, None);
                 self.log(ap::Print::message(m));
             }
         }
