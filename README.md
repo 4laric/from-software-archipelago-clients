@@ -43,7 +43,41 @@ live in the running game:
 * **graces** — start/bundle graces are lit as they are unlocked;
 * **region locks** — regions are sealed until you receive their Region Lock
   item. Runs start from Roundtable Hold, and entering a still-locked region
-  warps you back there.
+  warps you back there;
+* **lock hints** — you can spend progression-surface checks to reveal where a
+  Region Lock is (see below).
+
+### Lock hints
+
+Archipelago prices a hint at a percentage of your own location count, and an
+all-region Elden Ring seed carries about **4879** locations — so the default 10%
+is **487 points**, roughly a tenth of the entire seed, for one hint. Elden Ring
+is priced out of Archipelago's hints by arithmetic, not by a host's setting.
+
+So the client re-denominates the host's own percentage over the ~158-location
+**progression surface** — the only locations this world's own progression can
+occupy, shown with a `*` in the tracker. At the Archipelago default that is
+**16 surface checks per hint** instead of 487, and it still tracks the host's
+`hint_cost`: a room at 5% pays less here too, and a room that made hints free
+gets these free.
+
+Your balance is on the overlay menu bar (`Lock hints: 23/16`); clicking it opens
+the tracker. There you can either:
+
+* **Hint next lock** — reveals the next lock you can actually *reach*: the one
+  whose region is still sealed but whose item is already sitting somewhere
+  open. You are not told which region that is until you buy it, which is the
+  point — the chain order is a product of the fill, so guessing a lock by name
+  means paying to find out you guessed wrong.
+* **hint lock** on a specific `[locked]` region header, if you would rather aim.
+
+Either way this publishes a **real Archipelago hint**, visible to the whole room
+in the Hints tab. It is never a private reveal: a hint nobody else can see is
+indistinguishable from cheating. It also never spends your Archipelago hint
+points — `!hint` still shows the full total afterwards — and it can only ever
+target your *own* world's Region Lock items. If a lock spilled into someone
+else's world the client says so and points you at `!hint`, which is the only
+tool for that case.
 
 ### Overlay hotkeys
 
