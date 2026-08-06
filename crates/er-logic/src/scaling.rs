@@ -1922,7 +1922,10 @@ mod tests {
         let vyke_shaped = named[0];
         assert!(!area_may_vouch_for(vyke_shaped));
         assert_eq!(presumed_native_tier(vyke_shaped, Some(5)), None);
-        assert_eq!(scale_action(false, vyke_shaped, 11, Some(5)), ScaleAction::NoTouch);
+        assert_eq!(
+            scale_action(false, vyke_shaped, 11, Some(5)),
+            ScaleAction::NoTouch
+        );
         assert!(!placed_by_area(vyke_shaped, Some(5)));
     }
 
@@ -1941,8 +1944,14 @@ mod tests {
         // The cost, asserted so it cannot be quietly reverted: a REWARDED row is excluded here even
         // though `native_tier` could place it. That is deliberate -- it lands in the under-scaled
         // direction, a blemish rather than a wall.
-        assert!(native_tier(523240000).is_some(), "fixture must still carry its own tier");
-        assert_eq!(presumed_native_tier(523240000, Some(5)), native_tier(523240000));
+        assert!(
+            native_tier(523240000).is_some(),
+            "fixture must still carry its own tier"
+        );
+        assert_eq!(
+            presumed_native_tier(523240000, Some(5)),
+            native_tier(523240000)
+        );
     }
 
     #[test]
@@ -1952,8 +1961,14 @@ mod tests {
         // enemies would have excluded ~90% of the game -- the exact trash the fallback exists for.
         let unnamed_unrewarded = -1; // absent from NATIVE_TIERS and from the exclusion set
         assert!(area_may_vouch_for(unnamed_unrewarded));
-        assert_eq!(scale_action(false, unnamed_unrewarded, 11, Some(1)), ScaleAction::Apply);
-        assert!(crate::native_tiers::AREA_EXCLUDED.len() < 600, "this is a carve-out, not a class ban");
+        assert_eq!(
+            scale_action(false, unnamed_unrewarded, 11, Some(1)),
+            ScaleAction::Apply
+        );
+        assert!(
+            crate::native_tiers::AREA_EXCLUDED.len() < 600,
+            "this is a carve-out, not a class ban"
+        );
     }
 
     #[test]
@@ -1962,7 +1977,10 @@ mod tests {
         // answers for most ids rather than failing, which is the same shape as the npc_id/
         // npc_param_id bug in #63.
         let named = crate::native_tiers::AREA_EXCLUDED;
-        assert!(named.windows(2).all(|w| w[0] < w[1]), "must be sorted and duplicate-free");
+        assert!(
+            named.windows(2).all(|w| w[0] < w[1]),
+            "must be sorted and duplicate-free"
+        );
     }
 
     #[test]

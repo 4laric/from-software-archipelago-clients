@@ -43,8 +43,18 @@
 //! TALISMANS (#295) ride the SAME four reps -- they are `ChrAsmSlot` 17..=20 like any other
 //! equipment, so rep (1)'s refcount is acquired by the same `ChrAsm::operator=` and rep (4) is the
 //! same inventory index. Nothing new was reverse-engineered for them. What IS new is that the
-//! target slot is not a function of the item alone: it depends on how many slots the player has
-//! unlocked and on what is already worn, both read live below.
+//! target slot is not a function of the item alone: it depends on the talisman's POSITION IN THE
+//! AP RECEIVED STREAM and on what is already worn.
+//!
+//! 🛑 #342 -- THE SLOT COUNT IS NOT READ OFF THE LIVE CHARACTER ANY MORE. It used to be
+//! `pgd.unlocked_talisman_slots`, and that made the slot decision a function of live state, so the
+//! reconciler's replay of the received set evaluated the same talisman against a different count
+//! and silently rearranged the player's loadout. The count now comes from
+//! `er_logic::auto_equip::TalismanStream`, which counts Talisman Pouches in the received stream --
+//! legitimate for this one item because the pouch is itself an AP item (all three copies are
+//! randomized checks), so the stream is upstream of the game's field rather than a second tally of
+//! it. The live field is still READ and LOGGED on every accessory equip so a disagreement between
+//! the two shows up in a log instead of being argued about.
 //!
 //! PHYSICK TEARS (#334) ride NONE of the four reps above, and that is the point. Tears are
 //! `EQUIP_PARAM_GOODS` and never enter `chr_asm` -- the Flask of Wondrous Physick is a separate
@@ -165,11 +175,17 @@ fn is_physick_tear(full_id: i32) -> bool {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-/// Queued FullIDs, each with the position of that TEAR in the AP received stream (`0` for
-/// everything else, which never reads it). The ordinal rides the queue rather than being recomputed
-/// in `tick()` because `tick()` runs whenever the item happens to reach the bag, which is not the
-/// order it was received in.
-static PENDING: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+/// Queued FullIDs, each with the stream position the resolver needs: `(full_id, ordinal, pouches)`.
+///
+/// * TEARS use `ordinal` (their position among tears since connect, from [`TEAR_SEQ`]) and ignore
+///   `pouches`.
+/// * TALISMANS use both, and take them from `er_logic::auto_equip::TalismanPos` -- the ordinal
+///   among talismans in the WHOLE received stream, and the Talisman Pouches that preceded them.
+/// * Weapons and protectors read neither; they get `(0, 0)`.
+///
+/// The position rides the queue rather than being recomputed in `tick()` because `tick()` runs
+/// whenever the item happens to reach the bag, which is not the order it was received in.
+static PENDING: Mutex<Vec<(i32, u64, u8)>> = Mutex::new(Vec::new());
 
 /// How many physick tears have been enqueued since CONNECT. Reset in [`set_enabled`], which is the
 /// whole trick: AP replays the entire received set on every connect, so re-counting the same stream
@@ -233,7 +249,7 @@ pub fn set_enabled(on: bool) {
 /// bagged id can still differ from the queued one. That window is bounded by the retry, and closing
 /// it properly means matching on the base row in `tick()` -- deliberately left out of this fix so
 /// the change stays one line of behaviour.
-pub fn enqueue(full_id: i32) {
+pub fn enqueue(full_id: i32, talisman: Option<er_logic::auto_equip::TalismanPos>) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -252,16 +268,37 @@ pub fn enqueue(full_id: i32) {
     // The ordinal is consumed per RECEIVE, before the dedup below, so it is the tear's position in
     // the stream and not its position among the pushes. A duplicate that gets deduped here is
     // deduped identically on replay, so the numbering stays reproducible either way.
-    let ordinal = if tear {
-        TEAR_SEQ.fetch_add(1, Ordering::Relaxed)
+    let (ordinal, pouches) = if tear {
+        (TEAR_SEQ.fetch_add(1, Ordering::Relaxed), 0)
     } else {
-        0
+        // #342: a TALISMAN's position comes from the caller's `TalismanStream`, which walks the
+        // whole received stream. It cannot be counted here: `enqueue` only sees the tail past the
+        // persisted `received_through` watermark, so a session-local counter would report zero
+        // pouches to a player who found three last session.
+        match talisman {
+            Some(pos) => (pos.ordinal, pos.pouches),
+            None => {
+                if matches!(
+                    er_logic::auto_equip::equipable(full_id),
+                    Some(er_logic::auto_equip::Equipable::Accessory)
+                ) {
+                    // Not reachable from the receive loop (it resolves the FullID through the same
+                    // item map the stream walk uses), so shout rather than guess quietly: the
+                    // fallback is one unlocked slot, i.e. every talisman on slot 1.
+                    log::warn!(
+                        "auto_equip: talisman {full_id:#010x} enqueued with no stream position -- \
+                         falling back to slot 1 (#342)"
+                    );
+                }
+                (0, 0)
+            }
+        }
     };
     let full_id = crate::upgrades::enqueue_upgrade_id(full_id);
     if let Ok(mut q) = PENDING.lock()
-        && !q.iter().any(|&(id, _)| id == full_id)
+        && !q.iter().any(|&(id, _, _)| id == full_id)
     {
-        q.push((full_id, ordinal));
+        q.push((full_id, ordinal, pouches));
     }
 }
 
@@ -296,7 +333,7 @@ pub fn tick() {
     if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
         return;
     }
-    let pending: Vec<(i32, u64)> = match PENDING.lock() {
+    let pending: Vec<(i32, u64, u8)> = match PENDING.lock() {
         Ok(q) if !q.is_empty() => q.clone(),
         _ => return,
     };
@@ -317,11 +354,13 @@ pub fn tick() {
     // inventory.rs / no_equip_load.rs).
     let pgd = &mut *gdm.main_player_game_data;
 
-    // Read ONCE per tick, before anything borrows `pgd.equipment` mutably. This is the game's own
-    // Talisman Pouch progression -- we do not count pouch pickups ourselves, because the game
-    // already does and a second tally is a second source of truth. The raw value is logged on
-    // every accessory equip: its zero point (slots vs pouches) is NOT verified, and
-    // `usable_accessory_slots` clamps to 1..=4 so both readings stay inside the four legal slots.
+    // Read ONCE per tick, before anything borrows `pgd.equipment` mutably. DIAGNOSTIC ONLY since
+    // #342 -- the game's own Talisman Pouch count, logged beside the stream-derived one on every
+    // accessory equip so the two can be compared in a log. It decides nothing: the slot resolver
+    // takes `TalismanPos` and there is no parameter left to feed this into.
+    //
+    // 🛑 DO NOT put it back. It is live state, and a live modulus is exactly what made the replay
+    // of the received set rearrange the loadout (`er_logic::auto_equip::slot_for_accessory`).
     let unlocked_talisman_slots = pgd.unlocked_talisman_slots;
 
     // Snapshot id -> (handle, inventory index) first, so the inventory borrow is released before we
@@ -366,11 +405,11 @@ pub fn tick() {
         )
         .collect();
 
-    let mut still_pending: Vec<(i32, u64)> = Vec::new();
-    for (fid, ordinal) in pending {
+    let mut still_pending: Vec<(i32, u64, u8)> = Vec::new();
+    for (fid, ordinal, pouches) in pending {
         let full = fid as u32;
         let Some(&(handle, inv_index)) = owned.get(&full) else {
-            still_pending.push((fid, ordinal)); // not granted yet -- retry next tick
+            still_pending.push((fid, ordinal, pouches)); // not granted yet -- retry next tick
             continue;
         };
         let param_id = full & 0x0FFF_FFFF;
@@ -452,19 +491,45 @@ pub fn tick() {
                     (id > 0 && repo.get::<EquipParamAccessory>(id as u32).is_some()).then_some(id)
                 });
 
-                let Some(slot) = er_logic::auto_equip::slot_for_accessory(
-                    unlocked_talisman_slots,
-                    slots,
-                    param_id as i32,
-                ) else {
+                let pos = er_logic::auto_equip::TalismanPos { ordinal, pouches };
+                let Some(slot) =
+                    er_logic::auto_equip::slot_for_accessory(pos, slots, param_id as i32)
+                else {
                     // Already worn. ER refuses duplicate talismans, so equipping a second copy
                     // would build a loadout the menu cannot produce.
                     continue;
                 };
+                // BOTH counts, every time. `pouches` is what decided the slot; `raw` is the game's
+                // own number and decides nothing. They should agree once the pouch grant has
+                // landed (bobler's 0.3.5 log: pouch 05:05:41, raw 0 -> 1 by 05:05:43), so a line
+                // where they differ is either that couple of seconds or a real disagreement -- and
+                // either way it is now in the log rather than inferred.
                 log::info!(
-                    "auto_equip: talisman {full:#010x} -> slot {slot} \
-                     (unlocked_talisman_slots raw={unlocked_talisman_slots}, worn={slots:?})"
+                    "auto_equip: talisman {full:#010x} -> slot {slot} (stream #{ordinal}, \
+                     pouches={pouches} -> {} slot(s); unlocked_talisman_slots raw={unlocked_talisman_slots}, \
+                     worn={slots:?})",
+                    er_logic::auto_equip::usable_accessory_slots(pouches)
                 );
+                // 🛑 REPORTED, NOT REPAIRED (#342). The game knowing about MORE pouches than the
+                // stream delivered is the one state the stream-derived count gets wrong, and the
+                // repair -- taking the live field as a floor -- is exactly the live modulus this
+                // change exists to remove, so it is not available. Say so instead.
+                //
+                // Two ways to reach it: the character carried pouches in from another run or
+                // another seed (harmless, and the player can see why), or the seed did not place
+                // Talisman Pouch as a check at all. The apworld ships all three copies as
+                // randomized checks (`LOCATION_ITEM` 7770025..7770027), so the second should be
+                // unreachable -- and if it ever is reached, this line is how we find out rather
+                // than the player quietly losing slots 2..4.
+                if u32::from(unlocked_talisman_slots) > u32::from(pouches) {
+                    log::warn!(
+                        "auto_equip: the character has {unlocked_talisman_slots} Talisman \
+                         Pouch(es) but only {pouches} arrived through AP, so talismans will use \
+                         {} slot(s) and not {} (#342)",
+                        er_logic::auto_equip::usable_accessory_slots(pouches),
+                        er_logic::auto_equip::usable_accessory_slots(unlocked_talisman_slots)
+                    );
+                }
                 slot
             }
             Some(Equipable::Protector) => {
