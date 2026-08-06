@@ -506,10 +506,22 @@ pub fn tick() -> Option<String> {
     let (target, dbg, entry_toast) = {
         let guard = CONFIG.lock().unwrap();
         let cfg = guard.as_ref()?;
-        let tier = tier_for_region(cfg, region);
+        // 🛑 AN UNMAPPED REGION IS NOT A DIFFICULTY STATEMENT, SO WE DO NOT MAKE ONE. This used to
+        // resolve to the floor tier and sweep anyway; the 2026-08-06 log swept 198 enemies in
+        // `sub 0` (nothing resolved yet, at connect) and 42 in `sub 10010` (Chapel, not in the
+        // wire), applying rungs and 1b down-states in regions we could not name. `scale_action`
+        // already refuses to place an ENEMY it cannot identify; this is the same refusal one level
+        // up. ⭐ Enemies already carrying our state keep it -- we stop touching the region, we do
+        // not undo it.
+        let Some(tier) = tier_for_region(cfg, region) else {
+            drop(guard);
+            note_unmapped(region);
+            return None;
+        };
         let rates = tier_rates(tier);
         let dbg = RegionScaleDbg {
             tier,
+            // Always `Some` by the time we get here -- an unmapped region returns above.
             raw_target: raw_target_for_region(cfg, region),
             max_target: cfg.max_target,
             dlc_region: is_dlc_bucket(cfg, region),
@@ -867,6 +879,28 @@ fn scale_hostile_phantom(
             "enemy-scaling: scaled hostile phantom (chr_type={ty:?} team={team} npc_id={npc_id})"
         );
     }
+}
+
+/// Say once, per region, that we are declining to scale it -- then stay quiet.
+///
+/// 🛑 THE SWEEP IS THROTTLED, NOT ONE-SHOT, so an unconditional log here would emit every few frames
+/// for as long as the player stands in an unwired area. Keyed on the region so a transition still
+/// reports, which is the case worth seeing: at connect the region reads `0` until the game resolves
+/// one, and a sweep that silently does nothing there is indistinguishable from a broken sweep.
+fn note_unmapped(region: i32) {
+    static LAST: Mutex<Option<i32>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if *last == Some(region) {
+        return;
+    }
+    *last = Some(region);
+    log::info!(
+        "enemy-scaling: region {region} is not in the sphere wire -- left VANILLA (no tier, no \
+         down-state). Unkept and sealed regions are still walkable, so this is expected there; at \
+         connect it is also normal until the game resolves a region."
+    );
 }
 
 /// Ensure one enemy carries exactly `target` as its scaling SpEffect: skip if it already has it, else

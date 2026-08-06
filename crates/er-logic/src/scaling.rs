@@ -918,12 +918,33 @@ pub fn tier_for_target(
     tier.clamp(floor, ceiling)
 }
 
-/// Region → tier. A region absent from `region_targets` falls back to the floor tier (unknown = don't
-/// scale up). DLC buckets are NOT special-cased: with the DLC baked-scaling clear fixed
-/// (`DLC_SCALING_ID_RANGE`), DLC enemies scale by sphere depth exactly like base game.
-pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> usize {
+/// Region → tier, or **`None` when the region is unmapped**. DLC buckets are NOT special-cased: with
+/// the DLC baked-scaling clear fixed (`DLC_SCALING_ID_RANGE`), DLC enemies scale by sphere depth
+/// exactly like base game.
+///
+/// 🛑🛑 IT USED TO RETURN THE FLOOR TIER FOR AN UNMAPPED REGION, AND THAT WAS A GUESS WEARING A
+/// NUMBER'S CLOTHES. The comment called it "unknown = don't scale up", which was true only while the
+/// floor was 0; at any other floor it scales an unidentified region to a tier nobody chose. The
+/// 2026-08-06 log shows the cost: `sub 0` (nothing resolved yet, at connect) and `sub 10010` (Chapel,
+/// not in the wire) both floored, and **198 and 42 enemies were swept in them** — including, since
+/// #346 phase 1b, DOWN states.
+///
+/// ⭐⭐⭐ THIS FILE ALREADY DECIDED THIS QUESTION, ONE LEVEL DOWN. `presumed_native_tier` returns
+/// `None` for an enemy it cannot place, and `scale_action` leaves it exactly as vanilla shipped it —
+/// "absence is the safe state, and it is load-bearing". A region we cannot identify is the same fact
+/// about a bigger object, and it now gets the same answer.
+///
+/// 🛑 CONSEQUENCE, STATED OUT LOUD: a region the seed does not wire is left VANILLA. Sealed and
+/// unkept regions are still physically walkable, so this is reachable in ordinary play. Making no
+/// statement about a region the seed does not cover is the point, not a side effect.
+pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> Option<usize> {
     if let Some(&target) = cfg.region_targets.get(&region) {
-        tier_for_target(target, cfg.max_target, cfg.floor_tier, cfg.ceiling_tier)
+        Some(tier_for_target(
+            target,
+            cfg.max_target,
+            cfg.floor_tier,
+            cfg.ceiling_tier,
+        ))
     } else if let Some(&(_, _, target)) =
         // SCALING_WIRE: range fallback -- `region` is the play_region/100 sub id; the apworld
         // emits [lo, hi, target] buckets in the same space (a few dozen; linear scan is fine).
@@ -932,9 +953,14 @@ pub fn tier_for_region(cfg: &ScalingConfig, region: i32) -> usize {
             .iter()
             .find(|&&(lo, hi, _)| (lo..=hi).contains(&region))
     {
-        tier_for_target(target, cfg.max_target, cfg.floor_tier, cfg.ceiling_tier)
+        Some(tier_for_target(
+            target,
+            cfg.max_target,
+            cfg.floor_tier,
+            cfg.ceiling_tier,
+        ))
     } else {
-        cfg.floor_tier.min(NUM_TIERS - 1)
+        None
     }
 }
 
@@ -1125,11 +1151,15 @@ pub fn parse_triple_ranges(v: Option<&Value>) -> Vec<(i32, i32, i32)> {
 pub enum RegionScaling {
     /// The seed put this region's bucket on the wire; `target` resolved to this tier.
     Known(usize),
-    /// No target for this bucket (hub, tutorial, an unmapped sub-area, or a foreign/older seed), so
-    /// the client is using the floor tier. NOT the same thing as "tier 0", and the toast must not
-    /// present a defaulted value as a derived one -- unknown is said out loud, per the house rule
-    /// that a derivation which cannot answer must say so rather than answer.
-    Defaulted(usize),
+    /// No target for this bucket (hub, tutorial, an unmapped sub-area, an unkept region, or a
+    /// foreign/older seed), so **nothing is applied there at all**.
+    ///
+    /// 🛑 IT USED TO CARRY THE FLOOR TIER, AND THAT WENT STALE THE MOMENT THE SWEEP STOPPED USING
+    /// IT (2026-08-06, `tier_for_region` -> `Option`). An announcement that named a multiplier the
+    /// sweep no longer applies would be the confident wrong answer this enum exists to prevent —
+    /// worse than the "tier 0" rendering it was built to stop, because it would be actively false
+    /// rather than merely misleading. Carrying no number is what makes that impossible.
+    Unscaled,
 }
 
 /// Resolve a region's scaling for display. `target: None` means the bucket was absent from the wire.
@@ -1141,7 +1171,7 @@ pub fn region_scaling(
 ) -> RegionScaling {
     match target {
         Some(t) => RegionScaling::Known(tier_for_target(t, max_target, floor_tier, ceiling_tier)),
-        None => RegionScaling::Defaulted(floor_tier.min(NUM_TIERS - 1)),
+        None => RegionScaling::Unscaled,
     }
 }
 
@@ -1200,10 +1230,9 @@ pub fn region_scaling_toast(
             tier.clamp(floor, ceiling) - floor,
             span
         ),
-        RegionScaling::Defaulted(tier) => format!(
-            "{} - enemy scaling not set for this area; using the floor, {:.2}x",
-            region,
-            tier_multiplier(tier)
+        RegionScaling::Unscaled => format!(
+            "{} - enemy scaling not set for this area; enemies here are unchanged",
+            region
         ),
     }
 }
@@ -1362,13 +1391,13 @@ mod tests {
         c.max_target = 100;
         c.region_ranges = vec![(6850, 6850, 100), (64000, 64000, 100)]; // Jagged Peak + a base bucket
         c.dlc_blessing_floors = vec![(6850, 6850, 12)]; // 6850 is a DLC bucket (has a blessing floor)
-        assert_eq!(tier_for_region(&c, 6850), NUM_TIERS - 1); // DLC: full tier, uncapped
-        assert_eq!(tier_for_region(&c, 64000), NUM_TIERS - 1); // base: identical treatment
-                                                               // floor_tier still applies to DLC buckets like any other.
+        assert_eq!(tier_for_region(&c, 6850), Some(NUM_TIERS - 1)); // DLC: full tier, uncapped
+        assert_eq!(tier_for_region(&c, 64000), Some(NUM_TIERS - 1)); // base: identical treatment
+                                                                     // floor_tier still applies to DLC buckets like any other.
         c.floor_tier = 2;
         c.region_ranges = vec![(6850, 6850, 0)]; // shallow DLC bucket
         c.max_target = 100;
-        assert_eq!(tier_for_region(&c, 6850), 2);
+        assert_eq!(tier_for_region(&c, 6850), Some(2));
     }
 
     // --- ladder integrity (the vanilla 7010..7100 rows) ---
@@ -1423,10 +1452,10 @@ mod tests {
         let mut c = cfg(&[], 0);
         c.region_ranges = vec![(10000, 10000, 2000), (62000, 62999, 10000)];
         c.max_target = 10000;
-        // Stormveil sub 10000 -> low tier; Liurnia sub 62400 -> top tier; unmapped -> floor.
+        // Stormveil sub 10000 -> low tier; Liurnia sub 62400 -> top tier; unmapped -> no answer.
         assert!(tier_for_region(&c, 10000) < tier_for_region(&c, 62400));
-        assert_eq!(tier_for_region(&c, 99999), 0);
-        assert_eq!(tier_for_region(&c, 62400), NUM_TIERS - 1);
+        assert_eq!(tier_for_region(&c, 99999), None);
+        assert_eq!(tier_for_region(&c, 62400), Some(NUM_TIERS - 1));
     }
 
     #[test]
@@ -1526,15 +1555,32 @@ mod tests {
     fn known_region_maps_to_its_tier() {
         let c = cfg(&[(60000, 0), (63000, 50), (76000, 100)], 0);
         let mid = ((NUM_TIERS - 1) as f32 / 2.0).round() as usize; // ladder-length agnostic
-        assert_eq!(tier_for_region(&c, 60000), 0);
-        assert_eq!(tier_for_region(&c, 63000), mid);
-        assert_eq!(tier_for_region(&c, 76000), NUM_TIERS - 1);
+        assert_eq!(tier_for_region(&c, 60000), Some(0));
+        assert_eq!(tier_for_region(&c, 63000), Some(mid));
+        assert_eq!(tier_for_region(&c, 76000), Some(NUM_TIERS - 1));
     }
 
     #[test]
-    fn unknown_region_falls_back_to_floor() {
+    fn an_unmapped_region_gets_no_answer_rather_than_the_floor() {
+        // 🛑 THE PREMISE MOVED 2026-08-06 AND THE NAME MOVED WITH IT. This test used to be called
+        // `unknown_region_falls_back_to_floor` and asserted exactly that. The fallback was a GUESS,
+        // and it was invisible while the floor was 0 because tier 0 is nearly vanilla — with the
+        // floor at 2, as this fixture has it, an unidentified region was being scaled to 1.656x HP
+        // on no evidence at all.
+        //
+        // The bug the old test was written to catch — an unmapped region silently taking some OTHER
+        // region's tier — is still caught, and more strictly: `None` cannot be mistaken for a tier.
         let c = cfg(&[(60000, 100)], 2);
-        assert_eq!(tier_for_region(&c, 99999), 2);
+        assert_eq!(tier_for_region(&c, 99999), None);
+        // ⭐ NOT VACUOUS: the same config still answers for the region it does know, at a tier that
+        // is not the floor. A change that made this function return `None` for everything would
+        // pass the assertion above and fail here.
+        assert_eq!(tier_for_region(&c, 60000), Some(NUM_TIERS - 1));
+
+        // The floor still governs MAPPED regions -- this change is about identification, not about
+        // the floor.
+        let shallow = cfg(&[(60000, 0)], 2);
+        assert_eq!(tier_for_region(&shallow, 60000), Some(2));
     }
 
     // --- ids + floor conversion ---
@@ -1622,7 +1668,7 @@ mod tests {
         });
         let cfg = parse_scaling_config(&sd).expect("should arm");
         assert_eq!(cfg.ceiling_tier, NUM_TIERS - 1);
-        assert_eq!(tier_for_region(&cfg, 200), NUM_TIERS - 1);
+        assert_eq!(tier_for_region(&cfg, 200), Some(NUM_TIERS - 1));
     }
 
     #[test]
@@ -1638,12 +1684,12 @@ mod tests {
         assert_eq!(cfg.ceiling_tier, 5);
         assert_eq!(
             tier_for_region(&cfg, 200),
-            5,
+            Some(5),
             "the deepest region is capped"
         );
         assert_eq!(
             tier_for_region(&cfg, 100),
-            0,
+            Some(0),
             "the shallowest is unaffected"
         );
     }
@@ -1763,12 +1809,7 @@ mod tests {
         for tier in 0..=NUM_TIERS + 1 {
             for s in [
                 region_scaling_toast("Farum Azula", RegionScaling::Known(tier), 0, NUM_TIERS - 1),
-                region_scaling_toast(
-                    "Farum Azula",
-                    RegionScaling::Defaulted(tier),
-                    0,
-                    NUM_TIERS - 1,
-                ),
+                region_scaling_toast("Farum Azula", RegionScaling::Unscaled, 0, NUM_TIERS - 1),
                 region_scaling_toast("Farum Azula", RegionScaling::Known(tier), 3, 15),
                 region_scaling_toast("Farum Azula", RegionScaling::Known(tier), 7, 7),
             ] {
@@ -1864,28 +1905,29 @@ mod tests {
 
     #[test]
     fn an_unknown_bucket_says_so_instead_of_showing_tier_zero() {
-        // THE POINT OF THE ENUM. A region with no target on the wire falls back to the floor, and
-        // rendering that as "tier 0" would present a defaulted value as a derived one -- the exact
-        // confident-wrong-answer shape this crate's comments keep warning about.
-        let s = region_scaling_toast(
-            "Roundtable Hold",
-            RegionScaling::Defaulted(0),
-            0,
-            NUM_TIERS - 1,
-        );
+        // THE POINT OF THE ENUM, and the point moved on 2026-08-06. It used to be "do not render the
+        // floor as though it were derived"; now the sweep does not apply anything in an unmapped
+        // region, so the toast must not name a MULTIPLIER either. A number in this string would be
+        // a promise the sweep no longer keeps.
+        let s = region_scaling_toast("Roundtable Hold", RegionScaling::Unscaled, 0, NUM_TIERS - 1);
         assert!(s.contains("not set for this area"), "{s}");
         assert!(
             !s.contains("tier"),
-            "a defaulted region must not claim a tier: {s}"
+            "an unscaled region must not claim a tier: {s}"
         );
+        assert!(
+            !s.contains('x'),
+            "an unscaled region must not claim a multiplier either: {s}"
+        );
+        // ⭐ And it must still SAY something -- silence would read as a missing feature.
+        assert!(s.contains("Roundtable Hold"), "{s}");
     }
 
     #[test]
     fn region_scaling_maps_a_missing_target_to_defaulted_not_to_the_bottom() {
-        assert_eq!(
-            region_scaling(None, 10_000, 3, 19),
-            RegionScaling::Defaulted(3)
-        );
+        // 🛑 The floor is passed in and deliberately IGNORED: an unmapped region is not floored any
+        // more, it is untouched, and a variant carrying `3` here is what would let that drift back.
+        assert_eq!(region_scaling(None, 10_000, 3, 19), RegionScaling::Unscaled);
         assert!(matches!(
             region_scaling(Some(10_000), 10_000, 0, 19),
             RegionScaling::Known(_)
@@ -1986,12 +2028,18 @@ mod tests {
         c.ceiling_tier = 8;
         for bucket in [64000, 30000, 99999] {
             let applied = tier_for_region(&c, bucket);
-            let (RegionScaling::Known(shown) | RegionScaling::Defaulted(shown)) = region_scaling(
+            let shown = match region_scaling(
                 raw_target_for_region(&c, bucket),
                 c.max_target,
                 c.floor_tier,
                 c.ceiling_tier,
-            );
+            ) {
+                RegionScaling::Known(t) => Some(t),
+                // ⭐ THE INVARIANT SURVIVED THE PREMISE CHANGE BECAUSE IT WAS NEVER ABOUT NUMBERS.
+                // "Announced == applied" now includes announcing NOTHING when nothing is applied,
+                // and `99999` is in this list precisely to exercise that arm.
+                RegionScaling::Unscaled => None,
+            };
             assert_eq!(shown, applied, "bucket {bucket}");
         }
     }
