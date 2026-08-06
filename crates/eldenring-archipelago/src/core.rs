@@ -142,6 +142,17 @@ pub struct Core {
     progression_surface: HashSet<u64>,
     /// Coarse region name -> its lock item name, `"<coarse> Lock"` (absent = never locked).
     coarse_lock_items: HashMap<String, String>,
+    /// Throttled `(balance, price)` for the ALWAYS-VISIBLE menu bar (issue #412). `None` while
+    /// the ledger is unread or the price is underivable -- rendering nothing beats rendering a
+    /// zero the player would read as "this costs nothing".
+    lock_hint_hud: Option<(u64, u64)>,
+    /// `toast_clock` ms at the last HUD refresh. The HUD is recomputed ~4x/second rather than per
+    /// frame: it walks the checked-location set, which the always-on path should not do at 60fps.
+    lock_hint_hud_at: u64,
+    /// Edge latch for the "you can afford a lock hint" toast (`crossed_into_affordable`).
+    lock_hint_affordable_prev: Option<bool>,
+    /// One-shot "this feature exists" notice, re-armed on seed change.
+    lock_hint_intro_done: bool,
     /// Tracker filter: show only checks whose coarse region is currently accessible.
     tracker_in_logic_only: bool,
     /// Tracker filter: show only progression-surface checks.
@@ -472,6 +483,10 @@ impl shared::Core for Core {
             coarse_table: HashMap::new(),
             progression_surface: HashSet::new(),
             coarse_lock_items: HashMap::new(),
+            lock_hint_hud: None,
+            lock_hint_hud_at: 0,
+            lock_hint_affordable_prev: None,
+            lock_hint_intro_done: false,
             tracker_in_logic_only: false,
             tracker_surface_only: false,
             boss_defs: Vec::new(),
@@ -519,6 +534,23 @@ impl shared::Core for Core {
         if ui.menu_item("Tracker (F6)") {
             self.tracker_visible = !self.tracker_visible;
         }
+        // ---- lock-hint balance, issue #412 (the discoverability half) -------------------------
+        // The economy shipped entirely behind three closed doors at once: a tracker window that
+        // defaults to HIDDEN, a hotkey (F6) that appeared in no guide, and a price printed only on
+        // the header of a region that had to be both locked and scrolled into view. bobler played a
+        // whole 0.3.5 seed past it -- `0 hint(s) already bought` -- and spent three AP `!hint`s
+        // instead. This puts the balance where he already was: the menu bar, which is drawn
+        // whenever the main window is, and clicking it opens the thing that spends it.
+        if let Some((have, price)) = self.lock_hint_hud {
+            let label = if have >= price {
+                format!("Lock hints: {have}/{price} -- ready")
+            } else {
+                format!("Lock hints: {have}/{price}")
+            };
+            if ui.menu_item(label) {
+                self.tracker_visible = true;
+            }
+        }
     }
 
     /// Overlay frame hook: hotkey toggle + hint accumulation every frame (cheap -- the watermark
@@ -530,6 +562,7 @@ impl shared::Core for Core {
         }
 
         self.accumulate_hints_from_log();
+        self.refresh_lock_hint_hud();
 
         if self.tracker_visible {
             self.render_tracker_window(ui);
@@ -3337,6 +3370,12 @@ impl Core {
         // seed's purchases -- and its location ids would be meaningless here anyway. Re-read from
         // the server on the next pump.
         self.lock_hints.reset();
+        // ...and so must everything derived from it: a new seed's balance is a different number
+        // against a different set of locks, and the intro notice is news again.
+        self.lock_hint_hud = None;
+        self.lock_hint_hud_at = 0;
+        self.lock_hint_affordable_prev = None;
+        self.lock_hint_intro_done = false;
         // Boss-lock mode A: drop the parsed defs AND re-arm the felled-edge state, so the new
         // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
         self.boss_defs.clear();
@@ -3398,6 +3437,107 @@ impl Core {
         for entry in new_hints {
             self.hints.insert(entry);
         }
+    }
+
+    /// Recompute the always-visible lock-hint balance, and fire the two notices that make the
+    /// feature findable at all (issue #412).
+    ///
+    /// # Why a notice, and not just a better button
+    ///
+    /// bobler's 0.3.5 log is the whole argument: `lock hints: ledger loaded from er_lockhints_2 --
+    /// 0 hint(s) already bought`, followed by three AP `!hint`s three minutes apart. The economy
+    /// loaded, priced itself correctly, and was never touched, because nothing the player could see
+    /// ever mentioned it. Two moments are worth interrupting for, and no others: the first time we
+    /// know there is a lock to spend on, and the first time the balance is actually enough. Both
+    /// latch, so neither can become an advertisement that re-fires every frame.
+    ///
+    /// Throttled to ~4x/second: this walks the checked-location set, which the always-on path must
+    /// not do at frame rate.
+    fn refresh_lock_hint_hud(&mut self) {
+        const HUD_REFRESH_MS: u64 = 250;
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        if self.lock_hint_hud.is_some()
+            && now.saturating_sub(self.lock_hint_hud_at) < HUD_REFRESH_MS
+        {
+            return;
+        }
+        self.lock_hint_hud_at = now;
+        // The ledger gates the HUD for the same reason it gates the button: a balance computed
+        // against an unread ledger is free money printed on screen.
+        if !self.lock_hints.is_ready() {
+            self.lock_hint_hud = None;
+            return;
+        }
+        let surface: HashSet<i64> = self
+            .progression_surface
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+        let mut checked: HashSet<i64> = HashSet::new();
+        let mut unchecked_n: u64 = 0;
+        let mut points_per_hint: u64 = 0;
+        let mut connected = false;
+        if let Some(client) = self.client() {
+            connected = true;
+            for loc in client.checked_locations() {
+                checked.insert(loc.id() as i64);
+            }
+            for _ in client.unchecked_locations() {
+                unchecked_n += 1;
+            }
+            points_per_hint = client.points_per_hint();
+        }
+        if !connected {
+            self.lock_hint_hud = None;
+            return;
+        }
+        let total_locations = checked.len() as u64 + unchecked_n;
+        let surface_checked = er_logic::lock_hint_economy::surface_checked(&checked, &surface);
+        let Some((have, price)) = er_logic::lock_hint_economy::status(
+            surface.len() as u64,
+            surface_checked,
+            self.lock_hints.purchases(),
+            points_per_hint,
+            total_locations,
+        ) else {
+            self.lock_hint_hud = None;
+            return;
+        };
+        self.lock_hint_hud = Some((have, price));
+
+        // Both notices are gated on there BEING a lock to spend on. A seed with every region open
+        // has nothing to advertise, and saying so anyway is noise.
+        let open = self.open_coarse_regions();
+        let any_locked = self
+            .coarse_lock_items
+            .keys()
+            .any(|r| !r.is_empty() && !open.contains(r));
+        if !any_locked {
+            return;
+        }
+        // ASCII only -- toasts go through the FMG path (`every_toast_is_ascii`) and an em-dash
+        // draws as `?` in game.
+        if !self.lock_hint_intro_done {
+            self.lock_hint_intro_done = true;
+            self.log(ap::Print::message(format!(
+                "Lock hints: {have}/{price} progression-surface checks. Tracker (F6) -> Hint next lock."
+            )));
+            self.toasts.push(
+                format!("Lock hints: {have}/{price} -- F6 for the tracker"),
+                now,
+            );
+        }
+        let affordable = have >= price;
+        if er_logic::lock_hint_economy::crossed_into_affordable(
+            self.lock_hint_affordable_prev,
+            affordable,
+        ) {
+            self.log(ap::Print::message(
+                "You can afford a lock hint -- Tracker (F6) -> Hint next lock.".to_string(),
+            ));
+            self.toasts.push("You can afford a lock hint -- F6", now);
+        }
+        self.lock_hint_affordable_prev = Some(affordable);
     }
 
     /// Coarse regions currently accessible: a coarse region is open iff its lock item's physical
@@ -3536,6 +3676,37 @@ impl Core {
         // one coarse region, so any of the region's location ids resolves it.
         let coarse_of: HashMap<u64, String> = self.coarse_table.clone();
         let mut buy_clicks: Vec<i64> = Vec::new();
+        // "Hint next lock" (#412). The FRONTIER is the one lock whose region is still shut but
+        // whose ITEM already sits somewhere open -- the answer to "which lock can I go get now",
+        // which is the question a player asking "what is my 2nd lock" is really asking. Resolved
+        // out here, like everything else the closure reads, so the closure never borrows self.
+        let coarse_of_i64: HashMap<i64, String> = coarse_of
+            .iter()
+            .map(|(&id, region)| (id as i64, region.clone()))
+            .collect();
+        let next_offer = if ledger_ready {
+            er_logic::lock_hint_economy::next_offer(
+                &lock_item_of,
+                &open_coarse,
+                &coarse_of_i64,
+                &lock_scout,
+                &hinted_locs,
+                surface_total_n,
+                surface_checked_n,
+                purchases_n,
+                points_per_hint,
+                total_locations,
+            )
+        } else {
+            er_logic::lock_hint_economy::NextLockOffer::Idle
+        };
+        let hud = er_logic::lock_hint_economy::status(
+            surface_total_n,
+            surface_checked_n,
+            purchases_n,
+            points_per_hint,
+            total_locations,
+        );
 
         let mut open = true;
         // Filter state as locals (the closure stays self-free); written back to self after.
@@ -3553,6 +3724,58 @@ impl Core {
                     model.surface_done,
                     model.surface_total
                 ));
+                // ---- lock hints, at the TOP (#412) ------------------------------------------
+                // Above the filters, not on a region header: the balance and the one control that
+                // spends it must be visible the moment the window opens, without scrolling and
+                // without a locked region happening to be on screen.
+                if let Some((have, price)) = hud {
+                    ui.text(format!("lock hints: {have}/{price} surface checks"));
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(
+                            "You earn 1 per progression-surface check -- the * rows below.\nSpend them to publish a real Archipelago hint for a region lock.",
+                        );
+                    }
+                    use er_logic::lock_hint_economy::NextLockOffer as Next;
+                    match &next_offer {
+                        Next::Buyable { price, location, .. } => {
+                            ui.same_line();
+                            if ui.small_button(format!("Hint next lock ({price})###trk-buy-next")) {
+                                buy_clicks.push(*location);
+                            }
+                            if ui.is_item_hovered() {
+                                // 🛑 The region is deliberately NOT named here. Telling the player
+                                // which region is next for free hands over half of exactly what
+                                // the price is charged for.
+                                ui.tooltip_text(
+                                    "Hints the next lock you can actually reach, whichever it is.\nWhich region that turns out to be is what you are paying to find out.",
+                                );
+                            }
+                        }
+                        Next::Insufficient { price, have } => {
+                            ui.same_line();
+                            ui.text_disabled(format!("Hint next lock ({price} -- have {have})"));
+                        }
+                        Next::AllFrontierHinted => {
+                            ui.same_line();
+                            ui.text_colored(HINT_YELLOW, "next lock already hinted");
+                        }
+                        Next::Spilled { regions } => {
+                            // The dead-end the ruling called out: a lock in another player's world
+                            // is invisible to our scout, so say so and name the tool.
+                            ui.same_line();
+                            ui.text_disabled(format!(
+                                "next lock is in another world ({}) -- use !hint",
+                                regions.join(", ")
+                            ));
+                        }
+                        Next::NoneReachable => {
+                            ui.same_line();
+                            ui.text_disabled("no lock within reach -- you are gated on something else");
+                        }
+                        Next::Idle => {}
+                    }
+                    ui.separator();
+                }
                 ui.checkbox("in-logic only", &mut in_logic_only);
                 ui.same_line();
                 ui.checkbox("progression surface only", &mut surface_only);
@@ -3612,7 +3835,7 @@ impl Core {
                             Offer::Buyable { price, location } => {
                                 ui.same_line();
                                 if ui.small_button(format!(
-                                    "hint lock ({price} sp)###trk-buy-{}",
+                                    "hint lock ({price})###trk-buy-{}",
                                     region.region
                                 )) {
                                     buy_clicks.push(location);
@@ -3623,7 +3846,7 @@ impl Core {
                                 // the price, or that they are making progress toward it, learns
                                 // nothing from the mechanic.
                                 ui.same_line();
-                                ui.text_disabled(format!("hint lock ({price} sp -- have {have})"));
+                                ui.text_disabled(format!("hint lock ({price} -- have {have})"));
                             }
                             Offer::AlreadyHinted { .. } => {
                                 ui.same_line();
