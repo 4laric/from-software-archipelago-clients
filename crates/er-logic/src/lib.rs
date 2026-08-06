@@ -11,11 +11,11 @@
 //! See SHARED-CONVERGENCE-PLAN.md.
 
 pub mod add_item_probe;
-pub mod arena_grants;
 pub mod attunement;
 pub mod attunement_replay;
 pub mod auto_equip;
 pub mod boss_felled;
+pub mod boss_grants;
 pub mod boss_key_replay;
 pub mod capital;
 pub mod capital_replay;
