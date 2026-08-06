@@ -9,8 +9,13 @@
 //!
 //! Everything here is host-testable and holds no game state. The caller supplies the game-side
 //! facts we cannot read without the game: `EQUIP_PARAM_WEAPON_ST.wep_type`,
-//! `EQUIP_PARAM_PROTECTOR_ST.protectorCategory`, and -- for talismans --
-//! `PlayerGameData.unlocked_talisman_slots` plus what the four accessory slots currently hold.
+//! `EQUIP_PARAM_PROTECTOR_ST.protectorCategory`, and -- for talismans -- what the four accessory
+//! slots currently hold.
+//!
+//! Talisman SLOT COUNT is the one thing that is deliberately NOT read off the live character
+//! (#342). It is counted off the AP received stream instead, because the Talisman Pouch is itself
+//! an AP item and the slot decision has to be a pure function of replayed inputs. See
+//! [`TalismanStream`].
 
 use crate::hook::GameHook;
 
@@ -82,8 +87,8 @@ pub enum Equipable {
     Weapon,
     /// Read `EQUIP_PARAM_PROTECTOR_ST.protectorCategory`, then [`slot_for_protector_category`].
     Protector,
-    /// A TALISMAN. Read `PlayerGameData.unlocked_talisman_slots` and the current occupants of
-    /// [`ACCESSORY_SLOTS`], then [`slot_for_accessory`].
+    /// A TALISMAN. Take the [`TalismanPos`] the caller's [`TalismanStream`] produced and the
+    /// current occupants of [`ACCESSORY_SLOTS`], then [`slot_for_accessory`].
     Accessory,
 }
 
@@ -245,13 +250,103 @@ pub fn slot_for_protector_category(protector_category: u8) -> Option<u32> {
     }
 }
 
-/// How many of the four talisman slots the player has actually unlocked.
+/// The AP FullID of `Talisman Pouch`, as the apworld ships it: `1073751864` in
+/// `greenfield/eldenring/item_ids.py` on world `main` (`ITEM_CATALOG['Talisman Pouch']`), i.e.
+/// GOODS (category nibble 4) row 10040. All THREE vanilla copies are randomized checks --
+/// `LOCATION_ITEM` 7770025, 7770026 and 7770027 -- so a pouch cannot reach the player except
+/// through the AP received stream.
 ///
-/// `raw` is `PlayerGameData.unlocked_talisman_slots` read straight off the live character -- we do
-/// NOT track Talisman Pouch pickups ourselves, because the game already tracks them and a mod that
-/// counts pouches independently is a second source of truth waiting to disagree.
+/// 🛑 THAT IS THE ONLY REASON THIS CONSTANT EXISTS. See [`TalismanStream`] for why counting an
+/// item the game already counts is the right call for this one item and the wrong call in general.
+pub const TALISMAN_POUCH_FULL_ID: i32 = 1_073_751_864;
+
+/// Is this received FullID a Talisman Pouch?
+pub fn is_talisman_pouch(full_id: i32) -> bool {
+    full_id == TALISMAN_POUCH_FULL_ID
+}
+
+/// Where a talisman sits in the AP RECEIVED STREAM: its ordinal among talismans, and how many
+/// Talisman Pouches arrived strictly BEFORE it.
 ///
-/// ⭐ MEASURED 2026-08-03: THE FIELD COUNTS POUCHES, NOT SLOTS -- hence the `+ 1`.
+/// Both fields are pure functions of the replayed stream. [`slot_for_accessory`] takes this
+/// instead of a loose `u8` on purpose: there is no longer a parameter a future edit can quietly
+/// feed `PlayerGameData.unlocked_talisman_slots` back into.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TalismanPos {
+    /// 0-based position among the TALISMANS in the stream.
+    pub ordinal: u64,
+    /// Talisman Pouches received before this talisman. Feeds [`usable_accessory_slots`].
+    pub pouches: u8,
+}
+
+/// Running tally over the AP received stream, fed every received FullID in stream order.
+///
+/// ## 🛑 Why this counts pouches when the module used to refuse to
+///
+/// [`usable_accessory_slots`] used to be handed `PlayerGameData.unlocked_talisman_slots` straight
+/// off the live character, and the reason was written down here:
+///
+/// > we do NOT track Talisman Pouch pickups ourselves, because the game already tracks them and a
+/// > mod that counts pouches independently is a second source of truth waiting to disagree.
+///
+/// That reasoning is sound for a pickup the GAME owns, and it still governs everything the AP
+/// stream never sees. It stops applying to the Talisman Pouch, and only to it, because the pouch
+/// is ITSELF AN AP ITEM ([`TALISMAN_POUCH_FULL_ID`]): all three copies are randomized checks, so
+/// the stream is the source of truth for when the player got one and `unlocked_talisman_slots` is
+/// the DERIVED copy, updated a beat later when the grant lands. bobler's 0.3.5 log shows the two
+/// in that order -- pouch received 05:05:41, field steps `raw` 0 -> 1 by 05:05:43. Counting here
+/// is not a second tally of the game's number; it is reading the number UPSTREAM of the game's
+/// copy. The client still logs both on every accessory equip, so a disagreement shows up in a log
+/// instead of being argued about.
+///
+/// It has to be read upstream, because [`slot_for_accessory`] must be a pure function of replayed
+/// inputs and the live field is not one -- see that function's convergence note.
+///
+/// ⚠️ The tally must run over the WHOLE received stream, not over the tail the client happens to
+/// grant this connect. `received_through` is persisted per save, so a reconnect replays only the
+/// items past it; a counter that started at zero each connect would report zero pouches to a
+/// player who found three last session and pin them back to one slot. The call site therefore
+/// feeds this in the same history-agnostic pass that already counts `Progressive Flask Upgrade`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TalismanStream {
+    pouches: u32,
+    ordinal: u64,
+}
+
+impl TalismanStream {
+    /// Feed the NEXT FullID in the received stream. Returns the stream position when it is a
+    /// TALISMAN -- pass that straight to [`slot_for_accessory`] -- and `None` for everything else.
+    ///
+    /// Pouches are counted BEFORE the talisman that follows them, which is what makes the pair
+    /// (ordinal, pouches) reproduce exactly the unlock count that was live when the talisman first
+    /// arrived.
+    pub fn push(&mut self, full_id: i32) -> Option<TalismanPos> {
+        if is_talisman_pouch(full_id) {
+            self.pouches = self.pouches.saturating_add(1);
+            return None;
+        }
+        if equipable(full_id) != Some(Equipable::Accessory) {
+            return None;
+        }
+        let pos = TalismanPos {
+            ordinal: self.ordinal,
+            // Saturating, not wrapping: `usable_accessory_slots` clamps anyway, and a wrap would
+            // turn a garbage stream into ONE usable slot instead of four.
+            pouches: self.pouches.min(u8::MAX as u32) as u8,
+        };
+        self.ordinal += 1;
+        Some(pos)
+    }
+
+    /// Talisman Pouches seen so far. Diagnostics only -- the decision uses [`TalismanPos`].
+    pub fn pouches(&self) -> u32 {
+        self.pouches
+    }
+}
+
+/// How many of the four talisman slots the player has earned, from a POUCH COUNT.
+///
+/// ⭐ MEASURED 2026-08-03: THE COUNT IS POUCHES, NOT SLOTS -- hence the `+ 1`.
 ///
 /// It shipped clamped to `1..=4` with the zero point explicitly unverified, and the client logged
 /// the raw value on every accessory equip so the first real session would settle it. It did, on the
@@ -263,21 +358,33 @@ pub fn slot_for_protector_category(protector_category: u8) -> Option<u32> {
 /// reading that field would have to be `1`. So it is a count of EXTRA slots earned -- i.e. Talisman
 /// Pouches -- and the usable count is `raw + 1`.
 ///
+/// ✅ CONFIRMED DIRECTLY 2026-08-06, AT ONE POUCH. This carried a caveat that `+ 1` rested on a
+/// single reading at `raw = 0` and was therefore established by elimination rather than by
+/// observation, and asked for a reading at 1+ pouches. bobler's 0.3.5 session (13543-line log) is
+/// that reading. Talisman Pouch was a randomized check in his seed and he found one mid-run:
+///
+///   05:05:41  bobler found their Talisman Pouch (Liurnia :: Rimed Crystal Bud - near Road to the Manor)
+///   05:05:43  auto_equip: talisman 0x20000442 -> slot 18 (unlocked_talisman_slots raw=1, worn=[Some(1160), None, None, None])
+///
+/// Two seconds after the pouch the count steps 0 -> 1 and the resolver uses the SECOND accessory
+/// slot for the first time. Session tally: `raw=0` on 9 equips, `raw=1` on 13. The caveat is
+/// discharged -- `+ 1` is now observed, not inferred.
+///
 /// What the old clamp cost: from the FIRST pouch onward it under-counted by one, so a player with
 /// two slots only ever used one and a fully-upgraded player used three of four. Never an illegal
 /// write -- the failure direction the clamp was chosen for held -- just a wasted slot.
 ///
-/// ⚠️ ONE data point, at `raw = 0`. It is decisive against "slots" (a working slot cannot coexist
-/// with a count of zero) but a reading at 1+ pouches would confirm `+ 1` directly rather than by
-/// elimination. If that reading ever contradicts this, the log line is still there to catch it.
+/// The ARGUMENT is now [`TalismanPos::pouches`], counted off the AP stream rather than read off
+/// `PlayerGameData.unlocked_talisman_slots`. The units are identical -- the measurement above is
+/// what says so -- and [`TalismanStream`] says why the source moved.
 ///
 /// The clamp stays, and both ends still earn their keep:
 ///
 /// * lower bound 1 -- every character has slot 1 from the first minute;
 /// * upper bound 4 -- `ChrAsmSlot` 21 is the GREAT RUNE slot, and three pouches is the vanilla
 ///   maximum, so a larger value is a modded or garbage read and must not widen the range.
-pub fn usable_accessory_slots(raw: u8) -> usize {
-    (raw as usize + 1).clamp(1, ACCESSORY_SLOTS.len())
+pub fn usable_accessory_slots(pouches: u8) -> usize {
+    (pouches as usize + 1).clamp(1, ACCESSORY_SLOTS.len())
 }
 
 /// The `ChrAsmSlot` index a received TALISMAN should occupy, or `None` when there is nothing to do.
@@ -294,34 +401,71 @@ pub fn usable_accessory_slots(raw: u8) -> usize {
 ///
 /// 1. **Already worn -> `None`.** Not an optimisation: ER refuses duplicate talismans, so writing
 ///    the same row into a second slot builds a loadout the player could not have made in the menu.
-/// 2. **First EMPTY unlocked slot.** Fills 1, 2, 3, 4 as they come, so a player who has never
-///    touched the menu ends up with the four most recent talismans rather than one.
-/// 3. **All unlocked slots full -> the LOWEST unlocked slot, clobbering it.** Last writer wins,
-///    exactly as `SLOT_WEAPON_LEFT_1` already does when a staff lands on a shield. "All auto-
-///    equipped gear must stay equipped ... no unequipping allowed" means the answer to a full
-///    loadout is WHERE the new item lands, never WHETHER it is equipped -- so "keep the ones you
-///    have and leave the new talisman in the bag" is not available, and neither is a wear-value
-///    comparison, which is just choosing your build with extra steps.
+/// 2. **Otherwise `ACCESSORY_SLOTS[ordinal % n]`**, `n = usable_accessory_slots(pouches)` -- the
+///    talisman's own position in the AP received stream, taken modulo the number of slots it was
+///    earned into. Consecutive talismans therefore land on consecutive slots, which fills an empty
+///    loadout 1, 2, 3, 4 exactly as the old "first empty slot" rule did, and then keeps rotating
+///    instead of parking on slot 1 forever.
 ///
-/// Only `usable_accessory_slots(unlocked_talisman_slots)` slots are considered, so a locked slot is
-/// never read for occupancy nor written. Returning `Some` for every talisman is deliberate and is
+/// "All auto-equipped gear must stay equipped ... no unequipping allowed" means the answer to a
+/// full loadout is WHERE the new item lands, never WHETHER it is equipped -- so "keep the ones you
+/// have and leave the new talisman in the bag" is not available, and neither is a wear-value
+/// comparison, which is just choosing your build with extra steps.
+///
+/// ## 🛑 #342: what happens AFTER the slots fill, and why rule 2 is a rotation
+///
+/// This shipped as *fill the first empty unlocked slot, then clobber the LOWEST one*. Its own
+/// rationale ("a player who has never touched the menu ends up with the four most recent talismans
+/// rather than one") inverts the moment the slots are full: from then on slot 1 is the only one
+/// that ever changes and slots 2, 3, 4 freeze on whatever happened to arrive 2nd, 3rd and 4th.
+/// bobler's 0.3.5 log measures how early that bites -- **21 of his 22 talisman equips went to slot
+/// 17**, because at one unlocked slot "all unlocked slots full" is true from the second talisman
+/// onward. The clobbered talisman is unequipped, not lost; it stays in the bag.
+///
+/// The physick flask hit the same freeze and [`crate::physick::slot_for_tear`] fixed it with
+/// `ordinal % 2`. Porting that here needed a `% n` whose `n` did not move, and #342's blocker was
+/// that `n` is live state: `unlocked_talisman_slots` grows 1 -> 4 as pouches are found, so the
+/// same ordinal is taken modulo a different `n` live than on replay, and the reconciler's replay
+/// of the received set silently rearranges the loadout. **That blocker is discharged by making
+/// `n` a function of the stream** ([`TalismanStream`]): the pouch is an AP item, so the pouch
+/// count at any point in the stream is derivable from position in it.
+///
+/// ⚠️ MAKING `n` PURE IS NECESSARY AND NOT SUFFICIENT, and this is the part #342 did not have.
+/// A pure `n` alone does not converge, because the old rule 2 read the LIVE LOADOUT -- and the
+/// live loadout is exactly what differs between the first pass (slots empty) and every replay
+/// (slots full). #342's own worked example, 8 talismans with `n = 1,1,2,2,2,4,4,4`:
+///
+/// ```text
+/// live                                          (E, D, F, H)
+/// replay, n from the live field (4 throughout)  (E, F, G, H)   <- #342's divergence
+/// replay, n from the stream, rule 2 KEPT        (E, D, G, H)   <- still diverges, slot 3
+/// replay, n from the stream, rule 2 a ROTATION  (E, F, G, H) == live   <- converges
+/// ```
+///
+/// F and G reached slots 3 and 4 in the live pass through the empty-slot rule; on replay those
+/// slots are occupied, so they fall through to the rotation and land somewhere else. Any rule that
+/// reads occupancy has that shape. The rotation does not read occupancy at all, which is why it
+/// converges for every stream, every pouch schedule and every prefix length --
+/// `replaying_the_received_set_converges_for_every_pouch_schedule` is the acceptance test.
+///
+/// Rule 1 survives because under a rotation it is never a *different* answer: a talisman in the
+/// stream can only ever have been written to its own `ordinal % n`, so "already worn" fires only
+/// when the item is already in the slot the rotation was about to write. It is a no-op, not a
+/// diversion.
+///
+/// Only `usable_accessory_slots(pos.pouches)` slots are considered, so a locked slot is never read
+/// for occupancy nor written -- the reason this does not simply use a constant modulus of 4, which
+/// is #342's option 1 as literally filed. Returning `Some` for every talisman is deliberate and is
 /// why this does not mirror the `Option` on [`slot_for_wep_type`]: ammunition has no hand at all,
 /// whereas every talisman has a slot. The one `None` here means "already equipped", not "refused".
-pub fn slot_for_accessory(
-    unlocked_talisman_slots: u8,
-    slots: [Option<i32>; 4],
-    param_id: i32,
-) -> Option<u32> {
-    let n = usable_accessory_slots(unlocked_talisman_slots);
+pub fn slot_for_accessory(pos: TalismanPos, slots: [Option<i32>; 4], param_id: i32) -> Option<u32> {
+    let n = usable_accessory_slots(pos.pouches);
     let visible = &slots[..n];
 
     if visible.contains(&Some(param_id)) {
         return None;
     }
-    match visible.iter().position(Option::is_none) {
-        Some(i) => Some(ACCESSORY_SLOTS[i]),
-        None => Some(ACCESSORY_SLOTS[0]),
-    }
+    Some(ACCESSORY_SLOTS[(pos.ordinal % n as u64) as usize])
 }
 
 #[cfg(test)]
@@ -338,6 +482,42 @@ mod tests {
     /// Godrick's Great Rune as the apworld actually sends it: 1073742015 = category 4, row 191.
     /// GOODS, not accessory -- which is why no Great Rune ever reaches the accessory arm.
     const GOODS_GREAT_RUNE: i32 = 0x4000_00BF;
+
+    /// A stream position, spelled out at the call site so a reader can see both numbers.
+    fn pos(ordinal: u64, pouches: u8) -> TalismanPos {
+        TalismanPos { ordinal, pouches }
+    }
+
+    /// A talisman FullID for accessory param row `row` (category nibble 2), as the apworld sends
+    /// one. `0x2000_2778` in the constants above is the real Ailment Talisman; these are synthetic
+    /// rows in the same space, used only to tell eight talismans apart.
+    fn tal(row: i32) -> i32 {
+        (CATEGORY_ACCESSORY as i32) | row
+    }
+
+    /// Replay a whole received stream onto a starting loadout, exactly the way the client does:
+    /// every received FullID goes through the production [`TalismanStream`], and a talisman is
+    /// written to the slot [`slot_for_accessory`] names. The loadout holds PARAM ROWS, which is
+    /// what `chr_asm.equipment_param_ids` holds.
+    ///
+    /// This is the whole of the reconnect model. `run(EMPTY, stream)` is the first pass;
+    /// `run(run(EMPTY, stream), stream)` is what the player sees after a reconnect that replays
+    /// the set. The two must be equal.
+    fn run(start: [Option<i32>; 4], stream: &[i32]) -> [Option<i32>; 4] {
+        let mut worn = start;
+        let mut ts = TalismanStream::default();
+        for &full_id in stream {
+            let Some(p) = ts.push(full_id) else { continue };
+            let param_id = full_id & 0x0FFF_FFFF;
+            if let Some(slot) = slot_for_accessory(p, worn, param_id) {
+                let i = ACCESSORY_SLOTS.iter().position(|&s| s == slot).unwrap();
+                worn[i] = Some(param_id);
+            }
+        }
+        worn
+    }
+
+    const NOTHING_WORN: [Option<i32>; 4] = [None, None, None, None];
 
     #[test]
     fn only_weapons_are_weapons() {
@@ -487,13 +667,19 @@ mod tests {
     fn the_great_rune_slot_is_never_a_target() {
         const ACCESSORY_COVENANT: u32 = 21;
         assert!(!ACCESSORY_SLOTS.contains(&ACCESSORY_COVENANT));
-        for unlocked in 0..=255u8 {
-            let all_full = [Some(1), Some(2), Some(3), Some(4)];
-            let slot = slot_for_accessory(unlocked, all_full, 9999).unwrap();
-            assert!(
-                ACCESSORY_SLOTS.contains(&slot),
-                "unlocked={unlocked} produced slot {slot}, outside the four talisman slots"
-            );
+        // Both inputs are now unbounded caller-supplied numbers (a pouch count off the stream and
+        // a stream ordinal), so sweep both: neither the clamp nor the modulus may leave the four.
+        for pouches in 0..=255u8 {
+            for ordinal in [0u64, 1, 2, 3, 4, 7, 255, u64::MAX] {
+                let all_full = [Some(1), Some(2), Some(3), Some(4)];
+                let pos = TalismanPos { ordinal, pouches };
+                let slot = slot_for_accessory(pos, all_full, 9999).unwrap();
+                assert!(
+                    ACCESSORY_SLOTS.contains(&slot),
+                    "pouches={pouches} ordinal={ordinal} produced slot {slot}, outside the four \
+                     talisman slots"
+                );
+            }
         }
     }
 
@@ -512,27 +698,37 @@ mod tests {
         assert_eq!(usable_accessory_slots(9), 4); // clamped, not wrapped
         assert_eq!(usable_accessory_slots(255), 4);
 
-        // NO POUCHES (raw=0) = ONE slot. Empty -> slot 1, and NOT slot 2 even though 2 is empty
-        // too. This is the state Alaric's whole session ran in: six talismans, all to slot 17.
+        // NO POUCHES = ONE slot. Every talisman lands in slot 1 whatever its ordinal, and NOT in
+        // slot 2 even though slot 2 is empty. This is the state Alaric's whole 0.3.2 session ran
+        // in (six talismans, all to slot 17) and 21 of bobler's 22 equips too.
+        for ordinal in 0..8u64 {
+            assert_eq!(
+                slot_for_accessory(pos(ordinal, 0), [None, None, None, None], 1000),
+                Some(SLOT_ACCESSORY_1),
+                "ordinal {ordinal} with no pouches must stay in the one unlocked slot"
+            );
+        }
         assert_eq!(
-            slot_for_accessory(0, [None, None, None, None], 1000),
-            Some(SLOT_ACCESSORY_1)
+            slot_for_accessory(pos(1, 0), [Some(1000), None, None, None], 2000),
+            Some(SLOT_ACCESSORY_1),
+            "the LOCKED empties stay untouched -- a locked slot is neither read for occupancy \
+             nor written"
         );
-        // ...and once that one slot is full, clobber it. The LOCKED empties stay untouched, which
-        // is the assertion that matters: a locked slot is neither read for occupancy nor written.
+        // ONE pouch = two slots, and the rotation uses both -- never the third.
         assert_eq!(
-            slot_for_accessory(0, [Some(1000), None, None, None], 2000),
-            Some(SLOT_ACCESSORY_1)
-        );
-        // ONE pouch = two slots; first full -> the second, never the third.
-        assert_eq!(
-            slot_for_accessory(1, [Some(1000), None, None, None], 2000),
+            slot_for_accessory(pos(1, 1), [Some(1000), None, None, None], 2000),
             Some(SLOT_ACCESSORY_2)
         );
         assert_eq!(
-            slot_for_accessory(1, [Some(1000), Some(1010), None, None], 2000),
+            slot_for_accessory(pos(2, 1), [Some(1000), Some(1010), None, None], 2000),
             Some(SLOT_ACCESSORY_1),
-            "both unlocked slots full -> clobber the lowest; slot 3 is still locked"
+            "both unlocked slots full -> the rotation comes back round; slot 3 is still locked"
+        );
+        assert_eq!(
+            slot_for_accessory(pos(3, 1), [Some(1000), Some(1010), None, None], 2000),
+            Some(SLOT_ACCESSORY_2),
+            "...and back to slot 2. THE FREEZE (#342): under the shipped policy this was slot 1 \
+             again and slot 2 never changed for the rest of the run"
         );
     }
 
@@ -547,54 +743,91 @@ mod tests {
     fn a_pouch_earns_a_slot_and_the_slot_gets_used() {
         // one pouch = two slots: the second talisman must NOT clobber the first
         assert_eq!(
-            slot_for_accessory(1, [Some(1000), None, None, None], 2000),
+            slot_for_accessory(pos(1, 1), [Some(1000), None, None, None], 2000),
             Some(SLOT_ACCESSORY_2),
             "with one Talisman Pouch the player has two slots -- filling one and clobbering it is \
              the old off-by-one"
         );
         // three pouches = all four slots reachable
         assert_eq!(
-            slot_for_accessory(3, [Some(1000), Some(1010), Some(1020), None], 1030),
+            slot_for_accessory(pos(3, 3), [Some(1000), Some(1010), Some(1020), None], 1030),
             Some(SLOT_ACCESSORY_4),
             "three pouches is the vanilla maximum; slot 4 must be usable"
         );
     }
 
-    /// The stated policy, slot by slot: fill empties in order, then last-writer-wins on slot 1 --
-    /// the same rule `SLOT_WEAPON_LEFT_1` already applies when a staff lands on a shield.
+    /// The stated policy, slot by slot. With four slots unlocked the rotation fills an empty
+    /// loadout 1, 2, 3, 4 -- exactly what the old "first empty slot" rule did -- and then keeps
+    /// going round instead of parking on slot 1.
     #[test]
-    fn talismans_fill_empty_slots_then_clobber_the_lowest() {
-        let full = 4u8;
+    fn talismans_fill_the_slots_in_order_and_then_keep_rotating() {
+        let three = 3u8; // three pouches = all four slots
         assert_eq!(
-            slot_for_accessory(full, [None, None, None, None], 1000),
+            slot_for_accessory(pos(0, three), [None, None, None, None], 1000),
             Some(SLOT_ACCESSORY_1)
         );
         assert_eq!(
-            slot_for_accessory(full, [Some(1000), None, None, None], 1010),
+            slot_for_accessory(pos(1, three), [Some(1000), None, None, None], 1010),
             Some(SLOT_ACCESSORY_2)
         );
         assert_eq!(
-            slot_for_accessory(full, [Some(1000), Some(1010), None, None], 1020),
+            slot_for_accessory(pos(2, three), [Some(1000), Some(1010), None, None], 1020),
             Some(SLOT_ACCESSORY_3)
         );
         assert_eq!(
-            slot_for_accessory(full, [Some(1000), Some(1010), Some(1020), None], 1030),
+            slot_for_accessory(
+                pos(3, three),
+                [Some(1000), Some(1010), Some(1020), None],
+                1030
+            ),
             Some(SLOT_ACCESSORY_4)
         );
         // All four worn: the fifth talisman still gets equipped. Refusing it would be "you may
         // keep the build you have", which is the one thing the ruleset forbids.
+        let full = [Some(1000), Some(1010), Some(1020), Some(1030)];
         assert_eq!(
-            slot_for_accessory(full, [Some(1000), Some(1010), Some(1020), Some(1030)], 1040),
+            slot_for_accessory(pos(4, three), full, 1040),
             Some(SLOT_ACCESSORY_1)
+        );
+        // ...and the SIXTH goes to slot 2, not slot 1 again. That single assertion is #342: under
+        // the shipped policy every talisman from the fifth on went to slot 1 and slots 2, 3 and 4
+        // froze on whatever arrived 2nd, 3rd and 4th.
+        assert_eq!(
+            slot_for_accessory(pos(5, three), full, 1050),
+            Some(SLOT_ACCESSORY_2),
+            "slot 2 must be reachable again once the loadout is full -- the freeze is the bug"
+        );
+        assert_eq!(
+            slot_for_accessory(pos(6, three), full, 1060),
+            Some(SLOT_ACCESSORY_3)
+        );
+        assert_eq!(
+            slot_for_accessory(pos(7, three), full, 1070),
+            Some(SLOT_ACCESSORY_4)
         );
     }
 
-    /// A gap in the middle is filled before anything is clobbered -- the player unequipped slot 2
-    /// by hand, or a pouch arrived after slots 1 and 3 were written.
+    /// 🛑 WHAT THE ROTATION GAVE UP, stated so nobody re-adds it by accident.
+    ///
+    /// The old rule 2 hunted for the first EMPTY unlocked slot, so a gap in the middle -- the
+    /// player unequipped slot 2 by hand, or a pouch arrived after slots 1 and 3 were written --
+    /// was filled before anything was clobbered. The rotation does not look at occupancy, so the
+    /// gap is filled only when the ordinal comes round to it.
+    ///
+    /// That rule cannot come back. It reads the LIVE LOADOUT, and the live loadout is exactly what
+    /// differs between the first pass (slots empty) and every replay (slots full) -- see
+    /// `the_342_worked_example_diverges_until_rule_2_becomes_a_rotation`, which measures the
+    /// divergence it causes even with a perfectly pure modulus.
     #[test]
-    fn the_first_empty_slot_wins_even_out_of_order() {
+    fn a_hand_made_gap_is_not_hunted_for() {
         assert_eq!(
-            slot_for_accessory(4, [Some(1000), None, Some(1020), None], 1030),
+            slot_for_accessory(pos(4, 3), [Some(1000), None, Some(1020), None], 1030),
+            Some(SLOT_ACCESSORY_1),
+            "ordinal 4 % 4 = slot 1; the empty slot 2 is NOT preferred"
+        );
+        // The gap does get used -- one ordinal later.
+        assert_eq!(
+            slot_for_accessory(pos(5, 3), [Some(1000), None, Some(1020), None], 1030),
             Some(SLOT_ACCESSORY_2)
         );
     }
@@ -605,18 +838,23 @@ mod tests {
     #[test]
     fn a_talisman_already_worn_is_not_equipped_a_second_time() {
         assert_eq!(
-            slot_for_accessory(4, [Some(1000), None, None, None], 1000),
+            slot_for_accessory(pos(1, 3), [Some(1000), None, None, None], 1000),
             None
         );
         assert_eq!(
-            slot_for_accessory(4, [Some(1000), Some(1010), Some(1020), Some(1030)], 1020),
+            slot_for_accessory(
+                pos(1, 3),
+                [Some(1000), Some(1010), Some(1020), Some(1030)],
+                1020
+            ),
             None
         );
-        // ...but a copy sitting in a LOCKED slot is not "worn" -- it cannot be, so slot 1 it is.
-        // raw=0 (no pouches) => ONE unlocked slot, so the `Some(1010)` in slot 2 is unreachable
-        // state the game could not have produced and must not suppress the equip.
+        // ...but a copy sitting in a LOCKED slot is not "worn" -- it cannot be, so the rotation
+        // over the ONE unlocked slot wins. No pouches => one unlocked slot, so the `Some(1010)` in
+        // slot 2 is unreachable state the game could not have produced and must not suppress the
+        // equip.
         assert_eq!(
-            slot_for_accessory(0, [None, Some(1010), None, None], 1010),
+            slot_for_accessory(pos(0, 0), [None, Some(1010), None, None], 1010),
             Some(SLOT_ACCESSORY_1)
         );
     }
@@ -644,5 +882,279 @@ mod tests {
         let conventional = (1000i32 / 100) % 10; // == 0, i.e. "head"
         assert_eq!(conventional, 0);
         assert_eq!(slot_for_protector_category(4), None); // the game's answer for row 1000
+    }
+
+    /// The Talisman Pouch has to be recognised in the received stream by its FullID, so pin the id
+    /// the apworld actually ships. `greenfield/eldenring/item_ids.py` on world `main`:
+    /// `'Talisman Pouch': 1073751864`, i.e. GOODS (nibble 4) row 10040. If the world ever renumbers
+    /// it this fails here rather than silently reporting every player zero pouches.
+    #[test]
+    fn the_talisman_pouch_is_the_full_id_the_apworld_sends() {
+        assert_eq!(TALISMAN_POUCH_FULL_ID, 1_073_751_864);
+        assert_eq!(
+            TALISMAN_POUCH_FULL_ID as u32 & CATEGORY_MASK,
+            er_codec::CATEGORY_GOODS,
+            "the pouch is GOODS -- an accessory-nibble id here would make it a talisman"
+        );
+        assert_eq!(TALISMAN_POUCH_FULL_ID as u32 & !CATEGORY_MASK, 10_040);
+        assert!(is_talisman_pouch(TALISMAN_POUCH_FULL_ID));
+        // ...and nothing else is. In particular it is NOT equipable, so the pouch never reaches
+        // the accessory arm and cannot be mistaken for the talisman it unlocks a slot for.
+        assert!(!is_talisman_pouch(ACCESSORY_TALISMAN));
+        assert!(!is_talisman_pouch(GOODS_GREAT_RUNE));
+        assert!(!is_talisman_pouch(GOODS_FLASK));
+        assert_eq!(equipable(TALISMAN_POUCH_FULL_ID), None);
+    }
+
+    /// The seam that replaces the live `PlayerGameData.unlocked_talisman_slots` read: pouches are
+    /// counted BEFORE the talismans that follow them, and both numbers come out of stream position
+    /// alone.
+    #[test]
+    fn the_stream_says_how_many_pouches_came_before_each_talisman() {
+        let mut ts = TalismanStream::default();
+        let stream = [
+            tal(1000),
+            tal(1010),
+            TALISMAN_POUCH_FULL_ID,
+            tal(1020),
+            WEAPON_DAGGER, // everything that is not a talisman or a pouch is ignored...
+            PROTECTOR_HELM,
+            GOODS_GREAT_RUNE,
+            TALISMAN_POUCH_FULL_ID,
+            TALISMAN_POUCH_FULL_ID,
+            tal(1030),
+        ];
+        let seen: Vec<Option<TalismanPos>> = stream.iter().map(|&f| ts.push(f)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                Some(pos(0, 0)),
+                Some(pos(1, 0)),
+                None, // pouch
+                Some(pos(2, 1)),
+                None,
+                None,
+                None,
+                None, // pouch
+                None, // pouch
+                Some(pos(3, 3)),
+            ]
+        );
+        assert_eq!(ts.pouches(), 3);
+        // ...and that is exactly the unlock ladder the old live read produced: 1, 1, 2, 4 slots.
+        assert_eq!(
+            seen.iter()
+                .flatten()
+                .map(|p| usable_accessory_slots(p.pouches))
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 4]
+        );
+    }
+
+    /// 🛑 REJECTED VARIANTS. Kept ONLY to measure what they cost; neither is production code and
+    /// neither may be promoted into one. Both keep the shipped rule 2 ("first EMPTY unlocked
+    /// slot"); they differ in where the modulus comes from.
+    ///
+    /// * `live_n = Some(..)` supplies the modulus the way `pgd.unlocked_talisman_slots` did --
+    ///   the caller passes the growing ladder for the live pass and the settled value for the
+    ///   replay, which is the whole of #342's blocker.
+    /// * `live_n = None` derives it from the stream, i.e. the fix #342's comment proposed.
+    fn rejected_run(
+        start: [Option<i32>; 4],
+        stream: &[i32],
+        live_n: Option<&[usize]>,
+    ) -> [Option<i32>; 4] {
+        let mut worn = start;
+        let mut ts = TalismanStream::default();
+        for &full_id in stream {
+            let Some(p) = ts.push(full_id) else { continue };
+            let param_id = full_id & 0x0FFF_FFFF;
+            let n = match live_n {
+                Some(ladder) => ladder[p.ordinal as usize],
+                None => usable_accessory_slots(p.pouches),
+            };
+            if worn[..n].contains(&Some(param_id)) {
+                continue; // rule 1, unchanged
+            }
+            let i = match worn[..n].iter().position(Option::is_none) {
+                Some(i) => i,                            // rule 2: first EMPTY unlocked slot
+                None => (p.ordinal % n as u64) as usize, // rule 3: rotate
+            };
+            worn[i] = Some(param_id);
+        }
+        worn
+    }
+
+    /// 🛑 THE MOTIVATING CASE (rule 11), and it is #342's own worked example verbatim: eight
+    /// talismans A..H with Talisman Pouches arriving partway through, so the unlock ladder runs
+    /// `n = 1, 1, 2, 2, 2, 4, 4, 4`. The issue's table:
+    ///
+    /// ```text
+    /// live    (n = 1, 1, 2, 2, 2, 4, 4, 4)   ->  (E, D, F, H)
+    /// replay  (n = 4 throughout)             ->  (E, F, G, H)
+    ///                                             ^ diverges
+    /// ```
+    ///
+    /// Both rows are asserted below, so the analysis this change rests on is measured and not
+    /// quoted. Then the finding the issue does NOT have: making `n` a pure function of the stream
+    /// -- the whole of the proposed fix -- STILL DIVERGES, at slot 3, because rule 2 reads the live
+    /// loadout and the live loadout is empty on the first pass and full on every replay. Only
+    /// replacing rule 2 with the rotation converges.
+    ///
+    /// Fails if `slot_for_accessory` ever reads occupancy again for anything but rule 1.
+    #[test]
+    fn the_342_worked_example_diverges_until_rule_2_becomes_a_rotation() {
+        // A B [pouch] C D E [pouch] [pouch] F G H  =>  n = 1,1,2,2,2,4,4,4
+        let (a, b, c, d) = (tal(1000), tal(1010), tal(1020), tal(1030));
+        let (e, f, g, h) = (tal(1040), tal(1050), tal(1060), tal(1070));
+        let p = TALISMAN_POUCH_FULL_ID;
+        let stream = [a, b, p, c, d, e, p, p, f, g, h];
+        let row = |x: i32| Some(x & 0x0FFF_FFFF);
+        let ladder_live = [1usize, 1, 2, 2, 2, 4, 4, 4];
+        let ladder_replay = [4usize; 8];
+
+        // ROW 1 + 2 -- the issue's table, reproduced.
+        let live = rejected_run(NOTHING_WORN, &stream, Some(&ladder_live));
+        assert_eq!(
+            live,
+            [row(e), row(d), row(f), row(h)],
+            "#342's live row is (E, D, F, H)"
+        );
+        let replayed = rejected_run(live, &stream, Some(&ladder_replay));
+        assert_eq!(
+            replayed,
+            [row(e), row(f), row(g), row(h)],
+            "#342's replay row is (E, F, G, H)"
+        );
+        assert_ne!(live, replayed, "this IS the reported divergence");
+
+        // ROW 3 -- `n` derived from the stream, rule 2 kept. The modulus is now a pure function of
+        // replayed inputs and the loadout STILL rearranges: F, which reached slot 3 through the
+        // empty-slot rule, is displaced by G on replay.
+        let live2 = rejected_run(NOTHING_WORN, &stream, None);
+        let replayed2 = rejected_run(live2, &stream, None);
+        assert_eq!(live2, [row(e), row(d), row(f), row(h)]);
+        assert_eq!(replayed2, [row(e), row(d), row(g), row(h)]);
+        assert_ne!(
+            live2, replayed2,
+            "a pure modulus is NOT sufficient -- rule 2 reads the live loadout, and that is what \
+             differs between the first pass and the replay"
+        );
+
+        // ROW 4 -- what ships. Same stream, same ladder, and the loadout is a fixed point.
+        let shipped = run(NOTHING_WORN, &stream);
+        assert_eq!(
+            shipped,
+            [row(e), row(f), row(g), row(h)],
+            "the rotation gives the player the four most recent talismans, which is what rule 2's \
+             own rationale asked for and stopped delivering once the slots filled"
+        );
+        assert_eq!(
+            run(shipped, &stream),
+            shipped,
+            "RECONNECT MUST NOT REARRANGE THE LOADOUT"
+        );
+        assert_eq!(run(run(shipped, &stream), &stream), shipped);
+    }
+
+    /// 🛑 THE ACCEPTANCE TEST, the same shape as `physick::replaying_the_received_set_converges`
+    /// but swept over the thing #342 says cannot be swept: the pouch schedule.
+    ///
+    /// Every stream of 1..=8 distinct talismans, crossed with every placement of 0..=3 Talisman
+    /// Pouches among them (710 cases), must be a FIXED POINT of the replay. The pouch count is a
+    /// pure function of stream position, so the ladder is identical on both passes -- which is
+    /// precisely what a live `unlocked_talisman_slots` read cannot promise.
+    ///
+    /// Fails for a modulus taken from the live field, and fails for rule 2 (see the worked example
+    /// above for both).
+    #[test]
+    fn replaying_the_received_set_converges_for_every_pouch_schedule() {
+        let mut cases = 0usize;
+        for len in 1..=8usize {
+            let tals: Vec<i32> = (0..len).map(|i| tal(1000 + 10 * i as i32)).collect();
+            for pouches in 0..=3usize {
+                // Place `pouches` pouches into the `len + 1` gaps, with repeats -- every
+                // multiset of gap indices, i.e. every schedule.
+                for combo in gap_combinations(len + 1, pouches) {
+                    let at = |gap: usize| {
+                        std::iter::repeat_n(
+                            TALISMAN_POUCH_FULL_ID,
+                            combo.iter().filter(|&&g| g == gap).count(),
+                        )
+                    };
+                    let mut stream: Vec<i32> = Vec::new();
+                    for (gap, &t) in tals.iter().enumerate() {
+                        stream.extend(at(gap));
+                        stream.push(t);
+                    }
+                    stream.extend(at(len));
+                    let live = run(NOTHING_WORN, &stream);
+                    let replayed = run(live, &stream);
+                    assert_eq!(
+                        live, replayed,
+                        "reconnect rearranged the loadout for stream {stream:?}"
+                    );
+                    // ...and it must not drift on the third or fourth connect either.
+                    assert_eq!(live, run(run(live, &stream), &stream));
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 710, "the sweep must not silently shrink");
+    }
+
+    /// Non-decreasing multisets of `k` values drawn from `0..slots` -- every distinct way to place
+    /// `k` indistinguishable pouches into `slots` gaps.
+    fn gap_combinations(slots: usize, k: usize) -> Vec<Vec<usize>> {
+        if k == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        let mut cur = vec![0usize; k];
+        loop {
+            out.push(cur.clone());
+            // odometer over non-decreasing tuples
+            let mut i = k;
+            loop {
+                if i == 0 {
+                    return out;
+                }
+                i -= 1;
+                if cur[i] + 1 < slots {
+                    let v = cur[i] + 1;
+                    for c in cur.iter_mut().skip(i) {
+                        *c = v;
+                    }
+                    break;
+                }
+                if i == 0 {
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// The one case the rotation does NOT converge for, stated so it is a known trade and not a
+    /// surprise: the SAME talisman arriving twice in the stream. Rule 1 then fires against a slot
+    /// the rotation was not about to write, and the no-op is a real diversion rather than an
+    /// equivalent.
+    ///
+    /// Rule 1 wins that argument anyway. ER refuses duplicate talismans, so writing the row into a
+    /// second slot builds a loadout the player could not have made in the menu -- a visible, wrong
+    /// state -- whereas the divergence permutes items the player already has. The apworld places
+    /// each talisman once, so this needs a foreign world to send ours twice.
+    #[test]
+    fn a_duplicate_talisman_is_still_refused_a_second_slot() {
+        let t = tal(1000);
+        // Worn in slot 1, two slots unlocked, ordinal points at slot 2: still None.
+        assert_eq!(
+            slot_for_accessory(
+                pos(1, 1),
+                [Some(t & 0x0FFF_FFFF), None, None, None],
+                t & 0x0FFF_FFFF
+            ),
+            None,
+            "a talisman already worn must never be given a second slot, convergence or not"
+        );
     }
 }

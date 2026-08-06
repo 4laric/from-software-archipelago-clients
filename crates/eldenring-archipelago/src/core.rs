@@ -1761,6 +1761,17 @@ impl shared::Core for Core {
         // name, so a foreign apworld (Bedrock/fswap) that calls its fragments something else still
         // counts — a name match would fail silently on exactly the seeds we cannot test.
         let mut scadu_fragment_units: i32 = 0;
+        // #342, and the SAME history-agnostic doctrine as `flask_upgrade_count` above: a talisman's
+        // slot is decided by its position in the received stream and by how many Talisman Pouches
+        // preceded it, both walked over the WHOLE stream rather than the watermarked tail.
+        //
+        // 🛑 IT HAS TO BE THE WHOLE STREAM. `received_through` is persisted per save, so a
+        // reconnect only re-enqueues items past it; a tally that started at zero each connect would
+        // report zero pouches to a player who found three last session and pin every talisman back
+        // onto slot 1. The classification and the counting both live in
+        // `er_logic::auto_equip::TalismanStream`, which is where the tests for them are.
+        let mut talisman_stream = er_logic::auto_equip::TalismanStream::default();
+        let mut talisman_pos: HashMap<i64, er_logic::auto_equip::TalismanPos> = HashMap::new();
         let mut snapshot: Vec<RecvItem> = Vec::new();
         // DIAGNOSTIC (#293): `received_items().len()` -- the number that appeared in NO log line
         // anywhere, and without which "the cursor is stuck" and "the stream is stuck" read the
@@ -1787,6 +1798,13 @@ impl shared::Core for Core {
                         map,
                         &self.item_counts,
                     );
+                    // Talisman Pouches and talismans, in stream order. Keyed by AP index so the
+                    // enqueue below can look up the position for the item it is holding.
+                    if let Some(&full) = map.get(&ri.item().id())
+                        && let Some(pos) = talisman_stream.push(full as i32)
+                    {
+                        talisman_pos.insert(idx as i64, pos);
+                    }
                 }
                 if can_grant && idx >= floor {
                     // ECHO-DEDUP: an echo of our own check whose rewritten shop row already
@@ -1870,7 +1888,7 @@ impl shared::Core for Core {
                         // The category set lives in ONE place (`er_logic::auto_equip::equipable`)
                         // for the same reason: #295 was fixed by adding an arm there and nothing
                         // else, because there is no second filter to keep in step.
-                        crate::auto_equip::enqueue(full_id);
+                        crate::auto_equip::enqueue(full_id, talisman_pos.get(&ri.index).copied());
                         // STRANGLER (goods+ledger, THE ATOMIC FLIP): this ONE call grants every
                         // received item — key items/runes (goods) AND consumables (ledger). Once the
                         // reconciler owns BOTH classes it is the sole received-item grant path (goods
@@ -1958,7 +1976,7 @@ impl shared::Core for Core {
                         // Not talisman-specific and never was: weapons and armour bought from a
                         // repointed shop row went the same way.
                         if let Some(fid) = full_id {
-                            crate::auto_equip::enqueue(fid);
+                            crate::auto_equip::enqueue(fid, talisman_pos.get(&ri.index).copied());
                         }
                     }
                     GrantAction::AlreadyPushed => {}
