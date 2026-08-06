@@ -207,6 +207,260 @@ pub fn surface_checked(checked: &HashSet<i64>, surface: &HashSet<i64>) -> u64 {
     checked.intersection(surface).count() as u64
 }
 
+// =================================================================================================
+// "Hint the NEXT lock" -- issue #412
+// =================================================================================================
+//
+// MOTIVATING CASE (CONTRIBUTING rule 11). bobler, 0.3.5, 2026-08-06: *"there needs to be a hint
+// progressive lock instead of hinting for a specifc lock since i dont know what my 2nd lock is"*.
+// His log is the proof: three `!hint`s, three minutes apart, spent discovering an ORDER rather than
+// a location --
+//
+// ```text
+// 07:20:37  !hint Altus Lock       -> Liurnia    :: Golden Seed - near Academy Gate Town
+// 07:23:07  !hint Farum Azula Lock -> Altus      :: Golden Seed - On tree, Outer Wall Phantom Tree
+// 07:23:18  !hint Leyndell Lock    -> Farum Azula:: Remembrance of the Dragonlord - Placidusax
+// ```
+//
+// The chain was Liurnia -> Altus -> Farum Azula -> Leyndell. Naming a lock is a GUESS about which
+// region comes next, so the player must buy hints for locks he cannot reach in order to find the
+// one he can. The per-region button inherits that defect exactly: it asks the player for the answer.
+//
+// # There is no declared order to look up -- and we do not need one
+//
+// The chain is not a field in slot data; it is EMERGENT FROM THE FILL. "Altus is second" is just
+// "the Altus Lock item happens to sit in Liurnia". So the question the player is really asking is
+// not *"what is my 2nd region?"* but **"which lock can I go and get right now?"**, and that is a
+// join over three tables the client already holds:
+//
+// * `coarse_lock_items`  -- coarse region -> lock item name        (slot data, already parsed)
+// * `open_coarse_regions()` -- which coarse regions are open now   (live event flags)
+// * the connect-time scout -- AP location -> item name, our world  (`scout_proof`)
+//
+// A lock is on the FRONTIER when its own region is still locked but the location holding it lies in
+// a region that is already open. On bobler's seed that is a single lock at every point in the run,
+// and it collapses his three purchases into one.
+//
+// ⭐ Because the join uses only tables that already ship, this moves NOTHING across the wire:
+// `CONTRACT_HASH` is untouched and this stays client-only, exactly as the per-region button did.
+//
+// # Reachability here is REGION reachability, deliberately
+//
+// "Open" means the lock's region gate is down, not that AP logic has cleared the location -- a
+// frontier lock can still sit behind a boss lock or a key item. That is the same approximation the
+// tracker's own `[locked]` tag makes, and matching it is the point: two different notions of
+// reachable in one window would be worse than one imperfect one.
+
+/// A lock the player can actually go and get: its own region is still LOCKED, but the location
+/// holding its item lies in a region that is already OPEN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontierLock {
+    /// The coarse region this lock opens.
+    pub region: String,
+    /// The lock item's name.
+    pub lock_item: String,
+    /// The AP location in OUR world that holds it.
+    pub location: i64,
+}
+
+/// The answer to "which lock is my next one?".
+///
+/// Every variant renders differently, which is the bar for existing: a player who is told
+/// "nothing reachable" when the truth is "your next lock is in someone else's world" has been
+/// actively misinformed, and that is the failure this enum is shaped to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextLock {
+    /// Go get this one.
+    Reachable(FrontierLock),
+    /// Every lock you can reach has already been hinted -- by this button or by `!hint`.
+    AllFrontierHinted,
+    /// Nothing is reachable and at least one locked region's lock spilled into another player's
+    /// world, where the scout cannot see it. `!hint` is the tool; carries the region names so the
+    /// message can say which.
+    Spilled { regions: Vec<String> },
+    /// Locked regions remain and every one of their locks sits inside a region that is itself
+    /// still locked. A real state: the player is gated on something that is not a region lock.
+    NoneReachable,
+    /// No region is locked -- nothing to hint.
+    NothingLocked,
+    /// Tables have not landed, or a lock resolved to a location the region tables do not cover.
+    /// 🛑 Never collapse this into [`NextLock::NoneReachable`]: "I do not know" and "there is
+    /// nothing" are different claims and only one of them is safe to state to a stuck player.
+    Unknown,
+}
+
+/// Resolve the frontier: the lock whose region is shut but whose ITEM is already within reach.
+///
+/// * `lock_items` -- coarse region -> lock item name.
+/// * `open_regions` -- coarse regions currently open (the empty-string always-open bucket is
+///   treated as open whether or not the caller includes it).
+/// * `coarse_of` -- AP location id -> coarse region, for our own locations.
+/// * `scout` -- AP location id -> item name, our own locations, from the connect-time scout.
+/// * `hinted` -- locations with a standing hint, plus anything already bought.
+///
+/// Ties break on the LOWEST location id, matching [`resolve_lock_location`]. Arbitrary, but stable:
+/// a frontier that reordered itself between frames would make the button unclickable in practice.
+pub fn next_lock(
+    lock_items: &HashMap<String, String>,
+    open_regions: &HashSet<String>,
+    coarse_of: &HashMap<i64, String>,
+    scout: &HashMap<i64, String>,
+    hinted: &HashSet<i64>,
+) -> NextLock {
+    if lock_items.is_empty() || scout.is_empty() {
+        return NextLock::Unknown;
+    }
+    let mut locked: Vec<(&String, &String)> = lock_items
+        .iter()
+        .filter(|(region, _)| !region.is_empty() && !open_regions.contains(*region))
+        .collect();
+    if locked.is_empty() {
+        return NextLock::NothingLocked;
+    }
+    // Deterministic iteration: HashMap order must never reach the UI.
+    locked.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut frontier: Vec<FrontierLock> = Vec::new();
+    let mut spilled: Vec<String> = Vec::new();
+    let mut untabled = false;
+    for (region, item) in locked {
+        match resolve_lock_location(Some(item.as_str()), scout) {
+            LockHint::InAnotherWorld => spilled.push(region.clone()),
+            LockHint::Unknown => untabled = true,
+            LockHint::Found(loc) => match coarse_of.get(&loc) {
+                // The lock's own location is not in the region tables. We cannot say whether it is
+                // reachable, so we say nothing rather than reporting it out of reach.
+                None => untabled = true,
+                Some(holder) => {
+                    if holder.is_empty() || open_regions.contains(holder) {
+                        frontier.push(FrontierLock {
+                            region: region.clone(),
+                            lock_item: item.clone(),
+                            location: loc,
+                        });
+                    }
+                }
+            },
+        }
+    }
+
+    let best = frontier
+        .iter()
+        .filter(|f| !hinted.contains(&f.location))
+        .min_by_key(|f| f.location);
+    if let Some(f) = best {
+        return NextLock::Reachable(f.clone());
+    }
+    if !frontier.is_empty() {
+        return NextLock::AllFrontierHinted;
+    }
+    if !spilled.is_empty() {
+        spilled.sort();
+        return NextLock::Spilled { regions: spilled };
+    }
+    if untabled {
+        return NextLock::Unknown;
+    }
+    NextLock::NoneReachable
+}
+
+/// What the UI should render for the single "hint next lock" control.
+///
+/// Distinct from [`LockHintOffer`] on purpose: the per-region button answers "can I buy THIS one",
+/// this one answers "is there anything to buy at all", and the negative cases differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextLockOffer {
+    /// Affordable. `region` and `lock_item` are carried for the LOG LINE AFTER the purchase --
+    /// 🛑 they must not be rendered before it. Naming the next region for free would hand over
+    /// half of the very thing the price is charged for.
+    Buyable {
+        price: u64,
+        location: i64,
+        region: String,
+        lock_item: String,
+    },
+    /// Not affordable yet. Rendered DISABLED WITH THE COST, never hidden -- same rule as
+    /// [`LockHintOffer::Insufficient`], and for the same reason.
+    Insufficient { price: u64, have: u64 },
+    /// Everything reachable is already hinted.
+    AllFrontierHinted,
+    /// Reachable frontier is empty and a lock is in another player's world.
+    Spilled { regions: Vec<String> },
+    /// Locked regions remain, but all of their locks are behind other locks.
+    NoneReachable,
+    /// Nothing is locked, or nothing is known. The control does not render.
+    Idle,
+}
+
+/// The whole "hint next lock" decision, so the render layer stays a dumb consumer.
+#[allow(clippy::too_many_arguments)]
+pub fn next_offer(
+    lock_items: &HashMap<String, String>,
+    open_regions: &HashSet<String>,
+    coarse_of: &HashMap<i64, String>,
+    scout: &HashMap<i64, String>,
+    hinted: &HashSet<i64>,
+    surface_total: u64,
+    surface_checked: u64,
+    purchases: u64,
+    points_per_hint: u64,
+    total_locations: u64,
+) -> NextLockOffer {
+    let target = match next_lock(lock_items, open_regions, coarse_of, scout, hinted) {
+        NextLock::Reachable(f) => f,
+        NextLock::AllFrontierHinted => return NextLockOffer::AllFrontierHinted,
+        NextLock::Spilled { regions } => return NextLockOffer::Spilled { regions },
+        NextLock::NoneReachable => return NextLockOffer::NoneReachable,
+        NextLock::NothingLocked | NextLock::Unknown => return NextLockOffer::Idle,
+    };
+    let Some(price) = price_per_hint(surface_total, points_per_hint, total_locations) else {
+        return NextLockOffer::Idle; // an underivable price is never a free one
+    };
+    let have = balance(surface_checked, purchases, price);
+    if have >= price {
+        NextLockOffer::Buyable {
+            price,
+            location: target.location,
+            region: target.region,
+            lock_item: target.lock_item,
+        }
+    } else {
+        NextLockOffer::Insufficient { price, have }
+    }
+}
+
+/// Balance and price for the always-on status line.
+///
+/// # Why this exists at all (issue #412, the discoverability half)
+///
+/// bobler's log reads `lock hints: ledger loaded from er_lockhints_2 -- 0 hint(s) already bought`
+/// and then three AP `!hint`s. The economy worked perfectly and he never saw it, because every
+/// surface it had was behind three doors at once: the tracker window is **closed by default**, its
+/// toggle is **F6**, and the price only appeared on the header of a region that happened to be
+/// LOCKED and scrolled into view. A feature nobody can find has the same value as one that does not
+/// ship, so the balance is now readable wherever the player already is.
+///
+/// Returns `None` while the price cannot be derived -- the caller must render nothing, never zero.
+pub fn status(
+    surface_total: u64,
+    surface_checked: u64,
+    purchases: u64,
+    points_per_hint: u64,
+    total_locations: u64,
+) -> Option<(u64, u64)> {
+    let price = price_per_hint(surface_total, points_per_hint, total_locations)?;
+    Some((balance(surface_checked, purchases, price), price))
+}
+
+/// One-shot latch for the "you can afford a lock hint" toast.
+///
+/// Mirrors `toast::new_grants`: fires only on the FALSE -> TRUE edge, and never on the first
+/// observation (`None`), so a reconnect that replays an already-affordable balance stays silent.
+/// A toast that re-fires every frame you can afford something is an advertisement, not a notice.
+pub fn crossed_into_affordable(prev: Option<bool>, now: bool) -> bool {
+    matches!(prev, Some(false)) && now
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +761,369 @@ mod tests {
         assert_eq!(surface_checked(&checked, &surface), 20);
         assert_eq!(surface_checked(&HashSet::new(), &surface), 0);
         assert_eq!(surface_checked(&checked, &HashSet::new()), 0);
+    }
+
+    // =============================================================================================
+    // "Hint the NEXT lock" -- issue #412
+    // =============================================================================================
+
+    fn m(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn coarse(pairs: &[(i64, &str)]) -> HashMap<i64, String> {
+        pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
+    }
+
+    /// bobler's seed, 0.3.5. Locks: region -> item.
+    fn boblers_locks() -> HashMap<String, String> {
+        m(&[
+            ("Liurnia", "Liurnia Lock"),
+            ("Altus", "Altus Lock"),
+            ("Farum Azula", "Farum Azula Lock"),
+            ("Leyndell", "Leyndell Lock"),
+        ])
+    }
+
+    /// Where the fill put each lock item, and which coarse region that location belongs to.
+    /// Chain: Limgrave -> Liurnia -> Altus -> Farum Azula -> Leyndell.
+    ///
+    /// 🛑 The location ids are deliberately ANTI-CORRELATED with the chain. The first draft used
+    /// 101/202/303/404 in chain order, and mutation-testing caught that as vacuous: with ids that
+    /// ascend along the chain, the lowest-id TIE-BREAK reproduces the correct answer even when the
+    /// reachability check is deleted entirely, so the motivating test passed against an
+    /// implementation that did not implement the feature. Scrambling them makes the assertion
+    /// depend on the mechanism and nothing else.
+    fn boblers_fill() -> (HashMap<i64, String>, HashMap<i64, String>) {
+        let scouted = scout(&[
+            (4004, "Liurnia Lock"),     // in Limgrave      -- 1st in the chain, HIGHEST id
+            (1001, "Altus Lock"),       // in Liurnia       -- 2nd, LOWEST id
+            (3003, "Farum Azula Lock"), // in Altus
+            (2002, "Leyndell Lock"),    // in Farum Azula
+            (9009, "Golden Seed"),      // filler, so the scout is not lock-only
+        ]);
+        let coarse_of = coarse(&[
+            (4004, "Limgrave"),
+            (1001, "Liurnia"),
+            (3003, "Altus"),
+            (2002, "Farum Azula"),
+            (9009, "Limgrave"),
+        ]);
+        (scouted, coarse_of)
+    }
+
+    #[test]
+    fn boblers_three_hints_collapse_into_one_button() {
+        // THE MOTIVATING CASE. He spent three `!hint`s discovering an ORDER. Walking the chain,
+        // the frontier names the very lock he asked for at each step -- with no guess from him.
+        let locks = boblers_locks();
+        let (scouted, coarse_of) = boblers_fill();
+        let hinted = HashSet::new();
+        let expected = [
+            (set(&["Limgrave"]), "Liurnia", 4004),
+            (set(&["Limgrave", "Liurnia"]), "Altus", 1001),
+            (set(&["Limgrave", "Liurnia", "Altus"]), "Farum Azula", 3003),
+            (
+                set(&["Limgrave", "Liurnia", "Altus", "Farum Azula"]),
+                "Leyndell",
+                2002,
+            ),
+        ];
+        for (open, region, location) in expected {
+            let got = next_lock(&locks, &open, &coarse_of, &scouted, &hinted);
+            assert_eq!(
+                got,
+                NextLock::Reachable(FrontierLock {
+                    region: region.to_string(),
+                    lock_item: format!("{region} Lock"),
+                    location,
+                }),
+                "with {open:?} open, the next lock must be {region}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_frontier_never_offers_a_lock_the_player_cannot_reach() {
+        // The two hints bobler WASTED were Farum Azula and Leyndell, bought while standing in
+        // Liurnia. Neither may ever be the offer at that point in the run.
+        let locks = boblers_locks();
+        let (scouted, coarse_of) = boblers_fill();
+        let open = set(&["Limgrave", "Liurnia"]);
+        let NextLock::Reachable(f) =
+            next_lock(&locks, &open, &coarse_of, &scouted, &HashSet::new())
+        else {
+            panic!("a lock is reachable here");
+        };
+        assert_ne!(f.region, "Farum Azula");
+        assert_ne!(f.region, "Leyndell");
+    }
+
+    #[test]
+    fn a_lock_behind_another_lock_is_never_the_next_one() {
+        // Only the Leyndell lock remains and it sits in still-locked Farum Azula. Saying
+        // "none reachable" is correct here and is a DIFFERENT claim from "unknown".
+        let locks = m(&[("Leyndell", "Leyndell Lock")]);
+        let scouted = scout(&[(2002, "Leyndell Lock"), (9009, "Golden Seed")]);
+        let coarse_of = coarse(&[(2002, "Farum Azula"), (9009, "Limgrave")]);
+        assert_eq!(
+            next_lock(
+                &locks,
+                &set(&["Limgrave"]),
+                &coarse_of,
+                &scouted,
+                &HashSet::new()
+            ),
+            NextLock::NoneReachable
+        );
+    }
+
+    #[test]
+    fn a_spilled_next_lock_sends_the_player_to_hint_not_to_a_dead_end() {
+        // 🛑 THE MUTATION THAT MATTERS. A lock in another world is absent from the scout, so a
+        // naive implementation reports "nothing reachable" -- which tells a stuck player to stop
+        // looking. It must name the regions and point at `!hint` instead.
+        let locks = m(&[("Altus", "Altus Lock"), ("Leyndell", "Leyndell Lock")]);
+        let scouted = scout(&[(9009, "Golden Seed")]); // populated, but holds neither lock
+        let coarse_of = coarse(&[(9009, "Limgrave")]);
+        assert_eq!(
+            next_lock(
+                &locks,
+                &set(&["Limgrave"]),
+                &coarse_of,
+                &scouted,
+                &HashSet::new()
+            ),
+            NextLock::Spilled {
+                regions: vec!["Altus".to_string(), "Leyndell".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_reachable_lock_outranks_a_spilled_one() {
+        // Spilled is a FALLBACK, not a veto: one foreign lock must not suppress a buy the player
+        // can actually make.
+        let locks = m(&[("Altus", "Altus Lock"), ("Leyndell", "Leyndell Lock")]);
+        let scouted = scout(&[(1001, "Altus Lock"), (9009, "Golden Seed")]);
+        let coarse_of = coarse(&[(1001, "Liurnia"), (9009, "Limgrave")]);
+        let got = next_lock(
+            &locks,
+            &set(&["Limgrave", "Liurnia"]),
+            &coarse_of,
+            &scouted,
+            &HashSet::new(),
+        );
+        assert!(matches!(got, NextLock::Reachable(f) if f.region == "Altus"));
+    }
+
+    #[test]
+    fn buying_one_of_two_reachable_locks_advances_to_the_other() {
+        // A branching fill puts two locks in the same open region. Ties break low, and the bought
+        // one must not be re-sold on the next frame.
+        let locks = m(&[("Altus", "Altus Lock"), ("Caelid", "Caelid Lock")]);
+        let scouted = scout(&[(202, "Altus Lock"), (150, "Caelid Lock")]);
+        let coarse_of = coarse(&[(202, "Limgrave"), (150, "Limgrave")]);
+        let open = set(&["Limgrave"]);
+        let first = next_lock(&locks, &open, &coarse_of, &scouted, &HashSet::new());
+        assert!(matches!(first, NextLock::Reachable(ref f) if f.location == 150));
+        let hinted: HashSet<i64> = [150].into_iter().collect();
+        let second = next_lock(&locks, &open, &coarse_of, &scouted, &hinted);
+        assert!(matches!(second, NextLock::Reachable(ref f) if f.location == 202));
+        let both: HashSet<i64> = [150, 202].into_iter().collect();
+        assert_eq!(
+            next_lock(&locks, &open, &coarse_of, &scouted, &both),
+            NextLock::AllFrontierHinted
+        );
+    }
+
+    #[test]
+    fn an_untabled_lock_location_is_unknown_never_out_of_reach() {
+        // 🛑 The honest-failure pin. The scout found the lock but the region tables do not cover
+        // its location, so we cannot say whether it is reachable. Reporting `NoneReachable` would
+        // be a confident wrong answer to a player who is already stuck.
+        let locks = m(&[("Altus", "Altus Lock")]);
+        let scouted = scout(&[(1001, "Altus Lock"), (9009, "Golden Seed")]);
+        let coarse_of = coarse(&[(9009, "Limgrave")]); // 1001 missing on purpose
+        assert_eq!(
+            next_lock(
+                &locks,
+                &set(&["Limgrave"]),
+                &coarse_of,
+                &scouted,
+                &HashSet::new()
+            ),
+            NextLock::Unknown
+        );
+    }
+
+    #[test]
+    fn the_always_open_bucket_counts_as_open() {
+        // A lock sitting in the "" always-open coarse bucket is reachable from the first frame,
+        // whether or not the caller bothered to put "" in the open set.
+        let locks = m(&[("Altus", "Altus Lock")]);
+        let scouted = scout(&[(1001, "Altus Lock")]);
+        let coarse_of = coarse(&[(1001, "")]);
+        assert!(matches!(
+            next_lock(
+                &locks,
+                &HashSet::new(),
+                &coarse_of,
+                &scouted,
+                &HashSet::new()
+            ),
+            NextLock::Reachable(_)
+        ));
+    }
+
+    #[test]
+    fn nothing_locked_and_nothing_known_are_different_answers() {
+        let locks = boblers_locks();
+        let (scouted, coarse_of) = boblers_fill();
+        // Everything open -> there is nothing left to hint.
+        assert_eq!(
+            next_lock(
+                &locks,
+                &set(&["Limgrave", "Liurnia", "Altus", "Farum Azula", "Leyndell"]),
+                &coarse_of,
+                &scouted,
+                &HashSet::new()
+            ),
+            NextLock::NothingLocked
+        );
+        // Scout has not landed -> we do not know, and must not claim the locks are foreign.
+        assert_eq!(
+            next_lock(
+                &locks,
+                &set(&["Limgrave"]),
+                &coarse_of,
+                &HashMap::new(),
+                &HashSet::new()
+            ),
+            NextLock::Unknown
+        );
+    }
+
+    #[test]
+    fn the_frontier_does_not_depend_on_hashmap_iteration_order() {
+        // TWO candidates in the same open region -- with only one the test would pass against any
+        // implementation at all. The offer must be the same object every frame or the button moves
+        // out from under the cursor.
+        let scouted = scout(&[(1001, "Altus Lock"), (2002, "Caelid Lock")]);
+        let coarse_of = coarse(&[(1001, "Limgrave"), (2002, "Limgrave")]);
+        let a = m(&[("Altus", "Altus Lock"), ("Caelid", "Caelid Lock")]);
+        let b = m(&[("Caelid", "Caelid Lock"), ("Altus", "Altus Lock")]);
+        let open = set(&["Limgrave"]);
+        for _ in 0..8 {
+            assert_eq!(
+                next_lock(&a, &open, &coarse_of, &scouted, &HashSet::new()),
+                next_lock(&b, &open, &coarse_of, &scouted, &HashSet::new())
+            );
+        }
+    }
+
+    // --- the offer layer -------------------------------------------------------------------------
+
+    #[test]
+    fn an_unaffordable_next_lock_shows_its_price_and_reveals_nothing_else() {
+        // 🛑 Insufficient carries NO region and NO item name. Naming the next region for free would
+        // hand over half of exactly what the price is charged for -- the exhaustive literal below
+        // is what fails if a future edit adds one back.
+        let locks = boblers_locks();
+        let (scouted, coarse_of) = boblers_fill();
+        let got = next_offer(
+            &locks,
+            &set(&["Limgrave", "Liurnia"]),
+            &coarse_of,
+            &scouted,
+            &HashSet::new(),
+            SURFACE,
+            5,
+            0,
+            PPH_10PCT,
+            TOTAL,
+        );
+        assert_eq!(got, NextLockOffer::Insufficient { price: 16, have: 5 });
+    }
+
+    #[test]
+    fn an_affordable_next_lock_is_the_one_bobler_asked_for() {
+        let locks = boblers_locks();
+        let (scouted, coarse_of) = boblers_fill();
+        let got = next_offer(
+            &locks,
+            &set(&["Limgrave", "Liurnia"]),
+            &coarse_of,
+            &scouted,
+            &HashSet::new(),
+            SURFACE,
+            16,
+            0,
+            PPH_10PCT,
+            TOTAL,
+        );
+        assert_eq!(
+            got,
+            NextLockOffer::Buyable {
+                price: 16,
+                location: 1001,
+                region: "Altus".to_string(),
+                lock_item: "Altus Lock".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_underivable_price_never_buys_a_free_next_lock() {
+        // Same failure mode as `an_underivable_price_is_unknown_never_free`, one layer up: a
+        // connection that has not settled must not make the button free.
+        let locks = boblers_locks();
+        let (scouted, coarse_of) = boblers_fill();
+        let got = next_offer(
+            &locks,
+            &set(&["Limgrave", "Liurnia"]),
+            &coarse_of,
+            &scouted,
+            &HashSet::new(),
+            SURFACE,
+            9999,
+            0,
+            PPH_10PCT,
+            0, // total_locations unknown
+        );
+        assert_eq!(got, NextLockOffer::Idle);
+    }
+
+    // --- discoverability -------------------------------------------------------------------------
+
+    #[test]
+    fn the_status_line_reports_balance_and_price_together() {
+        // Both numbers or neither: "23" on its own tells a player nothing about whether they can
+        // buy anything.
+        assert_eq!(status(SURFACE, 23, 0, PPH_10PCT, TOTAL), Some((23, 16)));
+        assert_eq!(status(SURFACE, 23, 1, PPH_10PCT, TOTAL), Some((7, 16)));
+        assert_eq!(status(SURFACE, 23, 0, PPH_10PCT, 0), None);
+    }
+
+    #[test]
+    fn the_affordable_toast_fires_once_on_the_edge_and_never_on_a_reconnect() {
+        // A guard the corpus cannot fire on its own, so it is called directly.
+        assert!(crossed_into_affordable(Some(false), true), "the edge fires");
+        assert!(
+            !crossed_into_affordable(Some(true), true),
+            "still affordable is not news"
+        );
+        assert!(
+            !crossed_into_affordable(None, true),
+            "a reconnect that replays an affordable balance must stay silent"
+        );
+        assert!(!crossed_into_affordable(Some(true), false));
     }
 }
