@@ -579,6 +579,19 @@ pub const DOWN_STATES: &[DownState] = &[
 /// Alaric's call, 2026-08-06, after being shown 1.0 / 0.95 / 0.90 / 0.85 side by side.
 pub const DOWN_DEADBAND: f32 = 0.90;
 
+/// How far ABOVE the ladder's asked-for ratio a state may still be chosen.
+///
+/// 🔥 CAUGHT IN THE FIRST LIVE LOG (2026-08-06). `523210014`, native tier 9 at target 0, wanted
+/// 0.444 with a 0.45 state sitting right there — and a strict `<=` pushed it down a whole lattice
+/// step to 0.315. **A 30% extra cut for a 1.4% miss.** The table has a worse case: native 10 -> 1
+/// wants **0.450 exactly** and is still refused 0.45, because these are f32 ratios of f32 rates and
+/// exact equality was never going to hold.
+///
+/// ⭐ 2% fixes 7 of the 156 acting pairs and moves median overshoot 1.214 -> 1.177. The acted count
+/// does NOT change, so it buys precision at zero coverage cost — the deadband still decides whether
+/// we act at all, and this only decides which state we reach for once we have.
+pub const DOWN_TOLERANCE: f32 = 0.02;
+
 /// Which down state moves an enemy sitting at `native` to look like one at `target`.
 ///
 /// ⭐⭐⭐ BUCKET BY ATTACK, NOT BY HP. Every reported death in the 2026-08-04/05 Nexus thread is
@@ -609,7 +622,7 @@ pub fn down_state_for(native: usize, target: usize) -> Option<&'static DownState
     let attack = DOWN_STATES
         .iter()
         .map(|s| s.attack)
-        .filter(|&a| a <= want_attack)
+        .filter(|&a| a <= want_attack * (1.0 + DOWN_TOLERANCE))
         .fold(f32::NEG_INFINITY, f32::max);
     let attack = if attack.is_finite() {
         attack
@@ -686,6 +699,34 @@ pub enum ScaleAction {
     /// apply the down state — and NOT the region's rung, which would multiply on top of a base that
     /// already encodes the native tier. Phase 1b.
     Down(&'static DownState),
+    /// It already carries a down state from an earlier sweep and we can no longer say what its
+    /// native tier is, so the state stands. Behaviourally identical to `NoTouch` — nothing is
+    /// mutated — but it is a DIFFERENT FACT and the census must not conflate them.
+    ///
+    /// 🛑🛑 THIS EXISTS BECAUSE THE DOWN PATH HAS NO ANCHOR AND THE UP PATH DOES. An enemy the sweep
+    /// scales UP carries a ladder RUNG afterwards, so the next sweep reads it as runged and
+    /// `Replace` re-derives it forever. A down state is not a rung, so the next sweep re-derives
+    /// from `presumed_native_tier` — which, on a converged region, answers `None`: the area
+    /// histogram counts only rung-AND-band carriers and our own sweep stripped them, BY DESIGN.
+    ///
+    /// The first live log (2026-08-06, region 0) shows it exactly: `down-scaled 23 (settled 0)`,
+    /// then `down-scaled 0 (settled 5)` with `left vanilla` 19 -> 37. **18 + 5 = 23 and 19 + 18 =
+    /// 37.** The 18 area-placed enemies kept their state only because `NoTouch` happens to return
+    /// before the clear. That is correct behaviour resting on an accident, and it reported itself as
+    /// "left vanilla" — the opposite of what happened.
+    KeepDown,
+    /// It carries a down state that is no longer the right answer, and there is no new state to put
+    /// in its place. Strip ours and apply nothing.
+    ///
+    /// ⭐ SAFE TO STRIP WITHOUT REPLACING, unlike every other path in this file. The usual rule —
+    /// never clear an enemy and then decline to re-apply — protects VANILLA state, whose loss is
+    /// irreversible because the sweep re-derives everything from what the enemy currently carries.
+    /// A down state is additive and ours; removing it restores exactly what vanilla shipped.
+    ///
+    /// 🛑 WITHOUT THIS A DOWN STATE IS UNREMOVABLE. `down_state_for` returns `None` for 34 of the
+    /// 190 tier pairs (the deadband), so an enemy placed at one target and re-swept at a target only
+    /// slightly below its native tier would otherwise keep a state that is now far too strong a cut.
+    ClearDown,
     /// Leave it exactly as vanilla shipped it.
     NoTouch,
 }
@@ -727,6 +768,7 @@ pub fn native_tier(npc_param_id: i32) -> Option<usize> {
 /// rather than left alone. See `down_state_for` for why that path is RELATIVE and `Apply` absolute.
 pub fn scale_action(
     carried_ladder_rung: bool,
+    carried_downstate: bool,
     npc_param_id: i32,
     target_tier: usize,
     area_tier: Option<usize>,
@@ -742,8 +784,19 @@ pub fn scale_action(
         // NoTouch — the deadband, or a tier pair the lattice cannot express.
         Some(native) if native > target_tier => match down_state_for(native, target_tier) {
             Some(state) => ScaleAction::Down(state),
+            // In the deadband: no cut is warranted, so a state carried from an earlier sweep is now
+            // wrong and must come off.
+            None if carried_downstate => ScaleAction::ClearDown,
             None => ScaleAction::NoTouch,
         },
+        // Native EQUALS the target: it is exactly where it should be, so any state we put on it
+        // earlier is now a pure nerf.
+        Some(_) if carried_downstate => ScaleAction::ClearDown,
+        // 🛑 WE CANNOT PLACE IT *AND* IT ALREADY CARRIES ONE OF OUR STATES. Re-deriving is not an
+        // option, and stripping would be worse than either: the state is the only surviving record
+        // that this enemy was placed, so clearing it would silently restore full vanilla strength in
+        // a region we already decided was too strong. Classify from what it CARRIES.
+        None if carried_downstate => ScaleAction::KeepDown,
         _ => ScaleAction::NoTouch,
     }
 }
@@ -2041,7 +2094,7 @@ mod tests {
         assert!(native_tier(absent).is_none());
         for tier in 0..NUM_TIERS {
             assert_eq!(
-                scale_action(false, absent, tier, None),
+                scale_action(false, false, absent, tier, None),
                 ScaleAction::NoTouch,
                 "an unclassified enemy was scaled at tier {tier}"
             );
@@ -2067,11 +2120,11 @@ mod tests {
         let unplaceable = -1; // absent from NATIVE_TIERS, like every getSoul-less named boss
         for tier in 0..NUM_TIERS {
             assert_eq!(
-                scale_action(true, unplaceable, tier, None),
+                scale_action(true, false, unplaceable, tier, None),
                 ScaleAction::Replace
             );
             assert_eq!(
-                scale_action(false, unplaceable, tier, None),
+                scale_action(false, false, unplaceable, tier, None),
                 ScaleAction::NoTouch
             );
         }
@@ -2084,7 +2137,10 @@ mod tests {
         // rune reward in NpcParam, so both resolve here -- and the sponge and the one-shots came from
         // the same multiplier, applied to stats that already assumed the end of the game.
         for tier in 0..NUM_TIERS {
-            assert_eq!(scale_action(false, -1, tier, None), ScaleAction::NoTouch);
+            assert_eq!(
+                scale_action(false, false, -1, tier, None),
+                ScaleAction::NoTouch
+            );
         }
     }
 
@@ -2095,7 +2151,7 @@ mod tests {
         // tier. With the area vouching for them they take the same path as everything else.
         let unplaceable = -1; // absent from NATIVE_TIERS
         assert_eq!(
-            scale_action(false, unplaceable, 11, Some(1)),
+            scale_action(false, false, unplaceable, 11, Some(1)),
             ScaleAction::Apply
         );
         // ...and the region's own level is what they reach -- the area index is the enemy's PRESUMED
@@ -2117,7 +2173,7 @@ mod tests {
         assert!(!area_may_vouch_for(vyke_shaped));
         assert_eq!(presumed_native_tier(vyke_shaped, Some(5)), None);
         assert_eq!(
-            scale_action(false, vyke_shaped, 11, Some(5)),
+            scale_action(false, false, vyke_shaped, 11, Some(5)),
             ScaleAction::NoTouch
         );
         assert!(!placed_by_area(vyke_shaped, Some(5)));
@@ -2156,7 +2212,7 @@ mod tests {
         let unnamed_unrewarded = -1; // absent from NATIVE_TIERS and from the exclusion set
         assert!(area_may_vouch_for(unnamed_unrewarded));
         assert_eq!(
-            scale_action(false, unnamed_unrewarded, 11, Some(1)),
+            scale_action(false, false, unnamed_unrewarded, 11, Some(1)),
             ScaleAction::Apply
         );
         assert!(
@@ -2185,7 +2241,7 @@ mod tests {
         let vyke_shaped = named[0];
         for tier in 0..NUM_TIERS {
             assert_eq!(
-                scale_action(true, vyke_shaped, tier, Some(5)),
+                scale_action(true, false, vyke_shaped, tier, Some(5)),
                 ScaleAction::Replace
             );
         }
@@ -2196,7 +2252,10 @@ mod tests {
         // `None` is not "assume weak" -- it is "we did not see enough untouched neighbours to say".
         // Attributing a strength on no evidence is how the unrunged class got buffed in v0.3.4.
         for tier in 0..NUM_TIERS {
-            assert_eq!(scale_action(false, -1, tier, None), ScaleAction::NoTouch);
+            assert_eq!(
+                scale_action(false, false, -1, tier, None),
+                ScaleAction::NoTouch
+            );
         }
         assert_eq!(presumed_native_tier(-1, None), None);
         assert!(!placed_by_area(-1, None));
@@ -2225,7 +2284,7 @@ mod tests {
         //
         // Until 2026-08-06 this test asserted `NoTouch` and was named for it. That was an honest
         // statement of a missing primitive, not a property worth keeping.
-        let down = match scale_action(false, -1, 5, Some(7)) {
+        let down = match scale_action(false, false, -1, 5, Some(7)) {
             ScaleAction::Down(s) => s,
             other => panic!("Altus 7 -> 5 must scale DOWN, got {other:?}"),
         };
@@ -2243,7 +2302,10 @@ mod tests {
         );
 
         // Ground EQUAL to the target is still nothing to do -- there is no gap to close.
-        assert_eq!(scale_action(false, -1, 7, Some(7)), ScaleAction::NoTouch);
+        assert_eq!(
+            scale_action(false, false, -1, 7, Some(7)),
+            ScaleAction::NoTouch
+        );
     }
 
     #[test]
@@ -2252,7 +2314,10 @@ mod tests {
         // 0.70, so "closest available" would fire a 30% nerf at a 4% problem. Leaving it alone is
         // the honest answer and it matches how `presumed_native_tier` declines rather than guesses.
         assert!(SCALING_TIERS[5].attack / SCALING_TIERS[6].attack > DOWN_DEADBAND);
-        assert_eq!(scale_action(false, -1, 5, Some(6)), ScaleAction::NoTouch);
+        assert_eq!(
+            scale_action(false, false, -1, 5, Some(6)),
+            ScaleAction::NoTouch
+        );
         assert_eq!(down_state_for(6, 5), None);
         // Tiers 17/18/19 share an attack rate outright, so the ladder itself expresses no
         // difference there and neither may we.
@@ -2273,8 +2338,13 @@ mod tests {
                     continue;
                 };
                 acted += 1;
+                // 🛑 THE PREMISE MOVED 2026-08-06 AND THIS SENTENCE MOVED WITH IT. It used to read
+                // "at least as much as the step asked for", strictly. That strictness is what sent
+                // a want of 0.444 down to 0.315 past an available 0.45, and what refused an exact
+                // 0.450. The property worth keeping is that we never under-reduce by anything a
+                // player could feel -- DOWN_TOLERANCE is 2%, and the bound is still a bound.
                 assert!(
-                    state.attack <= want + f32::EPSILON,
+                    state.attack <= want * (1.0 + DOWN_TOLERANCE) + f32::EPSILON,
                     "tier {native} -> {target}: wanted {want}, state gives {}",
                     state.attack
                 );
@@ -2291,6 +2361,105 @@ mod tests {
             down_state_for(0, 5),
             None,
             "target ABOVE native is the Apply path"
+        );
+    }
+
+    #[test]
+    fn a_near_tie_does_not_cost_a_whole_lattice_step() {
+        // 🔥 FROM THE FIRST LIVE 1b LOG (2026-08-06). npc_param 523210014, native tier 9, target 0:
+        // the ladder wanted 0.444 and a 0.45 state was right there, but a strict `<=` reached past
+        // it to 0.315 -- a 30% extra cut to cover a 1.4% miss.
+        let want = SCALING_TIERS[0].attack / SCALING_TIERS[9].attack;
+        assert!(
+            (0.44..0.45).contains(&want),
+            "fixture drifted: want is {want}"
+        );
+        let s = down_state_for(9, 0).expect("must act");
+        assert_eq!(s.attack, 0.45, "a 1.4% miss must not cost a lattice step");
+
+        // The case that shows it was never a tuning preference: this pair wants 0.450 EXACTLY and
+        // was still refused, because these are f32 ratios of f32 rates.
+        let exact = SCALING_TIERS[1].attack / SCALING_TIERS[10].attack;
+        assert!((exact - 0.45).abs() < 0.001, "fixture drifted: {exact}");
+        assert_eq!(down_state_for(10, 1).expect("must act").attack, 0.45);
+
+        // 🛑 AND IT MUST NOT BECOME A SECOND DEADBAND. The tolerance decides WHICH state, never
+        // WHETHER -- the acted-pair count is unchanged by it.
+        let acted = (0..NUM_TIERS)
+            .flat_map(|n| (0..n).map(move |t| (n, t)))
+            .filter(|&(n, t)| down_state_for(n, t).is_some())
+            .count();
+        assert_eq!(
+            acted, 156,
+            "the tolerance changed COVERAGE, which it must not"
+        );
+    }
+
+    #[test]
+    fn a_carried_down_state_is_kept_when_we_can_no_longer_place_the_enemy() {
+        // ⭐⭐⭐ THE MOTIVATING CASE, from the first live 1b log (2026-08-06, region 0):
+        // `down-scaled 23 (settled 0)` then `down-scaled 0 (settled 5)`, with `left vanilla` going
+        // 19 -> 37. 18 + 5 = 23 and 19 + 18 = 37 -- the 18 area-placed enemies stopped resolving,
+        // because the area histogram counts only rung-AND-band carriers and our own sweep had
+        // stripped them. They kept their state, but ONLY because `NoTouch` returns before the clear,
+        // and they reported themselves as "left vanilla" -- the opposite of what happened.
+        let unplaceable = -1;
+        assert_eq!(presumed_native_tier(unplaceable, None), None);
+        assert_eq!(
+            scale_action(false, true, unplaceable, 0, None),
+            ScaleAction::KeepDown
+        );
+        // Same enemy, no state carried: genuinely untouched, and it must still say so.
+        assert_eq!(
+            scale_action(false, false, unplaceable, 0, None),
+            ScaleAction::NoTouch
+        );
+        // 🛑 KeepDown is the answer ONLY when we cannot place it. Where we can, the placement wins
+        // and the state is re-derived like any other.
+        let (npc, native) = crate::native_tiers::NATIVE_TIERS[0];
+        let native = native as usize;
+        assert!(!matches!(
+            scale_action(false, true, npc, native, None),
+            ScaleAction::KeepDown
+        ));
+    }
+
+    #[test]
+    fn a_down_state_that_is_no_longer_warranted_comes_off() {
+        // 🛑 WITHOUT `ClearDown` A DOWN STATE IS UNREMOVABLE, and the deadband makes that reachable:
+        // `down_state_for` declines 34 of the 190 pairs, so an enemy placed at one target and
+        // re-swept at a target just below its native tier would keep a cut nothing now justifies.
+        let (npc, native) = *crate::native_tiers::NATIVE_TIERS
+            .iter()
+            .find(|&&(_, t)| (t as usize) >= 6)
+            .expect("need a mid-ladder fixture");
+        let native = native as usize;
+
+        // Deep enough below to warrant a state...
+        assert!(matches!(
+            scale_action(false, true, npc, 0, None),
+            ScaleAction::Down(_)
+        ));
+        // ...one rung below is inside the deadband, so the carried state must come OFF.
+        assert_eq!(down_state_for(native, native - 1), None);
+        assert_eq!(
+            scale_action(false, true, npc, native - 1, None),
+            ScaleAction::ClearDown
+        );
+        // Exactly at its native tier: nothing is warranted at all.
+        assert_eq!(
+            scale_action(false, true, npc, native, None),
+            ScaleAction::ClearDown
+        );
+        // ⭐ And with no state carried, both of those are simply NoTouch -- `ClearDown` must never
+        // become a reason to touch an enemy we have never touched.
+        assert_eq!(
+            scale_action(false, false, npc, native - 1, None),
+            ScaleAction::NoTouch
+        );
+        assert_eq!(
+            scale_action(false, false, npc, native, None),
+            ScaleAction::NoTouch
         );
     }
 
@@ -2456,7 +2625,7 @@ mod tests {
         assert!(native_tier(band_only_unknown_npc).is_none());
         for tier in 0..NUM_TIERS {
             assert_eq!(
-                scale_action(false, band_only_unknown_npc, tier, None),
+                scale_action(false, false, band_only_unknown_npc, tier, None),
                 ScaleAction::NoTouch,
                 "a band-only enemy was scaled at tier {tier}"
             );
@@ -2582,7 +2751,7 @@ mod tests {
         let (npc, native) = crate::native_tiers::NATIVE_TIERS[0];
         let native = native as usize;
         for tier in 0..NUM_TIERS {
-            match scale_action(false, npc, tier, None) {
+            match scale_action(false, false, npc, tier, None) {
                 ScaleAction::Apply => assert!(
                     tier > native,
                     "Apply must never fire at or below native (tier {tier}, native {native})"
@@ -2595,6 +2764,11 @@ mod tests {
                     assert!(s.attack < 1.0);
                 }
                 ScaleAction::NoTouch => {}
+                // Both are conditioned on a carried down state, and this enemy carries none, so
+                // reaching either here would mean the guard has stopped guarding.
+                ScaleAction::KeepDown | ScaleAction::ClearDown => {
+                    panic!("no state is carried, so nothing can be kept or cleared")
+                }
                 ScaleAction::Replace => panic!("an unrunged enemy can never be Replaced"),
             }
         }
@@ -2605,9 +2779,12 @@ mod tests {
         // The 4,214-row mainline population is untouched by phase 1a: its rung IS its declared
         // native difficulty, so swapping rungs is a true re-tier and works downward already.
         for tier in 0..NUM_TIERS {
-            assert_eq!(scale_action(true, -1, tier, None), ScaleAction::Replace);
             assert_eq!(
-                scale_action(true, 40000000, tier, None),
+                scale_action(true, false, -1, tier, None),
+                ScaleAction::Replace
+            );
+            assert_eq!(
+                scale_action(true, false, 40000000, tier, None),
                 ScaleAction::Replace
             );
         }

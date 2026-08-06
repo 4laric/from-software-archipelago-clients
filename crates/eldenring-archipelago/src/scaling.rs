@@ -232,6 +232,14 @@ struct SweepTally {
     /// number: if `scaled_down` stays high and this stays 0 across repeat sweeps of one region, the
     /// down half is churning rather than settling and `settled_on_downstate` is not matching.
     settled_down: u32,
+    /// Carries one of our down states, and the area index has since gone `None` so we can no longer
+    /// re-derive it. 🛑 READ THIS WITH `settled_down`: before it existed these landed in
+    /// `left_vanilla`, which is the exact opposite of what happened to them. First log, region 0:
+    /// 23 down-scaled, then 5 settled and 18 silently counted as untouched.
+    kept_down: u32,
+    /// Carried a down state that is no longer warranted -- stripped, with nothing applied in its
+    /// place. Non-zero here means a region's target moved up under enemies we had cut.
+    cleared_down: u32,
     /// Swept, carried NO ladder rung: hand-tuned. The class #346 is about.
     unrunged: u32,
     /// Unrunged AND left completely untouched -- either we have no native tier for it, or the
@@ -703,7 +711,12 @@ pub fn tick() -> Option<String> {
                 tally.sample
             );
         }
-        if changed && (tally.scaled > 0 || tally.unrunged > 0 || tally.scaled_down > 0) {
+        if changed
+            && (tally.scaled > 0
+                || tally.unrunged > 0
+                || tally.scaled_down > 0
+                || tally.cleared_down > 0)
+        {
             let RegionScaleDbg {
                 tier,
                 raw_target,
@@ -732,7 +745,7 @@ pub fn tick() -> Option<String> {
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
-                 vanilla {}, npc_param_ids {:?}), down-scaled {} (settled {}), \
+                 vanilla {}, npc_param_ids {:?}), down-scaled {} (settled {}, kept {}, cleared {}), \
                  other-in-range {} {:?}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?} from {} \
                  vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {:?}, \
@@ -746,6 +759,8 @@ pub fn tick() -> Option<String> {
                 tally.unrunged_ids,
                 tally.scaled_down,
                 tally.settled_down,
+                tally.kept_down,
+                tally.cleared_down,
                 tally.other_in_range,
                 tally.other_ids,
                 tally.band_only,
@@ -917,6 +932,7 @@ fn scale_one(
     // CLASSIFY. `!stale.is_empty()` is NOT "this enemy had a vanilla tier" -- the clear range is the
     // whole 7000..8000 block and only some of it is the ladder (er_logic::scaling::ScalingKind).
     let mut carried_ladder_rung = false;
+    let mut carried_downstate = false;
     let mut carried_other = false;
     let mut band_tier: Option<usize> = None;
     let mut rung_id: Option<i32> = None;
@@ -928,9 +944,10 @@ fn scale_one(
                 rung_id = Some(id);
             }
             // OURS, from a previous sweep. Not vanilla's statement about the enemy, so it must not
-            // reach `other_in_range` (that census is about what VANILLA baked on) -- but it is in
-            // `stale`, so the clear below removes it and the decision is re-derived from scratch.
-            Some(ScalingKind::Downstate) => {}
+            // reach `other_in_range` (that census is about what VANILLA baked on). ⭐ It is also a
+            // FACT THE DECISION NEEDS: on a converged region the area index is `None` by design, so
+            // this flag is the only surviving evidence that we ever placed this enemy.
+            Some(ScalingKind::Downstate) => carried_downstate = true,
             Some(ScalingKind::OtherInRange) => {
                 carried_other = true;
                 tally.note_other(id);
@@ -974,6 +991,7 @@ fn scale_one(
     // trade is deliberate.
     match scale_action(
         carried_ladder_rung,
+        carried_downstate,
         chr.npc_param_id,
         target_tier,
         area_tier,
@@ -990,6 +1008,24 @@ fn scale_one(
             if placed_by_area(chr.npc_param_id, area_tier) {
                 tally.note_area_moved(chr.npc_param_id);
             }
+        }
+        ScaleAction::KeepDown => {
+            // Behaviourally identical to NoTouch -- and that is exactly why it needed its own arm.
+            // It was indistinguishable in the census, so 18 correctly-down-scaled enemies reported
+            // as "left vanilla" in the first live log.
+            tally.kept_down += 1;
+            return;
+        }
+        ScaleAction::ClearDown => {
+            // 🛑 STRIPS WITHOUT REPLACING, which every other path in this file is forbidden to do.
+            // The prohibition protects VANILLA state, whose loss is irreversible because the sweep
+            // re-derives from what the enemy carries. A down state is additive and ours: removing it
+            // restores exactly what vanilla shipped, which is the correct answer here.
+            for &id in &stale {
+                chr.remove_speffect(id);
+            }
+            tally.cleared_down += 1;
+            return;
         }
         ScaleAction::Down(state) => {
             // 🛑 SET-EQUAL, THEN RETURN WITHOUT MUTATING. A down state that re-applied every sweep
