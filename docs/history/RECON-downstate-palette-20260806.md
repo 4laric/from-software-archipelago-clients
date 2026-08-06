@@ -112,3 +112,69 @@ here.
 `down-scaled N (settled M)` on the region line. If `down-scaled` stays high and `settled` stays 0
 across repeat sweeps of one region, the down half is churning rather than converging and
 `settled_on_downstate` is not matching — the `residue 306` failure, in the down half.
+
+---
+
+# Follow-up: the first live 1b log, and the two things it caught
+
+Same day, from a build of PR #79. No errors, no crash.
+
+**Every applied state matched the derivation exactly**, checked against `NATIVE_TIERS` on five
+entities across four distinct lattice points — `[008]` at area index 2, `[004, 027]` at area index 5,
+`[004, 008, 027]` for table tier 12, `[002, 004, 008]` for table tier 16.
+
+**The HP half is confirmed in the field, twice, to the integer.** `523340014` went 1098 -> **274**
+(0.25x exactly) and `1000000` went 1939 -> **1454** (0.75x exactly). The second is the one that
+matters: it proves the `20018027` x `20018004` cancellation (3.0 x 0.25 = 0.75) works on a live
+enemy — the row that was not in the original design at all.
+
+Two entities carrying a 0.75 state showed HP unmoved 39s later. Either a recompute-timing artefact or
+something real; one log cannot separate them, and nothing here is built on it.
+
+## 1. `KeepDown` — the census was reporting the opposite of what happened
+
+Region 0 logged `down-scaled 23 (settled 0)`, then `down-scaled 0 (settled 5)` with `left vanilla`
+going 19 -> 37. **18 + 5 = 23, and 19 + 18 = 37.**
+
+The area index goes `None` on a converged region **by design**: the histogram counts only
+rung-AND-band carriers, and our own sweep strips them. So `presumed_native_tier` stops answering and
+the 18 area-placed enemies resolve to `NoTouch`.
+
+They kept their state — but only because `NoTouch` happens to return before the clear. Correct
+behaviour resting on an accident, reporting itself as the opposite of the truth.
+
+The asymmetry underneath is the real finding: **the up path self-anchors and the down path does
+not.** An enemy scaled up carries a ladder rung afterwards, so every later sweep reads it as runged
+and `Replace` re-derives it forever. A down state is not a rung.
+
+`ScaleAction::KeepDown` makes it explicit and countable. Behaviourally identical to `NoTouch`, which
+is precisely why it needed its own name.
+
+## 2. `ClearDown` — a down state was unremovable
+
+Found while writing (1)'s test, not in the log. `down_state_for` declines 34 of the 190 tier pairs
+(the deadband), and `NoTouch` returns before the clear — so an enemy placed at one target and
+re-swept at a target just below its native tier would keep a cut nothing justifies, forever. Same for
+a target that rises to equal its native tier.
+
+Safe to strip without replacing, uniquely on this path: the usual prohibition protects VANILLA state,
+whose loss is irreversible because the sweep re-derives from what the enemy carries. A down state is
+additive and ours.
+
+## 3. `DOWN_TOLERANCE` — a near-tie cost a whole lattice step
+
+`523210014`, native 9 at target 0, wanted 0.444 with a 0.45 state right there. A strict `<=` reached
+past it to 0.315: **a 30% extra cut for a 1.4% miss.** The table has a worse case — native 10 -> 1
+wants **0.450 exactly** and was still refused, because these are f32 ratios of f32 rates.
+
+2% fixes 7 of the 156 acting pairs and moves median overshoot 1.214 -> 1.177. The acted-pair count is
+unchanged, so it buys precision at zero coverage cost; a test asserts that count directly, because a
+tolerance quietly becoming a second deadband is the way this goes wrong.
+
+## Context that dwarfs all three
+
+Every region in the log read `sphere target 0` or `unmapped`, so every one resolved to tier 0,
+`ground > target` was true almost everywhere, and 1b fired its deepest states game-wide. In the same
+session Liurnia's RUNGED enemies went `[7060, 7460]` -> `[7010]`, 382 -> 192 HP. **Liurnia is being
+cut from both directions at once**, and neither half is 1b's doing. 1b only made the stuck sphere
+target impossible to ignore.
