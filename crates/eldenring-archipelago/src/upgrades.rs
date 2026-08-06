@@ -286,7 +286,7 @@ pub(crate) fn highest_held_level(somber: bool) -> Option<i32> {
 /// Does the bag hold ANY reinforce level of weapon base row `base`?
 ///
 /// `None` = the bag was not reachable this tick. The caller must treat that as "don't know", NEVER
-/// as "no": this is the idempotency latch for `er_logic::arena_grants`, and reading an unresolvable
+/// as "no": this is the idempotency latch for `er_logic::boss_grants`, and reading an unresolvable
 /// bag as empty duplicates a unique weapon on every tick until it resolves.
 ///
 /// Same typed walk as `walk_inventory_targets`, minus the caching -- it runs only while the player

@@ -14,13 +14,15 @@
 //! his room and gives Rykard's actual opponent nothing. The place is the one thing about this
 //! fight that is NOT stable.
 //!
-//! What IS stable is the character. `NpcParam.nameId` is a **PlaceName** id -- the boss-healthbar
-//! label -- and PlaceName [`RYKARD_PLACE_NAME_ID`] (160000) is "Rykard, Lord of Blasphemy",
-//! carried by exactly one row in all 7,039 of `NpcParam`: [`RYKARD_NPC_PARAM_IDS`]. A character
-//! brings its `NpcParam` row with it wherever it spawns, so this follows him.
+//! What IS stable is the character. `NpcParam` ids are CHR-ENCODED (`CCCC____`), so every row
+//! belonging to chr `c4710` identifies Rykard no matter which arena he was spawned into, and a
+//! prefix test on [`RYKARD_CHR_ID`] is the whole gate. Both phases are that one character --
+//! `c4700` has no rows at all -- so this covers the serpent as well, which matters because the
+//! spear is the answer to BOTH phases.
 //!
-//! ⭐ This is the same keying `AREA_EXCLUDED` already uses ("keyed PER CHARACTER via `nameId`, NOT
-//! per row"), for the same reason: the row says what an instance is, the character says who it is.
+//! 🛑 I first keyed this on `NpcParam.nameId` and got the **Twin Maiden Husks**; see
+//! [`RYKARD_NPC_PARAM_ROWS`] for how a single id resolving in the table I expected passed for
+//! evidence, and what to check instead.
 //!
 //! # Three properties, each load-bearing
 //!
