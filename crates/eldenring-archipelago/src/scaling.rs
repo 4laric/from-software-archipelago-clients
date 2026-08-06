@@ -98,27 +98,34 @@ fn now_ms() -> u64 {
 ///
 /// The histogram is the part that stops this recurring: the next build's logs will say what states
 /// enemies are ACTUALLY in, and only then can this be narrowed on evidence instead of on a name.
-/// Is any character with one of `npc_param_ids` loaded right now?
+/// Is a character of chr `chr_id` loaded right now?
 ///
 /// `None` = WorldChrMan was not reachable this tick. The caller must treat that as "don't know",
 /// NEVER as "no" -- see `er_logic::boss_grants` property 3.
 ///
 /// Walks the SAME two sets the sweep does (open-field base + every block slot), because that is
 /// where mobs and bosses live; phantom sets are deliberately not consulted.
-pub(crate) fn any_character_present(npc_param_ids: &[i32]) -> Option<bool> {
+///
+/// 🛑 `ChrIns` does NOT implement `AsRef`. The set iterators yield `&mut T: Subclass<ChrIns>`, and
+/// the way this file already gets a `&ChrIns` out of one is to PASS IT to a fn taking `&ChrIns`
+/// (see `area_sample_one`) and let the coercion happen at the call. `chr.as_ref()` does not
+/// compile; that cost a CI round.
+fn chr_is(chr: &ChrIns, chr_id: i32) -> bool {
+    er_logic::boss_grants::is_character(chr.npc_param_id, chr_id)
+}
+
+pub(crate) fn any_character_present(chr_id: i32) -> Option<bool> {
     let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {
         return None;
     };
     for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
-        let chr_ins: &ChrIns = chr.as_ref();
-        if npc_param_ids.contains(&chr_ins.npc_param_id) {
+        if chr_is(chr, chr_id) {
             return Some(true);
         }
     }
     for slot in wcm.chr_sets.iter().flatten() {
         for chr in sweepable_characters(slot) {
-            let chr_ins: &ChrIns = chr.as_ref();
-            if npc_param_ids.contains(&chr_ins.npc_param_id) {
+            if chr_is(chr, chr_id) {
                 return Some(true);
             }
         }

@@ -2812,17 +2812,39 @@ impl shared::Core for Core {
         crate::region::tick_capital();
         // 6c. BOSS GRANTS (#413): hand the player the tool the BOSS assumes they arrived with.
         //     Keyed on the CHARACTER, never the arena -- an enemy randomiser moves bosses between
-        //     rooms, so a place key would arm the wrong fight (Alaric, 2026-08-06). Gated on
-        //     `can_grant` because the grant needs a live inventory pointer and the possession
-        //     latch IS a bag read. The latch is possession, never the Serpent-Hunter's
-        //     obtained-flag: that flag is what check 7771816 is keyed on.
+        //     rooms, so a place key would arm the wrong fight (Alaric, 2026-08-06).
+        //
+        //     🛑 `present` is read OUTSIDE the `can_grant` gate on purpose. The weapon hold below
+        //     is driven from it, and if a lost `can_grant` simply skipped this block the hold would
+        //     STRAND at true and block every weapon equip for the rest of the session. `None`
+        //     resolves to "not paused", so losing the ability to act releases the hold instead.
+        let boss_present = if can_grant {
+            crate::scaling::any_character_present(er_logic::boss_grants::RYKARD_CHR_ID)
+        } else {
+            None
+        };
+        crate::auto_equip::set_weapons_paused(er_logic::boss_grants::should_pause_weapon_equips(
+            boss_present,
+            crate::auto_equip::queue_is_empty(),
+            crate::auto_equip::weapons_paused(),
+        ));
         if can_grant {
-            let present =
-                crate::scaling::any_character_present(er_logic::boss_grants::RYKARD_NPC_PARAM_IDS);
+            // The latch is possession, never the Serpent-Hunter's obtained-flag: that flag is what
+            // check 7771816 is keyed on, so latching on it would collect a check the player never
+            // found.
             let holds =
                 crate::upgrades::holds_weapon_base(er_logic::boss_grants::SERPENT_HUNTER_BASE);
             let mut game = EldenRingHook;
-            if let Some(m) = er_logic::boss_grants::tick(&mut game, present, holds) {
+            if let Some(m) = er_logic::boss_grants::tick(&mut game, boss_present, holds) {
+                // EQUIP IT. `enqueue` self-gates on the auto_equip option AND on the category, so
+                // this is a no-op for anyone who turned auto_equip off. Pass the BASE id, exactly
+                // as the receive path passes its raw full_id: the auto_equip::enqueue_id seam is
+                // what applies auto_upgrade, and duplicating that mapping at a call site is how the
+                // +N lookup missed the bag before.
+                //
+                // ⭐ This enqueue is why the hold above waits for an EMPTY queue: pausing on the
+                // same tick would hold the spear itself.
+                crate::auto_equip::enqueue(er_logic::boss_grants::SERPENT_HUNTER_BASE, None);
                 self.log(ap::Print::message(m));
             }
         }

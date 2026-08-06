@@ -175,6 +175,31 @@ fn is_physick_tear(full_id: i32) -> bool {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Hold WEAPON equips only, without touching `ENABLED`.
+///
+/// 🛑🛑 THIS EXISTS BECAUSE `set_enabled` IS NOT A PAUSE LEVER. `ENABLED` gates `enqueue` as well
+/// as `tick`, so flipping it off would drop every item received during the fight out of the queue
+/// permanently -- AP replays only on connect, so they would never be equipped at all. It also
+/// resets `TEAR_SEQ`, and physick tear ordinals have to stay reproducible (#342). This flag is
+/// read in ONE place: the drain loop, per entry.
+static WEAPONS_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Hold or release WEAPON equips. Driven per tick from `er_logic::boss_grants`.
+pub fn set_weapons_paused(on: bool) {
+    WEAPONS_PAUSED.store(on, Ordering::Relaxed);
+}
+
+/// Current hold state, fed back into the decision so a closed gate stays closed.
+pub fn weapons_paused() -> bool {
+    WEAPONS_PAUSED.load(Ordering::Relaxed)
+}
+
+/// Is the equip queue drained? A poisoned lock answers `false` -- "not empty" defers the pause,
+/// which is the safe direction (the alternative pauses before the granted weapon has equipped).
+pub fn queue_is_empty() -> bool {
+    PENDING.lock().map(|q| q.is_empty()).unwrap_or(false)
+}
 /// Queued FullIDs, each with the stream position the resolver needs: `(full_id, ordinal, pouches)`.
 ///
 /// * TEARS use `ordinal` (their position among tears since connect, from [`TEAR_SEQ`]) and ignore
@@ -407,6 +432,22 @@ pub fn tick() {
 
     let mut still_pending: Vec<(i32, u64, u8)> = Vec::new();
     for (fid, ordinal, pouches) in pending {
+        // WEAPONS HELD (#413): while a boss we armed for is on screen, a weapon arriving from
+        // another world must not tear that tool out of the player's hands. The entry is HELD, not
+        // dropped -- pushed straight back the same way an ungranted item is -- so it equips the
+        // moment the fight ends and nothing in the stream is lost.
+        //
+        // Weapons only: armour and talismans mid-fight cannot cost the player the fight, and the
+        // narrower the carve-out the less of the French Challenge premise it contradicts.
+        if WEAPONS_PAUSED.load(Ordering::Relaxed)
+            && matches!(
+                er_logic::auto_equip::equipable(fid),
+                Some(er_logic::auto_equip::Equipable::Weapon)
+            )
+        {
+            still_pending.push((fid, ordinal, pouches));
+            continue;
+        }
         let full = fid as u32;
         let Some(&(handle, inv_index)) = owned.get(&full) else {
             still_pending.push((fid, ordinal, pouches)); // not granted yet -- retry next tick
