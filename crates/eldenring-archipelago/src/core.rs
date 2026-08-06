@@ -2810,6 +2810,24 @@ impl shared::Core for Core {
         //     the burn-done flag is set). Holds 9116 matched to the capital the player is
         //     standing in, so the Erdtree burn never permanently strands the Royal checks.
         crate::region::tick_capital();
+        // 6c. BOSS GRANTS (#413): hand the player the tool the BOSS assumes they arrived with.
+        //     Keyed on the CHARACTER, never the arena -- an enemy randomiser moves bosses between
+        //     rooms, so a place key would arm the wrong fight (Alaric, 2026-08-06). Gated on
+        //     `can_grant` because the grant needs a live inventory pointer and the possession
+        //     latch IS a bag read. The latch is possession, never the Serpent-Hunter's
+        //     obtained-flag: that flag is what check 7771816 is keyed on.
+        if can_grant {
+            let present = crate::scaling::any_character_present(
+                er_logic::boss_grants::RYKARD_NPC_PARAM_IDS,
+            );
+            let holds =
+                crate::upgrades::holds_weapon_base(er_logic::boss_grants::SERPENT_HUNTER_BASE);
+            let mut game = EldenRingHook;
+            if let Some(m) = er_logic::boss_grants::tick(&mut game, present, holds) {
+                self.log(ap::Print::message(m));
+            }
+        }
+        }
         for g in graces_lit {
             self.log(ap::Print::message(format!("{g} unlocked")));
         }

@@ -283,6 +283,31 @@ pub(crate) fn highest_held_level(somber: bool) -> Option<i32> {
     })
 }
 
+/// Does the bag hold ANY reinforce level of weapon base row `base`?
+///
+/// `None` = the bag was not reachable this tick. The caller must treat that as "don't know", NEVER
+/// as "no": this is the idempotency latch for `er_logic::arena_grants`, and reading an unresolvable
+/// bag as empty duplicates a unique weapon on every tick until it resolves.
+///
+/// Same typed walk as `walk_inventory_targets`, minus the caching -- it runs only while the player
+/// stands in one arena, so a fresh read every tick beats a stale answer.
+pub(crate) fn holds_weapon_base(base: i32) -> Option<bool> {
+    // SAFETY: FD4 singleton (read-only walk). Err/None before the player is placed.
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    let pgd = gdm.main_player_game_data.as_ref();
+    for entry in pgd.equipment.equip_inventory_data.items_data.items() {
+        if entry.item_id.category() != ItemCategory::Weapon {
+            continue;
+        }
+        // param_id() strips the category nibble -> the resolved weapon row (base + level).
+        let row = entry.item_id.param_id() as i32;
+        if er_logic::arena_grants::is_level_of(row, base) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// One full typed inventory walk: returns (highest normal +N, highest somber +N) across all held
 /// weapons, or None if the bag isn't reachable this tick. Pure read; no writes. Each weapon entry's
 /// `param_id()` is the resolved row (base + level); we re-classify its track via the same param cap
