@@ -17,9 +17,10 @@ use std::time::Instant;
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
     NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
-    area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect, ladder_tier,
-    native_tier, placed_by_area, raw_target_for_region, region_name_for_bucket, scale_action,
-    scaling_kind, settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
+    area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect,
+    is_scaling_speffect_with_downstates, ladder_tier, native_tier, placed_by_area,
+    raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
+    settled_on_downstate, settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -224,6 +225,13 @@ pub fn configure(sd: &Value) {
 struct SweepTally {
     /// (Re)applied the tier -- the number the log line has always printed.
     scaled: u32,
+    /// Unrunged, we HAD a native tier, and the target was WEAKER: a down state was applied (#346
+    /// phase 1b). 🛑 These enemies do NOT carry the region's rung -- see `ScaleAction::Down`.
+    scaled_down: u32,
+    /// Already carrying exactly the down state we would have applied. ⭐ This is the CONVERGENCE
+    /// number: if `scaled_down` stays high and this stays 0 across repeat sweeps of one region, the
+    /// down half is churning rather than settling and `settled_on_downstate` is not matching.
+    settled_down: u32,
     /// Swept, carried NO ladder rung: hand-tuned. The class #346 is about.
     unrunged: u32,
     /// Unrunged AND left completely untouched -- either we have no native tier for it, or the
@@ -695,7 +703,7 @@ pub fn tick() -> Option<String> {
                 tally.sample
             );
         }
-        if changed && (tally.scaled > 0 || tally.unrunged > 0) {
+        if changed && (tally.scaled > 0 || tally.unrunged > 0 || tally.scaled_down > 0) {
             let RegionScaleDbg {
                 tier,
                 raw_target,
@@ -724,7 +732,8 @@ pub fn tick() -> Option<String> {
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
-                 vanilla {}, npc_param_ids {:?}), other-in-range {} {:?}; band-only {}, \
+                 vanilla {}, npc_param_ids {:?}), down-scaled {} (settled {}), \
+                 other-in-range {} {:?}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?} from {} \
                  vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {:?}, \
                  still NoTouch {}",
@@ -735,6 +744,8 @@ pub fn tick() -> Option<String> {
                 tally.scaled_by_native,
                 tally.left_vanilla,
                 tally.unrunged_ids,
+                tally.scaled_down,
+                tally.settled_down,
                 tally.other_in_range,
                 tally.other_ids,
                 tally.band_only,
@@ -870,7 +881,12 @@ fn scale_one(
         .special_effect
         .entries()
         .map(|e| e.param_id)
-        .filter(|&id| is_scaling_speffect(id))
+        // 🛑 WIDER THAN THE CLEAR USED TO BE. `is_scaling_speffect` stops at `7000..8000` plus the
+        // DLC range, and the down-state rows live in the DLC ally-tuning block outside BOTH -- so
+        // before 1b armed, a state we applied was invisible to the very sweep that applied it and
+        // would have stranded across reconnects and seed changes. An ALLOWLIST, never a widened
+        // range: widening would strip legitimate effects off DLC summons.
+        .filter(|&id| is_scaling_speffect_with_downstates(id))
         .collect();
     if sample_on {
         // BEFORE any early return: a settled enemy is still a data point, and once a region
@@ -911,6 +927,10 @@ fn scale_one(
                 carried_ladder_rung = true;
                 rung_id = Some(id);
             }
+            // OURS, from a previous sweep. Not vanilla's statement about the enemy, so it must not
+            // reach `other_in_range` (that census is about what VANILLA baked on) -- but it is in
+            // `stale`, so the clear below removes it and the decision is re-derived from scratch.
+            Some(ScalingKind::Downstate) => {}
             Some(ScalingKind::OtherInRange) => {
                 carried_other = true;
                 tally.note_other(id);
@@ -970,6 +990,31 @@ fn scale_one(
             if placed_by_area(chr.npc_param_id, area_tier) {
                 tally.note_area_moved(chr.npc_param_id);
             }
+        }
+        ScaleAction::Down(state) => {
+            // 🛑 SET-EQUAL, THEN RETURN WITHOUT MUTATING. A down state that re-applied every sweep
+            // would never converge, and the census would report it as freshly "scaled" on every
+            // pass -- which is exactly how the `residue 306` bug read before `settled_on_target`.
+            if settled_on_downstate(&stale, state) {
+                tally.settled_down += 1;
+                return;
+            }
+            for &id in &stale {
+                chr.remove_speffect(id);
+            }
+            for &id in state.ids {
+                chr.apply_speffect(id, false);
+            }
+            tally.scaled_down += 1;
+            if placed_by_area(chr.npc_param_id, area_tier) {
+                tally.note_area_moved(chr.npc_param_id);
+            }
+            // 🛑🛑 NO `apply_speffect(target)` ON THIS PATH, AND THAT IS THE POINT. This enemy
+            // carries no rung, so its base ALREADY encodes its native tier; putting the region's
+            // rung on top would multiply rather than replace -- the v0.3.4 one-shotting shape, in
+            // the direction we are trying to fix. The down state is the RATIO between the two
+            // tiers, so the base plus the state IS the target.
+            return;
         }
         ScaleAction::Replace => {}
     }
