@@ -99,7 +99,12 @@ pub fn set_auto_upgrade(level_or_flag: i32) {
 
 /// net.rs: `set_global_scadu_blessing(sd.pointer("/options/global_scadutree_blessing").and_then(|v| v.as_i64()).unwrap_or(0) as i32)`.
 pub fn set_global_scadu_blessing(mode: i32) {
-    let m = if mode == 1 || mode == 2 { mode } else { 0 };
+    // 0 off | 1 anywhere | 2 anywhere + DLC catch-up | 3 dlc_only + DLC catch-up.
+    // 🛑 AN UNRECOGNISED MODE CLAMPS TO OFF, deliberately: it is how a seed from a NEWER apworld
+    // degrades instead of guessing. It is also exactly why a mode-3 seed declares
+    // requiresClientFeatures ["dlc_blessing_catchup"] -- without the tag this clamp is a silent
+    // "the setting you chose did nothing" instead of a refusal to connect.
+    let m = if (1..=3).contains(&mode) { mode } else { 0 };
     GLOBAL_SCADU.store(m, Ordering::Relaxed);
     log::info!(
         "global_scadu_blessing: {}",
@@ -395,10 +400,13 @@ pub fn tick_global_scadu() -> Option<String> {
     // er-logic/src/scadu_blessing_replay.rs -- the floor over a TIMELINE: enter a DLC region with no
     // fragments, leave it again, transient bag miss, reconnect, a real higher blessing). Do NOT
     // re-implement it here: an inline copy is the drift this tier exists to kill.
-    //   mode 1 (player_only) = level from held fragments.
-    //   mode 2 (scaled)      = max(fragments, this region's DLC floor) -- so a DLC region unlocked
-    //                          with no fragments still meets its enemies' assumption. Composing as MAX
-    //                          means collected fragments still count above the floor.
+    //   mode 1 (anywhere)             = level from RECEIVED fragments.
+    //   mode 2 (anywhere + catch-up)  = max(fragments, this region's DLC floor) -- so a DLC region
+    //                                   entered with no fragments still meets its enemies'
+    //                                   assumption. Composing as MAX means collected fragments
+    //                                   still count above the floor.
+    //   mode 3 (dlc_only + catch-up)  = the floor ALONE. The game keeps its own fragment ladder;
+    //                                   we only refuse to let a DLC area run under its expectation.
     let Some(level) =
         er_logic::upgrades::blessing_target(scadu_mode(), frag_qty, dlc_blessing_floor_here())
     else {
@@ -411,7 +419,16 @@ pub fn tick_global_scadu() -> Option<String> {
     // own and applies that, which works everywhere. It is driven from here, and not from its own
     // tick, so that an `off` seed makes zero new game accesses: the mode gate, the `in_world()`
     // gate, the throttle and the bag walk above are all shared.
-    let toast = crate::scadu_blessing::drive(level);
+    // Modes 1 and 2 ONLY. Mode 3 is vanilla SCOPE: the player asked for the DLC catch-up WITHOUT
+    // the Limgrave power curve, so the clone row stays untouched and the stored byte below does all
+    // of the work -- which is exactly enough, because the byte is honoured inside the Land of Shadow
+    // and the floor only ever applies there anyway. Driving the clone here would hand mode 3 the
+    // one thing it exists to let people decline.
+    let toast = if er_logic::upgrades::applies_globally(scadu_mode()) {
+        crate::scadu_blessing::drive(level)
+    } else {
+        None
+    };
 
     // Read the current stored blessing, then ONLY raise it (never stomp a higher real DLC revere,
     // never down-flicker). The read+write share one mutable PlayerGameData borrow inside
@@ -535,13 +552,18 @@ mod tests {
 
     #[test]
     fn scadu_mode_clamp() {
-        // set_global_scadu_blessing clamps to {0,1,2}.
+        // set_global_scadu_blessing clamps to {0,1,2,3}.
         set_global_scadu_blessing(0);
         assert_eq!(scadu_mode(), 0);
         set_global_scadu_blessing(1);
         assert_eq!(scadu_mode(), 1);
         set_global_scadu_blessing(2);
         assert_eq!(scadu_mode(), 2);
+        // 3 = dlc_only scope + DLC catch-up (2026-08-06). It was OUT OF RANGE until the option
+        // split, so this assertion is the one that would have caught shipping the wire value
+        // without the arm that reads it -- the clamp would have turned every mode-3 seed off.
+        set_global_scadu_blessing(3);
+        assert_eq!(scadu_mode(), 3);
         set_global_scadu_blessing(7); // out of range -> off
         assert_eq!(scadu_mode(), 0);
         set_global_scadu_blessing(0);
