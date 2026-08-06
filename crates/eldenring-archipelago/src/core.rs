@@ -3480,7 +3480,7 @@ impl Core {
         if let Some(client) = self.client() {
             connected = true;
             for loc in client.checked_locations() {
-                checked.insert(loc.id() as i64);
+                checked.insert(loc.id());
             }
             for _ in client.unchecked_locations() {
                 unchecked_n += 1;
