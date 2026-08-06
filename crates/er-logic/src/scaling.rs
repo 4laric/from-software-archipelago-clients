@@ -251,12 +251,17 @@ pub enum ScalingKind {
     Ladder,
     /// In the clear range, so we strip it — but it says nothing about the enemy's native tier.
     OtherInRange,
+    /// One of OUR down-state rows (`DOWNSTATE_IDS`). Not vanilla's, not in either range: it is
+    /// there because a previous sweep put it there, so it is ours to clear and re-derive.
+    Downstate,
 }
 
 /// Classify one carried `param_id`. `None` = not ours to clear.
 pub fn scaling_kind(param_id: i32) -> Option<ScalingKind> {
     if is_ladder_rung(param_id) {
         Some(ScalingKind::Ladder)
+    } else if is_downstate_id(param_id) {
+        Some(ScalingKind::Downstate)
     } else if is_scaling_speffect(param_id) {
         Some(ScalingKind::OtherInRange)
     } else {
@@ -453,17 +458,184 @@ pub fn area_tier_from_histogram(hist: &[u32]) -> Option<usize> {
     None
 }
 
-/// The phase-1b DOWN-STATE pair: the only rows measured to scale an enemy BELOW vanilla.
+/// The phase-1b DOWN-STATE rows: the only rows in the game that can scale an enemy BELOW vanilla.
 ///
-/// `20018004` = 0.25x HP, `20018002` = 0.30x all-element attack. `spCategory 0` (so they stack),
-/// `effectEndurance -1`, `conditionHp -1`. No single row in the game's 11,325 does both, which is
-/// why the down primitive has to be a composition.
+/// SWEPT 2026-08-06 across all 11,325 `SpEffectParam` rows — every row with `maxHpRate < 1` or
+/// `physicsAttackPowerRate < 1`, each full-column-diffed against the identity row `7000`. Usable
+/// means `effectEndurance -1` (infinite), `conditionHp -1` (unconditional), `spCategory 0` (so they
+/// STACK), no `vfxId`/`iconId`/`stateInfo`/`cycleOccurrenceSpEffectId`, and the `effectTarget*`
+/// flags left at 1.
 ///
-/// 🛑 **DECLARED HERE, NOT YET ARMED.** Nothing in production applies these; only `downstate_probe`
-/// does, behind two env gates. They exist in this file so the CLEAR can learn them in the same
-/// change that arms them — see `downstates_are_not_yet_cleared`, which is a tripwire, not a
-/// preference.
-pub const DOWNSTATE_IDS: [i32; 2] = [20018004, 20018002];
+/// | id | attack | HP | non-default diffs vs `7000` |
+/// |---|---|---|---|
+/// | `20018008` | 0.70 | 1.00 | 5 — the attack rates, and nothing else |
+/// | `20018027` | 0.45 | 3.00 | 6 — the attack rates, and nothing else |
+/// | `20018002` | 0.30 | 1.00 | 6 — the rates, plus `targetPriority 0 -> -0.5` |
+/// | `20018004` | 1.00 | 0.25 | 3 — `maxHpRate`, plus `targetPriority 0 -> 1` |
+///
+/// ⭐ `20018027`'s 3x HP is not a defect, it is the CANCELLER: 3.0 x 0.25 = 0.75, so pairing it with
+/// `20018004` lands a near-neutral HP while halving the attack gap the original three-state design
+/// left open (it jumped 0.70 -> 0.30 on the axis this phase buckets by).
+///
+/// ⭐⭐⭐ `20018004` IS THE ONLY CLEAN HP-DOWN ROW IN THE GAME, and that is now verified rather than
+/// assumed. The other 19 sub-1.0 `maxHpRate` rows are all disqualified, and the reasons are recorded
+/// so nobody re-derives them: `1420` (0.5x) zeroes all seven `effectTarget*` flags AND doubles
+/// `defEnemyDmgCorrectRate`; `330800`/`500135`/`6083000`/`6083200`/`6160000` are player talismans
+/// (`iconId` + `addXStatus` + `effectTargetEnemy 0`); the rest are timed (`effectEndurance` 10-120)
+/// or a different `spCategory`.
+///
+/// 🛑 TWO ATTACK ROWS THAT LOOK USABLE AND ARE NOT. `18684`/`18685` (attack **0.0**) zero every
+/// `effectTarget*` flag and every `*DamageCutRate` — a total nullifier that can apply to nothing.
+/// `6109000` (0.95x) is a talisman: `iconId`, `cycleOccurrenceSpEffectId`, `addLuckStatus 8`,
+/// `effectTargetEnemy 0`. `19389` (0.35x) rides a `maxHpRate 2`. Don't reach for any of them.
+pub const DOWNSTATE_IDS: [i32; 4] = [20018002, 20018004, 20018008, 20018027];
+
+/// One expressible DOWN state: the ids applied together, and what they compose to.
+///
+/// `spCategory 0` rows stack MULTIPLICATIVELY — the same property that forces the sweep to clear the
+/// `70xx` before applying its own rung — so a subset of `DOWNSTATE_IDS` is simply a product.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DownState {
+    /// Applied together; cleared as a SET. Sorted, so `settled_on_downstate` can compare cheaply.
+    pub ids: &'static [i32],
+    /// Composed all-element attack multiplier. ⭐ THE PRIMARY AXIS — see `down_state_for`.
+    pub attack: f32,
+    /// Composed max-HP multiplier. Secondary: HP governs how long a fight takes, not whether you
+    /// get past it, and a slog is a blemish where a wall is a progression stop.
+    pub hp: f32,
+}
+
+/// Every state the four rows compose to that is actually usable, descending by attack.
+///
+/// 🛑 TWO FAMILIES ARE DELIBERATELY ABSENT. Subsets containing `20018027` WITHOUT `20018004` carry
+/// its 3x HP uncancelled — those are BUFFS, and offering them here would let a down decision make an
+/// enemy tankier. And `{20018004}` alone is attack-neutral, so on the primary axis it is a no-op;
+/// the honest answer in that case is `None`, not a state that does nothing to the wall.
+pub const DOWN_STATES: &[DownState] = &[
+    DownState {
+        ids: &[20018008],
+        attack: 0.7,
+        hp: 1.0,
+    },
+    DownState {
+        ids: &[20018004, 20018008],
+        attack: 0.7,
+        hp: 0.25,
+    },
+    DownState {
+        ids: &[20018004, 20018027],
+        attack: 0.45,
+        hp: 0.75,
+    },
+    DownState {
+        ids: &[20018004, 20018008, 20018027],
+        attack: 0.315,
+        hp: 0.75,
+    },
+    DownState {
+        ids: &[20018002],
+        attack: 0.3,
+        hp: 1.0,
+    },
+    DownState {
+        ids: &[20018002, 20018004],
+        attack: 0.3,
+        hp: 0.25,
+    },
+    DownState {
+        ids: &[20018002, 20018008],
+        attack: 0.21,
+        hp: 1.0,
+    },
+    DownState {
+        ids: &[20018002, 20018004, 20018008],
+        attack: 0.21,
+        hp: 0.25,
+    },
+    DownState {
+        ids: &[20018002, 20018004, 20018027],
+        attack: 0.135,
+        hp: 0.75,
+    },
+    DownState {
+        ids: &[20018002, 20018004, 20018008, 20018027],
+        attack: 0.0945,
+        hp: 0.75,
+    },
+];
+
+/// Leave the enemy vanilla when the ladder's own step between the two tiers is weaker than this.
+///
+/// ⭐⭐⭐ THE COARSEST TOOL WE HAVE IS 0.70x, AND THAT IS THE WHOLE REASON THIS CONSTANT EXISTS.
+/// Anything the ladder wants between 0.70 and 1.0 has no expressible answer: we either overshoot or
+/// do nothing. At 0.90 the 34 pairs whose ladder step is under 10% are left alone — firing a 30%
+/// nerf at a 5% problem is not a fix — while everything the ladder treats as a real difference still
+/// moves, INCLUDING the motivating case.
+///
+/// 🛑 DO NOT RAISE IT TO 0.85 WITHOUT RE-READING `altus_at_sphere_zero_is_scaled_down`. At 0.85 the
+/// Altus case (ground 7, target 5, want 0.879) falls into the deadband and this whole phase no-ops
+/// the defect it was built for. That is not a tuning preference, it is the acceptance test.
+///
+/// Alaric's call, 2026-08-06, after being shown 1.0 / 0.95 / 0.90 / 0.85 side by side.
+pub const DOWN_DEADBAND: f32 = 0.90;
+
+/// Which down state moves an enemy sitting at `native` to look like one at `target`.
+///
+/// ⭐⭐⭐ BUCKET BY ATTACK, NOT BY HP. Every reported death in the 2026-08-04/05 Nexus thread is
+/// damage TAKEN, and boblerrr is the control ("didn't seem too bad, but I also didn't get hit by
+/// them"). Attack is the axis a player hits a wall on; HP only sets how long the fight runs.
+///
+/// The target ratio is the LADDER'S OWN, `attack(target) / attack(native)` — not a ratio anyone
+/// argued for. Round DOWN on attack (never leave it stronger than the ladder asked), break ties on
+/// HP, then on fewest ids.
+///
+/// 🛑 THIS IS RELATIVE WHERE `Apply` IS ABSOLUTE, AND THE ASYMMETRY IS DELIBERATE. `Apply` puts the
+/// target RUNG on an enemy whose base already encodes its native strength, so it multiplies on top —
+/// the known hazard documented on `presumed_native_tier`. A down state cannot work that way: there
+/// is no rung to replace, so the only correct move is the RATIO between the two tiers. Fixing
+/// `Apply` to match is a separate change and is not attempted here.
+pub fn down_state_for(native: usize, target: usize) -> Option<&'static DownState> {
+    if target >= native {
+        return None;
+    }
+    let n = SCALING_TIERS.get(native)?;
+    let t = SCALING_TIERS.get(target)?;
+    let want_attack = t.attack / n.attack;
+    if want_attack > DOWN_DEADBAND {
+        return None; // the ladder's step is smaller than anything we can express
+    }
+    let want_hp = t.hp / n.hp;
+    // Strongest state that does not UNDER-reduce; if the gap outruns the lattice, its floor.
+    let attack = DOWN_STATES
+        .iter()
+        .map(|s| s.attack)
+        .filter(|&a| a <= want_attack)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let attack = if attack.is_finite() {
+        attack
+    } else {
+        DOWN_STATES.last()?.attack
+    };
+    DOWN_STATES
+        .iter()
+        .filter(|s| s.attack == attack)
+        .min_by(|a, b| {
+            (a.hp - want_hp)
+                .abs()
+                .partial_cmp(&(b.hp - want_hp).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.ids.len().cmp(&b.ids.len()))
+        })
+}
+
+/// Is this enemy ALREADY carrying exactly `state` and nothing else in the clear space?
+///
+/// 🛑 SET EQUALITY, for the same reason `settled_on_target` is. A down state that re-applied every
+/// sweep would churn the enemy's effect list forever and never converge, and the census would show
+/// it being "scaled" on every pass — which is exactly how the `residue 306` bug read.
+pub fn settled_on_downstate(carried: &[i32], state: &DownState) -> bool {
+    carried.len() == state.ids.len() && state.ids.iter().all(|id| carried.contains(id))
+}
 
 /// Whether `param_id` is one of the down-state rows.
 pub fn is_downstate_id(param_id: i32) -> bool {
@@ -499,8 +671,10 @@ pub fn settled_on_target(carried: &[i32], target: i32) -> bool {
     !carried.is_empty() && carried.iter().all(|&id| id == target)
 }
 
-/// What the sweep should do with one enemy (#346, phase 1a).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the sweep should do with one enemy (#346, phases 1a and 1b).
+///
+/// 🛑 `Eq` IS GONE ON PURPOSE: `Down` carries f32 rates. Nothing needs total equality here.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScaleAction {
     /// It carries a vanilla ladder rung, so the rung IS its declared native difficulty and swapping
     /// one rung for another is a true re-tier. Clear and apply, in both directions. This is the
@@ -508,6 +682,10 @@ pub enum ScaleAction {
     Replace,
     /// No vanilla rung, but we have a defensible native tier for it, and the target is STRONGER.
     Apply,
+    /// No vanilla rung, we have a defensible native tier, and the target is WEAKER. Clear, then
+    /// apply the down state — and NOT the region's rung, which would multiply on top of a base that
+    /// already encodes the native tier. Phase 1b.
+    Down(&'static DownState),
     /// Leave it exactly as vanilla shipped it.
     NoTouch,
 }
@@ -543,9 +721,10 @@ pub fn native_tier(npc_param_id: i32) -> Option<usize> {
 /// floor, which is what shipped — is a rung applied on top of hand-tuned endgame stats in a shallow
 /// sphere, which is a progression WALL. That asymmetry decides every open question in this file.
 ///
-/// 🛑 UP ONLY for derived entities. The ladder has no rung below 1.0, so "scale this hand-tuned
-/// enemy DOWN" is not expressible yet; `Apply` fires only when `target_tier` exceeds the native one.
-/// The down half needs the off-label `20018xxx` pair and is gated on a live probe.
+/// ⭐ BOTH DIRECTIONS, since 2026-08-06. The ladder still has no rung below 1.0 — `Apply` fires only
+/// when `target_tier` exceeds the native one — but the down half is now expressible off-label
+/// through `DOWN_STATES`, so a derived entity standing ABOVE its region's target is brought down
+/// rather than left alone. See `down_state_for` for why that path is RELATIVE and `Apply` absolute.
 pub fn scale_action(
     carried_ladder_rung: bool,
     npc_param_id: i32,
@@ -557,6 +736,14 @@ pub fn scale_action(
     }
     match presumed_native_tier(npc_param_id, area_tier) {
         Some(native) if target_tier > native => ScaleAction::Apply,
+        // 🛑 THE DOWN HALF, ARMED 2026-08-06. Ground ABOVE target used to fall to `NoTouch` and the
+        // comment below said so; that is the Altus reading (target 5, area index 7, 61 unrunged left
+        // at full Altus strength beside neighbours normalised to 2.266x). `None` here still means
+        // NoTouch — the deadband, or a tier pair the lattice cannot express.
+        Some(native) if native > target_tier => match down_state_for(native, target_tier) {
+            Some(state) => ScaleAction::Down(state),
+            None => ScaleAction::NoTouch,
+        },
         _ => ScaleAction::NoTouch,
     }
 }
@@ -1816,9 +2003,16 @@ mod tests {
         assert_eq!(scaling_kind(6999), None);
         assert_eq!(scaling_kind(8000), None);
         assert_eq!(scaling_kind(20008000), None);
-        // The DLC ally-tuning block -- candidate down-state ids, deliberately NOT in the clear
-        // space today. If a future change arms them it must widen this deliberately, by allowlist.
-        assert_eq!(scaling_kind(20018004), None);
+        // ⭐ THE DLC ALLY-TUNING BLOCK IS NOT OURS -- except for the four rows we apply. Armed
+        // 2026-08-06 by ALLOWLIST, which is the property this half of the test exists to pin: the
+        // ids we use are `Downstate`, and their immediate neighbours in the same block are still
+        // nothing to do with us. A range widened to swallow the block would fail here.
+        for id in DOWNSTATE_IDS {
+            assert_eq!(scaling_kind(id), Some(ScalingKind::Downstate), "{id}");
+        }
+        for id in [20018000, 20018001, 20018003, 20018007, 20018010, 20018035] {
+            assert_eq!(scaling_kind(id), None, "{id} is not ours");
+        }
     }
 
     #[test]
@@ -2021,12 +2215,122 @@ mod tests {
     }
 
     #[test]
-    fn the_area_does_not_scale_an_enemy_down_yet() {
-        // Altus at sphere 0 (2026-08-05): target 5, area index 7. The enemy is presumed STRONGER
-        // than the tier, so it is left alone -- the down half needs the 20018xxx pair, and applying
-        // a lower rung would only ADD a multiplier, never subtract one.
-        assert_eq!(scale_action(false, -1, 5, Some(7)), ScaleAction::NoTouch);
+    fn altus_at_sphere_zero_is_scaled_down() {
+        // ⭐⭐⭐ THE MOTIVATING CASE, AND THEREFORE THE ACCEPTANCE TEST (CONTRIBUTING rule 11).
+        // Altus at sphere 0, measured 2026-08-05: target tier 5, area index 7 off a 302-enemy
+        // sample. Every runged neighbour was normalised DOWN to 2.266x while **61 unrunged enemies
+        // stood at full Altus strength** in the same field -- lizzymagala's "one super squishy and
+        // weak, the other insanely tanky", which is not a bug in the tier but `NoTouch` doing
+        // exactly what it promised in a region whose ground is above the target.
+        //
+        // Until 2026-08-06 this test asserted `NoTouch` and was named for it. That was an honest
+        // statement of a missing primitive, not a property worth keeping.
+        let down = match scale_action(false, -1, 5, Some(7)) {
+            ScaleAction::Down(s) => s,
+            other => panic!("Altus 7 -> 5 must scale DOWN, got {other:?}"),
+        };
+        assert_eq!(down.ids, &[20018008]);
+        // The ladder's own step between those two rungs is 1.758/2.0 = 0.879 attack. 0.70 is the
+        // closest we can express without leaving it stronger than that.
+        assert_eq!(down.attack, 0.7);
+
+        // 🛑 THE DEADBAND MUST NOT SWALLOW THIS CASE. At a cutoff of 0.85 it does, and the whole
+        // phase silently no-ops the defect it was built for. If DOWN_DEADBAND is ever lowered, this
+        // is the assertion that should stop it.
+        assert!(
+            SCALING_TIERS[5].attack / SCALING_TIERS[7].attack <= DOWN_DEADBAND,
+            "the Altus step must stay expressible"
+        );
+
+        // Ground EQUAL to the target is still nothing to do -- there is no gap to close.
         assert_eq!(scale_action(false, -1, 7, Some(7)), ScaleAction::NoTouch);
+    }
+
+    #[test]
+    fn a_gap_too_small_to_express_is_left_vanilla() {
+        // ⭐ The other half of the deadband. Tier 6 -> 5 wants 0.960 attack; our coarsest tool is
+        // 0.70, so "closest available" would fire a 30% nerf at a 4% problem. Leaving it alone is
+        // the honest answer and it matches how `presumed_native_tier` declines rather than guesses.
+        assert!(SCALING_TIERS[5].attack / SCALING_TIERS[6].attack > DOWN_DEADBAND);
+        assert_eq!(scale_action(false, -1, 5, Some(6)), ScaleAction::NoTouch);
+        assert_eq!(down_state_for(6, 5), None);
+        // Tiers 17/18/19 share an attack rate outright, so the ladder itself expresses no
+        // difference there and neither may we.
+        assert_eq!(down_state_for(19, 18), None);
+        assert_eq!(down_state_for(18, 17), None);
+    }
+
+    #[test]
+    fn a_down_state_never_leaves_the_enemy_stronger_than_the_ladder_asked() {
+        // The rounding rule, over the whole ladder: where we act at all, we act by AT LEAST as much
+        // as the step between the two rungs. Over-reducing is a balance blemish; under-reducing
+        // leaves the wall standing, which is the failure this phase exists to remove.
+        let mut acted = 0;
+        for native in 0..NUM_TIERS {
+            for target in 0..native {
+                let want = SCALING_TIERS[target].attack / SCALING_TIERS[native].attack;
+                let Some(state) = down_state_for(native, target) else {
+                    continue;
+                };
+                acted += 1;
+                assert!(
+                    state.attack <= want + f32::EPSILON,
+                    "tier {native} -> {target}: wanted {want}, state gives {}",
+                    state.attack
+                );
+            }
+        }
+        // 🛑 A VACUOUS PASS IS THE FAILURE MODE HERE -- a deadband of 1.0 would make every pair
+        // `None` and this loop would assert nothing at all.
+        assert!(
+            acted > 100,
+            "only {acted} pairs acted; the deadband has eaten the phase"
+        );
+        assert_eq!(down_state_for(5, 5), None, "no gap, no state");
+        assert_eq!(
+            down_state_for(0, 5),
+            None,
+            "target ABOVE native is the Apply path"
+        );
+    }
+
+    #[test]
+    fn no_down_state_can_buff_anything() {
+        // 🛑 THE TABLE IS THE GUARD. `20018027` carries a 3x HP rate that only `20018004` cancels,
+        // so a subset built without it is a BUFF -- and a down decision that made an enemy tankier
+        // would be the wall direction, arrived at through the fix for walls.
+        for state in DOWN_STATES {
+            assert!(state.attack < 1.0, "{state:?} does not reduce attack");
+            assert!(state.hp <= 1.0, "{state:?} BUFFS hp");
+            assert!(!state.ids.is_empty());
+            // Every id we can apply must be one the clear can see, or it strands forever.
+            for id in state.ids {
+                assert!(is_downstate_id(*id), "{id} is applied but not cleared");
+                assert!(is_scaling_speffect_with_downstates(*id));
+            }
+            // Sorted, because `settled_on_downstate` and the census both read them as a set.
+            assert!(
+                state.ids.windows(2).all(|w| w[0] < w[1]),
+                "{state:?} is unsorted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_down_state_is_settled_only_on_exact_set_equality() {
+        let s = down_state_for(7, 5).expect("the Altus state");
+        assert!(settled_on_downstate(&[20018008], s));
+        // Order must not matter...
+        let two = down_state_for(11, 0).expect("a deep gap");
+        assert!(two.ids.len() >= 2);
+        let mut rev: Vec<i32> = two.ids.to_vec();
+        rev.reverse();
+        assert!(settled_on_downstate(&rev, two));
+        // ...but a SUPERSET is not settled. An enemy holding the state plus a stale rung must fall
+        // through and be cleared -- the `residue 306` lesson, in the down half.
+        assert!(!settled_on_downstate(&[20018008, 7060], s));
+        assert!(!settled_on_downstate(&[], s));
+        assert!(!settled_on_downstate(&[20018002], s));
     }
 
     #[test]
@@ -2084,18 +2388,16 @@ mod tests {
     }
 
     #[test]
-    fn downstates_are_not_yet_cleared() {
-        // 🛑 TRIPWIRE, NOT A PREFERENCE. The down-state pair sits OUTSIDE both clear ranges, so the
-        // sweep cannot see it: once 1b applies these, stale down-effects would strand across
-        // reconnects and seed changes, because the clear that removes everything else would walk
-        // straight past them.
+    fn downstates_are_cleared_but_their_block_is_not() {
+        // ⭐ ARMED 2026-08-06, and this test inverted in the same change exactly as its previous
+        // version instructed. The down-state rows sit OUTSIDE both clear ranges, so the sweep could
+        // not see them: a state applied before 1b would have stranded across reconnects and seed
+        // changes, because the clear that removes everything else walked straight past it.
         //
-        // It is deliberately un-armed today -- `downstate_probe` applies the pair, and a clear that
-        // knew about them would strip the probe's own subject before it could be measured.
-        //
-        // ⭐ ARMING 1b MEANS INVERTING THIS TEST IN THE SAME CHANGE. If it fails, either someone
-        // armed the down-states without teaching the clear, or someone widened a range far enough to
-        // swallow the DLC ally-tuning block -- and the second is worse than the first.
+        // 🛑 THE PROPERTY THAT MATTERS IS STILL THE ALLOWLIST. If this fails, either the ids and the
+        // clear have drifted apart, or someone widened a RANGE far enough to swallow the DLC
+        // ally-tuning block -- and the second is much worse, because it would strip legitimate
+        // effects off DLC summons with no symptom on our side at all.
         for id in DOWNSTATE_IDS {
             assert!(is_downstate_id(id));
             assert!(
@@ -2108,8 +2410,10 @@ mod tests {
         for id in [7010, 7200, 7460, 7850, 20007000, 20007400] {
             assert!(is_scaling_speffect_with_downstates(id));
         }
-        // ...and must NOT have become a range that swallows the block the pair lives in.
-        for id in [20018000, 20018001, 20018008, 20018010] {
+        // ...and must NOT have become a range that swallows the block the rows live in. 🛑 These
+        // are the NEIGHBOURS of the four we use, in the same block, deliberately: an allowlist
+        // leaves them alone and a widened range does not.
+        for id in [20018000, 20018001, 20018003, 20018007, 20018010, 20018035] {
             assert!(
                 !is_scaling_speffect_with_downstates(id),
                 "{id} is not ours to clear"
@@ -2269,22 +2573,30 @@ mod tests {
     }
 
     #[test]
-    fn a_derived_enemy_scales_up_but_never_down() {
-        // Up-only: the ladder has no rung below 1.0, so "weaker than native" is not expressible and
-        // must resolve to leaving the enemy alone rather than to the nearest thing we can say.
+    fn a_derived_enemy_scales_up_by_rung_and_down_by_state() {
+        // 🛑 THE DIRECTIONS USE DIFFERENT MACHINERY AND THAT IS THE PROPERTY. Up is a RUNG applied
+        // absolutely (`Apply`); down is a RATIO between two rungs, expressed off-label
+        // (`Down`), because there is no rung below 1.0 to apply. What must never happen is `Apply`
+        // firing downward: the rung would multiply on top of a base that already encodes the
+        // native tier, which is an up-scale wearing a down-scale's name.
         let (npc, native) = crate::native_tiers::NATIVE_TIERS[0];
         let native = native as usize;
         for tier in 0..NUM_TIERS {
-            let want = if tier > native {
-                ScaleAction::Apply
-            } else {
-                ScaleAction::NoTouch
-            };
-            assert_eq!(
-                scale_action(false, npc, tier, None),
-                want,
-                "npc {npc} at tier {tier}"
-            );
+            match scale_action(false, npc, tier, None) {
+                ScaleAction::Apply => assert!(
+                    tier > native,
+                    "Apply must never fire at or below native (tier {tier}, native {native})"
+                ),
+                ScaleAction::Down(s) => {
+                    assert!(
+                        tier < native,
+                        "Down must never fire at or above native (tier {tier}, native {native})"
+                    );
+                    assert!(s.attack < 1.0);
+                }
+                ScaleAction::NoTouch => {}
+                ScaleAction::Replace => panic!("an unrunged enemy can never be Replaced"),
+            }
         }
     }
 
