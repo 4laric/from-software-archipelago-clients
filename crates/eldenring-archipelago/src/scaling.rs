@@ -240,6 +240,25 @@ pub fn describe_region(bucket: i32) -> Option<String> {
     ))
 }
 
+/// Let the region-entry toast speak again -- called from the LuaWarp hook on a grace warp.
+///
+/// bobler asked for this on 2026-08-07: the toast is message-keyed and per session, so warping
+/// back into the region you are already standing in said nothing. A fast travel is precisely when
+/// a player is re-orienting and wants to be re-told how hard where they landed is.
+///
+/// 🛑 DELIBERATELY *NOT* FOLDED INTO `notify_transition`. That is also called on core's in-world
+/// false->true edge, which is a DEATH RESPAWN -- and re-announcing the scaling every time the
+/// player dies is noise, in the one seed shape where they die most. The warp hook is the narrower
+/// signal and the one that was actually asked for.
+///
+/// Infallible, like `notify_transition`: it runs inside the game's own warp call frame, so a
+/// poisoned lock is skipped rather than unwound across FFI.
+pub fn notify_grace_warp() {
+    if let Ok(mut ledger) = TOAST_LEDGER.lock() {
+        ledger.reset();
+    }
+}
+
 /// Parse slot_data at connect. The parse itself — including the SWEEP H4 / R6 refuse-to-arm on an
 /// empty/missing `regionSphereTargets` — lives in `er_logic::scaling::parse_scaling_config`
 /// (host-tested); this wrapper only owns the logging and the CONFIG swap.
