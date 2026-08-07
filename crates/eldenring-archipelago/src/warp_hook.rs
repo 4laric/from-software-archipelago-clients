@@ -103,6 +103,10 @@ unsafe extern "C" fn lua_warp_detour(rcx: *mut c_void, rdx: *mut c_void, warp_ar
     // construction (no panic path; see scaling::notify_transition), so it may run bare inside
     // the game's call frame.
     crate::scaling::notify_transition();
+    // TOAST RE-ARM (bobler, 2026-08-07): let the region-entry announcement fire again for
+    // wherever this warp lands -- including the region the player is already in, which the
+    // message-keyed ledger otherwise silences. Same infallible shape as the call above.
+    crate::scaling::notify_grace_warp();
     // SAME EDGE, OTHER VICTIM (2026-07-30, generalizing the 2026-07-24 pair): the GRANT path had
     // the identical warp-out blindness. `on_world_edge` only fires at ARRIVAL, so through the
     // teardown frames the captured inventory pointer stayed same-epoch while the engine freed the

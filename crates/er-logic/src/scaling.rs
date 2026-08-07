@@ -2178,6 +2178,33 @@ mod tests {
     }
 
     #[test]
+    fn a_grace_warp_re_announces_the_same_region() {
+        // MOTIVATING CASE (rule 11): bobler, 2026-08-07, asked for the scaling toast to fire again
+        // when he warps to a grace "even within region". The ledger is MESSAGE-keyed and per
+        // session, so re-entering the region you are already in was silent -- and a fast travel is
+        // exactly the moment a player is re-orienting and wants to be told again.
+        //
+        // 🛑 THE POINT IS THE *SAME* REGION. A different region already re-announced (different
+        // message), so a test that warped somewhere else would pass without the feature existing.
+        let c = cfg(&[(60000, 5000)], 0);
+        let mut ledger = RegionToastLedger::new();
+        let first = ledger
+            .on_region(&c, 60000, Some("Limgrave"))
+            .expect("announces");
+        assert_eq!(
+            ledger.on_region(&c, 60000, Some("Limgrave")),
+            None,
+            "still deduped in place"
+        );
+        ledger.reset(); // what the LuaWarp hook now calls
+        assert_eq!(
+            ledger.on_region(&c, 60000, Some("Limgrave")),
+            Some(first),
+            "a grace warp re-announces the region you warped INTO, even if you never left it"
+        );
+    }
+
+    #[test]
     fn the_announced_tier_is_the_applied_tier() {
         // The words must agree with what the sweep actually applies (tier_for_region) -- mapped,
         // unmapped, and ceiling-clamped alike. If region_scaling ever grows resolution rules of
