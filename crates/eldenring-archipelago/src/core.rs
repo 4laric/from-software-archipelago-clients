@@ -184,6 +184,12 @@ pub struct Core {
     /// re-banner regardless: already-checked members are filtered by the server checked-set, so
     /// a re-fired group grants 0 and produces no candidate.
     sweep_bannered: HashSet<u32>,
+    /// Last-polled state of every sweep TRIGGER flag, for the tracker's Boss sweeps section.
+    ///
+    /// 🛑 CACHED ON THE TICK. `get_event_flag` reads game memory and the tracker renders on the
+    /// imgui present thread, which must not. The poll already computes exactly this for
+    /// `sweep_watch`, so the row costs no extra read.
+    sweep_flag_state: HashMap<u32, bool>,
     /// Sweep-trigger flag watcher (diagnostic, 2026-08-07). Reports the group census once and then
     /// only CHANGES, so a trigger flag flipping is timestamped in the log instead of being
     /// inferred from the sweep that follows it. See `er_logic::sweep_watch` for the motivating
@@ -509,6 +515,7 @@ impl shared::Core for Core {
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
             sweep_bannered: HashSet::new(),
+            sweep_flag_state: HashMap::new(),
             sweep_watch: er_logic::sweep_watch::SweepWatch::new(),
             sweep_flag_pending: Vec::new(),
             toasts: er_logic::toast::Deck::new(4, 6000),
@@ -2434,6 +2441,9 @@ impl shared::Core for Core {
             // Silent unless something changed -- the poll runs all session and a per-poll dump
             // would bury the log.
             if !sweep_obs.is_empty() {
+                // Same observation feeds the tracker's Boss sweeps section (read on the tick, not
+                // in the render -- see `sweep_flag_state`).
+                self.sweep_flag_state = sweep_obs.iter().map(|&(f, _, set)| (f, set)).collect();
                 for line in self.sweep_watch.observe(&sweep_obs) {
                     log::info!("{line}");
                 }
@@ -3732,6 +3742,77 @@ impl Core {
             .scaling_here_bucket
             .and_then(crate::scaling::describe_region);
 
+        // ---- Boss sweeps (Alaric, 2026-08-07: "display how many sweep checks are attached to a
+        // boss"). A sweep is the single largest payout in the game -- 49 and 50 checks in one of
+        // bobler's sessions -- and it was invisible until it fired. Assembled here, outside the
+        // closure, from tables that are all pure memory: `sweep_flag_state` was read on the tick.
+        let checked_set: HashSet<u64> = checked.iter().copied().collect();
+        let mut sweep_rows: Vec<(String, String)> = Vec::new();
+        let mut sweep_header = String::new();
+        if let Some(fp) = self.flag_poll.as_ref() {
+            // Fully OWNED first, borrowed second. An earlier draft built the tuples out of
+            // references into another Vec and needed `**flag` to read a u32 -- unreadable, and
+            // unverifiable here since this crate does not compile off Windows. Owning costs one
+            // allocation per sweep group, of which a seed has ~17.
+            struct Row {
+                boss: Option<String>,
+                region: Option<String>,
+                flag: u32,
+                members: usize,
+                checked: usize,
+                fired: bool,
+                gate: Option<String>,
+            }
+            let mut rows: Vec<Row> = fp
+                .sweep_flags
+                .iter()
+                .map(|(&flag, locs)| Row {
+                    boss: self.boss_defs.iter().find(|d| d.flag == flag).map(|d| {
+                        d.name
+                            .strip_prefix("Felled: ")
+                            .unwrap_or(d.name.as_str())
+                            .to_string()
+                    }),
+                    region: locs
+                        .first()
+                        .and_then(|l| self.region_table.get(&(*l as u64)))
+                        .cloned(),
+                    flag,
+                    members: locs.len(),
+                    checked: locs
+                        .iter()
+                        .filter(|l| checked_set.contains(&(**l as u64)))
+                        .count(),
+                    fired: self.sweep_flag_state.get(&flag).copied().unwrap_or(false),
+                    gate: self.sweep_lock_gates.get(&flag).cloned(),
+                })
+                .collect();
+            // Stable order: region, then flag. A section that reshuffles every frame is unreadable.
+            rows.sort_by(|a, b| a.region.cmp(&b.region).then(a.flag.cmp(&b.flag)));
+            let views: Vec<er_logic::sweep_view::SweepGroupView<'_>> = rows
+                .iter()
+                .map(|r| er_logic::sweep_view::SweepGroupView {
+                    flag: r.flag,
+                    region: r.region.as_deref(),
+                    boss: r.boss.as_deref(),
+                    members: r.members,
+                    checked: r.checked,
+                    fired: r.fired,
+                    gated_on: r.gate.as_deref(),
+                })
+                .collect();
+            sweep_header = er_logic::sweep_view::section_header(&views);
+            sweep_rows = views
+                .iter()
+                .map(|v| {
+                    (
+                        er_logic::sweep_view::group_label(v),
+                        er_logic::sweep_view::group_state(v),
+                    )
+                })
+                .collect();
+        }
+
         // Region-lock accessibility snapshot (bound to a local BEFORE the model borrows &self
         // fields -- keeps the borrows sequential).
         let open_coarse = self.open_coarse_regions();
@@ -3899,6 +3980,23 @@ impl Core {
                         ui.tooltip_text(
                             "Enemy scaling where you are standing right now.\nThe tier is this seed's own band, not the full ladder -- tier 0 is your easiest region, not 'unscaled'.",
                         );
+                    }
+                    ui.separator();
+                }
+                // ---- Boss sweeps -----------------------------------------------------------
+                // Collapsed by default: it is reference, not a control. The HEADER carries the
+                // number worth glancing at ("N still behind a boss") so the section answers the
+                // question without being opened.
+                if !sweep_rows.is_empty()
+                    && ui.collapsing_header(
+                        format!("{sweep_header}###trk-sweeps"),
+                        imgui::TreeNodeFlags::empty(),
+                    )
+                {
+                    for (label, state) in &sweep_rows {
+                        ui.text(format!("  {label}"));
+                        ui.same_line();
+                        ui.text_disabled(format!("-- {state}"));
                     }
                     ui.separator();
                 }
