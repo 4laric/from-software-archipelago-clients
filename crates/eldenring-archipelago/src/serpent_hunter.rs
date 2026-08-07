@@ -22,6 +22,28 @@
 //! arena" is not a behaviour worth preserving. It is deliberately NOT an option: an option is a
 //! slot-data key, and a slot-data key is a contract change and a version band.
 //!
+//! 🛑🛑 THE PARAM WRITE ALONE IS NOT ENOUGH -- MEASURED, 2026-08-07 19:56:29. The resident slot is
+//! read when the weapon is EQUIPPED and never re-evaluated, so a row edited under an
+//! already-equipped weapon is INERT until it is re-equipped. The probe caught it the first session
+//! it shipped:
+//!
+//! ```text
+//! 19:23:15  auto_equip: slot 1 <- 0x0103db70 (param 17030000, ...)      <- spear goes in hand
+//! 19:56:29  serpent-hunter PROBE row 17030000: resident=[-1,-1,-1] behavior=[-1,-1,-1]
+//! 19:56:29  serpent-hunter: wave SpEffect 1908 -> resident slot 0 (read-back OK, now [1908,-1,-1])
+//! 19:56:29  serpent-hunter PROBE fight: ... wave_speffect_1908_active=false
+//! ```
+//!
+//! The write landed and read back, and 1908 was still not on the player -- the spear had been in
+//! his hand for 33 minutes. bobler then swapped weapons, walked back in, and the waves worked.
+//!
+//! So [`ensure_applied`] puts 1908 on the player DIRECTLY, the way `no_equip_load` /
+//! `no_fall_damage` / `scadu_blessing` / `scaling` already do, and re-applies it whenever it goes
+//! missing. That is not belt-and-braces over the param write, it is the load-bearing half: a map
+//! load restores the vanilla row AND the player keeps holding the spear across it, so the rewrite
+//! cannot rebind and the waves would die on every load without this. The param write stays because
+//! it is still correct for any FUTURE equip, and it costs one i32.
+//!
 //! THE PROBE, which is the point of shipping the two together. If the write does not fix it, the
 //! log must say what to do next rather than leaving us to guess again. Two halves:
 //!   * STATIC -- the row's six SpEffect fields as vanilla shipped them, logged once before we
@@ -34,7 +56,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eldenring::cs::{EquipParamWeapon, SoloParamRepository, WorldChrMan};
+use eldenring::cs::{ChrInsExt, EquipParamWeapon, SoloParamRepository, WorldChrMan};
 use er_logic::serpent_hunter::{ResidentWrite, SERPENT_HUNTER_ROW, WAVE_SPEFFECT, resident_write};
 use fromsoftware_shared::FromStatic;
 
@@ -42,6 +64,10 @@ static APPLIED: AtomicBool = AtomicBool::new(false);
 /// Has the STATIC half of the probe been logged this session? Separate from `APPLIED` so a map
 /// load re-arms the write without re-spamming a line whose content cannot change.
 static PROBED_ROW: AtomicBool = AtomicBool::new(false);
+/// Has the "applied directly" line been said this session? The APPLY itself repeats by design
+/// (it heals a cleared list every tick); the LINE must not, or a load spams the log.
+static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
 /// Have we dumped the player's SpEffect list for the CURRENT Rykard fight? Re-armed when the bar
 /// drops, so a re-fight probes again instead of the first fight of a session being the only one.
 static PROBED_FIGHT: AtomicBool = AtomicBool::new(false);
@@ -141,6 +167,64 @@ pub fn tick() {
     }
     // Row absent: the table is up but 17030000 is not in it. Retry next tick rather than latch --
     // that is the same "not ready yet" shape the rest of this crate treats as transient.
+}
+
+/// Keep SpEffect 1908 on the player while they own the Serpent-Hunter.
+///
+/// WHY DIRECTLY ON THE PLAYER, not left to the weapon row: the resident slot binds at EQUIP time
+/// (module doc, measured). This is the only path that survives "already equipped" and "still
+/// equipped across a map load", which between them cover almost every real session.
+///
+/// GATED ON POSSESSION, not applied unconditionally. What SpEffect 1908 does to a character NOT
+/// holding the spear is UNMEASURED, and an always-on effect whose blast radius nobody has read is
+/// how you ship a second bug while fixing the first. Owning the spear is a cheap, honest proxy for
+/// "this player is here for the waves"; `holds_weapon_base` is the same bag read `boss_grants`
+/// already makes each tick.
+///
+/// Self-correcting rather than latched: it re-applies the moment the id leaves the list, so a load,
+/// a death or anything else that clears the player's effects heals on the next tick.
+pub fn ensure_applied() {
+    if !crate::flags::in_world() {
+        return;
+    }
+    // `None` = the bag was unreadable this tick; that is "don't know", never "no".
+    //
+    // 🛑 `held_weapon_row`, not the `holds_weapon_base` this commit was originally written against:
+    // #102 DELETED that helper (it was the second, more tolerant bag read whose disagreement with
+    // the equip queue WAS the bug) and replaced it with one that returns the id. This commit
+    // predates that merge, and CI caught the stale call. `.is_some()` recovers the old boolean off
+    // the one remaining read, which is exactly the shape #102 left behind for callers like this.
+    if crate::upgrades::held_weapon_row(SERPENT_HUNTER_ROW).map(|r| r.is_some()) != Some(true) {
+        return;
+    }
+    // SAFETY: FD4 singleton, mutated only on the single-threaded FrameBegin tick.
+    let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
+        return;
+    };
+    let Some(player) = wcm.main_player.as_mut() else {
+        return;
+    };
+    // THE canonical predicate -- touching a dying character's SpEffect lists is where this crate's
+    // CTD was first observed (`no_equip_load`'s module doc).
+    if er_logic::death_guard::lists_unsafe_to_touch(player.chr_ins.modules.data.hp) {
+        return;
+    }
+    let chr = &mut player.chr_ins;
+    if chr
+        .special_effect
+        .entries()
+        .any(|e| e.param_id == WAVE_SPEFFECT)
+    {
+        return;
+    }
+    chr.apply_speffect(WAVE_SPEFFECT, false);
+    if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+        log::info!(
+            "serpent-hunter: applied wave SpEffect {WAVE_SPEFFECT} to the player directly -- the \
+             resident slot binds at EQUIP time, so the param write alone does nothing while the \
+             spear is already in hand"
+        );
+    }
 }
 
 /// LIVE half of the probe: dump the player's active SpEffect list while Rykard's healthbar is up.
