@@ -26,6 +26,7 @@ pub mod config_reload_replay;
 pub mod death_guard;
 pub mod deathlink;
 pub mod deathlink_gate_replay;
+pub mod esd_probe;
 pub mod fast_travel;
 pub mod fast_travel_replay;
 pub mod flagpoll_baseline_replay;

@@ -608,6 +608,12 @@ impl shared::Core for Core {
         // instead of erroring, so no install latch on Core is needed.
         crate::warp_hook::install();
 
+        // ESD talk-event probe (esd_probe.rs; shop auto-hints phase 1, er-archipelago#455).
+        // LOG-ONLY and gated on `ER_ESD_PROBE` -- with the var unset this is one `var_os` read
+        // and the hot dispatch is never patched at all. Same self-guarded one-shot shape as the
+        // LuaWarp hook above: an unsupported build degrades to one refusal line.
+        crate::esd_probe::install();
+
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them. Gated on the minibake
         // refuse guard — a wrong-seed save must not report checks (see reconcile_io::is_refused).
         let checks = crate::detour::take_pending_checks();
