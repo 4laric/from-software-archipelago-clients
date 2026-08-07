@@ -2866,17 +2866,31 @@ impl shared::Core for Core {
         //     Keyed on the CHARACTER, never the arena -- an enemy randomiser moves bosses between
         //     rooms, so a place key would arm the wrong fight (Alaric, 2026-08-06).
         //
-        //     🛑 `present` is read OUTSIDE the `can_grant` gate on purpose. The weapon hold below
-        //     is driven from it, and if a lost `can_grant` simply skipped this block the hold would
-        //     STRAND at true and block every weapon equip for the rest of the session. `None`
-        //     resolves to "not paused", so losing the ability to act releases the hold instead.
+        //     `present` is a LOAD test -- "is c4710 instantiated anywhere" -- so it goes true the
+        //     moment the area streams in. That is right for the GRANT (hand the player the tool
+        //     before the fight, wherever the randomiser put him) and wrong for the HOLD.
         let boss_present = if can_grant {
             crate::scaling::any_character_present(er_logic::boss_grants::RYKARD_CHR_ID)
         } else {
             None
         };
+        //     🛑 THE HOLD KEYS ON THE HEALTHBAR, NOT ON PRESENCE (#413, bobler 2026-08-07). Held
+        //     from area load, it covered a fight that had not started -- minutes of a foreign
+        //     weapon being refused for no reason, and the pause could arm on the very tick the
+        //     spear was enqueued (the empty queue it waits for is the PRE-grant empty, since the
+        //     enqueue below runs after this line). The healthbar is the game's own statement that
+        //     the fight is happening NOW, so the window closes to the fight itself and the spear
+        //     has long since drained by the time it opens.
+        //     Read UNCONDITIONALLY, outside `can_grant`: if a lost `can_grant` skipped it the hold
+        //     would STRAND at true and block every weapon equip for the rest of the session.
+        //     `None` (GameDataMan down) resolves to "not paused", so losing the ability to look
+        //     releases the hold rather than latching it.
+        let rykard_fight_on = er_logic::boss_grants::healthbar_shows(
+            er_logic::boss_grants::RYKARD_CHR_ID,
+            crate::flags::boss_healthbar_npc_param_id(),
+        );
         crate::auto_equip::set_weapons_paused(er_logic::boss_grants::should_pause_weapon_equips(
-            boss_present,
+            rykard_fight_on,
             crate::auto_equip::queue_is_empty(),
             crate::auto_equip::weapons_paused(),
         ));

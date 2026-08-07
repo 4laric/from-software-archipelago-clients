@@ -119,6 +119,26 @@ pub fn boss_grant_action(present: Option<bool>, holds: Option<bool>) -> Option<i
     }
 }
 
+/// Is the boss healthbar currently showing `chr_id`?
+///
+/// ⭐⭐⭐ THE FIGHT, NOT THE NEIGHBOURHOOD. [`crate::boss_grants`]'s other input,
+/// `any_character_present`, is a LOAD test -- it answers "is c4710 instantiated anywhere", which is
+/// true from the moment the area streams in. bobler got the Serpent-Hunter walking into a grace
+/// with the boss nowhere in sight (2026-08-07), and the weapon HOLD armed just as early, for a
+/// fight that had not started. `GameDataMan.boss_health_bar_npc_param_id` is the game's own
+/// statement that the fight is happening right now, and it is already in the id space
+/// [`is_character`] speaks, so no new key and no distance maths.
+///
+/// `healthbar_npc_param_id`: `None` = `GameDataMan` was unreadable this tick (main menu, mid-load).
+/// 🛑 `Some(0)` is "no boss bar is up" and MUST NOT reach [`is_character`], which would divide it
+/// down to chr 0 and match any `npc_param_id` below 10000.
+///
+/// Follows property 3 of this module: "don't know" is never "no". `None` propagates.
+pub fn healthbar_shows(chr_id: i32, healthbar_npc_param_id: Option<i32>) -> Option<bool> {
+    let id = healthbar_npc_param_id?;
+    Some(id != 0 && is_character(id, chr_id))
+}
+
 /// Should WEAPON auto-equips be held while this fight is on?
 ///
 /// ⭐⭐⭐ THE SEQUENCING IS THE WHOLE FUNCTION. Pausing on the same tick the spear is enqueued
@@ -159,6 +179,62 @@ pub fn tick(hook: &mut dyn GameHook, present: Option<bool>, holds: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_healthbar_names_the_fight_not_the_neighbourhood() {
+        // MOTIVATING CASE (rule 11): the hold used to key on `any_character_present`, which is a
+        // LOAD test -- true from the moment the area streams in. Under an enemy randomiser that
+        // also meant walking into a grace announced where Rykard had been swapped to.
+        for &row in RYKARD_NPC_PARAM_ROWS {
+            assert_eq!(
+                healthbar_shows(RYKARD_CHR_ID, Some(row)),
+                Some(true),
+                "row {row}"
+            );
+        }
+        // Torrent's only row -- a real npc_param_id that is not this fight.
+        assert_eq!(healthbar_shows(RYKARD_CHR_ID, Some(80000000)), Some(false));
+    }
+
+    #[test]
+    fn no_healthbar_is_a_no_not_a_match_on_chr_zero() {
+        // 🛑 THE ZERO TRAP. `is_character` is `npc_param_id / 10_000 == chr_id`, so a raw 0 would
+        // divide down to chr 0 -- and any caller asking about a low chr id would read "the fight is
+        // on" from an EMPTY healthbar. The guard is the `id != 0`, and this is what pins it.
+        assert_eq!(healthbar_shows(RYKARD_CHR_ID, Some(0)), Some(false));
+        assert_eq!(
+            healthbar_shows(0, Some(0)),
+            Some(false),
+            "chr 0 must not match an empty bar"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_game_data_man_is_dont_know_not_no() {
+        // Property 3. `None` must propagate rather than collapsing to `false`, so the caller can
+        // distinguish "no fight" from "could not look" -- they lead to the same pause decision
+        // today, but a silent collapse is how that stops being true by accident.
+        assert_eq!(healthbar_shows(RYKARD_CHR_ID, None), None);
+    }
+
+    #[test]
+    fn the_hold_now_follows_the_healthbar_end_to_end() {
+        // The composition the caller actually performs, asserted as one unit -- the two halves
+        // were each correct before and the DEFECT was in how they were wired together.
+        let hb = |id| healthbar_shows(RYKARD_CHR_ID, id);
+        // area loaded, no bar up: NOT held -- this is the case that used to hold
+        assert!(!should_pause_weapon_equips(hb(Some(0)), true, false));
+        // bar up, queue drained: held
+        assert!(should_pause_weapon_equips(hb(Some(47100000)), true, false));
+        // bar up but the queue still has the spear in it: NOT held yet
+        assert!(!should_pause_weapon_equips(
+            hb(Some(47100000)),
+            false,
+            false
+        ));
+        // GameDataMan down: released, never stranded
+        assert!(!should_pause_weapon_equips(hb(None), true, true));
+    }
 
     #[test]
     fn every_known_rykard_row_matches_and_neighbours_do_not() {

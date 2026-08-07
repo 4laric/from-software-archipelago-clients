@@ -3,7 +3,7 @@
 //! resolved against the `eldenring` crate (0.14): flags live on `CSEventFlagMan.virtual_memory_flag`;
 //! the current region is `WorldChrMan.main_player.play_region_id`.
 
-use eldenring::cs::{CSEventFlagMan, WorldChrMan};
+use eldenring::cs::{CSEventFlagMan, GameDataMan, WorldChrMan};
 use fromsoftware_shared::FromStatic;
 
 /// Read an event flag (true = set). Returns false before `CSEventFlagMan` initializes.
@@ -12,6 +12,16 @@ pub fn get_event_flag(flag_id: u32) -> bool {
         Ok(m) => m.virtual_memory_flag.get_flag(flag_id),
         Err(_) => false,
     }
+}
+
+/// The `npc_param_id` of whoever the BOSS HEALTHBAR is currently showing, or `None` if
+/// `GameDataMan` is down (main menu, mid-load).
+///
+/// `Some(0)` is the game saying no boss bar is up -- a real answer, not a failure, and the caller
+/// must keep the two apart (see `er_logic::boss_grants::healthbar_shows`).
+pub fn boss_healthbar_npc_param_id() -> Option<i32> {
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    Some(gdm.boss_health_bar_npc_param_id as i32)
 }
 
 /// Set an event flag. Idempotent + save-persisted, so replaying on reconnect is harmless.
