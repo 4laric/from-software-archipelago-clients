@@ -11,6 +11,7 @@ mod check_lots;
 mod config_watch;
 mod contract_gen;
 mod core;
+mod debug_flags;
 mod deathlink;
 mod detour;
 mod downstate_probe;

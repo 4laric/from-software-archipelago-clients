@@ -583,6 +583,10 @@ impl shared::Core for Core {
         // instead of erroring, so no install latch on Core is needed.
         crate::warp_hook::install();
 
+        // 🛑 THROWAWAY (SPEC-ashen-capital-lock probe, 2026-08-06): apconfig-driven event-flag
+        // set/read. Inert unless debugSetFlags / debugReadFlags are present. DELETE BEFORE MERGE.
+        crate::debug_flags::tick();
+
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them. Gated on the minibake
         // refuse guard — a wrong-seed save must not report checks (see reconcile_io::is_refused).
         let checks = crate::detour::take_pending_checks();
