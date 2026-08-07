@@ -139,6 +139,97 @@ pub fn healthbar_shows(chr_id: i32, healthbar_npc_param_id: Option<i32>) -> Opti
     Some(id != 0 && is_character(id, chr_id))
 }
 
+/// Render an `Option<bool>` read for a human. `None` is a FAILED READ, never a "no".
+fn say(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unreadable this tick",
+    }
+}
+
+/// Pack the two inputs the diagnostic keys on into one comparable value.
+///
+/// The caller lives in the Windows-only crate, which no test here can reach, so it gets exactly one
+/// atomic and zero branching: swap this key, compare, log on a change. Equality is the only
+/// operation -- the packing is not an id and nothing should decode it.
+pub fn diag_key(healthbar_npc_param_id: Option<i32>, present: Option<bool>) -> i64 {
+    let bar = healthbar_npc_param_id.unwrap_or(i32::MIN) as i64;
+    let pres = match present {
+        None => 2,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    (bar << 2) | pres
+}
+
+/// One line saying why the spear did -- or did not -- change hands.
+///
+/// ⭐⭐⭐ MOTIVATING CASE (rule 11), boblerrr 2026-08-07: *"no spear whatsoever"*. A NON-grant is
+/// completely silent. [`boss_grant_action`] returns `None` for three unrelated situations and the
+/// log cannot tell them apart:
+///
+/// 1. **Rykard was never loaded.** Under an enemy randomiser the boss standing in Rykard's arena is
+///    usually not `c4710` at all, so `present` is honestly `false` and the design is working. The
+///    player, looking at a boss healthbar that says Rykard, reports a bug.
+/// 2. **The player already holds one.** The equip rides on the grant, so a RE-fight gets nothing.
+/// 3. **A read failed** this tick and the next tick will retry.
+///
+/// Triage of the 2026-08-07 log stalled on exactly this: 13k lines, and the only admissible
+/// evidence about Rykard was two lines from the grants that DID fire. This makes the negative
+/// case speak.
+///
+/// 🛑 THE VERDICT IS TAKEN FROM [`boss_grant_action`], NEVER RE-DERIVED. A diagnostic that
+/// reimplements the decision it reports on can disagree with it, and then the log is worse than
+/// nothing. `the_verdict_can_never_disagree_with_the_decision` pins that across the whole matrix.
+///
+/// Returns `None` when there is nothing to say -- no boss bar up and no `c4710` loaded -- so the
+/// caller can log unconditionally.
+pub fn grant_diagnosis(
+    healthbar_npc_param_id: Option<i32>,
+    present: Option<bool>,
+    holds: Option<bool>,
+) -> Option<String> {
+    // 🛑 `Some(0)` is "no bar is up", and it must never reach `is_character` -- see
+    // `healthbar_shows`. Filtering it here keeps chr 0 out of the rendered line as well.
+    let bar = healthbar_npc_param_id.filter(|&id| id != 0);
+    if bar.is_none() && present != Some(true) {
+        return None;
+    }
+    let granting = boss_grant_action(present, holds).is_some();
+    let bar_txt = match bar {
+        Some(id) if is_rykard(id) => {
+            format!("healthbar npc_param {id} = chr {}, IS Rykard", id / 10_000)
+        }
+        Some(id) => format!(
+            "healthbar npc_param {id} = chr {}, NOT Rykard (c{RYKARD_CHR_ID})",
+            id / 10_000
+        ),
+        None => "no boss healthbar up".to_string(),
+    };
+    let mut line = format!(
+        "boss-grant: {bar_txt} | c{RYKARD_CHR_ID} loaded = {} | already holds the spear = {} -> {}",
+        say(present),
+        say(holds),
+        if granting { "GRANTING" } else { "no grant" }
+    );
+    if !granting {
+        if holds == Some(true) {
+            line.push_str(
+                " <- you already have a copy, so nothing is granted AND nothing is auto-equipped: \
+                 the equip rides on the grant, so a second fight gets no spear in hand.",
+            );
+        } else if bar.is_some_and(|id| !is_rykard(id)) {
+            line.push_str(
+                " <- if you are fighting Rykard right now then an enemy randomiser has replaced the \
+                 character. This grant is keyed on c4710 and never on the arena, so the spear \
+                 followed Rykard to wherever he actually is.",
+            );
+        }
+    }
+    Some(line)
+}
+
 /// Should WEAPON auto-equips be held while this fight is on?
 ///
 /// ⭐⭐⭐ THE SEQUENCING IS THE WHOLE FUNCTION. Pausing on the same tick the spear is enqueued
@@ -179,6 +270,106 @@ pub fn tick(hook: &mut dyn GameHook, present: Option<bool>, holds: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_swapped_in_boss_names_itself() {
+        // MOTIVATING CASE (rule 11), boblerrr 2026-08-07: "no spear whatsoever". He is at a boss he
+        // believes is Rykard; the character actually loaded is somebody else's. Before this the log
+        // said NOTHING at all, and triage could not separate it from a real miss.
+        let d = grant_diagnosis(Some(53600000), Some(false), Some(false)).unwrap();
+        assert!(d.contains("chr 5360"), "{d}");
+        assert!(d.contains("NOT Rykard (c4710)"), "{d}");
+        assert!(d.contains("no grant"), "{d}");
+        assert!(d.contains("enemy randomiser"), "{d}");
+        // 🛑 It must not accuse the player's own build of anything, and must not claim the bag.
+        assert!(!d.contains("already have a copy"), "{d}");
+    }
+
+    #[test]
+    fn a_real_rykard_bar_that_grants_says_so() {
+        for &row in RYKARD_NPC_PARAM_ROWS {
+            let d = grant_diagnosis(Some(row), Some(true), Some(false)).unwrap();
+            assert!(d.contains("IS Rykard"), "row {row}: {d}");
+            assert!(d.contains("GRANTING"), "row {row}: {d}");
+            assert!(!d.contains("enemy randomiser"), "row {row}: {d}");
+        }
+    }
+
+    #[test]
+    fn the_refight_case_is_the_one_that_looks_like_a_bug() {
+        // Rykard is right there, the player has the spear in the bag, and NOTHING happens -- no
+        // grant and, because the equip rides on the grant, no equip either. Indistinguishable from
+        // a broken grant unless the line says so.
+        let d = grant_diagnosis(Some(47101000), Some(true), Some(true)).unwrap();
+        assert!(d.contains("IS Rykard"), "{d}");
+        assert!(d.contains("no grant"), "{d}");
+        assert!(d.contains("already have a copy"), "{d}");
+    }
+
+    #[test]
+    fn silent_when_there_is_nothing_to_say() {
+        // No bar, nobody loaded: the overwhelming majority of ticks. The caller logs
+        // unconditionally, so the quiet has to live in here.
+        assert_eq!(grant_diagnosis(Some(0), Some(false), Some(false)), None);
+        assert_eq!(grant_diagnosis(None, None, None), None);
+        assert_eq!(grant_diagnosis(Some(0), None, Some(true)), None);
+        // ...but a field-spawned Rykard has NO healthbar at all, and that case must still report.
+        assert!(grant_diagnosis(Some(0), Some(true), Some(false)).is_some());
+        assert!(grant_diagnosis(None, Some(true), Some(false)).is_some());
+    }
+
+    #[test]
+    fn an_empty_bar_is_never_rendered_as_chr_zero() {
+        // 🛑 THE ZERO TRAP AGAIN, on the rendering side. `Some(0) / 10_000` is chr 0, and printing
+        // "chr 0, NOT Rykard" would send the next reader hunting a character that does not exist.
+        let d = grant_diagnosis(Some(0), Some(true), Some(false)).unwrap();
+        assert!(d.contains("no boss healthbar up"), "{d}");
+        assert!(!d.contains("chr 0"), "{d}");
+    }
+
+    #[test]
+    fn the_verdict_can_never_disagree_with_the_decision() {
+        // 🛑 A diagnostic that re-derives the decision it reports can drift out of step with it,
+        // and a log that lies is worse than a log that is silent. Sweep the whole input matrix and
+        // assert the rendered verdict is a pure function of `boss_grant_action`.
+        let bars = [None, Some(0), Some(47101000), Some(53600000)];
+        let tri = [None, Some(false), Some(true)];
+        for bar in bars {
+            for present in tri {
+                for holds in tri {
+                    let Some(d) = grant_diagnosis(bar, present, holds) else {
+                        continue;
+                    };
+                    let decided = boss_grant_action(present, holds).is_some();
+                    assert_eq!(
+                        d.contains("GRANTING"),
+                        decided,
+                        "bar {bar:?} present {present:?} holds {holds:?}: {d}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diag_key_moves_when_either_input_moves() {
+        // The caller keeps ONE atomic and logs on a change, so a key that collapsed two distinct
+        // states would silently swallow the transition between them.
+        let base = diag_key(Some(47101000), Some(true));
+        assert_ne!(base, diag_key(Some(47101000), Some(false)));
+        assert_ne!(base, diag_key(Some(47101000), None));
+        assert_ne!(base, diag_key(Some(53600000), Some(true)));
+        assert_ne!(base, diag_key(None, Some(true)));
+        assert_ne!(diag_key(Some(0), None), diag_key(None, None));
+        // Stable for an unchanged pair -- otherwise it would log every tick.
+        assert_eq!(base, diag_key(Some(47101000), Some(true)));
+        // Nothing may collide with the caller's "nothing reported yet" sentinel.
+        for bar in [None, Some(0), Some(47101000), Some(i32::MIN)] {
+            for present in [None, Some(false), Some(true)] {
+                assert_ne!(diag_key(bar, present), i64::MIN, "{bar:?} {present:?}");
+            }
+        }
+    }
 
     #[test]
     fn the_healthbar_names_the_fight_not_the_neighbourhood() {

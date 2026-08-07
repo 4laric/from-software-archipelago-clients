@@ -2895,10 +2895,9 @@ impl shared::Core for Core {
         //     would STRAND at true and block every weapon equip for the rest of the session.
         //     `None` (GameDataMan down) resolves to "not paused", so losing the ability to look
         //     releases the hold rather than latching it.
-        let rykard_fight_on = er_logic::boss_grants::healthbar_shows(
-            er_logic::boss_grants::RYKARD_CHR_ID,
-            crate::flags::boss_healthbar_npc_param_id(),
-        );
+        let healthbar = crate::flags::boss_healthbar_npc_param_id();
+        let rykard_fight_on =
+            er_logic::boss_grants::healthbar_shows(er_logic::boss_grants::RYKARD_CHR_ID, healthbar);
         crate::auto_equip::set_weapons_paused(er_logic::boss_grants::should_pause_weapon_equips(
             rykard_fight_on,
             crate::auto_equip::queue_is_empty(),
@@ -2910,6 +2909,21 @@ impl shared::Core for Core {
             // found.
             let holds =
                 crate::upgrades::holds_weapon_base(er_logic::boss_grants::SERPENT_HUNTER_BASE);
+            // ⭐⭐⭐ SAY WHY NOTHING HAPPENED (#413, boblerrr 2026-08-07 "no spear whatsoever").
+            // A non-grant is silent: `boss_grant_action` returns None for "Rykard was never
+            // loaded", "you already hold one" and "a read failed" alike, so a player log cannot
+            // tell the design from a defect. Keyed on the (healthbar, presence) pair so it lands
+            // at most once per boss fight entered rather than every tick, the same shape as
+            // kick-watch's KICK_WATCH_LAST_PR.
+            let diag_key = er_logic::boss_grants::diag_key(healthbar, boss_present);
+            if BOSS_GRANT_DIAG_LAST.swap(diag_key, std::sync::atomic::Ordering::Relaxed) != diag_key
+            {
+                if let Some(d) =
+                    er_logic::boss_grants::grant_diagnosis(healthbar, boss_present, holds)
+                {
+                    log::info!("{d}");
+                }
+            }
             let mut game = EldenRingHook;
             if let Some(m) = er_logic::boss_grants::tick(&mut game, boss_present, holds) {
                 // EQUIP IT. `enqueue` self-gates on the auto_equip option AND on the category, so
@@ -4238,6 +4252,12 @@ fn warn_unique_grant_fail_once(idx: usize, full_id: i32) {
 /// item with no trace, every session, on every replay. (Doc re-attached to the static it actually
 /// describes; it had drifted one static too high, onto the now-deleted START_ITEM_FAIL_LOGGED.)
 static UNMAPPED_LOGGED: std::sync::Mutex<Option<HashSet<i64>>> = std::sync::Mutex::new(None);
+
+/// #413 boss-grant diagnostic: the last (boss healthbar, `c4710` presence) pair already reported,
+/// so the line lands on a CHANGE instead of every tick. `i64::MIN` = nothing reported yet, and
+/// `diag_key` is tested never to produce it.
+static BOSS_GRANT_DIAG_LAST: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
 
 fn warn_unmapped_once(name: &str, ap_id: i64) {
     let mut guard = UNMAPPED_LOGGED.lock().unwrap();
