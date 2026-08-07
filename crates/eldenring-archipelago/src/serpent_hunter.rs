@@ -188,7 +188,13 @@ pub fn ensure_applied() {
         return;
     }
     // `None` = the bag was unreadable this tick; that is "don't know", never "no".
-    if crate::upgrades::holds_weapon_base(SERPENT_HUNTER_ROW) != Some(true) {
+    //
+    // 🛑 `held_weapon_row`, not the `holds_weapon_base` this commit was originally written against:
+    // #102 DELETED that helper (it was the second, more tolerant bag read whose disagreement with
+    // the equip queue WAS the bug) and replaced it with one that returns the id. This commit
+    // predates that merge, and CI caught the stale call. `.is_some()` recovers the old boolean off
+    // the one remaining read, which is exactly the shape #102 left behind for callers like this.
+    if crate::upgrades::held_weapon_row(SERPENT_HUNTER_ROW).map(|r| r.is_some()) != Some(true) {
         return;
     }
     // SAFETY: FD4 singleton, mutated only on the single-threaded FrameBegin tick.
