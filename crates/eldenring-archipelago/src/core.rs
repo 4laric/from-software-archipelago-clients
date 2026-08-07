@@ -2968,10 +2968,86 @@ impl shared::Core for Core {
             // it is written as a match rather than an unwrap so that a future caller loosening
             // `equip_for_fight` degrades to "do nothing this tick" instead of panicking.
             if equip_now && let Some(Some(row)) = held_row {
+                // SNAPSHOT BOTH HANDS BEFORE WE DISPLACE ONE (#413 swap-back). The drain picks the
+                // slot, not us -- `slot_for_weapon` decides right/left from `wep_type` inside
+                // `auto_equip::tick()` -- so at enqueue time we do not yet know which hand the
+                // spear will take. Recording both and asking which one holds the spear when the
+                // bar drops needs no change to the drain at all, which is the whole reason it is
+                // done this way round.
+                if let Some([left, right]) = crate::auto_equip::worn_weapon_param_ids() {
+                    PREV_WEAPON_LEFT.store(left, std::sync::atomic::Ordering::Relaxed);
+                    PREV_WEAPON_RIGHT.store(right, std::sync::atomic::Ordering::Relaxed);
+                    PREV_WEAPONS_SET.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 crate::auto_equip::enqueue_held(row);
                 log::info!(
                     "boss-grant: Rykard's healthbar is up and the spear was already in the bag -- putting it in your hand (queued {row:#010x})"
                 );
+            }
+            // GIVE IT BACK WHEN THE FIGHT IS OVER. The other half of Alaric's 2026-08-07 ask
+            // ("resume auto_equip queue") needs no code: #98's hold pushes weapons onto
+            // `still_pending` instead of dropping them, and `should_pause_weapon_equips` goes
+            // false the moment the bar is down, so the queue resumes itself.
+            let worn = crate::auto_equip::worn_weapon_param_ids();
+            // Which hand has the spear, and therefore which snapshot is the one to undo. `None`
+            // is an UNREADABLE loadout and stays `None` all the way into the seam -- it must not
+            // collapse to "the player swapped", which would throw the snapshot away.
+            let spear_slot = worn.map(|w| {
+                w.iter().position(|&id| {
+                    er_logic::boss_grants::is_level_of(
+                        id,
+                        er_logic::boss_grants::SERPENT_HUNTER_BASE,
+                    )
+                })
+            });
+            let snapshot = PREV_WEAPONS_SET
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then(|| match spear_slot {
+                    Some(Some(0)) => PREV_WEAPON_LEFT.load(std::sync::atomic::Ordering::Relaxed),
+                    _ => PREV_WEAPON_RIGHT.load(std::sync::atomic::Ordering::Relaxed),
+                })
+                // A slot the game reports as empty is not something to hand back.
+                .filter(|&id| id > 0);
+            let (restore, snapshot_after) = er_logic::boss_grants::restore_after_fight(
+                rykard_fight_on,
+                spear_slot.map(|p| p.is_some()),
+                crate::auto_equip::queue_has_weapon(),
+                snapshot,
+            );
+            if snapshot_after.is_none() {
+                PREV_WEAPONS_SET.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(previous) = restore {
+                // 🛑🛑 RESOLVE IT THROUGH THE BAG BEFORE QUEUEING IT, OR THIS REPEATS #413 ONE
+                // LAYER OUT. `enqueue_held` queues an EXACT row and `auto_equip::tick()` matches
+                // by exact FullID; a row the bag does not hold never resolves, goes back on
+                // `still_pending`, and retries in silence forever -- which also leaves the queue
+                // permanently non-empty, and `should_pause_weapon_equips` only ARMS on an empty
+                // queue, so #98's mid-fight hold would never fire again either.
+                //
+                // Two ways the snapshot can name such a row. `decode_weapon_id` closes the first:
+                // it takes rows in `[1_000_000, 90_000_000)` only, so the UNARMED row (110000) --
+                // what an empty hand reads as -- is rejected rather than "restored" as a weapon
+                // nobody owns. `held_weapon_row` closes the second: the player may have dropped,
+                // sold or upgraded that weapon during the fight, so we re-resolve the BASE row and
+                // queue whatever level the bag actually has now.
+                match er_logic::upgrades::decode_weapon_id(previous)
+                    .and_then(|(base, _)| crate::upgrades::held_weapon_row(base).flatten())
+                {
+                    Some(row) => {
+                        crate::auto_equip::enqueue_held(row);
+                        log::info!(
+                            "boss-grant: Rykard's fight is over -- putting your own weapon back (queued {row:#010x})"
+                        );
+                    }
+                    None => {
+                        log::info!(
+                            "boss-grant: Rykard's fight is over, but the weapon you were holding \
+                             ({previous:#010x}) is not a row the bag still has -- leaving your \
+                             loadout alone"
+                        );
+                    }
+                }
             }
         }
         // 🛑🛑 THE HOLD IS EVALUATED **LAST**, BELOW EVERY ENQUEUE ABOVE, AND THAT ORDER IS THE
@@ -4326,6 +4402,15 @@ static BOSS_GRANT_DIAG_LAST: std::sync::atomic::AtomicI64 =
 /// when the healthbar goes down, so every fight equips exactly once instead of every tick.
 static RYKARD_FIGHT_EQUIPPED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// #413 swap-back: the two weapon slots as they were the moment before the fight-equip displaced
+/// one. Param rows, never `GaitemHandle`s -- a handle goes stale when the inventory moves and
+/// `auto_upgrade` can change an id under us, so the row is re-resolved through the bag at restore
+/// time (the `held_row_to_equip` lesson). `PREV_WEAPONS_SET` is the presence bit: slot 0 is a
+/// legitimate-looking value and cannot double as "nothing recorded".
+static PREV_WEAPON_LEFT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static PREV_WEAPON_RIGHT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static PREV_WEAPONS_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn warn_unmapped_once(name: &str, ap_id: i64) {
     let mut guard = UNMAPPED_LOGGED.lock().unwrap();

@@ -195,6 +195,45 @@ pub fn weapons_paused() -> bool {
     WEAPONS_PAUSED.load(Ordering::Relaxed)
 }
 
+/// Does the queue currently hold a WEAPON?
+///
+/// #413 swap-back: an incoming AP weapon outranks restoring the player's pre-fight one. Weapons
+/// held through the Rykard fight drain on the very tick the bar drops, so a restore enqueued then
+/// would land after them and stomp what the player was just sent. A poisoned lock answers `true`
+/// -- "something might be queued" is the arm that declines to act, which is the safe direction.
+pub fn queue_has_weapon() -> bool {
+    match PENDING.lock() {
+        Ok(q) => q.iter().any(|&(fid, _, _)| {
+            matches!(
+                er_logic::auto_equip::equipable(fid),
+                Some(er_logic::auto_equip::Equipable::Weapon)
+            )
+        }),
+        Err(_) => true,
+    }
+}
+
+/// The param rows currently in the two weapon slots, `[left_1, right_1]`.
+///
+/// `None` = the player's game data was not reachable this tick, which the caller must treat as
+/// "don't know" and never as "empty". Read straight off `chr_asm.equipment_param_ids`, the same
+/// array the talisman branch of `tick()` reads its occupancy from and the same one the renderer
+/// polls -- so this is what the player is actually holding, not what we believe we equipped.
+pub fn worn_weapon_param_ids() -> Option<[i32; 2]> {
+    // SAFETY: FD4 singleton, read-only, on the single-threaded FrameBegin tick.
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    let worn = &gdm
+        .main_player_game_data
+        .as_ref()
+        .equipment
+        .chr_asm
+        .equipment_param_ids;
+    Some([
+        worn[er_logic::auto_equip::SLOT_WEAPON_LEFT_1 as usize],
+        worn[er_logic::auto_equip::SLOT_WEAPON_RIGHT_1 as usize],
+    ])
+}
+
 /// Is the equip queue drained? A poisoned lock answers `false` -- "not empty" defers the pause,
 /// which is the safe direction (the alternative pauses before the granted weapon has equipped).
 pub fn queue_is_empty() -> bool {

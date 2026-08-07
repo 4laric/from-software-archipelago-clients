@@ -198,6 +198,57 @@ pub fn equip_for_fight(fight_on: Option<bool>, holds: Option<bool>, latched: boo
     }
 }
 
+/// Give the player their own weapon back when the fight is over -- and what the snapshot becomes.
+///
+/// Returns `(restore, snapshot_after)`. `restore` is `Some(param_id)` to hand to
+/// `auto_equip::enqueue_held`, `None` to do nothing.
+///
+/// ⭐⭐⭐ THE ASK (Alaric, 2026-08-07): "swap weapon back after fight and then resume auto_equip
+/// queue". The second half needs NO code -- #98's hold pushes weapons onto `still_pending` rather
+/// than dropping them, and [`should_pause_weapon_equips`] goes false the moment the bar is down, so
+/// the queue resumes itself. This is only the first half.
+///
+/// 🛑 FOUR CONDITIONS, AND EVERY ONE OF THEM IS SOMEBODY ELSE WINNING THE SLOT:
+///
+/// 1. `fight_on == Some(false)` -- the bar is down. `Some(true)` is mid-fight and `None` is a
+///    FAILED READ (property 3); neither acts, and neither may clear the snapshot, or a blink at the
+///    wrong moment forgets what the player was holding.
+/// 2. We actually put the spear there -- `snapshot` is `Some`. No snapshot, nothing to undo.
+/// 3. `slot_holds_spear == Some(true)` -- THE PLAYER'S OWN CHOICE OUTRANKS OURS. If they swapped to
+///    something else mid-fight, restoring would stomp a deliberate decision, and #101 already
+///    stomped one such swap on the way in. `None` (unreadable) is not `false`: it retries.
+/// 4. `queue_has_weapon == false` -- AN INCOMING AP WEAPON OUTRANKS THE RESTORE. `set_weapons_paused`
+///    is evaluated BEFORE `auto_equip::tick()` in the same frame, so weapons held through the fight
+///    drain on this very tick; a restore enqueued now lands after them and would stomp the thing
+///    the player was just sent. Deferring to the stream is also the French Challenge premise --
+///    you equip what you are given.
+///
+/// The snapshot is a param id, never a `GaitemHandle`: handles go stale when the inventory moves,
+/// and `auto_upgrade` can change an id under us. Resolving it through the bag at restore time is
+/// the same lesson `held_row_to_equip` exists for.
+pub fn restore_after_fight(
+    fight_on: Option<bool>,
+    slot_holds_spear: Option<bool>,
+    queue_has_weapon: bool,
+    snapshot: Option<i32>,
+) -> (Option<i32>, Option<i32>) {
+    match fight_on {
+        // Mid-fight, or we could not look: hold the snapshot and do nothing.
+        Some(true) | None => (None, snapshot),
+        Some(false) => {
+            let Some(previous) = snapshot else {
+                return (None, None);
+            };
+            // The fight is over either way, so the snapshot is spent in every branch below --
+            // keeping it would restore into a LATER fight the player never asked us to touch.
+            if queue_has_weapon || slot_holds_spear != Some(true) {
+                return (None, None);
+            }
+            (Some(previous), None)
+        }
+    }
+}
+
 /// Render an `Option<bool>` read for a human. `None` is a FAILED READ, never a "no".
 fn say(v: Option<bool>) -> &'static str {
     match v {
@@ -333,6 +384,100 @@ pub fn tick(hook: &mut dyn GameHook, present: Option<bool>, holds: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_hand_is_not_a_weapon_to_hand_back() {
+        // 🛑 THE STUCK-ENTRY TRAP, pinned where it can be tested. An empty weapon slot reads as
+        // the UNARMED row (110000), and queueing that would name a row the bag can never hold:
+        // `auto_equip::tick()` matches by exact FullID, so it would retry in silence forever AND
+        // keep the queue non-empty, which stops `should_pause_weapon_equips` ever arming again.
+        // `decode_weapon_id` is the guard -- it takes `[1_000_000, 90_000_000)` only.
+        assert_eq!(crate::upgrades::decode_weapon_id(110_000), None);
+        // ...while a real weapon the player might have been holding decodes fine.
+        assert_eq!(
+            crate::upgrades::decode_weapon_id(1_000_003),
+            Some((1_000_000, 3))
+        );
+    }
+
+    #[test]
+    fn the_fight_ends_and_the_player_gets_their_weapon_back() {
+        // MOTIVATING CASE (rule 11), Alaric 2026-08-07: "swap weapon back after fight". The spear
+        // is still in the slot we put it in, nothing is queued, so the snapshot goes back.
+        assert_eq!(
+            restore_after_fight(Some(false), Some(true), false, Some(1_000_000)),
+            (Some(1_000_000), None)
+        );
+    }
+
+    #[test]
+    fn an_incoming_weapon_outranks_the_restore() {
+        // 🛑 `set_weapons_paused` runs BEFORE `auto_equip::tick()` in the same frame, so weapons
+        // held through the fight drain on this tick. A restore enqueued now lands AFTER them and
+        // would stomp what the player was just sent -- and "you equip what you are given" is the
+        // whole French Challenge premise.
+        assert_eq!(
+            restore_after_fight(Some(false), Some(true), true, Some(1_000_000)),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn a_deliberate_mid_fight_swap_is_left_alone() {
+        // 🛑 The player's own choice outranks ours. #101 already stomps one swap on the way IN;
+        // stomping a second on the way out would make the spear feel like it owns the slot.
+        assert_eq!(
+            restore_after_fight(Some(false), Some(false), false, Some(1_000_000)),
+            (None, None)
+        );
+        // ...and an UNREADABLE slot is not a "no": keep the snapshot and retry next tick.
+        assert_eq!(
+            restore_after_fight(None, None, false, Some(1_000_000)),
+            (None, Some(1_000_000))
+        );
+    }
+
+    #[test]
+    fn mid_fight_and_dont_know_both_keep_the_snapshot() {
+        // Property 3. A `None` from GameDataMan is a blink, not a fight ending -- clearing the
+        // snapshot on it would forget what the player was holding for the rest of the fight.
+        for holds in [Some(true), Some(false), None] {
+            assert_eq!(
+                restore_after_fight(Some(true), holds, false, Some(42)),
+                (None, Some(42))
+            );
+            assert_eq!(
+                restore_after_fight(None, holds, false, Some(42)),
+                (None, Some(42))
+            );
+        }
+    }
+
+    #[test]
+    fn no_snapshot_means_we_never_touched_the_slot() {
+        // The spear was already in hand, or auto_equip is off, or the fight-equip never fired.
+        // There is nothing to undo and nothing to remember.
+        assert_eq!(
+            restore_after_fight(Some(false), Some(true), false, None),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn the_snapshot_is_spent_however_the_fight_ends() {
+        // 🛑 THE LEAK THIS EXISTS FOR. Whatever the reason we decline, the snapshot must NOT
+        // survive the bar dropping -- a stale one would restore into a LATER fight the player
+        // never asked us to touch.
+        for (slot, queued) in [
+            (Some(true), true),
+            (Some(false), false),
+            (None, false),
+            (Some(false), true),
+        ] {
+            let (_, after) = restore_after_fight(Some(false), slot, queued, Some(7));
+            assert_eq!(after, None, "slot={slot:?} queued={queued}");
+        }
+    }
 
     #[test]
     fn the_equip_follows_the_fight_not_the_grant() {
