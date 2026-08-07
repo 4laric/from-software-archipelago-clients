@@ -2898,11 +2898,6 @@ impl shared::Core for Core {
         let healthbar = crate::flags::boss_healthbar_npc_param_id();
         let rykard_fight_on =
             er_logic::boss_grants::healthbar_shows(er_logic::boss_grants::RYKARD_CHR_ID, healthbar);
-        crate::auto_equip::set_weapons_paused(er_logic::boss_grants::should_pause_weapon_equips(
-            rykard_fight_on,
-            crate::auto_equip::queue_is_empty(),
-            crate::auto_equip::weapons_paused(),
-        ));
         if can_grant {
             // The latch is possession, never the Serpent-Hunter's obtained-flag: that flag is what
             // check 7771816 is keyed on, so latching on it would collect a check the player never
@@ -2938,7 +2933,40 @@ impl shared::Core for Core {
                 crate::auto_equip::enqueue(er_logic::boss_grants::SERPENT_HUNTER_BASE, None);
                 self.log(ap::Print::message(m));
             }
+            // ⭐⭐⭐ THE EQUIP FOLLOWS THE FIGHT, NOT THE GRANT (#413 cause 2; boblerrr
+            // 2026-08-07 16:10:50, caught by the diagnostic above). The grant is one-shot per
+            // character, so a reload, a re-fight, or simply swapping weapons afterwards left the
+            // player facing Rykard with the spear sitting in the bag. The grant answers "do they
+            // own one"; this answers "is it in their hand for the fight".
+            let latched = RYKARD_FIGHT_EQUIPPED.load(std::sync::atomic::Ordering::Relaxed);
+            let (equip_now, latched_after) =
+                er_logic::boss_grants::equip_for_fight(rykard_fight_on, holds, latched);
+            RYKARD_FIGHT_EQUIPPED.store(latched_after, std::sync::atomic::Ordering::Relaxed);
+            if equip_now {
+                crate::auto_equip::enqueue(er_logic::boss_grants::SERPENT_HUNTER_BASE, None);
+                log::info!(
+                    "boss-grant: Rykard's healthbar is up and the spear was already in the bag -- putting it in your hand"
+                );
+            }
         }
+        // 🛑🛑 THE HOLD IS EVALUATED **LAST**, BELOW EVERY ENQUEUE ABOVE, AND THAT ORDER IS THE
+        // WHOLE POINT. `should_pause_weapon_equips` waits for an EMPTY queue; read before the
+        // enqueues it sees the PRE-enqueue empty, closes the gate on the same tick, and the spear
+        // lands in its own drain -- released only when the fight ends, i.e. after the fight it was
+        // for. #98 dodged that for the GRANT path by keying the hold on the healthbar (the grant
+        // fires at area load, long before the bar). The fight-equip above has no such gap: it fires
+        // ON the bar, the same tick the hold would arm. So the read moved down instead of the
+        // hazard being argued away.
+        //
+        // Read UNCONDITIONALLY, outside `can_grant`: if a lost `can_grant` skipped it the hold
+        // would STRAND at true and block every weapon equip for the rest of the session. `None`
+        // (GameDataMan down) resolves to "not paused", so losing the ability to look releases the
+        // hold rather than latching it.
+        crate::auto_equip::set_weapons_paused(er_logic::boss_grants::should_pause_weapon_equips(
+            rykard_fight_on,
+            crate::auto_equip::queue_is_empty(),
+            crate::auto_equip::weapons_paused(),
+        ));
         for g in graces_lit {
             self.log(ap::Print::message(format!("{g} unlocked")));
         }
@@ -4259,6 +4287,11 @@ static UNMAPPED_LOGGED: std::sync::Mutex<Option<HashSet<i64>>> = std::sync::Mute
 /// `diag_key` is tested never to produce it.
 static BOSS_GRANT_DIAG_LAST: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// #413: have we already put the spear in the player's hand for the CURRENT Rykard fight? Re-armed
+/// when the healthbar goes down, so every fight equips exactly once instead of every tick.
+static RYKARD_FIGHT_EQUIPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn warn_unmapped_once(name: &str, ap_id: i64) {
     let mut guard = UNMAPPED_LOGGED.lock().unwrap();

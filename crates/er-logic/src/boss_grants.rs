@@ -139,6 +139,65 @@ pub fn healthbar_shows(chr_id: i32, healthbar_npc_param_id: Option<i32>) -> Opti
     Some(id != 0 && is_character(id, chr_id))
 }
 
+/// The `CCCC____` decode, but only where that shape is actually defensible.
+///
+/// ⭐⭐⭐ [`is_character`] divides by `10_000` unconditionally. That is correct for the rows this
+/// module GATES on -- every `c4710` row is 8 digits, and `id / 10_000 == 4710` can only hold for an
+/// 8-digit id -- and it is WRONG as a general decode. bobler's 2026-08-07 log carries 9-digit rows
+/// (`523610066`, `523250066`, and `523680065` in the scaling logs); dividing those by `10_000`
+/// yields "chr 52361", a five-digit character that does not exist. The GATE is unharmed by this,
+/// but a DIAGNOSTIC that prints the quotient invents a character and sends its reader hunting one.
+///
+/// 🛑 DO NOT "FIX" THIS BY GUESSING THE 9-DIGIT SPLIT. Nothing here has measured whether those rows
+/// are `CCCC_____` or `CCCCC____`, and a diagnostic that states an unmeasured decode as fact is
+/// worse than one that declines. Until something measures it, the honest output is no chr at all.
+pub fn decode_chr(npc_param_id: i32) -> Option<i32> {
+    (10_000_000..=99_999_999)
+        .contains(&npc_param_id)
+        .then_some(npc_param_id / 10_000)
+}
+
+/// Should the spear go into the player's hand for THIS fight -- and what does the latch become?
+///
+/// Returns `(enqueue_now, latched_after)`.
+///
+/// ⭐⭐⭐ MOTIVATING CASE (rule 11), boblerrr 2026-08-07 16:10:50, and it is the diagnostic's own
+/// output that caught it:
+///
+/// ```text
+/// boss-grant: healthbar npc_param 47101038 = chr 4710, IS Rykard | c4710 loaded = yes |
+///             already holds the spear = yes -> no grant
+/// ```
+///
+/// The real Rykard, the real spear in the bag, and nothing in his hand. The equip rode on the
+/// one-shot GRANT, so it fired exactly once per character, ever: reload, re-fight, or simply
+/// swapping weapons after the grant all left the player facing the fight without the tool the
+/// grant exists to provide. The grant answers "does the player own one"; this answers "is it in
+/// their hand for the fight", and they are different questions.
+///
+/// 🛑 ONCE PER FIGHT, via `latched`. Without it this re-enqueues every tick the bar is up, which
+/// would also stomp a deliberate mid-fight swap over and over rather than once.
+///
+/// 🛑 Property 3 of this module, twice over. `fight_on == None` (GameDataMan down) acts on nothing
+/// and CHANGES nothing -- it must not re-arm the latch, or a blink at the wrong moment re-equips
+/// mid-fight. `holds == None` (bag unresolvable) leaves the latch OPEN so the next tick retries,
+/// because latching on a failed read would silently skip the fight entirely.
+pub fn equip_for_fight(fight_on: Option<bool>, holds: Option<bool>, latched: bool) -> (bool, bool) {
+    match fight_on {
+        // The fight is over (or never started): re-arm for the next one.
+        Some(false) => (false, false),
+        // We could not look this tick. Do nothing, and leave the latch exactly as it was.
+        None => (false, latched),
+        Some(true) => match (latched, holds) {
+            (true, _) => (false, true),
+            (false, Some(true)) => (true, true),
+            // No spear in the bag, or the bag would not answer -- retry on the next tick. The
+            // grant path may be handing one over right now.
+            (false, _) => (false, false),
+        },
+    }
+}
+
 /// Render an `Option<bool>` read for a human. `None` is a FAILED READ, never a "no".
 fn say(v: Option<bool>) -> &'static str {
     match v {
@@ -201,10 +260,14 @@ pub fn grant_diagnosis(
         Some(id) if is_rykard(id) => {
             format!("healthbar npc_param {id} = chr {}, IS Rykard", id / 10_000)
         }
-        Some(id) => format!(
-            "healthbar npc_param {id} = chr {}, NOT Rykard (c{RYKARD_CHR_ID})",
-            id / 10_000
-        ),
+        Some(id) => match decode_chr(id) {
+            Some(chr) => format!("healthbar npc_param {id} = chr {chr}, NOT Rykard (c{RYKARD_CHR_ID})"),
+            // 🛑 Not the CCCC____ shape, so there is no chr to name. Saying so beats printing a
+            // quotient that looks like a character id and is not one -- see `decode_chr`.
+            None => format!(
+                "healthbar npc_param {id} = chr NOT DECODED (not the 8-digit CCCC____ shape), NOT Rykard (c{RYKARD_CHR_ID})"
+            ),
+        },
         None => "no boss healthbar up".to_string(),
     };
     let mut line = format!(
@@ -270,6 +333,95 @@ pub fn tick(hook: &mut dyn GameHook, present: Option<bool>, holds: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_equip_follows_the_fight_not_the_grant() {
+        // MOTIVATING CASE (rule 11), boblerrr 2026-08-07 16:10:50, caught by this module's own
+        // diagnostic: the real Rykard on screen, the real spear in the bag, nothing in hand,
+        // because the equip rode on a grant that had fired hours and one reload earlier.
+        assert_eq!(equip_for_fight(Some(true), Some(true), false), (true, true));
+    }
+
+    #[test]
+    fn one_equip_per_fight_not_one_per_tick() {
+        // 🛑 Without the latch this re-enqueues every tick the bar is up, which also means stomping
+        // a deliberate mid-fight swap over and over instead of once.
+        let (enqueue, latched) = equip_for_fight(Some(true), Some(true), false);
+        assert!(enqueue);
+        for _ in 0..100 {
+            assert_eq!(
+                equip_for_fight(Some(true), Some(true), latched),
+                (false, true)
+            );
+        }
+    }
+
+    #[test]
+    fn the_latch_rearms_when_the_fight_ends() {
+        // Rykard dies, or the player flees, or dies themselves: all read as "bar is down", and all
+        // of them must leave the next fight able to re-equip.
+        assert_eq!(
+            equip_for_fight(Some(false), Some(true), true),
+            (false, false)
+        );
+        assert_eq!(equip_for_fight(Some(false), None, true), (false, false));
+        // ...and the fight after that equips again.
+        assert_eq!(equip_for_fight(Some(true), Some(true), false), (true, true));
+    }
+
+    #[test]
+    fn dont_know_acts_on_nothing_and_rearms_nothing() {
+        // Property 3. A `None` from GameDataMan is a blink, not a fight ending -- re-arming on it
+        // would re-equip mid-fight the moment the read came back.
+        assert_eq!(equip_for_fight(None, Some(true), true), (false, true));
+        assert_eq!(equip_for_fight(None, Some(true), false), (false, false));
+        assert_eq!(equip_for_fight(None, None, true), (false, true));
+    }
+
+    #[test]
+    fn a_bag_that_will_not_answer_retries_instead_of_latching() {
+        // 🛑 The asymmetry with the clause above is deliberate. Latching on an unreadable BAG would
+        // skip the whole fight; leaving it open costs one retry per tick until the read lands.
+        assert_eq!(equip_for_fight(Some(true), None, false), (false, false));
+        // No spear at all is not a defect and not an equip -- the grant path may be mid-handover.
+        assert_eq!(
+            equip_for_fight(Some(true), Some(false), false),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn the_nine_digit_rows_from_boblers_log_are_not_decoded() {
+        // 🛑 THE REGRESSION THIS EXISTS FOR. These three are verbatim from the 2026-08-07 log, and
+        // `id / 10_000` renders them as "chr 52361" / "chr 52325" / "chr 52368" -- five-digit
+        // characters that do not exist. The gate is untouched (none can equal 4710); the DISPLAY
+        // was inventing a character.
+        for id in [523610066, 523250066, 523680065] {
+            assert_eq!(decode_chr(id), None, "id {id}");
+            assert!(!is_rykard(id), "id {id}");
+        }
+        let d = grant_diagnosis(Some(523610066), Some(false), Some(true)).unwrap();
+        assert!(d.contains("NOT DECODED"), "{d}");
+        assert!(!d.contains("chr 52361"), "{d}");
+    }
+
+    #[test]
+    fn the_eight_digit_rows_still_decode() {
+        // Everything the log actually decoded correctly must keep doing so.
+        for (id, chr) in [
+            (47101038, 4710),
+            (53600000, 5360),
+            (48000068, 4800),
+            (46300912, 4630),
+        ] {
+            assert_eq!(decode_chr(id), Some(chr), "id {id}");
+        }
+        // 🛑 Every Rykard row is 8-digit BY CONSTRUCTION -- `id / 10_000 == 4710` cannot hold
+        // otherwise -- so the gate and the decode can never disagree about this character.
+        for &row in RYKARD_NPC_PARAM_ROWS {
+            assert_eq!(decode_chr(row), Some(RYKARD_CHR_ID), "row {row}");
+        }
+    }
 
     #[test]
     fn the_swapped_in_boss_names_itself() {
