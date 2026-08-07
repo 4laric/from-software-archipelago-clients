@@ -19,8 +19,9 @@ use er_logic::scaling::{
     NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
     area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect,
     is_scaling_speffect_with_downstates, ladder_tier, native_tier, placed_by_area,
-    placed_by_area_down, raw_target_for_region, region_name_for_bucket, scale_action, scaling_kind,
-    settled_on_downstate, settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
+    placed_by_area_down, raw_target_for_region, region_name_for_bucket, region_scaling,
+    region_scaling_line, scale_action, scaling_kind, settled_on_downstate, settled_on_target,
+    speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -209,6 +210,34 @@ pub fn notify_transition() {
     if let Ok(mut logged) = RELEASE_LOGGED.lock() {
         *logged = false;
     }
+}
+
+/// The tracker's "what is my scaling here" row, for `bucket` (= `play_region_id / 100`).
+///
+/// `None` ONLY when there is no `ScalingConfig` at all -- not connected, or the seed has scaling
+/// off -- so the row can be omitted entirely rather than asserting something about a feature that
+/// is not running. Every other case, INCLUDING a bucket the wire never heard of, returns a
+/// sentence: see `er_logic::scaling::region_scaling_line` for why silence is the wrong answer to a
+/// question the player asked on purpose.
+///
+/// ⚠️ Read-only and lock-scoped: this runs on the imgui present thread, so it touches CONFIG and
+/// nothing else. The BUCKET is cached by core's tick rather than read here -- `play_region_id()`
+/// dereferences `WorldChrMan`, which is game memory this thread has no business reading.
+pub fn describe_region(bucket: i32) -> Option<String> {
+    let guard = CONFIG.lock().ok()?;
+    let cfg = guard.as_ref()?;
+    let scaling = region_scaling(
+        raw_target_for_region(cfg, bucket),
+        cfg.max_target,
+        cfg.floor_tier,
+        cfg.ceiling_tier,
+    );
+    Some(region_scaling_line(
+        region_name_for_bucket(bucket),
+        scaling,
+        cfg.floor_tier,
+        cfg.ceiling_tier,
+    ))
 }
 
 /// Parse slot_data at connect. The parse itself — including the SWEEP H4 / R6 refuse-to-arm on an

@@ -123,6 +123,17 @@ pub struct Core {
     sent_goal: bool,
     /// Item-tracker window visibility (overlay menu "Tracker" + F6 toggle).
     tracker_visible: bool,
+    /// The play_region BUCKET (`play_region_id / 100`) the player was last seen in, cached for the
+    /// tracker's scaling row. `None` off-world.
+    ///
+    /// 🛑 CACHED ON THE TICK, NEVER READ FROM THE RENDER. `play_region_id()` dereferences
+    /// `WorldChrMan`; the imgui present thread must not touch game memory. It rides the read the
+    /// grant gate already does, so this costs no extra deref.
+    ///
+    /// ⚠️ The sweep is throttled, so this can lag a region transition by a few frames. Fine for a
+    /// row the player reads at their own pace; it would be wrong for a toast, which is why the
+    /// entry announcement stays on the sweep's own path.
+    scaling_here_bucket: Option<i32>,
     /// Standing hint set (SPEC-item-tracker.md option (a)): fed from streamed `Print::Hint`
     /// entries in the overlay log; dedups by location id (connect-replay re-inserts are no-ops).
     hints: HintSet,
@@ -474,6 +485,7 @@ impl shared::Core for Core {
             lock_hints: crate::lock_hints::LockHints::new(),
             sent_goal: false,
             tracker_visible: false,
+            scaling_here_bucket: None,
             hints: HintSet::new(),
             hint_log_watermark: 0,
             // EMPTY until slot_data arrives. There is no baked table any more: it described the
@@ -1550,6 +1562,11 @@ impl shared::Core for Core {
                 // whole gate once a genuine pickup proves the pointer live, so this only ever DELAYS
                 // the pre-first-pickup timer path -- an established character is untouched.
                 let pr = crate::flags::play_region_id();
+                // The tracker's scaling row rides this read (see `scaling_here_bucket`): same
+                // value, one deref, and the row can never disagree with the gate about where the
+                // player is. BUCKET, not the raw id -- `play_region` is 6200000 where the scaling
+                // wire and `region_name_for_bucket` both speak 62000.
+                self.scaling_here_bucket = pr.map(|r| r / 100);
                 if pr.is_some() && pr != self.grant_gate_last_play_region {
                     if self.grant_gate_last_play_region.is_some() {
                         self.in_world_since = None;
@@ -1561,6 +1578,8 @@ impl shared::Core for Core {
             } else {
                 self.in_world_since = None;
                 self.grant_gate_last_play_region = None;
+                // Off-world: drop the row rather than leave it naming the last region visited.
+                self.scaling_here_bucket = None;
             }
             let start_items_settled = crate::detour::real_pickup_seen()
                 || self
@@ -3656,6 +3675,15 @@ impl Core {
         }
         let total_locations = (checked.len() + unchecked.len()) as u64;
 
+        // Scaling row (#346 follow-up, bobler 2026-08-07 "how to view my scaling"). Resolved HERE,
+        // outside the closure, like every other snapshot in this function. `None` = no
+        // ScalingConfig at all (not connected, or the seed has scaling off), and then the row is
+        // omitted entirely -- an unscaled SEED and an unscaled SPOT are different facts and the
+        // row must not blur them.
+        let scaling_here = self
+            .scaling_here_bucket
+            .and_then(crate::scaling::describe_region);
+
         // Region-lock accessibility snapshot (bound to a local BEFORE the model borrows &self
         // fields -- keeps the borrows sequential).
         let open_coarse = self.open_coarse_regions();
@@ -3811,6 +3839,18 @@ impl Core {
                             ui.text_disabled("no lock within reach -- you are gated on something else");
                         }
                         Next::Idle => {}
+                    }
+                    ui.separator();
+                }
+                // ---- where you are standing, and how hard it is ----------------------------
+                // The entry toast says this ONCE and is then gone; this is the same sentence,
+                // askable. Above the filters because it describes the player, not the list.
+                if let Some(line) = &scaling_here {
+                    ui.text(line);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(
+                            "Enemy scaling where you are standing right now.\nThe tier is this seed's own band, not the full ladder -- tier 0 is your easiest region, not 'unscaled'.",
+                        );
                     }
                     ui.separator();
                 }
