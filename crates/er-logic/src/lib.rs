@@ -68,6 +68,7 @@ pub mod start_backfill;
 pub mod static_lots;
 pub mod sweep_flush;
 pub mod sweep_gate;
+pub mod sweep_watch;
 pub mod toast;
 pub mod torrent_start_replay;
 pub mod tracker;

@@ -184,6 +184,11 @@ pub struct Core {
     /// re-banner regardless: already-checked members are filtered by the server checked-set, so
     /// a re-fired group grants 0 and produces no candidate.
     sweep_bannered: HashSet<u32>,
+    /// Sweep-trigger flag watcher (diagnostic, 2026-08-07). Reports the group census once and then
+    /// only CHANGES, so a trigger flag flipping is timestamped in the log instead of being
+    /// inferred from the sweep that follows it. See `er_logic::sweep_watch` for the motivating
+    /// 2m45s gap.
+    sweep_watch: er_logic::sweep_watch::SweepWatch,
     /// SWEEP FLAG FLUSH (2026-07-24): acquisition flags owed to swept members, held until each one
     /// READS BACK set. A sweep fires exactly once -- on the poll that observes the defeat flag,
     /// which can be mid-load when the game refuses writes -- so a fire-and-forget write would leave
@@ -504,6 +509,7 @@ impl shared::Core for Core {
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
             sweep_bannered: HashSet::new(),
+            sweep_watch: er_logic::sweep_watch::SweepWatch::new(),
             sweep_flag_pending: Vec::new(),
             toasts: er_logic::toast::Deck::new(4, 6000),
             toast_clock: std::time::Instant::now(),
@@ -2323,6 +2329,10 @@ impl shared::Core for Core {
             // group that newly fires this poll -- (defeat flag, member count, a member loc for
             // the region lookup) -- inside the immutable borrow; bannered after it ends.
             let mut sweep_fired: Vec<(u32, usize, i64)> = Vec::new();
+            // SWEEP WATCH (2026-08-07): every group's trigger flag as observed THIS poll, gated
+            // groups included. Collected in the immutable borrow and reported after it, exactly
+            // like `sweep_fired`.
+            let mut sweep_obs: Vec<er_logic::sweep_watch::GroupObservation> = Vec::new();
             // (location, detection flag) for every member this poll actually granted -- the input
             // to the sweep flag flush below (er_logic::sweep_flush::flags_to_assert).
             let mut swept_members: Vec<(i64, u32)> = Vec::new();
@@ -2379,6 +2389,13 @@ impl shared::Core for Core {
                     }
                 }
                 for (&flag, locs) in &fp.sweep_flags {
+                    // 🛑 OBSERVED BEFORE THE GATE, ON PURPOSE. A group held by its lock gate and a
+                    // group that does not exist logged identically before this -- as nothing -- so
+                    // "armed and waiting" was unreadable and a 2m45s delay looked like a broken
+                    // sweep (bobler, 2026-08-07). Read once here and reused by the fire test below,
+                    // so this costs no extra flag read on the firing path.
+                    let flag_set = crate::flags::get_event_flag(flag);
+                    sweep_obs.push((flag, locs.len(), flag_set));
                     // Draft B: hold a gated group's sweep until its boss-lock item is in the
                     // cumulative received set. sweepLockGates is FLAG-keyed, so look it up by this
                     // sweep's boss-defeat flag; poll-driven, so a lock received AFTER the kill fires
@@ -2389,7 +2406,7 @@ impl shared::Core for Core {
                     ) {
                         continue;
                     }
-                    if crate::flags::get_event_flag(flag) {
+                    if flag_set {
                         let mut granted = 0usize;
                         let mut sample_loc = 0i64;
                         for &loc in locs {
@@ -2413,6 +2430,14 @@ impl shared::Core for Core {
                     }
                 }
             }
+            // SWEEP WATCH lines first, so the census precedes the first banner it explains.
+            // Silent unless something changed -- the poll runs all session and a per-poll dump
+            // would bury the log.
+            if !sweep_obs.is_empty() {
+                for line in self.sweep_watch.observe(&sweep_obs) {
+                    log::info!("{line}");
+                }
+            }
             // SWEEP VISIBILITY banners (latched once per group per session via sweep_bannered;
             // reset on seed change). Same log/overlay channel as the Felled/attunement banners.
             for (flag, granted, sample_loc) in sweep_fired {
@@ -2426,12 +2451,20 @@ impl shared::Core for Core {
                         .to_string()
                 });
                 let region = self.region_table.get(&(sample_loc as u64)).cloned();
+                // 🛑 THE FLAG IS APPENDED UNCONDITIONALLY. The old chain degraded to the
+                // PRETTIEST remaining label rather than the most IDENTIFYING one: with
+                // `0 boss-lock def(s)` the boss name can never resolve, so every sweep fell to
+                // `Boss sweep ({region})` and dropped the flag -- while the arm one line below it
+                // was the one that printed it. bobler's 49-check sweep could not be mapped back to
+                // a trigger at all (2026-08-07), and slot_data's own `dungeonSweepFlags` echo is
+                // truncated in the log, so this was the last copy of that fact.
                 let label = match (boss, region) {
                     (Some(b), Some(r)) => format!("Boss sweep ({r}): {b}"),
                     (Some(b), None) => format!("Boss sweep: {b}"),
                     (None, Some(r)) => format!("Boss sweep ({r})"),
-                    (None, None) => format!("Boss sweep (flag {flag})"),
+                    (None, None) => "Boss sweep".to_string(),
                 };
+                let label = format!("{label} [trigger flag {flag}]");
                 self.log(ap::Print::message(format!(
                     "{label} -- {granted} check(s) granted."
                 )));
@@ -3439,6 +3472,7 @@ impl Core {
         self.boss_flag_prev.clear();
         // SWEEP VISIBILITY: re-arm the per-group sweep banner for the new seed.
         self.sweep_bannered.clear();
+        self.sweep_watch.reset();
         // ATTUNEMENT-RELEASE: drop the parsed gate + all per-save latches so the new seed re-parses
         // regionAttunement and re-primes / re-blooms from scratch.
         self.region_attunement.clear();
