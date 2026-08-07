@@ -274,7 +274,48 @@ pub fn set_enabled(on: bool) {
 /// bagged id can still differ from the queued one. That window is bounded by the retry, and closing
 /// it properly means matching on the base row in `tick()` -- deliberately left out of this fix so
 /// the change stays one line of behaviour.
+///
+/// 🛑 THIS RAISE IS FOR RECEIVES ONLY. A caller queueing something ALREADY IN THE BAG must use
+/// [`enqueue_held`] instead: there is no grant coming to deposit `base + target`, so raising the
+/// id names a row that will never exist and the drain misses it forever. That is #413 (boblerrr
+/// 2026-08-07 18:31:38), where #101's fight-equip came through here and the spear never landed.
 pub fn enqueue(full_id: i32, talisman: Option<er_logic::auto_equip::TalismanPos>) {
+    enqueue_inner(full_id, talisman, Raise::ToAutoUpgradeTarget);
+}
+
+/// Should `enqueue_inner` raise the id to the player's auto_upgrade target before queueing it?
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Raise {
+    /// A RECEIVE. The grant is about to deposit `base + target`, so the queue must say the same.
+    ToAutoUpgradeTarget,
+    /// ALREADY IN THE BAG. The caller read the real FullID off the inventory; there is no grant
+    /// coming, so raising it would name a row that will never exist.
+    Never,
+}
+
+/// Queue a weapon the player ALREADY OWNS, at the exact FullID the bag reports.
+///
+/// #413 / boblerrr 2026-08-07 18:31:38. #101's fight-equip called [`enqueue`], which raised
+/// `17030000` to `17030003` (`auto_upgrade: 0x103db70 -> 0x103db73 (enqueue)` in his log) for a
+/// spear that had been banked at `+0` hours earlier. `tick()` matches by EXACT FullID, so the
+/// entry missed, went back on `still_pending`, and retried silently for the rest of the session --
+/// the banner printed and no `auto_equip: slot ... <-` line ever followed.
+///
+/// The raise is right for a receive and wrong here, and the difference is the PREMISE: a receive
+/// is queued against an item a grant is about to put in the bag, this is queued against an item
+/// that is already there. See `er_logic::auto_equip::held_row_to_equip`, which is what the caller
+/// uses to find the id to pass.
+///
+/// COLLATERAL THIS ALSO CLOSES: `should_pause_weapon_equips` only ARMS on an empty queue, so the
+/// permanently-stuck entry left `PENDING` non-empty forever and the #98 mid-fight weapon hold
+/// could never arm again for the rest of the session. Unwitnessed in bobler's log (it ends 77s
+/// after the banner, with nothing arriving to be held) -- it follows from the code, and it stops
+/// following once the entry can drain.
+pub fn enqueue_held(full_id: i32) {
+    enqueue_inner(full_id, None, Raise::Never);
+}
+
+fn enqueue_inner(full_id: i32, talisman: Option<er_logic::auto_equip::TalismanPos>, raise: Raise) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -319,7 +360,10 @@ pub fn enqueue(full_id: i32, talisman: Option<er_logic::auto_equip::TalismanPos>
             }
         }
     };
-    let full_id = crate::upgrades::enqueue_upgrade_id(full_id);
+    let full_id = match raise {
+        Raise::ToAutoUpgradeTarget => crate::upgrades::enqueue_upgrade_id(full_id),
+        Raise::Never => full_id,
+    };
     if let Ok(mut q) = PENDING.lock()
         && !q.iter().any(|&(id, _, _)| id == full_id)
     {

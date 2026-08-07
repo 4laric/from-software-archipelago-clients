@@ -2902,8 +2902,15 @@ impl shared::Core for Core {
             // The latch is possession, never the Serpent-Hunter's obtained-flag: that flag is what
             // check 7771816 is keyed on, so latching on it would collect a check the player never
             // found.
-            let holds =
-                crate::upgrades::holds_weapon_base(er_logic::boss_grants::SERPENT_HUNTER_BASE);
+            // ONE BAG READ, TWO ANSWERS (#413, boblerrr 2026-08-07 18:31:38). `held_row` is
+            // `None` when the bag is unreachable, `Some(None)` when no spear is held, and
+            // `Some(Some(full_id))` with the EXACT id the inventory reports. `holds` is derived
+            // from it rather than read separately, so the question "does he have one" and the
+            // question "which one" can never disagree -- them disagreeing is the whole of the
+            // defect this closes.
+            let held_row =
+                crate::upgrades::held_weapon_row(er_logic::boss_grants::SERPENT_HUNTER_BASE);
+            let holds = held_row.map(|r| r.is_some());
             // ⭐⭐⭐ SAY WHY NOTHING HAPPENED (#413, boblerrr 2026-08-07 "no spear whatsoever").
             // A non-grant is silent: `boss_grant_action` returns None for "Rykard was never
             // loaded", "you already hold one" and "a read failed" alike, so a player log cannot
@@ -2942,10 +2949,18 @@ impl shared::Core for Core {
             let (equip_now, latched_after) =
                 er_logic::boss_grants::equip_for_fight(rykard_fight_on, holds, latched);
             RYKARD_FIGHT_EQUIPPED.store(latched_after, std::sync::atomic::Ordering::Relaxed);
-            if equip_now {
-                crate::auto_equip::enqueue(er_logic::boss_grants::SERPENT_HUNTER_BASE, None);
+            // QUEUE THE ID THE BAG ACTUALLY HAS, never `BASE`. Routing this through the plain
+            // `enqueue` raised it to the auto_upgrade target -- `17030000 -> 17030003` in
+            // bobler's log -- and the drain's exact-FullID lookup then missed forever, because
+            // the spear had been granted at `+0` back when the target was `+0` and no grant was
+            // coming to raise it. `equip_now` is only ever true when `holds` was `Some(true)`,
+            // which is `held_row == Some(Some(_))`, so the `if let` cannot realistically fail;
+            // it is written as a match rather than an unwrap so that a future caller loosening
+            // `equip_for_fight` degrades to "do nothing this tick" instead of panicking.
+            if equip_now && let Some(Some(row)) = held_row {
+                crate::auto_equip::enqueue_held(row);
                 log::info!(
-                    "boss-grant: Rykard's healthbar is up and the spear was already in the bag -- putting it in your hand"
+                    "boss-grant: Rykard's healthbar is up and the spear was already in the bag -- putting it in your hand (queued {row:#010x})"
                 );
             }
         }

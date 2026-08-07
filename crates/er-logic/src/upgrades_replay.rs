@@ -261,6 +261,168 @@ mod replay {
 // `post_fix_queue_matches_the_bag_for_an_upgraded_weapon` and
 // `queue_matches_the_bag_at_every_held_level` go red (mutation-verified before landing).
 
+// THE SECOND HALF OF THE SAME QUESTION (#413, boblerrr 2026-08-07 18:31:38).
+//
+// `auto_equip_queue_matches_bag` below pins the queue against THE GRANT PATH: `bagged` is
+// `apply_auto_upgrade`, i.e. what a grant is about to deposit. That premise is exactly right for a
+// RECEIVE and it is the reason those tests could not witness #101's defect -- the fight-equip
+// queues for an item that is ALREADY in the bag, banked at whatever the target was on the day it
+// arrived, with no grant coming to reconcile anything. Both sides of every assert down there are
+// computed from TODAY's target, so a bag holding yesterday's level is not representable.
+//
+// These tests model the thing that module structurally cannot: a bag whose contents were fixed in
+// the past, and a target that has moved since.
+
+#[cfg(test)]
+mod fight_equip_queues_what_the_bag_actually_holds {
+    use crate::auto_equip::held_row_to_equip;
+    use crate::boss_grants::SERPENT_HUNTER_BASE;
+    use crate::hook::GameHook;
+    use crate::upgrades::apply_auto_upgrade;
+
+    /// The bag as of bobler's 18:31:38 tick: the Serpent-Hunter banked at +0, and a normal-track
+    /// high-water mark that has since climbed to +3.
+    struct Bag {
+        held_normal: i32,
+    }
+
+    impl GameHook for Bag {
+        fn get_event_flag(&self, _f: u32) -> bool {
+            false
+        }
+        fn set_event_flag(&mut self, _f: u32, _on: bool) {}
+        fn try_set_event_flag(&mut self, _f: u32, _on: bool) -> bool {
+            true
+        }
+        fn in_world(&self) -> bool {
+            true
+        }
+        fn play_region_id(&self) -> Option<i32> {
+            None
+        }
+        fn grant_full_id(&mut self, _full_id: i32, _qty: i32) -> bool {
+            true
+        }
+        fn player_hp(&self) -> Option<i32> {
+            None
+        }
+        fn weapon_track_and_cap(&self, base: i32) -> Option<(i32, bool)> {
+            (base == SERPENT_HUNTER_BASE).then_some((25, false))
+        }
+        fn highest_held_level(&self, somber: bool) -> Option<i32> {
+            Some(if somber { 0 } else { self.held_normal })
+        }
+        fn scadutree_blessing(&self) -> Option<i32> {
+            None
+        }
+        fn set_scadutree_blessing(&mut self, _l: i32) {}
+    }
+
+    #[test]
+    fn the_motivating_case_in_exact_values() {
+        // boblerrr 2026-08-07 18:31:38, verbatim. The spear in the bag is +0; the target is +3.
+        let bag = Bag { held_normal: 3 };
+        let in_the_bag = [SERPENT_HUNTER_BASE];
+
+        // What #101 queued: the receive path's raise. His log line is the proof it ran --
+        // `auto_upgrade: 0x103db70 -> 0x103db73 (enqueue)`.
+        let what_101_queued = apply_auto_upgrade(&bag, true, SERPENT_HUNTER_BASE);
+        assert_eq!(what_101_queued, 17_030_003);
+        // ...and 17030003 is in nobody's bag, which is why the drain retried in silence forever.
+        assert!(!in_the_bag.contains(&what_101_queued));
+
+        // What the fix queues: the row the bag reports.
+        let queued = held_row_to_equip(SERPENT_HUNTER_BASE, in_the_bag.iter().copied());
+        assert_eq!(queued, Some(17_030_000));
+        assert!(in_the_bag.contains(&queued.unwrap()));
+    }
+
+    #[test]
+    fn a_queued_id_the_bag_does_not_hold_is_the_bug_shape() {
+        // The invariant, stated as a property rather than one pair of numbers: whatever this
+        // returns must be an id the bag literally contains, at EVERY target the run can reach.
+        // Mutation-verified before landing: dropping the `b == base` filter, swapping `max_by_key`
+        // for `min_by_key`, or returning `None` each turns this module red.
+        for target in 0..=25 {
+            let bag = Bag {
+                held_normal: target,
+            };
+            let in_the_bag = [SERPENT_HUNTER_BASE];
+            let queued = held_row_to_equip(SERPENT_HUNTER_BASE, in_the_bag.iter().copied())
+                .expect("a bag holding the base row must resolve");
+            assert!(
+                in_the_bag.contains(&queued),
+                "target +{target} queued {queued:#x}, which the bag does not hold"
+            );
+            // The raise would have named a row that is not there, for every target above +0.
+            let raised = apply_auto_upgrade(&bag, true, SERPENT_HUNTER_BASE);
+            assert_eq!(raised != queued, target > 0, "target +{target}");
+        }
+    }
+
+    #[test]
+    fn several_levels_held_takes_the_strongest() {
+        // Raise-only means the target is a floor, so the best copy is the one the intent points
+        // at -- and it is the only tie-break that does not depend on inventory ORDER.
+        let bag = [
+            SERPENT_HUNTER_BASE + 3,
+            SERPENT_HUNTER_BASE,
+            SERPENT_HUNTER_BASE + 9,
+            SERPENT_HUNTER_BASE + 1,
+        ];
+        assert_eq!(
+            held_row_to_equip(SERPENT_HUNTER_BASE, bag.iter().copied()),
+            Some(SERPENT_HUNTER_BASE + 9)
+        );
+        // Order-independence, stated: reversing the walk cannot change the answer.
+        assert_eq!(
+            held_row_to_equip(SERPENT_HUNTER_BASE, bag.iter().rev().copied()),
+            Some(SERPENT_HUNTER_BASE + 9)
+        );
+    }
+
+    #[test]
+    fn an_empty_bag_and_a_neighbouring_row_both_decline() {
+        assert_eq!(held_row_to_equip(SERPENT_HUNTER_BASE, []), None);
+        // A different weapon row, and one that is only a near-miss on the base arithmetic.
+        assert_eq!(
+            held_row_to_equip(
+                SERPENT_HUNTER_BASE,
+                [
+                    1_000_000,
+                    SERPENT_HUNTER_BASE - 100,
+                    SERPENT_HUNTER_BASE + 100
+                ]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_protector_in_the_walk_is_never_mistaken_for_a_level() {
+        // Category nibble 0x1. `decode_weapon_id` guards on it, so the row arithmetic never runs
+        // on a protector -- a caller that hands this the whole bag gets None, not a wrong slot.
+        const PROTECTOR: i32 = 0x1003_3450;
+        assert_eq!(held_row_to_equip(SERPENT_HUNTER_BASE, [PROTECTOR]), None);
+        assert_eq!(
+            held_row_to_equip(SERPENT_HUNTER_BASE, [PROTECTOR, SERPENT_HUNTER_BASE + 2]),
+            Some(SERPENT_HUNTER_BASE + 2)
+        );
+    }
+
+    #[test]
+    fn the_receive_path_is_deliberately_left_alone() {
+        // The fix must NOT become "stop raising everywhere". A received weapon still has a grant
+        // coming that deposits `base + target`, so its queue entry still has to be raised --
+        // that is #296/#302/#303, and the module below is what pins it.
+        let bag = Bag { held_normal: 3 };
+        assert_eq!(
+            apply_auto_upgrade(&bag, true, SERPENT_HUNTER_BASE),
+            17_030_003
+        );
+    }
+}
+
 #[cfg(test)]
 mod auto_equip_queue_matches_bag {
     use crate::auto_equip::enqueue_id;

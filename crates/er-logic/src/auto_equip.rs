@@ -128,6 +128,59 @@ pub fn enqueue_id(hook: &dyn GameHook, auto_upgrade_on: bool, full_id: i32) -> i
     crate::upgrades::apply_auto_upgrade(hook, auto_upgrade_on, full_id)
 }
 
+/// Which weapon ALREADY IN THE BAG should be put in the player's hand for base row `base`?
+///
+/// `owned_weapon_full_ids` is every WEAPON FullID the bag currently holds. Returns the FullID to
+/// queue -- the highest reinforce level of `base` the player actually owns -- or `None` if they
+/// own no level of it.
+///
+/// MOTIVATING CASE (rule 11), boblerrr 2026-08-07 18:31:38. #101 made the Rykard equip follow the
+/// FIGHT instead of the grant, and it enqueued `SERPENT_HUNTER_BASE` down the ordinary receive
+/// path -- through [`enqueue_id`], which raises the id to the player's auto_upgrade target. His
+/// log shows the raise happening on the equip tick:
+///
+/// ```text
+/// boss-grant: healthbar npc_param 47101038 = chr 4710, IS Rykard | c4710 loaded = yes |
+///             already holds the spear = yes -> no grant
+/// auto_upgrade: 0x103db70 -> 0x103db73 (enqueue)
+/// boss-grant: Rykard's healthbar is up and the spear was already in the bag -- putting it in
+///             your hand
+/// ```
+///
+/// `17030000 -> 17030003`. The drain then looks the queued id up in the bag by EXACT FullID, and
+/// his spear had been granted hours earlier at `+0`, when the target still WAS `+0`. Nothing
+/// matched, the entry went back on `still_pending`, and it retried in silence for the rest of the
+/// session -- his log has the banner above and no `auto_equip: slot ... <-` line anywhere after it.
+///
+/// THE RAISE IS CORRECT FOR A RECEIVE AND WRONG HERE, AND THE DIFFERENCE IS A PREMISE, NOT A
+/// NUMBER. [`enqueue_id`]'s own contract names it: "the grant path independently runs
+/// [`crate::upgrades::apply_auto_upgrade`] on the item's way into the bag". The raise exists so the
+/// queue agrees with what a grant is ABOUT TO DEPOSIT. This path has no grant -- the item is
+/// already in the bag, banked at whatever the target was on the day it arrived -- so there is
+/// nothing coming to reconcile the queue against, and `base + today's target` is a row that will
+/// never exist. Ask the bag what it HAS instead of predicting what a grant WOULD put there.
+///
+/// HIGHEST, not nearest. `apply_auto_upgrade` is raise-only and its target is a floor, so when the
+/// player owns several levels of one row the strongest is the one the auto-upgrade intent points
+/// at. It is also the only tie-break that cannot depend on bag ORDER, which the caller's inventory
+/// walk does not promise.
+///
+/// Non-weapons and out-of-range rows decode to `None` and never match, so a caller that hands this
+/// a protector gets `None` rather than a wrong slot.
+pub fn held_row_to_equip(
+    base: i32,
+    owned_weapon_full_ids: impl IntoIterator<Item = i32>,
+) -> Option<i32> {
+    owned_weapon_full_ids
+        .into_iter()
+        .filter_map(|full_id| {
+            let (b, level) = crate::upgrades::decode_weapon_id(full_id)?;
+            (b == base).then_some((level, full_id))
+        })
+        .max_by_key(|&(level, _)| level)
+        .map(|(_, full_id)| full_id)
+}
+
 /// Is this received FullID a weapon? Retained for callers that only care about the weapon case.
 pub fn is_weapon(full_id: i32) -> bool {
     (full_id as u32) & CATEGORY_MASK == CATEGORY_WEAPON
