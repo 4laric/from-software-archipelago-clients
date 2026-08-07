@@ -42,6 +42,7 @@ mod runes;
 mod scadu_blessing;
 mod scaling;
 mod scout_proof;
+mod serpent_hunter;
 mod shop_flags;
 mod shop_icon;
 mod shop_preview;
