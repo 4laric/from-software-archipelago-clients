@@ -283,29 +283,40 @@ pub(crate) fn highest_held_level(somber: bool) -> Option<i32> {
     })
 }
 
-/// Does the bag hold ANY reinforce level of weapon base row `base`?
+/// WHICH level of weapon base row `base` does the bag hold -- as the FullID the equip queue needs?
 ///
 /// `None` = the bag was not reachable this tick. The caller must treat that as "don't know", NEVER
 /// as "no": this is the idempotency latch for `er_logic::boss_grants`, and reading an unresolvable
-/// bag as empty duplicates a unique weapon on every tick until it resolves.
+/// bag as empty duplicates a unique weapon on every tick until it resolves. `Some(None)` =
+/// readable, and the player owns no level of `base`.
+///
+/// THE ONE WAY TO ASK, ON PURPOSE (#413, boblerrr 2026-08-07 18:31:38). This replaces
+/// `holds_weapon_base`, which answered the same question with a DIFFERENT tolerance: it matched
+/// ANY reinforce level of the base row and said "yes, he has the spear", while the equip queue was
+/// separately handed `base + today's auto_upgrade target` and looked THAT up by exact FullID --
+/// which the bag did not have, because the spear had been banked at `+0`. Two reads with different
+/// tolerances contradicted each other for a whole session; one read that returns the id cannot.
+/// A caller wanting the old boolean derives it (`.map(|r| r.is_some())`) from THIS answer.
 ///
 /// Same typed walk as `walk_inventory_targets`, minus the caching -- it runs only while the player
-/// stands in one arena, so a fresh read every tick beats a stale answer.
-pub(crate) fn holds_weapon_base(base: i32) -> Option<bool> {
+/// stands in one arena, so a fresh read every tick beats a stale answer. The choice among held
+/// levels is `er_logic::auto_equip::held_row_to_equip`, not inlined here: this crate has no test
+/// targets, and an inline decision here is exactly the shape the 2026-08-04 inert-test audit (F1)
+/// found could be deleted with the workspace still green.
+pub(crate) fn held_weapon_row(base: i32) -> Option<Option<i32>> {
     // SAFETY: FD4 singleton (read-only walk). Err/None before the player is placed.
     let gdm = unsafe { GameDataMan::instance() }.ok()?;
     let pgd = gdm.main_player_game_data.as_ref();
-    for entry in pgd.equipment.equip_inventory_data.items_data.items() {
-        if entry.item_id.category() != ItemCategory::Weapon {
-            continue;
-        }
-        // param_id() strips the category nibble -> the resolved weapon row (base + level).
-        let row = entry.item_id.param_id() as i32;
-        if er_logic::boss_grants::is_level_of(row, base) {
-            return Some(true);
-        }
-    }
-    Some(false)
+    let owned = pgd
+        .equipment
+        .equip_inventory_data
+        .items_data
+        .items()
+        .filter(|e| e.item_id.category() == ItemCategory::Weapon)
+        // into_inner() keeps the category nibble: the FullID the equip queue and its bag lookup
+        // both speak. For weapons that nibble is 0, so it reads the same as the row.
+        .map(|e| e.item_id.into_inner() as i32);
+    Some(er_logic::auto_equip::held_row_to_equip(base, owned))
 }
 
 /// One full typed inventory walk: returns (highest normal +N, highest somber +N) across all held
