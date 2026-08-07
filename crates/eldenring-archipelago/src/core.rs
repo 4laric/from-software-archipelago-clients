@@ -3022,6 +3022,10 @@ impl shared::Core for Core {
         // 8b1. serpent_hunter: the wave SpEffect into the spear's resident slot (latched once
         // applied, re-armed on the in_world edge below -- a map load restores the vanilla row).
         crate::serpent_hunter::tick();
+        // 8b1b. ...and the same SpEffect on the PLAYER, every tick. The resident slot binds at
+        // EQUIP time (measured 2026-08-07 19:56:29), so the row write above is inert while the
+        // spear is already in hand -- which, across a map load, is the normal case.
+        crate::serpent_hunter::ensure_applied();
 
         // 8b2. no_equip_load: weightless-equipment SpEffect on the player (param edit + apply).
         crate::no_equip_load::tick();
