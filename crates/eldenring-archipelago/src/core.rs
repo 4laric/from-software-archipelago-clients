@@ -2898,6 +2898,10 @@ impl shared::Core for Core {
         let healthbar = crate::flags::boss_healthbar_npc_param_id();
         let rykard_fight_on =
             er_logic::boss_grants::healthbar_shows(er_logic::boss_grants::RYKARD_CHR_ID, healthbar);
+        // LIVE half of the serpent-hunter probe. Deliberately OUTSIDE `can_grant`: the whole
+        // point is to capture what the game had during the fight even on a tick where the grant
+        // path could not run, and it only reads.
+        crate::serpent_hunter::probe_fight(rykard_fight_on);
         if can_grant {
             // The latch is possession, never the Serpent-Hunter's obtained-flag: that flag is what
             // check 7771816 is keyed on, so latching on it would collect a check the player never
@@ -3014,6 +3018,10 @@ impl shared::Core for Core {
 
         // 8b. no_weapon_requirements runtime param zeroing (latched once applied).
         crate::no_weapon_reqs::tick();
+
+        // 8b1. serpent_hunter: the wave SpEffect into the spear's resident slot (latched once
+        // applied, re-armed on the in_world edge below -- a map load restores the vanilla row).
+        crate::serpent_hunter::tick();
 
         // 8b2. no_equip_load: weightless-equipment SpEffect on the player (param edit + apply).
         crate::no_equip_load::tick();
@@ -3172,6 +3180,11 @@ impl shared::Core for Core {
             // EquipParamWeapon.proper_* / Magic.requirement_*. Opt-in option, so a post-load revert
             // is quiet and reads to the player as the option simply not working.
             crate::no_weapon_reqs::reset();
+            // EquipParamWeapon 17030000's resident SpEffect slot. Same revert-on-load shape as
+            // the line above, and the same reason it must re-arm: without this the spear's waves
+            // work until the player's first load and then stop, which reads as flaky rather than
+            // absent and is strictly harder to diagnose.
+            crate::serpent_hunter::reset();
             // The SpEffectParam pair, ruled on together as their docs ask: one row write each
             // (20012080 allItemWeightChangeRate, 20010827 fallDamageRate). The player keeps
             // carrying the row across a load, so a reverted row is a buff that is present and does

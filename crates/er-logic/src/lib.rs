@@ -61,6 +61,7 @@ pub mod scadu_blessing_replay;
 pub mod scaling;
 pub mod scaling_settle;
 pub mod seed_change;
+pub mod serpent_hunter;
 pub mod shop_echo;
 pub mod shop_repoint;
 pub mod shop_repoint_replay;
