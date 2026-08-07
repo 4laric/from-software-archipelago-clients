@@ -2915,14 +2915,15 @@ impl shared::Core for Core {
             // tell the design from a defect. Keyed on the (healthbar, presence) pair so it lands
             // at most once per boss fight entered rather than every tick, the same shape as
             // kick-watch's KICK_WATCH_LAST_PR.
+            // 🛑 The `swap` is the LEFT operand on purpose: it carries the side effect of
+            // recording this tick's key, so it must run on every tick regardless of what the
+            // right-hand side decides. Short-circuiting can only ever skip the RIGHT side.
             let diag_key = er_logic::boss_grants::diag_key(healthbar, boss_present);
             if BOSS_GRANT_DIAG_LAST.swap(diag_key, std::sync::atomic::Ordering::Relaxed) != diag_key
-            {
-                if let Some(d) =
+                && let Some(d) =
                     er_logic::boss_grants::grant_diagnosis(healthbar, boss_present, holds)
-                {
-                    log::info!("{d}");
-                }
+            {
+                log::info!("{d}");
             }
             let mut game = EldenRingHook;
             if let Some(m) = er_logic::boss_grants::tick(&mut game, boss_present, holds) {
