@@ -1237,7 +1237,7 @@ pub fn tier_multiplier(tier: usize) -> f32 {
 ///
 ///   `Liurnia - enemy scaling 4.12x (tier 10 of 19)`      (uncapped seed: the band IS the ladder)
 ///   `Liurnia - enemy scaling 4.12x (tier 7 of 12)`       (floor 3, ceiling 15)
-///   `Liurnia - enemy scaling not set for this area; using the floor, 1.14x`
+///   `Liurnia - enemy scaling not set for this area; enemies here are unchanged`
 ///
 /// The NUMBER is the point. A tier index alone means nothing to a player, and "hard" means nothing
 /// either; `4.12x` is a thing you can compare to your own weapon. The tier fraction rides along so
@@ -1287,6 +1287,44 @@ pub fn region_scaling_toast(
             "{} - enemy scaling not set for this area; enemies here are unchanged",
             region
         ),
+    }
+}
+
+/// The same sentence [`region_scaling_toast`] says ONCE on entry, available to be ASKED at any
+/// time -- the tracker's persistent "what is my scaling here" row.
+///
+/// ⭐ THE ENTRY TOAST IS NOT A QUERYABLE SURFACE, AND THAT IS WHAT THIS FIXES. It fires once per
+/// region per session and is then gone, so a player who was not looking has no way to get the
+/// answer back. bobler asked "how to view my scaling" on 2026-08-07 after a morning of watching
+/// our toasts scroll past -- the information was being delivered and was still unavailable.
+///
+/// 🛑 `name: None` IS THE ANSWER, NOT A FAILURE. [`region_name_for_bucket`] returns `None` for the
+/// geometry that names no region -- Roundtable, the tutorial, unmapped sub-areas -- and those are
+/// exactly the places the sweep declines outright (`tier_for_region -> None`, PR #82). The entry
+/// toast stays SILENT there, correctly: an announcement nobody asked for should not fire on a
+/// non-event. A row the player deliberately opened is the opposite case, and silence there reads
+/// as a broken feature rather than as an answer. So this is the first live path by which
+/// [`RegionScaling::Unscaled`] can reach a player at all: the sweep returns before the toast is
+/// ever built, and `on_region` refuses an unnamed bucket, so the variant was unsayable in-game.
+///
+/// The `(None, Known(_))` pairing cannot arise -- `region_locks::REGION_LOCKS` and the apworld's
+/// `regionSphereTargetRanges` are generated from the same `REGION_PLAY_IDS`, so a bucket the wire
+/// can target is a bucket we can name (`an_unnamed_bucket_is_always_unscaled` pins the direction
+/// that matters). It is still rendered as unscaled rather than asserted on: a row that panics is
+/// worse than a row that under-claims.
+///
+/// STOP: ASCII ONLY, for the reason on [`region_scaling_toast`] -- this is drawn by the same font.
+pub fn region_scaling_line(
+    name: Option<&str>,
+    scaling: RegionScaling,
+    floor_tier: usize,
+    ceiling_tier: usize,
+) -> String {
+    match name {
+        Some(n) => region_scaling_toast(n, scaling, floor_tier, ceiling_tier),
+        // Deliberately NOT routed through `region_scaling_toast` with a placeholder name: every
+        // phrasing of that ("This area - ... not set for this area") reads as a bug.
+        None => "This spot is not part of a scaled region; enemies here are unchanged".to_string(),
     }
 }
 
@@ -1865,12 +1903,80 @@ mod tests {
                 region_scaling_toast("Farum Azula", RegionScaling::Unscaled, 0, NUM_TIERS - 1),
                 region_scaling_toast("Farum Azula", RegionScaling::Known(tier), 3, 15),
                 region_scaling_toast("Farum Azula", RegionScaling::Known(tier), 7, 7),
+                // The tracker row is drawn by the SAME font, so it is bound by the same rule --
+                // including the unnamed-bucket sentence, which has no other caller to catch it.
+                region_scaling_line(
+                    Some("Farum Azula"),
+                    RegionScaling::Known(tier),
+                    0,
+                    NUM_TIERS - 1,
+                ),
+                region_scaling_line(None, RegionScaling::Unscaled, 0, NUM_TIERS - 1),
             ] {
                 assert!(
                     s.is_ascii(),
                     "toast is drawn by the GAME's font, which has no glyph for non-ASCII: {s:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_row_repeats_the_toast_verbatim_for_a_named_region() {
+        // MOTIVATING CASE (rule 11): bobler asked "how to view my scaling" on 2026-08-07 having
+        // watched our toasts all morning -- the entry announcement is not a queryable surface.
+        // The fix is to say the SAME sentence on demand, and the whole point of routing the row
+        // through `region_scaling_toast` is that the two can never drift into disagreeing about
+        // the same region. A second format string would have been the bug.
+        for tier in 0..=NUM_TIERS + 1 {
+            for (floor, ceiling) in [(0, NUM_TIERS - 1), (3, 15), (7, 7)] {
+                assert_eq!(
+                    region_scaling_line(
+                        Some("Liurnia"),
+                        RegionScaling::Known(tier),
+                        floor,
+                        ceiling
+                    ),
+                    region_scaling_toast("Liurnia", RegionScaling::Known(tier), floor, ceiling),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unnamed_bucket_never_states_a_number() {
+        // The Chapel / Roundtable / unmapped case, and the reason the row exists at all: the sweep
+        // returns at `tier_for_region -> None` BEFORE any toast is built, so before this there was
+        // no path by which a player could be told "nothing is applied here". Saying it is the
+        // answer to the 2026-08-07 tutorial question in one glance.
+        //
+        // 🛑 The assertion is the same one `RegionScaling::Unscaled` was rebuilt around (PR #82):
+        // NO tier and NO multiplier, because any number here would be a difficulty statement about
+        // a region we deliberately refused to make one about.
+        let s = region_scaling_line(None, RegionScaling::Unscaled, 0, NUM_TIERS - 1);
+        assert!(
+            !s.contains('x'),
+            "the row must not name a multiplier: {s:?}"
+        );
+        assert!(!s.contains("tier"), "the row must not name a tier: {s:?}");
+        assert!(
+            s.contains("unchanged"),
+            "the row must say what is true: {s:?}"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_bucket_is_always_unscaled() {
+        // `(None, Known(_))` cannot arise -- REGION_LOCKS and the apworld's
+        // regionSphereTargetRanges are generated from the same REGION_PLAY_IDS, so a bucket the
+        // wire can target is one we can name. This pins the DIRECTION that matters if that ever
+        // stops being true: an unnameable bucket must degrade to "unchanged" rather than leak a
+        // multiplier for a place whose name we could not resolve.
+        for tier in 0..=NUM_TIERS + 1 {
+            assert_eq!(
+                region_scaling_line(None, RegionScaling::Known(tier), 0, NUM_TIERS - 1),
+                region_scaling_line(None, RegionScaling::Unscaled, 0, NUM_TIERS - 1),
+            );
         }
     }
 
