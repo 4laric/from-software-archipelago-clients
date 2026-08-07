@@ -383,7 +383,10 @@ fn mode_3_is_the_floor_alone_and_never_global() {
     );
 
     // The predicate the tick reads to decide whether to touch the clone row at all.
-    assert!(!applies_globally(3), "mode 3 must NEVER drive the clone row");
+    assert!(
+        !applies_globally(3),
+        "mode 3 must NEVER drive the clone row"
+    );
     assert!(!applies_globally(0));
     assert!(applies_globally(1));
     assert!(applies_globally(2));

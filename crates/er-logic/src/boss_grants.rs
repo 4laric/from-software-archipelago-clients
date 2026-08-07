@@ -78,9 +78,8 @@ pub const RYKARD_CHR_ID: i32 = 4710;
 /// What replaced it is structural: `NpcParam` ids are CHR-ENCODED, `CCCC____`. Verified on two
 /// independent characters -- `c4710` has 6 rows (47100000, 47100038, 47101000, 47101038, 47102000,
 /// 47109000) and Torrent `c8000` has exactly one (80000000).
-pub const RYKARD_NPC_PARAM_ROWS: &[i32] = &[
-    47100000, 47100038, 47101000, 47101038, 47102000, 47109000,
-];
+pub const RYKARD_NPC_PARAM_ROWS: &[i32] =
+    &[47100000, 47100038, 47101000, 47101038, 47102000, 47109000];
 
 /// 🛑 THE FLAG THIS MODULE MUST NEVER TOUCH -- see property 1.
 pub const SERPENT_HUNTER_CHECK_FLAG: u32 = 16007690;
@@ -184,7 +183,10 @@ mod tests {
     #[test]
     fn reinforce_levels_all_belong_to_the_base() {
         for level in 0..=25 {
-            assert!(is_level_of(SERPENT_HUNTER_BASE + level, SERPENT_HUNTER_BASE));
+            assert!(is_level_of(
+                SERPENT_HUNTER_BASE + level,
+                SERPENT_HUNTER_BASE
+            ));
         }
         assert!(!is_level_of(SERPENT_HUNTER_BASE + 100, SERPENT_HUNTER_BASE));
         assert!(!is_level_of(SERPENT_HUNTER_BASE - 1, SERPENT_HUNTER_BASE));
@@ -203,10 +205,18 @@ mod tests {
     #[test]
     fn an_unknown_read_never_grants() {
         for holds in [Some(true), Some(false), None] {
-            assert_eq!(boss_grant_action(None, holds), None, "unknown presence granted");
+            assert_eq!(
+                boss_grant_action(None, holds),
+                None,
+                "unknown presence granted"
+            );
         }
         for present in [Some(true), Some(false), None] {
-            assert_eq!(boss_grant_action(present, None), None, "unknown bag granted");
+            assert_eq!(
+                boss_grant_action(present, None),
+                None,
+                "unknown bag granted"
+            );
         }
     }
 
@@ -258,8 +268,14 @@ mod tests {
 
     #[test]
     fn the_pause_lifts_when_the_fight_ends_or_the_read_fails() {
-        assert!(!should_pause_weapon_equips(Some(false), true, true), "boss gone -> resume");
-        assert!(!should_pause_weapon_equips(None, true, true), "unknown -> resume, never latch");
+        assert!(
+            !should_pause_weapon_equips(Some(false), true, true),
+            "boss gone -> resume"
+        );
+        assert!(
+            !should_pause_weapon_equips(None, true, true),
+            "unknown -> resume, never latch"
+        );
     }
 
     #[test]
