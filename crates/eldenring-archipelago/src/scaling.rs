@@ -266,13 +266,34 @@ pub fn configure(sd: &Value) {
     let requested = er_logic::options::parse_bool_option(sd, "completion_scaling");
     let cfg = er_logic::scaling::parse_scaling_config(sd);
     match (&cfg, requested) {
-        (Some(c), _) => log::info!(
-            "enemy-scaling: enabled ({:?}), {} region targets, max {}, floor tier {}",
-            c.basis,
-            c.region_targets.len() + c.region_ranges.len(),
-            c.max_target,
-            c.floor_tier
-        ),
+        (Some(c), _) => {
+            // THE BAND, NOT JUST ITS FLOOR. `completion_scaling_ceiling` reached the log only
+            // inside the truncated `options = {...}` blob, and it is not cosmetic: it clamps
+            // every resolved tier AND supplies the denominator the entry toast prints ("tier 3
+            // of 12"). Reading a seed's difficulty off this line used to require the ceiling and
+            // not have it. Multipliers alongside the indices because a tier number means nothing
+            // to anyone reading a player's log.
+            // SAME CLAMP ORDER as `region_scaling_toast` / `tier_for_target` -- ceiling first,
+            // then floor into it -- so this headline and the in-game toast can never disagree
+            // about where the seed's band starts.
+            let ceiling_tier = c.ceiling_tier.min(NUM_TIERS - 1);
+            let floor_tier = c.floor_tier.min(ceiling_tier);
+            let floor = tier_rates(floor_tier);
+            let ceil = tier_rates(ceiling_tier);
+            log::info!(
+                "enemy-scaling: enabled ({:?}), {} region targets, max {}, band = tier {} ({:.2}x \
+                 HP / {:.2}x atk) .. tier {} ({:.2}x HP / {:.2}x atk)",
+                c.basis,
+                c.region_targets.len() + c.region_ranges.len(),
+                c.max_target,
+                floor_tier,
+                floor.hp,
+                floor.attack,
+                ceiling_tier,
+                ceil.hp,
+                ceil.attack,
+            );
+        }
         (None, true) => {
             // R6 (SWEEP H4): with an empty/missing map, arming would resolve every region to
             // floor_tier and the sweep would strip baked vanilla scaling from EVERY loaded enemy
@@ -281,7 +302,19 @@ pub fn configure(sd: &Value) {
                 "completion_scaling requested but regionSphereTargets is empty -- enemy scaling left VANILLA"
             );
         }
-        (None, false) => {}
+        (None, false) => {
+            // 🛑🛑 SAY IT. This arm used to be empty, and silence was carrying four meanings at
+            // once: scaling off, slot_data not parsed, the feature broken, or "you are grepping
+            // for the wrong string". On 2026-08-07 I read a scaling-OFF log, told Alaric to have
+            // the player grep for the decline line, and that grep would have returned nothing --
+            // which I would have read as evidence of an old client. A feature that is off on
+            // purpose must say so, precisely BECAUSE it then emits nothing else all session.
+            log::info!(
+                "enemy-scaling: DISABLED for this seed (completion_scaling is off) -- every enemy \
+                 keeps its vanilla scaling everywhere, and no further 'enemy-scaling:' line will \
+                 appear in this log. Difficulty complaints on this seed are vanilla or another mod."
+            );
+        }
     }
     *CONFIG.lock().unwrap() = cfg;
     // New config = new tiers: the region-entry announcements start over. A poisoned lock only
@@ -1001,8 +1034,9 @@ fn note_unmapped(region: i32) {
     *last = Some(region);
     log::info!(
         "enemy-scaling: region {region} is not in the sphere wire -- left VANILLA (no tier, no \
-         down-state). Unkept and sealed regions are still walkable, so this is expected there; at \
-         connect it is also normal until the game resolves a region."
+         down-state). Expected in Roundtable, in the tutorial/Chapel, and transiently at connect \
+         before the game resolves a region. NOT expected anywhere you can fight: every region's \
+         buckets are wired, and a sealed region ejects rather than letting you walk it."
     );
 }
 
