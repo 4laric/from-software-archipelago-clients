@@ -45,6 +45,12 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         play_regions: &[69400, 69410],
     },
     BakedRegionLock {
+        region: "Ashen Capital",
+        lock_item: "Ashen Capital Lock",
+        open_flag: Some(71122),
+        play_regions: &[11050, 19000],
+    },
+    BakedRegionLock {
         region: "Belurat",
         lock_item: "Belurat Lock",
         open_flag: Some(72001),
@@ -114,7 +120,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Leyndell",
         lock_item: "Leyndell Lock",
         open_flag: Some(76980),
-        play_regions: &[11000, 11050, 19000],
+        play_regions: &[11000],
     },
     BakedRegionLock {
         region: "Limgrave",
