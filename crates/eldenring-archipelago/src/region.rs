@@ -567,7 +567,12 @@ fn parse_grace_attunement(v: Option<&Value>) -> HashMap<String, GraceGate> {
         let nums = |k: &str| -> Vec<u32> {
             e.get(k)
                 .and_then(|x| x.as_array())
-                .map(|a| a.iter().filter_map(|n| n.as_u64()).map(|n| n as u32).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_u64())
+                        .map(|n| n as u32)
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         let gate = GraceGate {
