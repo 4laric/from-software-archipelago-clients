@@ -937,8 +937,38 @@ pub struct ScalingConfig {
     pub ceiling_tier: usize,
 }
 
-/// Map a raw target to a tier index in `[floor_tier, NUM_TIERS)`. `max_target <= 0` → the floor tier.
-/// Monotonic in `target`.
+/// Map a raw target to a tier index in `[floor_tier, ceiling_tier]`. `max_target <= 0` → the floor
+/// tier. Monotonic in `target`.
+///
+/// 🛑🛑 IT USED TO NORMALISE TO THE LADDER AND CLAMP AFTERWARDS, WHICH THREW AWAY THE TOP OF EVERY
+/// CAPPED RAMP. `round(frac * 19).clamp(floor, ceiling)` spends the run's depth fraction on the full
+/// 20-rung ladder and then discards whatever exceeds the ceiling — so on a capped seed the deepest
+/// regions do not merely *reach* the cap, they SATURATE on it and become indistinguishable.
+///
+/// Measured on boblerrr's 2026-08-07 session (`completion_scaling_ceiling: 4.844` = tier 11, six
+/// distinct sphere targets on a 2000 grid):
+///
+/// | target | raw `frac * 19` | applied |
+/// |--------|-----------------|---------|
+/// | 0      | 0.0             | 0       |
+/// | 2000   | 3.8             | 4       |
+/// | 4000   | 7.6             | 8       |
+/// | 6000   | 11.4            | **11**  |
+/// | 8000   | 15.2            | **11**  |
+/// | 10000  | 19.0            | **11**  |
+///
+/// Three different depths, one tier: **the top 40% of that seed's spine was flat**, and the player
+/// reported it as "I reached tier 11 too fast" and "it skipped tier 2". Both symptoms are this one
+/// bug — coarse steps early because the ramp climbs at 1.9 tiers per 1000 target, then no steps at
+/// all once it hits the cap.
+///
+/// ⭐ `region_scaling_toast` ALREADY had the right model: it prints the rung as a position *within*
+/// `[floor, ceiling]`, because a tier index means nothing outside the band the seed chose. This
+/// function now agrees with the toast instead of contradicting it — before this fix a player on any
+/// of those three regions read the same `tier 11 of 11`.
+///
+/// 🛑 Lowering the ceiling ALONE makes saturation worse, not better: a lower cap is reached at a
+/// shallower target, so the flat zone grows. The band has to be re-spread, which is what this does.
 pub fn tier_for_target(
     target: i32,
     max_target: i32,
@@ -959,7 +989,11 @@ pub fn tier_for_target(
         return floor;
     }
     let frac = (target.max(0) as f32 / max_target as f32).clamp(0.0, 1.0);
-    let tier = (frac * (NUM_TIERS - 1) as f32).round() as usize;
+    // NORMALISE TO THE BAND, NOT THE LADDER. `frac` is this run's depth; the band [floor, ceiling]
+    // is the range the seed actually chose. Multiplying by `NUM_TIERS - 1` and clamping afterwards
+    // spends the fraction on rungs the seed forbade, and every one of those lands on the ceiling --
+    // so the deepest regions all collapse onto the same tier. See the saturation note above.
+    let tier = floor + (frac * (ceiling - floor) as f32).round() as usize;
     tier.clamp(floor, ceiling)
 }
 
@@ -1737,6 +1771,70 @@ mod tests {
         assert_eq!(tier_for_target(0, 100, 0, cap), 0);
         // uncapped is the previous behaviour, exactly.
         assert_eq!(tier_for_target(100, 100, 0, NUM_TIERS - 1), NUM_TIERS - 1);
+    }
+
+    /// MOTIVATING CASE (rule 11), from boblerrr's `archipelago-2026-08-07 (8).log`: six distinct
+    /// sphere targets on a 2000 grid under `completion_scaling_ceiling: 4.844` (= tier 11). The old
+    /// `round(frac * 19).clamp(..)` gave 0, 4, 8, 11, 11, 11 -- the deepest THREE regions collapsed
+    /// onto one tier, and the player felt it as "I reached tier 11 too fast".
+    ///
+    /// THE ASSERTION IS SATURATION, NOT SPECIFIC RUNGS. Pinning the exact tiers would freeze the
+    /// rounding and make any future ramp reshape look like a regression; what must never come back
+    /// is a capped ramp whose top is flat.
+    #[test]
+    fn a_capped_ramp_does_not_saturate_at_its_ceiling() {
+        let cap = 11;
+        let tiers: Vec<usize> = [0, 2000, 4000, 6000, 8000, 10000]
+            .iter()
+            .map(|&t| tier_for_target(t, 10000, 0, cap))
+            .collect();
+
+        // the band's ends are still exactly the band's ends
+        assert_eq!(tiers[0], 0, "shallowest region sits on the floor");
+        assert_eq!(tiers[5], cap, "deepest region sits on the ceiling");
+
+        // and the interior is SPREAD: every step strictly climbs, so no two depths tie.
+        for w in tiers.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "a capped ramp must keep climbing across the whole spine, got {tiers:?}"
+            );
+        }
+    }
+
+    /// The gap this suite had: EVERY capped assertion was an endpoint (`frac` 0 or 1), and every
+    /// interior assertion was uncapped -- where the old and new formulas are algebraically
+    /// identical. So the one combination that mattered, capped AND interior, was untested, which is
+    /// precisely where the saturation lived. A test that only checks endpoints cannot see a curve's
+    /// shape.
+    #[test]
+    fn the_interior_of_a_capped_ramp_is_distributed_across_the_band() {
+        // halfway up the run is halfway up the BAND, not halfway up the ladder then clamped.
+        assert_eq!(tier_for_target(50, 100, 0, 10), 5);
+        assert_eq!(tier_for_target(25, 100, 0, 8), 2);
+        // a floor shifts the band without compressing it
+        assert_eq!(tier_for_target(0, 100, 4, 12), 4);
+        assert_eq!(tier_for_target(50, 100, 4, 12), 8);
+        assert_eq!(tier_for_target(100, 100, 4, 12), 12);
+    }
+
+    /// A lower cap must not buy a flatter curve -- that was the trap in "just bring the ceiling
+    /// down". Under the old formula a tighter band saturated EARLIER; under this one it stays
+    /// spread, which is what makes lowering the cap a usable knob at all.
+    #[test]
+    fn a_tighter_ceiling_still_spreads_across_the_spine() {
+        for cap in [6, 9, 11, 15] {
+            let tiers: Vec<usize> = [0, 2000, 4000, 6000, 8000, 10000]
+                .iter()
+                .map(|&t| tier_for_target(t, 10000, 0, cap))
+                .collect();
+            assert_eq!(tiers[0], 0, "cap {cap}: floor end");
+            assert_eq!(tiers[5], cap, "cap {cap}: ceiling end");
+            assert!(
+                tiers.windows(2).all(|w| w[1] > w[0]),
+                "cap {cap} saturates: {tiers:?}"
+            );
+        }
     }
 
     #[test]
