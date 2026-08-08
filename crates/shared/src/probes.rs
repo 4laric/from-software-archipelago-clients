@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::info;
 
@@ -95,11 +96,26 @@ pub fn source(env_var: &str, key: &str) -> Option<String> {
     on.then(|| format!("apconfig probes.{key}"))
 }
 
+/// Has the active-probe line been emitted? See [`log_active`].
+static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
 /// Logs which probes are active, so "I turned it on and nothing happened" is answerable from the
 /// log rather than from a conversation.
 ///
 /// Takes the (env_var, key) pairs the caller cares about, because `shared` does not know them.
+///
+/// 🛑🛑 SELF-LATCHING, AND THAT IS NOT A CONVENIENCE. This shipped unlatched on 2026-08-08 and the
+/// natural call site is `core::update_live`, which runs EVERY TICK -- so boblerrr's first session
+/// on it logged `probes: none active` over two thousand times in ninety seconds. Its neighbours
+/// there (`warp_hook::install`, `esd_probe::install`) are all self-guarded one-shots, which is
+/// exactly why the call looked correct sitting among them.
+///
+/// The latch lives HERE rather than at the call site on purpose: a caller that has to remember is
+/// a caller that will forget, and the next probe added to the list would reintroduce it.
 pub fn log_active(pairs: &[(&str, &str)]) {
+    if ANNOUNCED.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let active: Vec<&str> = pairs
         .iter()
         .filter(|(env_var, key)| enabled(env_var, key))
@@ -148,6 +164,19 @@ mod tests {
     fn source_is_none_when_the_probe_is_off() {
         // No env var set for a name nothing uses, and no config installed in this test binary.
         assert_eq!(source("ER_A_PROBE_THAT_DOES_NOT_EXIST", "nope"), None);
+    }
+
+    /// The regression that put this latch here: unlatched, at a per-tick call site, it emitted
+    /// thousands of identical lines into a playtester's log.
+    #[test]
+    fn log_active_announces_at_most_once() {
+        // Two calls; the second must be a no-op. Asserted on the latch rather than on captured
+        // output, because the logger is process-global and a test must not depend on log capture.
+        ANNOUNCED.store(false, Ordering::Relaxed);
+        log_active(&[("ER_NOT_A_REAL_PROBE", "nope")]);
+        assert!(ANNOUNCED.load(Ordering::Relaxed), "first call must announce and latch");
+        log_active(&[("ER_NOT_A_REAL_PROBE", "nope")]);
+        assert!(ANNOUNCED.load(Ordering::Relaxed), "latch must stay set");
     }
 
     /// An absent key is absent, not false -- they are the same answer today, but the distinction is
