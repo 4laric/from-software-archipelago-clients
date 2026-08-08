@@ -138,6 +138,33 @@ pub(crate) fn sweepable_characters<T>(set: &ChrSet<T>) -> impl Iterator<Item = &
 where
     T: Subclass<ChrIns> + 'static,
 {
+    sweepable_characters_with_status(set).map(|(_status, chr)| chr)
+}
+
+/// The same walk, yielding each entry's `chr_load_status` alongside the character.
+///
+/// ⭐⭐⭐ ADDED 2026-08-08 TO ANSWER A QUESTION A HISTOGRAM CANNOT. boblerrr's Enir Ilim log showed
+/// **19 of 24 sampled enemies take the rung into their effect list while `max_hp` never moved**,
+/// held across four minutes -- and in the same sweeps the census read `active=4` while exactly
+/// **4 distinct entities' `max_hp` moved**. Three settles, 4 and 4 each time.
+///
+/// 🛑🛑 THAT IS A CORRELATION BETWEEN TWO AGGREGATES, AND ACTING ON IT IS PRECISELY THE MISTAKE
+/// THIS FILE ALREADY SHIPPED. `98a2362` narrowed the sweep to `chr_load_status == Active` on a
+/// reading of the enum's NAME, rejected ~99.5% of enemies, and reached players. The postmortem's
+/// rule is `COUNT, DO NOT FILTER` -- and its named follow-up is exactly this: make the per-entity
+/// state visible so the next log can settle it as a per-row fact instead of a coincidence of two
+/// totals. `Unloaded` is known to be the MAJORITY state of a live, fightable enemy, so the obvious
+/// reading ("only Active recomputes") predicts scaling would never work at all -- which it
+/// demonstrably does. The hypothesis is therefore UNDER-DETERMINED, not confirmed.
+///
+/// So: this changes no behaviour and filters nothing. It only lets the SAMPLE line say, per row,
+/// which state each enemy was in when we wrote to it.
+pub(crate) fn sweepable_characters_with_status<T>(
+    set: &ChrSet<T>,
+) -> impl Iterator<Item = (ChrLoadStatus, &mut T)>
+where
+    T: Subclass<ChrIns> + 'static,
+{
     let mut current = set.entries;
     let end = unsafe { current.add(set.capacity as usize) };
     std::iter::from_fn(move || {
@@ -152,10 +179,23 @@ where
             // COUNT, do not filter. A tally with no filter is evidence; a filter with no tally was
             // the bug (CONTRIBUTING rule 4 cuts both ways).
             STATUS_HIST[status_slot(status)].fetch_add(1, Ordering::Relaxed);
-            return Some(unsafe { chr_ins.as_mut() });
+            return Some((status, unsafe { chr_ins.as_mut() }));
         }
         None
     })
+}
+
+/// Short per-entity label for the SAMPLE line. Deliberately terse -- the sample tuple is already
+/// wide, and this rides on every row.
+fn status_label(s: ChrLoadStatus) -> &'static str {
+    match s {
+        ChrLoadStatus::Unloaded => "unloaded",
+        ChrLoadStatus::Initializing => "init",
+        ChrLoadStatus::Active => "active",
+        ChrLoadStatus::NetworkInitializing => "netinit",
+        ChrLoadStatus::ReadyForActivation => "ready",
+        ChrLoadStatus::Unloading => "unloading",
+    }
 }
 
 /// Stable index for a `ChrLoadStatus` in `STATUS_HIST`. Exhaustive on purpose: if upstream adds a
@@ -452,7 +492,7 @@ struct SweepTally {
     ///
     /// Capped, and emitted only when the census line changes -- a settled region prints nothing.
     /// ON by default (`ER_SCALING_SAMPLE=0` silences it); see `sampling` for why.
-    sample: Vec<(i32, i32, i32, i32, Vec<i32>)>,
+    sample: Vec<(i32, i32, i32, i32, &'static str, Vec<i32>)>,
     /// Distinct non-ladder ids found inside the clear range, capped. WITHOUT this the census says
     /// "199 of 240 enemies carried something we stripped" and cannot say WHAT -- and only 20 rows in
     /// all of `NpcParam` carry a non-ladder in-range effect innately, so nearly all of those 199 are
@@ -531,13 +571,14 @@ impl SweepTally {
         }
     }
 
-    fn note_sample(&mut self, chr: &ChrIns, carried: &[i32]) {
+    fn note_sample(&mut self, chr: &ChrIns, status: &'static str, carried: &[i32]) {
         if self.sample.len() < SAMPLE_CAP {
             self.sample.push((
                 chr.npc_param_id,
                 chr.npc_id,
                 chr.modules.data.hp,
                 chr.modules.data.max_hp,
+                status,
                 carried.to_vec(),
             ));
         }
@@ -688,10 +729,12 @@ pub fn tick() -> Option<String> {
     }
     let area_tier = area_tier_from_histogram(&tally.area_hist);
 
-    // PASS TWO -- decide and apply.
-    for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
+    // PASS TWO -- decide and apply. Uses the status-carrying walk so the SAMPLE line can state each
+    // enemy's load state PER ROW; nothing is filtered on it (see `sweepable_characters_with_status`).
+    for (status, chr) in sweepable_characters_with_status(&wcm.open_field_chr_set.base) {
         scale_one(
             chr,
+            status,
             target,
             target_tier,
             &player_handle,
@@ -701,9 +744,10 @@ pub fn tick() -> Option<String> {
         );
     }
     for slot in wcm.chr_sets.iter().flatten() {
-        for chr in sweepable_characters(slot) {
+        for (status, chr) in sweepable_characters_with_status(slot) {
             scale_one(
                 chr,
+                status,
                 target,
                 target_tier,
                 &player_handle,
@@ -755,9 +799,10 @@ pub fn tick() -> Option<String> {
     // chr_type, so the set an invader lands in no longer matters and no friendly is ever touched.
     // (ghost_chr_set is cosmetic bloodstain/message/replay playback -- non-interactive, left alone;
     // the census still watches it in case that assumption is ever wrong.)
-    for p in sweepable_characters(&wcm.player_chr_set) {
+    for (status, p) in sweepable_characters_with_status(&wcm.player_chr_set) {
         scale_hostile_phantom(
             &mut p.chr_ins,
+            status,
             target,
             target_tier,
             &player_handle,
@@ -766,9 +811,10 @@ pub fn tick() -> Option<String> {
             area_tier,
         );
     }
-    for c in sweepable_characters(&wcm.summon_buddy_chr_set) {
+    for (status, c) in sweepable_characters_with_status(&wcm.summon_buddy_chr_set) {
         scale_hostile_phantom(
             c,
+            status,
             target,
             target_tier,
             &player_handle,
@@ -852,7 +898,7 @@ pub fn tick() -> Option<String> {
             // for the sessions that are not running the experiment.
             log::info!(
                 "enemy-scaling: SAMPLE region {region} target {target} \
-                 (npc_param_id, npc_id, hp, max_hp, carried): {:?}",
+                 (npc_param_id, npc_id, hp, max_hp, load_status, carried): {:?}",
                 tally.sample
             );
         }
@@ -989,6 +1035,7 @@ fn area_sample_one(
 /// tier), so a co-op session's log names exactly what landed.
 fn scale_hostile_phantom(
     chr: &mut ChrIns,
+    status: ChrLoadStatus,
     target: i32,
     target_tier: usize,
     player_handle: &eldenring::cs::FieldInsHandle,
@@ -1003,6 +1050,7 @@ fn scale_hostile_phantom(
     let before = tally.scaled;
     scale_one(
         chr,
+        status,
         target,
         target_tier,
         player_handle,
@@ -1051,6 +1099,7 @@ fn note_unmapped(region: i32) {
 /// natively was is gone, so the next pass sees an unrunged enemy that genuinely has no rung.
 fn scale_one(
     chr: &mut ChrIns,
+    status: ChrLoadStatus,
     target: i32,
     target_tier: usize,
     player_handle: &eldenring::cs::FieldInsHandle,
@@ -1078,7 +1127,7 @@ fn scale_one(
         // BEFORE any early return: a settled enemy is still a data point, and once a region
         // converges the settled ones are the majority. Sampling only the mutated ones would show us
         // the population we changed rather than the population that is there.
-        tally.note_sample(chr, &carried);
+        tally.note_sample(chr, status_label(status), &carried);
     }
     if settled_on_target(&carried, target) {
         return; // carrying the tier and NOTHING else -- the only state worth leaving alone
