@@ -68,6 +68,7 @@ pub mod shop_repoint;
 pub mod shop_repoint_replay;
 pub mod start_backfill;
 pub mod static_lots;
+pub mod sweep_boss_names;
 pub mod sweep_flush;
 pub mod sweep_gate;
 pub mod sweep_view;
