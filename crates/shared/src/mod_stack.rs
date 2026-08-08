@@ -42,7 +42,7 @@
 //! stack out, which is the thing we could not do in August.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use log::{info, warn};
 
@@ -84,6 +84,28 @@ const OURS: &[&str] = &[
 /// foreign would manufacture a false positive on our own users; hiding it would lose a real
 /// signal. So it gets its own bucket and the reader decides.
 const AMBIGUOUS: &[&str] = &["menu"];
+
+/// Suffixes that NAME a specific third-party randomizer rather than merely proving one is present.
+///
+/// `*.randomizeopt` is thefifthmatt's ER Randomizer options file, which his output folder always
+/// carries. Confirmed from boblerrr's 2026-08-07 log, which listed `72131.randomizeopt` beside our
+/// DLL -- the first real matt output directory anyone here had seen, and the reason this list is
+/// evidence rather than a guess.
+///
+/// 🛑 A hit is a STRONG hint, not a proof, and a miss proves nothing at all: a user can rename or
+/// prune anything. It exists to short-circuit triage ("this is the matt stack") not to gate logic.
+const NAMED_RANDOMIZER_SUFFIXES: &[(&str, &str)] =
+    &[(".randomizeopt", "thefifthmatt ER Randomizer")];
+
+/// How many ancestor directories to inspect above the mod directory.
+///
+/// 🛑🛑 TWO IS NOT ARBITRARY, IT IS THE OBSERVED SHAPE. boblerrr's resolved mod directory was
+/// `...\ER-Archipelago-v0.3.7\me3\randomizer\dll` -- our DLL sits in a NESTED folder inside the
+/// host randomizer's tree, so a scan of that folder alone reports "no third-party data files" while
+/// matt's `regulation.bin` and `script/` sit one or two levels up, entirely unseen. The old probe
+/// was not wrong (its own wording scoped the negative to "HERE"), it was just looking at the wrong
+/// floor of the building.
+const ANCESTOR_DEPTH: usize = 2;
 
 /// One entry in the mod directory. Split out from the filesystem so [`classify`] is testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +151,29 @@ impl Report {
     /// in OUR directory", which is a narrower and honest claim.
     pub fn data_mod_present(&self) -> bool {
         !self.foreign.is_empty()
+    }
+
+    /// Names of third-party randomizers fingerprinted in this directory, if any.
+    ///
+    /// Scans every bucket, not just `other`: the point is to name the stack for a triager, and a
+    /// future rename could move a fingerprint file between buckets without changing what it means.
+    pub fn named_randomizers(&self) -> Vec<&'static str> {
+        let mut found = Vec::new();
+        let all = self
+            .foreign
+            .iter()
+            .chain(&self.ambiguous)
+            .chain(&self.ours)
+            .chain(&self.other);
+        for name in all {
+            let lower = name.to_lowercase();
+            for (suffix, label) in NAMED_RANDOMIZER_SUFFIXES {
+                if lower.ends_with(suffix) && !found.contains(label) {
+                    found.push(*label);
+                }
+            }
+        }
+        found
     }
 }
 
@@ -180,6 +225,27 @@ pub fn probe(dir: &Path) -> std::io::Result<Report> {
     Ok(classify(&entries))
 }
 
+/// `dir` plus up to [`ANCESTOR_DEPTH`] of its parents, nearest first, each with its own [`Report`].
+///
+/// Returned as a list rather than merged because WHERE a marker sits is the whole finding: a
+/// `regulation.bin` beside our DLL and one two levels up mean different things about the install,
+/// and flattening them would throw that away.
+pub fn probe_with_ancestors(dir: &Path) -> Vec<(PathBuf, std::io::Result<Report>)> {
+    let mut out = vec![(dir.to_path_buf(), probe(dir))];
+    let mut cursor = dir;
+    for _ in 0..ANCESTOR_DEPTH {
+        match cursor.parent() {
+            // A root has itself as an ancestor in some shapes; stop rather than loop or re-probe.
+            Some(parent) if parent != cursor && !parent.as_os_str().is_empty() => {
+                out.push((parent.to_path_buf(), probe(parent)));
+                cursor = parent;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
 /// Writes the provenance block into the log. Call once, immediately after the logger exists.
 ///
 /// Every line here is INFO: a co-loaded data mod is a supported configuration, not a fault. The
@@ -196,27 +262,70 @@ pub fn log_provenance() {
     };
     info!("mod stack: mod directory = {}", dir.display());
 
-    let report = match probe(dir) {
-        Ok(report) => report,
-        Err(err) => {
-            warn!("mod stack: could not read mod directory ({err}); no co-load information");
-            return;
-        }
-    };
+    // SCAN UPWARD TOO. Our DLL is routinely nested inside the host randomizer's own tree (see
+    // ANCESTOR_DEPTH), so probing only our own folder answers a narrower question than the one
+    // being asked.
+    let levels = probe_with_ancestors(dir);
+    let mut any_data_mod = false;
+    let mut named: Vec<&'static str> = Vec::new();
 
-    if report.data_mod_present() {
+    for (idx, (path, result)) in levels.iter().enumerate() {
+        let label = match idx {
+            0 => "mod directory".to_string(),
+            n => format!("{n} level(s) up"),
+        };
+        let report = match result {
+            Ok(report) => report,
+            Err(err) => {
+                // An unreadable ANCESTOR is ordinary (permissions, a drive root) and must not read
+                // as a fault; an unreadable mod directory already warned above.
+                info!(
+                    "mod stack: {label} ({}) not readable ({err})",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        for label in report.named_randomizers() {
+            if !named.contains(&label) {
+                named.push(label);
+            }
+        }
+        if report.data_mod_present() {
+            any_data_mod = true;
+            info!(
+                "mod stack: THIRD-PARTY DATA MOD at {label} ({}) -- {}.",
+                path.display(),
+                report.foreign.join(", ")
+            );
+        }
+    }
+
+    if any_data_mod {
         info!(
-            "mod stack: THIRD-PARTY DATA MOD present -- {} beside us. Stacking is supported \
-             (matt's enemy rando is the expected case), but treat this session as NON-VANILLA: \
-             enemy/arena bindings, params and FMG strings may not be the game's own.",
-            report.foreign.join(", ")
+            "mod stack: a co-loaded data mod is SUPPORTED (matt's enemy rando is the expected \
+             case), but treat this session as NON-VANILLA: enemy/arena bindings, params, ESD talk \
+             scripts and FMG strings may not be the game's own. Do not use this session as an \
+             oracle for vanilla ids."
         );
     } else {
         info!(
-            "mod stack: no third-party data files in our mod directory. NOTE this rules out a \
-             data mod HERE only -- a DLL-only mod, or one installed elsewhere, is invisible here."
+            "mod stack: no third-party data files in our mod directory or its {ANCESTOR_DEPTH} \
+             parents. NOTE a DLL-only mod, or a data mod installed further away, is still \
+             invisible here."
         );
     }
+    if !named.is_empty() {
+        info!(
+            "mod stack: fingerprinted randomizer(s): {}",
+            named.join(", ")
+        );
+    }
+
+    let report = match &levels[0].1 {
+        Ok(report) => report.clone(),
+        Err(_) => return,
+    };
     if !report.ambiguous.is_empty() {
         info!(
             "mod stack: ambiguous (ours ships these under ap-package/, so a top-level copy is \
@@ -231,6 +340,80 @@ pub fn log_provenance() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE MOTIVATING CASE (CONTRIBUTING rule 11), and the reason this change exists: boblerrr's
+    /// 2026-08-07 log said "no third-party data files in our mod directory" while he was demonstrably
+    /// running matt's enemy rando. His resolved mod directory was
+    /// `...\\ER-Archipelago-v0.3.7\\me3\\randomizer\\dll` -- our DLL nested inside the host
+    /// randomizer's tree, with the data one or two levels up and entirely out of scope.
+    ///
+    /// The old probe was not lying (its wording scoped the negative to "HERE"); it was standing on
+    /// the wrong floor. This asserts the shape that misled us cannot report a clean stack again.
+    #[test]
+    fn a_data_mod_one_level_above_us_is_not_missed() {
+        // what the `dll/` folder itself holds: nothing foreign
+        let ours = classify(&[
+            Entry::dir("ap-package"),
+            Entry::file("apconfig.json"),
+            Entry::file("eldenring_archipelago.dll"),
+            Entry::file("72131.randomizeopt"),
+        ]);
+        assert!(
+            !ours.data_mod_present(),
+            "the nested folder really does look clean -- that is the trap"
+        );
+
+        // ...and the parent, which is where matt actually installs
+        let parent = classify(&[
+            Entry::file("regulation.bin"),
+            Entry::dir("script"),
+            Entry::dir("msg"),
+        ]);
+        assert!(parent.data_mod_present());
+        assert_eq!(parent.foreign, vec!["msg/", "regulation.bin", "script/"]);
+    }
+
+    /// `script/` is the ESD talk-script tree, so its presence is what decides whether a session may
+    /// be used as an oracle for vanilla shop/talk ids. Pinned because the shop auto-hint probe
+    /// depends on this distinction.
+    #[test]
+    fn the_esd_script_tree_counts_as_a_data_mod() {
+        let report = classify(&[Entry::dir("script")]);
+        assert!(report.data_mod_present());
+        assert_eq!(report.foreign, vec!["script/"]);
+    }
+
+    /// The fingerprint that names matt rather than merely proving "some data mod". Taken verbatim
+    /// from boblerrr's directory listing -- the first real matt output folder we have seen.
+    #[test]
+    fn a_randomizeopt_file_names_the_randomizer() {
+        let report = classify(&[Entry::file("72131.randomizeopt")]);
+        assert_eq!(
+            report.named_randomizers(),
+            vec!["thefifthmatt ER Randomizer"]
+        );
+    }
+
+    #[test]
+    fn an_unfingerprinted_directory_names_nobody() {
+        let report = classify(&[Entry::file("apconfig.json"), Entry::dir("overlay")]);
+        assert!(report.named_randomizers().is_empty());
+    }
+
+    /// Walking up must terminate and must not re-probe a root as its own parent.
+    #[test]
+    fn ancestor_probing_terminates_at_the_root() {
+        let levels = probe_with_ancestors(Path::new("/"));
+        assert!(
+            levels.len() <= ANCESTOR_DEPTH + 1,
+            "got {} levels",
+            levels.len()
+        );
+        let mut seen = std::collections::HashSet::new();
+        for (path, _) in &levels {
+            assert!(seen.insert(path.clone()), "probed {path:?} twice");
+        }
+    }
 
     /// THE MOTIVATING CASE (CONTRIBUTING rule 11): boblerrr's directory, as we now know it to be --
     /// matt's randomizer output hosting our DLL. The probe must call this a data mod.
