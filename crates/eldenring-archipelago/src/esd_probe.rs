@@ -143,8 +143,8 @@ pub fn install() {
         return;
     }
     let _ = HOOK.set(hook);
-    let gate = shared::probes::source("ER_ESD_PROBE", "esd")
-        .unwrap_or_else(|| "unknown gate".to_string());
+    let gate =
+        shared::probes::source("ER_ESD_PROBE", "esd").unwrap_or_else(|| "unknown gate".to_string());
     log::info!(
         "ESD probe ACTIVE (via {gate}) -- logging every ESD talk command once per \
          (talk_id, event_id), and EVERY shop open (id {} buy / {} sell) with its arguments. \
