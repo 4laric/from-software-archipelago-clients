@@ -3933,12 +3933,23 @@ impl Core {
                 .sweep_flags
                 .iter()
                 .map(|(&flag, locs)| Row {
-                    boss: self.boss_defs.iter().find(|d| d.flag == flag).map(|d| {
-                        d.name
-                            .strip_prefix("Felled: ")
-                            .unwrap_or(d.name.as_str())
-                            .to_string()
-                    }),
+                    // slot_data WINS; the baked table is the fallback. `bossLockItems` is emitted
+                    // only when boss LOCKS are on, so most seeds report `0 boss-lock def(s)` and
+                    // every row used to degrade to its region name -- eight identical "Scadu Altus"
+                    // rows separable only by a raw flag (boblerrr, 2026-08-08).
+                    boss: self
+                        .boss_defs
+                        .iter()
+                        .find(|d| d.flag == flag)
+                        .map(|d| {
+                            d.name
+                                .strip_prefix("Felled: ")
+                                .unwrap_or(d.name.as_str())
+                                .to_string()
+                        })
+                        .or_else(|| {
+                            er_logic::sweep_boss_names::boss_name(flag).map(str::to_string)
+                        }),
                     region: locs
                         .first()
                         .and_then(|l| self.region_table.get(&(*l as u64)))
