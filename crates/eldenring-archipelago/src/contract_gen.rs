@@ -53,6 +53,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "capitalWorldBurnFlag", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "capitalPreBurnFlag", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "capitalReleaseRows", shape: Shape::TripleList, required: false, greenfield: true },
+    ContractKey { name: "graceAttunement", shape: Shape::Any, required: false, greenfield: true },
     ContractKey { name: "regionGraces", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "runeGatedGraces", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "greatRuneItemIds", shape: Shape::IntList, required: false, greenfield: true },
@@ -203,6 +204,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "d7d3a58e";
+pub const CONTRACT_HASH: &str = "5c2b9bf2";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.3.9";
 
