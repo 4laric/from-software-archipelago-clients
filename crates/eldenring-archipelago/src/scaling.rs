@@ -46,6 +46,27 @@ static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
 /// Ticks at the last sweep -- the repeat throttle. `None` = never swept, so the first allowed tick
 /// sweeps immediately instead of waiting for a modulo phase.
 static LAST_SWEEP_TICK: Mutex<Option<u32>> = Mutex::new(None);
+/// Everything about a sweep that does NOT vary per enemy, in one place.
+///
+/// Introduced 2026-08-08 because adding the per-entity `chr_load_status` pushed `scale_one` and
+/// `scale_hostile_phantom` to 8 positional arguments and clippy (`-D warnings`) refused them. The
+/// honest fix is not a shorter list -- it is noticing that five of those arguments are constant for
+/// the whole sweep and only two describe the enemy in hand.
+struct SweepCtx<'a> {
+    target: i32,
+    target_tier: usize,
+    player_handle: &'a eldenring::cs::FieldInsHandle,
+    sample_on: bool,
+    area_tier: Option<usize>,
+}
+
+/// One row of the per-enemy SAMPLE line:
+/// `(npc_param_id, npc_id, hp, max_hp, load_status, carried)`.
+///
+/// Named because clippy's `type_complexity` is right about the raw tuple, and because the field
+/// order is the thing a reader of a log line has to match up against.
+type SampleRow = (i32, i32, i32, i32, &'static str, Vec<i32>);
+
 /// Per-sweep tally of the `chr_load_status` of every entry we walked, indexed by `status_slot`.
 /// Diagnostic ONLY -- nothing filters on it. It exists because the last thing that DID filter on it
 /// rejected every enemy in the game, and no log at the time could say what the real states were.
@@ -492,7 +513,7 @@ struct SweepTally {
     ///
     /// Capped, and emitted only when the census line changes -- a settled region prints nothing.
     /// ON by default (`ER_SCALING_SAMPLE=0` silences it); see `sampling` for why.
-    sample: Vec<(i32, i32, i32, i32, &'static str, Vec<i32>)>,
+    sample: Vec<SampleRow>,
     /// Distinct non-ladder ids found inside the clear range, capped. WITHOUT this the census says
     /// "199 of 240 enemies carried something we stripped" and cannot say WHAT -- and only 20 rows in
     /// all of `NpcParam` carry a non-ladder in-range effect innately, so nearly all of those 199 are
@@ -731,30 +752,19 @@ pub fn tick() -> Option<String> {
 
     // PASS TWO -- decide and apply. Uses the status-carrying walk so the SAMPLE line can state each
     // enemy's load state PER ROW; nothing is filtered on it (see `sweepable_characters_with_status`).
+    let ctx = SweepCtx {
+        target,
+        target_tier,
+        player_handle: &player_handle,
+        sample_on,
+        area_tier,
+    };
     for (status, chr) in sweepable_characters_with_status(&wcm.open_field_chr_set.base) {
-        scale_one(
-            chr,
-            status,
-            target,
-            target_tier,
-            &player_handle,
-            &mut tally,
-            sample_on,
-            area_tier,
-        );
+        scale_one(chr, status, &ctx, &mut tally);
     }
     for slot in wcm.chr_sets.iter().flatten() {
         for (status, chr) in sweepable_characters_with_status(slot) {
-            scale_one(
-                chr,
-                status,
-                target,
-                target_tier,
-                &player_handle,
-                &mut tally,
-                sample_on,
-                area_tier,
-            );
+            scale_one(chr, status, &ctx, &mut tally);
         }
     }
     // HOSTILE-PHANTOM SWEEP -- revised 2026-07-19 (Alaric: "scaling works for mobs/bosses; NPC
@@ -800,28 +810,10 @@ pub fn tick() -> Option<String> {
     // (ghost_chr_set is cosmetic bloodstain/message/replay playback -- non-interactive, left alone;
     // the census still watches it in case that assumption is ever wrong.)
     for (status, p) in sweepable_characters_with_status(&wcm.player_chr_set) {
-        scale_hostile_phantom(
-            &mut p.chr_ins,
-            status,
-            target,
-            target_tier,
-            &player_handle,
-            &mut tally,
-            sample_on,
-            area_tier,
-        );
+        scale_hostile_phantom(&mut p.chr_ins, status, &ctx, &mut tally);
     }
     for (status, c) in sweepable_characters_with_status(&wcm.summon_buddy_chr_set) {
-        scale_hostile_phantom(
-            c,
-            status,
-            target,
-            target_tier,
-            &player_handle,
-            &mut tally,
-            sample_on,
-            area_tier,
-        );
+        scale_hostile_phantom(c, status, &ctx, &mut tally);
     }
 
     // ---- SETTLE RELEASE TELEMETRY (one line per transition) ------------------------------------
@@ -1036,28 +1028,15 @@ fn area_sample_one(
 fn scale_hostile_phantom(
     chr: &mut ChrIns,
     status: ChrLoadStatus,
-    target: i32,
-    target_tier: usize,
-    player_handle: &eldenring::cs::FieldInsHandle,
+    ctx: &SweepCtx<'_>,
     tally: &mut SweepTally,
-    sample_on: bool,
-    area_tier: Option<usize>,
 ) {
     if !is_hostile_phantom(chr.chr_type) {
         return;
     }
     let (ty, team, npc_id) = (chr.chr_type, chr.team_type, chr.npc_id);
     let before = tally.scaled;
-    scale_one(
-        chr,
-        status,
-        target,
-        target_tier,
-        player_handle,
-        tally,
-        sample_on,
-        area_tier,
-    );
+    scale_one(chr, status, ctx, tally);
     if tally.scaled > before {
         log::info!(
             "enemy-scaling: scaled hostile phantom (chr_type={ty:?} team={team} npc_id={npc_id})"
@@ -1097,16 +1076,14 @@ fn note_unmapped(region: i32) {
 /// either doing the whole thing or none of it -- and, because the sweep re-derives everything from
 /// what the enemy currently carries, it would also be irreversible: the evidence of what the enemy
 /// natively was is gone, so the next pass sees an unrunged enemy that genuinely has no rung.
-fn scale_one(
-    chr: &mut ChrIns,
-    status: ChrLoadStatus,
-    target: i32,
-    target_tier: usize,
-    player_handle: &eldenring::cs::FieldInsHandle,
-    tally: &mut SweepTally,
-    sample_on: bool,
-    area_tier: Option<usize>,
-) {
+fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally: &mut SweepTally) {
+    let SweepCtx {
+        target,
+        target_tier,
+        player_handle,
+        sample_on,
+        area_tier,
+    } = *ctx;
     if &chr.field_ins_handle == player_handle {
         return; // never scale the player
     }
