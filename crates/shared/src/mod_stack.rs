@@ -94,7 +94,8 @@ const AMBIGUOUS: &[&str] = &["menu"];
 ///
 /// 🛑 A hit is a STRONG hint, not a proof, and a miss proves nothing at all: a user can rename or
 /// prune anything. It exists to short-circuit triage ("this is the matt stack") not to gate logic.
-const NAMED_RANDOMIZER_SUFFIXES: &[(&str, &str)] = &[(".randomizeopt", "thefifthmatt ER Randomizer")];
+const NAMED_RANDOMIZER_SUFFIXES: &[(&str, &str)] =
+    &[(".randomizeopt", "thefifthmatt ER Randomizer")];
 
 /// How many ancestor directories to inspect above the mod directory.
 ///
@@ -278,7 +279,10 @@ pub fn log_provenance() {
             Err(err) => {
                 // An unreadable ANCESTOR is ordinary (permissions, a drive root) and must not read
                 // as a fault; an unreadable mod directory already warned above.
-                info!("mod stack: {label} ({}) not readable ({err})", path.display());
+                info!(
+                    "mod stack: {label} ({}) not readable ({err})",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -312,7 +316,10 @@ pub fn log_provenance() {
         );
     }
     if !named.is_empty() {
-        info!("mod stack: fingerprinted randomizer(s): {}", named.join(", "));
+        info!(
+            "mod stack: fingerprinted randomizer(s): {}",
+            named.join(", ")
+        );
     }
 
     let report = match &levels[0].1 {
@@ -381,7 +388,10 @@ mod tests {
     #[test]
     fn a_randomizeopt_file_names_the_randomizer() {
         let report = classify(&[Entry::file("72131.randomizeopt")]);
-        assert_eq!(report.named_randomizers(), vec!["thefifthmatt ER Randomizer"]);
+        assert_eq!(
+            report.named_randomizers(),
+            vec!["thefifthmatt ER Randomizer"]
+        );
     }
 
     #[test]
