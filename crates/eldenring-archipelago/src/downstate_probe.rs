@@ -160,8 +160,14 @@ fn armed() -> bool {
 }
 
 /// Player-subject mode: the trap-items question, not the #346 one.
+///
+/// 🛑 Goes through `shared::probes` like its two siblings. It was `env::var_os` ONLY,
+/// which made it the one probe in this file a playtester could not turn on from
+/// `apconfig.json` -- and asking a playtester to set an environment variable is exactly what
+/// the config gate was built to avoid. It silently cost a playtest round on 2026-08-08: the
+/// session ran with `probes: none active` and the trap measurement simply did not happen.
 fn player_mode() -> bool {
-    std::env::var_os("ER_DOWNSTATE_PROBE_PLAYER").is_some()
+    shared::probes::enabled("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player")
 }
 
 /// Ticks elapsed in player mode. Separate from [`Watch`] because the player needs no handle: it is

@@ -615,6 +615,7 @@ impl shared::Core for Core {
             ("ER_ESD_PROBE", "esd"),
             ("ER_DOWNSTATE_PROBE", "downstate"),
             ("ER_DOWNSTATE_PROBE_ARM", "downstate_arm"),
+            ("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player"),
         ]);
 
         // ESD talk-event probe (esd_probe.rs; shop auto-hints phase 1, er-archipelago#455).
