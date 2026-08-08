@@ -44,7 +44,39 @@
 //! ```text
 //! ER_DOWNSTATE_PROBE=1                 observe only: name a subject and dump its state
 //! ER_DOWNSTATE_PROBE=1 ER_DOWNSTATE_PROBE_ARM=1    also apply the pair, once, to one subject
+//! ER_DOWNSTATE_PROBE_PLAYER=1          make the PLAYER the subject (see below)
 //! ```
+//!
+//! ## Player-subject mode -- the TRAP-ITEMS question
+//!
+//! Everything measured so far applies a `20018xxx` row to an ENEMY. The trap-items design wants the
+//! mirror image: on the PLAYER, `maxHpRate 0.25` is "your HP is quartered" and the attack rows are
+//! "your damage is 30%". A whole graded family of traps falls out of work that is already
+//! datamined, measured and merged -- **if these rows read on the player at all.**
+//!
+//! Nobody has ever checked. The player is a `ChrIns` and these rows leave their targeting flags at
+//! 1, which is encouraging and is not evidence.
+//!
+//! Four deliberate differences from the enemy path:
+//!
+//! 1. **It applies `20018004` ONLY, not the pair.** `maxHpRate` is the sole effect of this block we
+//!    can READ on a `ChrIns` -- the crate exposes no attack field, so `20018002` would add an
+//!    unreadable variable and the one behavioural field in the block (`targetPriority`, whose
+//!    meaning on the player is undefined). One row, one number, one conclusion.
+//! 2. **It REMOVES the row when the watch finishes** and dumps again to prove it came off. These
+//!    rows are `effectEndurance -1`; on an enemy that is harmless because the enemy dies, but on
+//!    the player a permanent 0.25x max HP is a ruined session. Restore is a safety requirement
+//!    first and a second reading second -- a `max_hp` that drops AND comes back is a far stronger
+//!    result than one that merely drops.
+//! 3. **A death guard on every access**, because quartering max HP makes dying likely and iterating
+//!    `special_effect` at the death cam is this crate's original CTD (`er_logic::death_guard`).
+//! 4. **It runs on its own `instance_mut()` path and returns before the enemy code**, so the
+//!    shipped #346 instrument is not perturbed by the trap question sharing a file with it.
+//!
+//! 🛑 A pass here does NOT prove the attack half. It proves a `20018xxx` RATE COLUMN reaches the
+//! player's derived stats. The attack rows are the same block, same `spCategory`, same shape, so
+//! they very probably follow -- but "very probably" is the exact phrasing that broke enemy scaling
+//! once. Damage dealt is the only observable for attack and this probe does not read it.
 //!
 //! **The subject is whatever last hit you.** Let one trash enemy land a hit and it becomes the
 //! subject; the probe latches after one subject per session so it cannot cascade across a fight.
@@ -62,7 +94,7 @@
 //! Any of the three is a result. Attach the log to #346.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use eldenring::cs::{ChrIns, ChrInsExt, FieldInsHandle, WorldChrMan};
 use fromsoftware_shared::FromStatic;
@@ -70,6 +102,10 @@ use fromsoftware_shared::FromStatic;
 /// 0.25x HP, then 0.30x all-element attack. Applied in this order so that if the second call is the
 /// one that misbehaves, the log still shows the first one's outcome in isolation.
 const DOWNSTATE_PAIR: [i32; 2] = [20018004, 20018002];
+
+/// The single row used in player-subject mode: `maxHpRate 0.25`. See the module docs for why the
+/// PAIR is deliberately not used on the player.
+const PLAYER_PROBE_ROW: i32 = 20018004;
 
 /// One subject per session. A probe that WRITES must not be able to run twice by accident.
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -122,6 +158,17 @@ fn enabled() -> bool {
 fn armed() -> bool {
     std::env::var_os("ER_DOWNSTATE_PROBE_ARM").is_some()
 }
+
+/// Player-subject mode: the trap-items question, not the #346 one.
+fn player_mode() -> bool {
+    std::env::var_os("ER_DOWNSTATE_PROBE_PLAYER").is_some()
+}
+
+/// Ticks elapsed in player mode. Separate from [`Watch`] because the player needs no handle: it is
+/// resolved fresh from `main_player` every read, so there is nothing to store and match.
+static PLAYER_FRAMES: AtomicU32 = AtomicU32::new(0);
+/// Set once the row has been applied, so the tick knows to watch rather than re-apply.
+static PLAYER_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Log every scaling-relevant fact we can read off one enemy, and its whole active SpEffect list.
 ///
@@ -208,9 +255,76 @@ fn watch_step(wcm: &eldenring::cs::WorldChrMan) -> bool {
     true
 }
 
+/// Player-subject mode, self-contained: its own `instance_mut()`, its own counter, its own restore.
+///
+/// Kept entirely separate from the enemy path rather than threaded through it. The enemy probe is a
+/// SHIPPED instrument for #346 whose readings are already on the record, and a trap-items question
+/// arriving later has no business changing how it selects, applies or latches.
+fn player_tick() {
+    // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract
+    // `serpent_hunter` and `no_equip_load` rely on for their player writes.
+    let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
+        return;
+    };
+    let Some(player) = wcm.main_player.as_mut() else {
+        return;
+    };
+    // DEATH GUARD before ANY `special_effect` access, including the first dump. Not a failure --
+    // just try again next tick, once the player is alive and settled.
+    if er_logic::death_guard::lists_unsafe_to_touch(player.chr_ins.modules.data.hp) {
+        return;
+    }
+    let chr = &mut player.chr_ins;
+
+    if !PLAYER_ARMED.load(Ordering::Relaxed) {
+        dump(chr, "BEFORE (player)");
+        if !armed() {
+            log::info!(
+                "[downstate-probe] player mode, observe-only (set ER_DOWNSTATE_PROBE_ARM=1 to \
+                 apply {PLAYER_PROBE_ROW})"
+            );
+            DONE.store(true, Ordering::Relaxed);
+            return;
+        }
+        chr.apply_speffect(PLAYER_PROBE_ROW, false);
+        log::info!("[downstate-probe] applied {PLAYER_PROBE_ROW} to the PLAYER");
+        dump(chr, "AFTER (player, same tick -- too early to mean anything, see WATCH)");
+        PLAYER_ARMED.store(true, Ordering::Relaxed);
+        log::info!(
+            "[downstate-probe] watching the player's max_hp for {WATCH_DUMPS} reads at \
+             {WATCH_INTERVAL}-tick intervals, then removing {PLAYER_PROBE_ROW}"
+        );
+        return;
+    }
+
+    let frames = PLAYER_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if !frames.is_multiple_of(WATCH_INTERVAL) {
+        return;
+    }
+    let dumps = frames / WATCH_INTERVAL;
+    dump(chr, &format!("WATCH +{dumps}s (player)"));
+    if dumps < WATCH_DUMPS {
+        return;
+    }
+
+    // 🛑 RESTORE IS MANDATORY, not politeness. `PLAYER_PROBE_ROW` is `effectEndurance -1`, so
+    // without this the player carries 0.25x max HP for the rest of the session.
+    chr.remove_speffect(PLAYER_PROBE_ROW);
+    log::info!("[downstate-probe] removed {PLAYER_PROBE_ROW} from the player");
+    dump(chr, "RESTORED (player)");
+    DONE.store(true, Ordering::Relaxed);
+    log::info!("[downstate-probe] player watch complete -- latched for this session");
+}
+
 /// Per-tick entry point. Call from `update_live` while in-world; self-latching and env-gated.
 pub fn tick() {
     if !enabled() || DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    // Player mode is a different question with a different subject; it owns the tick outright and
+    // never reaches the enemy selection below.
+    if player_mode() {
+        player_tick();
         return;
     }
     let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {
