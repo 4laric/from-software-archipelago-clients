@@ -87,6 +87,20 @@ pub struct RegionConfig {
     pub lock_reveal_flags: HashMap<String, Vec<u32>>,
     /// lock item name -> grace warp-unlock flags.
     pub region_graces: HashMap<String, Vec<u32>>,
+    /// GRACE ATTUNEMENT (`graceAttunement`). Region lock name -> the gate for that region: touch
+    /// `threshold` of `members` (its non-anchor grace warp flags) and the rest (`bloom`) light.
+    ///
+    /// The apworld emits this ONLY for regions it decided to gate; a region absent here keeps the
+    /// whole-bundle behaviour, which is the off default and also what small regions get (the gate is
+    /// skipped where `members.len() <= threshold`, since traversal is not the problem there).
+    ///
+    /// ⭐⭐⭐ NO SESSION STATE, AND THAT IS NOT AN OVERSIGHT. `crate::attunement`'s check-based twin
+    /// needs `pending` / `attuned_latched` / `bloom_lit` because it counts the SERVER checked set,
+    /// which is external and re-snapshots on reconnect. This one counts GRACE FLAGS, which live in
+    /// the player's SAVE -- so the count re-derives identically after any reconnect, and the bloom
+    /// flags are their own latch exactly as `tick_grace_items` uses "the grace flag itself as the
+    /// latch". Nothing to prime, nothing to replay, no double-banner to defend against.
+    pub grace_attunement: HashMap<String, GraceGate>,
     /// grace_rando: "Grace: ..." item name -> that grace's warp-unlock flag (slot_data graceItems).
     pub grace_items: HashMap<String, u32>,
     /// region (lock name) -> disjunction of natural-key clauses. When ANY clause holds, the region's
@@ -152,6 +166,7 @@ pub fn parse(sd: &Value) -> RegionConfig {
         lock_reveal_flags: str_to_u32vec(sd.get("lockRevealFlags")),
         region_graces: str_to_u32vec(sd.get("regionGraces")),
         grace_items: str_to_u32(sd.get("graceItems")),
+        grace_attunement: parse_grace_attunement(sd.get("graceAttunement")),
         natural_key_triggers: parse_natural_keys(sd.get("naturalKeyTriggers")),
         lock_grant_items: str_to_i32vec(sd.get("lockGrantItems")),
         baked_fallback: None,
@@ -528,6 +543,86 @@ pub fn tick_grace_items(cfg: &RegionConfig, received: &HashSet<String>) -> Vec<S
         }
     }
     lit
+}
+
+/// One region's grace-attunement gate. `members` are the grace flags that COUNT toward attunement
+/// (the region's graces minus the anchor it was already given); `bloom` are the ones lit once the
+/// threshold is met.
+#[derive(Debug, Clone, Default)]
+pub struct GraceGate {
+    pub threshold: u32,
+    pub members: Vec<u32>,
+    pub bloom: Vec<u32>,
+}
+
+/// `{ "<lock name>": {"threshold": N, "members": [flag,...], "bloom": [flag,...]} }`.
+/// Tolerant like every other slot_data parse here: a malformed entry is skipped, not fatal.
+fn parse_grace_attunement(v: Option<&Value>) -> HashMap<String, GraceGate> {
+    let mut out = HashMap::new();
+    let Some(obj) = v.and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (name, entry) in obj {
+        let Some(e) = entry.as_object() else { continue };
+        let nums = |k: &str| -> Vec<u32> {
+            e.get(k)
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_u64())
+                        .map(|n| n as u32)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let gate = GraceGate {
+            threshold: e.get("threshold").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            members: nums("members"),
+            bloom: nums("bloom"),
+        };
+        // A gate with nothing to bloom is not a gate. Dropping it here keeps the tick honest and
+        // means the census below counts only regions that can actually do something.
+        if !gate.bloom.is_empty() {
+            out.insert(name.clone(), gate);
+        }
+    }
+    out
+}
+
+/// Per-tick (settled / in-world): light the rest of a region's graces once enough of them have been
+/// touched. Returns the regions that bloomed THIS tick, for the overlay console.
+///
+/// 🛑 THE BLOOM FLAGS ARE THEIR OWN LATCH. We only write a flag that is currently OFF, and we only
+/// report a region as bloomed when a write actually landed -- so a reconnect, a save-load, or a
+/// second tick in the same frame cannot re-fire the banner or double-grant. Same discipline (and
+/// same reason) as `tick_grace_items` above.
+pub fn tick_grace_attunement(cfg: &RegionConfig) -> Vec<String> {
+    let mut bloomed = Vec::new();
+    for (name, gate) in &cfg.grace_attunement {
+        // Only gate a region the player can actually be in: an unopened region's graces are all
+        // off, so it can never reach threshold anyway -- this is just an early out.
+        let touched = er_logic::attunement::attuned_count(
+            &gate.members.iter().map(|&f| f as i64).collect(),
+            |f| flags::get_event_flag(f as u32),
+        );
+        if touched < gate.threshold {
+            continue;
+        }
+        let mut lit = 0usize;
+        for &flag in &gate.bloom {
+            if !flags::get_event_flag(flag) && flags::try_set_event_flag(flag, true) {
+                lit += 1;
+            }
+        }
+        if lit > 0 {
+            log::info!(
+                "grace-attunement: '{name}' attuned ({touched}/{} touched) -- lit {lit} more grace(s)",
+                gate.threshold
+            );
+            bloomed.push(name.clone());
+        }
+    }
+    bloomed
 }
 
 /// lockGrantItems rider check: the packed FullIDs to grant for `name`, but ONLY when this is the

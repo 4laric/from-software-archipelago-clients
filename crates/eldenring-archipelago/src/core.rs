@@ -2878,6 +2878,11 @@ impl shared::Core for Core {
                 }
                 // grace_rando: light received "Grace: ..." items (graceItems port-gap, 2026-07-01).
                 graces_lit = crate::region::tick_grace_items(cfg, &received_all);
+                // Grace attunement: touch enough of a region's graces and the rest light. Self-
+                // latching on the bloom flags, so this is safe to call every settled tick.
+                for name in crate::region::tick_grace_attunement(cfg) {
+                    graces_lit.push(format!("{name} (attuned)"));
+                }
             }
             if let Some(m) = crate::region::tick_kick(cfg) {
                 region_msgs.push(m);

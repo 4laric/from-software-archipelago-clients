@@ -47,6 +47,11 @@ pub const SUPPORTED: &[&str] = &[
     // the tag: 0/1/2 mean exactly what they always meant, and a build without this arm clamps an
     // unrecognised 3 to 0 in set_global_scadu_blessing, so the catch-up would vanish in silence.
     "dlc_blessing_catchup",
+    // graceAttunement -> eldenring_archipelago::region::tick_grace_attunement (2026-08-08). A seed
+    // that gates graces MUST refuse an older client rather than connect: without this arm the key
+    // is unread, so the player is handed one grace per region and the rest never light -- which
+    // reads as a broken seed, not as an ignored setting.
+    "grace_attunement",
 ];
 
 /// Feature tags the seed requires that this build does not know.
