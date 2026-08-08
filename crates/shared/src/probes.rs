@@ -174,7 +174,10 @@ mod tests {
         // output, because the logger is process-global and a test must not depend on log capture.
         ANNOUNCED.store(false, Ordering::Relaxed);
         log_active(&[("ER_NOT_A_REAL_PROBE", "nope")]);
-        assert!(ANNOUNCED.load(Ordering::Relaxed), "first call must announce and latch");
+        assert!(
+            ANNOUNCED.load(Ordering::Relaxed),
+            "first call must announce and latch"
+        );
         log_active(&[("ER_NOT_A_REAL_PROBE", "nope")]);
         assert!(ANNOUNCED.load(Ordering::Relaxed), "latch must stay set");
     }
