@@ -75,6 +75,26 @@ pub fn enabled(env_var: &str, key: &str) -> bool {
     resolve(std::env::var_os(env_var).is_some(), config)
 }
 
+/// WHICH gate turned this probe on, for a log line. `None` when it is off.
+///
+/// 🛑 EXISTS BECAUSE A BANNER THAT NAMES THE WRONG GATE IS WORSE THAN NO BANNER. Before this, the
+/// ESD probe announced itself as "ACTIVE (ER_ESD_PROBE set)" unconditionally -- so a playtester who
+/// turned it on the new way, from `apconfig.json`, would read a line crediting an environment
+/// variable they had never set, and reasonably conclude the config key had done nothing and
+/// something else was responsible. An instrument misreporting its own state has cost this project
+/// a full triage cycle more than once.
+pub fn source(env_var: &str, key: &str) -> Option<String> {
+    if std::env::var_os(env_var).is_some() {
+        return Some(format!("env {env_var}"));
+    }
+    let on = CONFIG_PROBES
+        .get()
+        .and_then(|probes| probes.get(key))
+        .copied()
+        .unwrap_or(false);
+    on.then(|| format!("apconfig probes.{key}"))
+}
+
 /// Logs which probes are active, so "I turned it on and nothing happened" is answerable from the
 /// log rather than from a conversation.
 ///
@@ -120,6 +140,14 @@ mod tests {
         assert!(resolve(true, Some(false)));
         assert!(resolve(true, None));
         assert!(resolve(true, Some(true)));
+    }
+
+    /// The banner must credit the gate that ACTUALLY turned the probe on. Naming the env var when
+    /// the config key did it is how a working probe gets reported as broken.
+    #[test]
+    fn source_is_none_when_the_probe_is_off() {
+        // No env var set for a name nothing uses, and no config installed in this test binary.
+        assert_eq!(source("ER_A_PROBE_THAT_DOES_NOT_EXIST", "nope"), None);
     }
 
     /// An absent key is absent, not false -- they are the same answer today, but the distinction is
