@@ -288,7 +288,10 @@ fn player_tick() {
         }
         chr.apply_speffect(PLAYER_PROBE_ROW, false);
         log::info!("[downstate-probe] applied {PLAYER_PROBE_ROW} to the PLAYER");
-        dump(chr, "AFTER (player, same tick -- too early to mean anything, see WATCH)");
+        dump(
+            chr,
+            "AFTER (player, same tick -- too early to mean anything, see WATCH)",
+        );
         PLAYER_ARMED.store(true, Ordering::Relaxed);
         log::info!(
             "[downstate-probe] watching the player's max_hp for {WATCH_DUMPS} reads at \
