@@ -152,11 +152,11 @@ const WATCH_INTERVAL: u32 = 60;
 const WATCH_DUMPS: u32 = 4;
 
 fn enabled() -> bool {
-    std::env::var_os("ER_DOWNSTATE_PROBE").is_some()
+    shared::probes::enabled("ER_DOWNSTATE_PROBE", "downstate")
 }
 
 fn armed() -> bool {
-    std::env::var_os("ER_DOWNSTATE_PROBE_ARM").is_some()
+    shared::probes::enabled("ER_DOWNSTATE_PROBE_ARM", "downstate_arm")
 }
 
 /// Player-subject mode: the trap-items question, not the #346 one.

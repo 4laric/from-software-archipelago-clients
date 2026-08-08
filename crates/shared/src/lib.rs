@@ -21,6 +21,7 @@ mod input_blocker;
 pub mod log_collapse;
 pub mod mod_stack;
 mod overlay;
+pub mod probes;
 mod section_profiler;
 pub mod utils;
 
