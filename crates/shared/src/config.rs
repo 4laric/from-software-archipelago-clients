@@ -15,6 +15,11 @@ use crate::{Game, utils};
 /// rather than fatal.
 #[derive(Default, Debug, PartialEq, Deserialize, Serialize)]
 struct RawConfig {
+    /// Diagnostic probe flags, grouped under their own object so a reader can tell at a glance
+    /// which keys are diagnostics. Unknown names are KEPT, not rejected: a config written for a
+    /// newer client must not break an older one. See `crate::probes`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    probes: std::collections::BTreeMap<String, bool>,
     #[serde(default)]
     url: String,
     #[serde(default)]
@@ -85,6 +90,11 @@ impl<G: Game> Config<G> {
         Ok(dir.join("apconfig.json"))
     }
 
+    /// The diagnostic probe flags from the config file. See `crate::probes`.
+    pub fn probes(&self) -> &std::collections::BTreeMap<String, bool> {
+        &self.raw.probes
+    }
+
     /// Returns the Archipelago server URL defined in the config (empty if not set).
     pub fn url(&self) -> &str {
         self.raw.url.as_str()
@@ -133,6 +143,51 @@ impl<G: Game> Config<G> {
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    /// THE MOTIVATING CASE (CONTRIBUTING rule 11): a playtester who cannot set an environment
+    /// variable turns a probe on by adding one key to the file they already edit.
+    #[test]
+    fn probes_are_read_from_the_config_file() {
+        let raw = parse_config(r#"{"url":"x","probes":{"esd":true}}"#).expect("parses");
+        assert_eq!(raw.probes.get("esd"), Some(&true));
+    }
+
+    /// 🛑 THE REAL HAZARD IN THIS CHANGE. The connect overlay calls `save()`, which re-serialises
+    /// the WHOLE config -- so a probes key that did not survive a round-trip would be silently
+    /// deleted the first time the player connected, and the probe would stop working for reasons
+    /// no log could explain.
+    #[test]
+    fn a_probe_flag_survives_a_save_round_trip() {
+        let raw = parse_config(r#"{"url":"u","slot":"s","probes":{"esd":true}}"#).expect("parses");
+        let written = json::to_string(&raw).expect("serialises");
+        let reread = parse_config(&written).expect("re-parses");
+        assert_eq!(reread.probes.get("esd"), Some(&true));
+        assert_eq!(reread, raw);
+    }
+
+    /// An unknown probe name is KEPT, not dropped: a config written for a newer client that is
+    /// opened (and saved) by an older one must not lose the newer client's settings.
+    #[test]
+    fn an_unknown_probe_name_is_preserved() {
+        let raw = parse_config(r#"{"probes":{"not_a_real_probe_yet":true}}"#).expect("parses");
+        let reread = parse_config(&json::to_string(&raw).unwrap()).expect("re-parses");
+        assert_eq!(reread.probes.get("not_a_real_probe_yet"), Some(&true));
+    }
+
+    /// Nobody who never touched a probe should find `"probes":{}` appearing in their config.
+    #[test]
+    fn an_empty_probe_map_is_not_written_out() {
+        let raw = parse_config(r#"{"url":"u"}"#).expect("parses");
+        assert!(!json::to_string(&raw).unwrap().contains("probes"));
+    }
+
+    /// A config with no `probes` key at all is ordinary, not an error -- every config in the wild
+    /// today is one of these.
+    #[test]
+    fn a_config_without_probes_still_parses() {
+        let raw = parse_config(r#"{"url":"u","slot":"s"}"#).expect("parses");
+        assert!(raw.probes.is_empty());
+    }
 
     fn missing() -> io::Result<String> {
         Err(IoError::from(ErrorKind::NotFound))

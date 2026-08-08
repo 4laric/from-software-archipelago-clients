@@ -1,5 +1,6 @@
 //! `esd_probe` -- PHASE 1 of shop auto-hints (er-archipelago#455). LOG-ONLY. No hints, no writes,
-//! no behaviour change. Gated on `ER_ESD_PROBE`; unset means the detour is never installed.
+//! no behaviour change. Gated on `ER_ESD_PROBE` **or** `"probes": {"esd": true}` in
+//! `apconfig.json`; with neither, the detour is never installed.
 //!
 //! ## What it is for
 //!
@@ -9,7 +10,8 @@
 //! enough to design against and NOT enough to build on: nobody has watched command 22 come out of
 //! our build, at a real merchant, carrying a range we can use.
 //!
-//! This module buys that observation. Open Kale with `ER_ESD_PROBE=1` and read the log. If no
+//! This module buys that observation. Turn it on (env var, or the config key -- a playtester
+//! should use the config key), open Kale and read the log. If no
 //! `id=22` appears with a sane range, the feature dies here, before any hint logic exists.
 //!
 //! ## 🛑 Why it is behind an env var
@@ -81,7 +83,7 @@ static LEDGER: Mutex<Option<EsdProbeLedger>> = Mutex::new(None);
 
 /// Whether the probe was asked for. Read once, at install time.
 fn enabled() -> bool {
-    std::env::var_os("ER_ESD_PROBE").is_some()
+    shared::probes::enabled("ER_ESD_PROBE", "esd")
 }
 
 /// Ask the `eldenring` crate for the live `CSEzStateTalkEvent::invoke`, via a throwaway

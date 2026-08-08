@@ -74,6 +74,9 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
     pub fn new(game: impl Into<Ustr>) -> Result<Self> {
         let game = game.into();
         let config = Config::load()?;
+        // Install BEFORE anything can ask `probes::enabled`, so no probe can read an empty map and
+        // conclude it is off. This is the only call site.
+        crate::probes::install(config.probes().clone());
         let connection = Self::new_connection(game, &config);
 
         Ok(Self {

@@ -608,10 +608,19 @@ impl shared::Core for Core {
         // instead of erroring, so no install latch on Core is needed.
         crate::warp_hook::install();
 
+        // Which diagnostics are on, stated once. A probe turned on from `apconfig.json` is
+        // invisible to us otherwise, so "I set it and nothing happened" would cost a conversation
+        // instead of a grep -- and a silently-typo'd key would look exactly like a broken probe.
+        shared::probes::log_active(&[
+            ("ER_ESD_PROBE", "esd"),
+            ("ER_DOWNSTATE_PROBE", "downstate"),
+            ("ER_DOWNSTATE_PROBE_ARM", "downstate_arm"),
+        ]);
+
         // ESD talk-event probe (esd_probe.rs; shop auto-hints phase 1, er-archipelago#455).
-        // LOG-ONLY and gated on `ER_ESD_PROBE` -- with the var unset this is one `var_os` read
-        // and the hot dispatch is never patched at all. Same self-guarded one-shot shape as the
-        // LuaWarp hook above: an unsupported build degrades to one refusal line.
+        // LOG-ONLY and gated on `ER_ESD_PROBE` or `"probes": {"esd": true}` in apconfig.json --
+        // with neither the hot dispatch is never patched at all. Same self-guarded one-shot shape
+        // as the LuaWarp hook above: an unsupported build degrades to one refusal line.
         crate::esd_probe::install();
 
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them. Gated on the minibake

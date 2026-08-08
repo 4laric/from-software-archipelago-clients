@@ -20,6 +20,7 @@ mod game;
 mod input_blocker;
 pub mod log_collapse;
 pub mod mod_stack;
+pub mod probes;
 mod overlay;
 mod section_profiler;
 pub mod utils;
