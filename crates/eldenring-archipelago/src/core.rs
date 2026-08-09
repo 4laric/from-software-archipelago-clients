@@ -1261,6 +1261,15 @@ impl shared::Core for Core {
                 // Goal-send: split goalLocations into flag-detected / checked-fallback buckets
                 // against loc_flags (SPEC-goal-send-20260701.md; do NOT route through flagpoll).
                 let goal_cfg = crate::goal::parse(sd, &loc_flags);
+                // ...and ECHO it. `parse` logs how MANY goal locations there are; this says WHICH,
+                // and names the region they sit in. The client log is the artifact we actually get
+                // when a player reports a bad ending -- see goal::describe_goal for the case.
+                let goal_game = client.game(client.this_player().game());
+                crate::goal::log_goal(sd, |id| {
+                    goal_game
+                        .as_ref()
+                        .and_then(|g| g.location(id).map(|l| l.name().to_string()))
+                });
                 // Boss-lock mode A (SPEC-boss-lock-tracker.md): parse the bossLockItems metadata
                 // map into BossDef rows (gate=None for v0.2 — no sweepLockGates boss-key yet). This
                 // is a presentation/defeat-flag-watch layer only; it mints no AP item and no check.
