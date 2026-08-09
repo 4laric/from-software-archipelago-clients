@@ -458,6 +458,62 @@ pub fn area_tier_from_histogram(hist: &[u32]) -> Option<usize> {
     None
 }
 
+/// Vanilla's baked difficulty for a bucket, or `None` if we have no defensible answer for it.
+///
+/// See `crate::area_tiers` for the derivation and for the two caveats a caller must know. `None`
+/// means NO CLAIM and the caller must fall back -- it never means tier 0.
+pub fn baked_area_tier(region: i32) -> Option<usize> {
+    crate::area_tiers::AREA_TIERS
+        .binary_search_by_key(&region, |&(bucket, _)| bucket)
+        .ok()
+        .map(|i| crate::area_tiers::AREA_TIERS[i].1 as usize)
+}
+
+/// Which of the three answers to "how hard is this ground" the sweep actually used.
+///
+/// ⭐ The log says which, because "we looked it up", "we measured it" and "we remembered it" are
+/// three different claims about the same number, and the first live log is the only place the
+/// difference is visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AreaSource {
+    /// `area_tiers::AREA_TIERS` -- a full-map measurement, correct on the FIRST sweep.
+    Baked,
+    /// This sweep's own histogram over loaded, still-vanilla-shaped enemies.
+    Live,
+    /// `AreaAnchor` -- an earlier live reading for this region, held after its sample went silent.
+    Latched,
+    /// Nothing could answer. `scale_action` leaves the unrunged alone, which is the safe direction.
+    Unknown,
+}
+
+/// Resolve the area tier from the three sources, in order of how much ground each one saw.
+///
+/// ⭐⭐⭐ **BAKED WINS, AND THAT IS THE WHOLE POINT OF THE TABLE.** The live census can only see
+/// what is loaded, and it has already stripped the band off everything it touched, so on any
+/// re-entry it is measuring its own output or nothing at all. The baked reading saw every enemy
+/// vanilla placed on that ground, including the ones not currently loaded.
+///
+/// 🛑 A live reading is NOT preferred over the baked one even though it is "fresher". Freshness is
+/// not the axis: a sweep's histogram is a sample of the CURRENT load state, and the thing we are
+/// asking about is the MAP. The only case where live is strictly better is a co-loaded enemy
+/// randomiser, which has rewritten the ground -- and that is explicitly not supported
+/// (`mod stack: ... do not use this session as an oracle`).
+///
+/// The fallback chain still matters: 13 buckets have no baked entry, and a future game patch can
+/// add a region the table has never seen.
+pub fn resolve_area_tier(
+    baked: Option<usize>,
+    fresh: Option<usize>,
+    latched: Option<usize>,
+) -> (Option<usize>, AreaSource) {
+    match (baked, fresh, latched) {
+        (Some(t), _, _) => (Some(t), AreaSource::Baked),
+        (None, Some(t), _) => (Some(t), AreaSource::Live),
+        (None, None, Some(t)) => (Some(t), AreaSource::Latched),
+        (None, None, None) => (None, AreaSource::Unknown),
+    }
+}
+
 /// The area reading a region resolved while it still had a vanilla sample to read, held for the
 /// rest of the visit.
 ///
@@ -2990,6 +3046,109 @@ mod tests {
         hist[6] = MIN_AREA_SAMPLE;
         assert_eq!(area_tier_from_histogram(&hist), Some(6));
         assert_eq!(area_tier_from_histogram(&[0u32; NUM_TIERS]), None);
+    }
+
+    // ---------------------------------------------------------------- baked area tiers (#346)
+
+    #[test]
+    fn the_baked_table_is_sorted_so_binary_search_is_valid() {
+        // A binary search over an unsorted table does not fail loudly -- it MISSES, and a miss
+        // here reads as "no claim", i.e. the exact pre-table behaviour. The generator sorts; this
+        // is what notices if it ever stops.
+        let ids: Vec<i32> = crate::area_tiers::AREA_TIERS
+            .iter()
+            .map(|&(b, _)| b)
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            ids, sorted,
+            "AREA_TIERS must be sorted and free of duplicate buckets"
+        );
+    }
+
+    #[test]
+    fn every_baked_tier_is_a_real_ladder_index() {
+        for &(bucket, tier) in crate::area_tiers::AREA_TIERS {
+            assert!(
+                (tier as usize) < NUM_TIERS,
+                "bucket {bucket} has tier {tier}, outside 0..{NUM_TIERS}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_census_readings_the_table_was_validated_against_are_pinned() {
+        // MOTIVATING CASE AS THE TEST. These are the only two live area-index readings on record
+        // from sessions we can reason about, and the table reproduced both from static params:
+        // Liurnia measured 5 (153-enemy sample), Altus measured 7 (302). If a regen moves either,
+        // the derivation changed underneath us and the change needs an argument, not a re-pin.
+        assert_eq!(baked_area_tier(62000), Some(5), "Liurnia");
+        assert_eq!(baked_area_tier(63000), Some(7), "Altus");
+    }
+
+    #[test]
+    fn a_bucket_with_too_thin_a_sample_makes_no_claim() {
+        // 21020 is bobler's case for why the anchor alone is not enough: two sweeps, both with a
+        // zero live sample, so nothing to latch. It is ALSO under MIN_AREA_SAMPLE in the bake, so
+        // the table declines too -- and declining is the safe answer, not tier 0.
+        assert_eq!(baked_area_tier(11100), None);
+        assert_eq!(baked_area_tier(-1), None);
+    }
+
+    #[test]
+    fn baked_beats_live_beats_latched() {
+        assert_eq!(
+            resolve_area_tier(Some(7), Some(2), Some(3)),
+            (Some(7), AreaSource::Baked)
+        );
+        assert_eq!(
+            resolve_area_tier(None, Some(2), Some(3)),
+            (Some(2), AreaSource::Live)
+        );
+        assert_eq!(
+            resolve_area_tier(None, None, Some(3)),
+            (Some(3), AreaSource::Latched)
+        );
+        assert_eq!(
+            resolve_area_tier(None, None, None),
+            (None, AreaSource::Unknown)
+        );
+    }
+
+    #[test]
+    fn an_unknown_area_still_leaves_the_unrunged_alone() {
+        // The fallback chain ending in None must not become "tier 0" anywhere: at target 0 an
+        // unrunged enemy would then be judged against a native tier of 0 and touched. Absence has
+        // to stay absence all the way into scale_action.
+        let (tier, src) = resolve_area_tier(None, None, None);
+        assert_eq!(src, AreaSource::Unknown);
+        assert_eq!(
+            scale_action(false, false, 999_999_999, 0, tier),
+            ScaleAction::NoTouch
+        );
+    }
+
+    #[test]
+    fn a_dlc_bucket_is_flagged_as_rank_projected() {
+        // The two ladders are disjoint bands, so a DLC tier and a base tier are not comparable.
+        // Nothing branches on this today; the list exists so that a future change which wants to
+        // compare two tiers can see that it must not.
+        for &b in crate::area_tiers::DLC_RANKED {
+            assert!(
+                baked_area_tier(b).is_some(),
+                "bucket {b} is listed but has no tier"
+            );
+        }
+        assert!(
+            crate::area_tiers::DLC_RANKED.contains(&21010),
+            "Shadow Keep m21_01 is DLC"
+        );
+        assert!(
+            !crate::area_tiers::DLC_RANKED.contains(&62000),
+            "Liurnia is base game"
+        );
     }
 
     #[test]

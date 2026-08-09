@@ -16,12 +16,12 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
-    AreaAnchor, NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
-    area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect,
-    is_scaling_speffect_with_downstates, ladder_tier, native_tier, placed_by_area,
-    placed_by_area_down, raw_target_for_region, region_name_for_bucket, region_scaling,
-    region_scaling_line, scale_action, scaling_kind, settled_on_downstate, settled_on_target,
-    speffect_id_for_tier, tier_for_region, tier_rates,
+    AreaAnchor, AreaSource, NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
+    area_tier_from_histogram, baked_area_tier, band_native_tier, is_dlc_bucket,
+    is_scaling_speffect, is_scaling_speffect_with_downstates, ladder_tier, native_tier,
+    placed_by_area, placed_by_area_down, raw_target_for_region, region_name_for_bucket,
+    region_scaling, region_scaling_line, resolve_area_tier, scale_action, scaling_kind,
+    settled_on_downstate, settled_on_target, speffect_id_for_tier, tier_for_region, tier_rates,
 };
 use er_logic::scaling_settle::{SettlePolicy, SweepGate, sweep_blocked_by_death};
 use fromsoftware_shared::{FromStatic, Subclass};
@@ -765,15 +765,21 @@ pub fn tick() -> Option<String> {
     // re-derive) and fatal for anything that arrives later, which carries neither and falls to
     // `NoTouch` at full vanilla strength. A fresh reading still wins whenever there is one; the latch
     // only speaks after the sample has gone quiet. See `AreaAnchor`.
+    // ⭐⭐⭐ AND THE BAKED TABLE OUTRANKS BOTH, because it saw ground neither of them can. The live
+    // histogram sees only what is LOADED and has already stripped the band off everything it
+    // touched; the latch is an older copy of that same partial view. `area_tiers::AREA_TIERS`
+    // measured every enemy vanilla placed in the bucket, offline, so it is right on a region's
+    // FIRST sweep and on a save loaded into ground that is already converged -- the two cases the
+    // latch cannot reach. The census still RUNS: it is what the log reports as the live sample, and
+    // it is the fallback for the 13 buckets the table makes no claim for.
     let fresh_area_tier = area_tier_from_histogram(&tally.area_hist);
-    let (area_tier, area_latched) = match AREA_ANCHOR.lock() {
-        Ok(mut anchor) => (
-            anchor.resolve(region, fresh_area_tier),
-            anchor.is_latched(fresh_area_tier),
-        ),
+    let latched_area_tier = match AREA_ANCHOR.lock() {
+        Ok(mut anchor) => anchor.resolve(region, fresh_area_tier),
         // A poisoned lock costs the latch, never the sweep -- degrade to the pre-latch behaviour.
-        Err(_) => (fresh_area_tier, false),
+        Err(_) => fresh_area_tier,
     };
+    let (area_tier, area_source) =
+        resolve_area_tier(baked_area_tier(region), fresh_area_tier, latched_area_tier);
 
     // PASS TWO -- decide and apply. Uses the status-carrying walk so the SAMPLE line can state each
     // enemy's load state PER ROW; nothing is filtered on it (see `sweepable_characters_with_status`).
@@ -1010,7 +1016,15 @@ pub fn tick() -> Option<String> {
                 tally.band_vs_table,
                 tally.residue,
                 area_index,
-                if area_latched { " LATCHED" } else { "" },
+                match area_source {
+                    // ⭐ Name the SOURCE, not just the number: "looked it up", "measured it" and
+                    // "remembered it" are three different claims, and only the log can tell them
+                    // apart in a live session.
+                    AreaSource::Baked => " BAKED",
+                    AreaSource::Live => "",
+                    AreaSource::Latched => " LATCHED",
+                    AreaSource::Unknown => " UNKNOWN",
+                },
                 area_total,
                 area_dist,
                 tally.area_moved,
