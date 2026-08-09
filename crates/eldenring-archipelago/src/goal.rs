@@ -164,6 +164,68 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
     }
 }
 
+/// The goal as a line for the client log: WHICH locations end this run, and which region they
+/// sit in. Pure so it can be tested; `log_goal` below emits it.
+///
+/// WHY THIS EXISTS (2026-08-09). `parse` above logs a COUNT -- "goal: 3 location(s) -- 3
+/// flag-detected" -- and the generator's own log already names the answer ("goal = <Region>
+/// (n location(s))"). But the artifact that actually reaches us when a player reports a bad
+/// ending is the CLIENT log, not the generation log. On 2026-08-07 a `dlc_only` seed ended on
+/// Romina in the Ancient Ruins of Rauh; the player read the early goal as a broken ending, and
+/// nothing in his log could say which boss the goal even was, so triage began by asking him for
+/// slot_data. The datapackage has carried the answer the whole time and we never printed it.
+///
+/// The region is DERIVED from the location name -- ours are "<Region> :: <what> [fNNNNNN]" --
+/// so this needs no new slot_data key and no contract move. Returns None when there is nothing
+/// to say; the empty-goal case is already a WARN in `parse` and must not be said twice.
+pub fn describe_goal(sd: &Value, resolve: impl Fn(i64) -> Option<String>) -> Option<String> {
+    let ids: Vec<i64> = sd
+        .get("goalLocations")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return None;
+    }
+    // An id the datapackage cannot name is printed AS its id rather than dropped: a goal location
+    // the datapackage does not know is itself the thing worth seeing in the log.
+    let named: Vec<String> = ids
+        .iter()
+        .map(|id| resolve(*id).unwrap_or_else(|| format!("<unnamed id {id}>")))
+        .collect();
+    // Name the region ONLY when every name carries one and they all agree. A disagreeing or
+    // unnameable set means either the resolution ladder did something we did not predict or we are
+    // on a foreign datapackage -- and "goal: region Enir Ilim" over either of those is exactly the
+    // confidently-wrong line this function exists to prevent. Say the locations, decline the region.
+    let regions: Vec<Option<&str>> = named
+        .iter()
+        .map(|n| n.split_once(" :: ").map(|(r, _)| r))
+        .collect();
+    let agreed: Option<&str> = match regions.first().copied().flatten() {
+        Some(r) if regions.iter().all(|x| *x == Some(r)) => Some(r),
+        _ => None,
+    };
+    Some(match agreed {
+        Some(r) => format!(
+            "goal: region {r} -- {} location(s) end this run: {}",
+            named.len(),
+            named.join(", ")
+        ),
+        None => format!(
+            "goal: {} location(s) end this run, not all in one named region: {}",
+            named.len(),
+            named.join(", ")
+        ),
+    })
+}
+
+/// `describe_goal`, emitted. Silent when there is nothing to say.
+pub fn log_goal(sd: &Value, resolve: impl Fn(i64) -> Option<String>) {
+    if let Some(line) = describe_goal(sd, resolve) {
+        log::info!("{line}");
+    }
+}
+
 /// True when EVERY goal location is done: flag goals via `flag_read` (vanilla event flags),
 /// checked goals via `is_checked` (server-truth checked set; caller pre-filters against
 /// `valid_locations` -- `is_local_location_checked` panics on datapackage-unknown ids).
@@ -415,5 +477,78 @@ mod foreign_goal {
         let cfg = parse(&json!({"goalRequiredItems": ["Limgrave Lock"]}), &lf(&[]));
         assert!(!cfg.is_empty());
         assert!(is_met(&cfg, |_| true, |_| true, |n| n == "Limgrave Lock"));
+    }
+}
+
+#[cfg(test)]
+mod goal_echo {
+    //! THE CLIENT LOG MUST NAME THE ENDING.
+    //!
+    //! Motivating case, 2026-08-07: a `dlc_only` seed goaled on Romina and the player reported a
+    //! broken ending. The ladder was right -- Romina carries a Remembrance and the draw never kept
+    //! Enir Ilim -- but proving that took his slot_data, because his client log said only
+    //! "goal: 1 location(s) -- 1 flag-detected". These assert the log can answer it alone.
+    use super::*;
+    use serde_json::json;
+
+    /// Our real location-name shape: "<Region> :: <what> [fNNNNNN]".
+    fn er_names(id: i64) -> Option<String> {
+        Some(
+            match id {
+                7770775 => "Ancient Ruins :: Remembrance of the Saint of the Bud - Romina [f510600]",
+                7770770 => "Enir Ilim :: Remembrance of a God and a Lord - Promised Consort Radahn [f510430]",
+                7770300 => "Ashen Capital :: Remembrance of Hoarah Loux - Godfrey [f510070]",
+                7770301 => "Ashen Capital :: Elden Remembrance - Elden Beast [f510230]",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn the_romina_seed_names_its_region_and_its_boss() {
+        let line = describe_goal(&json!({"goalLocations": [7770775]}), er_names).unwrap();
+        assert!(line.contains("region Ancient Ruins"), "{line}");
+        assert!(line.contains("Romina"), "{line}");
+        // The whole point: this line alone answers "which boss ends my run".
+        assert!(line.contains("1 location(s)"), "{line}");
+    }
+
+    #[test]
+    fn a_two_boss_finale_still_names_one_region() {
+        let line = describe_goal(&json!({"goalLocations": [7770300, 7770301]}), er_names).unwrap();
+        assert!(line.contains("region Ashen Capital"), "{line}");
+        assert!(
+            line.contains("Godfrey") && line.contains("Elden Beast"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn regions_that_disagree_are_not_collapsed_into_one_claim() {
+        // Not a shape the ladder produces today -- which is the reason to assert it. If it ever
+        // does, the log must say so rather than confidently name the first region it saw.
+        let line = describe_goal(&json!({"goalLocations": [7770775, 7770770]}), er_names).unwrap();
+        assert!(!line.contains("region Ancient Ruins"), "{line}");
+        assert!(line.contains("not all in one named region"), "{line}");
+        assert!(line.contains("Romina") && line.contains("Radahn"), "{line}");
+    }
+
+    #[test]
+    fn an_id_the_datapackage_cannot_name_is_printed_not_dropped() {
+        // Foreign datapackage / contract drift: losing the id silently is how a goal set stops
+        // being auditable at all.
+        let line = describe_goal(&json!({"goalLocations": [7770775, 999]}), er_names).unwrap();
+        assert!(line.contains("<unnamed id 999>"), "{line}");
+        assert!(line.contains("2 location(s)"), "{line}");
+    }
+
+    #[test]
+    fn nothing_to_say_says_nothing() {
+        // `parse` already WARNs on the empty set; a second line about it would be noise, and the
+        // Bedrock `goal`-key seeds legitimately have no `goalLocations` at all.
+        assert!(describe_goal(&json!({}), er_names).is_none());
+        assert!(describe_goal(&json!({"goalLocations": []}), er_names).is_none());
+        assert!(describe_goal(&json!({"goal": [9101]}), er_names).is_none());
     }
 }
