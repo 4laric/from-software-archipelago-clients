@@ -618,10 +618,13 @@ impl shared::Core for Core {
             ("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player"),
         ]);
 
-        // ESD talk-event probe (esd_probe.rs; shop auto-hints phase 1, er-archipelago#455).
-        // LOG-ONLY and gated on `ER_ESD_PROBE` or `"probes": {"esd": true}` in apconfig.json --
-        // with neither the hot dispatch is never patched at all. Same self-guarded one-shot shape
-        // as the LuaWarp hook above: an unsupported build degrades to one refusal line.
+        // ESD talk-event hook (esd_probe.rs) -- the shop-open seam SHOP AUTO-HINTS ride on
+        // (er-archipelago#455, phase 2). Installed unconditionally now that phase 1 witnessed
+        // command 22 firing at a real merchant with a usable ShopLineupParam row range; the
+        // `ER_ESD_PROBE` / `"probes": {"esd": true}` gate survives as a VERBOSITY switch for the
+        // command-id enumeration, not as the install gate. Same self-guarded one-shot shape as the
+        // LuaWarp hook above: an unsupported build degrades to one refusal line AND marks shop
+        // hints inactive, which the connect banner then states outright.
         crate::esd_probe::install();
 
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them. Gated on the minibake
@@ -1181,6 +1184,10 @@ impl shared::Core for Core {
                 // eventFlag_forStock back to its AP location, so it can look up that location's
                 // preview good and WRITE it onto the row (er_logic::shop_repoint).
                 crate::shop_repoint::configure(loc_flags.clone());
+                // Third consumer of the same table, and the reason shop auto-hints move no
+                // contract hash: shop_hints inverts it to turn a live row's eventFlag_forStock
+                // into the AP location a shop-open should announce (er_logic::shop_hints).
+                crate::shop_hints::configure(loc_flags.clone());
                 // shopRunePrices: {ShopLineupParam row id (str) -> rolled rune price}.
                 crate::shop_prices::configure(
                     i64_to_u32_map(sd.get("shopRunePrices"))
@@ -1288,6 +1295,16 @@ impl shared::Core for Core {
                     "=== ER-AP client {} | contract {versions} | slot '{name}' ===",
                     crate::game::CLIENT_BUILD
                 );
+                // A refused hook must SAY the feature is off. Silently hinting nothing for a whole
+                // session looks exactly like a merchant with nothing on the shelf, and the player
+                // would report it as "shop hints don't work" with no way to tell the two apart.
+                if crate::shop_hints::is_inactive() {
+                    log::warn!(
+                        "shop hints INACTIVE this session -- the ESD talk hook did not install \
+                         (see the SHOP HINTS INACTIVE line above). Opening a merchant will \
+                         announce nothing to the multiworld; everything else is unaffected."
+                    );
+                }
                 log::info!(
                     "startcfg: start_region={start_region:?} | startGraces={} reveal_maps={} startItems={} | randomStart warp/area/done={}/{}/{} | area_locks={}",
                     start.start_graces.len(),
@@ -3199,6 +3216,11 @@ impl shared::Core for Core {
             lh.pump(client);
         }
         self.lock_hints = lh;
+        // Shop auto-hints: the ESD detour plans on the game thread and queues; the send happens
+        // HERE, where a live client is free. One create_hints packet per shop open.
+        if let Some(client) = self.client_mut() {
+            crate::shop_hints::pump(client);
+        }
         // Re-arm the ItemLotParam blank passes on a map-(re)load edge. check_lots / enemy_drops latch
         // DONE after their first successful in-world pass and are otherwise reset ONLY on reconnect
         // (configure()). But a map load streams params back in -- notably the DLC (Land of Shadow)
@@ -3242,6 +3264,7 @@ impl shared::Core for Core {
             // them. Without this the shop display is correct until the player's first load and
             // wrong for the rest of the run (er_logic::shop_repoint_replay pins the timeline).
             crate::shop_repoint::reset();
+            crate::shop_hints::reset();
             crate::shop_prices::reset();
             // shop_stock was MISSING from this list until 2026-07-29 -- the THIRD writer to make the
             // same mistake (shop_sell 07-24, shop_icon earlier today). Its reset() existed and was

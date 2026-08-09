@@ -45,6 +45,7 @@ mod scaling;
 mod scout_proof;
 mod serpent_hunter;
 mod shop_flags;
+mod shop_hints;
 mod shop_icon;
 mod shop_preview;
 mod shop_prices;

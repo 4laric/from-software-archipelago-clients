@@ -1,8 +1,20 @@
-//! `esd_probe` -- PHASE 1 of shop auto-hints (er-archipelago#455). LOG-ONLY. No hints, no writes,
-//! no behaviour change. Gated on `ER_ESD_PROBE` **or** `"probes": {"esd": true}` in
-//! `apconfig.json`; with neither, the detour is never installed.
+//! `esd_probe` -- the ESD talk-event detour: the shop-open seam for shop auto-hints
+//! (er-archipelago#455).
 //!
-//! ## What it is for
+//! ## 🛑 PHASE 1 IS OVER. THIS HOOK NOW CARRIES A FEATURE.
+//!
+//! It shipped as a LOG-ONLY probe gated on `ER_ESD_PROBE` / `"probes": {"esd": true}`, whose whole
+//! job was to falsify one premise: does command 22 fire at a real merchant on this build with a
+//! usable row range. boblerrr's 2026-08-08 session answered yes --
+//! `esd: SHOP talk 600001110 cmd 22 args [Int32(101800), Int32(101897)]` -- so the detour is now
+//! installed UNCONDITIONALLY and dispatches shop opens to `crate::shop_hints`.
+//!
+//! The gate did not go away, it changed jobs. It now controls VERBOSITY only: with the probe off,
+//! a non-shop dispatch costs one integer compare and nothing else; with it on, the phase-1
+//! command-id enumeration below still runs, which is what a future session needs to pin the four
+//! shop opens command 22 does not cover (Ash of War, tailoring, upgrading, change of purpose).
+//!
+//! ## What phase 1 was for (kept: it is why the seam is trusted)
 //!
 //! Shop auto-hints need a shop-open seam. The pinned crate's `examples/invoke-esd` names
 //! `OPEN_REGULAR_SHOP = 22` with a ShopLineupParam row range for arguments, and
@@ -14,14 +26,19 @@
 //! should use the config key), open Kale and read the log. If no
 //! `id=22` appears with a sane range, the feature dies here, before any hint logic exists.
 //!
-//! ## 🛑 Why it is behind an env var
+//! ## 🛑 It is a HOT dispatch, and it is now always patched
 //!
-//! `invoke` is a HOT dispatch -- every line of NPC dialogue, every talk-list rebuild, many times a
-//! second while a conversation is open. The standing rule is that a new hot-path hook does not ride
-//! a release window (see the FMG VirtualAlloc CTD and the generalized CTD guards). An env gate
-//! settles that without a version-gated feature flag: for every player who does not set it, the
-//! detour is not installed and the cost is one `var_os` read at startup. Alaric sets it, runs one
-//! session, and reads the log.
+//! `invoke` is the single dispatch for EVERY ESD talk event -- every line of NPC dialogue, every
+//! talk-list rebuild, many times a second while a conversation is open. Phase 1 kept it behind an
+//! env gate precisely because the standing rule is that a new hot-path hook does not ride a release
+//! window (see the FMG VirtualAlloc CTD and the generalized CTD guards). Phase 2 cannot keep that
+//! gate -- an always-on feature cannot be behind a diagnostic switch -- so the cost is paid down in
+//! the detour body instead: the common path is a null check, an id read, one comparison, and the
+//! trampoline. Everything expensive (the ledger, the argument formatting, the param walk) sits
+//! behind either the probe flag or `event_id == 22`.
+//!
+//! ⚠️ That still makes this the change that must NOT be merged into an open release window on the
+//! day it is written. It wants its own window and a playtest that visits merchants.
 //!
 //! ## 🛑 The vtable RVA is NOT reachable from here -- and that is why this looks indirect
 //!
@@ -46,10 +63,14 @@
 //!
 //! ## What it deliberately does not do
 //!
-//! No argument is interpreted. Phase 2's `plan_shop_hints` is a separate change gated on what this
-//! reports; guessing the range semantics here would bake an unverified premise into the artifact
-//! that exists to verify it. Volume policy (watched commands always, everything else once per
-//! `(talk_id, event_id)`) lives in `er_logic::esd_probe` and is unit-tested there.
+//! It interprets exactly ONE command's arguments -- command 22's, the pair phase 1 observed. The
+//! four other shop opens in the talk corpus (`OpenAshOfWarShop`, `OpenEnhanceShop`,
+//! `OpenEquipmentChangeOfPurposeShop`, `OpenTailoringShop`) have NO known command id: none appeared
+//! in the 08-08 log, and deriving ids by matching arguments against literal call sites is provably
+//! unsound on its own (it returns `EndMachine` as the unique answer for both 119 and 120). Guessing
+//! one here would put an unverified premise in a shipping path. Volume policy (watched commands
+//! always, everything else once per `(talk_id, event_id)`) lives in `er_logic::esd_probe` and is
+//! unit-tested there.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -81,7 +102,12 @@ static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 /// inside the game's call frame.
 static LEDGER: Mutex<Option<EsdProbeLedger>> = Mutex::new(None);
 
-/// Whether the probe was asked for. Read once, at install time.
+/// Whether the phase-1 command-id enumeration is on. Read once at install, then on every dispatch
+/// -- so it must stay a plain relaxed atomic load, not a config or env read.
+static PROBE_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the phase-1 ENUMERATION was asked for. Read once, at install time. It no longer gates
+/// the detour itself -- shop auto-hints need the hook whatever this says.
 fn enabled() -> bool {
     shared::probes::enabled("ER_ESD_PROBE", "esd")
 }
@@ -117,15 +143,14 @@ pub fn install() {
     if ATTEMPTED.swap(true, Ordering::Relaxed) {
         return;
     }
-    if !enabled() {
-        return;
-    }
+    PROBE_VERBOSE.store(enabled(), Ordering::Relaxed);
     let Some(target) = resolve_invoke() else {
         log::warn!(
-            "ESD probe INACTIVE: the eldenring crate's RVA table rejected this executable \
-             (unsupported version/language, or upstream moved the bundle) -- no shop-open \
-             observation will be made this session"
+            "SHOP HINTS INACTIVE: the eldenring crate's RVA table rejected this executable \
+             (unsupported version/language, or upstream moved the bundle), so the ESD talk hook \
+             could not be resolved -- opening a merchant will announce nothing this session"
         );
+        crate::shop_hints::mark_inactive();
         return;
     };
     // SAFETY: `target` came from the crate's own vtable for this build; `esd_invoke_detour`
@@ -133,25 +158,34 @@ pub fn install() {
     let hook = match unsafe { GenericDetour::<EsdInvokeFn>::new(target, esd_invoke_detour) } {
         Ok(h) => h,
         Err(e) => {
-            log::warn!("ESD probe INACTIVE: retour error: {e}");
+            log::warn!("SHOP HINTS INACTIVE: retour could not build the ESD talk detour: {e}");
+            crate::shop_hints::mark_inactive();
             return;
         }
     };
     // SAFETY: patching a verified, executable entry inside the loaded image.
     if let Err(e) = unsafe { hook.enable() } {
-        log::warn!("ESD probe INACTIVE: enable failed: {e}");
+        log::warn!("SHOP HINTS INACTIVE: enabling the ESD talk detour failed: {e}");
+        crate::shop_hints::mark_inactive();
         return;
     }
     let _ = HOOK.set(hook);
-    let gate =
-        shared::probes::source("ER_ESD_PROBE", "esd").unwrap_or_else(|| "unknown gate".to_string());
     log::info!(
-        "ESD probe ACTIVE (via {gate}) -- logging every ESD talk command once per \
-         (talk_id, event_id), and EVERY shop open (id {} buy / {} sell) with its arguments. \
-         Open a merchant and grep for 'esd:'.",
+        "ESD talk hook ACTIVE -- shop auto-hints armed on command {} (the regular buy menu). \
+         Grep for 'shop-hints:'.",
         er_logic::esd_probe::OPEN_REGULAR_SHOP,
-        er_logic::esd_probe::OPEN_SELL_SHOP,
     );
+    if PROBE_VERBOSE.load(Ordering::Relaxed) {
+        let gate = shared::probes::source("ER_ESD_PROBE", "esd")
+            .unwrap_or_else(|| "unknown gate".to_string());
+        log::info!(
+            "ESD command enumeration ACTIVE (via {gate}) -- logging every ESD talk command once \
+             per (talk_id, event_id), and EVERY shop open (id {} buy / {} sell) with its \
+             arguments. Grep for 'esd:'.",
+            er_logic::esd_probe::OPEN_REGULAR_SHOP,
+            er_logic::esd_probe::OPEN_SELL_SHOP,
+        );
+    }
 }
 
 /// Render up to `MAX_LOGGED_ARGS` arguments. Only called when we have already decided to log, so
@@ -195,6 +229,31 @@ unsafe extern "C" fn esd_invoke_detour(this: *mut c_void, event: *const EzStateE
             (talk_id, &*event)
         };
         let event_id = event_ref.id();
+
+        // ---- PHASE 2: THE FEATURE ----------------------------------------------------------
+        // Runs whether or not the enumeration is on -- the hint is the point; the probe flag only
+        // decides how loud the log is. This is also the ONLY work a non-shop dispatch can reach
+        // when the probe is off, which is what keeps an always-installed hot-path hook cheap.
+        if event_id == er_logic::esd_probe::OPEN_REGULAR_SHOP {
+            // 🛑 Bound on `args.len()`, never on `arg()`'s own answer: the crate's `arg` tests
+            // `index > len`, so `index == len` hands back `Some` of an out-of-bounds slot.
+            if event_ref.args.len() < 2 {
+                log::warn!(
+                    "shop-hints: command {} fired with {} argument(s), expected a row range \
+                     -- nothing hinted for this open",
+                    er_logic::esd_probe::OPEN_REGULAR_SHOP,
+                    event_ref.args.len()
+                );
+            } else if let (Some(lo), Some(hi)) = (event_ref.arg(0), event_ref.arg(1)) {
+                crate::shop_hints::on_shop_open(i32::from(lo), i32::from(hi));
+            }
+        }
+
+        if !PROBE_VERBOSE.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // ---- PHASE 1: THE COMMAND-ID ENUMERATION (diagnostic only) -------------------------
         let action = {
             let Ok(mut guard) = LEDGER.lock() else {
                 return;
