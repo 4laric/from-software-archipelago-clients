@@ -94,6 +94,37 @@ pub enum LockHintOffer {
     Unknown,
 }
 
+/// Should the tracker CONCEAL which region this row is?
+///
+/// bobler, 2026-08-09: the F6 tracker listed every kept region by name the moment you connected --
+/// `Ancient Ruins 0/55 [locked]`, `Belurat 0/93 [locked]`, `Enir Ilim 0/85 [locked]` -- so the
+/// seed's whole shape was readable before the run started. The region DRAW is the seed's shape, and
+/// on a dlc_only seed the check totals alone fingerprint the regions (the thirteen DLC sizes are
+/// all distinct). Ruling: hide them until they are unlocked or hinted, and let the purchase be the
+/// reveal (Alaric, same day). The names are still in `slot_data` for anyone who wants to dig --
+/// that is deliberate scope, not an oversight.
+///
+/// Concealed unless one of:
+///   * the region is ACCESSIBLE -- you are standing in it, there is nothing left to spoil;
+///   * `AlreadyHinted` -- the hint named the lock, and therefore the region, whether it came from
+///     our button or from AP's own `!hint`. This is the reveal the economy sells;
+///   * `Spilled` -- the lock is in another world, so `offer` can never return `AlreadyHinted` for
+///     it (`resolve_lock_location` short-circuits on `InAnotherWorld` BEFORE the hinted check). A
+///     mask the player has no way to lift is worse than the spoiler it prevents, so this one opens.
+///     Rare by construction: `confine_foreign_progression` keeps our locks in our own world.
+///
+/// `Unknown` stays CONCEALED. It means the scout has not answered yet, and a row that reveals
+/// itself during the pause before the ledger loads would leak exactly what this hides.
+pub fn conceal_region(accessible: bool, offer: &LockHintOffer) -> bool {
+    if accessible {
+        return false;
+    }
+    !matches!(
+        offer,
+        LockHintOffer::AlreadyHinted { .. } | LockHintOffer::Spilled
+    )
+}
+
 /// The hint price in progression-surface checks.
 ///
 /// `points_per_hint` and `total_locations` come from the live server connection, so this tracks the
@@ -1125,5 +1156,61 @@ mod tests {
             "a reconnect that replays an affordable balance must stay silent"
         );
         assert!(!crossed_into_affordable(Some(true), false));
+    }
+}
+
+#[cfg(test)]
+mod conceal {
+    //! THE TRACKER MUST NOT SPOIL THE DRAW.
+    use super::*;
+
+    #[test]
+    fn an_accessible_region_is_never_concealed() {
+        for offer in [
+            LockHintOffer::Unknown,
+            LockHintOffer::Spilled,
+            LockHintOffer::AlreadyHinted { location: 1 },
+            LockHintOffer::Buyable {
+                price: 2,
+                location: 1,
+            },
+        ] {
+            assert!(!conceal_region(true, &offer));
+        }
+    }
+
+    #[test]
+    fn a_locked_region_is_concealed_until_something_reveals_it() {
+        assert!(conceal_region(false, &LockHintOffer::Unknown));
+        assert!(conceal_region(
+            false,
+            &LockHintOffer::Buyable {
+                price: 2,
+                location: 1
+            }
+        ));
+        assert!(conceal_region(
+            false,
+            &LockHintOffer::Insufficient {
+                price: 2,
+                have: 0,
+                location: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn the_purchase_is_the_reveal() {
+        assert!(!conceal_region(
+            false,
+            &LockHintOffer::AlreadyHinted { location: 1 }
+        ));
+    }
+
+    #[test]
+    fn a_mask_the_player_cannot_lift_does_not_ship() {
+        // `offer` returns Spilled BEFORE it ever consults the hinted set, so a foreign lock can
+        // never report AlreadyHinted -- concealing it would hide the region forever.
+        assert!(!conceal_region(false, &LockHintOffer::Spilled));
     }
 }

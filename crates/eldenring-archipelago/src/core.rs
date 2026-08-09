@@ -4225,7 +4225,15 @@ impl Core {
 
                 // (b) Per-region rollups. The ### id is the region name alone so the header's
                 // open state survives the done/total counters changing.
-                for region in &model.regions {
+                // TWO PASSES, CONCEALED ROWS LAST (2026-08-09). Rendered in one pass, a concealed
+                // row keeps its ALPHABETICAL slot -- "Locked region" sitting between Belurat and
+                // Roundtable Hold tells you its initial is somewhere in C..R, which is most of the
+                // way to naming it. Sinking them to the bottom leaves only their order relative to
+                // EACH OTHER, which names nothing on its own. Two passes over the same body rather
+                // than a sorted index: the body renders interactive widgets, so it cannot be
+                // buffered and replayed.
+                for conceal_pass in [false, true] {
+                    for region in &model.regions {
                     // Filter pass first so fully-filtered regions can be skipped outright.
                     let shown: Vec<_> = region
                         .unchecked
@@ -4237,11 +4245,54 @@ impl Core {
                     if (in_logic_only || surface_only) && shown.is_empty() {
                         continue;
                     }
+                    // THE MASK. Computed from the same offer the button below renders, so the row
+                    // and its reveal can never disagree -- and defaulting to CONCEALED while the
+                    // ledger is still loading, because a row that names itself during the pause
+                    // leaks exactly what this hides. See lock_hint_economy::conceal_region.
+                    let row_offer = if region.accessible || !ledger_ready {
+                        None
+                    } else {
+                        let lock_item = region
+                            .unchecked
+                            .first()
+                            .and_then(|u| coarse_of.get(&u.location_id))
+                            .and_then(|c| lock_item_of.get(c))
+                            .map(|s| s.as_str());
+                        Some(er_logic::lock_hint_economy::offer(
+                            lock_item,
+                            &lock_scout,
+                            &hinted_locs,
+                            surface_total_n,
+                            surface_checked_n,
+                            purchases_n,
+                            points_per_hint,
+                            total_locations,
+                        ))
+                    };
+                    let concealed = match &row_offer {
+                        Some(o) => er_logic::lock_hint_economy::conceal_region(region.accessible, o),
+                        None => !region.accessible,
+                    };
+                    if concealed != conceal_pass {
+                        continue;
+                    }
                     let lock_tag = if region.accessible { "" } else { "  [locked]" };
-                    let header = format!(
-                        "{}  {}/{}{}###trk-region-{}",
-                        region.region, region.done, region.total, lock_tag, region.region
-                    );
+                    // THE COUNTS ARE PART OF THE NAME. The thirteen DLC region sizes are all
+                    // distinct, so `0/85` identifies Enir Ilim as surely as the word does. A
+                    // concealed row shows neither -- but it keeps the REAL region name after the
+                    // `###`, which imgui uses as the widget id and never draws, so a row's
+                    // open/closed state survives the reveal.
+                    let header = if concealed {
+                        format!(
+                            "Locked region  0/??{}###trk-region-{}",
+                            lock_tag, region.region
+                        )
+                    } else {
+                        format!(
+                            "{}  {}/{}{}###trk-region-{}",
+                            region.region, region.done, region.total, lock_tag, region.region
+                        )
+                    };
                     // Dim the header text while the region's coarse region is locked. The token
                     // pops on drop -- released right after the header so the rows keep their
                     // own colors.
@@ -4252,23 +4303,11 @@ impl Core {
                     // ---- "hint lock" button ---------------------------------------------------
                     // Only on a LOCKED region, and only once the ledger has been read back: a
                     // balance computed against an unread ledger looks like free money.
-                    if !region.accessible && ledger_ready {
-                        let lock_item = region
-                            .unchecked
-                            .first()
-                            .and_then(|u| coarse_of.get(&u.location_id))
-                            .and_then(|c| lock_item_of.get(c))
-                            .map(|s| s.as_str());
-                        let offer = er_logic::lock_hint_economy::offer(
-                            lock_item,
-                            &lock_scout,
-                            &hinted_locs,
-                            surface_total_n,
-                            surface_checked_n,
-                            purchases_n,
-                            points_per_hint,
-                            total_locations,
-                        );
+                    if let Some(offer) = row_offer {
+                        // THE PURCHASE IS THE REVEAL (Alaric, 2026-08-09), so the button stays on
+                        // a concealed row. Buying blind is the point: it is what turns "Locked
+                        // region" into a name, and hiding the button until something else revealed
+                        // the region would leave the economy with nothing to sell.
                         use er_logic::lock_hint_economy::LockHintOffer as Offer;
                         match offer {
                             Offer::Buyable { price, location } => {
@@ -4298,7 +4337,13 @@ impl Core {
                             Offer::Unknown => {}
                         }
                     }
-                    if expanded {
+                    // A CONCEALED ROW HAS NO CONTENTS. The location names leak more than the
+                    // header ever did -- ours carry the region as a "<Region> :: ..." prefix, and
+                    // the individual place names give it away even where they do not.
+                    if expanded && concealed {
+                        ui.text_disabled("  hidden until this region is unlocked or hinted");
+                    }
+                    if expanded && !concealed {
                         if shown.is_empty() {
                             ui.text_disabled("  complete");
                         }
@@ -4321,6 +4366,7 @@ impl Core {
                             }
                         }
                     }
+                }
                 }
                 // (b2) Bosses group (mode A/B). RE-AUTHORED tail -- no bak_rlwarn equivalent; the
                 // boss tracker post-dates that backup. Rendered from the pure `boss_group` snapshot.
