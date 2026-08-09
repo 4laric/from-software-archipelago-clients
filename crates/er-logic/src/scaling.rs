@@ -458,6 +458,69 @@ pub fn area_tier_from_histogram(hist: &[u32]) -> Option<usize> {
     None
 }
 
+/// The area reading a region resolved while it still had a vanilla sample to read, held for the
+/// rest of the visit.
+///
+/// ⭐⭐⭐ **THE ANCHOR OUTLIVES THE SAMPLE THAT PRODUCED IT, AND THAT IS THE WHOLE POINT.**
+/// `area_tier_from_histogram` counts only rung-AND-band carriers, because anything else is a
+/// statistic over our own output (see its docs). But WE STRIP THE BAND. So a region answers `Some(n)`
+/// on its first sweep and `None` on every sweep after — by design, and harmlessly, for the enemies
+/// that were standing there at the time: they came out of sweep one carrying either a rung
+/// (`Replace` re-derives them forever) or a down state (`KeepDown` holds it).
+///
+/// 🛑 A CHARACTER THAT ARRIVES LATER HAS NEITHER. It carries no rung to re-derive from and no down
+/// state to keep, so `presumed_native_tier` has nothing to answer with and `scale_action` returns
+/// `NoTouch` — full vanilla, in a region we already decided was too strong. bobler, 2026-08-09,
+/// Enir Ilim: matt's enemy randomiser gives a two-phase boss TWO separate entities and therefore two
+/// health bars, and the phase-2 entity instantiates mid-fight, long after the anchor is gone. Phase 1
+/// was placed off `area-index Some(5) from 33 vanilla-shaped`; the sweeps after it read
+/// `area-index None from 0 vanilla-shaped`, so phase 2 could not be placed at all. Same arena, same
+/// tier, one boss scaled and one vanilla.
+///
+/// ⭐ A FRESH READING ALWAYS WINS. The only sweep that can produce one is a sweep over ground we have
+/// not processed, so `Some` is always the more truthful answer and never our own echo. The latch
+/// fills in only where the sample has gone silent, which is exactly the case it was written for.
+///
+/// Cleared on region change (a different region's difficulty is not this one's) and on `configure`
+/// (a new seed re-tiers everything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AreaAnchor {
+    region: Option<i32>,
+    tier: Option<usize>,
+}
+
+impl AreaAnchor {
+    pub const fn new() -> Self {
+        Self {
+            region: None,
+            tier: None,
+        }
+    }
+
+    /// Feed this sweep's fresh reading; get back the reading to judge enemies against.
+    pub fn resolve(&mut self, region: i32, fresh: Option<usize>) -> Option<usize> {
+        if self.region != Some(region) {
+            self.region = Some(region);
+            self.tier = None;
+        }
+        if fresh.is_some() {
+            self.tier = fresh;
+        }
+        self.tier
+    }
+
+    /// Whether the last `resolve` answered from the latch rather than a live sample — the log wants
+    /// to say which, because "we remembered" and "we measured" are different claims.
+    pub fn is_latched(&self, fresh: Option<usize>) -> bool {
+        fresh.is_none() && self.tier.is_some()
+    }
+
+    pub fn forget(&mut self) {
+        self.region = None;
+        self.tier = None;
+    }
+}
+
 /// The phase-1b DOWN-STATE rows: the only rows in the game that can scale an enemy BELOW vanilla.
 ///
 /// SWEPT 2026-08-06 across all 11,325 `SpEffectParam` rows — every row with `maxHpRate < 1` or
@@ -2927,6 +2990,46 @@ mod tests {
         hist[6] = MIN_AREA_SAMPLE;
         assert_eq!(area_tier_from_histogram(&hist), Some(6));
         assert_eq!(area_tier_from_histogram(&[0u32; NUM_TIERS]), None);
+    }
+
+    #[test]
+    fn a_late_arriving_boss_is_judged_against_the_area_the_region_already_resolved() {
+        // 🛑 THE bobler / Enir Ilim SHAPE (2026-08-09), and the reason AreaAnchor exists.
+        // Sweep one still has vanilla neighbours to read. Every sweep after it reads nothing,
+        // because sweep one stripped the bands the reading is gated on -- so without the latch the
+        // phase-2 boss that spawns mid-fight is unplaceable and stays vanilla in an arena whose
+        // phase-1 boss we scaled.
+        let mut anchor = AreaAnchor::new();
+        assert_eq!(anchor.resolve(20010, Some(5)), Some(5));
+        assert_eq!(anchor.resolve(20010, None), Some(5));
+        assert_eq!(anchor.resolve(20010, None), Some(5));
+        assert!(anchor.is_latched(None));
+        assert!(!anchor.is_latched(Some(5)));
+    }
+
+    #[test]
+    fn a_fresh_area_reading_always_beats_the_latch() {
+        // Only an unprocessed region can produce a reading at all, so `Some` is never our own echo
+        // and must win -- otherwise a reload that re-instantiates the region with vanilla bands
+        // would keep being judged against a stale number.
+        let mut anchor = AreaAnchor::new();
+        anchor.resolve(20010, Some(5));
+        assert_eq!(anchor.resolve(20010, Some(7)), Some(7));
+        assert_eq!(anchor.resolve(20010, None), Some(7));
+    }
+
+    #[test]
+    fn another_regions_difficulty_is_not_this_ones() {
+        // The latch must not leak across a region change: Enir Ilim's 5 says nothing about Limgrave,
+        // and answering `Some(5)` there would license scaling something we cannot place.
+        let mut anchor = AreaAnchor::new();
+        anchor.resolve(20010, Some(5));
+        assert_eq!(anchor.resolve(10000, None), None);
+        // ...and coming back does not resurrect it; the region has to re-earn its reading.
+        assert_eq!(anchor.resolve(20010, None), None);
+        anchor.resolve(20010, Some(5));
+        anchor.forget();
+        assert_eq!(anchor.resolve(20010, None), None);
     }
 
     #[test]

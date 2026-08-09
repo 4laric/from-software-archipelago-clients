@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use er_logic::scaling::{
-    NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
+    AreaAnchor, NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
     area_tier_from_histogram, band_native_tier, is_dlc_bucket, is_scaling_speffect,
     is_scaling_speffect_with_downstates, ladder_tier, native_tier, placed_by_area,
     placed_by_area_down, raw_target_for_region, region_name_for_bucket, region_scaling,
@@ -80,6 +80,11 @@ static STATUS_HIST: [AtomicU32; 6] = [
 ];
 /// One-shot release log per transition.
 static RELEASE_LOGGED: Mutex<bool> = Mutex::new(true);
+/// The area reading this region resolved while it still had a vanilla sample to read. Pure policy +
+/// host tests in `er_logic::scaling::AreaAnchor`; this is only the residence. Without it a character
+/// that instantiates AFTER the region's first sweep can never be placed — see the type's docs for
+/// the two-health-bar boss that found it.
+static AREA_ANCHOR: Mutex<AreaAnchor> = Mutex::new(AreaAnchor::new());
 /// Once-per-announcement ledger for the region-entry scaling toast (pure + host-tested in
 /// `er_logic::scaling::RegionToastLedger`; the dedup policy and its tests live there). Reset in
 /// `configure` so a new seed's tiers announce afresh.
@@ -382,6 +387,11 @@ pub fn configure(sd: &Value) {
     // ever costs announcements, never the sweep.
     if let Ok(mut ledger) = TOAST_LEDGER.lock() {
         ledger.reset();
+    }
+    // ...and so does the area reading. A new seed re-tiers every region, so last seed's anchor is a
+    // claim about ground that no longer exists. Same degrade: a poisoned lock costs the latch only.
+    if let Ok(mut anchor) = AREA_ANCHOR.lock() {
+        anchor.forget();
     }
 }
 
@@ -748,7 +758,22 @@ pub fn tick() -> Option<String> {
             area_sample_one(chr, &player_handle, &mut tally);
         }
     }
-    let area_tier = area_tier_from_histogram(&tally.area_hist);
+    // ⭐ THE READING IS LATCHED, BECAUSE THE SAMPLE THAT PRODUCES IT IS SELF-CONSUMING. Pass one can
+    // only see vanilla-shaped (rung AND band) neighbours, and pass two strips the band off every one
+    // of them -- so a region answers `Some(n)` once and `None` forever after. That is fine for the
+    // enemies present at the time (they leave sweep one carrying a rung or a down state, and both
+    // re-derive) and fatal for anything that arrives later, which carries neither and falls to
+    // `NoTouch` at full vanilla strength. A fresh reading still wins whenever there is one; the latch
+    // only speaks after the sample has gone quiet. See `AreaAnchor`.
+    let fresh_area_tier = area_tier_from_histogram(&tally.area_hist);
+    let (area_tier, area_latched) = match AREA_ANCHOR.lock() {
+        Ok(mut anchor) => (
+            anchor.resolve(region, fresh_area_tier),
+            anchor.is_latched(fresh_area_tier),
+        ),
+        // A poisoned lock costs the latch, never the sweep -- degrade to the pre-latch behaviour.
+        Err(_) => (fresh_area_tier, false),
+    };
 
     // PASS TWO -- decide and apply. Uses the status-carrying walk so the SAMPLE line can state each
     // enemy's load state PER ROW; nothing is filtered on it (see `sweepable_characters_with_status`).
@@ -860,20 +885,47 @@ pub fn tick() -> Option<String> {
     // once a region settles the numbers stop moving and the line stops repeating, which the old
     // condition did not guarantee. Same idiom as the phantom census above.
     {
-        type ScaleLine = (i32, i32, u32, u32, u32, u32, u32, u32, u32, u32);
+        // 🛑 THE DOWN COUNTERS ARE IN THE KEY, SINCE 2026-08-09. They were not, and the omission hid
+        // the exact event we most needed to see: a character arriving mid-fight moves ONLY
+        // `scaled_down` / `settled_down` / `kept_down` / `area_down`, so the whole phase-2 boss
+        // arrival in bobler's Enir Ilim log produced no line at all. A struct rather than a tuple
+        // because this is now past the 12-element ceiling `PartialEq` is implemented to.
+        #[derive(PartialEq, Eq, Clone, Copy)]
+        struct ScaleLine {
+            region: i32,
+            target: i32,
+            scaled: u32,
+            unrunged: u32,
+            left_vanilla: u32,
+            other_in_range: u32,
+            scaled_by_native: u32,
+            band_only: u32,
+            band_and_rung: u32,
+            residue: u32,
+            scaled_down: u32,
+            settled_down: u32,
+            kept_down: u32,
+            cleared_down: u32,
+            area_down: u32,
+        }
         static LAST: Mutex<Option<ScaleLine>> = Mutex::new(None);
-        let line: ScaleLine = (
+        let line = ScaleLine {
             region,
             target,
-            tally.scaled,
-            tally.unrunged,
-            tally.left_vanilla,
-            tally.other_in_range,
-            tally.scaled_by_native,
-            tally.band_only,
-            tally.band_and_rung,
-            tally.residue,
-        );
+            scaled: tally.scaled,
+            unrunged: tally.unrunged,
+            left_vanilla: tally.left_vanilla,
+            other_in_range: tally.other_in_range,
+            scaled_by_native: tally.scaled_by_native,
+            band_only: tally.band_only,
+            band_and_rung: tally.band_and_rung,
+            residue: tally.residue,
+            scaled_down: tally.scaled_down,
+            settled_down: tally.settled_down,
+            kept_down: tally.kept_down,
+            cleared_down: tally.cleared_down,
+            area_down: tally.area_down,
+        };
         let changed = match LAST.lock() {
             Ok(mut last) => {
                 let changed = *last != Some(line);
@@ -914,9 +966,12 @@ pub fn tick() -> Option<String> {
             // hand-tuned enemies we currently leave at vanilla while normalising everything around
             // them, which is the shape of the sphere-2 Vyke complaint. `None` means the sweep did
             // not see enough untouched neighbours to say -- expected on a settled region's later
-            // sweeps, since the gate counts only enemies still carrying rung AND band.
+            // sweeps, since the gate counts only enemies still carrying rung AND band. ⭐ When that
+            // happens the LATCH answers instead (`area-index ... LATCHED`), and the `from N
+            // vanilla-shaped` count beside it is the live sample, so the two together still say
+            // plainly whether this sweep measured the area or remembered it.
             let area_total: u32 = tally.area_hist.iter().sum();
-            let area_index = area_tier_from_histogram(&tally.area_hist);
+            let area_index = area_tier;
             let area_dist: Vec<(usize, u32)> = tally
                 .area_hist
                 .iter()
@@ -930,7 +985,7 @@ pub fn tick() -> Option<String> {
                  atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
                  vanilla {}, npc_param_ids {:?}), down-scaled {} (settled {}, kept {}, cleared {}), \
                  area-down {} across {} row(s) {:?}; other-in-range {} {:?}; band-only {}, \
-                 band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?} from {} \
+                 band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?}{} from {} \
                  vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {:?}, \
                  still NoTouch {}",
                 NUM_TIERS - 1,
@@ -955,6 +1010,7 @@ pub fn tick() -> Option<String> {
                 tally.band_vs_table,
                 tally.residue,
                 area_index,
+                if area_latched { " LATCHED" } else { "" },
                 area_total,
                 area_dist,
                 tally.area_moved,
