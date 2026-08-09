@@ -12,6 +12,24 @@
 //! It is pure. No game, no socket, no params -- the caller reads the live rows and the live event
 //! flags and hands them in, which is what makes every rule below testable on any host.
 //!
+//! # 🛑 FOREIGN ITEMS ONLY (changed 2026-08-09, after the first working playtest)
+//!
+//! The original ruling said to hint own and foreign alike, on the DS3 precedent. Alaric ran it and
+//! asked for the narrower rule, and he is right: a hint for an item that is ALREADY YOURS, sitting
+//! on a shelf you are looking at, tells the multiworld nothing it can act on and tells you nothing
+//! the screen is not already showing. What a hint is FOR is the other player -- "your item is in
+//! Alaric's Elden Ring, at Kale's". So a slot only announces itself when checking it would SEND the
+//! item out.
+//!
+//! The discriminator is not new: `scout_proof::ScoutedItem::foreign` is `sender.slot() !=
+//! receiver.slot()`, computed at connect for every one of this seed's locations and, until now,
+//! deliberately unread. This is the consumer it was populated for.
+//!
+//! ⚠️ A location the scout cannot classify is NOT hinted. Guessing "probably foreign" would leak an
+//! own-world reward, and guessing "probably own" would silently drop the hint the feature exists to
+//! send; counting it is the only honest third answer. The caller must also refuse to plan AT ALL
+//! until the scout reply has landed -- see the note on [`plan_shop_hints`]'s `is_foreign`.
+//!
 //! # Why the shelf is not the same thing as the range
 //!
 //! The range is what the talkscript ASKED for. What the player can actually see is narrower, in two
@@ -81,6 +99,11 @@ pub struct SkipTally {
     pub purchased: u32,
     /// Stock flag is not one of this seed's check flags.
     pub unknown_flag: u32,
+    /// The reward at this location belongs to US. Not a hint -- see the module header.
+    pub own_world: u32,
+    /// The scout has no entry for this location, so we cannot say whose the reward is. Never
+    /// guessed either way.
+    pub unclassified: u32,
     /// Location already hinted -- earlier this session, or by another row in this same range.
     pub already_hinted: u32,
 }
@@ -128,16 +151,20 @@ pub fn normalize_range(begin: i32, end: i32) -> Option<(u32, u32)> {
 ///   The same table `shop_sell` and `shop_repoint` invert; nothing new travels in slot data for
 ///   this feature, which is why it moves no contract hash.
 /// * `flag_set` -- is this event flag set RIGHT NOW.
+/// * `is_foreign` -- does this location's reward belong to ANOTHER player? `None` = the scout has
+///   no answer for it, which is skipped and counted, never guessed.
+///   🛑 The caller must not call this function at all while the scout reply is still outstanding:
+///   every location would come back `None`, the whole shelf would land in `unclassified`, and
+///   because the caller claims what it plans, a shelf opened one frame too early would go quiet for
+///   the rest of the session. "Not scouted yet" is a reason to WAIT, not a reason to skip.
 /// * `hinted` -- locations already announced this session. Session-scoped on purpose (DS3
 ///   precedent): if something goes wrong the player can quit out and every hint is re-sent.
-///
-/// Own and foreign items alike are hinted. The trigger is "the player is looking at this shelf",
-/// and what the player is looking at does not depend on who the reward belongs to.
 pub fn plan_shop_hints(
     range: (u32, u32),
     rows: &[ShopRow],
     flag_to_loc: &HashMap<u32, i64>,
     flag_set: &dyn Fn(u32) -> bool,
+    is_foreign: &dyn Fn(i64) -> Option<bool>,
     hinted: &HashSet<i64>,
 ) -> ShopHintPlan {
     let (lo, hi) = range;
@@ -173,6 +200,17 @@ pub fn plan_shop_hints(
                 continue;
             }
         };
+        match is_foreign(loc) {
+            Some(true) => {}
+            Some(false) => {
+                tally.own_world += 1;
+                continue;
+            }
+            None => {
+                tally.unclassified += 1;
+                continue;
+            }
+        }
         if hinted.contains(&loc) || !batch.insert(loc) {
             tally.already_hinted += 1;
             continue;
@@ -206,6 +244,12 @@ mod tests {
         false
     }
 
+    /// Every reward belongs to someone else -- the default for the tests that are about the SHELF
+    /// rules rather than about ownership.
+    fn all_foreign(_: i64) -> Option<bool> {
+        Some(true)
+    }
+
     /// THE MOTIVATING CASE (er-archipelago#455, and boblerrr's ask in the shape he asked for it):
     /// the player opens Kale, whose real observed range is `101800..=101897`, and the two AP checks
     /// on that shelf are announced to the multiworld.
@@ -221,6 +265,7 @@ mod tests {
             &rows,
             &map(&[(280_060, 7_774_858), (280_590, 7_774_859)]),
             &nothing_set,
+            &all_foreign,
             &HashSet::new(),
         );
         assert_eq!(plan.locations, vec![7_774_858, 7_774_859]);
@@ -237,6 +282,7 @@ mod tests {
             &rows,
             &map(&[(280_060, 7_774_858)]),
             &|f| f == 280_060,
+            &all_foreign,
             &HashSet::new(),
         );
         assert!(plan.is_empty());
@@ -256,6 +302,7 @@ mod tests {
             &rows,
             &flags,
             &nothing_set,
+            &all_foreign,
             &HashSet::new(),
         );
         assert!(before.is_empty());
@@ -266,6 +313,7 @@ mod tests {
             &rows,
             &flags,
             &|f| f == 9_116,
+            &all_foreign,
             &HashSet::new(),
         );
         assert_eq!(after.locations, vec![7_770_500]);
@@ -284,6 +332,7 @@ mod tests {
             &rows,
             &map(&[(280_060, 7_774_858)]),
             &nothing_set,
+            &all_foreign,
             &HashSet::new(),
         );
         assert_eq!(plan.locations, vec![7_774_858]);
@@ -301,6 +350,7 @@ mod tests {
             &rows,
             &map(&[(280_060, 7_774_858), (280_590, 7_774_859)]),
             &nothing_set,
+            &all_foreign,
             &hinted,
         );
         assert_eq!(plan.locations, vec![7_774_859]);
@@ -317,6 +367,7 @@ mod tests {
             &rows,
             &map(&[(280_000, 111), (280_060, 7_774_858)]),
             &nothing_set,
+            &all_foreign,
             &HashSet::new(),
         );
         assert_eq!(plan.locations, vec![7_774_858]);
@@ -334,6 +385,7 @@ mod tests {
             &rows,
             &map(&[(280_060, 7_774_858)]),
             &nothing_set,
+            &all_foreign,
             &HashSet::new(),
         );
         assert!(plan.is_empty());
@@ -371,9 +423,67 @@ mod tests {
             &rows,
             &map(&[(280_060, 7_774_858), (280_590, 7_774_859)]),
             &nothing_set,
+            &all_foreign,
             &HashSet::new(),
         );
         assert_eq!(plan.locations, vec![7_774_858, 7_774_859]);
+    }
+
+    /// THE RULE ALARIC ASKED FOR after the first working playtest: an item that is already yours,
+    /// on a shelf you are looking at, is not news to anybody. Only a reward that would be SENT
+    /// somewhere else announces itself.
+    #[test]
+    fn an_own_world_reward_is_not_announced() {
+        let rows = [row(101_800, 280_060, 0), row(101_801, 280_590, 0)];
+        let plan = plan_shop_hints(
+            (101_800, 101_897),
+            &rows,
+            &map(&[(280_060, 7_774_858), (280_590, 7_774_859)]),
+            &nothing_set,
+            &|loc| Some(loc == 7_774_859),
+            &HashSet::new(),
+        );
+        assert_eq!(plan.locations, vec![7_774_859]);
+        assert_eq!(plan.tally.own_world, 1);
+    }
+
+    /// 🛑 A location the scout cannot classify is NEVER guessed. Guessing foreign leaks an own-world
+    /// reward; guessing own drops the hint the feature exists to send. It is counted, and the count
+    /// is the caller's cue that something is wrong upstream.
+    #[test]
+    fn an_unclassifiable_location_is_counted_not_guessed() {
+        let rows = [row(101_800, 280_060, 0)];
+        let plan = plan_shop_hints(
+            (101_800, 101_897),
+            &rows,
+            &map(&[(280_060, 7_774_858)]),
+            &nothing_set,
+            &|_| None,
+            &HashSet::new(),
+        );
+        assert!(plan.is_empty());
+        assert_eq!(plan.tally.unclassified, 1);
+        assert_eq!(plan.tally.own_world, 0);
+    }
+
+    /// Ownership is asked LAST, after the shelf rules, so a bought or unreleased own-world slot is
+    /// reported as bought or unreleased. Two skips that mean different things must not collapse
+    /// into one bucket -- the tally is the only thing that explains a quiet open.
+    #[test]
+    fn ownership_does_not_mask_the_shelf_reasons() {
+        let rows = [row(101_800, 280_060, 0), row(101_801, 280_590, 4_242)];
+        let plan = plan_shop_hints(
+            (101_800, 101_897),
+            &rows,
+            &map(&[(280_060, 7_774_858), (280_590, 7_774_859)]),
+            &|f| f == 280_060,
+            &|_| Some(false),
+            &HashSet::new(),
+        );
+        assert!(plan.is_empty());
+        assert_eq!(plan.tally.purchased, 1);
+        assert_eq!(plan.tally.not_released, 1);
+        assert_eq!(plan.tally.own_world, 0);
     }
 
     /// A shelf with nothing to say still has to say WHY, or a working feature and a broken one look
@@ -390,6 +500,7 @@ mod tests {
             &rows,
             &map(&[(280_060, 7_774_858), (280_590, 7_774_859)]),
             &|f| f == 280_060,
+            &all_foreign,
             &HashSet::new(),
         );
         assert!(plan.is_empty());

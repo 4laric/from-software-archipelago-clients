@@ -4,6 +4,19 @@
 //! This is the I/O half. Every rule about WHICH slots qualify lives in `er_logic::shop_hints`,
 //! pure and unit-tested on any host; this module only reads the live game and drives the socket.
 //!
+//! ## 🛑 FOREIGN REWARDS ONLY
+//!
+//! A slot announces itself only when checking it would send the item to ANOTHER player. Alaric ran
+//! the first working build and asked for this narrowing: a hint for an item that is already yours,
+//! on a shelf you are looking at, is not news to anyone. The discriminator is
+//! `scout_proof::ScoutedItem::foreign` (`sender.slot() != receiver.slot()`), computed at connect
+//! for every location this seed has and, until now, populated but never read.
+//!
+//! Consequence: **this feature cannot plan until the connect-time scout reply has landed.** Every
+//! location would classify as unknown, and because a plan CLAIMS what it hints, a shelf opened one
+//! frame early would go quiet for the rest of the session. So an open before `cache_ready()` is
+//! deferred, not skipped -- nothing is claimed and the next open plans properly.
+//!
 //! ## The seam, and why we can trust it now
 //!
 //! Phase 1's log-only probe answered the one question the design could not assume. boblerrr,
@@ -86,8 +99,8 @@ pub fn configure(loc_flags: HashMap<i64, u32>) {
     }
     log::info!(
         "shop-hints: configured {n} check flag(s); opening a merchant will hint its unbought, \
-         released slots (buy menu only -- Ash of War / tailoring / upgrade / change-of-purpose \
-         open through commands whose ids are not known yet)"
+         released slots whose reward belongs to ANOTHER player (buy menu only -- Ash of War / \
+         tailoring / upgrade / change-of-purpose open through commands whose ids are not known yet)"
     );
 }
 
@@ -129,6 +142,16 @@ pub fn on_shop_open(begin: i32, end: i32) {
     if flag_to_loc.is_empty() {
         return; // seed has no check flags at all: no shop checks to hint, and nothing to say.
     }
+    // 🛑 DEFER, do not skip. Planning now would classify the whole shelf as unclassified AND claim
+    // it, so this shelf would never hint again. Nothing is touched; the next open re-plans.
+    if !crate::scout_proof::cache_ready() {
+        log::info!(
+            "shop-hints: shop opened over rows {lo}..={hi} before the connect scout replied, so \
+             nothing can be classified as own or foreign yet -- DEFERRED, not skipped; re-open the \
+             shop once connected. (If this never stops, the scout failed -- grep 'AP scout-proof'.)"
+        );
+        return;
+    }
 
     // SAFETY: FD4 singleton, read-only, on the game thread. Same sanctioned access `shop_flags`
     // uses; no mutable borrow is taken, so this cannot alias the tick's `instance_mut()` passes.
@@ -159,14 +182,16 @@ pub fn on_shop_open(begin: i32, end: i32) {
         &rows,
         flag_to_loc,
         &crate::flags::get_event_flag,
+        &|loc| crate::scout_proof::lookup(loc).map(|s| s.foreign),
         hinted,
     );
     let t = plan.tally;
     // TALLY, not a bare count. A shelf that hints nothing because everything on it is bought and a
     // shelf that hints nothing because the feature is broken are the same log line without this.
     log::info!(
-        "shop-hints: shop open rows {lo}..={hi} ({} live) -> {} hint(s) {:?} | skipped: \
-         vanilla {} unreleased {} bought {} unknown-flag {} already-hinted {}",
+        "shop-hints: shop open rows {lo}..={hi} ({} live) -> {} foreign hint(s) {:?} | skipped: \
+         vanilla {} unreleased {} bought {} unknown-flag {} own-world {} unclassified {} \
+         already-hinted {}",
         rows.len(),
         plan.locations.len(),
         plan.locations,
@@ -174,6 +199,8 @@ pub fn on_shop_open(begin: i32, end: i32) {
         t.not_released,
         t.purchased,
         t.unknown_flag,
+        t.own_world,
+        t.unclassified,
         t.already_hinted,
     );
     if plan.locations.is_empty() {
@@ -196,7 +223,7 @@ pub fn pump(client: &mut ap::Client<serde_json::Value>) {
     for batch in batches {
         match client.create_hints(batch.iter().copied()) {
             Ok(()) => log::info!(
-                "shop-hints: announced {} shop location(s) to the multiworld: {batch:?}",
+                "shop-hints: announced {} foreign shop location(s) to the multiworld: {batch:?}",
                 batch.len()
             ),
             Err(e) => {
