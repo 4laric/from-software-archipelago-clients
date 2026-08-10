@@ -3416,6 +3416,26 @@ impl shared::Core for Core {
             // (scaling::notify_transition; same native-crash class as Siofra 2026-07-09).
             crate::scaling::notify_transition();
         }
+        // THE MENU EDGE (in_world true->false): the player quit to the main menu, which is the one
+        // moment a latched marker refusal may be released. `reconcile_io::REFUSED` had no writer
+        // that ever stored `false` and `reconcile_inited` is set the moment `init` RETURNS -- refuse
+        // path included, which returns before building a `Driver` -- so a wrong-save player who
+        // followed the toast's own instruction ("start a fresh character") loaded the new character
+        // into a gated, silent, permanently inert session. Only a game restart cleared it, and
+        // nothing said so (Alaric, 2026-08-10).
+        //
+        // Clearing `reconcile_inited` is the other half and must not be skipped: without it `init`
+        // never runs again, so the released latch would just leave an unarmed session behind.
+        //
+        // This edge, not the false->true one, deliberately. `init` runs in-world, EARLIER in this
+        // same tick, so releasing on the load edge would clear the refusal the tick it was latched
+        // and loop. Releasing on the way OUT means the next load re-asks the guard cleanly.
+        // `clear_refusal_if_rearmable` decides via `er_logic::marker::release_verdict`, which holds
+        // a mid-session room change forever (its `Driver` is armed for the old room and `DRIVER` is
+        // a `OnceLock`) -- see the 229-check incident in `disarm_if_identity_moved`.
+        if !now_in_world && self.was_in_world && crate::reconcile_io::clear_refusal_if_rearmable() {
+            self.reconcile_inited = false;
+        }
         self.was_in_world = now_in_world;
         if crate::flags::in_world() {
             let _ = crate::fmg_inject::run();

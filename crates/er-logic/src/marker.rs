@@ -389,10 +389,60 @@ pub enum Refusal {
 /// makes a per-tick re-push free — which is what a persistent condition wants.
 pub fn refusal_toast(refusal: Refusal) -> String {
     match refusal {
-        Refusal::WrongSaveAtConnect => "Archipelago: this save belongs to a DIFFERENT seed.              Nothing will send or arrive. Load the save for this room, or start a fresh character."
+        Refusal::WrongSaveAtConnect => "Archipelago: this save belongs to a DIFFERENT seed.              Nothing will send or arrive. Quit to the main menu, then load this room's save or start a new character."
             .to_string(),
         Refusal::RoomChangedMidSession => "Archipelago: the room changed while you were playing.              Nothing will send or arrive, so this save's checks are not sent to the new room.              RESTART the game."
             .to_string(),
+    }
+}
+
+/// What may be done with a LATCHED refusal when the player leaves the world.
+///
+/// See [`release_verdict`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalRelease {
+    /// Keep the session gated. Only a game restart clears this one.
+    Hold,
+    /// Clear the latch, so session init runs again against whatever character loads next.
+    Rearm,
+}
+
+/// May a latched refusal be RELEASED now that the player has left the world?
+///
+/// # The bug this exists for (2026-08-10, Alaric)
+///
+/// [`refusal_toast`] tells a wrong-save player to "start a fresh character", and until this
+/// predicate existed that instruction could not work. The refusal is a process-lifetime latch
+/// (`reconcile_io::REFUSED`), and `core`'s `reconcile_inited` is set the moment `init` RETURNS --
+/// including the [`InitDecision::Refuse`] path, which returns before building anything. So the
+/// player quit to the menu, rolled a brand-new character, and got a save that was gated, silent and
+/// permanently inert: no checks reported, no items granted, the same toast still on screen. The
+/// only recovery was restarting the game, and nothing on screen said so.
+///
+/// # Why this is a predicate and not just "clear the flag"
+///
+/// The two refusals are NOT symmetric, and clearing both would reintroduce the 229-check corruption
+/// [`ArmedVerdict`] exists to stop:
+///
+/// * [`Refusal::WrongSaveAtConnect`] fires INSIDE init, before a driver is constructed. There is
+///   nothing armed, nothing built for the wrong identity, and nothing that has reported a check.
+///   Re-running init is a genuine first init, so this one releases.
+/// * [`Refusal::RoomChangedMidSession`] fires against an ALREADY-ARMED reconciler built for the old
+///   room. `reconcile_io`'s `DRIVER` is a `OnceLock` and cannot be replaced, so "clear the latch and
+///   re-init" would silently keep the OLD driver while looking correct. Fail closed: hold, and let
+///   the toast's RESTART instruction stand.
+///
+/// `driver_armed` is the caller's answer to "does a driver exist right now" (`DRIVER.get().is_some()`).
+/// It is a parameter rather than an assumption because the first bullet's "there is nothing armed"
+/// is an invariant of today's `init`, not a law -- if a future init ever builds a driver before
+/// refusing, this holds instead of releasing a session onto a driver built for someone else.
+pub fn release_verdict(refusal: Refusal, driver_armed: bool) -> RefusalRelease {
+    match refusal {
+        // An armed driver belongs to an identity we can no longer serve, and a `OnceLock` cannot be
+        // replaced -- so a release here would re-arm nothing and un-gate everything.
+        Refusal::RoomChangedMidSession => RefusalRelease::Hold,
+        Refusal::WrongSaveAtConnect if driver_armed => RefusalRelease::Hold,
+        Refusal::WrongSaveAtConnect => RefusalRelease::Rearm,
     }
 }
 
@@ -640,8 +690,69 @@ mod tests {
             // The consequence, so a silent game is explained rather than merely flagged.
             assert!(t.contains("Nothing will send or arrive"), "{t}");
         }
-        assert!(wrong.to_lowercase().contains("fresh character"), "{wrong}");
+        assert!(wrong.to_lowercase().contains("new character"), "{wrong}");
         assert!(changed.to_lowercase().contains("restart"), "{changed}");
+    }
+
+    /// The wrong-save toast names the MENU step, because that is the step that does the work.
+    /// `release_verdict` is only consulted when the player leaves the world, so "start a new
+    /// character" without "quit to the main menu" describes an action the player cannot take from
+    /// where they are standing -- which is how this instruction was wrong for the whole of v0.3.
+    #[test]
+    fn the_wrong_save_toast_names_the_menu_step_that_actually_releases_the_latch() {
+        let wrong = refusal_toast(Refusal::WrongSaveAtConnect).to_lowercase();
+        assert!(wrong.contains("main menu"), "{wrong}");
+    }
+
+    /// In-game strings render through the game's own font path and must stay ASCII
+    /// (er-toast-strings-are-ascii-only). The em dashes elsewhere in this file are DOC comments,
+    /// which never reach a screen; these do.
+    #[test]
+    fn refusal_toasts_are_ascii_only() {
+        for r in [Refusal::WrongSaveAtConnect, Refusal::RoomChangedMidSession] {
+            let t = refusal_toast(r);
+            assert!(t.is_ascii(), "{t}");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // release_verdict — clearing a latched refusal (2026-08-10)
+    // -----------------------------------------------------------------------------------------
+
+    /// THE MOTIVATING CASE, at the predicate level. A wrong-save refusal happens inside `init`,
+    /// before a driver exists; quitting to the menu must let the next character arm. Before this
+    /// predicate the latch was permanent and a brand-new character was silently inert until the
+    /// player restarted the game.
+    #[test]
+    fn a_wrong_save_refusal_releases_once_the_player_leaves_the_world() {
+        assert_eq!(
+            release_verdict(Refusal::WrongSaveAtConnect, false),
+            RefusalRelease::Rearm
+        );
+    }
+
+    /// The 229-check corruption guard must NOT be releasable. `DRIVER` is a `OnceLock`, so a
+    /// released mid-session disarm would un-gate the pipeline while keeping the OLD room's
+    /// reconciler -- the exact outcome `ArmedVerdict` was written to prevent.
+    #[test]
+    fn a_mid_session_room_change_never_releases() {
+        for armed in [false, true] {
+            assert_eq!(
+                release_verdict(Refusal::RoomChangedMidSession, armed),
+                RefusalRelease::Hold
+            );
+        }
+    }
+
+    /// Fail CLOSED on the combination today's `init` cannot produce. "Refused implies no driver" is
+    /// an invariant of one function, not a law; if it ever stops holding, releasing would hand the
+    /// session a driver built for somebody else's identity.
+    #[test]
+    fn a_wrong_save_refusal_holds_while_a_driver_is_armed() {
+        assert_eq!(
+            release_verdict(Refusal::WrongSaveAtConnect, true),
+            RefusalRelease::Hold
+        );
     }
 
     /// The two cases need DIFFERENT actions — restarting does not fix a wrong save, and loading

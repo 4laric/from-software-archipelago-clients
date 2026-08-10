@@ -591,6 +591,11 @@ static DRIVER: OnceLock<Mutex<Driver>> = OnceLock::new();
 /// i.e. this save belongs to a different seed/slot. The reconciler is NOT armed (no grants), and the
 /// caller must also gate check REPORTING on this, so seed-A's save flags aren't reported as seed-B
 /// checks (which would corrupt the multiworld, strictly worse than a double-grant). See `is_refused`.
+///
+/// Cleared in exactly ONE place -- [`clear_refusal_if_rearmable`], on the menu edge, and only for
+/// the refusals `er_logic::marker::release_verdict` calls releasable. It was a write-once latch
+/// until 2026-08-10, which made the toast's own "start a fresh character" instruction impossible to
+/// follow; see that function for the whole story.
 static REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the current session was REFUSED by the marker identity guard (see [`REFUSED`]). `core`
@@ -625,6 +630,55 @@ fn set_refused(refusal: marker::Refusal) {
     REFUSED.store(true, Ordering::Relaxed);
 }
 
+/// RELEASE a latched refusal, if this is one of the refusals that may be released. Returns `true`
+/// iff the latch was actually cleared, in which case the caller MUST also clear its own
+/// `reconcile_inited` so [`init`] runs again for the next character.
+///
+/// 🛑 WHY THIS EXISTS (2026-08-10, Alaric): [`refusal_toast`] tells a wrong-save player to start a
+/// fresh character, and that instruction could not work. `REFUSED` had no writer that ever stored
+/// `false`, and `core` sets `reconcile_inited` the moment [`init`] RETURNS -- including the refuse
+/// path, which returns before building a `Driver`. So the player quit to the menu, rolled a new
+/// character, and loaded into a session that was gated, silent and permanently inert: no checks
+/// reported, no items granted, the same toast still on screen. The only recovery was restarting the
+/// game, and nothing said so.
+///
+/// The decision is [`marker::release_verdict`], NOT a local `if` -- test/prod drift is exactly what
+/// the replay tier exists to kill, and the timelines live in `er_logic::marker_replay`. It is
+/// deliberately asymmetric: a `WrongSaveAtConnect` refusal never built a driver, so re-running
+/// `init` is a genuine first init; a `RoomChangedMidSession` disarm holds forever, because `DRIVER`
+/// is a `OnceLock` that cannot be replaced and releasing would un-gate the pipeline while keeping
+/// the old room's reconciler. `DRIVER.get().is_some()` is passed in so that invariant is CHECKED
+/// rather than assumed.
+///
+/// Called from the `in_world` true->false edge (the player left to the menu), never mid-world: the
+/// question this re-opens is one only a fresh `init` can answer, and `init` only runs in-world.
+pub fn clear_refusal_if_rearmable() -> bool {
+    if !is_refused() {
+        return false;
+    }
+    // Hold the REFUSAL lock across the `REFUSED` store, for the same reason `set_refused` sets them
+    // together: `is_refused` and `refusal_toast` must never disagree about the current state.
+    let Ok(mut guard) = REFUSAL.lock() else {
+        return false; // poisoned: a refusal we cannot evaluate must stay latched (fail closed)
+    };
+    let Some(refusal) = *guard else {
+        return false;
+    };
+    match marker::release_verdict(refusal, DRIVER.get().is_some()) {
+        marker::RefusalRelease::Hold => false,
+        marker::RefusalRelease::Rearm => {
+            *guard = None;
+            REFUSED.store(false, Ordering::Relaxed);
+            log::info!(
+                "[reconcile] refusal RELEASED at the menu ({refusal:?}) -- session init will run \
+                 again for the next character. Loading the same wrong save simply refuses again; \
+                 this re-asks the guard's question, it does not answer it."
+            );
+            true
+        }
+    }
+}
+
 /// Re-ask the reconnect guard's question about an ALREADY-ARMED reconciler, and disarm it if the
 /// session's identity has moved out from under it.
 ///
@@ -641,6 +695,13 @@ fn set_refused(refusal: marker::Refusal) {
 /// `OnceLock` — it cannot be replaced, so a "clear the latch and re-init" fix would silently keep
 /// the OLD driver while looking correct. Gating until the player restarts the game is the honest
 /// bound, and a restart is exactly what the message asks for.
+///
+/// ⚠️ [`clear_refusal_if_rearmable`] (2026-08-10) can now clear `REFUSED` — but NOT this refusal.
+/// `marker::release_verdict` holds every `RoomChangedMidSession` unconditionally, precisely because
+/// of the `OnceLock` argument above, and it is host-tested as
+/// `marker_replay::the_menu_edge_never_releases_a_mid_session_room_change`. The reason this
+/// paragraph is an invariant with a test instead of a comment is that it now has a neighbour that
+/// looks like a counter-example.
 ///
 /// No-op when nothing is armed: [`init`] has not run, so its own guard still covers that session.
 pub fn disarm_if_identity_moved(room_seed: &str) {
@@ -933,7 +994,8 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
             log::warn!(
                 "[reconcile] REFUSED: save marker identity {stored:#010x} != this session {expected:#010x} \
                  -- this save belongs to a different seed/slot. NOT arming the reconciler; check \
-                 reporting is gated. Reconnect the correct save, or start a fresh character."
+                 reporting is gated. Quit to the main menu, then load this room's save or start a \
+                 new character -- the menu edge releases this refusal (clear_refusal_if_rearmable)."
             );
             return; // no Driver -> tick() no-ops; is_refused() gates check reporting in core
         }
