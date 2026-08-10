@@ -586,6 +586,15 @@ impl shared::Core for Core {
             self.tracker_visible = !self.tracker_visible;
         }
 
+        // Deliver a queued TRAP ITEM, at most one per frame. Unlike the F7/F8 probe below this is
+        // NOT gated on the probe flag: a trap that arrived as a real AP item must fire whether or
+        // not anyone turned a diagnostic on.
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        if let Some(line) = crate::traps::poll_pending(now) {
+            self.toasts.push(line.to_string(), now);
+            self.log(ap::Print::message(line.to_string()));
+        }
+
         // TRAP PROBE (traps.rs) -- off unless `probes: { "traps": true }`. Function keys for the
         // same reason F6 is one: a letter fights the say input, and a trap fired by a stray
         // keystroke while typing to the room would be indistinguishable from a bug.
@@ -2078,6 +2087,17 @@ impl shared::Core for Core {
                             log::debug!(
                                 "region-lock '{}' (ap id {ap_item_id}) -> handled via open flag (not an ER item grant)",
                                 ri.name
+                            );
+                        } else if ri.name.starts_with(er_logic::traps::ITEM_PREFIX) {
+                            // TRAP ITEMS are synthetic tokens like Boss Keys -- deliberately absent
+                            // from apIdsToItemIds, because the effect is ours to fire and there is
+                            // no ER item to hand over. Queued rather than fired here: this runs in
+                            // the receive loop, which can land while the player is in a menu, and a
+                            // trap dropped there is GONE (the item is already marked received and
+                            // the server will never resend it). traps::poll_pending delivers it.
+                            crate::traps::enqueue_by_item_name(
+                                &ri.name,
+                                self.toast_clock.elapsed().as_millis() as u64,
                             );
                         } else if ri.name.starts_with("Boss Key: ") {
                             // Boss Keys (mode B) are SYNTHETIC gate tokens, intentionally absent from

@@ -41,10 +41,82 @@
 //! `SpEffectParam` back in and restores the vanilla values, which is exactly the bug `no_equip_load`
 //! carries a `reset()` for. Patch-then-apply costs one row write per keypress and cannot go stale.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use eldenring::cs::{ChrInsExt, SoloParamRepository, SpEffectParam, WorldChrMan};
 use er_logic::safe_speffect_rows::TRAP_NO_FLASK;
 use er_logic::traps::{NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, Trap, rune_thief_target};
 use fromsoftware_shared::FromStatic;
+
+/// The traps waiting on the player being able to receive one.
+///
+/// A trap arriving as an ITEM cannot be dropped when the player is in a menu: the item is already
+/// marked received and the server will never resend it. `TrapQueue` holds it; `poll_pending` below
+/// is called from the same tick the client already runs. (A trap fired from the F7/F8 probe skips
+/// the queue -- a keypress is definitionally a moment the player is in control.)
+static PENDING: Mutex<Option<er_logic::traps::TrapQueue>> = Mutex::new(None);
+/// One warn per overdue head, not one per tick.
+static WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Queue a trap that arrived as an AP item. Called from the receive loop, which knows the NAME.
+///
+/// Unknown `Trap: ...` names are logged and dropped ON PURPOSE: that is a world newer than this
+/// client, and firing the wrong effect is worse than firing none.
+pub fn enqueue_by_item_name(name: &str, now_ms: u64) {
+    let Some(trap) = Trap::from_item_name(name) else {
+        log::warn!(
+            "trap item {name:?} is not one this client knows -- ignored. A newer world minted it; \
+             update the client rather than guessing which effect was meant."
+        );
+        return;
+    };
+    let Ok(mut guard) = PENDING.lock() else {
+        return;
+    };
+    guard
+        .get_or_insert_with(er_logic::traps::TrapQueue::new)
+        .push(trap, now_ms);
+    log::info!("trap {} queued from item {name:?}", trap.key());
+}
+
+/// Per-tick: deliver at most one queued trap, once the player can take it.
+///
+/// Returns the line to toast, or `None`. `can_fire` is formed HERE (in world) and refined inside
+/// `fire` (death guard, param streamed) -- a trap that cannot land this tick goes back to waiting
+/// rather than being consumed, which is the whole point of the queue.
+pub fn poll_pending(now_ms: u64) -> Option<&'static str> {
+    let Ok(mut guard) = PENDING.lock() else {
+        return None;
+    };
+    let q = guard.as_mut()?;
+    if q.is_empty() {
+        WARNED.store(false, Ordering::Relaxed);
+        return None;
+    }
+    if q.overdue(now_ms) && !WARNED.swap(true, Ordering::Relaxed) {
+        // Reported, never dropped: the alternative to holding is losing the item outright.
+        log::warn!(
+            "trap delivery has been deferred for over {}s ({} waiting) -- the player has not been \
+             in a state to receive one. Still held.",
+            er_logic::traps::DEFER_WARN_MS / 1000,
+            q.len()
+        );
+    }
+    let trap = q.poll(now_ms, crate::flags::in_world())?;
+    match fire(trap) {
+        Some(line) => {
+            WARNED.store(false, Ordering::Relaxed);
+            Some(line)
+        }
+        None => {
+            // `fire` refused (mid-death, param not streamed). Put it BACK -- consuming it here is
+            // exactly the silent loss the queue exists to prevent.
+            q.push(trap, now_ms);
+            None
+        }
+    }
+}
 
 /// Is the trap probe on? Environment wins over `apconfig.json`, per `shared::probes`.
 pub fn enabled() -> bool {
