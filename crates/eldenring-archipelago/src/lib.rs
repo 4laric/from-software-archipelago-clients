@@ -30,6 +30,7 @@ mod inventory;
 mod key_resolver;
 mod keyitems;
 mod lock_hints;
+mod merchant_bells;
 mod minibaker;
 mod no_equip_load;
 mod no_fall_damage;

@@ -800,6 +800,12 @@ impl shared::Core for Core {
                 // both apworlds). The receive loop queues equipable FullIDs -- weapons, armour and
                 // talismans; auto_equip::tick drains them.
                 crate::auto_equip::set_enabled(er_logic::options::parse_auto_equip(sd));
+                // merchant bells (#325): opening a merchant's buy menu sets the flag the Twin
+                // Maiden Husks would have set had you handed them that merchant's Bell Bearing.
+                // The ESD detour does the work; this only tells it whether the seed asked for it.
+                crate::merchant_bells::set_enabled(
+                    er_logic::options::parse_merchant_bells_on_talk(sd),
+                );
                 // Accepts our `no_weapon_requirements` OR Bedrock/fswap's
                 // `remove_weapon_and_spell_requirements` (same client feature, two apworld names).
                 crate::no_weapon_reqs::set_enabled(er_logic::options::parse_no_weapon_reqs(sd));
@@ -3231,6 +3237,15 @@ impl shared::Core for Core {
         }
         self.flask_seen = Some(flask_upgrade_count);
 
+        // 8b2c. merchant bells (#325): the ESD detour set the flag inside the game's own talk
+        // frame, where there is no `&mut Client` and therefore no toast deck. It left the notice
+        // behind; this is the tick that owns the deck. Drained in a loop because a single frame can
+        // in principle carry more than one open.
+        while let Some(notice) = crate::merchant_bells::take_notice() {
+            let now = self.toast_clock.elapsed().as_millis() as u64;
+            self.toasts.push(notice, now);
+        }
+
         // 8b3. auto_equip: drain queued received weapons into a primary hand (once each is in the bag).
         crate::auto_equip::tick();
 
@@ -3717,6 +3732,10 @@ impl Core {
         self.sent_goal = false;
         self.hints = HintSet::new();
         self.hint_log_watermark = 0;
+        // Session counter + any undrained notice. The hand-ins themselves are EVENT FLAGS in the
+        // player's save and are deliberately NOT undone -- a bell handed in stays handed in, the
+        // same as one the player carried to the Maidens.
+        crate::merchant_bells::reset();
         // CLEAR the tracker's seed-scoped model so a new seed cannot inherit the prior seed's
         // regions or surface. The slot_data parse re-applies this seed's own (or leaves them empty
         // and shows nothing -- see the deleted-fallback note there). Under num_regions two seeds
