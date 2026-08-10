@@ -66,13 +66,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Cerulean",
         lock_item: "Cerulean Lock",
         open_flag: Some(76831),
-        play_regions: &[68300],
-    },
-    BakedRegionLock {
-        region: "Charo's",
-        lock_item: "Charo's Lock",
-        open_flag: Some(76841),
-        play_regions: &[41020, 68400],
+        play_regions: &[22000, 41020, 68300, 68400],
     },
     BakedRegionLock {
         region: "Deeproot Depths",
@@ -187,12 +181,6 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         lock_item: "Siofra River Lock",
         open_flag: Some(71222),
         play_regions: &[12020, 12070],
-    },
-    BakedRegionLock {
-        region: "Stone Coffin",
-        lock_item: "Stone Coffin Lock",
-        open_flag: Some(72201),
-        play_regions: &[22000],
     },
     BakedRegionLock {
         region: "Stormveil",
