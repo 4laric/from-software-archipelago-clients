@@ -586,6 +586,30 @@ impl shared::Core for Core {
             self.tracker_visible = !self.tracker_visible;
         }
 
+        // TRAP PROBE (traps.rs) -- off unless `probes: { "traps": true }`. Function keys for the
+        // same reason F6 is one: a letter fights the say input, and a trap fired by a stray
+        // keystroke while typing to the room would be indistinguishable from a bug.
+        // 🛑 These are DESTRUCTIVE on purpose -- F7 really takes half your runes. The gate is the
+        // consent.
+        if crate::traps::enabled() {
+            for (key, trap) in [
+                (imgui::Key::F7, er_logic::traps::Trap::RuneThief),
+                (imgui::Key::F8, er_logic::traps::Trap::NoFlask),
+            ] {
+                if !ui.is_key_pressed(key) {
+                    continue;
+                }
+                // `fire` returns None when it could not act this tick (not in world, player
+                // mid-death, param not streamed yet). Nothing to toast, nothing to log twice.
+                let Some(line) = crate::traps::fire(trap) else {
+                    continue;
+                };
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(line.to_string(), now);
+                self.log(ap::Print::message(line.to_string()));
+            }
+        }
+
         self.accumulate_hints_from_log();
         self.refresh_lock_hint_hud();
 
@@ -616,6 +640,7 @@ impl shared::Core for Core {
             ("ER_DOWNSTATE_PROBE", "downstate"),
             ("ER_DOWNSTATE_PROBE_ARM", "downstate_arm"),
             ("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player"),
+            ("ER_TRAP_PROBE", "traps"),
         ]);
 
         // ESD talk-event hook (esd_probe.rs) -- the shop-open seam SHOP AUTO-HINTS ride on
