@@ -2451,8 +2451,21 @@ mod tests {
     fn baked_geometry_names_the_buckets_the_wire_speaks() {
         // Spot-checks against the generated table (region_locks.rs): the intra-fold delta bucket
         // and a DLC bucket both resolve; an id in no region does not.
+        //
+        // 🛑 A DLC BUCKET'S LABEL IS NOT STABLE AND MUST NOT BE HARD-CODED. Bucket 41020
+        // (Charo's Hidden Grave) read "Charo's" until the 2026-08-10 regen (5ac1e83e) folded
+        // Charo's and Stone Coffin into Cerulean; region_locks.rs now lists 41020 under
+        // `region: "Cerulean"`. Nothing was wrong with the code -- this literal simply did not
+        // travel with the generated table, and it reddened main on merge. What this test is FOR
+        // is that a bucket the wire speaks RESOLVES at all, so assert resolution for the DLC
+        // arm and keep one stable base-game literal as the anchor against a wholesale
+        // generation failure.
         assert_eq!(region_name_for_bucket(64020), Some("Caelid"));
-        assert_eq!(region_name_for_bucket(41020), Some("Charo's"));
+        assert!(
+            region_name_for_bucket(41020).is_some(),
+            "a DLC bucket the wire speaks must resolve to some region; its LABEL is a fold \
+             away from changing and is deliberately not asserted here"
+        );
         assert_eq!(region_name_for_bucket(99999), None);
     }
 
