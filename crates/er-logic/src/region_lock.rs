@@ -141,6 +141,10 @@ pub struct VanillaGate {
     /// because the plural ("the Great Runes open") and the singular ("the Academy Glintstone
     /// Key opens") do not share a verb. A test pins that it still names `key`.
     pub note: &'static str,
+    /// The SHORT clause, for the unlock toast, where `note` does not fit. Written out per gate
+    /// for exactly the reason `note` is: `format!("the {key} opens it")` reads "the Great Runes
+    /// opens it". A test pins that it names `key` too.
+    pub opens: &'static str,
 }
 
 /// The regions with a vanilla seal on top of their Lock.
@@ -160,16 +164,19 @@ pub const VANILLA_GATED_REGIONS: &[VanillaGate] = &[
         region: "Leyndell",
         key: "Great Runes",
         note: "The Great Runes open the game's own seal here, not the region Lock.",
+        opens: "the Great Runes open it",
     },
     VanillaGate {
         region: "Raya Lucaria Academy",
         key: "Academy Glintstone Key",
         note: "The Academy Glintstone Key opens the game's own seal here, not the region Lock.",
+        opens: "the Academy Glintstone Key opens it",
     },
     VanillaGate {
         region: "Sewer",
         key: "Great Runes",
         note: "The Great Runes open the game's own seal here, not the region Lock.",
+        opens: "the Great Runes open it",
     },
 ];
 
@@ -267,6 +274,158 @@ pub fn sealed_region_message(pr: i32, lock_item: Option<&str>, outcome: SealedOu
         None => {
             format!("SEALED REGION: {region}. Come back once you receive \"{lock_item}\". {tail}")
         }
+    }
+}
+
+/// The line a player reads when a region Lock lands: "the EFFECT, not the receipt".
+///
+/// MOTIVATING CASE (rule 11), and it is a player's own words -- LordChungle, Nexus 2026-08-10,
+/// v0.3.9: *"Sub-region locks didnt seem to work at all. Raya Lucaria, Leyndell Sewers, and Ashen
+/// Capital were all unlocked but I couldnt reach any of them."* Every one of those was working
+/// exactly as designed. A GATED CHILD's Lock deliberately lights no graces (the world withholds
+/// the bundle while the wall is armed -- `features/graces.py`), so there is no warp and you walk
+/// in through the game's own seal. The Lock landed, the toast said "Region unlocked", the door was
+/// shut, and nothing anywhere distinguished a Lock that WARPS YOU IN from a Lock that only ADMITS
+/// you. Told nothing, he reported the feature as broken, which was the only reasonable reading.
+///
+/// 🛑 THE STATE IS THE CALLER'S AND THE WORDS ARE OURS, the same split as `sealed_region_message`
+/// and `marker::refusal_toast`. `bundle_withheld` is LIVE SEED DATA the caller already holds --
+/// `regionGraces["<region> Lock"]` present and EMPTY, which the world emits deliberately ("[] and
+/// not key-absence: the client warns about a genuine lock with NO regionGraces entry, and this one
+/// is intended"). It has to be live, not static: Leyndell's wall is a Great Rune COUNT, and a seed
+/// that sets it to 0 disarms the wall, un-withholds the bundle, and the Lock really does warp you
+/// in. Reading the static table alone would print a walk-in line for a seed that warps.
+///
+/// The words come from [`VANILLA_GATED_REGIONS`], which already names each region's real key and
+/// needs no slot_data key, no contract change and no feature tag -- it is static vanilla geometry
+/// that was already here for the KICK message and had never been asked at receipt time.
+///
+/// ASCII only (`every_unlock_message_is_ascii`): the in-game font draws `?` for anything else, and
+/// the v0.2.18 em-dash escape lived in the CONSTANT part of a format string.
+pub fn region_unlocked_message(region: &str, bundle_withheld: bool) -> String {
+    if !bundle_withheld {
+        // Unchanged wording for the ordinary case, deliberately: one phrasing to learn, not two.
+        return format!("Region unlocked: {region}");
+    }
+    match vanilla_gate(region) {
+        // `g.opens`, never `format!("the {key} opens it")` -- that reads "the Great Runes opens it".
+        Some(g) => format!(
+            "Region unlocked: {region} -- walk in, {} (no grace warp)",
+            g.opens
+        ),
+        // A withheld bundle with no entry in the static table: a gated child we have not written
+        // words for. Say the true half rather than nothing -- "no warp" is the part that stops the
+        // player standing at a grace menu looking for a region that will never appear in it.
+        None => format!("Region unlocked: {region} -- walk in, no grace warp"),
+    }
+}
+
+#[cfg(test)]
+mod unlock_message_tests {
+    use super::*;
+
+    /// RULE 11: the reported case, by name, end to end.
+    #[test]
+    fn the_reported_gated_children_name_their_real_key() {
+        assert_eq!(
+            region_unlocked_message("Raya Lucaria Academy", true),
+            "Region unlocked: Raya Lucaria Academy -- walk in, the Academy Glintstone Key opens it (no grace warp)"
+        );
+        assert_eq!(
+            region_unlocked_message("Sewer", true),
+            "Region unlocked: Sewer -- walk in, the Great Runes open it (no grace warp)"
+        );
+    }
+
+    /// The ordinary case must not move. Every non-gated region keeps the exact v0.2 line, so the
+    /// player learns ONE phrasing; a change here is a change to every seed's console.
+    #[test]
+    fn an_ordinary_region_keeps_its_wording() {
+        assert_eq!(
+            region_unlocked_message("Liurnia", false),
+            "Region unlocked: Liurnia"
+        );
+    }
+
+    /// 🛑 THE HALF A STATIC TABLE CANNOT ANSWER. Leyndell IS in VANILLA_GATED_REGIONS, but its wall
+    /// is a Great Rune COUNT -- a seed with that count at 0 disarms the wall, the world stops
+    /// withholding the bundle, and the Lock genuinely does warp you in. Keyed on the live
+    /// `bundle_withheld`, the same region prints both lines, which is the point.
+    #[test]
+    fn a_disarmed_wall_prints_the_ordinary_line_for_the_same_region() {
+        assert_eq!(
+            region_unlocked_message("Leyndell", false),
+            "Region unlocked: Leyndell"
+        );
+        assert!(region_unlocked_message("Leyndell", true).contains("Great Runes"));
+    }
+
+    /// A withheld bundle we have no words for still says the true half.
+    #[test]
+    fn an_unknown_gated_child_still_says_no_warp() {
+        let msg = region_unlocked_message("Some Future Child", true);
+        assert!(msg.contains("no grace warp"), "{msg}");
+        assert!(!msg.contains("opens it"), "{msg}");
+    }
+
+    /// The short clause must still NAME the key, and must agree with the key in number -- the
+    /// plural/singular verb split is the whole reason this field is written out rather than
+    /// templated, so a future gate that templates it fails here.
+    #[test]
+    fn every_short_clause_names_its_key_and_picks_the_right_verb() {
+        assert!(
+            !VANILLA_GATED_REGIONS.is_empty(),
+            "WITNESS: nothing was swept"
+        );
+        for g in VANILLA_GATED_REGIONS {
+            assert!(
+                g.opens.contains(g.key),
+                "{}: {:?} does not name {:?}",
+                g.region,
+                g.opens,
+                g.key
+            );
+            assert!(
+                g.note.contains(g.key),
+                "{}: {:?} does not name {:?}",
+                g.region,
+                g.note,
+                g.key
+            );
+            let plural = g.key.ends_with('s');
+            assert_eq!(
+                g.opens.contains(&format!("{} open it", g.key)),
+                plural,
+                "{}: {:?} disagrees in number with key {:?}",
+                g.region,
+                g.opens,
+                g.key
+            );
+        }
+    }
+
+    /// Every string this function can produce goes through the FMG path.
+    #[test]
+    fn every_unlock_message_is_ascii() {
+        // WITNESS: the sweep must have seen the gated table, or "all ASCII" is what an empty
+        // iterator says too.
+        assert!(!VANILLA_GATED_REGIONS.is_empty());
+        let mut seen = 0;
+        for g in VANILLA_GATED_REGIONS {
+            for withheld in [true, false] {
+                let m = region_unlocked_message(g.region, withheld);
+                assert!(m.is_ascii(), "non-ASCII unlock message: {m}");
+                seen += 1;
+            }
+        }
+        for m in [
+            region_unlocked_message("Liurnia", false),
+            region_unlocked_message("Some Future Child", true),
+        ] {
+            assert!(m.is_ascii(), "non-ASCII unlock message: {m}");
+            seen += 1;
+        }
+        assert_eq!(seen, VANILLA_GATED_REGIONS.len() * 2 + 2);
     }
 }
 
