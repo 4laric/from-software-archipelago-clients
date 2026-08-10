@@ -2102,10 +2102,26 @@ impl shared::Core for Core {
         // already ASCII by construction, and an em-dash here drew as `?` in v0.2.18.
         let region_toast_live = self.region_toast_primed;
         for region in unlocked {
-            self.log(ap::Print::message(format!("Region unlocked: {region}")));
+            // A GATED CHILD's Lock lights no graces -- the world withholds the bundle while the
+            // wall is armed and emits `regionGraces["<region> Lock"] = []` DELIBERATELY (its own
+            // comment: "[] and not key-absence: the client warns about a genuine lock with NO
+            // regionGraces entry, and this one is intended"). So an empty-but-present bundle IS
+            // the wire that says "this Lock admits you, it does not warp you", and it was already
+            // arriving; nothing had ever asked it. A player read the resulting silence as the
+            // feature being broken (LordChungle, Nexus 2026-08-10) -- see region_unlocked_message.
+            //
+            // LIVE, not static: Leyndell's wall is a Great Rune COUNT, and a seed that sets it to 0
+            // disarms the wall and the Lock really does warp you in. Only the seed knows.
+            let withheld = self
+                .region
+                .as_ref()
+                .and_then(|c| c.region_graces.get(&format!("{region} Lock")))
+                .is_some_and(|fs| fs.is_empty());
+            let line = er_logic::region_lock::region_unlocked_message(&region, withheld);
+            self.log(ap::Print::message(line.clone()));
             if region_toast_live {
                 let now = self.toast_clock.elapsed().as_millis() as u64;
-                self.toasts.push(format!("Region unlocked: {region}"), now);
+                self.toasts.push(line, now);
             }
         }
         // Prime AFTER the loop, so the connect replay is the baseline and everything later is news.
