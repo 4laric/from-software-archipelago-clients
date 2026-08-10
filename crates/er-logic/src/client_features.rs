@@ -52,6 +52,11 @@ pub const SUPPORTED: &[&str] = &[
     // is unread, so the player is handed one grace per region and the rest never light -- which
     // reads as a broken seed, not as an ignored setting.
     "grace_attunement",
+    // options.merchant_bells_on_talk -> er_logic::merchant_bells + the ESD shop-open detour
+    // (2026-08-10, er-archipelago#325). A seed with this on MUST refuse an older client: the key
+    // would be unread, so the player would walk every merchant expecting their wares at the Twin
+    // Maidens and find the hub empty -- which reads as a broken seed rather than an ignored option.
+    "merchant_bells_on_talk",
 ];
 
 /// Feature tags the seed requires that this build does not know.
@@ -150,6 +155,20 @@ mod tests {
         // Alongside the other tag, too -- a seed may need several.
         let sd = json!({ "requiresClientFeatures": ["auto_equip", "scaling_ceiling"] });
         assert!(unsupported(&required_from_slot_data(&sd)).is_empty());
+    }
+
+    /// THE CASE THIS TAG WAS ADDED FOR: a seed rolled with `merchant_bells_on_talk` on declares the
+    /// tag, and this build carries the behaviour (`er_logic::merchant_bells` planning +
+    /// `merchant_bell_table` + the game-side ESD shop-open detour). The option is an
+    /// OPTIONS_SUBKEYS bool, and the contract hash folds CONTRACT and NOT OPTIONS_SUBKEYS, so
+    /// nothing else in the handshake would have caught an older client here.
+    #[test]
+    fn a_seed_requiring_merchant_bells_on_talk_is_accepted() {
+        let sd = json!({ "requiresClientFeatures": ["merchant_bells_on_talk"] });
+        assert!(
+            unsupported(&required_from_slot_data(&sd)).is_empty(),
+            "this build implements merchant_bells_on_talk, so the tag must be in SUPPORTED"
+        );
     }
 
     /// THE CASE THIS TAG WAS ADDED FOR: blessing mode 3 (`dlc_only` scope + `dlc_blessing_catchup`)

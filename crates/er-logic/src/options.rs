@@ -70,6 +70,15 @@ pub fn parse_auto_equip(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "auto_equip")
 }
 
+/// `options.merchant_bells_on_talk` (int-or-bool). When on, opening a merchant's buy menu sets the
+/// event flag the Twin Maiden Husks would have set had you handed them that merchant's Bell
+/// Bearing, so their wares are available at the hub from then on (see [`crate::merchant_bells`]).
+/// An absent key parses false, which is the off default -- so a seed rolled by an older apworld,
+/// or by a foreign one, is unaffected.
+pub fn parse_merchant_bells_on_talk(slot_data: &Value) -> bool {
+    parse_bool_option(slot_data, "merchant_bells_on_talk")
+}
+
 /// `options.no_fall_damage` (int-or-bool). When on, the player never takes fall damage (the
 /// spirit-spring `fallDamageRate=0` trick, applied permanently -- see [`crate::no_fall_damage`]).
 pub fn parse_no_fall_damage(slot_data: &Value) -> bool {

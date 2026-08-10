@@ -245,7 +245,13 @@ unsafe extern "C" fn esd_invoke_detour(this: *mut c_void, event: *const EzStateE
                     event_ref.args.len()
                 );
             } else if let (Some(lo), Some(hi)) = (event_ref.arg(0), event_ref.arg(1)) {
-                crate::shop_hints::on_shop_open(i32::from(lo), i32::from(hi));
+                let (lo, hi) = (i32::from(lo), i32::from(hi));
+                crate::shop_hints::on_shop_open(lo, hi);
+                // er-archipelago#325. Same range, same frame, and deliberately AFTER the hint: the
+                // hint describes the shelf as the player is about to see it, and handing the bell
+                // in changes nothing about THIS shelf (it adds a menu entry at the Twin Maidens),
+                // so the order is not load-bearing -- but a feature added later goes second.
+                crate::merchant_bells::on_shop_open(lo, hi);
             }
         }
 

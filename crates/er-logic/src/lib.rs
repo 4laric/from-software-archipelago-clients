@@ -42,6 +42,8 @@ pub mod lock_hint_economy;
 pub mod map_reveal_replay;
 pub mod marker;
 pub mod marker_replay;
+pub mod merchant_bell_table;
+pub mod merchant_bells;
 pub mod name_override;
 pub mod native_tiers;
 pub mod options;
