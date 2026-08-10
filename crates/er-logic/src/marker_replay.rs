@@ -2,7 +2,8 @@
 //! record behaves correctly across the transitions the live client hits: fresh init, same-identity
 //! resume (no re-grant), a crash that commits the cursor BEHIND the grants, a restored save backup,
 //! a brand-new character in a reused slot, a torn double-buffer write, legacy migration, and an
-//! identity-mismatch REFUSE. It drives the REAL [`crate::reconcile::Reconciler`] against the in-memory
+//! identity-mismatch REFUSE, and the RELEASE of that refusal when the player quits to the main menu
+//! and rolls a new character. It drives the REAL [`crate::reconcile::Reconciler`] against the in-memory
 //! [`crate::reconcile::MockGame`], so the marker codec + the init wiring are proven on any host — only
 //! the real flag-band audit and the Windows persist verify remain (they cannot be host-tested).
 //!
@@ -40,7 +41,7 @@ pub fn reconciler_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::marker::{self, identity_hash, FlagBand};
+    use crate::marker::{self, identity_hash, FlagBand, Refusal, RefusalRelease};
     use crate::reconcile::{
         DesiredInputs, GameIo, GoodsId, ItemSemantics, MockGame, ReceivedItem, Reconciler,
         SaveIdentity, SlotData, StartItem, TickBudget,
@@ -287,6 +288,212 @@ mod tests {
             "refuse -> no reconciler, pipeline gated by caller"
         );
         assert_eq!(g.flags, before, "a refused save is not mutated");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // (10)-(13) THE REFUSAL LATCH: quitting to the menu and rolling a new character.
+    //
+    // The client keeps THREE separate pieces of process-lifetime state that a menu round-trip
+    // never touched, and this model carries all three because the bug lives in their interaction,
+    // not in any one of them:
+    //
+    //   * `reconcile_io::REFUSED`      -- an `AtomicBool` with no writer that ever stores `false`;
+    //   * `core::Core::reconcile_inited` -- set the moment `init` RETURNS, including the refuse
+    //     path, which returns before building anything;
+    //   * `reconcile_io::DRIVER`       -- a `OnceLock`, so whatever is in it cannot be replaced.
+    //
+    // Together they made "start a fresh character" -- the instruction the refusal toast itself
+    // gives -- impossible: the new character loaded into a gated, silent session and stayed there
+    // until the game was restarted (Alaric, 2026-08-10).
+    // ---------------------------------------------------------------------------------------
+
+    /// Does a latched refusal ever get released? `NeverRelease` is the pre-fix client.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReleasePolicy {
+        NeverRelease,
+        ReleaseWhenRearmable,
+    }
+
+    /// The three client latches, modelled together. Field-for-field the state `core` +
+    /// `reconcile_io` hold across a menu round-trip.
+    struct Session {
+        /// `core::Core::reconcile_inited`.
+        inited: bool,
+        /// `reconcile_io::REFUSED` + `REFUSAL`, latched as one.
+        refused: Option<Refusal>,
+        /// `reconcile_io::DRIVER` — a `OnceLock`: `set` once, never replaced.
+        driver: Option<Reconciler>,
+    }
+
+    impl Session {
+        fn new() -> Self {
+            Session {
+                inited: false,
+                refused: None,
+                driver: None,
+            }
+        }
+
+        /// A character finishes loading; the first stable in-world tick runs `reconcile_io::init`.
+        /// Faithful to the real one: `inited` is set whatever the marker decides, and the refuse
+        /// path returns BEFORE the `DRIVER.set`.
+        fn load_character(&mut self, g: &mut MockGame, inp: DesiredInputs) {
+            if self.inited {
+                return; // `core` only calls init behind `!self.reconcile_inited`
+            }
+            self.inited = true;
+            match marker::decide(marker::read(g, BAND), id()) {
+                InitDecision::Refuse { .. } => {
+                    self.refused = Some(Refusal::WrongSaveAtConnect);
+                    // returns here — no driver is ever constructed
+                }
+                decision => {
+                    let mut r = reconciler_for(decision, inp, None).expect("not a refusal");
+                    drive(&mut r, g);
+                    let _ = marker::commit(g, BAND, id(), r.applied_watermark());
+                    self.driver = Some(r);
+                }
+            }
+        }
+
+        /// The player quits to the main menu — `core`'s `in_world` true->false edge.
+        fn quit_to_menu(&mut self, policy: ReleasePolicy) {
+            if policy == ReleasePolicy::NeverRelease {
+                return; // the pre-fix client: the edge did not look at the refusal at all
+            }
+            let Some(refusal) = self.refused else { return };
+            if marker::release_verdict(refusal, self.driver.is_some()) == RefusalRelease::Rearm {
+                self.refused = None;
+                self.inited = false; // let init run again for whatever loads next
+            }
+        }
+
+        /// What `core` gates check reporting and grants on.
+        fn is_gated(&self) -> bool {
+            self.refused.is_some()
+        }
+    }
+
+    /// A save belonging to a different seed, as it sits on disk before we ever see it.
+    fn a_wrong_seed_save() -> MockGame {
+        let mut g = MockGame::stable();
+        assert!(marker::commit(
+            &mut g,
+            BAND,
+            identity_hash("SOME-OTHER-SEED", SLOT),
+            7
+        ));
+        g
+    }
+
+    fn one_start_item() -> DesiredInputs {
+        inputs(
+            vec![],
+            vec![StartItem {
+                full_id: 1001,
+                qty: 1,
+            }],
+        )
+    }
+
+    // (10) THE BUG. Pre-fix: load the wrong save, quit to the menu, roll a new character — and the
+    // new character is still gated, so it never receives its own start item. This is the failing
+    // half of the pair; it passes only because it asserts the BROKEN behaviour.
+    #[test]
+    fn a_wrong_save_refusal_strands_the_next_character_when_the_latch_never_releases() {
+        let mut s = Session::new();
+        let mut wrong = a_wrong_seed_save();
+        s.load_character(&mut wrong, one_start_item());
+        assert!(s.is_gated(), "the wrong save is refused, as it should be");
+
+        s.quit_to_menu(ReleasePolicy::NeverRelease);
+
+        let mut fresh = MockGame::stable(); // brand-new character: no marker at all
+        s.load_character(&mut fresh, one_start_item());
+
+        assert!(
+            s.is_gated(),
+            "PRE-FIX: the latch survives the menu, so the new character is still gated"
+        );
+        assert_eq!(
+            fresh.ledger_count(1001),
+            0,
+            "PRE-FIX: the new character never gets its start item -- only a game restart helps"
+        );
+    }
+
+    // (11) THE FIX, same timeline. Quitting to the menu releases a wrong-save refusal, init runs
+    // again against the new character's (absent) marker, and the character arms normally.
+    #[test]
+    fn quitting_to_the_menu_releases_a_wrong_save_refusal_and_the_next_character_arms() {
+        let mut s = Session::new();
+        let mut wrong = a_wrong_seed_save();
+        let before = wrong.flags.clone();
+        s.load_character(&mut wrong, one_start_item());
+        assert!(s.is_gated());
+        assert_eq!(wrong.flags, before, "a refused save is still never mutated");
+
+        s.quit_to_menu(ReleasePolicy::ReleaseWhenRearmable);
+        assert!(!s.is_gated(), "the menu released the latch");
+
+        let mut fresh = MockGame::stable();
+        s.load_character(&mut fresh, one_start_item());
+
+        assert!(!s.is_gated(), "the new character runs ungated");
+        assert_eq!(
+            fresh.ledger_count(1001),
+            1,
+            "the new character gets its own start item exactly once"
+        );
+        // The watermark itself is the reconciler's business (a fresh character sits at the negative
+        // start-item band floor, not 0); what matters here is that the marker now carries OUR
+        // identity, so the next connect Resumes instead of refusing.
+        assert!(
+            matches!(
+                marker::read(&fresh, BAND),
+                marker::MarkerRead::Present { identity, .. } if identity == id()
+            ),
+            "the new character writes its own marker, so the next connect Resumes"
+        );
+    }
+
+    // (12) Re-loading the SAME wrong save after the release refuses again. The release is not a
+    // bypass: it re-asks the question rather than answering it, so the guard is undiminished.
+    #[test]
+    fn releasing_and_reloading_the_same_wrong_save_refuses_again() {
+        let mut s = Session::new();
+        let mut wrong = a_wrong_seed_save();
+        s.load_character(&mut wrong, one_start_item());
+        s.quit_to_menu(ReleasePolicy::ReleaseWhenRearmable);
+        assert!(!s.is_gated());
+
+        s.load_character(&mut wrong, one_start_item());
+        assert!(s.is_gated(), "same wrong save, same refusal");
+        assert_eq!(
+            wrong.ledger_count(1001),
+            0,
+            "and still nothing is granted into it"
+        );
+    }
+
+    // (13) A mid-session room change is NOT releasable, even by the same menu edge. Its driver is
+    // armed for the old room and `DRIVER` is a `OnceLock`, so releasing would un-gate the pipeline
+    // while keeping the old room's reconciler -- the 229-check corruption, re-opened.
+    #[test]
+    fn the_menu_edge_never_releases_a_mid_session_room_change() {
+        let mut s = Session::new();
+        let mut g = MockGame::stable();
+        s.load_character(&mut g, one_start_item());
+        assert!(s.driver.is_some(), "a healthy session arms a driver");
+
+        // The room changes under the live session: `disarm_if_identity_moved` latches.
+        s.refused = Some(Refusal::RoomChangedMidSession);
+
+        s.quit_to_menu(ReleasePolicy::ReleaseWhenRearmable);
+        assert!(
+            s.is_gated(),
+            "held: only a game restart clears this one, which is what its toast says"
+        );
     }
 
     // (9) Flag holder not ready during a commit: the write fails cleanly and the ACTIVE cursor never
