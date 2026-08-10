@@ -44,9 +44,14 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eldenring::cs::{ChrInsExt, SoloParamRepository, SpEffectParam, WorldChrMan};
+use eldenring::cs::{
+    ChrDebugSpawnRequest, ChrInsExt, SoloParamRepository, SpEffectParam, WorldChrMan,
+};
 use er_logic::safe_speffect_rows::TRAP_NO_FLASK;
-use er_logic::traps::{NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, Trap, rune_thief_target};
+use er_logic::traps::{
+    NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, RUNEBEAR_CHARA_INIT_PARAM_ID, RUNEBEAR_CHR_ID,
+    RUNEBEAR_NPC_PARAM_ID, RUNEBEAR_THINK_PARAM_ID, Trap, rune_thief_target,
+};
 use fromsoftware_shared::FromStatic;
 
 /// The traps waiting on the player being able to receive one.
@@ -137,6 +142,7 @@ pub fn fire(trap: Trap) -> Option<&'static str> {
     let ok = match trap {
         Trap::RuneThief => fire_rune_thief(),
         Trap::NoFlask => fire_no_flask(),
+        Trap::Runebear => fire_runebear(),
     };
     ok.then(|| trap.toast())
 }
@@ -155,6 +161,59 @@ fn fire_rune_thief() -> bool {
         log::warn!("trap rune_thief: write refused ({before} -> {after})");
         false
     }
+}
+
+/// Put a Runebear where the player is standing.
+///
+/// `WorldChrMan::spawn_debug_character` is typed and takes exactly the four ids plus a position.
+/// The ids are DERIVED (see `er_logic::traps` and the NpcName decode above them) rather than
+/// recalled -- the recollection I started from was wrong by 330 model numbers.
+///
+/// 🛑 SPAWNED AT THE PLAYER'S OWN POSITION, on purpose, for three reasons:
+///   1. it is the ask -- bobler's line was "enemy horde on your head";
+///   2. it is the only point we KNOW is valid ground, because the player is standing on it. Any
+///      offset can put a bear in a wall, off a cliff, or through a floor;
+///   3. it needs no orientation maths. "In front of you" means rotating a forward vector by
+///      `CSChrPhysicsModule::orientation` (a quaternion) -- a second thing to get wrong, for a joke
+///      that lands better at zero range.
+///
+/// 🛑 NO DEATH GUARD, and that is deliberate rather than an omission: this reads
+/// `modules.physics.position` and never touches `special_effect`, which is the list that CTDs at
+/// the death cam. `in_world` in `fire` is its only precondition.
+fn fire_runebear() -> bool {
+    // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract every
+    // other player write in this crate relies on.
+    let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
+        return false;
+    };
+    let Some(player) = wcm.main_player.as_ref() else {
+        return false;
+    };
+    let pos = player.chr_ins.modules.physics.position;
+    let request = ChrDebugSpawnRequest {
+        chr_id: RUNEBEAR_CHR_ID,
+        chara_init_param_id: RUNEBEAR_CHARA_INIT_PARAM_ID,
+        npc_param_id: RUNEBEAR_NPC_PARAM_ID,
+        npc_think_param_id: RUNEBEAR_THINK_PARAM_ID,
+        // Not an EMEVD entity and nothing to talk to: this bear exists for the joke, so it carries
+        // no event id a script could key on and no talk id.
+        event_entity_id: 0,
+        talk_id: 0,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        pos_z: pos.2,
+    };
+    wcm.spawn_debug_character(&request);
+    log::info!(
+        "trap runebear: spawn requested -- c{RUNEBEAR_CHR_ID} npc={RUNEBEAR_NPC_PARAM_ID} \
+         think={RUNEBEAR_THINK_PARAM_ID} at ({}, {}, {})",
+        pos.0,
+        pos.1,
+        pos.2
+    );
+    // 🛑 It is a REQUEST: the debug creator spawns on its own schedule, so `true` here means
+    // "asked", not "standing there". The player finds out within a second either way.
+    true
 }
 
 fn fire_no_flask() -> bool {
