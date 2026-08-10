@@ -4106,7 +4106,10 @@ impl Core {
                     // this region (Roundtable Hold ships ""), so it is reachable, not sealed. An
                     // ABSENT entry is treated the same, so an unknown never reads as locked.
                     region_open: Some(
-                        match locs.first().and_then(|l| self.coarse_table.get(&(*l as u64))) {
+                        match locs
+                            .first()
+                            .and_then(|l| self.coarse_table.get(&(*l as u64)))
+                        {
                             Some(c) if !c.is_empty() => open_coarse.contains(c),
                             _ => true,
                         },
