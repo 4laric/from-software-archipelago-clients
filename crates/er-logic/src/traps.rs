@@ -27,6 +27,7 @@
 pub enum Trap {
     RuneThief,
     NoFlask,
+    Runebear,
 }
 
 impl Trap {
@@ -35,6 +36,7 @@ impl Trap {
         match self {
             Trap::RuneThief => "rune_thief",
             Trap::NoFlask => "no_flask",
+            Trap::Runebear => "runebear",
         }
     }
 
@@ -52,6 +54,7 @@ impl Trap {
             // `NO_FLASK_SECONDS`. Promising a blocked animation would be a lie the player finds out
             // about at the worst possible moment.
             Trap::NoFlask => "TRAP: No Flask -- your flask heals nothing for 20s",
+            Trap::Runebear => "TRAP: Runebear -- something large is standing where you are",
         }
     }
 }
@@ -101,6 +104,7 @@ impl Trap {
         match self {
             Trap::RuneThief => "Trap: Rune Thief",
             Trap::NoFlask => "Trap: No Flask",
+            Trap::Runebear => "Trap: Runebear",
         }
     }
 
@@ -114,7 +118,39 @@ impl Trap {
 }
 
 /// Every trap this build can fire. One place, so a new variant cannot be half-added.
-pub const ALL: [Trap; 2] = [Trap::RuneThief, Trap::NoFlask];
+pub const ALL: [Trap; 3] = [Trap::RuneThief, Trap::NoFlask, Trap::Runebear];
+
+// ---- Runebear -----------------------------------------------------------------------------------
+//
+// DERIVED 2026-08-10 from `gen_inputs.db`, not recalled -- and the derivation corrected a confident
+// wrong memory (I had "Runebear is c4300"; it is not).
+//
+// `msg/item-msgbnd-dcx/NpcName.fmg.xml` ids encode the model as `90` + <model4> + <variant3>:
+//   904630310 = "Runebear"  =>  model c4630
+// Corroborated by two further tables, which is why this is an id and not a guess:
+//   * NpcParam      `4630xxxx` -- 21 rows, all hp 2585, getSoul rising with the area tier
+//   * NpcThinkParam `46300000 / 46300010 / 46300020 / 46300052`
+//
+// ⚠️ `NpcParam.Name` is EMPTY in this dump (7039 rows, zero non-empty) and `nameId` is NOT the
+// NpcName id -- joining on it returns nothing, silently. The id-prefix decode is the working route;
+// do not "fix" it into a join.
+
+/// Character model: `c4630`.
+pub const RUNEBEAR_CHR_ID: i32 = 4630;
+
+/// The NpcParam row the spawn uses.
+///
+/// `46300010` rather than the family's `...0000` template: every row shares `hp 2585` (the
+/// difficulty spread lives in the area-tier speffect ladder, not here) and the template carries
+/// `getSoul 0`, so it would pay nothing. A player who survives the bear should be paid for it.
+pub const RUNEBEAR_NPC_PARAM_ID: i32 = 46_300_010;
+
+/// The think (AI) row -- the family's base entry. The bear has to actually come after you.
+pub const RUNEBEAR_THINK_PARAM_ID: i32 = 46_300_000;
+
+/// `chara_init_param_id` for a non-humanoid: none. `CharaInitParam` describes a HUMAN loadout
+/// (stats, starting equipment); a bear has no use for one, and -1 is the param convention for unset.
+pub const RUNEBEAR_CHARA_INIT_PARAM_ID: i32 = -1;
 
 /// Rune Thief's new total: half, rounded down.
 ///
@@ -228,10 +264,14 @@ mod tests {
 
     #[test]
     fn every_trap_line_is_ascii_and_names_itself() {
-        let all = [Trap::RuneThief, Trap::NoFlask];
-        // WITNESS: an empty list would make every assertion below vacuously true.
-        assert_eq!(all.len(), 2);
-        for t in all {
+        // WITNESS, and a deliberate pin: an empty list would make every assertion below vacuously
+        // true, and a NEW trap should force somebody to look at this file rather than sail past it.
+        assert_eq!(
+            ALL.len(),
+            3,
+            "a trap was added -- check its line and key here, then bump this"
+        );
+        for t in ALL {
             assert!(t.toast().is_ascii(), "non-ASCII trap line: {}", t.toast());
             assert!(t.key().is_ascii());
             assert!(
@@ -249,11 +289,32 @@ mod tests {
 
     /// Keys are the yaml surface; two traps sharing one is an option that cannot address them both.
     #[test]
+    fn the_runebear_ids_are_the_derived_ones() {
+        // Pinned against a careless edit. These are load-bearing GAME ids: a typo spawns a
+        // different creature, or nothing, and the failure surfaces in a live session rather than as
+        // a build error. The derivation sits in the comment above them (FMG id 904630310).
+        assert_eq!(RUNEBEAR_CHR_ID, 4630);
+        assert_eq!(RUNEBEAR_NPC_PARAM_ID, 46_300_010);
+        assert_eq!(RUNEBEAR_THINK_PARAM_ID, 46_300_000);
+        assert_eq!(RUNEBEAR_CHARA_INIT_PARAM_ID, -1);
+    }
+
+    /// The npc and think rows must belong to the model `chr_id` names, or we spawn one creature's
+    /// body running another's brain.
+    #[test]
+    fn the_runebear_param_rows_belong_to_its_model() {
+        let prefix = RUNEBEAR_CHR_ID.to_string();
+        for id in [RUNEBEAR_NPC_PARAM_ID, RUNEBEAR_THINK_PARAM_ID] {
+            assert!(
+                id.to_string().starts_with(&prefix),
+                "param row {id} is not in the c{prefix} family"
+            );
+        }
+    }
+
+    #[test]
     fn trap_keys_are_unique() {
-        let keys: Vec<&str> = [Trap::RuneThief, Trap::NoFlask]
-            .iter()
-            .map(|t| t.key())
-            .collect();
+        let keys: Vec<&str> = ALL.iter().map(|t| t.key()).collect();
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -327,7 +388,7 @@ mod tests {
 
     #[test]
     fn every_trap_round_trips_through_its_item_name() {
-        assert_eq!(ALL.len(), 2, "WITNESS: nothing was swept");
+        assert_eq!(ALL.len(), 3, "WITNESS: nothing was swept");
         for t in ALL {
             assert_eq!(Trap::from_item_name(t.item_name()), Some(t));
             assert!(t.item_name().starts_with(ITEM_PREFIX), "{}", t.item_name());
