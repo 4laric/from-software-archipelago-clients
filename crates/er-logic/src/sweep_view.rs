@@ -14,6 +14,12 @@
 //! header above them. This states a relationship the player could work out by hand, which is the
 //! opposite of the lock-hint economy (`lock_hint_economy`), where naming the region IS the thing
 //! being charged for.
+//!
+//! THAT LAST CLAIM HOLDS ONLY WHILE THE HEADER IS REVEALED (2026-08-10). Under
+//! `lock_hint_economy::conceal_region` a LOCKED region's header reads "Locked region", so a sweep
+//! row that names it hands over free exactly what the economy charges for. `region_open` closes
+//! that: a region known to be locked is never named, by `group_label` or by `group_state`. Unknown
+//! accessibility still reveals, which is what these rows already did.
 
 /// One sweep group, as the tracker sees it. Borrowed rather than owned: the caller assembles these
 /// from live tables each frame and nothing outlives the render.
@@ -23,6 +29,10 @@ pub struct SweepGroupView<'a> {
     pub flag: u32,
     /// Region name, resolved from a member location. `None` when the region table cannot place it.
     pub region: Option<&'a str>,
+    /// Is that region reachable right now? `Some(false)` is "known locked", and the ONLY case in
+    /// which the region is concealed. `None` is "unknown" and is treated as revealable, never as
+    /// locked, so a missing table entry cannot invent a wall the player does not have.
+    pub region_open: Option<bool>,
     /// Boss name, when `boss_defs` can supply one. Usually `None` -- seeds routinely report
     /// `0 boss-lock def(s)`, which is exactly why the flag is always shown too.
     pub boss: Option<&'a str>,
@@ -49,10 +59,19 @@ impl SweepGroupView<'_> {
 /// when the seed shipped boss-lock defs, and seeds that report `0 boss-lock def(s)` can never name
 /// one. A row that degrades to the prettiest available label instead of the most identifying one is
 /// how a 49-check sweep became untraceable in bobler's log.
+///
+/// The region rides ALONGSIDE the boss name rather than losing to it. bobler, 2026-08-10, reading
+/// nine rows: "i see many here that isnt cerulean region". Every one of them was in a region he
+/// kept -- but with only a boss name on the row he had no way to place any of them, so a seed-wide
+/// section read as a region-scoped one. Naming both is what makes that question answerable.
 pub fn group_label(v: &SweepGroupView<'_>) -> String {
+    // A region known to be LOCKED is never named here -- see the module note.
+    let show_region = v.region_open != Some(false);
     let who = match (v.boss, v.region) {
+        (Some(b), Some(r)) if show_region => format!("{b} ({r})"),
         (Some(b), _) => b.to_string(),
-        (None, Some(r)) => r.to_string(),
+        (None, Some(r)) if show_region => r.to_string(),
+        (None, Some(_)) => "locked region".to_string(),
         (None, None) => "unplaced".to_string(),
     };
     format!(
@@ -67,6 +86,18 @@ pub fn group_label(v: &SweepGroupView<'_>) -> String {
 /// members still owed (they are in flight, or another world holds them), and reading "fired" while
 /// items are missing is exactly the confusion that produced "wtf it gave me nothing".
 pub fn group_state(v: &SweepGroupView<'_>) -> String {
+    // A group that has FIRED and paid in full is settled, whatever its region says now.
+    if v.fired && v.owed() == 0 {
+        return "done".to_string();
+    }
+    // bobler, 2026-08-10: "it thinks i can fight putrescent knight in logic btw". It did not think
+    // that -- it had no way to say otherwise. Putrescent Knight sits in Stone Coffin, whose lock he
+    // had never received, and the row read "waiting on the boss": character-for-character what a
+    // boss he could walk to right now reads. Reachability OUTRANKS the kill, because the kill is
+    // not available. The region stays unnamed -- see the module note.
+    if v.region_open == Some(false) {
+        return "region still locked -- you cannot reach this boss yet".to_string();
+    }
     // 🛑 NOT a let-chain: er-logic is edition 2021 (the workspace is 2024) and `if let ... &&` does
     // not compile there. Same trap for anyone adding to this crate.
     if !v.fired {
@@ -112,6 +143,7 @@ mod tests {
             checked,
             fired,
             gated_on: None,
+            region_open: Some(true),
         }
     }
 
@@ -130,15 +162,57 @@ mod tests {
     }
 
     #[test]
-    fn a_named_boss_wins_over_the_region_but_the_flag_still_shows() {
+    fn a_named_boss_carries_its_region_too_and_the_flag_still_shows() {
+        // The boss used to REPLACE the region, which left nine rows unplaceable for bobler.
         let mut g = v(20000800, Some("Shadow Keep"), 49, 0, false);
         g.boss = Some("Messmer");
         let s = group_label(&g);
         assert!(s.contains("Messmer"), "{s}");
+        assert!(s.contains("Shadow Keep"), "the row must be placeable: {s}");
         assert!(
             s.contains("20000800"),
             "the flag survives a resolvable name: {s}"
         );
+    }
+
+    #[test]
+    fn a_locked_region_is_never_named_by_either_string() {
+        // THE LEAK THIS GUARDS: `lock_hint_economy` charges for a locked region's name and the
+        // rollup header above conceals it. A sweep row spelling it out would sell it for free.
+        let mut g = v(22000800, Some("Stone Coffin"), 8, 0, false);
+        g.boss = Some("Putrescent Knight");
+        g.region_open = Some(false);
+        let label = group_label(&g);
+        let state = group_state(&g);
+        assert!(!label.contains("Stone Coffin"), "{label}");
+        assert!(!state.contains("Stone Coffin"), "{state}");
+        // The boss and the flag still identify the row -- concealment is not silence.
+        assert!(label.contains("Putrescent Knight"), "{label}");
+        assert!(label.contains("22000800"), "{label}");
+    }
+
+    #[test]
+    fn a_boss_you_cannot_reach_does_not_read_as_one_you_can() {
+        // MOTIVATING CASE (rule 11), bobler 2026-08-10: "it thinks i can fight putrescent knight
+        // in logic btw". Stone Coffin Lock was never received in that seed, yet the row was
+        // indistinguishable from a boss standing in a region he had open.
+        let mut locked = v(22000800, Some("Stone Coffin"), 8, 0, false);
+        locked.region_open = Some(false);
+        let open = v(2048380850, Some("Cerulean"), 19, 0, false);
+        let locked_state = group_state(&locked);
+        assert_ne!(locked_state, group_state(&open));
+        assert_eq!(group_state(&open), "waiting on the boss");
+        assert!(locked_state.contains("locked"), "{locked_state}");
+    }
+
+    #[test]
+    fn unknown_accessibility_never_invents_a_wall() {
+        // `None` means the coarse table could not place it. Reporting that as locked would tell a
+        // player they cannot go somewhere they can, which is worse than saying nothing.
+        let mut g = v(1, Some("Belurat"), 10, 0, false);
+        g.region_open = None;
+        assert_eq!(group_state(&g), "waiting on the boss");
+        assert!(group_label(&g).contains("Belurat"));
     }
 
     #[test]
