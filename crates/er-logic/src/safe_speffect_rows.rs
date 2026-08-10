@@ -41,11 +41,24 @@ pub const NO_FALL_DAMAGE: i32 = 20_010_827;
 /// literal `20012081` occurs exactly once across all 239 param tables — only as its own row.
 pub const SCADU_BLESSING: i32 = 20_012_081;
 
+/// `traps::NoFlask` -- `changeHp/MpEstusFlaskCorrectRate -> 0` with a FINITE `effectEndurance`.
+///
+/// Verified 2026-08-10 (`python tools/verify_safe_speffect_row.py 20012082`):
+///   ok    no-op, silent, permanent (identical to 20012080)
+///   ok    unreferenced: occurs exactly once across all 239 param tables (itself)
+///
+/// 🛑 Note the tension this row is the first to carry, and it is not a contradiction. Eligibility
+/// demands `effectEndurance -1` IN VANILLA -- so the row cannot expire out from under a feature
+/// that wants it permanent -- while the trap writes a finite endurance itself at fire time. The
+/// duration IS the param field; that is the whole mechanism (`er_logic::traps`).
+pub const TRAP_NO_FLASK: i32 = 20_012_082;
+
 /// Every claimed row, for the duplicate-claim test below. Add here in the same commit that claims.
-pub const CLAIMED: [(i32, &str); 3] = [
+pub const CLAIMED: [(i32, &str); 4] = [
     (NO_EQUIP_LOAD, "no_equip_load"),
     (NO_FALL_DAMAGE, "no_fall_damage"),
     (SCADU_BLESSING, "scadu_blessing"),
+    (TRAP_NO_FLASK, "traps::no_flask"),
 ];
 
 #[cfg(test)]
@@ -74,6 +87,7 @@ mod tests {
         assert_eq!(NO_EQUIP_LOAD, 20012080);
         assert_eq!(NO_FALL_DAMAGE, 20010827);
         assert_eq!(SCADU_BLESSING, 20012081);
+        assert_eq!(TRAP_NO_FLASK, 20012082);
     }
 
     /// 🛑 Our clone row must not collide with the vanilla Scadutree ladder (`20000100..=20000120`).

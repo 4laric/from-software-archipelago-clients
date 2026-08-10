@@ -55,6 +55,7 @@ mod shop_stock;
 mod shop_value;
 mod start_item_backfill;
 mod startgrants;
+mod traps;
 mod upgrade_cost;
 mod upgrades;
 mod warp;

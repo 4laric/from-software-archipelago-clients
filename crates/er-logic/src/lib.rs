@@ -79,6 +79,7 @@ pub mod toast;
 pub mod torrent_start_replay;
 pub mod tracker;
 pub mod tracker_tables;
+pub mod traps;
 pub mod unique_grants;
 pub mod upgrade_cost;
 pub mod upgrade_cost_replay;
