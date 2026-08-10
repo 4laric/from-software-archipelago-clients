@@ -4046,6 +4046,15 @@ impl Core {
             .scaling_here_bucket
             .and_then(crate::scaling::describe_region);
 
+        // Region-lock accessibility snapshot (bound to a local BEFORE the model borrows &self
+        // fields -- keeps the borrows sequential).
+        //
+        // MOVED ABOVE THE SWEEP BLOCK (2026-08-10): the sweep rows now need to know whether a
+        // group's region is reachable, and a pure function cannot be handed a fact the caller has
+        // not computed yet. Same shape as the weapons-hold ordering bug -- that defect lived
+        // entirely in CALL ORDER at an impure site no er-logic test could observe.
+        let open_coarse = self.open_coarse_regions();
+
         // ---- Boss sweeps (Alaric, 2026-08-07: "display how many sweep checks are attached to a
         // boss"). A sweep is the single largest payout in the game -- 49 and 50 checks in one of
         // bobler's sessions -- and it was invisible until it fired. Assembled here, outside the
@@ -4061,6 +4070,7 @@ impl Core {
             struct Row {
                 boss: Option<String>,
                 region: Option<String>,
+                region_open: Option<bool>,
                 flag: u32,
                 members: usize,
                 checked: usize,
@@ -4092,6 +4102,15 @@ impl Core {
                         .first()
                         .and_then(|l| self.region_table.get(&(*l as u64)))
                         .cloned(),
+                    // Mirrors `tracker::is_in_logic`: an EMPTY coarse key means no lock governs
+                    // this region (Roundtable Hold ships ""), so it is reachable, not sealed. An
+                    // ABSENT entry is treated the same, so an unknown never reads as locked.
+                    region_open: Some(
+                        match locs.first().and_then(|l| self.coarse_table.get(&(*l as u64))) {
+                            Some(c) if !c.is_empty() => open_coarse.contains(c),
+                            _ => true,
+                        },
+                    ),
                     flag,
                     members: locs.len(),
                     checked: locs
@@ -4109,6 +4128,7 @@ impl Core {
                 .map(|r| er_logic::sweep_view::SweepGroupView {
                     flag: r.flag,
                     region: r.region.as_deref(),
+                    region_open: r.region_open,
                     boss: r.boss.as_deref(),
                     members: r.members,
                     checked: r.checked,
@@ -4119,6 +4139,10 @@ impl Core {
             sweep_header = er_logic::sweep_view::section_header(&views);
             sweep_rows = views
                 .iter()
+                // Alaric, 2026-08-10: "we can clear these from the view once they've paid out".
+                // A group that fired and owes nothing is settled history taking up a row. The
+                // HEADER still counts it, so the section's totals do not silently shrink.
+                .filter(|v| !(v.fired && v.owed() == 0))
                 .map(|v| {
                     (
                         er_logic::sweep_view::group_label(v),
@@ -4128,9 +4152,6 @@ impl Core {
                 .collect();
         }
 
-        // Region-lock accessibility snapshot (bound to a local BEFORE the model borrows &self
-        // fields -- keeps the borrows sequential).
-        let open_coarse = self.open_coarse_regions();
         let model = er_logic::tracker::build_tracker_model(
             &checked,
             &unchecked,
