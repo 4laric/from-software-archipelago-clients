@@ -4222,8 +4222,19 @@ impl Core {
         // Filter state as locals (the closure stays self-free); written back to self after.
         let mut in_logic_only = self.tracker_in_logic_only;
         let mut surface_only = self.tracker_surface_only;
+        // bobler, 2026-08-10: "you forgot to resize the box though i have to drag it out to read".
+        // 480 was never wide enough -- several header rows below compose a text and a widget with
+        // `same_line()`, and imgui does not wrap, so the tail was simply clipped.
+        //
+        // `size_constraints` is the load-bearing half of this fix, NOT the wider default. It is
+        // re-applied EVERY frame, so it also rescues a player whose window is already sized too
+        // small, which `FirstUseEver` by definition cannot: that condition fires once and never
+        // looks again. The max is viewport-relative so the window can never open larger than the
+        // screen it is drawn on.
+        let display = ui.io().display_size;
         ui.window("Item Tracker###ap-tracker")
-            .size([480.0, 520.0], imgui::Condition::FirstUseEver)
+            .size([640.0, 560.0], imgui::Condition::FirstUseEver)
+            .size_constraints([560.0, 240.0], [display[0] * 0.95, display[1] * 0.95])
             .opened(&mut open)
             .build(|| {
                 ui.text(format!("checks: {}/{}", model.done, model.total));
@@ -4272,7 +4283,11 @@ impl Core {
                         Next::Spilled { regions } => {
                             // The dead-end the ruling called out: a lock in another player's world
                             // is invisible to our scout, so say so and name the tool.
-                            ui.same_line();
+                            //
+                            // No `same_line()` here, unlike every sibling arm. This is the ONE arm
+                            // whose text grows with the seed -- it joins N region names -- so on
+                            // the shared row it was the first line to clip, and no window width
+                            // fixes that in general. Its own row instead.
                             ui.text_disabled(format!(
                                 "next lock is in another world ({}) -- use !hint",
                                 regions.join(", ")
