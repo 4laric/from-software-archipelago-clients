@@ -133,6 +133,14 @@ fn scadu_mode() -> i32 {
     GLOBAL_SCADU.load(Ordering::Relaxed)
 }
 
+/// Is the DLC catch-up arm live? Mode 3 (`dlc_only` scope + catch-up) is the only value that needs
+/// the `dlc_blessing_catchup` client-feature tag: 0/1/2 mean what they always meant, and an
+/// unrecognised mode clamps to 0 in `set_global_scadu_blessing` -- which is precisely the silent
+/// "your setting did nothing" the handshake exists to make loud. See `feature_handshake`.
+pub fn dlc_blessing_catchup_armed() -> bool {
+    scadu_mode() == 3
+}
+
 // ================================================================================================
 // auto_upgrade
 // ================================================================================================

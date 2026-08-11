@@ -1,0 +1,225 @@
+//! `feature_handshake` -- subtract what ARMED from what the seed DECLARED, and name the difference.
+//!
+//! # The bug this exists for
+//!
+//! er-archipelago#536. `merchant_bells_on_talk` shipped complete on both sides -- this client baked
+//! its 38-row table, armed the ESD detour and listed the tag in `client_features::SUPPORTED`; the
+//! apworld declared the sub-key in `contract.py` and documented it in `CONTRACT.md`. The one line
+//! that puts the option's VALUE on the wire was never written. `parse_merchant_bells_on_talk` read
+//! an absent key as `false` and the feature was dark for every seed that turned it on.
+//!
+//! Four gates were green while it was broken, and each for a defensible reason:
+//!
+//! * the contract validator reports MISSING only for `required=True`, and a client-gated option is
+//!   `required=False` **on purpose** (an absent key must parse false on an older client) -- so
+//!   absence and OFF are the same observation;
+//! * `OPTIONS_SUBKEYS` is not folded into the contract hash, so `VERSION: OK` printed over the gap;
+//! * the cross-repo path gate runs CLIENT-READ -> DECLARATION, and the declaration was the half
+//!   that existed -- the mirror direction had no gate at all;
+//! * `requiresClientFeatures` -- the one signal designed to stop a client silently ignoring an
+//!   option -- was *satisfied*, because this client does support the tag.
+//!
+//! ⭐⭐⭐ **A handshake that succeeds over an empty payload is a false positive.** It is worse than a
+//! refusal, because the refusal path is loud and this one reads as proof everything is fine.
+//!
+//! # Why the client can answer this at all
+//!
+//! It already holds both halves. `requiresClientFeatures` says what the seed depends on; the
+//! feature modules know whether they are live. Nothing ever subtracted one from the other. That
+//! subtraction is this module, and it is the only check in either repo that can see the gap --
+//! world-side, the missing line is *a line that is not there*, and no runtime assertion sees an
+//! absence.
+//!
+//! Two player reports five days apart both needed a source read to diagnose. Either would have been
+//! one grep against this line.
+//!
+//! # 🛑 Why the probe is a READ-BACK
+//!
+//! Every probe below asks the feature module for the state its own behaviour gates on --
+//! `merchant_bells::is_armed()` loads the same atomic the detour loads. A probe that instead
+//! recorded "we called `set_enabled`" would be a receipt, and a receipt cannot witness the thing it
+//! is receipting for: it would have reported ARMED throughout #536, because `set_enabled(false)`
+//! was faithfully called with the value that never arrived.
+//!
+//! # 🛑 Why this is a REGISTRY with a gate, not a check per feature
+//!
+//! `auto_equip` already had a per-feature emission test, which is why auto_equip works. That test
+//! did nothing for the next feature, because the next feature has to remember to copy it -- and did
+//! not. So [`PROBES`] must cover [`SUPPORTED`] exactly, and
+//! `every_supported_tag_has_a_probe` reds when it does not. Adding a tag without a probe is a
+//! build failure, not a thing to remember.
+
+use er_logic::client_features;
+
+use crate::region::RegionConfig;
+
+/// The borrowed state a probe may need. Most features keep their arming flag in a module static and
+/// ignore this; `grace_attunement` lives on the per-connect [`RegionConfig`], which is owned by
+/// `core` and cannot be a static.
+pub struct ProbeCtx<'a> {
+    pub region: Option<&'a RegionConfig>,
+}
+
+/// A tag paired with the read-back that decides whether it is live.
+type Probe = fn(&ProbeCtx) -> bool;
+
+/// Every tag in [`SUPPORTED`], with the live-state read that answers "did it arm?".
+///
+/// ⭐ ORDER IS THE ORDER OF `SUPPORTED`, so the two lists diff by eye as well as by test.
+pub const PROBES: &[(&str, Probe)] = &[
+    // A ceiling is only DECLARED by a seed that actually caps, so ARMED must mean the same thing --
+    // configured, and capping below the top rung.
+    ("scaling_ceiling", |_| crate::scaling::ceiling_is_capped()),
+    // The atomic the receive-queue drain gates on.
+    ("auto_equip", |_| crate::auto_equip::is_armed()),
+    // Blessing mode 3 specifically: 0/1/2 are old values no client misreads.
+    ("dlc_blessing_catchup", |_| {
+        crate::upgrades::dlc_blessing_catchup_armed()
+    }),
+    // Parsed per connect into RegionConfig. Non-empty = at least one region is gated, which is the
+    // only case the apworld declares the tag for.
+    ("grace_attunement", |c| {
+        c.region.is_some_and(|r| !r.grace_attunement.is_empty())
+    }),
+    // #536's own tag: the atomic the ESD shop-open detour loads on every merchant open.
+    ("merchant_bells_on_talk", |_| {
+        crate::merchant_bells::is_armed()
+    }),
+];
+
+/// Build the `(tag, live)` table this connect.
+fn armed(ctx: &ProbeCtx) -> Vec<(&'static str, bool)> {
+    PROBES.iter().map(|(tag, p)| (*tag, p(ctx))).collect()
+}
+
+/// Reconcile and log. Call ONCE per connect, **after every feature has been configured** -- a probe
+/// run mid-arming would report a false negative and cry wolf, which is how a gate stops being read.
+///
+/// Returns the declared-but-unarmed tags so the caller can also surface them on screen: a player
+/// who never opens the log is exactly the one who would otherwise conclude the option they chose
+/// simply does nothing.
+pub fn log_and_report(required: &[String], ctx: &ProbeCtx) -> Vec<String> {
+    let armed = armed(ctx);
+    let h = client_features::reconcile(required, &armed);
+
+    if !h.declared_not_armed.is_empty() {
+        log::warn!(
+            "{}",
+            client_features::not_armed_message(&h.declared_not_armed)
+        );
+    }
+    // Say the check RAN even when it is happy. A gate that is silent on success is a gate you
+    // cannot distinguish from a gate that was never called -- which is the whole failure mode this
+    // module was written about.
+    log::info!(
+        "feature-handshake: {} declared, {} armed as declared, {} declared-but-dark, {} armed \
+         without being declared (normal: a seed only declares what an older client would break on)",
+        required.len(),
+        h.agreed.len(),
+        h.declared_not_armed.len(),
+        h.armed_not_declared.len()
+    );
+    if !h.agreed.is_empty() {
+        log::info!("feature-handshake: honoured {:?}", h.agreed);
+    }
+    if !h.armed_not_declared.is_empty() {
+        log::info!(
+            "feature-handshake: on but undeclared {:?}",
+            h.armed_not_declared
+        );
+    }
+    h.declared_not_armed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use er_logic::client_features::SUPPORTED;
+
+    /// ⭐⭐⭐ THE GATE. A new entry in `SUPPORTED` with no probe would make this module quietly
+    /// blind to exactly the feature most likely to have the #536 bug -- the newest one. A per-
+    /// feature guard is not a gate; this is the gate.
+    #[test]
+    fn every_supported_tag_has_a_probe() {
+        let mut probed: Vec<&str> = PROBES.iter().map(|(t, _)| *t).collect();
+        let mut supported: Vec<&str> = SUPPORTED.to_vec();
+        probed.sort_unstable();
+        supported.sort_unstable();
+        assert_eq!(
+            probed, supported,
+            "client_features::SUPPORTED and feature_handshake::PROBES must match EXACTLY. \
+             A tag in SUPPORTED with no probe is a feature whose darkness nothing can see; a probe \
+             for a tag that is not SUPPORTED is a claim of support this build does not make."
+        );
+    }
+
+    /// The probe table must not carry duplicates: `reconcile`'s `any(live)` would then let one
+    /// stale `true` mask a real `false`.
+    #[test]
+    fn the_probe_table_has_no_duplicate_tags() {
+        let mut seen: Vec<&str> = PROBES.iter().map(|(t, _)| *t).collect();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "duplicate tag in PROBES");
+    }
+
+    /// Probes must be callable with no game attached and no region config -- this runs on a CI
+    /// runner with no Elden Ring in sight, and a probe that dereferenced a game pointer would
+    /// panic there long before a player ever saw the line.
+    ///
+    /// 🛑 ASSERTS NO VALUE, DELIBERATELY. Every probe reads a process-wide static, and the other
+    /// tests in this binary run in the same process in parallel -- so "nothing is configured,
+    /// therefore false" is true only until some unrelated test calls `set_enabled`. That is a
+    /// draw-dependent assertion, and it would fail once a week and be re-run until green. The
+    /// VALUE logic is tested where it is deterministic: `client_features::reconcile` in er-logic.
+    #[test]
+    fn probes_are_host_safe() {
+        let ctx = ProbeCtx { region: None };
+        for (_tag, p) in PROBES {
+            let _ = p(&ctx);
+        }
+    }
+
+    /// `grace_attunement` is the one probe that reads BORROWED state rather than a static, so it
+    /// is the one that can be pinned deterministically: no config -> not armed, gated region ->
+    /// armed. This is the shape a future probe should copy.
+    #[test]
+    fn the_grace_attunement_probe_follows_its_config() {
+        let probe = PROBES
+            .iter()
+            .find(|(t, _)| *t == "grace_attunement")
+            .expect("covered by every_supported_tag_has_a_probe")
+            .1;
+        assert!(!probe(&ProbeCtx { region: None }), "no config -> not armed");
+
+        let mut cfg = RegionConfig::default();
+        assert!(
+            !probe(&ProbeCtx { region: Some(&cfg) }),
+            "a seed that gates no region must not report the feature armed"
+        );
+        cfg.grace_attunement.insert(
+            "Limgrave Lock".to_string(),
+            crate::region::GraceGate::default(),
+        );
+        assert!(
+            probe(&ProbeCtx { region: Some(&cfg) }),
+            "one gated region is what the apworld declares the tag for"
+        );
+    }
+
+    /// End to end on the shape that shipped broken (#536): the seed declares the bell option and
+    /// the probe table says it is not live, so the reconciliation names it. Driven through
+    /// `reconcile` with an explicit table rather than through `log_and_report`, for the same
+    /// parallel-statics reason as above.
+    #[test]
+    fn the_536_shape_is_reported() {
+        let required = vec!["merchant_bells_on_talk".to_string()];
+        let armed: Vec<(&str, bool)> = PROBES.iter().map(|(t, _)| (*t, false)).collect();
+        let h = client_features::reconcile(&required, &armed);
+        assert_eq!(
+            h.declared_not_armed,
+            vec!["merchant_bells_on_talk".to_string()]
+        );
+    }
+}

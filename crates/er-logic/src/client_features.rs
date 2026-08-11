@@ -97,6 +97,92 @@ pub fn refusal_message(missing: &[String]) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------------------------
+// DECLARED vs ARMED -- the half this handshake was missing until 2026-08-11
+// ---------------------------------------------------------------------------------------------
+//
+// Everything above answers "is this client NEW enough for the seed?". It cannot answer "did the
+// feature the seed asked for actually TURN ON?", and those are different questions with the same
+// symptom.
+//
+// er-archipelago#536 is the worked example. `merchant_bells_on_talk` shipped complete on both
+// sides: this crate had the planner, the game crate had the ESD detour, and the tag was in
+// `SUPPORTED`. The apworld declared the sub-key and documented it -- and never emitted its VALUE.
+// So `parse_merchant_bells_on_talk` read an absent key as `false`, the detour stayed asleep, and
+// every gate was green: `required=False` means the contract validator's MISSING arm never fires,
+// and `OPTIONS_SUBKEYS` is not folded into the contract hash, so `VERSION: OK` printed straight
+// over the gap. The seed declared the tag, this client accepted the tag, and nothing happened.
+//
+// ⭐⭐⭐ THE HANDSHAKE SUCCEEDING IS WORSE THAN A REFUSAL. `requiresClientFeatures` exists to stop a
+// client silently ignoring an option; here the client implements the feature, accepts the tag, and
+// is handed no payload -- so the one signal designed to catch this reads as PROOF IT IS FINE.
+//
+// The client already holds both halves of the answer. It just never subtracted them. That is all
+// this does: DECLARED (from slot_data) minus ARMED (read back out of the live feature state), the
+// difference logged by name. Two player reports, five days apart, both needed a source read to
+// diagnose; either would have been one grep with this line in the log.
+//
+// 🛑 ARMED MUST BE A READ-BACK, NOT A RECEIPT. The probe has to ask the feature module what its
+// state IS, not remember that `set_enabled` was called -- a guard whose subject cannot witness it
+// is the same blindness one level down.
+
+/// The three-way split between what the seed asked for and what this client turned on.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Handshake {
+    /// The seed declared it, this build knows the tag, and the feature is NOT live. **This is the
+    /// defect class**: the value never reached us, or an arming path failed. Always a WARN.
+    pub declared_not_armed: Vec<String>,
+    /// Declared and live. The happy path; logged so a reader can see the check ran at all.
+    pub agreed: Vec<String>,
+    /// Live but never declared. Not an error -- most options are legitimately undeclared, because
+    /// a seed only declares what an OLDER client would break on. Logged at INFO as context.
+    pub armed_not_declared: Vec<String>,
+}
+
+/// Subtract ARMED from DECLARED.
+///
+/// `armed` is the probe table: every tag in [`SUPPORTED`] paired with its live state. Tags the seed
+/// declared that this build does not know are NOT reported here -- [`unsupported`] already refuses
+/// those, and reporting the same tag twice under two names would train a reader to skim both.
+pub fn reconcile(required: &[String], armed: &[(&str, bool)]) -> Handshake {
+    let live = |tag: &str| armed.iter().any(|(t, on)| *t == tag && *on);
+    let mut h = Handshake::default();
+    for tag in required {
+        // Unknown tags are `unsupported`'s business, not ours.
+        if !SUPPORTED.contains(&tag.as_str()) {
+            continue;
+        }
+        if live(tag) {
+            h.agreed.push(tag.clone());
+        } else {
+            h.declared_not_armed.push(tag.clone());
+        }
+    }
+    for (tag, on) in armed {
+        if *on && !required.iter().any(|r| r == tag) {
+            h.armed_not_declared.push((*tag).to_string());
+        }
+    }
+    h
+}
+
+/// The WARN body for a declared-but-unarmed feature. Names the tags AND the two things that cause
+/// it, because "merchant_bells_on_talk not armed" tells a triager nothing actionable.
+///
+/// ASCII only: this string can reach the in-game toast deck.
+pub fn not_armed_message(tags: &[String]) -> String {
+    format!(
+        "feature-handshake: DECLARED but NOT ARMED: {}. The seed asked this client for the \
+         feature(s) above and this build has them, but they did not turn on -- so the option will \
+         do nothing and the log will otherwise look healthy. Almost always the apworld sent the \
+         TAG without the VALUE (the option's key is missing from slot_data `options`), which no \
+         other check can see: an optional sub-key's absence is identical to its OFF state, and \
+         OPTIONS_SUBKEYS is not folded into the contract hash. Regenerate the seed with an apworld \
+         that emits the value; updating this client will NOT help.",
+        tags.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +307,113 @@ mod tests {
             assert!(!f.trim().is_empty(), "blank feature tag");
             assert!(seen.insert(*f), "duplicate feature tag {f}");
         }
+    }
+
+    // ---- DECLARED vs ARMED ------------------------------------------------------------------
+
+    /// ⭐⭐⭐ THE MOTIVATING CASE, verbatim: er-archipelago#536. The seed declares
+    /// `merchant_bells_on_talk`, this build supports it (so `unsupported` is EMPTY and the old
+    /// handshake is happy), and the feature is off because the value never arrived. Before this
+    /// function that combination was indistinguishable from a healthy session.
+    #[test]
+    fn a_declared_feature_that_never_armed_is_named() {
+        let sd = json!({ "requiresClientFeatures": ["merchant_bells_on_talk"] });
+        let required = required_from_slot_data(&sd);
+        assert!(
+            unsupported(&required).is_empty(),
+            "precondition: the OLD handshake sees nothing wrong here -- that is the whole bug"
+        );
+
+        let armed = [("merchant_bells_on_talk", false), ("auto_equip", false)];
+        let h = reconcile(&required, &armed);
+        assert_eq!(
+            h.declared_not_armed,
+            vec!["merchant_bells_on_talk".to_string()]
+        );
+        assert!(h.agreed.is_empty());
+
+        let msg = not_armed_message(&h.declared_not_armed);
+        assert!(
+            msg.contains("merchant_bells_on_talk"),
+            "must NAME the tag: {msg}"
+        );
+        assert!(
+            msg.contains("Regenerate"),
+            "must say what actually fixes it: {msg}"
+        );
+        assert!(
+            msg.is_ascii(),
+            "reaches the in-game toast deck, which is ASCII-only: {msg}"
+        );
+    }
+
+    /// The same seed once the apworld emits the value: declared AND armed, nothing to warn about.
+    #[test]
+    fn a_declared_feature_that_armed_is_silent() {
+        let required = required_from_slot_data(&json!({
+            "requiresClientFeatures": ["merchant_bells_on_talk"]
+        }));
+        let h = reconcile(&required, &[("merchant_bells_on_talk", true)]);
+        assert!(h.declared_not_armed.is_empty());
+        assert_eq!(h.agreed, vec!["merchant_bells_on_talk".to_string()]);
+    }
+
+    /// An option that is ON but undeclared is the NORMAL case, not a defect: a seed only declares
+    /// what would break an older client. It must never reach the WARN arm.
+    #[test]
+    fn armed_but_undeclared_is_context_not_a_defect() {
+        let h = reconcile(&[], &[("auto_equip", true), ("scaling_ceiling", false)]);
+        assert!(h.declared_not_armed.is_empty());
+        assert_eq!(h.armed_not_declared, vec!["auto_equip".to_string()]);
+    }
+
+    /// A tag this build does not know is `unsupported`'s job. Reporting it here as well would put
+    /// the same tag in two WARN lines under two different names.
+    #[test]
+    fn an_unknown_tag_is_left_to_the_refusal_path() {
+        let required = required_from_slot_data(&json!({
+            "requiresClientFeatures": ["some_future_thing"]
+        }));
+        let h = reconcile(&required, &[("auto_equip", false)]);
+        assert!(h.declared_not_armed.is_empty(), "not ours to report");
+        assert!(h.agreed.is_empty());
+        assert_eq!(
+            unsupported(&required),
+            vec!["some_future_thing".to_string()]
+        );
+    }
+
+    /// Mixed: one honoured, one dark, one unknown -- each lands in exactly one bucket.
+    #[test]
+    fn each_tag_lands_in_exactly_one_bucket() {
+        let required = required_from_slot_data(&json!({
+            "requiresClientFeatures": ["auto_equip", "merchant_bells_on_talk", "some_future_thing"]
+        }));
+        let h = reconcile(
+            &required,
+            &[
+                ("auto_equip", true),
+                ("merchant_bells_on_talk", false),
+                ("scaling_ceiling", true),
+            ],
+        );
+        assert_eq!(h.agreed, vec!["auto_equip".to_string()]);
+        assert_eq!(
+            h.declared_not_armed,
+            vec!["merchant_bells_on_talk".to_string()]
+        );
+        assert_eq!(h.armed_not_declared, vec!["scaling_ceiling".to_string()]);
+        assert_eq!(
+            unsupported(&required),
+            vec!["some_future_thing".to_string()]
+        );
+    }
+
+    /// A seed that declares nothing and a client with nothing on: the check must be completely
+    /// silent rather than emitting an empty banner every connect.
+    #[test]
+    fn a_quiet_seed_produces_a_wholly_empty_handshake() {
+        let h = reconcile(&[], &[("auto_equip", false), ("scaling_ceiling", false)]);
+        assert_eq!(h, Handshake::default());
     }
 }

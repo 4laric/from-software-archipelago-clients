@@ -50,6 +50,13 @@ pub fn set_enabled(on: bool) {
     }
 }
 
+/// Is the detour live? A READ-BACK of the state the detour itself consults -- not a memo of
+/// whether `set_enabled` was called. `feature_handshake` subtracts this from the seed's
+/// `requiresClientFeatures` declaration, which is the only thing that would have caught #536.
+pub fn is_armed() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 /// A merchant opened its buy menu over `ShopLineupParam` rows `[begin, end]`.
 ///
 /// Runs on the game thread inside the ESD dispatch. The caller wraps this in `catch_unwind`; every
