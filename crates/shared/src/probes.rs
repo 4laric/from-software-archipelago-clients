@@ -76,6 +76,28 @@ pub fn enabled(env_var: &str, key: &str) -> bool {
     resolve(std::env::var_os(env_var).is_some(), config)
 }
 
+/// The resolution rule for a probe that is ON unless someone turns it OFF.
+///
+/// ⭐ THIS IS A DIFFERENT QUESTION FROM [`resolve`], NOT A VARIANT OF IT. There, absence means off
+/// and any presence means on; here, absence means ON and only an explicit `0` / `false` silences
+/// it. A probe defaults on when the cost of it being silently absent is HIGHER than the cost of its
+/// volume -- which is the case whenever the measurement can only be taken during a playtest we do
+/// not control, and cannot be retaken later.
+///
+/// 🛑 `ER_FOO=0` MEANS OFF HERE, and that is deliberately the opposite of [`resolve`]'s convention.
+/// It has to be: a default-on probe with no way to say "no" is not a switch. `ER_SCALING_SAMPLE`
+/// already reads `Ok("0") | Ok("false")` for exactly this reason and predates this function.
+pub fn enabled_by_default(env_var: &str, key: &str) -> bool {
+    if matches!(std::env::var(env_var).as_deref(), Ok("0") | Ok("false")) {
+        return false;
+    }
+    CONFIG_PROBES
+        .get()
+        .and_then(|probes| probes.get(key))
+        .copied()
+        .unwrap_or(true)
+}
+
 /// WHICH gate turned this probe on, for a log line. `None` when it is off.
 ///
 /// 🛑 EXISTS BECAUSE A BANNER THAT NAMES THE WRONG GATE IS WORSE THAN NO BANNER. Before this, the
@@ -134,6 +156,32 @@ pub fn log_active(pairs: &[(&str, &str)]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_on_is_silenced_only_by_an_explicit_no() {
+        // Pure-argument twin of `enabled_by_default`, so the RULE is tested without touching a
+        // process env or the OnceLock. If these two ever disagree the function is not what its
+        // doc says it is.
+        fn rule(env: Option<&str>, config: Option<bool>) -> bool {
+            if matches!(env, Some("0") | Some("false")) {
+                return false;
+            }
+            config.unwrap_or(true)
+        }
+        assert!(
+            rule(None, None),
+            "absent everywhere must be ON -- that is the point"
+        );
+        assert!(!rule(Some("0"), None));
+        assert!(!rule(Some("false"), None));
+        assert!(rule(Some("1"), None));
+        assert!(!rule(None, Some(false)), "apconfig must be able to say no");
+        assert!(rule(None, Some(true)));
+        // 🛑 The env is the OVERRIDE, both ways: a developer silencing a probe for one run must not
+        // be overruled by a config file, and vice versa.
+        assert!(!rule(Some("0"), Some(true)), "env off beats config on");
+        assert!(rule(Some("1"), Some(false)), "env on beats config off");
+    }
+
     use super::*;
 
     /// THE MOTIVATING CASE (CONTRIBUTING rule 11): a playtester who cannot set an environment

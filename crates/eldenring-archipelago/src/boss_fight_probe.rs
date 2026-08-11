@@ -16,15 +16,11 @@
 //!
 //! # Design constraints, and where each one comes from
 //!
-//! * **Probe-gated and OFF by default.** `ER_BOSSFIGHT_PROBE` / `"probes": {"boss_fight": true}`.
-//!   This is diagnostic volume, not something to ship on for everyone.
-//!
-//!   ⚠️ Deliberately UNLIKE `ER_SCALING_SAMPLE`, which defaults ON because its measurement is taken
-//!   through matt's randomizer's launcher and an env var would have to survive two process spawns.
-//!   That argument does not transfer: `shared::probes` reads `apconfig.json` too, so a playtester
-//!   turns this on by editing a file that sits beside the DLL and that they have already edited
-//!   once for the server URL. The launcher problem the scaling sample was working around no longer
-//!   exists.
+//! * **ON by default**, silenced with `ER_BOSSFIGHT_PROBE=0` or
+//!   `"probes": {"boss_fight": false}` -- the same shape as `ER_SCALING_SAMPLE`. See [`enabled`]
+//!   for why this reversed after shipping off-by-default: a measurement that can only be taken
+//!   during someone else's playtest, and that has already cost three triage cycles, must not be
+//!   able to no-op silently.
 //!
 //! * **Read-only.** No param writes, no game state, no flags. That is what exempts it from the
 //!   `in_world`-edge re-arm rule (`test_gf_client_resets_are_called`): there is nothing a map load
@@ -62,9 +58,48 @@ use eldenring::cs::{ChrIns, WorldChrMan};
 use er_logic::boss_fight_sample::{FightSampler, Hp, Reading, Step, format_sample};
 use fromsoftware_shared::FromStatic;
 
-/// Off by default. See the module doc for why this differs from `ER_SCALING_SAMPLE`.
+/// **ON by default.** `ER_BOSSFIGHT_PROBE=0` or `"probes": {"boss_fight": false}` silences it.
+///
+/// 🛑 THIS SHIPPED OFF BY DEFAULT AND THAT WAS WRONG. #553 says "probe-gated and OFF by default",
+/// and the argument for following it was that `shared::probes` reads `apconfig.json`, which sits
+/// beside the DLL, so the launcher problem `ER_SCALING_SAMPLE` defaults ON to dodge does not apply.
+///
+/// The record disagrees. On 2026-08-08 a session ran with `probes: none active` and the trap
+/// measurement simply did not happen -- a whole playtest round spent on a configuration nobody
+/// noticed was inert. `ER_SCALING_SAMPLE`'s own doc names the failure exactly: *"A probe that
+/// silently no-ops because a variable did not make that journey is worse than no probe: it looks
+/// like a clean result."*
+///
+/// ⭐ AND THE ASYMMETRY IS NOT CLOSE. This measurement can only be taken DURING a fight, in a
+/// playtest we do not run, on a machine we do not have; a missed session cannot be retaken, and the
+/// question it answers ("2 bosses in one fight wildly different") has already cost three separate
+/// triage cycles. The cost of being on is bounded and small: ~2 Hz, only while a healthbar is up,
+/// capped at [`er_logic::boss_fight_sample::MAX_SAMPLES_PER_FIGHT`] -- a 90-second fight is about
+/// 180 lines in a log that is already appended across sessions.
 fn enabled() -> bool {
-    shared::probes::enabled("ER_BOSSFIGHT_PROBE", "boss_fight")
+    shared::probes::enabled_by_default("ER_BOSSFIGHT_PROBE", "boss_fight")
+}
+
+/// Say which way the switch is set, once, on the first tick that reaches it.
+///
+/// 🛑 A DEFAULT-ON PROBE CANNOT RIDE `probes::log_active`. That line lists probes it resolved as ON
+/// through [`shared::probes::enabled`] -- the default-OFF rule -- so it would report this one as off
+/// in exactly the case where it is on, which is worse than saying nothing. `ER_SCALING_SAMPLE` is
+/// absent from that list for the same reason. Saying it here keeps the answer in the log.
+fn announce_once(on: bool) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if on {
+        log::info!(
+            "boss-fight probe: ON (default). Samples player and boss HP ~2 Hz while a boss \
+             healthbar is up. Set ER_BOSSFIGHT_PROBE=0, or \"probes\": {{\"boss_fight\": false}} \
+             in apconfig.json, to silence it"
+        );
+    } else {
+        log::info!("boss-fight probe: SILENCED by ER_BOSSFIGHT_PROBE=0 / probes.boss_fight=false");
+    }
 }
 
 /// The sampler's own state. A `Mutex` rather than a raw static because [`FightSampler`] is a small
@@ -88,7 +123,9 @@ fn now_ms() -> u64 {
 
 /// Per-tick entry point. Hard no-op unless the probe is on.
 pub fn tick() {
-    if !enabled() {
+    let on = enabled();
+    announce_once(on);
+    if !on {
         return;
     }
 

@@ -650,7 +650,9 @@ impl shared::Core for Core {
             ("ER_DOWNSTATE_PROBE_ARM", "downstate_arm"),
             ("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player"),
             ("ER_TRAP_PROBE", "traps"),
-            ("ER_BOSSFIGHT_PROBE", "boss_fight"),
+            // ER_BOSSFIGHT_PROBE is deliberately NOT here: it is ON by default, and this line
+            // resolves through the default-OFF rule, so it would report the probe as off in exactly
+            // the case where it is running. boss_fight_probe::announce_once says it instead.
         ]);
 
         // ESD talk-event hook (esd_probe.rs) -- the shop-open seam SHOP AUTO-HINTS ride on
