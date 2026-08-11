@@ -3392,8 +3392,18 @@ impl shared::Core for Core {
         // frame, where there is no `&mut Client` and therefore no toast deck. It left the notice
         // behind; this is the tick that owns the deck. Drained in a loop because a single frame can
         // in principle carry more than one open.
+        //
+        // BOTH SURFACES, and the log line is the one that was missing. The toast deck is the
+        // bottom-left overlay -- transient, 6 s, and gone before a player who was reading the shop
+        // menu ever looked away from it. The client window in the TOP RIGHT is the feed they
+        // actually read, and it is the only one with any history: a hand-in fires at most once per
+        // merchant FOREVER, so a notice that expires unseen is not recoverable by playing on.
+        // Every other notice in this function that a player is meant to keep already goes to both
+        // (region unlocks, traps, boss keys); this one only ever toasted, which is why the feature
+        // looked silent even when the flag write succeeded.
         while let Some(notice) = crate::merchant_bells::take_notice() {
             let now = self.toast_clock.elapsed().as_millis() as u64;
+            self.log(ap::Print::message(notice.clone()));
             self.toasts.push(notice, now);
         }
 
