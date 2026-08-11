@@ -88,8 +88,17 @@ pub fn enabled(env_var: &str, key: &str) -> bool {
 /// It has to be: a default-on probe with no way to say "no" is not a switch. `ER_SCALING_SAMPLE`
 /// already reads `Ok("0") | Ok("false")` for exactly this reason and predates this function.
 pub fn enabled_by_default(env_var: &str, key: &str) -> bool {
-    if matches!(std::env::var(env_var).as_deref(), Ok("0") | Ok("false")) {
-        return false;
+    // 🛑 THE ENV IS THE OVERRIDE, BOTH WAYS, AND IT MUST RETURN HERE RATHER THAN FALL THROUGH.
+    // Falling through to the config on a non-`0` value is what made `ER_FOO=1` with
+    // `"key": false` answer FALSE -- a developer forcing a probe on for one run, silently
+    // overruled by a config file they may not have written. `default_on_is_silenced_only_by_an_
+    // explicit_no` is the gate on it, and it caught this on main.
+    match std::env::var(env_var).as_deref() {
+        Ok("0") | Ok("false") => return false,
+        // Set to anything else -- `1`, `true`, even the empty string -- is an explicit yes,
+        // matching `resolve`'s "presence means on" convention for the half where they agree.
+        Ok(_) => return true,
+        Err(_) => {}
     }
     CONFIG_PROBES
         .get()
@@ -162,8 +171,10 @@ mod tests {
         // process env or the OnceLock. If these two ever disagree the function is not what its
         // doc says it is.
         fn rule(env: Option<&str>, config: Option<bool>) -> bool {
-            if matches!(env, Some("0") | Some("false")) {
-                return false;
+            match env {
+                Some("0") | Some("false") => return false,
+                Some(_) => return true,
+                None => {}
             }
             config.unwrap_or(true)
         }
