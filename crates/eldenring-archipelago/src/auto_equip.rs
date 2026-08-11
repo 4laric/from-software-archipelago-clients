@@ -275,9 +275,24 @@ pub fn set_enabled(on: bool) {
         q.clear();
     }
     if on {
+        // 🛑 THIS SENTENCE WAS FALSE FOR A DAY AND IT COST A BUG REPORT. It read "spells are NOT
+        // covered" -- written before #440 -- and stayed put when #148 shipped the memory-slot
+        // write. It is the ONLY thing the log says about spells, so a player whose spell did not
+        // land reads it and reasonably concludes the feature does not exist (boblerrr, 2026-08-11).
+        // A banner is not a comment: it is the feature's own account of itself, and it must move
+        // when the behaviour does.
+        //
+        // ⚠️ It also states the LIMIT, because that is the half that actually gets misread: this
+        // acts on ARRIVAL only. A spell already sitting in the bag -- received under an older
+        // build, or before the option was on -- is never looked at, because the receive cursor
+        // persists across launches and nothing re-offers it. That is exactly what happened to
+        // boblerrr's Rotten Breath and Ranni's Dark Moon, and no amount of logging inside the
+        // spell path would have said so.
         log::info!(
-            "auto_equip: enabled (received weapons, armour, talismans and physick tears are \
-             equipped/mixed on arrival; spells are NOT covered)"
+            "auto_equip: enabled (received weapons, armour, talismans, physick tears and SPELLS \
+             are equipped/memorised ON ARRIVAL). Anything already in the bag is NOT reconciled -- \
+             the receive cursor persists across launches, so an item granted before this option \
+             was on, or under a build that could not place it, stays where it is."
         );
     }
 }
@@ -393,6 +408,17 @@ pub fn enqueue_spell(full_id: i32, pos: Option<er_logic::spell_equip::SpellPos>)
         return;
     }
     let (Some(pos), Some(row)) = (pos, er_logic::physick::goods_row(full_id)) else {
+        // 🛑 SAY IT. `pos` is None for anything `spell_class` did not call a Spell, which is the
+        // overwhelmingly common case (every weapon, every rune) and must stay quiet -- but a
+        // `goods_row` miss on an item the caller ALREADY classified as a spell is a real defect
+        // wearing silence, and it used to leave no trace at all. Split the two.
+        if pos.is_some() {
+            log::warn!(
+                "auto_equip: spell {full_id:#x} classified as a Spell but has no goods row -- \
+                 NOT queued, and nothing will retry it. The goods->Magic identity has broken, or \
+                 the param table is modded"
+            );
+        }
         return;
     };
     // goods id == MagicParam id, 213/213 with zero exceptions. The one collision this identity
@@ -442,10 +468,49 @@ pub fn tick_spells() {
             *s = (id != -1).then_some(id);
         }
         let Some(slot) = er_logic::spell_equip::slot_for_spell(pos, &slots, magic_id) else {
-            continue; // already memorised, or no slot earned yet
+            // 🛑 THIS IS A DROP, NOT A DEFERRAL, and it used to be a bare `continue` with a
+            // comment. `pending` was taken out of the queue by the `mem::take` above, so an entry
+            // that lands here is GONE -- there is no retry on a later tick and no retry on a later
+            // session. Whatever the reason, it is the last moment anyone can observe it.
+            //
+            // The benign reason is "already memorised", which is genuinely nothing to do and is
+            // the case on every replayed receive. It still gets a line, at debug, because the two
+            // are indistinguishable from outside and a reader chasing a missing spell needs to
+            // know which one they are looking at.
+            let n = er_logic::spell_equip::usable_magic_slots(pos.stones);
+            if er_logic::spell_equip::already_memorised(pos, &slots, magic_id) {
+                log::debug!(
+                    "auto_equip: spell {magic_id} already in a memory slot -- nothing to do \
+                     (ordinal {}, {n} usable slot(s))",
+                    pos.ordinal
+                );
+            } else {
+                log::warn!(
+                    "auto_equip: spell {magic_id} DROPPED -- no slot resolved (ordinal {}, \
+                     stones {}, {n} usable slot(s), occupied {:?}). It is out of the queue and \
+                     nothing retries it",
+                    pos.ordinal,
+                    pos.stones,
+                    &slots[..n.min(slots.len())]
+                );
+            }
+            continue;
         };
+        let evicted = slots[slot as usize];
         magic.entries[slot as usize].param_id = magic_id;
-        log::info!("auto_equip: spell {magic_id} -> memory slot {slot}");
+        // ⚠️ The slot is `ordinal % n`, so a seed that sends more spells than the player has
+        // memory slots OVERWRITES. That is the designed policy (the French Challenge ruling: the
+        // answer to a full loadout is WHERE it lands, never WHETHER it is equipped) -- but it is
+        // indistinguishable in play from "my spell vanished", so the eviction is named.
+        match evicted {
+            Some(old) if old != magic_id => log::info!(
+                "auto_equip: spell {magic_id} -> memory slot {slot} (evicted {old}; ordinal {} \
+                 over {} usable slot(s), so the loadout is cycling)",
+                pos.ordinal,
+                er_logic::spell_equip::usable_magic_slots(pos.stones)
+            ),
+            _ => log::info!("auto_equip: spell {magic_id} -> memory slot {slot}"),
+        }
     }
 }
 

@@ -231,16 +231,27 @@ pub fn usable_magic_slots(stones: u8) -> usize {
 /// [`BASE_MAGIC_SLOTS`], so unlike a talisman-slot count this one is never 0. A spell always has
 /// somewhere to go.
 pub fn slot_for_spell(pos: SpellPos, slots: &[Option<i32>], magic_id: i32) -> Option<u32> {
-    let n = usable_magic_slots(pos.stones);
-    // Occupancy is read only over the prefix that both exists and is unlocked. `n` stays the
-    // modulus either way: a caller that hands us a short slice is telling us less than it knows
-    // about occupancy, not less than it knows about capacity.
-    let visible = &slots[..n.min(slots.len())];
-
-    if visible.contains(&Some(magic_id)) {
+    if already_memorised(pos, slots, magic_id) {
         return None;
     }
-    Some((pos.ordinal % n as u64) as u32)
+    Some((pos.ordinal % usable_magic_slots(pos.stones) as u64) as u32)
+}
+
+/// Is `magic_id` already in a slot this character can use?
+///
+/// ⭐ This is the ONLY reason [`slot_for_spell`] answers `None`, factored out so a caller can NAME
+/// that reason without re-deriving it. The client needs to: a `None` there is a DROP (the pending
+/// queue has already been taken), and "already memorised, nothing to do" and "we failed to place a
+/// spell and it is now gone" are the same silence from outside. Re-implementing the check
+/// client-side would be a second source of truth for one decision, and it would agree with itself
+/// right up until one of the two moved.
+///
+/// Occupancy is read only over the prefix that both exists and is unlocked. `n` stays the modulus
+/// either way: a caller that hands us a short slice is telling us less than it knows about
+/// occupancy, not less than it knows about capacity.
+pub fn already_memorised(pos: SpellPos, slots: &[Option<i32>], magic_id: i32) -> bool {
+    let n = usable_magic_slots(pos.stones);
+    slots[..n.min(slots.len())].contains(&Some(magic_id))
 }
 
 /// Does a spell of cost `slot_length` fit a character with `stones` Memory Stones at all?
@@ -323,6 +334,42 @@ mod tests {
 
     fn pos(ordinal: u64, stones: u8) -> SpellPos {
         SpellPos { ordinal, stones }
+    }
+
+    /// 🛑 THE POINT OF FACTORING IT OUT: the client logs "already memorised, nothing to do" vs
+    /// "DROPPED, nothing retries it" by asking `already_memorised`, while the placement decision is
+    /// made by `slot_for_spell`. If those two ever disagree, the log tells a player the opposite of
+    /// what happened -- the worst outcome available, because a wrong line is trusted where silence
+    /// is merely unhelpful. This pins them to one another over the whole small space.
+    #[test]
+    fn already_memorised_is_exactly_when_no_slot_is_returned() {
+        let ids = [-1_i32, 100, 200];
+        let mut checked = 0;
+        for stones in 0..=MEMORY_STONES {
+            for ordinal in 0..6u64 {
+                for a in ids {
+                    for b in ids {
+                        for c in ids {
+                            let slots: Vec<Option<i32>> =
+                                [a, b, c].iter().map(|&i| (i != -1).then_some(i)).collect();
+                            let p = SpellPos { ordinal, stones };
+                            for magic_id in [100, 200, 300] {
+                                assert_eq!(
+                                    slot_for_spell(p, &slots, magic_id).is_none(),
+                                    already_memorised(p, &slots, magic_id),
+                                    "disagreed at stones={stones} ordinal={ordinal} \
+                                     slots={slots:?} magic_id={magic_id}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // WITNESS (test_gf_vacuous_pass's rule, applied by hand in Rust): a loop that ran zero
+        // times would pass every assertion above and prove nothing.
+        assert!(checked > 1000, "only {checked} cases -- the scan collapsed");
     }
 
     #[test]
