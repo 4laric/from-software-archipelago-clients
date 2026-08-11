@@ -131,6 +131,20 @@ fn mode_to_wire(mode: RollMode) -> u8 {
     }
 }
 
+/// Read-back for the `no_equip_load_roll` feature handshake: is the MEDIUM mode live?
+///
+/// 🛑 It loads the same atomic `tick()` gates on, which is what makes it a read-back rather than a
+/// receipt. A probe that recorded "we called `set_mode`" would have reported ARMED throughout
+/// er-archipelago#536, because `set_enabled(false)` was faithfully called with the value that never
+/// arrived.
+///
+/// MEDIUM specifically, not `is_on()`: the apworld declares this tag only for a seed that asks for
+/// medium (light and off are what every client in circulation already does), so ARMED has to mean
+/// the same narrow thing DECLARED does or the subtraction is comparing two different questions.
+pub fn medium_armed() -> bool {
+    matches!(mode(), RollMode::Medium)
+}
+
 fn mode() -> RollMode {
     match i64::from(MODE.load(Ordering::Relaxed)) {
         er_logic::equip_load::WIRE_LIGHT => RollMode::Light,
