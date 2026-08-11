@@ -2020,6 +2020,14 @@ impl shared::Core for Core {
         // `er_logic::auto_equip::TalismanStream`, which is where the tests for them are.
         let mut talisman_stream = er_logic::auto_equip::TalismanStream::default();
         let mut talisman_pos: HashMap<i64, er_logic::auto_equip::TalismanPos> = HashMap::new();
+        // Spells and Memory Stones, same shape and for the same reason (#440). See the gate below.
+        let mut spell_stream = er_logic::spell_equip::SpellStream::default();
+        let mut spell_pos: HashMap<i64, er_logic::spell_equip::SpellPos> = HashMap::new();
+        // 🛑 UNLIKE the talisman stream, spell classification reads a PARAM ROW. On a tick where
+        // the repo is not up, every item would classify as Other, the stream would be short, and
+        // every later spell would be placed in the WRONG SLOT -- silently, and plausibly. So the
+        // whole build is all-or-nothing behind the same in_world signal every param reader uses.
+        let spells_readable = crate::flags::in_world();
         let mut snapshot: Vec<RecvItem> = Vec::new();
         // DIAGNOSTIC (#293): `received_items().len()` -- the number that appeared in NO log line
         // anywhere, and without which "the cursor is stuck" and "the stream is stuck" read the
@@ -2052,6 +2060,17 @@ impl shared::Core for Core {
                         && let Some(pos) = talisman_stream.push(full as i32)
                     {
                         talisman_pos.insert(idx as i64, pos);
+                    }
+                    if spells_readable && let Some(&full) = map.get(&ri.item().id()) {
+                        match crate::auto_equip::spell_class(full as i32) {
+                            crate::auto_equip::SpellClass::MemoryStone => {
+                                spell_stream.push_memory_stone();
+                            }
+                            crate::auto_equip::SpellClass::Spell => {
+                                spell_pos.insert(idx as i64, spell_stream.push_spell());
+                            }
+                            crate::auto_equip::SpellClass::Other => {}
+                        }
                     }
                 }
                 if can_grant && idx >= floor {
@@ -2137,6 +2156,13 @@ impl shared::Core for Core {
                         // for the same reason: #295 was fixed by adding an arm there and nothing
                         // else, because there is no second filter to keep in step.
                         crate::auto_equip::enqueue(full_id, talisman_pos.get(&ri.index).copied());
+                        // #440: a received sorcery or incantation into its memory slot. Same
+                        // self-gating shape -- `enqueue_spell` checks the option, and `pos` is
+                        // None for everything that is not a spell.
+                        crate::auto_equip::enqueue_spell(
+                            full_id,
+                            spell_pos.get(&ri.index).copied(),
+                        );
                         // STRANGLER (goods+ledger, THE ATOMIC FLIP): this ONE call grants every
                         // received item — key items/runes (goods) AND consumables (ledger). Once the
                         // reconciler owns BOTH classes it is the sole received-item grant path (goods
@@ -3373,6 +3399,9 @@ impl shared::Core for Core {
 
         // 8b3. auto_equip: drain queued received weapons into a primary hand (once each is in the bag).
         crate::auto_equip::tick();
+        // #440 memory slots. Independent of the call above: a stale ChrAsm commit pin must not
+        // stop spells landing.
+        crate::auto_equip::tick_spells();
 
         // 8b4. physick_probe (#334 phase 2): READ-ONLY RE diagnostic, hard no-op unless
         // ER_PHYSICK_PROBE is set. Placed after auto_equip because it reads the same inventory the
