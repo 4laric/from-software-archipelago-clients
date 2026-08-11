@@ -29,30 +29,39 @@
 /// in the pure half, so they are testable and so no caller can forget.
 pub fn deathlink_line(source: &str) -> String {
     const MAX_NAME: usize = 24;
-    let mut name: String = source
-        .chars()
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '?'
-            }
-        })
-        .take(MAX_NAME)
-        .collect();
-    let name = {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            // A name that is entirely unprintable still has to say SOMETHING true. "someone" is
-            // honest; an empty quote reads as a bug in us.
-            name = "someone".to_string();
-            name.as_str()
-        } else if trimmed.len() < name.len() {
-            name = trimmed.to_string();
-            name.as_str()
+    // 🛑 THE QUESTION IS "DID ANYTHING PRINTABLE SURVIVE", NOT "IS THE RESULT NON-EMPTY".
+    // Every unprintable char is substituted with `?`, so a name made entirely of them comes out
+    // NON-empty and trims to nothing -- `"\u{200b}\u{200b}"` rendered as `killed by ??`, which
+    // tells the player exactly as little as an empty quote and reads as our bug either way. So the
+    // substitution is TRACKED as it happens rather than inferred from the result afterwards.
+    //
+    // ⭐ Tracking it also keeps a LITERAL `???` as a name working: `?` is `ascii_graphic`, so a
+    // player really called that is named, while a player whose name merely rendered as `?` is not.
+    // Trimming `?` out of the result -- the obvious alternative -- cannot tell those two apart.
+    let mut printable = false;
+    let mut name = String::new();
+    for c in source.chars().take(MAX_NAME) {
+        if c.is_ascii_graphic() {
+            printable = true;
+            name.push(c);
+        } else if c == ' ' {
+            name.push(c);
         } else {
-            name.as_str()
+            name.push('?');
         }
+    }
+    let trimmed = name.trim();
+    // A name that is entirely unprintable still has to say SOMETHING true. "someone" is honest; an
+    // empty quote, or a row of question marks, reads as a bug in us.
+    //
+    // ⚠️ LOSSY FOR A GENUINELY NON-ASCII SLOT NAME -- a CJK or emoji name becomes "someone" rather
+    // than being transliterated. That is deliberate under the ASCII-only in-game text rule: between
+    // `killed by ??` and `killed by someone`, neither names them and only one reads as intentional.
+    // If naming them matters, the answer is a different renderer, not a different fallback.
+    let name = if printable && !trimmed.is_empty() {
+        trimmed
+    } else {
+        "someone"
     };
     format!("DeathLink: killed by {name}")
 }
