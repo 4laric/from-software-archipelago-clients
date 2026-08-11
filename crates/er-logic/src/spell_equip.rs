@@ -254,6 +254,89 @@ pub fn already_memorised(pos: SpellPos, slots: &[Option<i32>], magic_id: i32) ->
     slots[..n.min(slots.len())].contains(&Some(magic_id))
 }
 
+/// What the BACKFILL pass should do with one spell (er-archipelago#549).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backfill {
+    /// It is already in a usable slot. Nothing to do, and the common case on every pass after the
+    /// first -- this is what makes the pass converge.
+    AlreadyMemorised,
+    /// Write it to `slot`. `home` is whether that is the slot its stream ordinal names; `false`
+    /// means its own slot was taken and this is the first free one instead.
+    Place { slot: u32, home: bool },
+    /// Every usable slot is occupied by a DIFFERENT spell. 🛑 Nothing is evicted -- see the type
+    /// doc on why that is the whole point.
+    NoRoom { usable: usize },
+}
+
+/// Where a spell the player ALREADY OWNS but has never memorised should go -- **filling only,
+/// never evicting**.
+///
+/// # The defect this closes
+///
+/// er-archipelago#549. `auto_equip` acts on arrival, once, and the receive cursor is persisted per
+/// save. boblerrr's Rotten Breath (13:14) and Ranni's Dark Moon (13:36) arrived under a 0.3.10
+/// build; the 0.3.11 session that could have memorised them opened at `recv: stream=413
+/// cursor=413`, already caught up, so `enqueue_spell` was never called for either. They sit in the
+/// bag unmemorised and, without this, always would.
+///
+/// ⭐ THE ORDINAL IS NOT INVENTED, AND THAT IS THE WHOLE DESIGN. Alaric, 2026-08-11: *"we should be
+/// doing the ordering based on the archipelago stream of received items, since that never
+/// changes"*. He is right, and it is already computed: `core.rs`'s receive loop folds
+/// [`SpellStream`] over the **whole** stream every tick and builds `spell_pos` for every spell ever
+/// received -- then throws the below-watermark half away, because only items past the watermark
+/// reach `enqueue_spell`. So a stranded spell's [`SpellPos`] exists, is correct, and is stable
+/// forever: the server fixes the stream order, and this fold is pure over it.
+///
+/// That kills every alternative that was on the table. No tail-append, no `magic_id` ordering, no
+/// persisted assignment, no new ordinal semantics -- and the bag is never an ORDER, only a
+/// membership test, so an in-game inventory re-sort cannot move anything.
+///
+/// # 🛑 WHY IT NEVER EVICTS
+///
+/// Ruled 2026-08-11 (Alaric: *"backfill only, agreed that the major risk here is looping"*).
+///
+/// [`slot_for_spell`] OVERWRITES -- `ordinal % n` is the French Challenge ruling applied, and for a
+/// RECEIVE that is correct: the answer to a full loadout is where the spell lands, never whether it
+/// is equipped. A pass that re-ran that policy would be a different animal. Two spells whose
+/// ordinals are congruent mod `n` would trade one slot back and forth on every pass, forever --
+/// each pass "fixing" what the last one did. That is `residue 306` wearing a new hat, and it is the
+/// failure mode this whole family has hit before.
+///
+/// Filling only makes convergence a property of the code rather than a thing to test for: **every
+/// pass either occupies one more slot or does nothing**, occupancy is bounded by
+/// [`usable_magic_slots`], so the pass terminates and then stays silent. Nothing the player had is
+/// ever taken away, which also means this can never be the cause of a "my spell vanished" report.
+///
+/// The cost is honest and bounded: a spell whose own slot is taken lands in a free one instead
+/// (`home: false`), so a backfilled spell's position is not always the one its ordinal names. The
+/// receive path's policy is untouched.
+pub fn backfill_slot(pos: SpellPos, slots: &[Option<i32>], magic_id: i32) -> Backfill {
+    if already_memorised(pos, slots, magic_id) {
+        return Backfill::AlreadyMemorised;
+    }
+    let n = usable_magic_slots(pos.stones).min(slots.len());
+    if n == 0 {
+        return Backfill::NoRoom { usable: 0 };
+    }
+    // Its own slot first, so a backfilled spell agrees with the receive path wherever it can.
+    let home = (pos.ordinal % n as u64) as usize;
+    if slots[home].is_none() {
+        return Backfill::Place {
+            slot: home as u32,
+            home: true,
+        };
+    }
+    // Otherwise the lowest free slot. Lowest rather than nearest so the choice is total and
+    // reproducible from the slot array alone -- two clients reading the same state must agree.
+    match slots[..n].iter().position(Option::is_none) {
+        Some(i) => Backfill::Place {
+            slot: i as u32,
+            home: false,
+        },
+        None => Backfill::NoRoom { usable: n },
+    }
+}
+
 /// Does a spell of cost `slot_length` fit a character with `stones` Memory Stones at all?
 ///
 /// ✅ **RULING 2026-08-10: the client writes `slot_length = 1` across all 213 spells** -- one byte
@@ -533,5 +616,180 @@ mod tests {
                 "final loadout, schedule {schedule:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // BACKFILL (er-archipelago#549) -- fill only, never evict.
+    // ---------------------------------------------------------------------------------------
+
+    /// THE MOTIVATING CASE (rule 11). boblerrr's Rotten Breath and Ranni's Dark Moon arrived under
+    /// 0.3.10; the 0.3.11 session opened with the cursor already caught up, so nothing ever placed
+    /// them. Their SpellPos was computed on every tick of that session and thrown away.
+    #[test]
+    fn a_spell_stranded_below_the_watermark_is_placed_at_the_slot_its_ordinal_names() {
+        let slots = [None, None, None, None];
+        assert_eq!(
+            backfill_slot(pos(0, 2), &slots, 4001),
+            Backfill::Place {
+                slot: 0,
+                home: true
+            }
+        );
+        assert_eq!(
+            backfill_slot(pos(3, 2), &slots, 4002),
+            Backfill::Place {
+                slot: 3,
+                home: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_taken_home_slot_falls_to_the_lowest_free_one_and_says_it_did() {
+        // Ordinal 1 wants slot 1; something else is there.
+        let slots = [None, Some(9999), None, None];
+        assert_eq!(
+            backfill_slot(pos(1, 2), &slots, 4001),
+            Backfill::Place {
+                slot: 0,
+                home: false
+            },
+            "a backfilled spell may land off its ordinal -- that is the stated cost of never evicting"
+        );
+    }
+
+    /// 🛑 THE ANTI-LOOP PROPERTY. If this ever returns Place over an occupied slot, two spells whose
+    /// ordinals are congruent mod n trade it forever and the pass never converges (`residue 306`).
+    #[test]
+    fn a_full_rack_is_left_completely_alone() {
+        // 🛑 `stones` is the MEMORY STONE COUNT, not a slot count: BASE_MAGIC_SLOTS is 2, so
+        // `stones: 0` is two usable slots and `stones: 2` is four. Getting that backwards is how
+        // this test was wrong on its first run.
+        let two_full = [Some(1), Some(2), None, None];
+        assert_eq!(
+            backfill_slot(pos(0, 0), &two_full, 4001),
+            Backfill::NoRoom { usable: 2 },
+            "no stones = two usable slots, so the free slots BEYOND them are not room"
+        );
+        let slots = [Some(1), Some(2), Some(3), Some(4)];
+        assert_eq!(
+            backfill_slot(pos(0, 2), &slots, 4001),
+            Backfill::NoRoom { usable: 4 }
+        );
+        assert_eq!(
+            backfill_slot(pos(7, 2), &slots, 4001),
+            Backfill::NoRoom { usable: 4 }
+        );
+    }
+
+    #[test]
+    fn an_already_memorised_spell_is_a_no_op_which_is_what_makes_the_pass_settle() {
+        let slots = [Some(4001), None, None, None];
+        assert_eq!(
+            backfill_slot(pos(1, 2), &slots, 4001),
+            Backfill::AlreadyMemorised
+        );
+        // ... and only within the slots this character can actually USE. A spell parked in a slot
+        // beyond the unlocked count is not memorised for this character.
+        let far = [None, None, Some(4001), None];
+        assert!(matches!(
+            backfill_slot(pos(0, 0), &far, 4001),
+            Backfill::Place { .. }
+        ));
+    }
+
+    /// ⭐⭐⭐ THE CONVERGENCE GATE. #549's fourth acceptance case: run the pass ten times with
+    /// nothing new and get ZERO writes. Non-convergence is the failure mode this family has hit
+    /// before, so it is asserted directly rather than hoped for.
+    #[test]
+    fn ten_passes_over_the_same_stream_write_once_and_then_never_again() {
+        // Eight stranded spells, four usable slots (2 stones), ordinals chosen so several are
+        // congruent mod 4 -- the exact shape that would oscillate under an evicting policy.
+        let stream: Vec<(i32, SpellPos)> =
+            (0..8u64).map(|i| (4000 + i as i32, pos(i, 2))).collect();
+        let mut slots = [None::<i32>; MAGIC_SLOTS];
+        let mut writes_per_pass = Vec::new();
+
+        for _ in 0..10 {
+            let mut writes = 0;
+            for (magic_id, p) in &stream {
+                match backfill_slot(*p, &slots, *magic_id) {
+                    Backfill::Place { slot, .. } => {
+                        assert!(
+                            slots[slot as usize].is_none(),
+                            "backfill must NEVER be handed an occupied slot -- that is the loop"
+                        );
+                        slots[slot as usize] = Some(*magic_id);
+                        writes += 1;
+                    }
+                    Backfill::AlreadyMemorised | Backfill::NoRoom { .. } => {}
+                }
+            }
+            writes_per_pass.push(writes);
+        }
+
+        assert_eq!(
+            writes_per_pass[0], 4,
+            "the first pass fills the four usable slots"
+        );
+        assert!(
+            writes_per_pass[1..].iter().all(|&w| w == 0),
+            "passes 2..10 must be SILENT, got {writes_per_pass:?}"
+        );
+    }
+
+    /// The same property stated as an invariant rather than a count: occupancy only ever grows, and
+    /// no slot's occupant is ever replaced. A future change that reintroduces eviction fails here
+    /// even if it happens to converge for the case above.
+    #[test]
+    fn backfill_is_monotonic_over_every_ordering_and_never_displaces_an_occupant() {
+        for stones in 0..=MEMORY_STONES {
+            let n = usable_magic_slots(stones);
+            let mut slots = [None::<i32>; MAGIC_SLOTS];
+            // Seed a couple of slots so the pass has to work around real occupants.
+            slots[0] = Some(7001);
+            if n > 2 {
+                slots[2] = Some(7002);
+            }
+            let before = slots;
+            let mut occupied = slots[..n].iter().filter(|s| s.is_some()).count();
+            for i in 0..40u64 {
+                let magic_id = 4000 + i as i32;
+                if let Backfill::Place { slot, .. } =
+                    backfill_slot(pos(i, stones), &slots, magic_id)
+                {
+                    assert!(
+                        slots[slot as usize].is_none(),
+                        "stones={stones} displaced an occupant"
+                    );
+                    slots[slot as usize] = Some(magic_id);
+                    occupied += 1;
+                }
+                assert!(occupied <= n, "stones={stones} occupied {occupied} of {n}");
+            }
+            // The pre-existing occupants are untouched, whatever else happened.
+            assert_eq!(slots[0], before[0], "stones={stones}");
+            if n > 2 {
+                assert_eq!(slots[2], before[2], "stones={stones}");
+            }
+        }
+    }
+
+    /// The receive path is deliberately NOT changed by any of this: it still overwrites, because
+    /// that is the French Challenge ruling. Pinned so the two policies cannot quietly merge.
+    #[test]
+    fn the_receive_path_still_overwrites_while_backfill_does_not() {
+        // No stones -> exactly two usable slots, both occupied.
+        let slots = [Some(9001), Some(9002), None, None];
+        assert_eq!(
+            slot_for_spell(pos(0, 0), &slots, 4001),
+            Some(0),
+            "receive still lands on ordinal % n even when that slot is taken"
+        );
+        assert_eq!(
+            backfill_slot(pos(0, 0), &slots, 4001),
+            Backfill::NoRoom { usable: 2 },
+            "backfill refuses the same write -- this divergence IS the fix"
+        );
     }
 }

@@ -514,6 +514,115 @@ pub fn tick_spells() {
     }
 }
 
+/// Spells the player received on an EARLIER launch, with the stream position they have always had:
+/// `(MagicParam id, SpellPos)`, in ascending AP index order.
+///
+/// Republished in full on every receive pass rather than appended to, so it cannot grow, cannot
+/// double-count, and cannot carry a stale entry -- the receive loop rebuilds `spell_pos` from the
+/// whole stream every tick anyway, so this costs one Vec and buys idempotence by construction.
+static SPELL_BACKFILL: Mutex<Vec<(i32, er_logic::spell_equip::SpellPos)>> = Mutex::new(Vec::new());
+
+/// Magic ids already reported as having nowhere to go, so [`tick_spell_backfill`] states that once
+/// per launch instead of twice a second.
+static BACKFILL_NO_ROOM_REPORTED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Publish the below-watermark spells for [`tick_spell_backfill`]. Called from the receive loop,
+/// which is the only place that can see the whole stream.
+///
+/// 🛑 CALL IT ONLY WHEN THE SPELL STREAM WAS ACTUALLY BUILT. `core.rs` gates the classification on
+/// `spells_readable` because it reads a param row, and an unreadable tick classifies everything as
+/// `Other` -- publishing then would replace a good list with an empty one and make the pass flap.
+pub fn set_spell_backfill(list: Vec<(i32, er_logic::spell_equip::SpellPos)>) {
+    if let Ok(mut g) = SPELL_BACKFILL.lock() {
+        *g = list;
+    }
+}
+
+/// Memorise spells the player owns from an earlier launch and that nothing will ever re-offer.
+///
+/// # Why this is needed at all
+///
+/// er-archipelago#549. `auto_equip` acts on arrival, once, and `received_through` is persisted PER
+/// SAVE. boblerrr's Rotten Breath (13:14) and Ranni's Dark Moon (13:36) arrived under a 0.3.10
+/// build; the 0.3.11 session that could have memorised them opened at `recv: stream=413
+/// cursor=413`, already caught up. `enqueue_spell` was never called for either, and never will be.
+///
+/// ⭐ THE ORDINAL IS NOT INVENTED. `core.rs`'s receive loop already folds `SpellStream` over the
+/// WHOLE stream every tick -- it has to, or a reconnect would report zero Memory Stones to a player
+/// who found three last session -- so every stranded spell's `SpellPos` is computed correctly on
+/// every tick and then dropped on the floor, because only items past the watermark reach the
+/// snapshot. This reads the half that was being discarded. The AP stream order is fixed by the
+/// server, so those ordinals are stable across launches without persisting anything.
+///
+/// # 🛑 It FILLS, it never EVICTS
+///
+/// See `er_logic::spell_equip::backfill_slot`. Re-running the receive path's `ordinal % n`
+/// overwrite would let two congruent ordinals trade a slot forever, one pass undoing the last.
+/// Filling only makes each pass either occupy one more slot or do nothing, which is why this
+/// converges and then goes silent.
+///
+/// # ⚠️ Ownership is inferred from the watermark, not read from the bag
+///
+/// An item below `received_through` was granted, because the watermark is HELD when a grant fails
+/// to place (`receive.rs` H3). That is a bookkeeping signal, and `start_item_backfill`'s doctrine
+/// is to verify against the BAG instead. The mitigation is that this only ever writes into an EMPTY
+/// slot, so the worst case of a wrong inference is a memorised spell the player does not have --
+/// visible, non-destructive, and it overwrites nothing. Reading the bag here would mean a second
+/// inventory walk; worth doing if that case is ever observed.
+pub fn tick_spell_backfill() {
+    if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
+        return;
+    }
+    let pending: Vec<(i32, er_logic::spell_equip::SpellPos)> = match SPELL_BACKFILL.lock() {
+        Ok(q) if !q.is_empty() => q.clone(),
+        _ => return,
+    };
+    let Ok(gdm) = (unsafe { GameDataMan::instance_mut() }) else {
+        return;
+    };
+    // SAFETY: FD4 singleton, mutated only on the single-threaded FrameBegin tick -- the same
+    // contract as `tick_spells`, and `main_player_game_data` names player 0 so co-op is not a
+    // question (a second EquipMagicData sits behind the other player slot).
+    let pgd = &mut *gdm.main_player_game_data;
+    let magic = &mut *pgd.equipment.equip_magic_data;
+    for (magic_id, pos) in pending {
+        let mut slots = [None::<i32>; er_logic::spell_equip::MAGIC_SLOTS];
+        for (i, s) in slots.iter_mut().enumerate() {
+            let id = magic.entries[i].param_id;
+            *s = (id != -1).then_some(id);
+        }
+        match er_logic::spell_equip::backfill_slot(pos, &slots, magic_id) {
+            // The common case on every pass after the first. Silent on purpose: this runs on the
+            // frame tick, and a line here would be the whole log.
+            er_logic::spell_equip::Backfill::AlreadyMemorised => {}
+            er_logic::spell_equip::Backfill::Place { slot, home } => {
+                magic.entries[slot as usize].param_id = magic_id;
+                log::info!(
+                    "auto_equip backfill: spell {magic_id} -> memory slot {slot} (ordinal {},                      stones {}{}). It was received on an earlier launch, below this save's receive                      cursor, so nothing would ever have offered it again",
+                    pos.ordinal,
+                    pos.stones,
+                    if home {
+                        ""
+                    } else {
+                        ", its own slot was taken so this is the first free one"
+                    }
+                );
+            }
+            er_logic::spell_equip::Backfill::NoRoom { usable } => {
+                // Stated ONCE per magic id per launch. It is a standing condition, not an event.
+                if let Ok(mut seen) = BACKFILL_NO_ROOM_REPORTED.lock()
+                    && !seen.contains(&magic_id)
+                {
+                    seen.push(magic_id);
+                    log::info!(
+                        "auto_equip backfill: spell {magic_id} is owned but not memorised, and all                          {usable} usable memory slot(s) are full. NOTHING IS EVICTED -- memorise it                          yourself, or find a Memory Stone and it lands on the next pass"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Should `enqueue_inner` raise the id to the player's auto_upgrade target before queueing it?
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Raise {
