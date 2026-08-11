@@ -145,6 +145,20 @@ mod tests {
         let mut supported: Vec<&str> = SUPPORTED.to_vec();
         probed.sort_unstable();
         supported.sort_unstable();
+        // 🛑 THE WITNESS. This gate is an `assert_eq!` between two lists, and two EMPTY lists
+        // compare equal -- so if `SUPPORTED` were ever emptied (or this module's `PROBES` lost its
+        // entries in a bad merge), the assertion below would pass while checking nothing. Shipping
+        // a vacuous coverage gate inside a change that exists to stop vacuous gates would be a
+        // joke at our own expense. Pin the floor and pin a known member.
+        assert!(
+            supported.len() >= 5,
+            "vacuous: SUPPORTED has {} entries, so the equality below proves nothing",
+            supported.len()
+        );
+        assert!(
+            probed.contains(&"merchant_bells_on_talk"),
+            "vacuous: the tag this whole module was written for is not in PROBES"
+        );
         assert_eq!(
             probed, supported,
             "client_features::SUPPORTED and feature_handshake::PROBES must match EXACTLY. \
