@@ -328,6 +328,127 @@ pub fn enqueue(full_id: i32, talisman: Option<er_logic::auto_equip::TalismanPos>
     enqueue_inner(full_id, talisman, Raise::ToAutoUpgradeTarget);
 }
 
+// ---- spells: memory slots (#440) ----------------------------------------------------------
+
+/// Pins the measurement behind the memory-slot write. `equip_magic_data` IS public on the pinned
+/// crate, so this is not needed to reach it -- it is here so that a crate reshape fails the BUILD
+/// instead of letting the write land somewhere else, the same guard shape as `PHYSICK_MIXTURE_OFF`.
+/// Measured in game on 1.16.2: EquipGameData sits at PlayerGameData+0x2B0 and the pointer at
+/// PlayerGameData+0x530.
+const _: () = assert!(std::mem::offset_of!(EquipGameData, equip_magic_data) == 0x280);
+
+/// What a received item is, for memory-slot purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpellClass {
+    /// A sorcery or incantation. Takes a memory slot.
+    Spell,
+    /// A Memory Stone. Raises the ceiling, occupies nothing.
+    MemoryStone,
+    /// Anything else.
+    Other,
+}
+
+/// Classify a received FullID off the game's OWN `EquipParamGoods` row, exactly as
+/// [`is_physick_tear`] does, so no hardcoded id list can go stale.
+///
+/// 🛑🛑 **Returns `Other` when the param repo is not up, and that is DANGEROUS to the caller.**
+/// A spell's memory slot is a function of its POSITION in the received stream, so a stream built on
+/// a tick where this returns `Other` for everything is not merely a shorter stream -- it puts every
+/// later spell in the WRONG SLOT. The classification is deliberately all-or-nothing (the repo is
+/// fetched before even the id-only Memory Stone test) so a half-built stream is impossible, and the
+/// caller MUST additionally gate the whole stream build on `crate::flags::in_world()`.
+pub fn spell_class(full_id: i32) -> SpellClass {
+    let Some(row) = er_logic::physick::goods_row(full_id) else {
+        return SpellClass::Other;
+    };
+    // Fetched FIRST, before the id-only Memory Stone test, so this function is all-or-nothing:
+    // never "stones but not spells", which would shift placement silently.
+    // SAFETY: FD4 singleton, read on the game thread like every other param read in this module.
+    let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+        return SpellClass::Other;
+    };
+    if er_logic::spell_equip::is_memory_stone(row) {
+        return SpellClass::MemoryStone;
+    }
+    let Some(g) = repo.get::<EquipParamGoods>(row) else {
+        return SpellClass::Other;
+    };
+    if er_logic::spell_equip::is_spell(g.goods_type(), g.sort_id()) {
+        SpellClass::Spell
+    } else {
+        SpellClass::Other
+    }
+}
+
+/// Received spells awaiting a memory-slot write: `(MagicParam id, stream position)`.
+///
+/// The SLOT is not resolved here: [`er_logic::spell_equip::slot_for_spell`] needs the live slot
+/// array to spot a spell already memorised, and that is only readable on the game thread.
+static PENDING_SPELLS: Mutex<Vec<(i32, er_logic::spell_equip::SpellPos)>> = Mutex::new(Vec::new());
+
+/// Queue a received spell for its memory slot. Self-gates on the option, like [`enqueue`].
+/// `pos` is `None` for anything that is not a spell.
+pub fn enqueue_spell(full_id: i32, pos: Option<er_logic::spell_equip::SpellPos>) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let (Some(pos), Some(row)) = (pos, er_logic::physick::goods_row(full_id)) else {
+        return;
+    };
+    // goods id == MagicParam id, 213/213 with zero exceptions. The one collision this identity
+    // creates (Stonesword Key, goods 8000) cannot reach here: `pos` is only ever Some for an item
+    // `spell_class` called a Spell.
+    let magic_id = er_logic::spell_equip::magic_row_for_spell_goods(row) as i32;
+    if let Ok(mut q) = PENDING_SPELLS.lock() {
+        q.push((magic_id, pos));
+    }
+}
+
+/// Drain queued spells into memory slots. Called from the FrameBegin tick beside [`tick`], but
+/// deliberately INDEPENDENT of it: the four-rep `ChrAsm` commit and its RVA pin have nothing to do
+/// with a memory slot, and a stale weapon pin must not stop spells landing.
+///
+/// The write is ONE field. Measured on 1.16.2: `charges` is inert (`{id, 0}` casts exactly like the
+/// `{id, -1}` the game itself writes) and `selected_slot` is the game's own cursor, which
+/// self-corrects. A spell written this way displays in the Memorize screen, casts with no menu or
+/// grace round-trip, and survives a reload.
+pub fn tick_spells() {
+    if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
+        return;
+    }
+    let pending: Vec<(i32, er_logic::spell_equip::SpellPos)> = match PENDING_SPELLS.lock() {
+        Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
+        _ => return,
+    };
+    let Ok(gdm) = (unsafe { GameDataMan::instance_mut() }) else {
+        if let Ok(mut q) = PENDING_SPELLS.lock() {
+            q.splice(0..0, pending);
+        }
+        return;
+    };
+    // SAFETY: FD4 singleton, mutated only on the single-threaded FrameBegin tick -- same contract
+    // as `tick()` above.
+    //
+    // 🛑 `main_player_game_data` is what makes this correct in CO-OP. More than one
+    // `EquipMagicData` is live (a second sits behind the other player slot, owner stride 0xC00);
+    // resolving by signature and taking the first hit would ship a co-op-only bug. This names
+    // player 0 by construction, so there is nothing to get wrong.
+    let pgd = &mut *gdm.main_player_game_data;
+    let magic = &mut *pgd.equipment.equip_magic_data;
+    for (magic_id, pos) in pending {
+        let mut slots = [None::<i32>; er_logic::spell_equip::MAGIC_SLOTS];
+        for (i, s) in slots.iter_mut().enumerate() {
+            let id = magic.entries[i].param_id;
+            *s = (id != -1).then_some(id);
+        }
+        let Some(slot) = er_logic::spell_equip::slot_for_spell(pos, &slots, magic_id) else {
+            continue; // already memorised, or no slot earned yet
+        };
+        magic.entries[slot as usize].param_id = magic_id;
+        log::info!("auto_equip: spell {magic_id} -> memory slot {slot}");
+    }
+}
+
 /// Should `enqueue_inner` raise the id to the player's auto_upgrade target before queueing it?
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Raise {
