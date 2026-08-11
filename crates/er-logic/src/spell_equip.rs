@@ -10,9 +10,10 @@
 //! attunement-release gate, which has nothing to do with spells. The collision is a trap for
 //! anyone grepping.
 //!
-//! ## Where the slots live (confirmed twice, independently)
+//! ## Where the slots live (MEASURED IN GAME, build 1.16.2, 2026-08-10)
 //!
-//! The pinned `eldenring` crate (`fromsoftware-rs`, `crates/eldenring/src/cs/player_game_data.rs`):
+//! The pinned `eldenring` crate (`fromsoftware-rs`, `crates/eldenring/src/cs/player_game_data.rs`)
+//! gives the layout:
 //!
 //! ```text
 //! EquipGameData.equip_magic_data : OwnedPtr<EquipMagicData>
@@ -20,14 +21,37 @@
 //! EquipMagicItem { param_id: i32, charges: i32 }
 //! ```
 //!
-//! and the Hexinton all-in-one v6.1 CE table, whose `EquipMagicData` group resolves
-//! `GameDataMan -> +0x08 -> +0x518 -> +0x10 + 8n` for `Memory Slot 1..14`. Both give the same array:
-//! **14 entries at +0x10, stride 8, `param_id` first.** So the live half needs no AOB, no RVA and no
-//! new RE -- it is a typed field access off a pointer the client already resolves for the
-//! `GameDataMan` healthbar read.
+//! and the live addresses, found by signature search and confirmed by locating the class twice in
+//! one process at the same relative offset:
 //!
-//! ⚠️ `EquipMagicItem` has a SECOND field, `charges`. Whether a bare `param_id` write yields a
-//! castable spell or one with zero uses is probe **P4** in `CE-PROBE-magic-slots.md`.
+//! ```text
+//! PlayerGameData + 0x2B0 = EquipGameData          (stride 0xC00 per player slot)
+//!   EquipGameData + 0x280 = OwnedPtr<EquipMagicData>
+//!     EquipMagicData + 0x10 = entries[14], stride 8, param_id first
+//!     EquipMagicData + 0x80 = selected_slot
+//! ```
+//!
+//! So the live half needs no AOB, no RVA and no new RE -- it is a typed field access off a pointer
+//! the client already resolves for the `GameDataMan` healthbar read.
+//!
+//! 🛑🛑 **An earlier revision of this file called the layout "confirmed twice, independently" and
+//! gave the hop as `+0x518`. Both claims were wrong.** `+0x518` is 0x18 short and lands in an
+//! object of UTF-16 strings and vtables; the Hexinton `Memory Slot 1..14` rows use it and read the
+//! same garbage on 1.16.2. And the two sources never corroborated each other in the first place --
+//! the crate describes a STRUCT LAYOUT, the CE table describes a POINTER PATH, so agreeing that
+//! `entries` sits at `+0x10` says nothing about whether that path reaches an `EquipMagicData`. Two
+//! sources describing different halves of a claim cannot disagree, so their agreement was never
+//! evidence.
+//!
+//! 🛑 **More than one `EquipMagicData` is live.** The owner stride `0xC00` is the co-op / second
+//! player slot. Resolve the instance owned by `EquipGameData` index 0, not the first one found; a
+//! naive "take the first signature hit" ships a bug that only appears in co-op.
+//!
+//! ⭐ **The live write is ONE field: `entries[n].param_id`.** Measured, not assumed: `charges` is
+//! inert (`{id, 0}` casts identically to the `{id, -1}` the game itself writes), and `selected_slot`
+//! is the game's own cursor, which self-corrects without being written. A spell written this way
+//! displays, casts immediately with no menu or grace round-trip, and survives a grace save plus
+//! Alt+F4 and reload.
 //!
 //! ## ⭐⭐⭐ MEMORY SLOTS ARE ITEMS, NOT A STAT
 //!
@@ -51,21 +75,15 @@
 //! cost is that two real slots go untargeted; the failure direction is a wasted slot, never an
 //! illegal write, which is the same trade the talisman clamp already takes.
 //!
-//! ## What this module deliberately does NOT do: classify
+//! ## Classification -- the query has now been run
 //!
-//! There is no `is_spell()` and no `is_memory_stone()` here, and their absence is the point. Both
-//! are `EquipParamGoods` rows, so classifying one means naming a `goodsType` or an id -- and this
-//! repo has already paid for a guessed param constant (`wep_type 59`, which matched every staff and
-//! no seal). One query closes it:
-//!
-//! ```text
-//! EquipParamGoods.csv (gen_inputs bundle, world repo) -- group by goodsType, join GoodsName.fmg,
-//! read off the sorcery and incantation buckets and the Memory Stone row.
-//! Exclude unused rows the way physick does: sortId != 999999.
-//! ```
-//!
-//! Note also that a memory slot holds a **`MagicParam` id, not a goods id**, so the goods -> magic
-//! join is a SECOND thing to datamine, not an assumption.
+//! An earlier revision left `is_spell()` and `is_memory_stone()` out on purpose, because naming a
+//! `goodsType` from memory is how this repo bought `wep_type 59` (which matched every staff and no
+//! seal). The query has since been run against the committed `gen_inputs.db` bundle
+//! (`EquipParamGoods.csv` join `Magic.csv` join `GoodsName.fmg`, base + both DLC), so the constants
+//! below carry their counts and their source. See [`SPELL_GOODS_TYPES`],
+//! [`MEMORY_STONE_GOODS_ROW`], and -- for the one that would have bitten us --
+//! [`magic_row_for_spell_goods`].
 
 /// `EquipMagicData.entries` length. From the crate declaration, not from a count of CE rows.
 pub const MAGIC_SLOTS: usize = 14;
@@ -75,6 +93,63 @@ pub const BASE_MAGIC_SLOTS: u8 = 2;
 
 /// Memory Stones in the game. 8 stones + [`BASE_MAGIC_SLOTS`] = 10 without the Nokstella talisman.
 pub const MEMORY_STONES: u8 = 8;
+
+/// `EquipParamGoods.goodsType` values that denote a memorisable spell.
+///
+/// **FOUR types, not two** -- each school splits attack from support. Datamined 2026-08-10, named
+/// rows with `sortId != 999999`:
+///
+/// | goodsType | rows | school |
+/// |---|---|---|
+/// | 5 | 69 | sorcery, attack (Glintstone Pebble, Comet) |
+/// | 17 | 15 | sorcery, support (Terra Magica, Scholar's Armament) |
+/// | 16 | 87 | incantation, attack (Catch Flame, Death Lightning) |
+/// | 18 | 42 | incantation, support (Flame, Cleanse Me) |
+///
+/// 84 sorceries + 129 incantations = **213** memorisable spells.
+///
+/// 🛑 A two-type guess would have silently dropped **57** spells -- the same
+/// umbrella-narrower-than-its-members shape as `wep_type 59`. And the stat requirement is NOT a
+/// substitute discriminator: 14 of the 69 type-5 sorceries carry a faith requirement, and 4 of the
+/// 87 type-16 incantations carry an intelligence one.
+pub const SPELL_GOODS_TYPES: [u8; 4] = [5, 16, 17, 18];
+
+/// `EquipParamGoods` row for Memory Stone.
+///
+/// It is ONE id with `maxNum == 8`, not eight ids -- which is why [`MEMORY_STONES`] is a count and
+/// [`SpellStream::push_memory_stone`] takes no argument.
+pub const MEMORY_STONE_GOODS_ROW: u32 = 10_030;
+
+/// Is this goods row a memorisable spell?
+///
+/// Takes the two param fields rather than reading them, exactly as [`crate::physick::is_tear`]
+/// does. `sort_id` is required, not optional, for the same reason it is required there: the type
+/// alone admits FromSoft's unused rows.
+pub fn is_spell(goods_type: u8, sort_id: i32) -> bool {
+    SPELL_GOODS_TYPES.contains(&goods_type) && sort_id != crate::physick::UNUSED_SORT_ID
+}
+
+/// Does receiving this goods row raise the memory-slot ceiling?
+pub fn is_memory_stone(goods_row: u32) -> bool {
+    goods_row == MEMORY_STONE_GOODS_ROW
+}
+
+/// The `MagicParam` id a memory slot must hold, given a spell's goods row.
+///
+/// ⭐ **It is the IDENTITY.** `EquipParamGoods.ID == Magic.ID` for all 213 spells, zero exceptions.
+/// There is no reference field to follow -- `refId_default` is NOT it and resolves for none of
+/// them. Confirmed against ground truth from the in-game probe: Catch Flame is goods `6000`, and
+/// the live memory slot held `MagicParam` `6000`.
+///
+/// 🛑🛑 **The identity does NOT license the converse.** Goods `8000` is a **Stonesword Key**
+/// (`goodsType 1`), and `Magic.csv` also carries a row `8000` -- so the obvious shortcut, "the
+/// goods id resolves in `Magic.csv`, therefore it is a spell", files every Stonesword Key in the
+/// pool as a spell. It is the ONLY such collision among named non-spell goods, which is precisely
+/// what would let it survive a spot-check. Callers MUST gate on [`is_spell`] first; this function
+/// is deliberately total and will happily convert a Stonesword Key.
+pub fn magic_row_for_spell_goods(goods_row: u32) -> u32 {
+    goods_row
+}
 
 /// Where a received spell sits in the AP received stream, and how many Memory Stones had arrived by
 /// then. Mirrors [`crate::auto_equip::TalismanPos`] exactly, and for the same reason: both fields
@@ -170,11 +245,18 @@ pub fn slot_for_spell(pos: SpellPos, slots: &[Option<i32>], magic_id: i32) -> Op
 
 /// Does a spell of cost `slot_length` fit a character with `stones` Memory Stones at all?
 ///
-/// Kept separate from [`slot_for_spell`] because it is NOT the same question and must not be folded
-/// in until probe **P7** says what the game does with an overflowing write. `slot_length` is
-/// `MagicParam +0x21`, a single byte -- adjacent to the requirement bytes the existing
-/// `no_weapon_requirements` path already writes, so forcing every spell to one slot is a field on a
-/// write we ship, not a new mechanism.
+/// ✅ **RULING 2026-08-10: the client writes `slot_length = 1` across all 213 spells** -- one byte
+/// at `MagicParam +0x21`, adjacent to the requirement bytes the existing `no_weapon_requirements`
+/// path already writes. In a shipped run this therefore returns `true` for every spell and the
+/// modulus in [`slot_for_spell`] is exact, with no bin-packing.
+///
+/// It is kept, rather than deleted, because it is the honest predicate for an UNPATCHED character
+/// -- 24 of the 213 cost more than one slot, the maximum being 3 (Comet Azur, Placidusax's Ruin,
+/// Scarlet Aeonia) -- and because that param write is a deliberate GLOBAL one whose absence should
+/// fail loudly here rather than silently misplace a spell.
+///
+/// 🛑 Measured: the game itself does NOT enforce capacity. A spell written to slot 5 on a
+/// two-slot character is accepted, castable, and survives a reload. The clamp is entirely ours.
 pub fn fits(slot_length: u8, stones: u8) -> bool {
     slot_length as usize <= usable_magic_slots(stones)
 }
@@ -182,6 +264,58 @@ pub fn fits(slot_length: u8, stones: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE MOTIVATING CASE (CONTRIBUTING rule 11). Goods `8000` is a Stonesword Key, and
+    /// `Magic.csv` carries a row `8000` as well. The obvious classifier -- "the goods id resolves
+    /// in `Magic.csv`" -- files every Stonesword Key in the item pool as a spell.
+    #[test]
+    fn a_stonesword_key_is_not_a_spell_despite_colliding_with_a_magic_row() {
+        // goods 8000 Stonesword Key: goodsType 1, sortId 203090.
+        assert!(!is_spell(1, 203_090));
+        // The identity is total and WILL convert it, which is exactly why is_spell() is the gate.
+        assert_eq!(magic_row_for_spell_goods(8000), 8000);
+    }
+
+    #[test]
+    fn the_two_support_schools_are_not_forgotten() {
+        // 57 of the 213 live in these two types -- a "sorceries and incantations"
+        // guess drops every one of them.
+        assert!(is_spell(17, 300_000), "support sorcery");
+        assert!(is_spell(18, 300_000), "support incantation");
+    }
+
+    #[test]
+    fn catch_flame_classifies_and_maps_to_the_id_seen_in_game() {
+        // goods 6000 Catch Flame: goodsType 16, sortId 306000. The memory slot held 6000.
+        assert!(is_spell(16, 306_000));
+        assert_eq!(magic_row_for_spell_goods(6000), 6000);
+    }
+
+    #[test]
+    fn unused_rows_are_rejected_the_way_physick_rejects_them() {
+        let unused = crate::physick::UNUSED_SORT_ID;
+        for gt in SPELL_GOODS_TYPES {
+            assert!(!is_spell(gt, unused), "goodsType {gt}");
+        }
+    }
+
+    #[test]
+    fn non_spell_goods_types_are_rejected() {
+        for gt in [0u8, 1, 2, 3, 7, 8, 9, 10, 11, 12, 14, 15] {
+            assert!(!is_spell(gt, 100), "goodsType {gt} classified as a spell");
+        }
+    }
+
+    #[test]
+    fn memory_stone_is_one_id_held_eight_times() {
+        assert!(is_memory_stone(MEMORY_STONE_GOODS_ROW));
+        assert!(!is_memory_stone(8000));
+        let mut s = SpellStream::default();
+        for _ in 0..20 {
+            s.push_memory_stone();
+        }
+        assert_eq!(s.stones(), MEMORY_STONES, "the stone count must saturate");
+    }
 
     fn empty(n: usize) -> Vec<Option<i32>> {
         vec![None; n]
