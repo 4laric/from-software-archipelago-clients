@@ -338,7 +338,7 @@ mod tests {
         assert!(is_connectable("localhost:38281"));
         assert!(is_connectable("wss://archipelago.gg:12345"));
         assert!(is_connectable("ws://localhost:38281"));
-        assert!(is_connectable("archipelago.gg"));       // port defaults to 38281 downstream
+        assert!(is_connectable("archipelago.gg")); // port defaults to 38281 downstream
         assert!(is_connectable("wss://archipelago.gg"));
         assert!(is_connectable("[::1]:38281"));
         assert!(is_connectable("192.168.0.10:38281"));
