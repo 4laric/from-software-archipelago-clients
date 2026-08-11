@@ -185,7 +185,11 @@ pub fn tick() {
     // placed character, and `after > 0.0 * 1.5` would report WORKING for any reading at all. Re-arm
     // and ask again rather than answer from it; this is the exact shape of assertion that made the
     // old "we wrote the row" log worthless.
-    if !(before > 0.0) {
+    // NOT `!(before > 0.0)` -- clippy::neg_cmp_op_on_partial_ord rejects a negated comparison on a
+    // partially ordered type, and it is right to: the NaN case is the whole reason the negation was
+    // there, so say it outright. `is_finite` covers NaN and both infinities; `<= 0.0` covers zero
+    // and negatives. Same set, no negated comparison.
+    if !before.is_finite() || before <= 0.0 {
         VERIFIED.store(false, Ordering::Relaxed);
         LOAD_BEFORE_BITS.store(NOT_SAMPLED, Ordering::Relaxed);
         return;
