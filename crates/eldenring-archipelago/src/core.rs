@@ -650,6 +650,7 @@ impl shared::Core for Core {
             ("ER_DOWNSTATE_PROBE_ARM", "downstate_arm"),
             ("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player"),
             ("ER_TRAP_PROBE", "traps"),
+            ("ER_BOSSFIGHT_PROBE", "boss_fight"),
         ]);
 
         // ESD talk-event hook (esd_probe.rs) -- the shop-open seam SHOP AUTO-HINTS ride on
@@ -3422,6 +3423,17 @@ impl shared::Core for Core {
         // on. Hard no-op unless ER_DOWNSTATE_PROBE is set, and read-only unless ER_DOWNSTATE_PROBE_ARM
         // is set too. Latches after a single subject.
         crate::downstate_probe::tick();
+
+        // 8b6. boss_fight_probe (#553): the OUTCOME instrument. Every scaling report this project
+        // has had -- "2 bosses in one fight wildly different", "one squishy one insanely tanky",
+        // "1 shots from 50 vigor AND a sponge" -- describes a fight, and nothing we log describes a
+        // fight. The census says what we DECIDED; two HP curves say what happened. Hard no-op
+        // unless ER_BOSSFIGHT_PROBE / probes.boss_fight is set. Read-only, death-guarded, ~2 Hz.
+        //
+        // Placed after downstate_probe and before the write-y sections below because it is the last
+        // read-only diagnostic in the tick: everything above it has finished touching the character
+        // sets, so the HP it reads is the HP the frame ends with.
+        crate::boss_fight_probe::tick();
 
         // 8c. Ticker-only pickup notifs: set showDialogCondType=0 game-wide so AP grants show the
         //     native right-side ticker, not the blocking "NEW Y:OK" modal (was a retired-baker
