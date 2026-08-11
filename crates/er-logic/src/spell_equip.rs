@@ -278,9 +278,10 @@ mod tests {
 
     #[test]
     fn the_two_support_schools_are_not_forgotten() {
-        // 57 of the 213 live in these two types; a "sorceries and incantations" guess drops them.
-        assert!(is_spell(17, 300_000), "type 17 (support sorcery) must classify");
-        assert!(is_spell(18, 300_000), "type 18 (support incantation) must classify");
+        // 57 of the 213 live in these two types -- a "sorceries and incantations"
+        // guess drops every one of them.
+        assert!(is_spell(17, 300_000), "support sorcery");
+        assert!(is_spell(18, 300_000), "support incantation");
     }
 
     #[test]
@@ -292,8 +293,9 @@ mod tests {
 
     #[test]
     fn unused_rows_are_rejected_the_way_physick_rejects_them() {
+        let unused = crate::physick::UNUSED_SORT_ID;
         for gt in SPELL_GOODS_TYPES {
-            assert!(!is_spell(gt, crate::physick::UNUSED_SORT_ID), "goodsType {gt}");
+            assert!(!is_spell(gt, unused), "goodsType {gt}");
         }
     }
 
