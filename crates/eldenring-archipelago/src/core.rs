@@ -2031,6 +2031,13 @@ impl shared::Core for Core {
         // every later spell would be placed in the WRONG SLOT -- silently, and plausibly. So the
         // whole build is all-or-nothing behind the same in_world signal every param reader uses.
         let spells_readable = crate::flags::in_world();
+        // #549: the below-watermark half of `spell_pos`, which is computed on every tick and then
+        // discarded because only `idx >= floor` reaches `snapshot`. Those spells were granted on an
+        // earlier launch and NOTHING will ever offer them again -- boblerrr's Rotten Breath and
+        // Ranni's Dark Moon arrived under 0.3.10 and the 0.3.11 session opened already caught up at
+        // `cursor=413`. Collected in ascending index order, which IS the stream order, so the
+        // ordinals are stable across launches without persisting anything.
+        let mut spell_backfill: Vec<(i32, er_logic::spell_equip::SpellPos)> = Vec::new();
         let mut snapshot: Vec<RecvItem> = Vec::new();
         // DIAGNOSTIC (#293): `received_items().len()` -- the number that appeared in NO log line
         // anywhere, and without which "the cursor is stuck" and "the stream is stuck" read the
@@ -2070,7 +2077,20 @@ impl shared::Core for Core {
                                 spell_stream.push_memory_stone();
                             }
                             crate::auto_equip::SpellClass::Spell => {
-                                spell_pos.insert(idx as i64, spell_stream.push_spell());
+                                let sp = spell_stream.push_spell();
+                                spell_pos.insert(idx as i64, sp);
+                                // Below BOTH watermarks -> this item will not be snapshotted, so
+                                // the normal enqueue path never sees it. 🛑 The position is taken
+                                // from the SAME fold as the receive path, not recomputed: a second
+                                // derivation of one ordinal would agree right up until one moved.
+                                if idx < floor
+                                    && let Some(row) = er_logic::physick::goods_row(full as i32)
+                                {
+                                    let magic_id =
+                                        er_logic::spell_equip::magic_row_for_spell_goods(row)
+                                            as i32;
+                                    spell_backfill.push((magic_id, sp));
+                                }
                             }
                             crate::auto_equip::SpellClass::Other => {}
                         }
@@ -2103,6 +2123,15 @@ impl shared::Core for Core {
             // checks once crossed seeds). A reconnect replays the whole stream, so the first pass
             // after connecting recomputes the total from scratch.
             crate::upgrades::set_received_fragments(scadu_fragment_units);
+        }
+
+        // #549. Publish the below-watermark spells for `auto_equip::tick_spell_backfill`.
+        // 🛑 GATED ON `spells_readable`, and that gate is load-bearing. Spell classification reads
+        // a param row; on a tick where the repo is not up EVERY item classifies as `Other`, so the
+        // list would come out empty -- and publishing an empty list would replace a good one and
+        // make the pass flap on and off. Same all-or-nothing reasoning as the stream build itself.
+        if spells_readable {
+            crate::auto_equip::set_spell_backfill(spell_backfill);
         }
 
         // 3b. Baked region-lock fallback arming (bedrock interop): the first received
@@ -3415,6 +3444,10 @@ impl shared::Core for Core {
         // #440 memory slots. Independent of the call above: a stale ChrAsm commit pin must not
         // stop spells landing.
         crate::auto_equip::tick_spells();
+        // #549. Spells received on an EARLIER launch, below this save's persisted receive cursor,
+        // which the enqueue path can never offer again. FILLS EMPTY SLOTS ONLY -- it never evicts,
+        // so it cannot trade a slot with the receive path forever (the `residue 306` shape).
+        crate::auto_equip::tick_spell_backfill();
 
         // 8b4. physick_probe (#334 phase 2): READ-ONLY RE diagnostic, hard no-op unless
         // ER_PHYSICK_PROBE is set. Placed after auto_equip because it reads the same inventory the
