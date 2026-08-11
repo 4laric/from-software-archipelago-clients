@@ -3321,6 +3321,17 @@ impl shared::Core for Core {
                     if crate::deathlink::is_enabled() {
                         log::info!("DeathLink received from '{source}'");
                         crate::deathlink::latch_incoming_kill();
+                        // SAY IT ON SCREEN. This kills the player, and until now the only record
+                        // was the log line above -- so a death with no visible cause reads as the
+                        // mod misbehaving rather than as another world's death arriving. Both
+                        // surfaces, like every other notice a player is meant to keep: the toast
+                        // catches them mid-fight, the client feed keeps the history.
+                        // The line is built in er-logic because the payload is an arbitrary
+                        // player-chosen slot name and has to be sanitised to drawable ASCII.
+                        let line = er_logic::toast::deathlink_line(&source);
+                        let now = self.toast_clock.elapsed().as_millis() as u64;
+                        self.toasts.push(line.clone(), now);
+                        self.log(ap::Print::message(line));
                     } else {
                         log::info!(
                             "DeathLink received from '{source}' but disabled for this slot -- ignored"
