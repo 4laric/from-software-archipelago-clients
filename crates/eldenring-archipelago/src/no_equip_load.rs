@@ -1,4 +1,4 @@
-//! no_equip_load — make equipment weightless so the player is always at light-roll.
+//! no_equip_load — multiply the player's equip-load ceiling so heavy kit stops being punished.
 //!
 //! The game recomputes max equip load every frame from Endurance, so a plain memory write to the
 //! computed field reverts instantly (verified 2026-07-18: writing `PlayerGameData.max_equip_load`
@@ -45,10 +45,25 @@
 //! log digs to get this far. It now samples `PlayerGameData::max_equip_load` before the effect goes
 //! on and again once the game has recomputed with it, and logs both. One line in a playtest log now
 //! settles it: the numbers move, or the field is wrong too and we have learned that cheaply.
+//!
+//! ## TWO MODES SINCE er-archipelago#548, and the readback now proves WHICH ONE
+//!
+//! boblerrr, the moment light-roll landed: *"light roll would be to op / imagine full heavy armor +
+//! light roll"*. He is right -- a fast roll in full plate with no trade-off means the equip-load
+//! budget stops being a decision. So the option carries a ROLL MODE now
+//! ([`er_logic::equip_load::RollMode`]), and the only thing that changes down here is the constant.
+//!
+//! 🛑 THE READBACK HAD TO GET STRICTER WITH IT. The old check was `after > before * 1.5`, which is
+//! true for 3x and true for 100x -- so a `medium` seed that silently got `light` would have logged
+//! WORKING. That is the same class of error as the month this module spent writing an inert field
+//! and reporting success: an assertion loose enough to pass for the wrong reason. It now checks the
+//! observed ratio against the mode's OWN multiplier, and prints the ratio either way, because that
+//! printed ratio is how #548's provisional 3.0 gets tuned into a measured number.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use eldenring::cs::{ChrInsExt, GameDataMan, SoloParamRepository, SpEffectParam, WorldChrMan};
+use er_logic::equip_load::{Parsed, RollMode};
 use fromsoftware_shared::FromStatic;
 
 /// The repurposed vanilla no-op `SpEffectParam` row (see module doc for why it is safe).
@@ -56,14 +71,19 @@ const SP_EFFECT_ID: i32 = er_logic::safe_speffect_rows::NO_EQUIP_LOAD;
 // CLAIMED, not chosen here: `er-logic/src/safe_speffect_rows.rs` is the single source of
 // truth for repurposed rows and carries the eligibility criteria + the duplicate-claim test.
 
-/// Multiplier written to `equipWeightChangeRate`. Light roll is under 30% of max equip load, so
-/// 100x puts any carriable load far under it -- a level-1 character at 45 equip load reads as 4500,
-/// and the heaviest full kit in the game is nowhere near 1350. Deliberately a big round number
-/// rather than a tuned one: this is "weightless", not a balance knob, and the game already ships a
-/// 4.5 on row 511012, so values well above 1 are within what the field is built for.
-const EQUIP_LOAD_MULTIPLIER: f32 = 100.0;
+/// How close the observed `after / before` ratio must sit to the mode's multiplier before the
+/// readback will call it WORKING.
+///
+/// A band rather than an equality because the player may be wearing the game's OWN equip-load
+/// talismans -- Arsenal Charm is +19% at most, Erdtree's Favor +8% -- and those multiply the same
+/// field. 0.75 admits both stacked (1.19 * 1.08 = 1.285, so a 3x reads as high as 3.86 and a 100x
+/// as high as 128.5) while still being far too tight for a `medium` seed to pass on a `light`
+/// write: 100 / 3 is 33x out of band.
+const RATIO_TOLERANCE: f32 = 0.75;
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
+/// The active mode, as its wire value (see [`er_logic::equip_load`]). `AtomicU8` rather than a
+/// lock: written once at connect, read on the tick.
+static MODE: AtomicU8 = AtomicU8::new(er_logic::equip_load::WIRE_OFF as u8);
 static PARAM_PATCHED: AtomicBool = AtomicBool::new(false);
 
 /// `max_equip_load` sampled just BEFORE the effect was applied, as f32 bits; `NOT_SAMPLED` until
@@ -78,10 +98,45 @@ const NOT_SAMPLED: u32 = u32::MAX;
 static VERIFIED: AtomicBool = AtomicBool::new(false);
 
 /// Set from slot_data `options.no_equip_load` at connect.
-pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::Relaxed);
-    if on {
-        log::info!("no_equip_load: enabled (weightless SpEffect {SP_EFFECT_ID})");
+///
+/// Takes the whole [`Parsed`] rather than a [`RollMode`] so the "I did not understand that value"
+/// case is stated by the feature that degraded, in the feature's own voice, instead of being
+/// dropped on the floor by the caller. A silent degrade here is indistinguishable from the player
+/// having left the option off -- which is the failure the handshake exists to prevent.
+pub fn set_mode(parsed: Parsed) {
+    if let Some(raw) = parsed.unrecognised {
+        log::warn!(
+            "no_equip_load: slot_data asked for mode {raw}, which this client does not know. \
+             Treating it as OFF. This seed was generated by an apworld NEWER than this client -- \
+             update the client, or reroll with no_equip_load at a mode this build has. (A seed \
+             that really needs a newer mode should have been refused at connect by the \
+             `no_equip_load_roll` feature tag; reaching this line means it was not declared.)"
+        );
+    }
+    MODE.store(mode_to_wire(parsed.mode), Ordering::Relaxed);
+    if parsed.mode.is_on() {
+        log::info!(
+            "no_equip_load: enabled, mode {} (SpEffect {SP_EFFECT_ID} equipWeightChangeRate -> {})",
+            parsed.mode.label(),
+            parsed.mode.multiplier()
+        );
+    }
+}
+
+fn mode_to_wire(mode: RollMode) -> u8 {
+    match mode {
+        RollMode::Off => er_logic::equip_load::WIRE_OFF as u8,
+        RollMode::Light => er_logic::equip_load::WIRE_LIGHT as u8,
+        RollMode::Medium => er_logic::equip_load::WIRE_MEDIUM as u8,
+    }
+}
+
+fn mode() -> RollMode {
+    match i64::from(MODE.load(Ordering::Relaxed)) {
+        er_logic::equip_load::WIRE_LIGHT => RollMode::Light,
+        er_logic::equip_load::WIRE_MEDIUM => RollMode::Medium,
+        // Only WIRE_OFF can reach here: `mode_to_wire` is the sole writer and it is total.
+        _ => RollMode::Off,
     }
 }
 
@@ -89,7 +144,7 @@ pub fn set_enabled(on: bool) {
 /// streams SpEffectParam back in, which restores our repurposed row's vanilla
 /// `allItemWeightChangeRate`, and PARAM_PATCHED would otherwise stop `tick()` ever re-zeroing it --
 /// the player keeps carrying a row that no longer makes anything weightless. Clears the LATCH ONLY:
-/// `ENABLED` is slot_data configuration set once at connect. Re-running costs ONE row write; the
+/// `MODE` is slot_data configuration set once at connect. Re-running costs ONE row write; the
 /// player-side apply is already idempotent (it only applies when the entry is absent).
 pub fn reset() {
     PARAM_PATCHED.store(false, Ordering::Relaxed);
@@ -106,18 +161,19 @@ pub fn tick() {
     if !crate::flags::in_world() {
         return;
     }
-    let enabled = ENABLED.load(Ordering::Relaxed);
-    if !enabled {
+    let mode = mode();
+    if !mode.is_on() {
         // OFF -> FULLY INERT. The block below unconditionally iterated the PLAYER's special_effect
         // list every frame (to compute `has`), which CTD'd at the death-cam transition when the
         // player's chr_ins is being torn down (archipelago20260719 Copy 2.log). A disabled feature
-        // must never touch the player. The strip-when-toggled-off path is unreachable: ENABLED is set
-        // once at connect, so !enabled => never applied this session => nothing to strip (a leftover
-        // from a prior on-session is a harmless allItemWeightChangeRate=0 no-op row).
+        // must never touch the player. The strip-when-toggled-off path is unreachable: MODE is set
+        // once at connect, so Off => never applied this session => nothing to strip (a leftover
+        // from a prior on-session is a harmless no-op row).
         return;
     }
+    let multiplier = mode.multiplier();
 
-    // One-time param edit: allItemWeightChangeRate -> 0 on our chosen row (enabled is guaranteed here).
+    // One-time param edit: equipWeightChangeRate on our row (the mode is on, guaranteed here).
     if !PARAM_PATCHED.load(Ordering::Relaxed) {
         // SAFETY: FD4 singleton; only mutated on the single-threaded FrameBegin tick.
         let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
@@ -130,12 +186,13 @@ pub fn tick() {
                 // multiplier anywhere in the game. Writing BOTH would make the next playtest
                 // unreadable -- if the player goes light we would not know which one did it, and
                 // that ambiguity is the whole reason this took two reports to find.
-                row.set_equip_weight_change_rate(EQUIP_LOAD_MULTIPLIER);
+                row.set_equip_weight_change_rate(multiplier);
                 PARAM_PATCHED.store(true, Ordering::Relaxed);
                 log::info!(
-                    "no_equip_load: SpEffect {SP_EFFECT_ID} equipWeightChangeRate -> \
-                     {EQUIP_LOAD_MULTIPLIER} (was 1; allItemWeightChangeRate is NOT written -- it \
-                     is a sentinel, never a multiplier)"
+                    "no_equip_load: SpEffect {SP_EFFECT_ID} equipWeightChangeRate -> {multiplier} \
+                     for mode {} (was 1; allItemWeightChangeRate is NOT written -- it is a \
+                     sentinel, never a multiplier)",
+                    mode.label()
                 );
             }
             None => return, // param file not populated yet -- retry next tick
@@ -194,18 +251,38 @@ pub fn tick() {
         LOAD_BEFORE_BITS.store(NOT_SAMPLED, Ordering::Relaxed);
         return;
     }
-    if after > before * 1.5 {
+    // 🛑 THE RATIO, NOT A FLOOR. `after > before * 1.5` was true for 3x AND for 100x, so a
+    // `medium` seed silently handed `light` would have logged WORKING -- an assertion that passes
+    // for the wrong reason, which is the exact failure this readback was added to end. The observed
+    // ratio is printed either way: it is the number #548's provisional 3.0 gets tuned from, and a
+    // log line nobody can compute from is not a measurement.
+    let ratio = after / before;
+    let expected = mode.multiplier();
+    if ratio >= expected * RATIO_TOLERANCE {
         log::info!(
-            "no_equip_load: WORKING -- max equip load {before:.1} -> {after:.1} with SpEffect \
-             {SP_EFFECT_ID} resident"
+            "no_equip_load: WORKING -- mode {} wrote equipWeightChangeRate {expected}, max equip \
+             load {before:.1} -> {after:.1} (ratio {ratio:.2}) with SpEffect {SP_EFFECT_ID} \
+             resident",
+            mode.label()
+        );
+    } else if ratio > 1.0 + f32::EPSILON {
+        // It MOVED, but not by what this mode asked for. Distinct from INERT on purpose: the field
+        // is taking, so the mod-stack diagnosis below would be the wrong advice.
+        log::warn!(
+            "no_equip_load: WRONG MULTIPLIER -- mode {} asked for {expected}x, max equip load \
+             moved {before:.1} -> {after:.1} (ratio {ratio:.2}). The field IS taking, so this is \
+             not a spare-row collision; something else is writing equipWeightChangeRate on this \
+             player, or the mode that reached the client is not the mode the seed was rolled with",
+            mode.label()
         );
     } else {
         log::warn!(
             "no_equip_load: INERT -- SpEffect {SP_EFFECT_ID} is resident on the player and \
-             equipWeightChangeRate is {EQUIP_LOAD_MULTIPLIER}, but max equip load did not move \
+             equipWeightChangeRate is {expected} for mode {}, but max equip load did not move \
              ({before:.1} -> {after:.1}). The row is being applied and the field is not taking. \
              Most likely a co-loaded mod shipping its own regulation.bin in which {SP_EFFECT_ID} \
-             is NOT a spare row -- check the mod stack before changing the field again"
+             is NOT a spare row -- check the mod stack before changing the field again",
+            mode.label()
         );
     }
 }
