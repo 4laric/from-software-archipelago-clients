@@ -59,9 +59,16 @@ pub fn parse_flatten_cap(slot_data: &Value) -> i64 {
     }
 }
 
-/// `options.no_equip_load` (int-or-bool). Same option name on both our apworld and Bedrock/fswap's.
+/// `options.no_equip_load` as a plain on/off. Same option name on both our apworld and
+/// Bedrock/fswap's.
+///
+/// 🛑 THIS IS THE LOSSY READ. Since er-archipelago#548 the key carries a ROLL MODE, not a bool
+/// (`0` off / `1` light / `2` medium), and [`crate::equip_load::parse`] is the one that can tell
+/// `light` from `medium`. This wrapper survives for callers that only need "is the feature on",
+/// and it DELEGATES rather than re-deriving so the two can never disagree about what an
+/// unrecognised value means.
 pub fn parse_no_equip_load(slot_data: &Value) -> bool {
-    parse_bool_option(slot_data, "no_equip_load")
+    crate::equip_load::parse(slot_data).mode.is_on()
 }
 
 /// `options.auto_equip` (int-or-bool). Same option name on both our apworld and Bedrock/fswap's.

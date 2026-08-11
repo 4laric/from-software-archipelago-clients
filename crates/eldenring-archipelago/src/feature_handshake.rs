@@ -85,6 +85,13 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("merchant_bells_on_talk", |_| {
         crate::merchant_bells::is_armed()
     }),
+    // MEDIUM specifically (er-archipelago#548). `off` and `light` are what every client in
+    // circulation already does, so the apworld declares this tag only for a medium seed -- ARMED
+    // must therefore mean "the mode is medium", not "the feature is on", or the subtraction would
+    // be comparing two different questions and a light seed would look declared-but-dark.
+    ("no_equip_load_roll", |_| {
+        crate::no_equip_load::medium_armed()
+    }),
 ];
 
 /// Build the `(tag, live)` table this connect.

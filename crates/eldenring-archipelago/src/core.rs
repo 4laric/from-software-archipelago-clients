@@ -844,7 +844,9 @@ impl shared::Core for Core {
                 // int-or-bool tolerant (er_logic::options): the apworld serializes options
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
-                crate::no_equip_load::set_enabled(er_logic::options::parse_no_equip_load(sd));
+                // #548: a ROLL MODE, not a bool. `parse` is handed over whole so the feature can
+                // state an unrecognised value itself rather than have it collapse into "off" here.
+                crate::no_equip_load::set_mode(er_logic::equip_load::parse(sd));
                 // no_fall_damage: the spirit-spring fallDamageRate=0 SpEffect, kept on the player.
                 crate::no_fall_damage::set_enabled(er_logic::options::parse_no_fall_damage(sd));
                 // flask: history-agnostic reconciled LEVELED flask (charges + potency) driven by the

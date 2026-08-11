@@ -57,6 +57,18 @@ pub const SUPPORTED: &[&str] = &[
     // would be unread, so the player would walk every merchant expecting their wares at the Twin
     // Maidens and find the hub empty -- which reads as a broken seed rather than an ignored option.
     "merchant_bells_on_talk",
+    // options.no_equip_load = 2 (MEDIUM) -> er_logic::equip_load::RollMode (2026-08-11,
+    // er-archipelago#548). ONLY MEDIUM NEEDS THE TAG, and the asymmetry is the whole point:
+    // `no_equip_load` deliberately ships with no tag at all because the capability is older than
+    // every client in circulation (features/body_tuning.py spells this out, and tagging `light`
+    // would lock every existing player out of a seed whose feature they already implement).
+    //
+    // That reasoning stops dead at `medium`. An old client reads the new `2` through
+    // parse_bool_option, sees a nonzero, and gives LIGHT -- so the player asked for the WEAKER
+    // setting and silently got the strongest one. A difficulty option that can only fail in the
+    // direction of "easier, and nothing said so" is exactly #536's shape, and a refusal is the only
+    // honest answer.
+    "no_equip_load_roll",
 ];
 
 /// Feature tags the seed requires that this build does not know.
