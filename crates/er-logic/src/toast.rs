@@ -15,6 +15,57 @@
 //!
 //! The queue lives here, pure and host-tested; the client owns only the drawing.
 
+/// The on-screen line for an incoming DeathLink, from the sending slot's name.
+///
+/// Until 2026-08-11 an incoming DeathLink killed you with **nothing on screen** -- `core.rs` logged
+/// `DeathLink received from '<source>'` and that was the entire record. A player who drops dead for
+/// no visible reason reads it as a bug in the mod, not as another world's death arriving, and the
+/// one place the truth existed was a file they were not looking at.
+///
+/// 🛑 ASCII, AND THE SOURCE IS NOT OURS TO TRUST. Toasts draw through the FMG path, where a
+/// non-ASCII glyph renders as `?` -- and unlike every other toast in this crate the payload here is
+/// an ARBITRARY PLAYER-CHOSEN SLOT NAME. Anything outside printable ASCII becomes `?`, and the name
+/// is capped, because a 60-character slot name would push the line off the deck. Both are done here,
+/// in the pure half, so they are testable and so no caller can forget.
+pub fn deathlink_line(source: &str) -> String {
+    const MAX_NAME: usize = 24;
+    // 🛑 THE QUESTION IS "DID ANYTHING PRINTABLE SURVIVE", NOT "IS THE RESULT NON-EMPTY".
+    // Every unprintable char is substituted with `?`, so a name made entirely of them comes out
+    // NON-empty and trims to nothing -- `"\u{200b}\u{200b}"` rendered as `killed by ??`, which
+    // tells the player exactly as little as an empty quote and reads as our bug either way. So the
+    // substitution is TRACKED as it happens rather than inferred from the result afterwards.
+    //
+    // ⭐ Tracking it also keeps a LITERAL `???` as a name working: `?` is `ascii_graphic`, so a
+    // player really called that is named, while a player whose name merely rendered as `?` is not.
+    // Trimming `?` out of the result -- the obvious alternative -- cannot tell those two apart.
+    let mut printable = false;
+    let mut name = String::new();
+    for c in source.chars().take(MAX_NAME) {
+        if c.is_ascii_graphic() {
+            printable = true;
+            name.push(c);
+        } else if c == ' ' {
+            name.push(c);
+        } else {
+            name.push('?');
+        }
+    }
+    let trimmed = name.trim();
+    // A name that is entirely unprintable still has to say SOMETHING true. "someone" is honest; an
+    // empty quote, or a row of question marks, reads as a bug in us.
+    //
+    // ⚠️ LOSSY FOR A GENUINELY NON-ASCII SLOT NAME -- a CJK or emoji name becomes "someone" rather
+    // than being transliterated. That is deliberate under the ASCII-only in-game text rule: between
+    // `killed by ??` and `killed by someone`, neither names them and only one reads as intentional.
+    // If naming them matters, the answer is a different renderer, not a different fallback.
+    let name = if printable && !trimmed.is_empty() {
+        trimmed
+    } else {
+        "someone"
+    };
+    format!("DeathLink: killed by {name}")
+}
+
 /// One notice, with the timestamp it was raised at (caller's monotonic ms).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toast {
@@ -106,6 +157,52 @@ pub fn new_grants(prev: Option<usize>, now: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deathlink_line_is_always_ascii_and_bounded() {
+        // The payload is an arbitrary player-chosen slot name, so the interesting inputs are the
+        // hostile ones. Each must still produce a drawable line.
+        for src in [
+            "bobler",
+            "Alaric",
+            "Kalé",   // the accent this repo has been bitten by before
+            "плеер",  // wholly non-latin
+            "🐺🐺🐺", // emoji
+            "   ",    // whitespace only
+            "",       // empty
+            "a-very-long-slot-name-that-would-run-off-the-toast-deck-entirely",
+        ] {
+            let line = deathlink_line(src);
+            assert!(line.is_ascii(), "non-ASCII line for {src:?}: {line}");
+            assert!(line.len() <= 45, "line too long for {src:?}: {line}");
+            assert!(line.starts_with("DeathLink: killed by "), "{line}");
+            // WITNESS: a line that degenerated to the prefix alone would pass the three assertions
+            // above and tell the player nothing.
+            assert!(
+                line.len() > "DeathLink: killed by ".len(),
+                "no name at all for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deathlink_line_keeps_an_ordinary_name_verbatim() {
+        // The sanitiser must not be so eager that it mangles the common case.
+        assert_eq!(deathlink_line("bobler"), "DeathLink: killed by bobler");
+    }
+
+    #[test]
+    fn deathlink_line_never_renders_an_empty_quote() {
+        // An all-unprintable name used to be the shape that produced `killed by ` with nothing
+        // after it, which reads as our bug rather than as their name.
+        for src in ["", "   ", "\u{200b}\u{200b}"] {
+            assert_eq!(
+                deathlink_line(src),
+                "DeathLink: killed by someone",
+                "src={src:?}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
