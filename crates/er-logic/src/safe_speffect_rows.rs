@@ -28,7 +28,19 @@
 //! including the cross-reference sweep over every table. Run it and paste the output in the PR —
 //! do not reason from "the id next door was fine" (`prefer-datamine-over-runtime-read`).
 
-/// `no_equip_load` — `allItemWeightChangeRate -> 0` (always light-roll).
+/// `no_equip_load` — `equipWeightChangeRate -> 100` (always light-roll).
+///
+/// 🔴 THE FIELD CHANGED 2026-08-11 and the row did not. It was `allItemWeightChangeRate -> 0` from
+/// the feature's first day, and that write is INERT: across vanilla `SpEffectParam`'s 11325 rows
+/// `allItemWeightChangeRate` is `1` on 11302 and `0` on 23, with no third value anywhere, and all
+/// 23 zero rows are unnamed sentinels (the null row, band terminators). `equipWeightChangeRate` is
+/// the field the game itself multiplies equip load with — 310300/310310/310320 at 1.15/1.17/1.19
+/// are the Arsenal Charm line, 310400/310410/310420 at 1.05/1.065/1.08 are Erdtree's Favor.
+///
+/// 🛑 This is why "verified safe" is not "verified working". `verify_safe_speffect_row.py` proves a
+/// row is UNREFERENCED, which is exactly what makes an edit harmless — and a field nothing reads is
+/// both maximally safe and completely inert. The safety verdict on this row is unaffected: the
+/// eligibility criteria are about the ROW, and the row is unchanged.
 pub const NO_EQUIP_LOAD: i32 = 20_012_080;
 
 /// `no_fall_damage` — `fallDamageRate -> 0`.
