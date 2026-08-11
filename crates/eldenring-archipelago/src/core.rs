@@ -2039,7 +2039,11 @@ impl shared::Core for Core {
         // Ranni's Dark Moon arrived under 0.3.10 and the 0.3.11 session opened already caught up at
         // `cursor=413`. Collected in ascending index order, which IS the stream order, so the
         // ordinals are stable across launches without persisting anything.
-        let mut spell_backfill: Vec<(i32, er_logic::spell_equip::SpellPos)> = Vec::new();
+        let mut spell_backfill: Vec<(
+            i32,
+            er_logic::spell_equip::SpellPos,
+            Option<er_logic::spell_equip::School>,
+        )> = Vec::new();
         let mut snapshot: Vec<RecvItem> = Vec::new();
         // DIAGNOSTIC (#293): `received_items().len()` -- the number that appeared in NO log line
         // anywhere, and without which "the cursor is stuck" and "the stream is stuck" read the
@@ -2091,7 +2095,11 @@ impl shared::Core for Core {
                                     let magic_id =
                                         er_logic::spell_equip::magic_row_for_spell_goods(row)
                                             as i32;
-                                    spell_backfill.push((magic_id, sp));
+                                    // School comes off the SAME goods row `spell_class` just
+                                    // read, so a spell that classified cannot fail to have one
+                                    // unless the repo went away between the two reads.
+                                    let school = crate::auto_equip::spell_school(full as i32);
+                                    spell_backfill.push((magic_id, sp, school));
                                 }
                             }
                             crate::auto_equip::SpellClass::Other => {}

@@ -395,6 +395,38 @@ pub fn spell_class(full_id: i32) -> SpellClass {
     }
 }
 
+/// Which school a spell belongs to, off the same `EquipParamGoods` row [`spell_class`] reads.
+///
+/// `None` = not a spell, or the param repo was not up. The caller must treat "could not read" as
+/// no-preference, never as "the player cannot cast it".
+pub fn spell_school(full_id: i32) -> Option<er_logic::spell_equip::School> {
+    let row = er_logic::physick::goods_row(full_id)?;
+    // SAFETY: FD4 singleton, read on the game thread like every other param read in this module.
+    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
+    let g = repo.get::<EquipParamGoods>(row)?;
+    er_logic::spell_equip::school_of(g.goods_type())
+}
+
+/// What the player is holding, as far as casting is concerned.
+///
+/// Reads `chr_asm.equipment_param_ids` through [`worn_weapon_param_ids`] -- what the player is
+/// ACTUALLY holding, not what we believe we equipped -- and resolves each row's `wepType`, the same
+/// instrument the hand/slot routing already uses. No hardcoded catalyst id list to go stale.
+///
+/// `None` = game data unreachable this tick, which the caller must treat as don't-know.
+pub fn held_catalysts() -> Option<er_logic::spell_equip::Catalysts> {
+    let worn = worn_weapon_param_ids()?;
+    // SAFETY: FD4 singleton, read-only, single-threaded FrameBegin tick.
+    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
+    // `/ 100 * 100` strips the upgrade level, exactly as the equip path does at its own wep_type
+    // read -- a +9 staff is not a different weapon type.
+    let types = worn.map(|id| {
+        repo.get::<EquipParamWeapon>(((id / 100) * 100) as u32)
+            .map(|w| w.wep_type())
+    });
+    Some(er_logic::spell_equip::Catalysts::from_wep_types(types))
+}
+
 /// Received spells awaiting a memory-slot write: `(MagicParam id, stream position)`.
 ///
 /// The SLOT is not resolved here: [`er_logic::spell_equip::slot_for_spell`] needs the live slot
@@ -520,7 +552,15 @@ pub fn tick_spells() {
 /// Republished in full on every receive pass rather than appended to, so it cannot grow, cannot
 /// double-count, and cannot carry a stale entry -- the receive loop rebuilds `spell_pos` from the
 /// whole stream every tick anyway, so this costs one Vec and buys idempotence by construction.
-static SPELL_BACKFILL: Mutex<Vec<(i32, er_logic::spell_equip::SpellPos)>> = Mutex::new(Vec::new());
+/// `(MagicParam id, stream position, school)`. The school rides along so the pass can order by
+/// what the player can actually cast without a second param read per spell per tick.
+type BackfillEntry = (
+    i32,
+    er_logic::spell_equip::SpellPos,
+    Option<er_logic::spell_equip::School>,
+);
+
+static SPELL_BACKFILL: Mutex<Vec<BackfillEntry>> = Mutex::new(Vec::new());
 
 /// Magic ids already reported as having nowhere to go, so [`tick_spell_backfill`] states that once
 /// per launch instead of twice a second.
@@ -532,7 +572,7 @@ static BACKFILL_NO_ROOM_REPORTED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 /// 🛑 CALL IT ONLY WHEN THE SPELL STREAM WAS ACTUALLY BUILT. `core.rs` gates the classification on
 /// `spells_readable` because it reads a param row, and an unreadable tick classifies everything as
 /// `Other` -- publishing then would replace a good list with an empty one and make the pass flap.
-pub fn set_spell_backfill(list: Vec<(i32, er_logic::spell_equip::SpellPos)>) {
+pub fn set_spell_backfill(list: Vec<BackfillEntry>) {
     if let Ok(mut g) = SPELL_BACKFILL.lock() {
         *g = list;
     }
@@ -573,7 +613,7 @@ pub fn tick_spell_backfill() {
     if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
         return;
     }
-    let pending: Vec<(i32, er_logic::spell_equip::SpellPos)> = match SPELL_BACKFILL.lock() {
+    let pending: Vec<BackfillEntry> = match SPELL_BACKFILL.lock() {
         Ok(q) if !q.is_empty() => q.clone(),
         _ => return,
     };
@@ -583,9 +623,20 @@ pub fn tick_spell_backfill() {
     // SAFETY: FD4 singleton, mutated only on the single-threaded FrameBegin tick -- the same
     // contract as `tick_spells`, and `main_player_game_data` names player 0 so co-op is not a
     // question (a second EquipMagicData sits behind the other player slot).
+    //
+    // CATALYST-AWARE ORDER (#549). ⭐ A PREFERENCE, NEVER A FILTER. Nothing is withheld; castable
+    // spells are simply offered the free slots first, which is the whole of the complaint when a
+    // seal build with two memory slots meets a stream full of sorceries. Withholding would repeal
+    // the French Challenge ruling `slot_for_spell` documents ("no 'only if the player can cast
+    // it'"), and #549 asking for catalyst awareness does not repeal it.
+    let held = held_catalysts().unwrap_or_default();
+    let batch: Vec<(BackfillEntry, Option<er_logic::spell_equip::School>)> =
+        pending.iter().map(|e| (*e, e.2)).collect();
+    let ordered = er_logic::spell_equip::prefer_castable(&batch, held);
+
     let pgd = &mut *gdm.main_player_game_data;
     let magic = &mut *pgd.equipment.equip_magic_data;
-    for (magic_id, pos) in pending {
+    for (magic_id, pos, school) in ordered {
         let mut slots = [None::<i32>; er_logic::spell_equip::MAGIC_SLOTS];
         for (i, s) in slots.iter_mut().enumerate() {
             let id = magic.entries[i].param_id;
@@ -597,15 +648,28 @@ pub fn tick_spell_backfill() {
             er_logic::spell_equip::Backfill::AlreadyMemorised => {}
             er_logic::spell_equip::Backfill::Place { slot, home } => {
                 magic.entries[slot as usize].param_id = magic_id;
+                // "not silently placed where it cannot be cast" was #549's actual ask. It is still
+                // PLACED -- withholding is the ruling this must not break -- but a player wondering
+                // why a sorcery is sitting in a seal build's slots can read why, here.
+                let uncastable = match school {
+                    Some(sch) if !held.none() && !held.can_cast(sch) => format!(
+                        ", which your equipped catalyst cannot cast ({sch:?}) -- it took a slot \
+                         only because no castable spell wanted one"
+                    ),
+                    _ => String::new(),
+                };
                 log::info!(
-                    "auto_equip backfill: spell {magic_id} -> memory slot {slot} (ordinal {},                      stones {}{}). It was received on an earlier launch, below this save's receive                      cursor, so nothing would ever have offered it again",
+                    "auto_equip backfill: spell {magic_id} -> memory slot {slot} (ordinal {}, \
+                     stones {}{}{}). It was received on an earlier launch, below this save's \
+                     receive cursor, so nothing would ever have offered it again",
                     pos.ordinal,
                     pos.stones,
                     if home {
                         ""
                     } else {
                         ", its own slot was taken so this is the first free one"
-                    }
+                    },
+                    uncastable
                 );
             }
             er_logic::spell_equip::Backfill::NoRoom { usable } => {
