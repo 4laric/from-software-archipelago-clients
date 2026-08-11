@@ -17,6 +17,7 @@ mod downstate_probe;
 mod enemy_drops;
 mod esd_probe;
 mod fast_travel;
+mod feature_handshake;
 mod flagpoll;
 mod flags;
 mod flask;

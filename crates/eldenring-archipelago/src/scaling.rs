@@ -325,6 +325,21 @@ pub fn notify_grace_warp() {
     }
 }
 
+/// Is a CEILING actually in force? `scaling_ceiling` is declared only by a seed that genuinely
+/// caps (`completion_scaling_ceiling` below the top rung), so the probe has to mean the same thing:
+/// scaling is configured AND its ceiling is below `NUM_TIERS - 1`. A seed that leaves the knob at
+/// the top declares nothing and arms nothing, and both sides agree on that. See `feature_handshake`.
+pub fn ceiling_is_capped() -> bool {
+    CONFIG
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .map(|c| c.ceiling_tier.min(NUM_TIERS - 1) < NUM_TIERS - 1)
+        })
+        .unwrap_or(false)
+}
+
 /// Parse slot_data at connect. The parse itself — including the SWEEP H4 / R6 refuse-to-arm on an
 /// empty/missing `regionSphereTargets` — lives in `er_logic::scaling::parse_scaling_config`
 /// (host-tested); this wrapper only owns the logging and the CONFIG swap.

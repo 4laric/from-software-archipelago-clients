@@ -282,6 +282,12 @@ pub fn set_enabled(on: bool) {
     }
 }
 
+/// Is the equip path live? Read back from the flag the queue drain actually gates on, so the
+/// answer cannot drift from the behaviour. See `feature_handshake`.
+pub fn is_armed() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 /// Queue a received FullID for equipping. Called from the received-item loop. Self-gating: no-op
 /// if the option is off, or if the category is not something we equip. The caller deliberately
 /// does NOT pre-filter -- it used to gate on `is_weapon`, which silently excluded armour, and

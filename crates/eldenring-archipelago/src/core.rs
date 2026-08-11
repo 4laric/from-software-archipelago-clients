@@ -687,6 +687,11 @@ impl shared::Core for Core {
             .client()
             .map(|c| c.seed_name().to_string())
             .unwrap_or_default();
+        // Snapshot BEFORE the parse overwrites it: the seed banner below needs the seed this log
+        // was on last, and it is read from inside the slot_data closure, which already borrows
+        // `*self` via `self.client()`. Same reason `feature_warn` is computed in the closure and
+        // surfaced after it.
+        let previous_seed = self.parsed_seed.clone();
         if self.slot_data_parsed
             && er_logic::seed_change::is_seed_change(
                 self.parsed_seed.as_deref(),
@@ -716,9 +721,49 @@ impl shared::Core for Core {
                     let mut items: Vec<(&String, String)> = obj
                         .iter()
                         .map(|(k, v)| {
+                            // TRUNCATE THE TABLES, NEVER THE TOGGLES (2026-08-11). A flat 200-char
+                            // cap treated `options` -- the flat map of every runtime toggle this
+                            // seed set -- exactly like `apIdsToItemIds`, a 2000-entry id table. So
+                            // the one dict a triager always needs was the one always cut off, and
+                            // reading an option's value out of a player's log was IMPOSSIBLE. That
+                            // is not hypothetical: diagnosing er-archipelago#536 from a log needed
+                            // `options.merchant_bells_on_talk` and the log physically could not
+                            // carry it.
+                            //
+                            // So the cap follows the SHAPE, not the key name (naming `options` here
+                            // would rot the moment a second flat dict appears):
+                            //   * scalars        -- bounded by construction, never truncated;
+                            //   * flat AND SMALL -- only scalar members and few of them, so it is
+                            //     a settings blob; 4000 chars covers today's `options` many times;
+                            //   * nested         -- a data table. 200 chars is enough to see the
+                            //     shape, and the COUNT below is what a reader actually wants.
                             let s = v.to_string();
-                            let s = if s.chars().count() > 200 {
-                                format!("{} ...(truncated)", s.chars().take(200).collect::<String>())
+                            let (scalar_members, len) = match v {
+                                serde_json::Value::Object(o) => (
+                                    o.values().all(|x| !x.is_object() && !x.is_array()),
+                                    o.len(),
+                                ),
+                                serde_json::Value::Array(a) => (
+                                    a.iter().all(|x| !x.is_object() && !x.is_array()),
+                                    a.len(),
+                                ),
+                                _ => return (k, s),
+                            };
+                            // 🛑 SHAPE ALONE IS NOT ENOUGH: `apIdsToItemIds` is also a flat map of
+                            // scalars, and it has ~2000 entries. The COUNT is what separates a
+                            // settings blob from an id table, so require both. `options` is ~25
+                            // keys; SETTINGS_MAX_KEYS is generous enough to absorb years of new
+                            // options without ever reaching a generated table.
+                            const SETTINGS_MAX_KEYS: usize = 64;
+                            let settings_blob = scalar_members && len <= SETTINGS_MAX_KEYS;
+                            let limit = if settings_blob { 4000 } else { 200 };
+                            let s = if s.chars().count() > limit {
+                                // Say how much was dropped: "truncated" alone leaves a reader
+                                // unable to tell a big table from a corrupt one.
+                                format!(
+                                    "{} ...(truncated, {len} entries)",
+                                    s.chars().take(limit).collect::<String>()
+                                )
                             } else {
                                 s
                             };
@@ -775,8 +820,8 @@ impl shared::Core for Core {
                 // validator below (which warns and boots): a shape mismatch degrades one key, while
                 // an unknown feature tag means a setting the player chose cannot happen at all.
                 // Seeds that leave those options at their defaults declare nothing and are unaffected.
-                let missing = er_logic::client_features::unsupported(
-                    &er_logic::client_features::required_from_slot_data(sd));
+                let required_features = er_logic::client_features::required_from_slot_data(sd);
+                let missing = er_logic::client_features::unsupported(&required_features);
                 if !missing.is_empty() {
                     log::error!(
                         "CLIENT TOO OLD: {}",
@@ -1344,6 +1389,28 @@ impl shared::Core for Core {
                     "=== ER-AP client {} | contract {versions} | slot '{name}' ===",
                     crate::game::CLIENT_BUILD
                 );
+                // WHICH SEED IS THIS? (2026-08-11). The client log is APPENDED to one file per DAY,
+                // so a single upload routinely holds several launches and -- because a player
+                // regenerates when something looks broken -- several different SEEDS, newest at the
+                // bottom. Until now the room id appeared NOWHERE: it was inferable only from the
+                // `ap_save_<seed>_<slot>.json` path logged 200 lines later, which is easy to miss
+                // and easier to mis-attribute. Two triages in ten days answered a question off the
+                // wrong session, one of them recommending a regenerate to a player who had already
+                // regenerated twice.
+                //
+                // So the seed names itself, next to the build that read it, at the top of every
+                // connect -- and says when it CHANGED, so the file segments itself instead of
+                // relying on a reader who remembers to check.
+                match previous_seed.as_deref() {
+                    Some(prev) if prev != current_room_seed.as_str() && !current_room_seed.is_empty() => {
+                        log::warn!(
+                            "seed: {current_room_seed:?} -- SEED CHANGED (previous {prev:?}). Everything above \
+                             this line belongs to a DIFFERENT seed; do not read the two halves of \
+                             this log as one session."
+                        );
+                    }
+                    _ => log::info!("seed: {current_room_seed:?} | slot '{name}'"),
+                }
                 // A refused hook must SAY the feature is off. Silently hinting nothing for a whole
                 // session looks exactly like a merchant with nothing on the shelf, and the player
                 // would report it as "shop hints don't work" with no way to tell the two apart.
@@ -1439,7 +1506,7 @@ impl shared::Core for Core {
                     }
                 }
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn)
+                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features)
             });
             if let Some((
                 map,
@@ -1459,6 +1526,7 @@ impl shared::Core for Core {
                 progression_surface,
                 tracker_tables,
                 feature_warn,
+                required_features,
             )) = parsed
             {
                 log::info!(
@@ -1533,6 +1601,21 @@ impl shared::Core for Core {
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
                 self.parsed_seed = Some(current_room_seed.clone());
+                // DECLARED vs ARMED (#536). Everything this seed asked for has now been configured,
+                // so this is the first moment the question is answerable -- and the LAST moment it
+                // is cheap. `feature_warn` above catches a client too OLD for the seed; this catches
+                // a client that is new enough, said yes, and was handed nothing to act on. That
+                // second case passed four green gates for four days, because an optional sub-key's
+                // ABSENCE is indistinguishable from its OFF state everywhere except here.
+                //
+                // 🛑 MUST run after the whole arming block: a probe read mid-arming reports a false
+                // negative, and a gate that cries wolf is a gate people stop reading.
+                let dark_features = crate::feature_handshake::log_and_report(
+                    &required_features,
+                    &crate::feature_handshake::ProbeCtx {
+                        region: self.region.as_ref(),
+                    },
+                );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A
                 // player who never opens the log is exactly the one who would otherwise conclude
                 // the option they set simply does nothing.
@@ -1540,6 +1623,20 @@ impl shared::Core for Core {
                     let now = self.toast_clock.elapsed().as_millis() as u64;
                     self.toasts.push(
                         format!("Client too old for this seed: {}", feature_warn.join(", ")),
+                        now,
+                    );
+                }
+                // The mirror case, and the one a player is far more likely to hit: the client is
+                // new enough and the feature still did not turn on. Same reasoning as above --
+                // without a toast the only symptom is an option that silently does nothing, which
+                // is indistinguishable from the option not existing.
+                if !dark_features.is_empty() {
+                    let now = self.toast_clock.elapsed().as_millis() as u64;
+                    self.toasts.push(
+                        format!(
+                            "Seed asked for {} but it did not arm -- regenerate with an updated apworld",
+                            dark_features.join(", ")
+                        ),
                         now,
                     );
                 }

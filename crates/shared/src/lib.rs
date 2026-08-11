@@ -126,11 +126,34 @@ fn start_logger_for_dir(dir: impl AsRef<Path>) -> Result<()> {
     let combined = CombinedLogger::new(loggers);
     log::set_max_level(combined.level());
     log::set_boxed_logger(Box::new(log_collapse::CollapseDuplicates::new(combined)))?;
+    log_session_separator();
     // Native crash telemetry, armed as soon as a logger exists so its "armed" line is captured.
     // A native fault (the 2026-07-24 warp CTD) previously ended the log with NO record at all;
     // this names the faulting module+offset in crash-<pid>.txt beside the log + the log itself.
     crash_handler::install(dir.as_ref().join("log"));
     Ok(())
+}
+
+/// The first line of every launch: a separator a reader can segment the file on.
+///
+/// `create_write_logger` opens `archipelago-<date>.log` in APPEND mode, one file per DAY, so a
+/// player who launches the game four times uploads one file holding four sessions -- and if they
+/// regenerated in between, several different seeds. Nothing in the file said where one ended and
+/// the next began; you had to know that `Logger initialized.` implies a fresh process. Triage has
+/// been answered off the wrong session more than once for exactly that reason.
+///
+/// 🛑 DELIBERATELY NOT A COUNTER. "SESSION 3 of 4" would mean re-reading the existing log at
+/// startup to count previous separators, on the game's load path -- and these files reach hundreds
+/// of megabytes (one report arrived with 612,842 lines of hudhook render spam in it). The wall
+/// clock plus the pid identify a launch uniquely and cost nothing; the ordinal is whatever `grep -n`
+/// prints beside it.
+fn log_session_separator() {
+    info!(
+        "=== SESSION START {} | pid {} | this file is APPENDED across launches: everything above \
+         belongs to an earlier run ===",
+        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        std::process::id()
+    );
 }
 
 /// Creates a write logger that writes to files in [dir].
