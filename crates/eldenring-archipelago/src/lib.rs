@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use windows::Win32::{Foundation::HINSTANCE, System::SystemServices::DLL_PROCESS_ATTACH};
 
 mod auto_equip;
+mod boss_fight_probe;
 mod check_lots;
 mod config_watch;
 mod contract_gen;
