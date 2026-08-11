@@ -254,6 +254,120 @@ pub fn already_memorised(pos: SpellPos, slots: &[Option<i32>], magic_id: i32) ->
     slots[..n.min(slots.len())].contains(&Some(magic_id))
 }
 
+/// Which school a spell belongs to, and therefore which catalyst can cast it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum School {
+    /// Cast from a Glintstone Staff.
+    Sorcery,
+    /// Cast from a Sacred Seal.
+    Incantation,
+}
+
+/// School from `EquipParamGoods.goodsType`.
+///
+/// ⭐ THE DISCRIMINATOR IS ALREADY IN THE DATA. [`SPELL_GOODS_TYPES`] is four values because each
+/// school splits attack from support, so the split this needs is the same one that classifier
+/// already makes -- 5/17 sorcery, 16/18 incantation. Nothing new is datamined and no id list is
+/// introduced.
+///
+/// 🛑 NOT THE STAT REQUIREMENT. The obvious-looking shortcut ("faith requirement means
+/// incantation") is measured wrong: **14 of the 69 type-5 sorceries carry a faith requirement, and
+/// 4 of the 87 type-16 incantations carry an intelligence one.** That is the note already on
+/// [`SPELL_GOODS_TYPES`], and it rules the shortcut out on evidence rather than on taste.
+pub fn school_of(goods_type: u8) -> Option<School> {
+    match goods_type {
+        5 | 17 => Some(School::Sorcery),
+        16 | 18 => Some(School::Incantation),
+        _ => None,
+    }
+}
+
+/// `EquipParamWeapon.wepType` for a Glintstone Staff. 19 rows.
+pub const WEP_TYPE_STAFF: u16 = 57;
+/// `EquipParamWeapon.wepType` for a Sacred Seal. 10 rows.
+///
+/// 🛑 61, NOT 59. `wep_type 59` has zero rows and shipping a classifier against it is a mistake
+/// this repo has already made once -- see [`crate::auto_equip::hand_for_wep_type`]'s tests.
+pub const WEP_TYPE_SEAL: u16 = 61;
+
+/// What the player is holding, as far as casting is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Catalysts {
+    pub staff: bool,
+    pub seal: bool,
+}
+
+impl Catalysts {
+    /// Fold the worn weapon rows' `wepType`s into a catalyst picture. `None` entries are slots that
+    /// hold nothing, or weapons whose row could not be read.
+    pub fn from_wep_types(worn: impl IntoIterator<Item = Option<u16>>) -> Self {
+        let mut c = Self::default();
+        for t in worn.into_iter().flatten() {
+            if t == WEP_TYPE_STAFF {
+                c.staff = true;
+            } else if t == WEP_TYPE_SEAL {
+                c.seal = true;
+            }
+        }
+        c
+    }
+
+    /// Is the player holding nothing that casts anything? Then there is no preference to express
+    /// and every spell is treated alike.
+    pub fn none(self) -> bool {
+        !self.staff && !self.seal
+    }
+
+    /// Can what the player is holding cast this school?
+    pub fn can_cast(self, school: School) -> bool {
+        match school {
+            School::Sorcery => self.staff,
+            School::Incantation => self.seal,
+        }
+    }
+}
+
+/// Order a backfill batch so spells the player can actually cast take slots first.
+///
+/// # What this is, and the ruling it must not break
+///
+/// er-archipelago#549: *"A character holding a seal should not have `auto_equip` fill its slots
+/// with sorceries it cannot cast, and today nothing looks."*
+///
+/// 🛑 IT IS A PREFERENCE, NOT A FILTER, AND THE DIFFERENCE IS A STANDING RULING.
+/// [`slot_for_spell`]'s doc rules the filter out in as many words: *"there is no 'leave it in the
+/// bag', no 'only if the player can cast it', and no better-spell comparison -- that is choosing
+/// your build with extra steps."* That is the French Challenge ruling, it governs the RECEIVE path,
+/// and #549 asking for catalyst awareness does not repeal it.
+///
+/// So nothing is ever withheld. Castable spells are simply offered the free slots first, which is
+/// the whole of the complaint when slots are scarce -- a seal build with two memory slots and a
+/// stream full of sorceries. When there is room for everything, everything still lands, and the
+/// caller names the ones the current catalyst cannot cast rather than hiding them. "Not silently"
+/// was the actual ask.
+///
+/// ⚠️ The player can swap catalysts at any moment, which would reorder a *future* batch. That is
+/// fine and is why this only reorders -- a filter would mean a spell's fate depended on what was in
+/// your left hand the tick a pass happened to run.
+///
+/// Stable within each group, so the stream order (and therefore the ordinals) still decides ties.
+/// 🛑 `None` school means "we could not read it", and it is treated as CASTABLE. Deprioritising an
+/// item because a param read failed would make placement depend on a transient, and a transient
+/// that only bites on a slow load is the worst kind of nondeterminism to chase.
+pub fn prefer_castable<T: Copy>(batch: &[(T, Option<School>)], held: Catalysts) -> Vec<T> {
+    if held.none() {
+        return batch.iter().map(|(t, _)| *t).collect();
+    }
+    let castable = |s: &Option<School>| s.is_none_or(|s| held.can_cast(s));
+    let mut out: Vec<T> = batch
+        .iter()
+        .filter(|(_, s)| castable(s))
+        .map(|(t, _)| *t)
+        .collect();
+    out.extend(batch.iter().filter(|(_, s)| !castable(s)).map(|(t, _)| *t));
+    out
+}
+
 /// What the BACKFILL pass should do with one spell (er-archipelago#549).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backfill {
@@ -791,5 +905,179 @@ mod tests {
             Backfill::NoRoom { usable: 2 },
             "backfill refuses the same write -- this divergence IS the fix"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // CATALYST-AWARE ROUTING (er-archipelago#549).
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn every_spell_goods_type_has_a_school_and_nothing_else_does() {
+        assert_eq!(school_of(5), Some(School::Sorcery));
+        assert_eq!(school_of(17), Some(School::Sorcery));
+        assert_eq!(school_of(16), Some(School::Incantation));
+        assert_eq!(school_of(18), Some(School::Incantation));
+        // 🛑 THE COVERAGE GATE. SPELL_GOODS_TYPES is the classifier the rest of the client uses; a
+        // type in it with no school would route silently wrong, which is the exact
+        // umbrella-narrower-than-its-members shape that shipped `wep_type 59`.
+        for t in SPELL_GOODS_TYPES {
+            assert!(
+                school_of(t).is_some(),
+                "goodsType {t} is a spell with no school"
+            );
+        }
+        for t in [0u8, 1, 2, 4, 6, 10, 15, 19, 255] {
+            assert_eq!(school_of(t), None, "goodsType {t} is not a spell");
+        }
+    }
+
+    #[test]
+    fn a_catalyst_is_read_from_wep_type_not_from_an_id_list() {
+        let seal = Catalysts::from_wep_types([Some(WEP_TYPE_SEAL), None]);
+        assert!(seal.seal && !seal.staff);
+        assert!(seal.can_cast(School::Incantation));
+        assert!(!seal.can_cast(School::Sorcery));
+
+        let staff = Catalysts::from_wep_types([None, Some(WEP_TYPE_STAFF)]);
+        assert!(staff.can_cast(School::Sorcery) && !staff.can_cast(School::Incantation));
+
+        // Both hands full: a hybrid casts everything and has no preference to express.
+        let both = Catalysts::from_wep_types([Some(WEP_TYPE_STAFF), Some(WEP_TYPE_SEAL)]);
+        assert!(both.can_cast(School::Sorcery) && both.can_cast(School::Incantation));
+        assert!(!both.none());
+
+        // A greatsword is not a catalyst, and neither is an unreadable row.
+        let melee = Catalysts::from_wep_types([Some(3), None]);
+        assert!(melee.none(), "wep_type 3 is not a catalyst");
+        assert!(Catalysts::from_wep_types([None, None]).none());
+        // 🛑 59 is the wrong seal type -- it has zero rows and must classify as nothing.
+        assert!(Catalysts::from_wep_types([Some(59), None]).none());
+    }
+
+    /// THE MOTIVATING CASE (rule 11), #549 acceptance 3: a character holding a SEAL receives a
+    /// sorcery and an incantation, and the incantation is the one that gets the slot.
+    #[test]
+    fn a_seal_build_fills_its_slots_with_incantations_first() {
+        let batch = [
+            (4001, Some(School::Sorcery)),
+            (4002, Some(School::Incantation)),
+            (4003, Some(School::Sorcery)),
+            (4004, Some(School::Incantation)),
+        ];
+        let seal = Catalysts::from_wep_types([Some(WEP_TYPE_SEAL), None]);
+        assert_eq!(
+            prefer_castable(&batch, seal),
+            vec![4002, 4004, 4001, 4003],
+            "incantations first, and stream order preserved WITHIN each group"
+        );
+    }
+
+    /// 🛑 THE RULING THIS MUST NOT BREAK. slot_for_spell's doc: "there is no 'leave it in the bag',
+    /// no 'only if the player can cast it'". Preference is allowed; withholding is not.
+    #[test]
+    fn nothing_is_ever_withheld_however_the_catalyst_is_held() {
+        let batch = [
+            (1, Some(School::Sorcery)),
+            (2, Some(School::Incantation)),
+            (3, Some(School::Sorcery)),
+        ];
+        for held in [
+            Catalysts::from_wep_types([Some(WEP_TYPE_SEAL), None]),
+            Catalysts::from_wep_types([Some(WEP_TYPE_STAFF), None]),
+            Catalysts::from_wep_types([Some(WEP_TYPE_STAFF), Some(WEP_TYPE_SEAL)]),
+            Catalysts::default(),
+        ] {
+            let out = prefer_castable(&batch, held);
+            assert_eq!(out.len(), batch.len(), "a spell was DROPPED for {held:?}");
+            let mut sorted = out.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, vec![1, 2, 3], "the set changed for {held:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_school_is_treated_as_castable_never_deprioritised() {
+        let batch = [
+            (1, None),
+            (2, Some(School::Sorcery)),
+            (3, Some(School::Incantation)),
+        ];
+        let seal = Catalysts::from_wep_types([Some(WEP_TYPE_SEAL), None]);
+        assert_eq!(
+            prefer_castable(&batch, seal),
+            vec![1, 3, 2],
+            "an unread school keeps its place among the castable -- a failed param read must not \
+             decide a loadout"
+        );
+    }
+
+    #[test]
+    fn no_catalyst_means_no_reordering_at_all() {
+        let batch = [
+            (9, Some(School::Sorcery)),
+            (8, Some(School::Incantation)),
+            (7, Some(School::Sorcery)),
+        ];
+        assert_eq!(
+            prefer_castable(&batch, Catalysts::default()),
+            vec![9, 8, 7],
+            "a player holding no catalyst has no preference to express, so the stream order stands"
+        );
+    }
+
+    #[test]
+    fn a_hybrid_reorders_nothing_because_it_can_cast_everything() {
+        let batch = [
+            (9, Some(School::Sorcery)),
+            (8, Some(School::Incantation)),
+            (7, Some(School::Sorcery)),
+        ];
+        let both = Catalysts::from_wep_types([Some(WEP_TYPE_STAFF), Some(WEP_TYPE_SEAL)]);
+        assert_eq!(prefer_castable(&batch, both), vec![9, 8, 7]);
+    }
+
+    /// Preference + fill-only still converges: reordering changes WHICH spell takes a slot, never
+    /// how many passes it takes.
+    #[test]
+    fn preference_does_not_reintroduce_the_loop() {
+        let batch: Vec<(i32, Option<School>)> = (0..6)
+            .map(|i| {
+                (
+                    4000 + i,
+                    Some(if i % 2 == 0 {
+                        School::Sorcery
+                    } else {
+                        School::Incantation
+                    }),
+                )
+            })
+            .collect();
+        let seal = Catalysts::from_wep_types([Some(WEP_TYPE_SEAL), None]);
+        let order = prefer_castable(&batch, seal);
+        let mut slots = [None::<i32>; MAGIC_SLOTS];
+        let mut writes = Vec::new();
+        for _ in 0..10 {
+            let mut w = 0;
+            for (ord, magic_id) in order.iter().enumerate() {
+                let p = SpellPos {
+                    ordinal: ord as u64,
+                    stones: 0,
+                };
+                if let Backfill::Place { slot, .. } = backfill_slot(p, &slots, *magic_id) {
+                    assert!(slots[slot as usize].is_none());
+                    slots[slot as usize] = Some(*magic_id);
+                    w += 1;
+                }
+            }
+            writes.push(w);
+        }
+        assert_eq!(writes[0], 2, "two usable slots with no stones");
+        assert!(
+            writes[1..].iter().all(|&w| w == 0),
+            "must still settle: {writes:?}"
+        );
+        // And the two that got them are the castable ones.
+        assert_eq!(slots[0], Some(4001));
+        assert_eq!(slots[1], Some(4003));
     }
 }
