@@ -863,6 +863,10 @@ impl shared::Core for Core {
                 // Accepts our `no_weapon_requirements` OR Bedrock/fswap's
                 // `remove_weapon_and_spell_requirements` (same client feature, two apworld names).
                 crate::no_weapon_reqs::set_enabled(er_logic::options::parse_no_weapon_reqs(sd));
+                // spell_slot_length rides auto_equip's option deliberately: it exists only to
+                // make that feature's memory-slot modulus exact, so it has no meaning without
+                // it and needs no contract key of its own.
+                crate::spell_slot_length::set_enabled(er_logic::options::parse_auto_equip(sd));
                 crate::upgrades::set_auto_upgrade(
                     sd.pointer("/options/auto_upgrade").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 );
@@ -3321,6 +3325,10 @@ impl shared::Core for Core {
         // 8b. no_weapon_requirements runtime param zeroing (latched once applied).
         crate::no_weapon_reqs::tick();
 
+        // 8b0. Magic.slotLength -> 1 so auto_equip's memory-slot modulus is exact (latched
+        // once applied, re-armed on the in_world edge below for the same reason 8b is).
+        crate::spell_slot_length::tick();
+
         // 8b1. serpent_hunter: the wave SpEffect into the spear's resident slot (latched once
         // applied, re-armed on the in_world edge below -- a map load restores the vanilla row).
         crate::serpent_hunter::tick();
@@ -3501,6 +3509,10 @@ impl shared::Core for Core {
             // EquipParamWeapon.proper_* / Magic.requirement_*. Opt-in option, so a post-load revert
             // is quiet and reads to the player as the option simply not working.
             crate::no_weapon_reqs::reset();
+            // Magic.slotLength. Same revert-on-load shape as the line above: a map load
+            // restores the vanilla lengths, and auto_equip would then place spells by a
+            // modulus that no longer matches what the game charges for them.
+            crate::spell_slot_length::reset();
             // EquipParamWeapon 17030000's resident SpEffect slot. Same revert-on-load shape as
             // the line above, and the same reason it must re-arm: without this the spear's waves
             // work until the player's first load and then stop, which reads as flaky rather than

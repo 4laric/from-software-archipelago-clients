@@ -39,6 +39,7 @@ mod no_weapon_reqs;
 mod notif_ticker;
 mod params;
 mod physick_probe;
+mod spell_slot_length;
 mod reconcile_io;
 mod region;
 mod runes;
