@@ -100,7 +100,11 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         // archipelago_rs tries to open an empty/incomplete URL and surfaces a confusing
         // "HTTP format error: empty string". `None` lets the overlay prompt for the details and
         // connect cleanly once they're entered.
-        if config.url().is_empty() || config.slot().is_empty() {
+        // `is_connectable` also rejects a url whose PORT is not a number -- the shipped
+        // apconfig.json default is `archipelago.gg:PORT`, a deliberate placeholder, and without
+        // this it would reach tungstenite as `wss://archipelago.gg:PORT` and produce exactly the
+        // confusing parser-error loop described above rather than the connect form.
+        if !crate::config::is_connectable(config.url()) || config.slot().is_empty() {
             return None;
         }
 

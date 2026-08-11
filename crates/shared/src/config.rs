@@ -139,6 +139,39 @@ impl<G: Game> Config<G> {
     }
 }
 
+/// Whether `url` is worth opening a socket to.
+///
+/// A url is NOT connectable when it is empty, or when it carries a port that is not a number.
+///
+/// 🛑 THE SECOND CASE EXISTS BECAUSE THE SHIPPED DEFAULT USES ONE. `package_release.ps1` writes
+/// `{"url":"archipelago.gg:PORT", ...}`: archipelago.gg gives every room its OWN port at creation,
+/// so no number could be correct there, and `38281` -- the local default -- beside `archipelago.gg`
+/// would be a plausible-looking lie. `PORT` cannot be mistaken for a setting. Without this check it
+/// would also not be SAFE: `Socket::connect` hands `wss://archipelago.gg:PORT` to tungstenite,
+/// which fails to parse the uri, and the player gets a retry loop of parser errors instead of the
+/// connect form. That is the same failure the empty-url guard above was written for, and the same
+/// remedy applies -- treat it as "not configured yet" and let the overlay ask.
+///
+/// Deliberately narrow: it answers "could this port ever be a port", not "is this host real". A
+/// bracketed IPv6 literal (`[::1]:38281`) still ends in digits and passes; a scheme's own colon is
+/// stripped first so `wss://archipelago.gg` (no port at all) is connectable, as it always was.
+pub fn is_connectable(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() {
+        return false;
+    }
+    let host_part = url
+        .split_once("://")
+        .map(|(_scheme, rest)| rest)
+        .unwrap_or(url);
+    // Only the LAST colon can introduce a port; anything before it is IPv6 or noise we do not judge.
+    match host_part.rsplit_once(':') {
+        // A trailing bare colon ("host:") is as unusable as a bad port, and for the same reason.
+        Some((_host, port)) => !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +316,31 @@ mod tests {
         // A missing file is fine; a permissions error (or anything else) must NOT be swallowed.
         let read = Err(IoError::from(ErrorKind::PermissionDenied));
         assert!(resolve_config(read).is_err());
+    }
+
+    #[test]
+    fn a_placeholder_port_is_not_connectable() {
+        // The shipped default, verbatim. If this ever returns true the release template starts a
+        // retry loop of tungstenite parse errors on every fresh install.
+        assert!(!is_connectable("archipelago.gg:PORT"));
+        assert!(!is_connectable("archipelago.gg:<port>"));
+        assert!(!is_connectable("archipelago.gg:12345x"));
+        assert!(!is_connectable("archipelago.gg:"));
+        assert!(!is_connectable(""));
+        assert!(!is_connectable("   "));
+    }
+
+    #[test]
+    fn real_urls_are_still_connectable() {
+        // WITNESS for the test above: a guard that rejects everything would pass it and break the
+        // client. These are the shapes players actually have.
+        assert!(is_connectable("archipelago.gg:12345"));
+        assert!(is_connectable("localhost:38281"));
+        assert!(is_connectable("wss://archipelago.gg:12345"));
+        assert!(is_connectable("ws://localhost:38281"));
+        assert!(is_connectable("archipelago.gg"));       // port defaults to 38281 downstream
+        assert!(is_connectable("wss://archipelago.gg"));
+        assert!(is_connectable("[::1]:38281"));
+        assert!(is_connectable("192.168.0.10:38281"));
     }
 }
