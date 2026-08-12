@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
+use eldenring::position::HavokPosition;
 use er_logic::scaling::{
     AreaAnchor, AreaSource, NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
     area_tier_from_histogram, baked_area_tier, band_native_tier, is_dlc_bucket,
@@ -158,6 +159,101 @@ pub(crate) fn any_character_present(chr_id: i32) -> Option<bool> {
         }
     }
     Some(false)
+}
+
+/// One sighting of `c<chr_id>`, for the #594 diagnostic. READ-ONLY.
+pub(crate) struct Sighting {
+    pub npc_param_id: i32,
+    pub status: ChrLoadStatus,
+    /// Straight-line distance to the main player. `None` when there is no main player to measure
+    /// from -- never `0.0`, which would read as "standing on top of him".
+    pub metres: Option<f32>,
+}
+
+/// Every instance of `c<chr_id>` the presence walk can see, and how far each one is.
+///
+/// MOTIVATING CASE (rule 11), #594, bobler 2026-08-12. `any_character_present` reported c4710
+/// loaded and the Serpent-Hunter was granted, while matt's spoiler placed the seed's ONLY Rykard in
+/// Enir-Ilim and the player was in Ancient Ruins of Rauh -- a different map. The presence test
+/// returns one bool for the whole world, so the log could not say which instance answered, what
+/// state it was in, or where it was. This says all three.
+///
+/// 🛑 Walks EXACTLY the sets `any_character_present` walks, in the same order, and adds no filter of
+/// its own -- so the two can never disagree about what is present. See `sweepable_characters` for
+/// why narrowing this walk is a mistake this file has already shipped once.
+///
+/// `None` = WorldChrMan unreachable: the same "don't know" `any_character_present` means by `None`.
+pub(crate) fn sight_character(chr_id: i32) -> Option<Vec<Sighting>> {
+    let Ok(wcm) = (unsafe { WorldChrMan::instance() }) else {
+        return None;
+    };
+    let player = wcm
+        .main_player
+        .as_ref()
+        .map(|p| p.chr_ins.modules.physics.position);
+    let mut out = Vec::new();
+    for (status, chr) in sweepable_characters_with_status(&wcm.open_field_chr_set.base) {
+        sight_one(chr, chr_id, status, player, &mut out);
+    }
+    for slot in wcm.chr_sets.iter().flatten() {
+        for (status, chr) in sweepable_characters_with_status(slot) {
+            sight_one(chr, chr_id, status, player, &mut out);
+        }
+    }
+    Some(out)
+}
+
+/// Takes `&ChrIns` so the caller's `&mut T: Subclass<ChrIns>` coerces at the call site -- the same
+/// trick `chr_is` and `area_sample_one` use, and `chr.as_ref()` still does not compile.
+fn sight_one(
+    chr: &ChrIns,
+    chr_id: i32,
+    status: ChrLoadStatus,
+    player: Option<HavokPosition>,
+    out: &mut Vec<Sighting>,
+) {
+    if !er_logic::boss_grants::is_character(chr.npc_param_id, chr_id) {
+        return;
+    }
+    let metres = player.map(|p| {
+        let q = chr.modules.physics.position;
+        let (dx, dy, dz) = (q.0 - p.0, q.1 - p.1, q.2 - p.2);
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    });
+    out.push(Sighting {
+        npc_param_id: chr.npc_param_id,
+        status,
+        metres,
+    });
+}
+
+/// The log line for a `sight_character` result.
+///
+/// ⭐ The EMPTY case is the whole point and gets its own wording: "present said yes and the walk
+/// found nothing" is a different fact from "present said yes and here is the one it found, 400m
+/// away", and #594 cannot be settled without telling them apart.
+pub(crate) fn describe_sightings(chr_id: i32, sightings: &[Sighting]) -> String {
+    if sightings.is_empty() {
+        return format!(
+            "serpent-hunter sightings: c{chr_id} NONE -- no entry in any walked ChrSet carries a \
+             matching npc_param"
+        );
+    }
+    let body = sightings
+        .iter()
+        .map(|s| {
+            let label = status_label(s.status);
+            match s.metres {
+                Some(m) => format!("npc_param {} ({label}) {m:.1}m", s.npc_param_id),
+                None => format!("npc_param {} ({label}) no main player", s.npc_param_id),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "serpent-hunter sightings: c{chr_id} x{} -- {body}",
+        sightings.len()
+    )
 }
 
 pub(crate) fn sweepable_characters<T>(set: &ChrSet<T>) -> impl Iterator<Item = &mut T>
