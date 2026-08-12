@@ -4313,6 +4313,9 @@ impl Core {
         let checked_set: HashSet<u64> = checked.iter().copied().collect();
         let mut sweep_rows: Vec<(String, String)> = Vec::new();
         let mut sweep_header = String::new();
+        // #171: groups whose region is known LOCKED are withheld and only counted -- see
+        // `sweep_view`'s module note for why concealing the region NAME was not enough.
+        let mut sweep_withheld: usize = 0;
         if let Some(fp) = self.flag_poll.as_ref() {
             // Fully OWNED first, borrowed second. An earlier draft built the tuples out of
             // references into another Vec and needed `**flag` to read a u32 -- unreadable, and
@@ -4391,19 +4394,13 @@ impl Core {
                 })
                 .collect();
             sweep_header = er_logic::sweep_view::section_header(&views);
-            sweep_rows = views
-                .iter()
-                // Alaric, 2026-08-10: "we can clear these from the view once they've paid out".
-                // A group that fired and owes nothing is settled history taking up a row. The
-                // HEADER still counts it, so the section's totals do not silently shrink.
-                .filter(|v| !(v.fired && v.owed() == 0))
-                .map(|v| {
-                    (
-                        er_logic::sweep_view::group_label(v),
-                        er_logic::sweep_view::group_state(v),
-                    )
-                })
-                .collect();
+            // The settled filter (Alaric, 2026-08-10: "we can clear these from the view once
+            // they've paid out") MOVED INTO er-logic with #171, because it now interacts with the
+            // withheld rule and that interaction needs a test. The HEADER still counts every
+            // group either way, so the section's totals do not silently shrink.
+            let section = er_logic::sweep_view::section_rows(&views);
+            sweep_rows = section.rows;
+            sweep_withheld = section.withheld;
         }
 
         let model = er_logic::tracker::build_tracker_model(
@@ -4592,7 +4589,11 @@ impl Core {
                 // Collapsed by default: it is reference, not a control. The HEADER carries the
                 // number worth glancing at ("N still behind a boss") so the section answers the
                 // question without being opened.
-                if !sweep_rows.is_empty()
+                // 🛑 The guard is on rows OR withheld, not on rows alone. A seed whose every
+                // sweep sits behind a locked region has zero rows and the section would vanish --
+                // and "there are no sweeps" is a different fact from "there are sweeps you cannot
+                // see yet", which is the one thing #171 still has to say.
+                if (!sweep_rows.is_empty() || sweep_withheld > 0)
                     && ui.collapsing_header(
                         format!("{sweep_header}###trk-sweeps"),
                         imgui::TreeNodeFlags::empty(),
@@ -4602,6 +4603,12 @@ impl Core {
                         ui.text(format!("  {label}"));
                         ui.same_line();
                         ui.text_disabled(format!("-- {state}"));
+                    }
+                    if sweep_withheld > 0 {
+                        ui.text_disabled(format!(
+                            "  {}",
+                            er_logic::sweep_view::withheld_line(sweep_withheld)
+                        ));
                     }
                     ui.separator();
                 }
