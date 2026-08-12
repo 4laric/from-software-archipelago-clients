@@ -182,12 +182,22 @@ pub fn withheld_line(n: usize) -> String {
 ///
 /// This is the number bobler actually wanted -- not "is there a sweep" but "how much am I owed".
 pub fn section_header(groups: &[SweepGroupView<'_>]) -> String {
-    let total: usize = groups.iter().map(|g| g.members).sum();
-    let owed: usize = groups.iter().map(SweepGroupView::owed).sum();
+    let (owed, total) = check_totals(groups);
     format!(
         "Boss sweeps -- {} group(s), {owed} of {total} check(s) still behind a boss",
         groups.len()
     )
+}
+
+/// Check totals for a group list, as `(owed, total)`.
+///
+/// Deliberately blind to `section_rows`: this sums EVERY group, including the ones the list
+/// withholds (#171). Withholding conceals rows, never arithmetic -- bobler asked "how much am I
+/// owed", and a total that shrank every time a region locked would answer that question wrongly.
+fn check_totals(groups: &[SweepGroupView<'_>]) -> (usize, usize) {
+    let total: usize = groups.iter().map(|g| g.members).sum();
+    let owed: usize = groups.iter().map(SweepGroupView::owed).sum();
+    (owed, total)
 }
 
 #[cfg(test)]
@@ -445,5 +455,69 @@ mod tests {
         ] {
             assert!(s.is_ascii(), "{s:?}");
         }
+    }
+
+    #[test]
+    fn an_unknown_region_is_never_withheld_because_unknown_is_not_locked() {
+        // 🛑 THE LOAD-BEARING CASE. `None` means the coarse table could not place the group -- it
+        // is the ABSENCE of a verdict, not a verdict of "locked". Withholding it would conceal a
+        // group the player can walk to right now, and he would never learn it existed: the list
+        // is a view, so a wrongly withheld row leaves no trace anywhere. Wrongly SHOWING an
+        // unreachable group costs one line of noise; wrongly withholding a reachable one costs
+        // the sweep. `group_state` already refuses to invent a wall out of `None` for the same
+        // reason. (`an_unplaceable_group_still_renders` pins the same rule one level up, at the
+        // list; this pins the predicate itself, which is what every caller reads.)
+        let mut g = v(1, Some("Belurat"), 10, 0, false);
+        g.region_open = None;
+        assert!(!is_withheld(&g));
+    }
+
+    #[test]
+    fn nothing_but_region_open_can_flip_the_verdict() {
+        // ONE PREDICATE, ONE INPUT, as a corpus. Withholding is a DISCLOSURE rule, so the only
+        // question it may ask is whether somebody established that this region is locked.
+        // `fired`, `gated_on` and the check counts all answer "what is this group waiting for",
+        // and any of them leaking in would conceal -- or reveal -- a row for a reason that has
+        // nothing to do with what the player is allowed to see. (`is_settled` does take those
+        // fields, and `section_rows` resolves the two in ORDER; that is tested separately.)
+        let mut corpus = Vec::new();
+        for fired in [false, true] {
+            for gate in [None, Some("Stone Coffin Lock")] {
+                for checked in [0, 8] {
+                    let mut g = v(1, Some("Stone Coffin"), 8, checked, fired);
+                    g.gated_on = gate;
+                    g.boss = Some("Putrescent Knight");
+                    corpus.push(g);
+                }
+            }
+        }
+        // WITNESS: an empty corpus would make every assertion below vacuous.
+        assert_eq!(corpus.len(), 8, "corpus must be built before it is judged");
+        for g in &corpus {
+            let mut open = *g;
+            open.region_open = Some(true);
+            let mut unknown = *g;
+            unknown.region_open = None;
+            let mut locked = *g;
+            locked.region_open = Some(false);
+            assert!(!is_withheld(&open), "{:?}", open);
+            assert!(!is_withheld(&unknown), "{:?}", unknown);
+            assert!(is_withheld(&locked), "{:?}", locked);
+        }
+    }
+
+    #[test]
+    fn the_header_wording_is_pinned() {
+        // PINNED ON PURPOSE. This is the string players have been reading since 2026-08-07, and
+        // it is the one place a withheld group is still counted -- rewording or re-scoping it by
+        // accident is how "how much am I owed" starts answering a different question.
+        let groups = [
+            v(1, Some("Shadow Keep"), 49, 49, true),
+            v(2, Some("Belurat"), 50, 10, false),
+        ];
+        assert_eq!(
+            section_header(&groups),
+            "Boss sweeps -- 2 group(s), 40 of 99 check(s) still behind a boss"
+        );
     }
 }

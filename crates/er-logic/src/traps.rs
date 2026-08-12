@@ -516,6 +516,212 @@ impl SpawnSpec {
     }
 }
 
+// ---- why a name was refused ---------------------------------------------------------------------
+
+/// Why [`Trap::from_item_name`] said `None`, so a log line can name the RIGHT suspect.
+///
+/// 🛑🛑 THE GOVERNING RULE: **A DIAGNOSTIC MUST NEVER ASSERT A DIRECTION IT HAS NOT ESTABLISHED.**
+/// Naming the wrong suspect costs more than being vague -- it spends somebody's afternoon in the
+/// wrong repository. This type exists because the sentence it replaced broke that rule. On
+/// 2026-08-12 a live seed sent `Trap: c2120 (2120/21200000/21200000 x1)` -- the OLD three-field
+/// payload -- and the client logged "A newer world minted it; update the client rather than
+/// guessing which effect was meant." The world was OLDER than the client, not newer, and that
+/// advice was exactly backwards. It was written when the only drift anybody had imagined was
+/// world-ahead-of-client, and it asserted that direction for every refusal including the one
+/// direction it could not be.
+///
+/// 🛑 DIAGNOSTICS ONLY. Nothing here decides whether a name is accepted; [`SpawnSpec::from_item_name`]
+/// remains the sole authority on that and its rules are unchanged. This type is consulted only
+/// AFTER it refused.
+///
+/// 🛑 NOT [`crate::marker::Refusal`], which is about a refused SESSION. Same word, unrelated
+/// subject -- name it `traps::Refusal` at every use site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Not a name this build has a trap for. Includes a bare `Trap: ...` with no parenthesised
+    /// payload at all -- an unknown FIXED trap is exactly this case.
+    ///
+    /// 🛑 THE ONLY VARIANT THAT MAY MENTION A NEWER WORLD, and even it must name the other
+    /// possibility in the same breath: a name that is not a trap at all looks identical from here.
+    NotATrap,
+    /// Spawn-trap shaped, carrying the PRE-CHANGE three-field payload `(<chr>/<npc>/<think>)`.
+    ///
+    /// 🛑 THE ONE CASE WHERE A DIRECTION IS ESTABLISHED RATHER THAN GUESSED: this build both mints
+    /// and reads two fields ([`SpawnSpec::item_name`]), so three is a shape only an OLDER world
+    /// emits. The incident above is this variant.
+    WorldBehind,
+    /// Recognisably a spawn-trap name -- prefix plus a trailing parenthesised payload -- that
+    /// breaks one of [`SpawnSpec::from_item_name`]'s strict rules. Carries WHICH rule.
+    ///
+    /// 🛑 EVIDENCE ABOUT NEITHER SIDE'S VERSION. No released build on either side mints a name
+    /// like this, so it says nothing about which of them is older; the advice must not pretend
+    /// otherwise.
+    Malformed(&'static str),
+    /// The name is one this build ACCEPTS. Nothing was refused, so there is nothing to blame.
+    ///
+    /// 🛑 UNREACHABLE FROM THE ONLY CALLER, which asks this question only after `from_item_name`
+    /// returned `None` -- and kept deliberately, because a total function needs something TRUE to
+    /// say about a name that parses. Answering `NotATrap` there would be the same class of mistake
+    /// this whole type exists to fix: a confident sentence about a case nobody established. It is
+    /// also what lets [`classify_refusal`]'s tail mean "the mirror has drifted" rather than
+    /// "no idea" -- see `a_name_this_build_accepts_is_blamed_on_nobody`.
+    NoFault,
+}
+
+impl Refusal {
+    /// The operator-facing sentence. ASCII, because it lands in a log a human greps.
+    ///
+    /// `Cow` for the same reason [`Trap::toast`] is one: three of the four verdicts are constants
+    /// and [`Refusal::Malformed`] has to name the rule it tripped, so there is no static to borrow.
+    ///
+    /// 🛑 READ THESE AS THE PRODUCT DECISION THEY ARE. Each one is pinned by a test that asserts
+    /// what it must NOT say, not only what it must: the defect being fixed was a sentence that read
+    /// perfectly well and pointed at the wrong repository.
+    pub fn advice(self) -> Cow<'static, str> {
+        match self {
+            // Names BOTH possibilities, in this order, because from here they are
+            // indistinguishable: an unknown `Trap: ...` and `Boss Key: Godrick` arrive as the same
+            // refusal.
+            Refusal::NotATrap => Cow::Borrowed(
+                "no trap of that name exists in this build. EITHER a newer world minted a trap \
+                 this client does not have, OR the name is not a trap at all -- this side cannot \
+                 tell which, so check the world's trap list before changing either half.",
+            ),
+            // 🛑 QUOTES THE SHAPE THIS BUILD SPEAKS. "The world is behind" is unactionable on its
+            // own; the shape is what somebody compares the apworld's minting code against.
+            Refusal::WorldBehind => Cow::Borrowed(
+                "the payload carries THREE fields, which is the shape minted BEFORE this build. \
+                 The WORLD (apworld) is behind, not this side: update the apworld or regenerate \
+                 the seed. This build mints and reads `Trap: <label> x<count> (<chr>/<npc>)`.",
+            ),
+            Refusal::Malformed(rule) => Cow::Owned(format!(
+                "it is shaped like a spawn trap but this build cannot read it: {rule}. That is \
+                 evidence about NEITHER side's version -- no build mints a name like this -- so \
+                 quote it verbatim rather than updating either half.",
+            )),
+            Refusal::NoFault => Cow::Borrowed(
+                "this build ACCEPTS that name -- there is nothing about the name to diagnose. If \
+                 something refused it, the reason lies somewhere other than its format.",
+            ),
+        }
+    }
+}
+
+/// Why a received item name is not a trap this build can fire.
+///
+/// 🛑 A MIRROR OF [`SpawnSpec::from_item_name`]'s GATES, IN ITS ORDER, so the rule it reports is
+/// the first one that parser would have tripped. It decides NOTHING -- the parser is asked first
+/// and remains the only thing that accepts or refuses a name. The mirror is the price of a
+/// diagnostic that can be host-tested without a game, and the drift it risks is held to account by
+/// `the_classifier_and_the_parser_agree_about_every_name`: no name may be refused by one and
+/// excused by the other.
+///
+/// The three shape gates come first and all fail to [`Refusal::NotATrap`]. That ordering is the
+/// point: `Boss Key: Godrick` must not be reported as a broken trap, and `Trap: Reversed Controls`
+/// -- a fixed trap from a newer world -- has no payload to be malformed.
+///
+/// 🛑 er-logic OWNS THE WORDS, per the house split at the top of this file. The client crate calls
+/// this and logs [`Refusal::advice`]; it holds no copy of the sentence, so the sentence is
+/// host-testable and there is one place to fix when it is wrong again.
+pub fn classify_refusal(name: &str) -> Refusal {
+    // 🛑 THE PARSER IS ASKED FIRST, and it is the authority. A name this build accepts has no
+    // refusal to explain, and asking here is also what lets the tail below mean "this mirror has
+    // drifted from the parser" instead of "no rule matched".
+    if Trap::from_item_name(name).is_some() {
+        return Refusal::NoFault;
+    }
+
+    // The three SHAPE gates the parser opens with. Failing any of them means the name is not
+    // spawn-trap shaped at all -- which is not a malformed payload, and must not be reported as
+    // one.
+    let Some(body) = name.strip_prefix(ITEM_PREFIX) else {
+        return Refusal::NotATrap;
+    };
+    let Some(body) = body.strip_suffix(')') else {
+        return Refusal::NotATrap;
+    };
+    // LAST ` (`, exactly as the parser splits it: a label may carry one of its own.
+    let Some((readable, payload)) = body.rsplit_once(" (") else {
+        return Refusal::NotATrap;
+    };
+
+    // Collected rather than iterated because the COUNT of fields is the whole question here, and
+    // this is a cold path that runs once per refused item.
+    let fields: Vec<&str> = payload.split('/').collect();
+    if fields.len() == 3 {
+        // 🛑 ONLY THE FIRST TWO ARE HELD TO BEING NUMBERS. The old shape parked the count INSIDE
+        // the payload's last field (`21200000 x1` in the incident), so demanding three numbers
+        // would miss the exact string that motivated this. Two numeric ids in a three-field
+        // payload is the old shape and nothing else mints it.
+        //
+        // 🛑 AND NOTHING MORE IS DEMANDED: not the model range, not the family rule. A name from an
+        // older world owes this build's other rules nothing, and turning a failed one into
+        // "malformed" would discard the direction we had actually established.
+        let numeric = fields[0].parse::<i32>().is_ok() && fields[1].parse::<i32>().is_ok();
+        if numeric {
+            return Refusal::WorldBehind;
+        }
+        return Refusal::Malformed("the payload's first two fields must both be numbers");
+    }
+    if fields.len() != 2 {
+        return Refusal::Malformed(
+            "the payload must be exactly two slash-separated fields, `<chr>/<npc>`",
+        );
+    }
+    let (chr, npc) = (fields[0], fields[1]);
+
+    // From here the order mirrors the parser's own, so the rule reported is the first it trips.
+    let Some((label, count)) = readable.rsplit_once(" x") else {
+        return Refusal::Malformed("the readable half must end in ` x<count>` before the payload");
+    };
+    if label.is_empty() {
+        return Refusal::Malformed("the label must not be empty");
+    }
+    if !label.is_ascii() {
+        return Refusal::Malformed(
+            "the label must be ASCII -- the in-game font draws `?` for everything else",
+        );
+    }
+    let Ok(chr_id) = chr.parse::<i32>() else {
+        return Refusal::Malformed("`<chr>` must be a number");
+    };
+    let Ok(npc_id) = npc.parse::<i32>() else {
+        return Refusal::Malformed("`<npc>` must be a number");
+    };
+    let Ok(count) = count.parse::<u32>() else {
+        return Refusal::Malformed("`<count>` must be a number");
+    };
+    // 🛑 THE CAP IS NAMED, NOT SPELLED OUT. `LABEL_CAP` is a contract with the world and it may
+    // move; a literal here would go stale silently, in a sentence whose whole job is to be
+    // trusted.
+    if label.len() > LABEL_CAP {
+        return Refusal::Malformed(
+            "the label is longer than LABEL_CAP bytes, and it is refused rather than truncated",
+        );
+    }
+    if !(100..=9999).contains(&chr_id) {
+        return Refusal::Malformed("`<chr>` must be a plausible model number, 100..=9999");
+    }
+    if !(1..=MAX_SPAWN_COUNT).contains(&count) {
+        return Refusal::Malformed("`<count>` must be between 1 and MAX_SPAWN_COUNT");
+    }
+    if !npc_id.to_string().starts_with(&chr_id.to_string()) {
+        return Refusal::Malformed(
+            "`<npc>` must be a row in the `<chr>` model's own family -- a body must not run \
+             another creature's stat block",
+        );
+    }
+
+    // 🛑 REACHABLE ONLY WHEN THIS MIRROR HAS DRIFTED FROM THE PARSER: the parser refused the name
+    // (asked at the top) and every rule above it excused it. Says exactly that, blames neither
+    // side's version, and is the string
+    // `the_classifier_and_the_parser_agree_about_every_name` exists to keep out of a log.
+    Refusal::Malformed(
+        "this build's parser refused it but no rule here can say which -- the refusal classifier \
+         has drifted from the parser",
+    )
+}
+
 // ---- Runebear -----------------------------------------------------------------------------------
 //
 // DERIVED 2026-08-10 from `gen_inputs.db`, not recalled -- and the derivation corrected a confident
@@ -1350,5 +1556,346 @@ mod tests {
         assert_eq!(q.poll(10, true), Some(Trap::Spawn(spec)));
         assert_eq!(q.poll(10, true), Some(Trap::RuneThief));
         assert!(q.is_empty());
+    }
+
+    // ---- why a name was refused ----------------------------------------------------------------
+
+    /// 🛑 THE INCIDENT, VERBATIM, 2026-08-12. This exact name reached a live playtest and the
+    /// client answered "A newer world minted it; update the client rather than guessing which
+    /// effect was meant." The world was BEHIND the client -- the world half of the two-field change
+    /// had not merged -- so that sentence sent the maintainer into the wrong repository. This is
+    /// the string the whole classifier exists for, so it is pinned as a LITERAL rather than
+    /// rebuilt from the constants: a corpus generated by this build would only ever mint the shape
+    /// this build already speaks.
+    #[test]
+    fn the_incident_name_says_the_world_is_behind_not_the_client() {
+        let incident = "Trap: c2120 (2120/21200000/21200000 x1)";
+        assert_eq!(
+            Trap::from_item_name(incident),
+            None,
+            "WITNESS: the incident name must still be REFUSED -- this change is diagnostics only"
+        );
+        assert_eq!(classify_refusal(incident), Refusal::WorldBehind);
+
+        let advice = classify_refusal(incident).advice();
+        // Names the side that is actually behind, in the words the maintainer greps for.
+        assert!(advice.contains("apworld"), "{advice}");
+        assert!(advice.contains("WORLD"), "{advice}");
+        assert!(
+            advice.contains("regenerate the seed"),
+            "an in-flight seed's names are fixed at generation: {advice}"
+        );
+        // ...and quotes the shape THIS build speaks, because "the world is behind" alone is not
+        // something anybody can act on.
+        assert!(
+            advice.contains("`Trap: <label> x<count> (<chr>/<npc>)`"),
+            "{advice}"
+        );
+        // 🛑 THE DEFECT ITSELF. The old line's advice was to update the client; that is the one
+        // instruction this case must never carry again.
+        let lowered = advice.to_lowercase();
+        assert!(
+            !lowered.contains("update the client"),
+            "the backwards advice came back: {advice}"
+        );
+        assert!(
+            !lowered.contains("newer world"),
+            "the world is OLDER here, and the diagnostic must not say otherwise: {advice}"
+        );
+    }
+
+    /// The half-migrated form -- count moved to the readable half, think row still in the payload
+    /// -- is the same drift and must read the same way. It is what a world mid-change mints, and
+    /// diagnosing it as "malformed" would hide a version skew behind a shrug.
+    #[test]
+    fn a_half_migrated_old_name_is_still_the_world_being_behind() {
+        let names = [
+            "Trap: Basilisk (4150/41500060/41500000 x3)",
+            "Trap: c4630 (4630/46300010/46300000 x1)",
+            "Trap: Basilisk x3 (4150/41500060/41500000)",
+        ];
+        // WITNESS: an empty list would classify no old name at all.
+        assert_eq!(names.len(), 3, "the old-format corpus was emptied");
+        for name in names {
+            assert_eq!(
+                Trap::from_item_name(name),
+                None,
+                "{name} stopped being refused -- parsing changed"
+            );
+            assert_eq!(
+                classify_refusal(name),
+                Refusal::WorldBehind,
+                "{name} did not read as an older world"
+            );
+        }
+    }
+
+    /// A name in the shape this build speaks is ACCEPTED, so it never reaches the classifier at
+    /// all. The failure this catches is a diagnostic that grew teeth: if adding one changed which
+    /// names parse, the fix would have broken every live seed it was meant to explain.
+    #[test]
+    fn the_new_shape_is_accepted_and_therefore_never_classified() {
+        let basilisk = spec(4150, 41_500_060, 3, "Basilisk");
+        assert_eq!(
+            Trap::from_item_name("Trap: Basilisk x3 (4150/41500060)"),
+            Some(Trap::Spawn(basilisk)),
+            "the current shape stopped parsing"
+        );
+        // Closed both ways, so the shape quoted in the WorldBehind advice is the one that works.
+        assert_eq!(basilisk.item_name(), "Trap: Basilisk x3 (4150/41500060)");
+        // The same creature the incident carried, in this build's shape: c2120 x1.
+        let incident_creature = spec(2120, 21_200_000, 1, "c2120");
+        assert_eq!(
+            Trap::from_item_name("Trap: c2120 x1 (2120/21200000)"),
+            Some(Trap::Spawn(incident_creature)),
+            "the shape the incident's world SHOULD have minted does not parse"
+        );
+        // The fixed names are untouched by any of this.
+        assert_eq!(
+            Trap::from_item_name("Trap: Rune Thief"),
+            Some(Trap::RuneThief)
+        );
+    }
+
+    /// 🛑 A MALFORMED NAME IS EVIDENCE ABOUT NOBODY. No released build on either side mints one, so
+    /// a diagnostic that blamed a version here would be guessing -- which is the mistake the
+    /// incident line made. Each case also pins the RULE it reports, because "malformed" without a
+    /// rule is the same dead end the old sentence was.
+    #[test]
+    fn a_malformed_name_names_its_rule_and_blames_neither_side() {
+        let cases = [
+            // one payload field, not two
+            ("Trap: X x3 (4150)", "exactly two slash-separated"),
+            // four, which is not the old shape either
+            (
+                "Trap: X x3 (4150/41500060/41500000/4)",
+                "exactly two slash-separated",
+            ),
+            // three fields, but not two ids -- shaped like the old payload, is not one
+            (
+                "Trap: X x3 (a/b/c)",
+                "first two fields must both be numbers",
+            ),
+            // no ` x<count>` at all
+            ("Trap: X (4150/41500060)", "` x<count>`"),
+            // empty label
+            ("Trap:  x3 (4150/41500060)", "label must not be empty"),
+            // non-ASCII label -- the in-game font draws `?` for it
+            ("Trap: Basilisqu\u{e9} x3 (4150/41500060)", "must be ASCII"),
+            ("Trap: X x3 (c4150/41500060)", "`<chr>` must be a number"),
+            ("Trap: X x3 (4150/four)", "`<npc>` must be a number"),
+            (
+                "Trap: X xthree (4150/41500060)",
+                "`<count>` must be a number",
+            ),
+            ("Trap: X x1 (99/990000)", "plausible model number"),
+            (
+                "Trap: X x0 (4150/41500060)",
+                "between 1 and MAX_SPAWN_COUNT",
+            ),
+            // 🛑 a basilisk body running a runebear's stat block
+            ("Trap: X x3 (4150/46300010)", "own family"),
+        ];
+        // WITNESS: one rule per case, and an empty list would classify nothing at all.
+        assert_eq!(cases.len(), 12, "a refusal rule lost its case");
+        for (name, rule) in cases {
+            assert_eq!(
+                Trap::from_item_name(name),
+                None,
+                "{name} was accepted -- parsing changed"
+            );
+            let verdict = classify_refusal(name);
+            assert!(
+                matches!(verdict, Refusal::Malformed(_)),
+                "{name} classified as {verdict:?}, which asserts something about a version"
+            );
+            let advice = verdict.advice();
+            assert!(
+                advice.contains(rule),
+                "{name}: {advice} does not say {rule}"
+            );
+            // 🛑 THE GOVERNING RULE, asserted as an ABSENCE. A malformed name establishes no
+            // direction, so the advice may not carry one -- neither the incident's "newer world"
+            // nor its mirror image.
+            let lowered = advice.to_lowercase();
+            for forbidden in [
+                "newer world",
+                "behind",
+                "out of date",
+                "update the client",
+                "update the apworld",
+                "regenerate the seed",
+            ] {
+                assert!(
+                    !lowered.contains(forbidden),
+                    "{name}: {advice} asserts a direction it has not established ({forbidden})"
+                );
+            }
+        }
+        // The label cap is the one rule whose case cannot be a literal -- raising the constant must
+        // not leave a stale string here.
+        let over = format!("Trap: {} x3 (4150/41500060)", "L".repeat(LABEL_CAP + 1));
+        let verdict = classify_refusal(&over);
+        assert!(matches!(verdict, Refusal::Malformed(_)), "{verdict:?}");
+        assert!(verdict.advice().contains("LABEL_CAP"), "{over}");
+    }
+
+    /// 🛑 THE ONLY VERDICT ALLOWED TO MENTION A NEWER WORLD, AND ONLY ALONGSIDE THE ALTERNATIVE.
+    /// `Trap: Reversed Controls` and `Boss Key: Godrick` are indistinguishable from here: one is a
+    /// world this client is behind, the other is not a trap at all. Asserting either would be
+    /// naming a suspect on a coin flip.
+    #[test]
+    fn a_non_trap_name_names_both_possibilities_and_picks_neither() {
+        let names = [
+            "Boss Key: Godrick",
+            "Smithing Stone [1]",
+            "",
+            // 🛑 A `Trap: ` NAME WITH NO PAYLOAD AT ALL. This is what an unknown FIXED trap from a
+            // newer world looks like, and it is still not proof of one.
+            "Trap: Reversed Controls",
+            // Prefix and a payload, but no trailing `)` and no ` (` -- not spawn-trap shaped, so
+            // not a malformed spawn trap.
+            "Trap: Basilisk x3 (4150/41500060",
+            "Trap: Basilisk x3 4150/41500060)",
+            // No prefix: a world item that merely mentions the shape.
+            "Basilisk x3 (4150/41500060)",
+        ];
+        // WITNESS: an empty list would agree with itself about every name it never classified.
+        assert_eq!(names.len(), 7, "the non-trap corpus was emptied");
+        for name in names {
+            assert_eq!(
+                Trap::from_item_name(name),
+                None,
+                "{name} was accepted -- parsing changed"
+            );
+            assert_eq!(
+                classify_refusal(name),
+                Refusal::NotATrap,
+                "{name} was reported as a broken trap"
+            );
+        }
+        let advice = Refusal::NotATrap.advice();
+        assert!(advice.contains("EITHER"), "{advice}");
+        assert!(advice.contains("newer world"), "{advice}");
+        assert!(advice.contains("not a trap at all"), "{advice}");
+    }
+
+    /// `NoFault` is unreachable from the only caller -- the client asks only after
+    /// `from_item_name` refused -- and a guard no corpus can fire is a guard nothing tests, so it
+    /// gets a DIRECT call. It exists because the honest answer about a name that PARSES is not
+    /// "not a trap": that would be the same confident sentence about an unestablished case that
+    /// this whole type was written to delete.
+    #[test]
+    fn a_name_this_build_accepts_is_blamed_on_nobody() {
+        let accepted = [
+            "Trap: Basilisk x3 (4150/41500060)",
+            "Trap: c2120 x1 (2120/21200000)",
+            "Trap: Rune Thief",
+            "Trap: No Flask",
+            "Trap: Runebear",
+        ];
+        // WITNESS: an empty list would prove nothing about any accepted name.
+        assert_eq!(accepted.len(), 5, "the acceptance corpus was emptied");
+        for name in accepted {
+            assert!(
+                Trap::from_item_name(name).is_some(),
+                "{name}: WITNESS -- this case only means anything while the name PARSES"
+            );
+            assert_eq!(classify_refusal(name), Refusal::NoFault, "{name}");
+        }
+        let advice = Refusal::NoFault.advice();
+        let lowered = advice.to_lowercase();
+        for forbidden in ["newer world", "behind", "update the client", "apworld"] {
+            assert!(!lowered.contains(forbidden), "{advice}");
+        }
+    }
+
+    /// 🛑 THE MIRROR MUST NOT DRIFT. `classify_refusal` re-walks `SpawnSpec::from_item_name`'s
+    /// gates rather than sharing its code, which buys a host-testable diagnostic and costs a second
+    /// copy of the rules. The failure that copy makes possible is a name one of them refuses and
+    /// the other excuses -- and the way it would show up is a log line saying the classifier has
+    /// drifted, which is the tail of `classify_refusal` and must never be reached.
+    #[test]
+    fn the_classifier_and_the_parser_agree_about_every_name() {
+        let accepted = [
+            "Trap: Rune Thief",
+            "Trap: No Flask",
+            "Trap: Runebear",
+            "Trap: Basilisk x3 (4150/41500060)",
+            "Trap: Giant Crab (Ruin) x2 (3210/32100000)",
+            "Trap: Crab x2 x3 (2270/22700000)",
+            "Trap: c100 x8 (100/1000000)",
+        ];
+        let refused = [
+            "Trap: c2120 (2120/21200000/21200000 x1)",
+            "Trap: Basilisk x3 (4150/41500060/41500000)",
+            "Trap: X x3 (4150)",
+            "Trap: X x3 (4150/41500060/41500000/4)",
+            "Trap: X (4150/41500060)",
+            "Trap: X x (4150/41500060)",
+            "Trap: X (4150/41500060 x3)",
+            "Trap:  x3 (4150/41500060)",
+            "Trap: Basilisqu\u{e9} x3 (4150/41500060)",
+            "Trap: X x3 (c4150/41500060)",
+            "Trap: X x3 (4150/four)",
+            "Trap: X xthree (4150/41500060)",
+            "Trap: X x-1 (4150/41500060)",
+            "Trap: X x1 (99/990000)",
+            "Trap: X x1 (10000/100000000)",
+            "Trap: X x1 (-4150/-41500060)",
+            "Trap: X x3 (4150/46300010)",
+            "Trap: X x0 (4150/41500060)",
+            "Trap: Reversed Controls",
+            "Boss Key: Godrick",
+            "Smithing Stone [1]",
+            "",
+        ];
+        // WITNESS: two empty lists would agree about nothing, loudly.
+        assert_eq!(accepted.len(), 7, "the acceptance corpus was emptied");
+        assert_eq!(refused.len(), 22, "the refusal corpus was emptied");
+        for name in accepted {
+            assert!(Trap::from_item_name(name).is_some(), "{name}");
+            assert_eq!(
+                classify_refusal(name),
+                Refusal::NoFault,
+                "{name}: the parser accepted it and the classifier found a fault"
+            );
+        }
+        for name in refused {
+            assert_eq!(Trap::from_item_name(name), None, "{name}");
+            assert_ne!(
+                classify_refusal(name),
+                Refusal::NoFault,
+                "{name}: the parser refused it and the classifier found nothing wrong"
+            );
+            // ...and the drift tail specifically, which is the string that says the two copies of
+            // the rules no longer match.
+            assert!(
+                !classify_refusal(name).advice().contains("has drifted"),
+                "{name}: the classifier no longer mirrors the parser"
+            );
+        }
+    }
+
+    /// The advice lands in a log a human greps and, unlike a toast, is not held to the in-game
+    /// font -- but the same rule is cheaper than deciding which lines are exempt. Every verdict is
+    /// covered, including the two no corpus above reaches by more than one route.
+    #[test]
+    fn every_advice_line_is_ascii_and_every_verdict_is_covered() {
+        let verdicts = [
+            Refusal::NotATrap,
+            Refusal::WorldBehind,
+            Refusal::Malformed("the label must not be empty"),
+            Refusal::NoFault,
+            // The drift tail, which by construction nothing else can produce.
+            classify_refusal("Trap: X x3 (4150/46300010)"),
+        ];
+        // WITNESS: an empty list would be ASCII in the most useless possible way.
+        assert_eq!(verdicts.len(), 5, "the verdict corpus was emptied");
+        for v in verdicts {
+            let advice = v.advice();
+            assert!(advice.is_ascii(), "non-ASCII advice for {v:?}: {advice}");
+            assert!(!advice.is_empty(), "{v:?} advises nothing");
+        }
     }
 }
