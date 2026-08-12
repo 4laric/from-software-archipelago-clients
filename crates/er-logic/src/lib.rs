@@ -74,6 +74,7 @@ pub mod shop_repoint;
 pub mod shop_repoint_replay;
 pub mod spell_equip;
 pub mod start_backfill;
+pub mod startup_retry;
 pub mod static_lots;
 pub mod sweep_boss_names;
 pub mod sweep_flush;
