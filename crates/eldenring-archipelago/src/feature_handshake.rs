@@ -92,6 +92,20 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("no_equip_load_roll", |_| {
         crate::no_equip_load::medium_armed()
     }),
+    // 🛑 THIS TAG VERSIONS A FORMAT, SO THE PROBE PARSES ONE (er-archipelago#595). Every entry
+    // above reads an arming flag; spawn traps have none to read. `enqueue_by_item_name` is always
+    // live, and the tag does not claim the feature is ON -- it claims this build reads the CURRENT
+    // name shape. So the read-back that honestly answers "did it arm?" is the parse itself.
+    //
+    // 🛑🛑 `|_| true` WOULD HAVE COMPILED AND PASSED THE GATE. It is a probe that cannot fail,
+    // which is precisely the darkness this registry exists to see: a build whose parser had been
+    // broken would still report ARMED, and the subtraction would go on agreeing with itself. The
+    // literal mirrors the one in `client_features`'s own
+    // `the_spawn_trap_tag_means_the_shape_this_build_actually_reads`, deliberately -- both pin the
+    // same shape, and the apworld pins its half in `test_gf_spawn_traps`.
+    ("spawn_traps", |_| {
+        er_logic::traps::SpawnSpec::from_item_name("Trap: Basilisk x3 (4150/41500060)").is_some()
+    }),
 ];
 
 /// Build the `(tag, live)` table this connect.
