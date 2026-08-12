@@ -69,6 +69,24 @@ pub const SUPPORTED: &[&str] = &[
     // direction of "easier, and nothing said so" is exactly #536's shape, and a refusal is the only
     // honest answer.
     "no_equip_load_roll",
+    // Spawn traps: the item NAME carries the ids (er-archipelago#581/#585, this crate's
+    // `traps::SpawnSpec::from_item_name`) (2026-08-12, er-archipelago#595).
+    //
+    // 🛑 THE MOTIVATING CASE IS AN ITEM THAT EATS ITSELF. bobler's seed placed seven spawn traps
+    // this build could not read. On pickup the item arrives, AP marks it delivered, the name does
+    // not parse, and `enqueue_by_item_name` DROPS it -- no toast, no tracker row, nothing to
+    // recover. The handshake was honoured in full that session and could not help, because spawn
+    // traps declared nothing for it to check.
+    //
+    // 🛑🛑 THIS TAG VERSIONS THE NAME FORMAT, NOT THE CAPABILITY, which is why it is not called
+    // something like "traps". A build that knows spawn traps but speaks the older
+    // `Trap: <label> (<chr>/<npc>/<think> x<count>)` shape refuses the name exactly as an ignorant
+    // build does, so a capability boolean would pass the handshake and still lose the item. When
+    // `SpawnSpec::item_name`'s format changes, the apworld mints a NEW tag and this list gains it in
+    // the same release that learns the new shape -- older builds then say CLIENT TOO OLD instead of
+    // failing quietly. `traps.rs` pins the format literal; the apworld pins the pair in
+    // `test_gf_spawn_traps`.
+    "spawn_traps",
 ];
 
 /// Feature tags the seed requires that this build does not know.
@@ -198,6 +216,27 @@ pub fn not_armed_message(tags: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🛑 er-archipelago#595. The tag is only worth anything if it means "this build reads the
+    /// CURRENT spawn-trap name shape". Pins both halves together: if `SpawnSpec::item_name`'s format
+    /// moves and this build keeps claiming `spawn_traps`, seeds minted for the new shape would
+    /// handshake clean here and then have every spawn trap consume itself -- the exact defect the
+    /// tag exists to stop. Changing the format means minting a new tag, in both repos.
+    #[test]
+    fn the_spawn_trap_tag_means_the_shape_this_build_actually_reads() {
+        assert!(SUPPORTED.contains(&"spawn_traps"));
+        let spec = crate::traps::SpawnSpec::from_item_name("Trap: Basilisk x3 (4150/41500060)")
+            .expect("this build must read the shape its tag claims");
+        assert_eq!(spec.chr_id, 4150);
+        assert_eq!(spec.count, 3);
+        // The shape the tag REPLACES. A build that read this too would not need a new tag, and the
+        // versioning argument above would be wrong.
+        assert!(
+            crate::traps::SpawnSpec::from_item_name("Trap: Basilisk (4150/41500060/41500000 x3)")
+                .is_none(),
+            "if the old shape parsed, the tag would not be versioning anything"
+        );
+    }
     use serde_json::json;
 
     #[test]
