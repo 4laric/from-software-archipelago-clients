@@ -4311,8 +4311,16 @@ impl Core {
         // bobler's sessions -- and it was invisible until it fired. Assembled here, outside the
         // closure, from tables that are all pure memory: `sweep_flag_state` was read on the tick.
         let checked_set: HashSet<u64> = checked.iter().copied().collect();
-        let mut sweep_rows: Vec<(String, String)> = Vec::new();
+        // The third tuple field is "hidden by `in-logic only`", decided HERE by
+        // `sweep_view::hidden_by_in_logic_only` and carried alongside the row so the render loop
+        // skips without re-deriving a verdict a pure function already owns.
+        let mut sweep_rows: Vec<(String, String, bool)> = Vec::new();
+        // BOTH headers, built before the closure. The checkbox is read INSIDE the closure and can
+        // flip on this very frame, so the CHOICE between them happens there; building only one
+        // here would make the header lag the toggle by a frame. Two Strings, no `self` in the
+        // closure -- same rule every other snapshot in this function follows.
         let mut sweep_header = String::new();
+        let mut sweep_header_filtered = String::new();
         if let Some(fp) = self.flag_poll.as_ref() {
             // Fully OWNED first, borrowed second. An earlier draft built the tuples out of
             // references into another Vec and needed `**flag` to read a u32 -- unreadable, and
@@ -4391,6 +4399,10 @@ impl Core {
                 })
                 .collect();
             sweep_header = er_logic::sweep_view::section_header(&views);
+            // `true` unconditionally: this is the string to SHOW IF the filter is on, and the
+            // function already falls back to the plain wording when the filter bites nothing.
+            // Both headers count every group -- see `section_header_filtered`.
+            sweep_header_filtered = er_logic::sweep_view::section_header_filtered(&views, true);
             sweep_rows = views
                 .iter()
                 // Alaric, 2026-08-10: "we can clear these from the view once they've paid out".
@@ -4401,6 +4413,7 @@ impl Core {
                     (
                         er_logic::sweep_view::group_label(v),
                         er_logic::sweep_view::group_state(v),
+                        er_logic::sweep_view::hidden_by_in_logic_only(v),
                     )
                 })
                 .collect();
@@ -4588,27 +4601,69 @@ impl Core {
                     }
                     ui.separator();
                 }
-                // ---- Boss sweeps -----------------------------------------------------------
-                // Collapsed by default: it is reference, not a control. The HEADER carries the
-                // number worth glancing at ("N still behind a boss") so the section answers the
-                // question without being opened.
-                if !sweep_rows.is_empty()
-                    && ui.collapsing_header(
-                        format!("{sweep_header}###trk-sweeps"),
-                        imgui::TreeNodeFlags::empty(),
-                    )
-                {
-                    for (label, state) in &sweep_rows {
-                        ui.text(format!("  {label}"));
-                        ui.same_line();
-                        ui.text_disabled(format!("-- {state}"));
-                    }
-                    ui.separator();
-                }
+                // ---- filters ---------------------------------------------------------------
+                // MOVED ABOVE THE SWEEPS SECTION (2026-08-12). `in-logic only` now governs the
+                // sweep rows as well as the rollups, and a control that sits BELOW the first thing
+                // it filters is one you toggle before you can see what it did. Both checkboxes
+                // travel together: they are one row of filters, whatever each one governs.
+                //
+                // 🛑 `progression surface only` GAINS NOTHING HERE. It answers a different
+                // question -- is this check on the progression surface -- and still governs only
+                // the per-region rollups below. Sweeps are not surface-classified, so wiring it in
+                // would hide rows for a reason its label does not name.
                 ui.checkbox("in-logic only", &mut in_logic_only);
                 ui.same_line();
                 ui.checkbox("progression surface only", &mut surface_only);
                 ui.separator();
+                // ---- Boss sweeps -----------------------------------------------------------
+                // Collapsed by default: it is reference, not a control. The HEADER carries the
+                // number worth glancing at ("N still behind a boss") so the section answers the
+                // question without being opened.
+                //
+                // Alaric, 2026-08-12: 24 groups listed, 21 of them "region still locked -- you
+                // cannot reach this boss yet". He wants "only the ones he can actually go and
+                // fight". That is the SAME `in-logic only` checkbox the rollups below read, on
+                // purpose: one control, one meaning. The per-row verdict rides in the tuple.
+                if !sweep_rows.is_empty() {
+                    let sweep_shown = sweep_rows
+                        .iter()
+                        .filter(|(_, _, hidden)| !(in_logic_only && *hidden))
+                        .count();
+                    if sweep_shown == 0 {
+                        // Mirrors the fully-filtered-region `continue` below, except this one SAYS
+                        // so instead of rendering nothing: "everything is behind a locked region"
+                        // is a real answer and a useful one, while an empty collapsing header
+                        // reads like a bug. Reachable only with the filter on -- with it off every
+                        // row is shown, so a non-empty `sweep_rows` always shows something.
+                        ui.text_disabled(format!(
+                            "Boss sweeps -- all {} group(s) still owed are behind a locked region",
+                            sweep_rows.len()
+                        ));
+                        ui.separator();
+                    } else {
+                        // The header follows the checkbox, chosen here rather than at build time
+                        // so it can never be a frame behind the toggle.
+                        let header = if in_logic_only {
+                            &sweep_header_filtered
+                        } else {
+                            &sweep_header
+                        };
+                        if ui.collapsing_header(
+                            format!("{header}###trk-sweeps"),
+                            imgui::TreeNodeFlags::empty(),
+                        ) {
+                            for (label, state, hidden) in &sweep_rows {
+                                if in_logic_only && *hidden {
+                                    continue;
+                                }
+                                ui.text(format!("  {label}"));
+                                ui.same_line();
+                                ui.text_disabled(format!("-- {state}"));
+                            }
+                            ui.separator();
+                        }
+                    }
+                }
                 if model.total == 0 {
                     ui.text_disabled("No location data yet -- connect to a session.");
                 }
