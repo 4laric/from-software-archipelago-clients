@@ -43,8 +43,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use log::{info, warn};
+
+use crate::utils::Loader;
 
 /// Top-level names a FromSoft DATA mod brings and this client never ships.
 ///
@@ -96,6 +99,97 @@ const AMBIGUOUS: &[&str] = &["menu"];
 /// prune anything. It exists to short-circuit triage ("this is the matt stack") not to gate logic.
 const NAMED_RANDOMIZER_SUFFIXES: &[(&str, &str)] =
     &[(".randomizeopt", "thefifthmatt ER Randomizer")];
+
+/// Whether the me3 VFS icon override can possibly be in effect this session.
+///
+/// 🛑 **THE OVERRIDE IS NOT A COSMETIC NICETY, IT IS HALF OF A FEATURE.** The AP flower is not an
+/// item. It is EquipParamGoods icon cell 92 -- the vanilla **Telescope** -- repainted by
+/// `ap-package/menu/{hi,low}/01_common.tpf.dcx`. `shop_icon` and `check_lots` write icon id 92 onto
+/// every foreign shop slot and onto the check placeholder UNCONDITIONALLY, so when the repaint is
+/// absent the write still lands and the player is shown a literal telescope. A client that writes
+/// an icon id and a bundle that does not define it are two halves of one feature
+/// (`docs/AP-ICON-PIPELINE.md` in the world repo).
+///
+/// That package is pulled in by ONE line in `ap.me3` -- `[[packages]] path = 'ap-package'` -- and
+/// only me3 reads it. Load us through thefifthmatt's randomizer "Add dll mod" button, which is a
+/// SUPPORTED and documented configuration, and the profile is never read, so the override never
+/// applies. The sheet is usually sitting right there on disk, in a folder the loader is not
+/// looking at.
+///
+/// ## The motivating case (CONTRIBUTING rule 11)
+///
+/// boblerrr played v0.3.12 that way and reported seeing no AP flower in shops (2026-08-12). His log
+/// already carried every fact needed to say so on line one: `loader = non-me3`, `ap-package/` in
+/// OURS, matt's tree one level up at `...\me3\randomizer`. Three lines that nothing read together.
+/// This type is that read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconOverride {
+    /// me3 loaded us, so `ap.me3`'s package line applies.
+    ByProfile,
+    /// A non-me3 loader, but a `menu/` sits at or above us: somebody copied it into the loader's
+    /// own mod root.
+    ///
+    /// 🛑 A NAME IS NOT A TEXTURE. This says a folder is in a place the loader will read, not that
+    /// it holds our sprite sheet. Verifying the sheet needs the archive, not a directory listing.
+    CopiedIntoModRoot,
+    /// A non-me3 loader and no `menu/` anywhere we can see. Icon cell 92 is still the Telescope.
+    Missing,
+    /// The loader never resolved, or no level was readable. No claim in either direction.
+    Unknown,
+}
+
+/// Decides [`IconOverride`] from the loader and the per-level reports. Pure -- no I/O, unit-tested.
+///
+/// `levels` is nearest-first, as [`probe_with_ancestors`] returns it, with an unreadable level as
+/// `None`. A `None` carries no evidence: it neither proves nor disproves a copied override, which
+/// is why an all-unreadable scan reports [`IconOverride::Unknown`] rather than `Missing`.
+///
+/// 🛑 The `menu/` it looks for is the AMBIGUOUS bucket, not OURS. Our own deploy files it under
+/// `ap-package/`, so a TOP-level `menu/` is by construction somebody's copy -- which under a
+/// non-me3 loader is exactly the copy this warning asks for.
+pub fn icon_override_status(loader: Loader, levels: &[Option<Report>]) -> IconOverride {
+    match loader {
+        Loader::Me3 => IconOverride::ByProfile,
+        Loader::Unknown => IconOverride::Unknown,
+        Loader::DllDirectory => {
+            if levels.iter().all(Option::is_none) {
+                return IconOverride::Unknown;
+            }
+            let copied = levels.iter().flatten().any(|report| {
+                report
+                    .ambiguous
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("menu/"))
+            });
+            if copied {
+                IconOverride::CopiedIntoModRoot
+            } else {
+                IconOverride::Missing
+            }
+        }
+    }
+}
+
+const ICON_UNKNOWN: u8 = 0;
+const ICON_BY_PROFILE: u8 = 1;
+const ICON_COPIED: u8 = 2;
+const ICON_MISSING: u8 = 3;
+
+static ICON_OVERRIDE: AtomicU8 = AtomicU8::new(ICON_UNKNOWN);
+
+/// The verdict [`log_provenance`] reached, for consumers that run later than it does.
+///
+/// Returns [`IconOverride::Unknown`] until `log_provenance` has run. The game crate reads this to
+/// tell the player in-game, because a `warn!` in a log file only reaches the players who already
+/// suspect something is wrong -- and the whole failure mode here is that nothing looks wrong.
+pub fn icon_override() -> IconOverride {
+    match ICON_OVERRIDE.load(Ordering::Relaxed) {
+        ICON_BY_PROFILE => IconOverride::ByProfile,
+        ICON_COPIED => IconOverride::CopiedIntoModRoot,
+        ICON_MISSING => IconOverride::Missing,
+        _ => IconOverride::Unknown,
+    }
+}
 
 /// How many ancestor directories to inspect above the mod directory.
 ///
@@ -268,6 +362,9 @@ pub fn log_provenance() {
     let levels = probe_with_ancestors(dir);
     let mut any_data_mod = false;
     let mut named: Vec<&'static str> = Vec::new();
+    // The nearest level that actually holds a data mod -- i.e. the folder the host loader is
+    // treating as its mod root, which is where a hand-copied `menu/` has to go.
+    let mut data_mod_root: Option<PathBuf> = None;
 
     for (idx, (path, result)) in levels.iter().enumerate() {
         let label = match idx {
@@ -293,6 +390,9 @@ pub fn log_provenance() {
         }
         if report.data_mod_present() {
             any_data_mod = true;
+            if data_mod_root.is_none() {
+                data_mod_root = Some(path.clone());
+            }
             info!(
                 "mod stack: THIRD-PARTY DATA MOD at {label} ({}) -- {}.",
                 path.display(),
@@ -320,6 +420,55 @@ pub fn log_provenance() {
             "mod stack: fingerprinted randomizer(s): {}",
             named.join(", ")
         );
+    }
+
+    // THE ICON OVERRIDE. Decided from the same scan, because the same three facts that name the
+    // stack also settle whether cell 92 is a flower or a telescope this session.
+    let reports: Vec<Option<Report>> = levels
+        .iter()
+        .map(|(_, result)| result.as_ref().ok().cloned())
+        .collect();
+    let verdict = icon_override_status(crate::utils::loader(), &reports);
+    ICON_OVERRIDE.store(
+        match verdict {
+            IconOverride::ByProfile => ICON_BY_PROFILE,
+            IconOverride::CopiedIntoModRoot => ICON_COPIED,
+            IconOverride::Missing => ICON_MISSING,
+            IconOverride::Unknown => ICON_UNKNOWN,
+        },
+        Ordering::Relaxed,
+    );
+    match verdict {
+        IconOverride::Missing => {
+            // WARN, not INFO, and the only warn in this module: every other line here is
+            // provenance, and this one is a feature announcing that it is inert (CONTRIBUTING,
+            // "Runtime visibility" -- tolerance requires telemetry).
+            warn!(
+                "mod stack: THE AP FLOWER ICON OVERRIDE IS NOT LOADED. It ships as a me3 package \
+                 and only ap.me3 pulls it in, so under this loader icon cell 92 stays the vanilla \
+                 TELESCOPE -- every AP shop slot and every check placeholder will wear one. \
+                 Nothing else is affected: the NAMES are written at runtime, so an AP item still \
+                 reads 'AP: <item> / For: <owner>', and that is the reliable marker here."
+            );
+            warn!(
+                "mod stack: to fix it, copy the `menu` folder from {} into {}, then relaunch. \
+                 (Re-running the host randomizer may overwrite its own output folder, so re-copy \
+                 if the telescopes come back.)",
+                dir.join("ap-package").display(),
+                data_mod_root.as_deref().unwrap_or(dir).display()
+            );
+        }
+        IconOverride::CopiedIntoModRoot => info!(
+            "mod stack: a top-level menu/ is present under a non-me3 loader, so the AP flower icon \
+             override looks installed by hand. NOT VERIFIED -- we can see the folder, not the \
+             sprite sheet inside it."
+        ),
+        IconOverride::ByProfile => {
+            info!("mod stack: AP flower icon override applies (me3 read ap.me3's package line).")
+        }
+        IconOverride::Unknown => info!(
+            "mod stack: AP flower icon override status unknown (loader or directory unresolved)."
+        ),
     }
 
     let report = match &levels[0].1 {
@@ -477,5 +626,97 @@ mod tests {
         let report = classify(&[Entry::file("me3.toml"), Entry::file("AP_me3.sl2")]);
         assert!(!report.data_mod_present());
         assert_eq!(report.other, vec!["AP_me3.sl2", "me3.toml"]);
+    }
+
+    /// THE MOTIVATING CASE (CONTRIBUTING rule 11), boblerrr on v0.3.12, 2026-08-12: "no AP flower
+    /// in shops". This is his directory listing, verbatim from that log -- our whole deploy
+    /// including `ap-package/` sitting in matt's `dll/` subfolder, with matt's data one level up.
+    ///
+    /// Every fact needed to explain his report is in these two listings plus the loader. The old
+    /// code logged all three and drew no conclusion, which is why it cost a session.
+    #[test]
+    fn boblers_stack_reports_a_missing_icon_override() {
+        let ours = classify(&[
+            Entry::dir("ap-package"),
+            Entry::file("apconfig.json"),
+            Entry::file("check_lots_table.json"),
+            Entry::file("eldenring_archipelago.dll"),
+            Entry::dir("log"),
+            Entry::file("shoplineup_flags.json"),
+            Entry::file("ap.me3"),
+            Entry::file("RandomizerHelper.dll"),
+        ]);
+        let matt = classify(&[
+            Entry::dir("event"),
+            Entry::dir("map"),
+            Entry::dir("msg"),
+            Entry::file("regulation.bin"),
+            Entry::dir("script"),
+            Entry::dir("sfx"),
+        ]);
+        assert_eq!(
+            icon_override_status(Loader::DllDirectory, &[Some(ours), Some(matt)]),
+            IconOverride::Missing,
+            "ap-package/ on disk is not the same as ap-package/ LOADED"
+        );
+    }
+
+    /// The negative control that decides whether this is shippable: the ordinary me3 install must
+    /// never see this warning, whatever else is in the folder.
+    #[test]
+    fn me3_never_warns_about_the_icon() {
+        let report = classify(&[Entry::dir("ap-package")]);
+        assert_eq!(
+            icon_override_status(Loader::Me3, &[Some(report)]),
+            IconOverride::ByProfile
+        );
+    }
+
+    /// The fix the warning asks for, seen from the other side: once `menu/` is copied into the
+    /// loader's mod root, the warning must stop. A warning that survives its own remedy is one
+    /// everybody learns to ignore.
+    #[test]
+    fn a_hand_copied_menu_at_the_mod_root_stops_the_warning() {
+        let ours = classify(&[Entry::dir("ap-package")]);
+        let root = classify(&[Entry::file("regulation.bin"), Entry::dir("menu")]);
+        assert_eq!(
+            icon_override_status(Loader::DllDirectory, &[Some(ours), Some(root)]),
+            IconOverride::CopiedIntoModRoot
+        );
+    }
+
+    /// Windows is case-insensitive and mod tools are inconsistent; `Menu` is the same folder.
+    #[test]
+    fn the_copied_menu_match_is_case_insensitive() {
+        let root = classify(&[Entry::dir("Menu")]);
+        assert_eq!(
+            icon_override_status(Loader::DllDirectory, &[Some(root)]),
+            IconOverride::CopiedIntoModRoot
+        );
+    }
+
+    /// 🛑 ABSENCE IN AN UNREADABLE SCAN IS NOT ABSENCE. If nothing could be read, the honest
+    /// verdict is no verdict -- not "missing", which would put a false alarm in front of a player
+    /// whose install is fine.
+    #[test]
+    fn an_unreadable_scan_makes_no_claim() {
+        assert_eq!(
+            icon_override_status(Loader::DllDirectory, &[None, None]),
+            IconOverride::Unknown
+        );
+        assert_eq!(
+            icon_override_status(Loader::DllDirectory, &[]),
+            IconOverride::Unknown
+        );
+    }
+
+    /// A loader we never resolved cannot be reasoned about either way.
+    #[test]
+    fn an_unresolved_loader_makes_no_claim() {
+        let report = classify(&[Entry::dir("ap-package")]);
+        assert_eq!(
+            icon_override_status(Loader::Unknown, &[Some(report)]),
+            IconOverride::Unknown
+        );
     }
 }

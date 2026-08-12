@@ -215,6 +215,12 @@ pub struct Core {
     /// (it always has); six toasts on every reconnect cannot. Same shape and same reason as
     /// `flask_seen` -- the first observation after a connect is a baseline, not news.
     region_toast_primed: bool,
+    /// Has the "your icon override never loaded" toast been shown this session?
+    ///
+    /// The verdict itself is decided once at startup by `shared::mod_stack`; this is only the
+    /// latch that keeps it to ONE toast rather than one per map load. A log `warn!` alone was not
+    /// enough: the failure mode is that nothing looks broken, so the player never opens the log.
+    icon_override_warned: bool,
     /// ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker): per-region gate data
     /// {threshold, member_ap_ids, bloom_flags}. Empty => feature off. Parsed once per seed.
     region_attunement: HashMap<String, RegionAttunement>,
@@ -522,6 +528,7 @@ impl shared::Core for Core {
             toast_clock: std::time::Instant::now(),
             flask_seen: None,
             region_toast_primed: false,
+            icon_override_warned: false,
             region_attunement: HashMap::new(),
             boss_payout_pending: HashMap::new(),
             attuned_regions: HashSet::new(),
@@ -3577,6 +3584,21 @@ impl shared::Core for Core {
         // the param repo being up and re-latch after one clean pass, so this costs one re-blank per load.
         let now_in_world = crate::flags::in_world();
         if now_in_world && !self.was_in_world {
+            // THE ICON OVERRIDE, ONCE. `shop_icon` writes icon cell 92 onto every foreign shop slot
+            // whether or not the me3 package that repaints it was ever loaded, so under a non-me3
+            // loader the player is shown telescopes and nothing says why. Told here rather than at
+            // startup because there is no HUD to draw on until the world exists.
+            if !self.icon_override_warned
+                && shared::mod_stack::icon_override() == shared::mod_stack::IconOverride::Missing
+            {
+                self.icon_override_warned = true;
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                // ASCII ONLY -- the game's font has no typographic quotes or dashes.
+                self.toasts.push(
+                    "AP icon override not loaded: AP items wear a Telescope. Read the name.",
+                    now,
+                );
+            }
             crate::check_lots::reset();
             // Same stream-in revert, same re-arm: the whetblade getItemFlagId repoints are
             // ItemLotParam writes too, and a reverted one flips a whetblade check back onto the
