@@ -40,6 +40,24 @@ fn parse_config(text: &str) -> Result<RawConfig> {
     Ok(json::from_str(text)?)
 }
 
+/// Serialises a [RawConfig] for disk. PRETTY, and with a trailing newline.
+///
+/// WHY PRETTY. `apconfig.json` is a file we ask players to OPEN AND EDIT BY HAND -- it is how you
+/// set the server url and the slot, and since the probe work it is also how you turn a diagnostic
+/// on without touching an environment variable. A single 96-character line is a poor thing to hand
+/// someone for that, and it is the shape `save()` produced the moment they first connected through
+/// the overlay, silently reflowing whatever they had typed.
+///
+/// 🛑 THE SHIPPED TEMPLATE MUST MATCH THIS SHAPE. `package_release.ps1` in the apworld repo writes
+/// the generic apconfig a release ships with. If that stays one line while this is pretty, the file
+/// changes shape under the player on first connect -- which is the same surprise, just delayed. The
+/// two are kept in step by convention and by `the_template_shape_is_what_we_ship` below.
+///
+/// Trailing newline because it is a text file a human opens; editors and `cat` both expect one.
+fn serialize_config(raw: &RawConfig) -> Result<String> {
+    Ok(format!("{}\n", json::to_string_pretty(raw)?))
+}
+
 /// Resolves the config from the result of reading the config file. A *missing* file yields an empty
 /// config (the connect overlay then prompts for the details); a present-but-malformed file, or any
 /// other IO error (permissions, etc.), is surfaced as an error rather than silently ignored.
@@ -72,9 +90,9 @@ impl<G: Game> Config<G> {
         })
     }
 
-    /// Saves the config file to disk.
+    /// Saves the config file to disk. See [serialize_config] for why it is pretty-printed.
     pub fn save(&self) -> Result<()> {
-        Ok(fs::write(Self::path()?, json::to_string(&self.raw)?)?)
+        Ok(fs::write(Self::path()?, serialize_config(&self.raw)?)?)
     }
 
     /// The path to the configuration file.
@@ -192,7 +210,7 @@ mod tests {
     #[test]
     fn a_probe_flag_survives_a_save_round_trip() {
         let raw = parse_config(r#"{"url":"u","slot":"s","probes":{"esd":true}}"#).expect("parses");
-        let written = json::to_string(&raw).expect("serialises");
+        let written = serialize_config(&raw).expect("serialises");
         let reread = parse_config(&written).expect("re-parses");
         assert_eq!(reread.probes.get("esd"), Some(&true));
         assert_eq!(reread, raw);
@@ -203,7 +221,7 @@ mod tests {
     #[test]
     fn an_unknown_probe_name_is_preserved() {
         let raw = parse_config(r#"{"probes":{"not_a_real_probe_yet":true}}"#).expect("parses");
-        let reread = parse_config(&json::to_string(&raw).unwrap()).expect("re-parses");
+        let reread = parse_config(&serialize_config(&raw).unwrap()).expect("re-parses");
         assert_eq!(reread.probes.get("not_a_real_probe_yet"), Some(&true));
     }
 
@@ -211,7 +229,49 @@ mod tests {
     #[test]
     fn an_empty_probe_map_is_not_written_out() {
         let raw = parse_config(r#"{"url":"u"}"#).expect("parses");
-        assert!(!json::to_string(&raw).unwrap().contains("probes"));
+        assert!(!serialize_config(&raw).unwrap().contains("probes"));
+    }
+
+    /// THE MOTIVATING CASE (CONTRIBUTING rule 11): Alaric, 2026-08-12 -- "the default apconfig,
+    /// can we write that so it's formatted across multiple lines?" It is a file we ask people to
+    /// hand-edit, and it was one 96-character line.
+    #[test]
+    fn the_config_is_written_across_multiple_lines() {
+        let raw = parse_config(r#"{"url":"u","slot":"s"}"#).expect("parses");
+        let out = serialize_config(&raw).expect("serialises");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.len() > 3, "config is still one line: {out:?}");
+        assert_eq!(lines[0], "{", "the object should open on its own line");
+        assert!(out.ends_with("}\n"), "want a closing brace and a newline: {out:?}");
+        // Every key on its own indented line -- the property a hand-editor cares about.
+        for key in ["url", "slot", "seed", "client_version", "password"] {
+            let want = format!("  \"{key}\":");
+            let found = lines.iter().any(|l| l.starts_with(&want));
+            assert!(found, "no indented line for {key} in {out:?}");
+        }
+    }
+
+    /// 🛑 CROSS-REPO: this is the exact text `package_release.ps1` (apworld repo) ships as the
+    /// generic apconfig. Pinned here because the client is what would REWRITE it -- if the two
+    /// shapes drift, a player's file silently reflows the first time they connect through the
+    /// overlay -- the surprise the pretty-printing exists to remove. Change one, change both.
+    #[test]
+    fn the_template_shape_is_what_we_ship() {
+        let shipped = concat!(
+            r#"{"url":"archipelago.gg:PORT","slot":"Player1","seed":"","#,
+            r#""client_version":null,"password":null}"#,
+        );
+        let raw = parse_config(shipped).expect("the shipped template parses");
+        let want = concat!(
+            "{\n",
+            "  \"url\": \"archipelago.gg:PORT\",\n",
+            "  \"slot\": \"Player1\",\n",
+            "  \"seed\": \"\",\n",
+            "  \"client_version\": null,\n",
+            "  \"password\": null\n",
+            "}\n",
+        );
+        assert_eq!(serialize_config(&raw).expect("serialises"), want);
     }
 
     /// A config with no `probes` key at all is ordinary, not an error -- every config in the wild
