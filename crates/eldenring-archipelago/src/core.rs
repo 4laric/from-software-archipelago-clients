@@ -4546,7 +4546,9 @@ impl Core {
         }
         // Same guard as the render site: a seed whose every group is withheld draws no rows but
         // still draws the header and the withheld line, and a row the floor never measured is a
-        // row that clips -- which is the whole of #170.
+        // row that clips -- which is the whole of #170. ONE header now (#175 measured two while
+        // `in-logic only` could pick between them; withholding is unconditional, so there is only
+        // ever one string) and every row in `sweep_rows` renders, so none of them can be skipped.
         if !sweep_rows.is_empty() || sweep_withheld > 0 {
             measured.push((sweep_header.clone(), false));
         }
