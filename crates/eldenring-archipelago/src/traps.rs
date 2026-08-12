@@ -41,6 +41,7 @@
 //! `SpEffectParam` back in and restores the vanilla values, which is exactly the bug `no_equip_load`
 //! carries a `reset()` for. Patch-then-apply costs one row write per keypress and cannot go stale.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -49,8 +50,7 @@ use eldenring::cs::{
 };
 use er_logic::safe_speffect_rows::TRAP_NO_FLASK;
 use er_logic::traps::{
-    NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, RUNEBEAR_CHARA_INIT_PARAM_ID, RUNEBEAR_CHR_ID,
-    RUNEBEAR_NPC_PARAM_ID, RUNEBEAR_THINK_PARAM_ID, Trap, rune_thief_target,
+    NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, RUNEBEAR_SPAWN, SpawnSpec, Trap, rune_thief_target,
 };
 use fromsoftware_shared::FromStatic;
 
@@ -90,7 +90,7 @@ pub fn enqueue_by_item_name(name: &str, now_ms: u64) {
 /// Returns the line to toast, or `None`. `can_fire` is formed HERE (in world) and refined inside
 /// `fire` (death guard, param streamed) -- a trap that cannot land this tick goes back to waiting
 /// rather than being consumed, which is the whole point of the queue.
-pub fn poll_pending(now_ms: u64) -> Option<&'static str> {
+pub fn poll_pending(now_ms: u64) -> Option<Cow<'static, str>> {
     let Ok(mut guard) = PENDING.lock() else {
         return None;
     };
@@ -134,7 +134,10 @@ pub fn enabled() -> bool {
 /// 🛑 Individually fallible and swallowed, by design: issue #114 rule 1, and the reason is F4 --
 /// one bad item must not drop the whole batch. A trap that cannot fire says so and is skipped; it
 /// never propagates an error into the receive path it will eventually live in.
-pub fn fire(trap: Trap) -> Option<&'static str> {
+///
+/// `Cow` rather than `&'static str` because a parameterised spawn's line is minted from the ids in
+/// its item name -- there is no static to borrow. Every caller already `to_string`s it.
+pub fn fire(trap: Trap) -> Option<Cow<'static, str>> {
     if !crate::flags::in_world() {
         log::info!("trap {}: not in world -- skipped", trap.key());
         return None;
@@ -142,7 +145,10 @@ pub fn fire(trap: Trap) -> Option<&'static str> {
     let ok = match trap {
         Trap::RuneThief => fire_rune_thief(),
         Trap::NoFlask => fire_no_flask(),
-        Trap::Runebear => fire_runebear(),
+        // The legacy variant is a `SpawnSpec` in everything but its name, so it goes down the same
+        // path -- one spawn implementation, not two that can drift.
+        Trap::Runebear => fire_spawn(RUNEBEAR_SPAWN),
+        Trap::Spawn(spec) => fire_spawn(spec),
     };
     ok.then(|| trap.toast())
 }
@@ -163,11 +169,14 @@ fn fire_rune_thief() -> bool {
     }
 }
 
-/// Put a Runebear where the player is standing.
+/// Put `spec.count` of a creature where the player is standing.
 ///
 /// `WorldChrMan::spawn_debug_character` is typed and takes exactly the four ids plus a position.
-/// The ids are DERIVED (see `er_logic::traps` and the NpcName decode above them) rather than
-/// recalled -- the recollection I started from was wrong by 330 model numbers.
+/// The ids are not this crate's to invent: they arrive in the ITEM NAME and `SpawnSpec` has already
+/// refused anything whose npc/think rows are outside the model's family (the failure that would
+/// otherwise give one creature's body another's brain). For the Runebear they are DERIVED (see
+/// `er_logic::traps` and the NpcName decode above them) rather than recalled -- the recollection I
+/// started from was wrong by 330 model numbers.
 ///
 /// 🛑 SPAWNED AT THE PLAYER'S OWN POSITION, on purpose, for three reasons:
 ///   1. it is the ask -- bobler's line was "enemy horde on your head";
@@ -180,7 +189,11 @@ fn fire_rune_thief() -> bool {
 /// 🛑 NO DEATH GUARD, and that is deliberate rather than an omission: this reads
 /// `modules.physics.position` and never touches `special_effect`, which is the list that CTDs at
 /// the death cam. `in_world` in `fire` is its only precondition.
-fn fire_runebear() -> bool {
+///
+/// All `count` requests go to that ONE identical point, also on purpose: the debug creator resolves
+/// the overlap itself, and any per-creature offset would re-introduce exactly the wall/cliff/floor
+/// risk reason 2 above exists to avoid -- multiplied by the count.
+fn fire_spawn(spec: SpawnSpec) -> bool {
     // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract every
     // other player write in this crate relies on.
     let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
@@ -191,27 +204,34 @@ fn fire_runebear() -> bool {
     };
     let pos = player.chr_ins.modules.physics.position;
     let request = ChrDebugSpawnRequest {
-        chr_id: RUNEBEAR_CHR_ID,
-        chara_init_param_id: RUNEBEAR_CHARA_INIT_PARAM_ID,
-        npc_param_id: RUNEBEAR_NPC_PARAM_ID,
-        npc_think_param_id: RUNEBEAR_THINK_PARAM_ID,
-        // Not an EMEVD entity and nothing to talk to: this bear exists for the joke, so it carries
-        // no event id a script could key on and no talk id.
+        chr_id: spec.chr_id,
+        chara_init_param_id: SpawnSpec::CHARA_INIT_PARAM_ID,
+        npc_param_id: spec.npc_param_id,
+        npc_think_param_id: spec.think_param_id,
+        // Not an EMEVD entity and nothing to talk to: these exist for the joke, so they carry no
+        // event id a script could key on and no talk id. One request value, reused: the fields are
+        // identical for every copy, including the position.
         event_entity_id: 0,
         talk_id: 0,
         pos_x: pos.0,
         pos_y: pos.1,
         pos_z: pos.2,
     };
-    wcm.spawn_debug_character(&request);
+    for _ in 0..spec.count {
+        wcm.spawn_debug_character(&request);
+    }
     log::info!(
-        "trap runebear: spawn requested -- c{RUNEBEAR_CHR_ID} npc={RUNEBEAR_NPC_PARAM_ID} \
-         think={RUNEBEAR_THINK_PARAM_ID} at ({}, {}, {})",
+        "trap spawn: {} x c{} requested -- npc={} think={} chara_init={} at ({}, {}, {})",
+        spec.count,
+        spec.chr_id,
+        spec.npc_param_id,
+        spec.think_param_id,
+        SpawnSpec::CHARA_INIT_PARAM_ID,
         pos.0,
         pos.1,
         pos.2
     );
-    // 🛑 It is a REQUEST: the debug creator spawns on its own schedule, so `true` here means
+    // 🛑 They are REQUESTS: the debug creator spawns on its own schedule, so `true` here means
     // "asked", not "standing there". The player finds out within a second either way.
     true
 }
