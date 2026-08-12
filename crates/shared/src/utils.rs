@@ -146,6 +146,60 @@ pub fn current_module_directory() -> Result<PathBuf> {
         .to_path_buf())
 }
 
+/// Every 64-bit module currently loaded in this process, by full path.
+///
+/// 🛑 **THE LIST WE ALREADY HAD AND THREW AWAY.** [`try_load_mod_directory`] enumerates exactly
+/// this, walks all of it, keeps the one entry named `me3_mod_host.dll` and discards the rest --
+/// and it runs inside `start_logger`, *before* a logger exists, so even its `Found N loaded DLLs`
+/// line goes to stdout and never reaches the log file a player sends us. So "we cannot tell what
+/// else is loaded" was never true; we just never asked twice.
+///
+/// This is the instrument [`crate::mod_stack`] does not have. That module reads the mod DIRECTORY,
+/// which is right for a DATA mod (matt's randomizer ships no DLL at all and is invisible to any
+/// module list) and useless for a DLL: a file sitting beside us proves it is installed, never that
+/// it was loaded. `RandomizerHelper.dll` is the live example -- it is in boblerrr's folder and we
+/// cannot say from that whether his launcher loaded it.
+///
+/// 🛑 Deliberately NOT shared code with [`try_load_mod_directory`]. That function resolves the mod
+/// directory before logging exists and every session depends on it. This one is a diagnostic, and
+/// a diagnostic must not be able to break the loader.
+pub fn loaded_modules() -> Result<Vec<PathBuf>> {
+    // Size, then fill. A module can be loaded between the two passes, so the retry is not
+    // paranoia -- it is the documented contract of EnumProcessModulesEx.
+    let module_size = mem::size_of::<HMODULE>() as u32;
+    let mut size = 512u32;
+    for _ in 0..2 {
+        let mut modules = vec![MaybeUninit::<HMODULE>::uninit(); size as usize];
+        let mut bytes_needed: u32 = 0;
+        unsafe {
+            EnumProcessModulesEx(
+                GetCurrentProcess(),
+                modules.as_mut_ptr().cast(),
+                module_size * size,
+                &raw mut bytes_needed,
+                // 64-bit modules only, matching try_load_mod_directory.
+                ENUM_PROCESS_MODULES_EX_FLAGS(2),
+            )?;
+        }
+        let needed = bytes_needed / module_size;
+        if needed > size {
+            size = needed;
+            continue;
+        }
+        let mut out = Vec::with_capacity(needed as usize);
+        for module in &modules[..needed as usize] {
+            // One unreadable module must not lose the whole list; the count still reports it.
+            if let Ok(path) = get_module_path(unsafe { module.assume_init() }) {
+                out.push(path);
+            }
+        }
+        return Ok(out);
+    }
+    Err(Error::msg(
+        "the module list kept growing between sizing it and reading it",
+    ))
+}
+
 /// Passes an array of the given [size] to [EnumProcessModules] to attempt to
 /// find the mod location.
 ///
