@@ -4,12 +4,15 @@
 //! invented. Lines marked `// VERIFY` are the spots most likely to need a tweak on the first
 //! Windows build (the Phase 1-5 builds each had one or two of these).
 
-use std::time::Duration;
+use std::thread;
+use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use eldenring::cs::{CSTaskGroupIndex, CSTaskImp, WorldChrMan};
 use eldenring::fd4::FD4TaskData;
+use er_logic::startup_retry::{DEFAULT_ATTEMPT_TIMEOUT, Next, RetryPolicy};
 use fromsoftware_shared::{FromStatic, SharedTaskImpExt};
+use log::{info, warn};
 
 /// One-line build identity for the connect banner: `<pkg-version> (<sha> @ <build-time>)`.
 /// SHA + build time are stamped into the env by `build.rs`.
@@ -49,9 +52,9 @@ impl shared::Game for EldenRing {
     /// (DS3/Sekiro keep the default `false` inventory-scan-convert model.) Requires the shared change.
     const OWN_WORLD: bool = true;
 
-    /// Schedule per-frame work on CSTaskImp / FrameBegin — the same idiom the existing client uses.
+    /// Schedule per-frame work on CSTaskImp / FrameBegin -- the same idiom the existing client uses.
     fn run_recurring_task(mut task: impl FnMut() + 'static + Send) -> Result<()> {
-        CSTaskImp::wait_for_instance(Duration::MAX)?.run_recurring(
+        wait_for_task_scheduler()?.run_recurring(
             move |_: &'_ FD4TaskData| task(),
             CSTaskGroupIndex::FrameBegin,
         ); // VERIFY closure arg type
@@ -64,6 +67,54 @@ impl shared::Game for EldenRing {
         match unsafe { WorldChrMan::instance() } {
             Ok(wcm) => wcm.main_player.as_ref().is_none(),
             Err(_) => true,
+        }
+    }
+}
+
+/// Ask the game for `CSTaskImp`, retrying while its singleton map is still being built.
+///
+/// `CSTaskImp::wait_for_instance` loops on `InstanceError::Null` but *returns* on
+/// `InstanceError::NotFound`, and `NotFound` is precisely the transient case: `from-singleton`
+/// documents `map()` as "may not contain all singletons if it is called before Dantelion2
+/// reflection is initialized by the process". `wait_for_system_init` only waits on the CSWindow
+/// `hInstance`, which is set earlier than that, so it can hand us a window in which `CSTask` is not
+/// in the map yet. That surfaced to players as a fatal `Could not translate RVA to VA` modal over a
+/// perfectly healthy game (4laric/er-archipelago#475), on an install that had launched fine minutes
+/// before. Retrying is the whole fix; see [`er_logic::startup_retry`] for the policy and the
+/// evidence.
+///
+/// Note the finite per-attempt timeout. `Duration::MAX` made `SystemInitError::Timeout`
+/// unconstructible, so a game that genuinely never came up reported the same misleading text.
+fn wait_for_task_scheduler() -> Result<&'static CSTaskImp> {
+    let policy = RetryPolicy::default();
+    let started = Instant::now();
+    let mut attempts: u32 = 0;
+
+    loop {
+        attempts += 1;
+
+        match CSTaskImp::wait_for_instance(DEFAULT_ATTEMPT_TIMEOUT) {
+            Ok(scheduler) => {
+                if attempts > 1 {
+                    info!(
+                        "CSTask was not registered yet on startup; got it on attempt {attempts} after {:?}.",
+                        started.elapsed(),
+                    );
+                }
+                return Ok(scheduler);
+            }
+            Err(err) => {
+                if attempts == 1 {
+                    warn!("CSTask lookup failed on the first attempt ({err}); retrying.");
+                }
+
+                match policy.after_failure(started.elapsed()) {
+                    Next::RetryAfter(delay) => thread::sleep(delay),
+                    Next::GiveUp => {
+                        bail!(policy.give_up_message(attempts, started.elapsed(), &err.to_string()))
+                    }
+                }
+            }
         }
     }
 }
