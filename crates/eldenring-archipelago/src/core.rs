@@ -4559,9 +4559,15 @@ impl Core {
             measured.push((line.clone(), false));
         }
         if !sweep_rows.is_empty() {
+            // BOTH headers. The `in-logic only` checkbox is read inside the closure and can flip
+            // on this very frame, so either string can be the one drawn; measuring only one would
+            // let the window under-size for exactly one frame after every toggle.
             measured.push((sweep_header.clone(), false));
+            measured.push((sweep_header_filtered.clone(), false));
         }
-        for (label, state) in &sweep_rows {
+        // Every row, INCLUDING the ones `in-logic only` is hiding right now -- unticking the box
+        // must not need a second frame to widen the window.
+        for (label, state, _hidden) in &sweep_rows {
             measured.push((format!("  {label} -- {state}"), false));
         }
         for region in &model.regions {
