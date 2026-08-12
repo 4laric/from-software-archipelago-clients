@@ -50,7 +50,8 @@ use eldenring::cs::{
 };
 use er_logic::safe_speffect_rows::TRAP_NO_FLASK;
 use er_logic::traps::{
-    NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, RUNEBEAR_SPAWN, SpawnSpec, Trap, rune_thief_target,
+    NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, RUNEBEAR_SPAWN, SpawnSpec, Trap, classify_refusal,
+    rune_thief_target,
 };
 use fromsoftware_shared::FromStatic;
 
@@ -66,13 +67,22 @@ static WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Queue a trap that arrived as an AP item. Called from the receive loop, which knows the NAME.
 ///
-/// Unknown `Trap: ...` names are logged and dropped ON PURPOSE: that is a world newer than this
-/// client, and firing the wrong effect is worse than firing none.
+/// A name this build cannot read is logged and dropped ON PURPOSE: firing the wrong effect is
+/// worse than firing none, and the ids in a spawn name go straight to the game's debug creator.
+///
+/// 🛑 THE WORDS COME FROM er-logic, and that is the fix rather than a tidy-up. This line used to
+/// say "A newer world minted it; update the client rather than guessing which effect was meant."
+/// On 2026-08-12 a live seed sent `Trap: c2120 (2120/21200000/21200000 x1)` -- the OLD three-field
+/// payload, from a world that had NOT taken the change this client had -- and that sentence sent
+/// the maintainer into the wrong repository. `classify_refusal` establishes the direction before
+/// naming one, and holds the sentence where it can be host-tested.
 pub fn enqueue_by_item_name(name: &str, now_ms: u64) {
     let Some(trap) = Trap::from_item_name(name) else {
+        // ONE line, and the diagnosis is a value rather than a literal: the client keeps no copy
+        // of the words, so there is one place to fix when they are wrong again.
         log::warn!(
-            "trap item {name:?} is not one this client knows -- ignored. A newer world minted it; \
-             update the client rather than guessing which effect was meant."
+            "trap item {name:?} is not one this client can fire -- ignored. {}",
+            classify_refusal(name).advice()
         );
         return;
     };
