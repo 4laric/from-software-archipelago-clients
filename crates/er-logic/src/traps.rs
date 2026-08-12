@@ -17,8 +17,8 @@
 //!   `effectEndurance 5`, `spCategory 0` -- so this is one `apply_speffect` on a row we own, not
 //!   the input-hook problem the design originally filed it as.
 //!
-//! ...plus SPAWN traps, which are open-ended: the world mints the three spawn ids INTO the item
-//! name and the client parses them out ([`SpawnSpec`]). 🛑 That is the point of the design -- the
+//! ...plus SPAWN traps, which are open-ended: the world mints the spawn ids INTO the item name
+//! and the client parses them out ([`SpawnSpec`]). 🛑 That is the point of the design -- the
 //! client holds NO creature table, so a world that learns a new creature needs no client release,
 //! and there is no id list here to drift out of date. `Trap: Runebear` predates it and survives as
 //! its own fixed variant because that exact name is already in the wild.
@@ -200,6 +200,15 @@ pub struct SpawnSpec {
     /// `NpcParam` row -- the body: hp, damage, what it drops.
     pub npc_param_id: i32,
     /// `NpcThinkParam` row -- the brain. Without a live one the creature stands there.
+    ///
+    /// 🛑 DERIVED, NOT CARRIED: `chr_id * `[`THINK_PARAM_MULTIPLIER`], computed once by
+    /// [`SpawnSpec::new`] and no longer present in the item name. It is redundant BY CONSTRUCTION
+    /// rather than by luck -- see that constant for the eligibility rule that makes it so, and
+    /// `the_think_row_is_always_the_family_template` for the test that fails if it stops holding.
+    ///
+    /// 🛑 STILL A REAL FIELD, deliberately. The client reads it straight into
+    /// `ChrDebugSpawnRequest`; deriving it at that use site would put the arithmetic next to an FFI
+    /// struct instead of next to its justification, which is here.
     pub think_param_id: i32,
     /// How many. `1..=MAX_SPAWN_COUNT`.
     pub count: u32,
@@ -253,6 +262,29 @@ const _: () = assert!(
     "a horde large enough to hang the game is a save-ruining bug, not a trap"
 );
 
+/// A model's `NpcThinkParam` row is `chr_id *` this -- the family template, `<chr>0000`.
+///
+/// 🛑 AN ELIGIBILITY RULE, NOT AN OBSERVED PATTERN, which is the whole difference between dropping
+/// a field and dropping a field we will want back. The world admits a model to its spawn table
+/// ONLY when `NpcThinkParam` has a row at exactly `<chr>0000`: a model with no template row has no
+/// brain to give the spawned creature, so it never becomes a trap in the first place. Every name
+/// the world can mint therefore satisfies this by construction, and the committed table agrees --
+/// 0 of 390 rows deviate.
+///
+/// 🛑 `npc_param_id` IS NOT DERIVABLE THE SAME WAY and is not treated as if it were: 300 of those
+/// same 390 rows differ from their `<chr>0000` template (the Runebear's own `46300010` among
+/// them), because that is where hp, damage and rune payout live. It still travels in the name.
+pub const THINK_PARAM_MULTIPLIER: i32 = 10_000;
+
+// The derivation must not be able to leave `i32`, because [`SpawnSpec::new`] runs BEFORE the range
+// check in `is_sane` and a hand-built spec may hand it anything. `100..=9999` times this is
+// `99_990_000`, comfortably inside `i32` -- asserted here so a future widening of either number
+// fails the BUILD rather than wrapping a param row id in somebody's session.
+const _: () = assert!(
+    9_999i64 * THINK_PARAM_MULTIPLIER as i64 <= i32::MAX as i64,
+    "the widest plausible model number overflows its think row"
+);
+
 impl SpawnSpec {
     /// `chara_init_param_id` for a spawned creature: none.
     ///
@@ -271,13 +303,12 @@ impl SpawnSpec {
     ///
     /// `const`, so [`RUNEBEAR_SPAWN`] can stay a `const` and a built-in label that outgrew the cap
     /// fails the BUILD rather than a session.
-    pub const fn new(
-        chr_id: i32,
-        npc_param_id: i32,
-        think_param_id: i32,
-        count: u32,
-        label: &str,
-    ) -> Option<Self> {
+    ///
+    /// 🛑 IT ALSO DERIVES `think_param_id`, and this is the ONE place that arithmetic happens --
+    /// deliberately, so the multiplication sits next to the rule that justifies it
+    /// ([`THINK_PARAM_MULTIPLIER`]) rather than beside the FFI struct that consumes it. Every
+    /// `SpawnSpec` in existence comes through here, so there is no second derivation to drift.
+    pub const fn new(chr_id: i32, npc_param_id: i32, count: u32, label: &str) -> Option<Self> {
         let bytes = label.as_bytes();
         if bytes.len() > LABEL_CAP {
             return None;
@@ -296,7 +327,12 @@ impl SpawnSpec {
         Some(Self {
             chr_id,
             npc_param_id,
-            think_param_id,
+            // SATURATING, not plain `*`: `is_sane` has not run yet (it cannot -- it reads the value
+            // this expression produces), so a hand-built `chr_id` of `i32::MAX` reaches here. An
+            // overflow panic in the RECEIVE path costs the player the session; a saturated row id
+            // costs nothing, because `is_sane` refuses anything outside `100..=9999` immediately
+            // after.
+            think_param_id: chr_id.saturating_mul(THINK_PARAM_MULTIPLIER),
             count,
             label: buf,
             // Fits, by the compile-time assert on `LABEL_CAP` and the length check above.
@@ -362,39 +398,59 @@ impl SpawnSpec {
         )
     }
 
-    /// The item name this spec round-trips through.
+    /// The item name this spec round-trips through: `Trap: <label> x<count> (<chr>/<npc>)`.
     ///
     /// 🛑 CROSS-REPO STRING CONTRACT, and a wider one than the fixed names: the world mints this
-    /// shape for creatures this client has never heard of. `Trap: <label> (<chr>/<npc>/<think>
-    /// x<count>)`. Change the shape on one side and every spawn trap in the pool becomes an
-    /// unrecognised name that is logged and dropped.
+    /// shape for creatures this client has never heard of. Change the shape on one side and every
+    /// spawn trap in the pool becomes an unrecognised name that is logged and dropped.
+    ///
+    /// 🛑 THE READABLE HALF COMES FIRST, AND THE COUNT WITH IT, because an item name is not only
+    /// something the client parses -- it is something a PLAYER TYPES. Archipelago resolves
+    /// `!getitem` and `/send` through `get_intended_text`, a fuzzy match at a 75% threshold. Of the
+    /// 390 spawn names the world mints, 389 have no `NpcName.fmg` entry and fall back to a
+    /// `c<NNNN>` label, so with the payload in front they were 389 near-identical runs of digits
+    /// and the server answered "Too many close matches" rather than sending anything. Leading with
+    /// the text that actually differs makes the match key on it.
+    ///
+    /// 🛑 `think_param_id` IS NOT IN THE NAME. It is `chr_id * `[`THINK_PARAM_MULTIPLIER`] by the
+    /// world's own eligibility rule, so carrying it was carrying a second copy of `chr_id` that
+    /// could disagree with the first -- and the shorter the name, the further apart the fuzzy
+    /// matcher can tell two of them.
+    ///
+    /// 🛑 THIS SHAPE CHANGE IS FREE ONLY INSIDE THE OPEN v0.3.12 WINDOW. Nothing is tagged, so no
+    /// seed in flight was minted against the old shape. AFTER a tag it is a COMPAT BREAK in the
+    /// worst way: an in-flight seed's item names are fixed at generation, and a client that
+    /// understands only one shape logs-and-drops every spawn trap the other side minted. Move both
+    /// repos together, or not at all.
     pub fn item_name(self) -> String {
         format!(
-            "{ITEM_PREFIX}{} ({}/{}/{} x{})",
+            "{ITEM_PREFIX}{} x{} ({}/{})",
             self.label(),
+            self.count,
             self.chr_id,
-            self.npc_param_id,
-            self.think_param_id,
-            self.count
+            self.npc_param_id
         )
     }
 
-    /// Parse `Trap: <label> (<chr>/<npc>/<think> x<count>)`, or `None`.
+    /// Parse `Trap: <label> x<count> (<chr>/<npc>)`, or `None`.
     ///
     /// 🛑 STRICT, AND IT REFUSES RATHER THAN GUESSES -- the same rule the exact-match arm follows,
     /// for a stronger reason: these ids go straight to the game's debug creator. A field that is
-    /// nearly a number, or a think row belonging to a different creature, is not a name to be
+    /// nearly a number, or an npc row belonging to a different creature, is not a name to be
     /// generous about. Every branch below returns `None` on a doubt:
     ///
     /// * prefix `Trap: ` and a trailing `)`;
     /// * the payload opens at the LAST ` (` -- a label may carry one of its own, a payload may not;
-    /// * exactly three `/` fields, the third split by exactly one ` x`;
-    /// * all four fields parse (`i32`, `i32`, `i32`, `u32`);
+    /// * exactly two `/` fields, both parsing as `i32`. 🛑 EXACTLY two, so the OLD three-field
+    ///   shape is REFUSED rather than half-parsed -- see
+    ///   `the_old_three_field_payload_is_refused_not_half_parsed`;
+    /// * the readable half splits at its LAST ` x` -- a label may carry one of those too
+    ///   (`Crab x2`), and the count is always the final one;
+    /// * `count` parses as `u32` and is `1..=MAX_SPAWN_COUNT`;
     /// * `chr` is a plausible model number, `100..=9999`;
-    /// * `npc` and `think` are IN THE `chr` FAMILY (their decimal ids start with its digits) --
-    ///   the same check `the_runebear_param_rows_belong_to_its_model` makes, because a body running
-    ///   another creature's brain is the failure it catches;
-    /// * `count` is `1..=MAX_SPAWN_COUNT`;
+    /// * `npc` is IN THE `chr` FAMILY (its decimal id starts with the model's digits) -- the same
+    ///   check `the_runebear_param_rows_belong_to_its_model` makes, because a body running another
+    ///   creature's stat block is the failure it catches;
     /// * the label is non-empty and ASCII (it reaches the in-game font);
     /// * 🛑 the label is at most [`LABEL_CAP`] bytes -- REFUSED, not truncated, exactly like every
     ///   other malformed payload here. The label is retained INLINE so [`SpawnSpec`] stays `Copy`
@@ -403,36 +459,39 @@ impl SpawnSpec {
     ///   cannot faithfully repeat. Truncating would silently rename the creature in the one line
     ///   the player reads, and a trap that lies about what arrived is worse than one that never
     ///   fires.
+    ///
+    /// 🛑 `think_param_id` IS NOT READ FROM THE NAME -- it is not there. The checked constructor
+    /// derives it (see [`THINK_PARAM_MULTIPLIER`]), which is the only reason this parser is allowed
+    /// to be one field shorter than the thing it produces.
     pub fn from_item_name(name: &str) -> Option<Self> {
         let body = name.strip_prefix(ITEM_PREFIX)?.strip_suffix(')')?;
         // LAST ` (`, so a label carrying one of its own cannot swallow the payload.
-        let (label, payload) = body.rsplit_once(" (")?;
+        let (readable, payload) = body.rsplit_once(" (")?;
+
+        // EXACTLY two, checked rather than taken from the front: `split` yields the first two of
+        // three just as happily, and a world still minting the OLD `<chr>/<npc>/<think>` payload
+        // would be silently half-parsed into a spec whose think row it never agreed to. The two
+        // repos move together or this fails loudly.
+        let mut fields = payload.split('/');
+        let chr = fields.next()?;
+        let npc = fields.next()?;
+        if fields.next().is_some() {
+            return None;
+        }
+
+        // LAST ` x` again, and for the same reason as the ` (` above: `Crab x2` is a label somebody
+        // may legitimately write, and the count is whatever follows the FINAL one.
+        let (label, count) = readable.rsplit_once(" x")?;
         if label.is_empty() || !label.is_ascii() {
             return None;
         }
 
-        // EXACTLY three, checked rather than taken from the front: `split` yields the first three
-        // of four just as happily, and the fourth would be silently discarded.
-        let mut fields = payload.split('/');
-        let chr = fields.next()?;
-        let npc = fields.next()?;
-        let tail = fields.next()?;
-        if fields.next().is_some() {
-            return None;
-        }
-        let mut halves = tail.split(" x");
-        let think = halves.next()?;
-        let count = halves.next()?;
-        if halves.next().is_some() {
-            return None;
-        }
-
-        // Through the CHECKED constructor, which is where the label cap is enforced: a label the
-        // buffer cannot hold whole is refused here, exactly like a count the game cannot survive.
+        // Through the CHECKED constructor, which is where the label cap is enforced and where the
+        // think row is derived: a label the buffer cannot hold whole is refused here, exactly like
+        // a count the game cannot survive.
         let spec = SpawnSpec::new(
             chr.parse().ok()?,
             npc.parse().ok()?,
-            think.parse().ok()?,
             count.parse().ok()?,
             label,
         )?;
@@ -448,9 +507,12 @@ impl SpawnSpec {
         if !(1..=MAX_SPAWN_COUNT).contains(&self.count) {
             return false;
         }
+        // The npc row only. `think_param_id` is `chr_id * THINK_PARAM_MULTIPLIER`, so it is in the
+        // family BY CONSTRUCTION and checking it here would be a tautology dressed as a guard --
+        // `the_think_row_is_always_the_family_template` is where that premise is actually held to
+        // account.
         let family = self.chr_id.to_string();
         self.npc_param_id.to_string().starts_with(&family)
-            && self.think_param_id.to_string().starts_with(&family)
     }
 }
 
@@ -480,6 +542,11 @@ pub const RUNEBEAR_CHR_ID: i32 = 4630;
 pub const RUNEBEAR_NPC_PARAM_ID: i32 = 46_300_010;
 
 /// The think (AI) row -- the family's base entry. The bear has to actually come after you.
+///
+/// 🛑 NO LONGER PASSED TO [`SpawnSpec::new`]; it is DERIVED there, and this constant is now the
+/// number that derivation has to reproduce. It was hand-derived from `NpcThinkParam` in 2026-08-10
+/// long before the `<chr>0000` rule was known, so it is the independent witness for it:
+/// `4630 * 10_000 == 46_300_000`, asserted in `the_think_row_is_always_the_family_template`.
 pub const RUNEBEAR_THINK_PARAM_ID: i32 = 46_300_000;
 
 /// `chara_init_param_id` for a non-humanoid: none. Kept as its own name because the client imports
@@ -494,18 +561,13 @@ pub const RUNEBEAR_CHARA_INIT_PARAM_ID: i32 = SpawnSpec::CHARA_INIT_PARAM_ID;
 /// It carries the label "Runebear" so that `Trap::Spawn(RUNEBEAR_SPAWN)` names the creature the way
 /// the fixed [`Trap::Runebear`] line does. 🛑 The bare name `Trap: Runebear` still resolves to the
 /// fixed variant -- the exact-match arm wins before the parser ever sees it.
-pub const RUNEBEAR_SPAWN: SpawnSpec = match SpawnSpec::new(
-    RUNEBEAR_CHR_ID,
-    RUNEBEAR_NPC_PARAM_ID,
-    RUNEBEAR_THINK_PARAM_ID,
-    1,
-    "Runebear",
-) {
-    Some(spec) => spec,
-    // 🛑 A BUILD FAILURE, not a runtime fallback. The only way `new` refuses a literal is a label
-    // that outgrew `LABEL_CAP` or stopped being ASCII, and either is an edit somebody must see.
-    None => panic!("the Runebear label does not fit LABEL_CAP"),
-};
+pub const RUNEBEAR_SPAWN: SpawnSpec =
+    match SpawnSpec::new(RUNEBEAR_CHR_ID, RUNEBEAR_NPC_PARAM_ID, 1, "Runebear") {
+        Some(spec) => spec,
+        // 🛑 A BUILD FAILURE, not a runtime fallback. The only way `new` refuses a literal is a label
+        // that outgrew `LABEL_CAP` or stopped being ASCII, and either is an edit somebody must see.
+        None => panic!("the Runebear label does not fit LABEL_CAP"),
+    };
 
 /// Rune Thief's new total: half, rounded down.
 ///
@@ -739,6 +801,19 @@ mod tests {
     fn item_names_are_the_ones_the_world_mints() {
         assert_eq!(Trap::RuneThief.item_name(), "Trap: Rune Thief");
         assert_eq!(Trap::NoFlask.item_name(), "Trap: No Flask");
+        // 🛑 THE PARAMETERISED SHAPE, pinned as a LITERAL rather than as a round trip, because a
+        // round trip agrees with itself no matter which shape both halves moved to. This is the
+        // byte-for-byte string `greenfield/eldenring/gen_data/spawn_traps.py` mints for all 390
+        // rows: readable half first (`get_intended_text` fuzzy-matches on it), payload last, and
+        // NO think row.
+        assert_eq!(
+            Trap::Spawn(spec(4150, 41_500_060, 3, "Basilisk")).item_name(),
+            "Trap: Basilisk x3 (4150/41500060)"
+        );
+        assert_eq!(
+            Trap::Spawn(spec(4630, 46_300_010, 1, "c4630")).item_name(),
+            "Trap: c4630 x1 (4630/46300010)"
+        );
     }
 
     #[test]
@@ -766,14 +841,8 @@ mod tests {
     /// Fixture builder. Every spec below is built through the CHECKED constructor because that is
     /// the only way the label can be set at all -- the buffer is private -- which also means a
     /// fixture that outgrew `LABEL_CAP` fails loudly here rather than quietly parsing differently.
-    fn spec(
-        chr_id: i32,
-        npc_param_id: i32,
-        think_param_id: i32,
-        count: u32,
-        label: &str,
-    ) -> SpawnSpec {
-        SpawnSpec::new(chr_id, npc_param_id, think_param_id, count, label)
+    fn spec(chr_id: i32, npc_param_id: i32, count: u32, label: &str) -> SpawnSpec {
+        SpawnSpec::new(chr_id, npc_param_id, count, label)
             .expect("fixture label must be ASCII and fit LABEL_CAP")
     }
 
@@ -788,10 +857,13 @@ mod tests {
     fn a_spawn_spec_round_trips_through_its_item_name() {
         let specs = [
             // Basilisk, the motivating case (issue #114 / the trap the world mints first).
-            spec(4150, 41_500_060, 41_500_000, 3, "Basilisk"),
+            spec(4150, 41_500_060, 3, "Basilisk"),
             // A label with a SPACE in it, which is also the shape that would let a payload be
             // swallowed if the split ever moved off the LAST ` (`.
-            spec(3210, 32_100_000, 32_100_000, 1, "Giant Crab"),
+            spec(3210, 32_100_000, 1, "Giant Crab"),
+            // A label carrying the COUNT DELIMITER, which is the shape that would lose its tail if
+            // the readable half ever split on the FIRST ` x` instead of the last.
+            spec(2270, 22_700_000, 3, "Crab x2"),
             // Both ends of the count range, which is where an off-by-one would live.
             SpawnSpec {
                 count: MAX_SPAWN_COUNT,
@@ -800,10 +872,10 @@ mod tests {
             RUNEBEAR_SPAWN,
             // A three-digit model: the family prefix check is a STRING prefix, so a shorter chr id
             // is the case that would wrongly pass or wrongly fail it.
-            spec(100, 10_000_000, 10_000_000, 2, "c100"),
+            spec(100, 10_000_000, 2, "c100"),
         ];
         // WITNESS: an empty list would make every assertion below vacuously true.
-        assert_eq!(specs.len(), 5, "the round-trip corpus was emptied");
+        assert_eq!(specs.len(), 6, "the round-trip corpus was emptied");
         for spec in specs {
             let name = spec.item_name();
             let Some(Trap::Spawn(back)) = Trap::from_item_name(&name) else {
@@ -824,21 +896,21 @@ mod tests {
     /// fires.
     #[test]
     fn the_worlds_own_label_parses_to_the_ids_it_carries() {
-        let basilisk = spec(4150, 41_500_060, 41_500_000, 3, "Basilisk");
+        let basilisk = spec(4150, 41_500_060, 3, "Basilisk");
         assert_eq!(
-            Trap::from_item_name("Trap: Basilisk (4150/41500060/41500000 x3)"),
+            Trap::from_item_name("Trap: Basilisk x3 (4150/41500060)"),
             Some(Trap::Spawn(basilisk))
         );
         assert_eq!(
-            Trap::from_item_name("Trap: c3210 (3210/32100000/32100000 x1)"),
-            Some(Trap::Spawn(spec(3210, 32_100_000, 32_100_000, 1, "c3210")))
+            Trap::from_item_name("Trap: c3210 x1 (3210/32100000)"),
+            Some(Trap::Spawn(spec(3210, 32_100_000, 1, "c3210")))
         );
         // A label with spaces and punctuation is still just a label -- the payload opens at the
         // LAST ` (`, which is what makes that safe. 🛑 It parses to the same IDS as the basilisk
         // above and NOT to the same spec: the label is retained, so it is part of the value.
-        let crab = spec(4150, 41_500_060, 41_500_000, 3, "Giant Crab (Ruin)");
+        let crab = spec(4150, 41_500_060, 3, "Giant Crab (Ruin)");
         assert_eq!(
-            Trap::from_item_name("Trap: Giant Crab (Ruin) (4150/41500060/41500000 x3)"),
+            Trap::from_item_name("Trap: Giant Crab (Ruin) x3 (4150/41500060)"),
             Some(Trap::Spawn(crab))
         );
         assert_eq!(crab.chr_id, basilisk.chr_id);
@@ -855,17 +927,19 @@ mod tests {
     #[test]
     fn a_parsed_spawn_keeps_the_label_the_world_wrote() {
         let cases = [
-            ("Trap: Basilisk (4150/41500060/41500000 x3)", "Basilisk"),
+            ("Trap: Basilisk x3 (4150/41500060)", "Basilisk"),
             // A label containing a SPACE, and one containing a space AND the payload's own ` (`.
-            ("Trap: Giant Crab (4150/41500060/41500000 x2)", "Giant Crab"),
+            ("Trap: Giant Crab x2 (4150/41500060)", "Giant Crab"),
             (
-                "Trap: Giant Crab (Ruin) (4150/41500060/41500000 x3)",
+                "Trap: Giant Crab (Ruin) x3 (4150/41500060)",
                 "Giant Crab (Ruin)",
             ),
-            ("Trap: c3210 (3210/32100000/32100000 x1)", "c3210"),
+            // ...and one carrying the COUNT's own ` x`, which the readable half splits at its LAST.
+            ("Trap: Crab x2 x3 (2270/22700000)", "Crab x2"),
+            ("Trap: c3210 x1 (3210/32100000)", "c3210"),
         ];
         // WITNESS: an empty list would prove nothing about any label at all.
-        assert_eq!(cases.len(), 4, "the label corpus was emptied");
+        assert_eq!(cases.len(), 5, "the label corpus was emptied");
         for (name, want) in cases {
             let Some(Trap::Spawn(parsed)) = Trap::from_item_name(name) else {
                 panic!("{name} was refused outright");
@@ -887,8 +961,7 @@ mod tests {
         // "TRAP: c4150 x3 -- something is standing where you are". (A `c<chr>` LABEL is legitimate
         // and one of the cases above, which is why this pin is written out here instead of as a
         // "does not contain the model number" assertion in the loop.)
-        let Some(Trap::Spawn(basilisk)) =
-            Trap::from_item_name("Trap: Basilisk (4150/41500060/41500000 x3)")
+        let Some(Trap::Spawn(basilisk)) = Trap::from_item_name("Trap: Basilisk x3 (4150/41500060)")
         else {
             panic!("the motivating case was refused outright");
         };
@@ -912,7 +985,7 @@ mod tests {
         assert_eq!(at_cap.len(), LABEL_CAP);
         assert_eq!(over.len(), LABEL_CAP + 1);
 
-        let accepted = format!("Trap: {at_cap} (4150/41500060/41500000 x3)");
+        let accepted = format!("Trap: {at_cap} x3 (4150/41500060)");
         let Some(Trap::Spawn(parsed)) = Trap::from_item_name(&accepted) else {
             panic!("{accepted} was refused AT the cap -- the boundary is off by one");
         };
@@ -920,7 +993,7 @@ mod tests {
         assert_eq!(parsed.label(), at_cap.as_str());
         assert_eq!(parsed.retained_label().len(), LABEL_CAP);
 
-        let refused = format!("Trap: {over} (4150/41500060/41500000 x3)");
+        let refused = format!("Trap: {over} x3 (4150/41500060)");
         assert_eq!(
             Trap::from_item_name(&refused),
             None,
@@ -928,11 +1001,11 @@ mod tests {
         );
 
         // The constructor is the rule's real home; the parser only inherits it.
-        assert!(SpawnSpec::new(4150, 41_500_060, 41_500_000, 3, &at_cap).is_some());
-        assert!(SpawnSpec::new(4150, 41_500_060, 41_500_000, 3, &over).is_none());
+        assert!(SpawnSpec::new(4150, 41_500_060, 3, &at_cap).is_some());
+        assert!(SpawnSpec::new(4150, 41_500_060, 3, &over).is_none());
         // A label is bytes, not characters, and the cap is a BYTE cap -- non-ASCII is refused
         // outright, so there is no multi-byte label that could sneak past a `chars().count()`.
-        assert!(SpawnSpec::new(4150, 41_500_060, 41_500_000, 3, "Basilisqu\u{e9}").is_none());
+        assert!(SpawnSpec::new(4150, 41_500_060, 3, "Basilisqu\u{e9}").is_none());
     }
 
     /// 🛑 A KEY IS AN IDENTITY SURFACE, A LABEL IS COSMETIC. The world may rename a creature in any
@@ -942,9 +1015,9 @@ mod tests {
     #[test]
     fn the_key_does_not_move_when_only_the_label_changes() {
         let renamed = [
-            spec(4150, 41_500_060, 41_500_000, 3, "Basilisk"),
-            spec(4150, 41_500_060, 41_500_000, 3, "Basilisk (Ruin)"),
-            spec(4150, 41_500_060, 41_500_000, 3, "c4150"),
+            spec(4150, 41_500_060, 3, "Basilisk"),
+            spec(4150, 41_500_060, 3, "Basilisk (Ruin)"),
+            spec(4150, 41_500_060, 3, "c4150"),
         ];
         // WITNESS: an empty list would agree with itself about every key it never checked.
         assert_eq!(renamed.len(), 3, "the rename corpus was emptied");
@@ -961,11 +1034,11 @@ mod tests {
         assert_ne!(renamed[1].label(), renamed[2].label());
         // The key DOES move when the IDENTITY moves -- same label, different creature and count.
         assert_ne!(
-            Trap::Spawn(spec(4630, 46_300_010, 46_300_000, 3, "Basilisk")).key(),
+            Trap::Spawn(spec(4630, 46_300_010, 3, "Basilisk")).key(),
             "spawn_c4150_x3"
         );
         assert_ne!(
-            Trap::Spawn(spec(4150, 41_500_060, 41_500_000, 2, "Basilisk")).key(),
+            Trap::Spawn(spec(4150, 41_500_060, 2, "Basilisk")).key(),
             "spawn_c4150_x3"
         );
     }
@@ -978,43 +1051,45 @@ mod tests {
     fn a_malformed_spawn_name_is_refused_not_guessed() {
         let refused = [
             // no `Trap: ` prefix
-            "Basilisk (4150/41500060/41500000 x3)",
+            "Basilisk x3 (4150/41500060)",
             // no trailing `)`
-            "Trap: Basilisk (4150/41500060/41500000 x3",
+            "Trap: Basilisk x3 (4150/41500060",
             // no ` (` delimiter at all
-            "Trap: Basilisk 4150/41500060/41500000 x3)",
+            "Trap: Basilisk x3 4150/41500060)",
             // empty label
-            "Trap:  (4150/41500060/41500000 x3)",
+            "Trap:  x3 (4150/41500060)",
             // non-ASCII label -- the in-game font draws `?` for it
-            "Trap: Basilisqu\u{e9} (4150/41500060/41500000 x3)",
-            // two payload fields, not three
-            "Trap: X (4150/41500060 x3)",
-            // four payload fields -- the extra one would be silently dropped
-            "Trap: X (4150/41500060/41500000/7 x3)",
+            "Trap: Basilisqu\u{e9} x3 (4150/41500060)",
+            // one payload field, not two
+            "Trap: X x3 (4150)",
+            // 🛑 three payload fields -- THE OLD SHAPE. Its own test spells out why this one is
+            // not just another malformed string; see
+            // `the_old_three_field_payload_is_refused_not_half_parsed`.
+            "Trap: X x3 (4150/41500060/41500000)",
             // no ` x<count>` at all
-            "Trap: X (4150/41500060/41500000)",
-            // two ` x` splits
-            "Trap: X (4150/41500060/41500000 x3 x4)",
+            "Trap: X (4150/41500060)",
+            // ` x` with nothing after it
+            "Trap: X x (4150/41500060)",
+            // the count left inside the PAYLOAD, which is where the old shape kept it
+            "Trap: X (4150/41500060 x3)",
             // chr is not a number
-            "Trap: X (c4150/41500060/41500000 x3)",
+            "Trap: X x3 (c4150/41500060)",
             // npc is not a number
-            "Trap: X (4150/four/41500000 x3)",
+            "Trap: X x3 (4150/four)",
             // count is not a number
-            "Trap: X (4150/41500060/41500000 xthree)",
+            "Trap: X xthree (4150/41500060)",
             // chr below the plausible model range
-            "Trap: X (99/990000/990000 x1)",
+            "Trap: X x1 (99/990000)",
             // chr above it
-            "Trap: X (10000/100000000/100000000 x1)",
+            "Trap: X x1 (10000/100000000)",
             // negative chr
-            "Trap: X (-4150/-41500060/-41500000 x1)",
+            "Trap: X x1 (-4150/-41500060)",
             // 🛑 npc row from ANOTHER family: a basilisk body running a runebear's stat block
-            "Trap: X (4150/46300010/41500000 x3)",
-            // 🛑 think row from another family: the body is right, the brain is a bear's
-            "Trap: X (4150/41500060/46300000 x3)",
+            "Trap: X x3 (4150/46300010)",
             // count 0 -- a trap that spawns nothing is a trap that looks broken
-            "Trap: X (4150/41500060/41500000 x0)",
+            "Trap: X x0 (4150/41500060)",
             // negative count (parses as i32, must not parse as u32)
-            "Trap: X (4150/41500060/41500000 x-1)",
+            "Trap: X x-1 (4150/41500060)",
         ];
         // WITNESS: one rule per case, and an empty list would refuse nothing at all.
         assert_eq!(refused.len(), 19, "a refusal rule lost its case");
@@ -1026,7 +1101,7 @@ mod tests {
             );
         }
         // Built from the constant, so raising the cap cannot leave this pinned to a stale number.
-        let over = format!("Trap: X (4150/41500060/41500000 x{})", MAX_SPAWN_COUNT + 1);
+        let over = format!("Trap: X x{} (4150/41500060)", MAX_SPAWN_COUNT + 1);
         assert_eq!(
             Trap::from_item_name(&over),
             None,
@@ -1034,11 +1109,118 @@ mod tests {
         );
         // ...and the value one below it is accepted, so the case above is refused for the RIGHT
         // reason rather than because the whole shape stopped parsing.
-        let at_cap = format!("Trap: X (4150/41500060/41500000 x{MAX_SPAWN_COUNT})");
+        let at_cap = format!("Trap: X x{MAX_SPAWN_COUNT} (4150/41500060)");
         assert!(Trap::from_item_name(&at_cap).is_some(), "{at_cap}");
         // The LABEL CAP is the one refusal rule whose case cannot be a literal here -- it is built
         // from `LABEL_CAP`. It lives in `a_label_of_exactly_label_cap_is_kept_and_one_byte_more_
         // is_refused`, beside the acceptance that proves it refuses for the right reason.
+    }
+
+    /// 🛑 THE INVARIANT THAT LICENSED DROPPING THE FIELD FROM THE NAME. The item name no longer
+    /// carries a think row; [`SpawnSpec::new`] derives it as `chr_id * THINK_PARAM_MULTIPLIER`.
+    /// That is sound ONLY while the world's eligibility rule holds -- a model reaches the spawn
+    /// table only when `NpcThinkParam` has a row at exactly `<chr>0000`, and 0 of the 390 committed
+    /// rows deviate. If it ever stops holding, the NAME CAN NO LONGER EXPRESS REALITY, and this is
+    /// where that has to be discovered: the alternative is a session in which a body runs no brain
+    /// and the creature stands there being shot at.
+    #[test]
+    fn the_think_row_is_always_the_family_template() {
+        let names = [
+            "Trap: Basilisk x3 (4150/41500060)",
+            "Trap: Runebear x1 (4630/46300010)",
+            "Trap: Giant Crab (Ruin) x2 (3210/32100000)",
+            // A three-digit model, where a string-prefix family check is most likely to be wrong.
+            "Trap: c100 x8 (100/1000000)",
+        ];
+        // WITNESS: an empty list would agree with itself about every id it never derived.
+        assert_eq!(names.len(), 4, "the derivation corpus was emptied");
+        for name in names {
+            let Some(Trap::Spawn(parsed)) = Trap::from_item_name(name) else {
+                panic!("{name} was refused outright");
+            };
+            assert_eq!(
+                parsed.think_param_id,
+                parsed.chr_id * THINK_PARAM_MULTIPLIER,
+                "{name} did not derive its think row"
+            );
+            // ...and it lands in the model's family, which is the check the name used to carry a
+            // whole field so that `is_sane` could make.
+            let family = parsed.chr_id.to_string();
+            assert!(
+                parsed.think_param_id.to_string().starts_with(&family),
+                "{name}: think row {} is not in the c{family} family",
+                parsed.think_param_id
+            );
+        }
+        // The Runebear is the INDEPENDENT WITNESS for the rule: `46300000` was hand-derived from
+        // `NpcThinkParam` on 2026-08-10, long before `<chr>0000` was known to be the eligibility
+        // criterion, and the arithmetic reproduces it exactly.
+        assert_eq!(
+            RUNEBEAR_THINK_PARAM_ID,
+            RUNEBEAR_CHR_ID * THINK_PARAM_MULTIPLIER,
+            "the hand-derived think row is not the family template"
+        );
+        assert_eq!(RUNEBEAR_SPAWN.think_param_id, RUNEBEAR_THINK_PARAM_ID);
+    }
+
+    /// 🛑 THE OLD SHAPE MUST FAIL LOUDLY, NOT HALF-PARSE. `Trap: <label> (<chr>/<npc>/<think>
+    /// x<count>)` is what the world minted until this change, and the two repos have to move
+    /// together. A parser that took the first two of three `/` fields would accept it and build a
+    /// spec whose think row nobody agreed to -- and the label would come out as the whole readable
+    /// half, so the toast would look plausible while the game got the wrong brain.
+    ///
+    /// Refusing costs one trap and one log line; guessing costs a run in a way nobody can trace
+    /// back to a format change.
+    #[test]
+    fn the_old_three_field_payload_is_refused_not_half_parsed() {
+        let old_shape = [
+            // Exactly what shipped: the motivating basilisk, in the wild-format string.
+            "Trap: Basilisk (4150/41500060/41500000 x3)",
+            "Trap: c4630 (4630/46300010/46300000 x1)",
+            // ...and the half-migrated form, where the count moved but the think row did not.
+            "Trap: Basilisk x3 (4150/41500060/41500000)",
+        ];
+        // WITNESS: an empty list would refuse no old name at all.
+        assert_eq!(old_shape.len(), 3, "the old-format corpus was emptied");
+        for name in old_shape {
+            assert_eq!(
+                Trap::from_item_name(name),
+                None,
+                "{name} is the OLD format and was accepted -- the payload was half-parsed"
+            );
+        }
+        // ...and the SAME creature in the new shape is accepted, so the refusals above are for the
+        // payload's shape and not because these ids stopped being valid.
+        assert_eq!(
+            Trap::from_item_name("Trap: Basilisk x3 (4150/41500060)"),
+            Some(Trap::Spawn(spec(4150, 41_500_060, 3, "Basilisk")))
+        );
+    }
+
+    /// The readable half splits at its LAST ` x`, so a label may contain one. `Crab x2` is not a
+    /// hypothetical: the world labels variant models exactly like that, and a parser splitting at
+    /// the FIRST ` x` would read the count as `2 x3` and refuse the whole name -- a trap that
+    /// silently never fires.
+    #[test]
+    fn a_label_may_carry_its_own_x_and_the_count_is_the_last_one() {
+        let Some(Trap::Spawn(parsed)) = Trap::from_item_name("Trap: Crab x2 x3 (2270/22700000)")
+        else {
+            panic!("a label containing ` x` was refused outright");
+        };
+        assert_eq!(
+            parsed.retained_label(),
+            "Crab x2",
+            "the label lost its tail"
+        );
+        assert_eq!(parsed.count, 3, "the count was taken from the wrong ` x`");
+        // Closed both ways: the name it mints back is the one it came from, ` x` and all.
+        assert_eq!(parsed.item_name(), "Trap: Crab x2 x3 (2270/22700000)");
+        // The unambiguous case still reads the way it looks, or the rule above proves nothing.
+        let Some(Trap::Spawn(plain)) = Trap::from_item_name("Trap: Crab x2 (2270/22700000)") else {
+            panic!("the plain case was refused outright");
+        };
+        assert_eq!(plain.retained_label(), "Crab");
+        assert_eq!(plain.count, 2);
     }
 
     /// The cap is asserted at COMPILE TIME beside the constant (see `MAX_SPAWN_COUNT`), because a
@@ -1071,7 +1253,7 @@ mod tests {
     #[test]
     fn every_spawn_line_is_ascii_and_names_itself() {
         let specs = [
-            spec(4150, 41_500_060, 41_500_000, 3, "Basilisk"),
+            spec(4150, 41_500_060, 3, "Basilisk"),
             RUNEBEAR_SPAWN,
             SpawnSpec {
                 count: MAX_SPAWN_COUNT,
@@ -1079,10 +1261,10 @@ mod tests {
             },
             // A label at exactly `LABEL_CAP`, with spaces: the widest line the parser can hand the
             // in-game font.
-            spec(4150, 41_500_060, 41_500_000, 8, "Ancestral Follower Chief"),
+            spec(4150, 41_500_060, 8, "Ancestral Follower Chief"),
             // No label retained: the only path on which the `c<chr_id>` fallback is reachable, and
             // it must still be ASCII and still name something.
-            SpawnSpec::new(4150, 41_500_060, 41_500_000, 1, "")
+            SpawnSpec::new(4150, 41_500_060, 1, "")
                 .expect("an empty label is constructible even though the parser refuses one"),
         ];
         // WITNESS: an empty list would satisfy every assertion below without checking a line.
@@ -1119,17 +1301,14 @@ mod tests {
     /// hand-built spec names something truthful rather than nothing at all.
     #[test]
     fn an_unlabelled_spec_falls_back_to_the_model_number() {
-        let bare = SpawnSpec::new(4150, 41_500_060, 41_500_000, 1, "")
+        let bare = SpawnSpec::new(4150, 41_500_060, 1, "")
             .expect("an empty label is not itself a construction error");
         assert_eq!(bare.retained_label(), "", "nothing was retained");
         assert_eq!(bare.label(), "c4150");
         assert!(Trap::Spawn(bare).toast().contains("c4150"));
         // ...and the parser really does refuse the name it mints back, which is what makes the
         // fallback unreachable from a received item rather than merely unlikely.
-        assert_eq!(
-            Trap::from_item_name("Trap:  (4150/41500060/41500000 x1)"),
-            None
-        );
+        assert_eq!(Trap::from_item_name("Trap:  x1 (4150/41500060)"), None);
     }
 
     /// The legacy variant and the parameterised one must describe the SAME bear, or "Trap:
@@ -1162,7 +1341,7 @@ mod tests {
     /// `Copy` or the queue grew a fixed-variant assumption.
     #[test]
     fn a_spawn_survives_the_queue_intact() {
-        let spec = spec(4150, 41_500_060, 41_500_000, 3, "Basilisk");
+        let spec = spec(4150, 41_500_060, 3, "Basilisk");
         let mut q = TrapQueue::new();
         q.push(Trap::Spawn(spec), 0);
         q.push(Trap::RuneThief, 0);
