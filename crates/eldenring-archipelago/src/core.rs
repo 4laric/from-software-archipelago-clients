@@ -4519,10 +4519,73 @@ impl Core {
         // small, which `FirstUseEver` by definition cannot: that condition fires once and never
         // looks again. The max is viewport-relative so the window can never open larger than the
         // screen it is drawn on.
+        //
+        // 🛑 AND 640 WAS NOT WIDE ENOUGH EITHER (#170, bobler 2026-08-12, same complaint a second
+        // time: his window measured exactly 640 and the rows still clipped). 480 -> 640 -> clipping
+        // says the NUMBER is not the fix. Two of these rows grow with the seed and no constant
+        // survives that: `Next::Spilled` joins N region names, and a region header carries a name
+        // this crate never chose. So MEASURE instead -- `calc_text_size` is the only thing that
+        // knows the font, and it is already used this way in `crates/shared/src/overlay.rs:755`.
         let display = ui.io().display_size;
+        let style = ui.clone_style();
+        let gap = style.item_spacing[0];
+        // Padding on both sides, the scrollbar this window always has, and one gap of slack.
+        let chrome = style.window_padding[0] * 2.0 + style.scrollbar_size + gap;
+        // The widest TRAILING widget any measured row can carry. Every arm of both offer enums is
+        // a short fixed label with at most two numbers in it, and this is the longest shape they
+        // reach: `hint lock (N -- have N)` on a region header, `Hint next lock (N -- have N)` on
+        // the lock-hints line. Measured, not guessed, and deliberately generous by two digits.
+        let widget = ui.calc_text_size("Hint next lock (999 -- have 999)")[0] + gap;
+        // Every row this window can emit, paired with whether it carries a trailing widget.
+        // 🛑 The strings are shaped like their render sites, not copied from them -- a row that
+        // drifts costs width, never correctness, because the floor only ever grows the window.
+        let mut measured: Vec<(String, bool)> = vec![
+            (format!("checks: {}/{}", model.done, model.total), false),
+            (
+                format!(
+                    "in-logic: {}/{}   surface: {}/{}",
+                    model.in_logic_done,
+                    model.in_logic_total,
+                    model.surface_done,
+                    model.surface_total
+                ),
+                false,
+            ),
+        ];
+        if let Some((have, price)) = hud {
+            measured.push((format!("lock hints: {have}/{price} surface checks"), true));
+        }
+        if let Some(line) = &scaling_here {
+            measured.push((line.clone(), false));
+        }
+        if !sweep_rows.is_empty() {
+            measured.push((sweep_header.clone(), false));
+        }
+        for (label, state) in &sweep_rows {
+            measured.push((format!("  {label} -- {state}"), false));
+        }
+        for region in &model.regions {
+            measured.push((
+                format!(
+                    "{}  {}/{}  [locked]",
+                    region.region, region.done, region.total
+                ),
+                true,
+            ));
+        }
+        let widest = measured
+            .iter()
+            .fold(0.0_f32, |acc: f32, (row, has_widget)| {
+                let w = ui.calc_text_size(row)[0] + if *has_widget { widget } else { 0.0 };
+                acc.max(w)
+            });
+        // The ceiling is raised to the old floor first, so `clamp` can never be handed a range
+        // whose min exceeds its max on a very small viewport -- that would panic, in a render.
+        let ceiling = (display[0] * 0.95).max(560.0);
+        let floor_w = (widest + chrome).clamp(560.0, ceiling);
         ui.window("Item Tracker###ap-tracker")
-            .size([640.0, 560.0], imgui::Condition::FirstUseEver)
-            .size_constraints([560.0, 240.0], [display[0] * 0.95, display[1] * 0.95])
+            .size([floor_w, 560.0], imgui::Condition::FirstUseEver)
+            .size_constraints([floor_w, 240.0], [ceiling, display[1] * 0.95])
             .opened(&mut open)
             .build(|| {
                 ui.text(format!("checks: {}/{}", model.done, model.total));
