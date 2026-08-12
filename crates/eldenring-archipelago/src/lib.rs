@@ -59,6 +59,7 @@ mod shop_value;
 mod spell_slot_length;
 mod start_item_backfill;
 mod startgrants;
+mod trap_feel_probe;
 mod traps;
 mod upgrade_cost;
 mod upgrades;

@@ -619,6 +619,39 @@ impl shared::Core for Core {
             }
         }
 
+        // TRAP FEEL PROBE (trap_feel_probe.rs) -- ON by default, unlike the F7/F8 block above.
+        // F9 nightfall, F10 half stamina for 30s, F11 blackout. All three are non-destructive and
+        // self-restoring, which is the whole argument for defaulting them on; it is written out in
+        // the module note. Function keys for the same reason F6 and F7 are: a letter fights the say
+        // input.
+        //
+        // 🛑 `tick` sits OUTSIDE the `enabled` check on purpose. Nothing can arm while the probe is
+        // off, so the cost is one lock and one idle check -- and a player who silences the probe
+        // mid-blackout still gets their screen back.
+        crate::trap_feel_probe::tick();
+        if crate::trap_feel_probe::enabled() {
+            for (key, effect) in [
+                (imgui::Key::F9, er_logic::trap_probe::FeelEffect::Nightfall),
+                (
+                    imgui::Key::F10,
+                    er_logic::trap_probe::FeelEffect::StaminaHalved,
+                ),
+                (imgui::Key::F11, er_logic::trap_probe::FeelEffect::Blackout),
+            ] {
+                if !ui.is_key_pressed(key) {
+                    continue;
+                }
+                // `fire` returns None when it could not act this tick (not in world, singleton
+                // unreachable). Nothing to toast, nothing to log twice.
+                let Some(line) = crate::trap_feel_probe::fire(effect) else {
+                    continue;
+                };
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(line.to_string(), now);
+                self.log(ap::Print::message(line.to_string()));
+            }
+        }
+
         self.accumulate_hints_from_log();
         self.refresh_lock_hint_hud();
 
@@ -653,6 +686,8 @@ impl shared::Core for Core {
             // ER_BOSSFIGHT_PROBE is deliberately NOT here: it is ON by default, and this line
             // resolves through the default-OFF rule, so it would report the probe as off in exactly
             // the case where it is running. boss_fight_probe::announce_once says it instead.
+            // ER_TRAP_FEEL_PROBE is absent for the same reason; trap_feel_probe::announce_once
+            // says that one, and also prints its key map.
         ]);
 
         // ESD talk-event hook (esd_probe.rs) -- the shop-open seam SHOP AUTO-HINTS ride on
