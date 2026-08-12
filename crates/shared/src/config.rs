@@ -242,7 +242,10 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() > 3, "config is still one line: {out:?}");
         assert_eq!(lines[0], "{", "the object should open on its own line");
-        assert!(out.ends_with("}\n"), "want a closing brace and a newline: {out:?}");
+        assert!(
+            out.ends_with("}\n"),
+            "want a closing brace and a newline: {out:?}"
+        );
         // Every key on its own indented line -- the property a hand-editor cares about.
         for key in ["url", "slot", "seed", "client_version", "password"] {
             let want = format!("  \"{key}\":");
