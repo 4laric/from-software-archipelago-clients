@@ -3248,6 +3248,19 @@ impl shared::Core for Core {
                     er_logic::boss_grants::grant_diagnosis(healthbar, boss_present, holds)
             {
                 log::info!("{d}");
+                // #594: the verdict says WHETHER c4710 was loaded, never WHICH instance said so.
+                // bobler's grant fired two maps from the seed's only Rykard, and the one-bool
+                // answer could not show that. Emitted only on the diag edge, so the extra walk
+                // stays off the per-tick path.
+                if let Some(sightings) =
+                    crate::scaling::sight_character(er_logic::boss_grants::RYKARD_CHR_ID)
+                {
+                    let line = crate::scaling::describe_sightings(
+                        er_logic::boss_grants::RYKARD_CHR_ID,
+                        &sightings,
+                    );
+                    log::info!("{line}");
+                }
             }
             let mut game = EldenRingHook;
             if let Some(m) = er_logic::boss_grants::tick(&mut game, boss_present, holds) {
