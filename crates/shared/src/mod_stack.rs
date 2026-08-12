@@ -100,6 +100,81 @@ const AMBIGUOUS: &[&str] = &["menu"];
 const NAMED_RANDOMIZER_SUFFIXES: &[(&str, &str)] =
     &[(".randomizeopt", "thefifthmatt ER Randomizer")];
 
+/// Modules that are a KNOWN PROBLEM in this stack, and what they cost.
+///
+/// One entry, and it earns its place: `release/ENEMY-AND-STARTING-CLASS-RANDOMIZATION.md` in the
+/// world repo tells players outright not to load `RandomizerHelper.dll`, calling it the single most
+/// common way to end up with a connected client that cannot give you anything.
+///
+/// 🛑 A HIT IS NOT A DIAGNOSIS. Presence is not sufficient for the defect -- boblerrr's 2026-08-07
+/// log carried this DLL *and* eleven healthy `AddItemFunc detour installed` lines. The warning says
+/// "this is in your process and it is known to break receives", not "this is your bug".
+const DENY_MODULES: &[(&str, &str)] = &[(
+    "randomizerhelper.dll",
+    "our own setup docs say never to load it -- it is the most common cause of a connected client \
+     that cannot grant items. Presence is not proof it is biting you; if receives work, it is not. \
+     Take it out before reporting a receive bug",
+)];
+
+/// What the loaded-module list says. Split from the enumeration so [`triage_modules`] is testable.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ModuleReport {
+    /// How many modules were loaded, including the ones filtered out of `non_system`.
+    pub total: usize,
+    /// File names of modules loaded from outside the Windows directory, sorted and deduplicated.
+    pub non_system: Vec<String>,
+    /// Full paths of modules on [`DENY_MODULES`], with the reason each is listed.
+    pub denied: Vec<(String, &'static str)>,
+}
+
+/// Sorts loaded module paths into [`ModuleReport`]. Pure -- no I/O, so it is unit-testable.
+///
+/// ## Why the Windows directory is the filter
+///
+/// A process this size loads well over a hundred modules and nearly all of them are `System32`
+/// boilerplate. Printing them is not "more evidence", it is a wall that makes the four interesting
+/// names harder to find -- and the whole point of this line is that a triager reads it without
+/// asking the player anything. Everything from outside `%SystemRoot%` survives: the game's own
+/// DLLs, the loader, our client, and every mod. `total` is reported alongside so nothing is hidden.
+///
+/// `windows_dir` is `None` when the environment does not say; then nothing is filtered, which is
+/// the right failure -- a noisy line beats a silently pruned one.
+pub fn triage_modules(paths: &[PathBuf], windows_dir: Option<&Path>) -> ModuleReport {
+    let system_prefix = windows_dir
+        .map(|dir| dir.to_string_lossy().to_lowercase())
+        .filter(|prefix| !prefix.is_empty());
+    let mut report = ModuleReport {
+        total: paths.len(),
+        ..Default::default()
+    };
+    for path in paths {
+        // 🛑 NOT `Path::file_name()`. These paths come from `GetModuleFileNameW` and are always
+        // WINDOWS paths, but this function's tests have to pass wherever the suite runs -- and a
+        // Unix host reads `C:\x\y.dll` as ONE component, so `file_name()` would hand back the whole
+        // string and every assertion here would be testing something other than what it says.
+        let full = path.to_string_lossy();
+        let name = full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let lower_name = name.to_lowercase();
+        for (denied, why) in DENY_MODULES {
+            if lower_name == *denied {
+                report.denied.push((full.to_string(), *why));
+            }
+        }
+        let is_system = system_prefix
+            .as_ref()
+            .is_some_and(|prefix| full.to_lowercase().starts_with(prefix));
+        if !is_system {
+            report.non_system.push(name);
+        }
+    }
+    report.non_system.sort();
+    report.non_system.dedup();
+    report
+}
+
 /// Whether the me3 VFS icon override can possibly be in effect this session.
 ///
 /// 🛑 **THE OVERRIDE IS NOT A COSMETIC NICETY, IT IS HALF OF A FEATURE.** The AP flower is not an
@@ -471,6 +546,29 @@ pub fn log_provenance() {
         ),
     }
 
+    // WHAT IS ACTUALLY LOADED. Everything above this point is a DIRECTORY listing, which is the
+    // right instrument for a data mod and the wrong one for a DLL: a file beside us proves it is
+    // installed, never that it was loaded. This is the other half, and we have always had it --
+    // the loader enumerates exactly this list at startup to find me3, then discards it before any
+    // logger exists to write it down.
+    match crate::utils::loaded_modules() {
+        Ok(paths) => {
+            let windows_dir = std::env::var_os("SystemRoot").map(PathBuf::from);
+            let modules = triage_modules(&paths, windows_dir.as_deref());
+            info!(
+                "mod stack: {} module(s) loaded, {} from outside the Windows directory: [{}]",
+                modules.total,
+                modules.non_system.len(),
+                modules.non_system.join(", ")
+            );
+            for (path, why) in &modules.denied {
+                warn!("mod stack: {path} IS LOADED -- {why}.");
+            }
+        }
+        // Not a fault: the list is a diagnostic, and losing it costs triage speed, nothing else.
+        Err(err) => info!("mod stack: loaded-module list unavailable ({err})"),
+    }
+
     let report = match &levels[0].1 {
         Ok(report) => report.clone(),
         Err(_) => return,
@@ -718,5 +816,75 @@ mod tests {
             icon_override_status(Loader::Unknown, &[Some(report)]),
             IconOverride::Unknown
         );
+    }
+
+    /// The reason this exists: `RandomizerHelper.dll` sat in boblerrr's folder on 2026-08-12 and
+    /// the directory listing could not say whether it was LOADED. The module list can.
+    #[test]
+    fn a_denied_module_is_named_with_its_full_path() {
+        let modules = triage_modules(
+            &[PathBuf::from(
+                r"C:\mods\randomizer\dll\RandomizerHelper.dll",
+            )],
+            Some(Path::new(r"C:\Windows")),
+        );
+        assert_eq!(modules.denied.len(), 1);
+        assert!(modules.denied[0].0.ends_with("RandomizerHelper.dll"));
+        assert!(modules.denied[0].1.contains("cannot grant items"));
+    }
+
+    /// Windows is case-insensitive; a launcher that writes the name differently is the same DLL.
+    #[test]
+    fn the_deny_match_is_case_insensitive() {
+        let modules = triage_modules(&[PathBuf::from(r"C:\x\randomizerhelper.DLL")], None);
+        assert_eq!(modules.denied.len(), 1);
+    }
+
+    /// The filter that makes the line readable, and the count that stops it hiding anything.
+    #[test]
+    fn system_modules_are_counted_but_not_listed() {
+        let modules = triage_modules(
+            &[
+                PathBuf::from(r"C:\Windows\System32\ntdll.dll"),
+                PathBuf::from(r"C:\WINDOWS\system32\kernel32.dll"),
+                PathBuf::from(r"D:\SteamLibrary\ELDEN RING\Game\eldenring.exe"),
+                PathBuf::from(r"D:\mods\eldenring_archipelago.dll"),
+            ],
+            Some(Path::new(r"C:\Windows")),
+        );
+        assert_eq!(modules.total, 4);
+        assert_eq!(
+            modules.non_system,
+            vec!["eldenring.exe", "eldenring_archipelago.dll"]
+        );
+        assert!(modules.denied.is_empty());
+    }
+
+    /// 🛑 An environment that does not name the Windows directory must produce a NOISY line, not a
+    /// quietly pruned one. Silence is the failure mode this whole module exists to remove.
+    #[test]
+    fn an_unknown_windows_directory_filters_nothing() {
+        let modules = triage_modules(
+            &[
+                PathBuf::from(r"C:\Windows\System32\ntdll.dll"),
+                PathBuf::from(r"D:\mods\eldenring_archipelago.dll"),
+            ],
+            None,
+        );
+        assert_eq!(modules.non_system.len(), 2);
+    }
+
+    /// Duplicate paths (a module mapped twice) must not double the line.
+    #[test]
+    fn repeated_module_names_are_listed_once() {
+        let modules = triage_modules(
+            &[
+                PathBuf::from(r"D:\mods\overlay.dll"),
+                PathBuf::from(r"D:\mods\overlay.dll"),
+            ],
+            None,
+        );
+        assert_eq!(modules.non_system, vec!["overlay.dll"]);
+        assert_eq!(modules.total, 2, "the count is of MODULES, not of names");
     }
 }
