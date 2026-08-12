@@ -20,6 +20,19 @@
 //! row that names it hands over free exactly what the economy charges for. `region_open` closes
 //! that: a region known to be locked is never named, by `group_label` or by `group_state`. Unknown
 //! accessibility still reveals, which is what these rows already did.
+//!
+//! 🛑🛑 AND THE ROW ITSELF GOES (2026-08-12, Alaric's ruling on #171). Concealing the NAME was not
+//! enough. The premise above -- "the member locations are ordinary rows in their region's list" --
+//! is false for a locked region, because that region's rollup is concealed too. So the sweep row
+//! became the only place the count was visible, and `Rugalea the Great Red Bear -- 0/38 checks`
+//! ranks the seed's locked regions by payload without naming one of them. bobler's 2026-08-12
+//! screenshot shows twenty such rows with BOTH filters ticked; Alaric: "ah its still spoiling
+//! here".
+//!
+//! `section_rows` withholds those groups entirely and returns a COUNT instead, the same shape the
+//! region rollup already uses (`Locked region 0/??`). This supersedes "concealment is not silence"
+//! for the locked case only: a group whose region is unknown, or open, is unchanged, and the
+//! section header still totals every group so the seed-wide numbers do not silently shrink.
 
 /// One sweep group, as the tracker sees it. Borrowed rather than owned: the caller assembles these
 /// from live tables each frame and nothing outlives the render.
@@ -112,6 +125,59 @@ pub fn group_state(v: &SweepGroupView<'_>) -> String {
     }
 }
 
+/// Is this group WITHHELD from the list? Only a region known to be locked -- `None` is "the coarse
+/// table could not place it" and must never read as a wall (same rule `group_state` follows).
+pub fn is_withheld(v: &SweepGroupView<'_>) -> bool {
+    v.region_open == Some(false)
+}
+
+/// Has this group fired and paid in full? Settled history, and it stops taking up a row.
+///
+/// Alaric, 2026-08-10: "we can clear these from the view once they've paid out". This lived as an
+/// inline filter at the call site in `core.rs`, where no test could reach it; it is here so that
+/// its interaction with `is_withheld` is pinned rather than assumed.
+pub fn is_settled(v: &SweepGroupView<'_>) -> bool {
+    v.fired && v.owed() == 0
+}
+
+/// What the tracker's Boss sweeps section actually draws.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SectionRows {
+    /// `(label, state)` for every group that renders, in the order given.
+    pub rows: Vec<(String, String)>,
+    /// How many groups were withheld because their region is known locked.
+    pub withheld: usize,
+}
+
+/// Split the groups into the rows that render and a count of the ones withheld (#171).
+///
+/// ⭐ ORDER MATTERS AND IT IS TESTED. Settled is checked FIRST, so a group that fired and paid in
+/// full is dropped outright rather than counted as withheld -- otherwise a locked region the player
+/// has already been paid out of would inflate a number whose whole job is to say "there is more
+/// here you cannot see yet".
+pub fn section_rows(groups: &[SweepGroupView<'_>]) -> SectionRows {
+    let mut out = SectionRows::default();
+    for v in groups {
+        if is_settled(v) {
+            continue;
+        }
+        if is_withheld(v) {
+            out.withheld += 1;
+            continue;
+        }
+        out.rows.push((group_label(v), group_state(v)));
+    }
+    out
+}
+
+/// The single line that stands in for every withheld group.
+///
+/// It says the NUMBER and nothing else. A count of locked groups is not orderable into a route the
+/// way a per-region member count is, which is the whole difference #171 turns on.
+pub fn withheld_line(n: usize) -> String {
+    format!("{n} locked group(s) -- hidden until you can reach them")
+}
+
 /// The header for the whole section: how much is parked behind bosses right now.
 ///
 /// This is the number bobler actually wanted -- not "is there a sweep" but "how much am I owed".
@@ -123,62 +189,15 @@ pub fn section_header(groups: &[SweepGroupView<'_>]) -> String {
     )
 }
 
-/// Is this group hidden while the tracker's `in-logic only` filter is on?
-///
-/// MOTIVATING CASE (rule 11), Alaric 2026-08-12, looking at the F6 Boss sweeps panel: 24 groups
-/// listed, 21 of them reading "region still locked -- you cannot reach this boss yet". "He wants to
-/// see only the ones he can actually go and fight."
-///
-/// 🛑 THIS KEYS ON `region_open == Some(false)` AND NOTHING ELSE, and `None` MUST STAY VISIBLE.
-/// `Some(false)` is a fact somebody established -- the lock governing that region has not been
-/// received. `None` is the ABSENCE of a fact: the coarse table could not place the group at all.
-/// Hiding on `None` would silently drop groups nobody has shown to be unreachable, which is the
-/// difference between hiding the 21 rows Alaric asked about and hiding a row he needed. It is the
-/// same asymmetry `group_state` already runs on -- an unknown never invents a wall -- and this is
-/// the single most important decision in the filter.
-///
-/// Nothing else in the view is consulted, either. `fired`, `gated_on` and `owed()` answer "what is
-/// this group waiting for", not "can I walk there"; folding any of them in would give one checkbox
-/// two meanings, and the checkbox is shared with the per-region rollups below.
-pub fn hidden_by_in_logic_only(v: &SweepGroupView<'_>) -> bool {
-    v.region_open == Some(false)
-}
-
 /// Check totals for a group list, as `(owed, total)`.
 ///
-/// Shared by both headers on purpose: the filter hides ROWS, it must never touch the arithmetic, and
-/// two copies of this sum are two chances for the filtered header to disagree with the plain one.
+/// Deliberately blind to `section_rows`: this sums EVERY group, including the ones the list
+/// withholds (#171). Withholding conceals rows, never arithmetic -- bobler asked "how much am I
+/// owed", and a total that shrank every time a region locked would answer that question wrongly.
 fn check_totals(groups: &[SweepGroupView<'_>]) -> (usize, usize) {
     let total: usize = groups.iter().map(|g| g.members).sum();
     let owed: usize = groups.iter().map(SweepGroupView::owed).sum();
     (owed, total)
-}
-
-/// The header when the `in-logic only` filter may be hiding rows.
-///
-/// 🛑 A HEADER MUST NOT LIE ABOUT WHAT IS UNDER IT. `N group(s)` read above three visible rows is
-/// worse than the noise it replaced -- the player cannot tell a seed with three sweeps from a seed
-/// with twenty-four and a filter on. So when the filter bites, the header says how many it kept, how
-/// many it hid, and why it hid them.
-///
-/// ⭐ THE TOTALS STILL COUNT EVERY GROUP, which is the property the already-paid row filter in
-/// `core.rs` was built with ("The HEADER still counts it, so the section's totals do not silently
-/// shrink"). A hidden group is still owed to the player; a section that stopped counting it would
-/// answer bobler's original question -- "how much am I owed" -- with a smaller number every time he
-/// lost a region.
-pub fn section_header_filtered(groups: &[SweepGroupView<'_>], in_logic_only: bool) -> String {
-    let hidden = groups.iter().filter(|g| hidden_by_in_logic_only(g)).count();
-    // Filter off, or on and biting nothing: the plain header, character for character. "24
-    // reachable, 0 behind locked regions" announces a filter that did not do anything, which is
-    // its own species of noise.
-    if !in_logic_only || hidden == 0 {
-        return section_header(groups);
-    }
-    let (owed, total) = check_totals(groups);
-    format!(
-        "Boss sweeps -- {} reachable, {hidden} behind locked regions, {owed} of {total} check(s) still behind a boss",
-        groups.len() - hidden
-    )
 }
 
 #[cfg(test)]
@@ -334,53 +353,133 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_group_does_not_render_at_all_it_is_counted() {
+        // MOTIVATING CASE (rule 11), bobler 2026-08-12 with BOTH filters ticked. Twenty rows like
+        // "Rugalea the Great Red Bear -- 0/38 checks [flag 2044470800] -- region still locked".
+        // The region was already concealed and that was not enough: 0/38 ranks the locked regions
+        // by payload, and the rollup those members belong to is concealed, so this row was the
+        // ONLY place the number appeared. Alaric: "ah its still spoiling here".
+        let mut rugalea = v(2044470800, Some("Rauh Base"), 38, 0, false);
+        rugalea.boss = Some("Rugalea the Great Red Bear");
+        rugalea.region_open = Some(false);
+        let mut midra = v(28000800, Some("Abyss"), 7, 0, false);
+        midra.boss = Some("Midra, Lord of Frenzied Flame");
+        midra.region_open = Some(false);
+        let open = v(2046450800, Some("Belurat"), 20, 1, false);
+
+        let out = section_rows(&[rugalea, midra, open]);
+        assert_eq!(out.withheld, 2);
+        assert_eq!(out.rows.len(), 1, "only the reachable group renders");
+        let rendered = format!("{:?}", out.rows);
+        for leak in ["Rugalea", "Midra", "0/38", "0/7", "2044470800", "28000800"] {
+            assert!(!rendered.contains(leak), "{leak} survived into {rendered}");
+        }
+        assert!(rendered.contains("Belurat"), "{rendered}");
+    }
+
+    #[test]
+    fn the_withheld_line_carries_the_count_and_nothing_else() {
+        let s = withheld_line(20);
+        assert!(s.contains("20"), "{s}");
+        assert!(s.is_ascii(), "{s:?}");
+        // Nothing orderable: no region, no boss, no per-group size.
+        assert!(!s.contains('/'), "a fraction would rank them again: {s}");
+    }
+
+    #[test]
+    fn a_settled_group_is_dropped_not_counted_as_withheld() {
+        // ORDER MATTERS. A locked region the player has already been paid out of must not inflate
+        // "N locked group(s)" -- that number exists to say there is more here you cannot see yet.
+        let mut paid = v(1, Some("Abyss"), 9, 9, true);
+        paid.region_open = Some(false);
+        let out = section_rows(&[paid]);
+        assert_eq!(out.withheld, 0, "settled outranks withheld");
+        assert!(out.rows.is_empty());
+        assert!(is_settled(&paid));
+        assert!(
+            is_withheld(&paid),
+            "the predicates disagree on purpose; the ORDER resolves it"
+        );
+    }
+
+    #[test]
+    fn an_unplaceable_group_still_renders() {
+        // `None` is "the coarse table could not place it". Withholding it would hide a group the
+        // player can walk to right now -- the same rule `group_state` already follows.
+        let mut g = v(1, Some("Belurat"), 10, 0, false);
+        g.region_open = None;
+        let out = section_rows(&[g]);
+        assert_eq!(out.withheld, 0);
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    #[test]
+    fn the_header_still_totals_the_groups_the_list_withholds() {
+        // The precedent is the settled filter: "The HEADER still counts it, so the section's
+        // totals do not silently shrink." A seed-wide total does not rank anything, so it stays.
+        let mut locked = v(1, Some("Abyss"), 38, 0, false);
+        locked.region_open = Some(false);
+        let open = v(2, Some("Belurat"), 20, 0, false);
+        let groups = [locked, open];
+        let out = section_rows(&groups);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.withheld, 1);
+        let h = section_header(&groups);
+        assert!(h.contains("2 group(s)"), "{h}");
+        assert!(h.contains("58 of 58"), "{h}");
+    }
+
+    #[test]
+    fn a_seed_whose_every_group_is_locked_renders_no_rows_but_says_so() {
+        // The section must not vanish: "0 rows" and "20 groups you cannot see" are different
+        // facts, and the caller gates the whole header on one of them.
+        let mut g = v(1, Some("Abyss"), 7, 0, false);
+        g.region_open = Some(false);
+        let out = section_rows(&[g, g, g]);
+        assert!(out.rows.is_empty());
+        assert_eq!(out.withheld, 3);
+    }
+
+    #[test]
     fn every_string_is_ascii() {
         // These are imgui labels, not game-font toasts, but the project rule is ASCII everywhere a
         // user might copy the text out of.
         let mut g = v(20000800, Some("Shadow Keep"), 49, 3, true);
         g.gated_on = Some("Shadow Keep Lock");
         g.boss = Some("Messmer");
-        for s in [group_label(&g), group_state(&g), section_header(&[g])] {
+        for s in [
+            group_label(&g),
+            group_state(&g),
+            section_header(&[g]),
+            withheld_line(20),
+        ] {
             assert!(s.is_ascii(), "{s:?}");
         }
     }
 
     #[test]
-    fn a_known_locked_region_is_hidden_by_the_in_logic_filter() {
-        // THE ROW ALARIC IS DROWNING IN: 21 of his 24 groups read "region still locked -- you
-        // cannot reach this boss yet". If this returned false the checkbox would appear to do
-        // nothing and the panel would stay unreadable.
-        let mut g = v(22000800, Some("Stone Coffin"), 8, 0, false);
-        g.region_open = Some(false);
-        assert!(hidden_by_in_logic_only(&g));
-    }
-
-    #[test]
-    fn a_reachable_region_survives_the_in_logic_filter() {
-        // The three rows he actually asked for. Hiding these would empty the section he wanted.
-        let g = v(2048380850, Some("Cerulean"), 19, 0, false);
-        assert_eq!(g.region_open, Some(true));
-        assert!(!hidden_by_in_logic_only(&g));
-    }
-
-    #[test]
-    fn an_unknown_region_is_shown_because_unknown_is_not_locked() {
+    fn an_unknown_region_is_never_withheld_because_unknown_is_not_locked() {
         // 🛑 THE LOAD-BEARING CASE. `None` means the coarse table could not place the group -- it
-        // is the ABSENCE of a verdict, not a verdict of "locked". Hiding it would delete a row
-        // nobody established was unreachable, and the player would never learn it existed: the
-        // filter is a view, so a wrongly-hidden row leaves no trace anywhere. Wrongly SHOWING an
-        // unreachable group costs one line of noise; wrongly hiding a reachable one costs the
-        // sweep. `group_state` already refuses to invent a wall out of `None` for the same reason.
+        // is the ABSENCE of a verdict, not a verdict of "locked". Withholding it would conceal a
+        // group the player can walk to right now, and he would never learn it existed: the list
+        // is a view, so a wrongly withheld row leaves no trace anywhere. Wrongly SHOWING an
+        // unreachable group costs one line of noise; wrongly withholding a reachable one costs
+        // the sweep. `group_state` already refuses to invent a wall out of `None` for the same
+        // reason. (`an_unplaceable_group_still_renders` pins the same rule one level up, at the
+        // list; this pins the predicate itself, which is what every caller reads.)
         let mut g = v(1, Some("Belurat"), 10, 0, false);
         g.region_open = None;
-        assert!(!hidden_by_in_logic_only(&g));
+        assert!(!is_withheld(&g));
     }
 
     #[test]
     fn nothing_but_region_open_can_flip_the_verdict() {
-        // The one-checkbox-one-meaning rule, as a corpus. `fired`, `gated_on` and the check counts
-        // all answer "what is this waiting for", and any of them leaking into "can I walk there"
-        // would give the shared `in-logic only` checkbox a second meaning nobody asked for.
+        // ONE PREDICATE, ONE INPUT, as a corpus. Withholding is a DISCLOSURE rule, so the only
+        // question it may ask is whether somebody established that this region is locked.
+        // `fired`, `gated_on` and the check counts all answer "what is this group waiting for",
+        // and any of them leaking in would conceal -- or reveal -- a row for a reason that has
+        // nothing to do with what the player is allowed to see. (`is_settled` does take those
+        // fields, and `section_rows` resolves the two in ORDER; that is tested separately.)
         let mut corpus = Vec::new();
         for fired in [false, true] {
             for gate in [None, Some("Stone Coffin Lock")] {
@@ -401,16 +500,17 @@ mod tests {
             unknown.region_open = None;
             let mut locked = *g;
             locked.region_open = Some(false);
-            assert!(!hidden_by_in_logic_only(&open), "{:?}", open);
-            assert!(!hidden_by_in_logic_only(&unknown), "{:?}", unknown);
-            assert!(hidden_by_in_logic_only(&locked), "{:?}", locked);
+            assert!(!is_withheld(&open), "{:?}", open);
+            assert!(!is_withheld(&unknown), "{:?}", unknown);
+            assert!(is_withheld(&locked), "{:?}", locked);
         }
     }
 
     #[test]
-    fn the_unfiltered_header_wording_is_pinned() {
-        // PINNED ON PURPOSE. The filtered header is a new string; this one is what players have
-        // been reading since 2026-08-07, and adding a filter must not reword it by accident.
+    fn the_header_wording_is_pinned() {
+        // PINNED ON PURPOSE. This is the string players have been reading since 2026-08-07, and
+        // it is the one place a withheld group is still counted -- rewording or re-scoping it by
+        // accident is how "how much am I owed" starts answering a different question.
         let groups = [
             v(1, Some("Shadow Keep"), 49, 49, true),
             v(2, Some("Belurat"), 50, 10, false),
@@ -419,66 +519,5 @@ mod tests {
             section_header(&groups),
             "Boss sweeps -- 2 group(s), 40 of 99 check(s) still behind a boss"
         );
-        // Filter off must be byte-identical to no filter at all.
-        assert_eq!(
-            section_header_filtered(&groups, false),
-            section_header(&groups)
-        );
-    }
-
-    #[test]
-    fn the_filtered_header_names_the_hidden_count_and_why() {
-        // Reading "3 group(s)" above 3 rows while 21 are hidden is worse than the noise: it makes
-        // a filtered seed look like a small one. The header has to admit what it is not showing.
-        let mut locked_a = v(2, Some("Stone Coffin"), 8, 0, false);
-        locked_a.region_open = Some(false);
-        let mut locked_b = v(3, Some("Enir Ilim"), 12, 2, false);
-        locked_b.region_open = Some(false);
-        let groups = [v(1, Some("Cerulean"), 19, 4, false), locked_a, locked_b];
-        assert_eq!(
-            section_header_filtered(&groups, true),
-            "Boss sweeps -- 1 reachable, 2 behind locked regions, 33 of 39 check(s) still behind a boss"
-        );
-    }
-
-    #[test]
-    fn a_filter_that_hides_nothing_does_not_claim_it_hid_something() {
-        // On, but biting nothing. "2 reachable, 0 behind locked regions" would be true and useless
-        // -- it advertises a filter with no effect and pushes the number that matters to the right.
-        let groups = [
-            v(1, Some("Shadow Keep"), 49, 49, true),
-            v(2, Some("Belurat"), 50, 10, false),
-        ];
-        let s = section_header_filtered(&groups, true);
-        assert_eq!(s, section_header(&groups));
-        assert!(!s.contains("behind locked regions"), "{s}");
-    }
-
-    #[test]
-    fn the_filter_hides_rows_and_never_the_arithmetic() {
-        // 🛑 A HIDDEN GROUP IS STILL OWED. bobler's question was "how much am I owed"; if the
-        // totals shrank with the view, losing a region would look like being owed less. Same
-        // property the already-paid row filter in core.rs was built with.
-        let mut locked = v(2, Some("Stone Coffin"), 8, 0, false);
-        locked.region_open = Some(false);
-        let groups = [v(1, Some("Cerulean"), 19, 4, false), locked];
-        let on = section_header_filtered(&groups, true);
-        let off = section_header_filtered(&groups, false);
-        assert!(on.contains("23 of 27 check(s)"), "{on}");
-        assert!(off.contains("23 of 27 check(s)"), "{off}");
-        assert_ne!(
-            on, off,
-            "the filtered header must still say it is filtering"
-        );
-    }
-
-    #[test]
-    fn the_filtered_header_is_ascii_too() {
-        // Same rule as `every_string_is_ascii`: imgui labels a player may copy out.
-        let mut locked = v(2, Some("Stone Coffin"), 8, 0, false);
-        locked.region_open = Some(false);
-        let groups = [v(1, Some("Cerulean"), 19, 4, false), locked];
-        let s = section_header_filtered(&groups, true);
-        assert!(s.is_ascii(), "{s:?}");
     }
 }
