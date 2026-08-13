@@ -6,8 +6,16 @@ on:
   # `main`, so it never ran. Three consecutive Windows build round-trips were burned on symbol names
   # (ItemLotParam_map, ITEMLOT_PARAM_ST, set_lot_item_id01..08) that this workflow would have caught
   # for free on a GitHub runner. Gate the branch people actually push to.
+  # EVERY BRANCH, not just main (2026-08-13). A side branch used to run NOTHING, so the first clean-
+  # environment build of any work happened when a PR opened -- or, for work that never opened one, on
+  # the maintainer's box and nowhere else. That is the whole reason a release .dll has historically
+  # been "built separately": there was no other machine that built it.
+  #
+  # 🛑 THIS IS ONLY AFFORDABLE BECAUSE THE CACHE STOPPED THRASHING in the same commit. Widening the
+  # trigger without the `save-if` below would have made it worse: more branches x 585 MB per cache,
+  # against a 10 GB repo limit that was ALREADY over.
   push:
-    branches: [main]
+    branches: ['**']
   # Manual kick. Actions is DISABLED BY DEFAULT ON FORKS and this repo is a fork of
   # fswap/from-software-archipelago-clients -- so the workflow read as `state: active` while having
   # literally never run (total_count: 0). Enabled 2026-07-12 after it let three broken builds through
@@ -24,11 +32,32 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - uses: dtolnay/rust-toolchain@stable
+    # 🛑 ASK FOR THE TOOLCHAIN THE REPO PINS. `rust-toolchain.toml` says `nightly`, so every cargo
+    # invocation below resolves through rustup to nightly regardless of what this step installs --
+    # this used to say `@stable`, which meant the job installed one toolchain and built with another,
+    # and `Swatinem/rust-cache` keyed the cache on the version of the one that was NOT used.
+    # `dtolnay/rust-toolchain@master` + an explicit `toolchain:` makes the two agree.
+    #
+    # Nightly is not a preference here: stable rustfmt ignores `format_generated_files = false` and
+    # rewrites the @generated files, which is a red on a file nobody edited.
+    - uses: dtolnay/rust-toolchain@master
       with:
+        toolchain: nightly
         targets: x86_64-pc-windows-msvc
         components: clippy, rustfmt
+    # 🛑🛑 SAVE ONLY FROM main. MEASURED 2026-08-13: 18 cache entries, ~585 MB each, **10,530 MB
+    # against a 10,240 MB repo limit**. The cache was over its own ceiling, so GitHub was evicting
+    # LRU entries faster than runs could use them and a push to main logged `No cache found` and
+    # compiled **258 crates** from scratch. The cache was not cold because caching was hard; it was
+    # cold because we were storing three copies of it.
+    #
+    # Every distinct `Cargo.lock` spawns a fresh ~585 MB family, and previously main AND each PR
+    # branch saved their own copy of that family. Restores are unaffected by this change: a PR still
+    # reads main's cache, because Actions makes the default branch's caches visible to every branch.
+    # Only the writes stop.
     - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     # ORDER MATTERS (2026-07-12). These steps used to run fmt -> clippy -> build -> test, and every
     # step is fail-fast, so a style lint SKIPS the build. On the first run this repo ever did, that is
@@ -64,3 +93,30 @@ jobs:
     # nothing was stopping it.
     - run: cargo clippy -- -D warnings
     - run: cargo clippy --features=profile -- -D warnings
+
+    # -------------------------------------------------------------------------------------------
+    # THE ARTIFACT. Until now this job built the .dll and threw it away, so the only machine that
+    # produced a runnable client was the maintainer's -- which is why "it works on my box" has been
+    # an untestable claim and why `er-archipelago/.github/workflows/release.yaml` records the bundle
+    # as "a Windows-built manual upload". That file says the release runner "cannot build" the .dll;
+    # true of THAT runner, which is ubuntu-latest, and not of this one, which has been building it
+    # on every PR for a month.
+    #
+    # 🛑 RELEASE, NOT DEBUG. `cargo build` above is the compile gate and stays debug (faster, and
+    # `-D warnings` is what it is there for). A .dll someone is going to load into the game wants
+    # optimisation, and a debug cdylib for this workspace is an order of magnitude larger.
+    #
+    # 🛑 THIS IS NOT A RELEASE. It is a build anyone can download and run, on any branch, so a
+    # playtest no longer waits on one person's environment. The hash-matched-pair rule in
+    # release/DISTRIBUTION.md still governs what may be handed to a PLAYER: this .dll is paired with
+    # nothing, so the artifact name carries the sha and the retention is short on purpose.
+    - run: cargo build --release
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: eldenring_archipelago-${{ github.sha }}
+        path: target/release/eldenring_archipelago.dll
+        if-no-files-found: error
+        # Short on purpose: these are build outputs, not releases, and artifact storage is the same
+        # quota the cache above just got evicted out of.
+        retention-days: 14
