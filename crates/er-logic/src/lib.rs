@@ -39,6 +39,7 @@ pub mod grace;
 pub mod grace_flush_replay;
 pub mod grants;
 pub mod hook;
+pub mod icon_seam;
 pub mod inv_ptr;
 pub mod lock_hint_economy;
 pub mod map_reveal_replay;

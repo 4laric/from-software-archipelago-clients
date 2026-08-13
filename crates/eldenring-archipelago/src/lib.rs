@@ -27,6 +27,7 @@ mod fogwall;
 mod game;
 mod goal;
 mod hook_impl;
+mod icon_seam_probe;
 mod input;
 mod inventory;
 mod key_resolver;
