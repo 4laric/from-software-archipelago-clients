@@ -79,8 +79,21 @@ pub enum Step {
     /// fight is still being timed.
     Capped { npc_param_id: i32, elapsed_ms: u64 },
     /// The bar this sampler was following went away (killed, fled, reloaded, or replaced by a
-    /// different boss). `elapsed_ms` is the fight length.
-    End { npc_param_id: i32, elapsed_ms: u64 },
+    /// different boss).
+    ///
+    /// 🛑 `elapsed_ms` IS MEASURED TO THE LAST TICK THE BAR WAS ACTUALLY SEEN, not to the tick we
+    /// noticed it was gone. Those are the same number in a normal end and wildly different when the
+    /// player dies -- see [`FightSampler::last_seen_ms`] for the log that forced this.
+    ///
+    /// `unseen_ms` is the gap between the two: how long the sampler was blind before it found the
+    /// bar cleared. The fight really ended somewhere inside that window, so `elapsed_ms` is a lower
+    /// bound and `elapsed_ms + unseen_ms` is the upper one. A reader is told both rather than being
+    /// handed a point estimate that is silently wrong on exactly the fights that were lost.
+    End {
+        npc_param_id: i32,
+        elapsed_ms: u64,
+        unseen_ms: u64,
+    },
 }
 
 /// Follows one boss healthbar at a time and decides when to sample.
@@ -99,6 +112,20 @@ pub struct FightSampler {
     started_ms: u64,
     /// Wall clock of the last emitted sample.
     last_sample_ms: u64,
+    /// Wall clock of the last tick on which this bar was OBSERVED up.
+    ///
+    /// 🛑 THIS EXISTS BECAUSE THE FIGHT LENGTH WAS WRONG ON EVERY DEATH (client#184). The probe's
+    /// death guard returns before [`FightSampler::step`] is ever called once the player's HP hits
+    /// 0, and `read_player` returns `None` through the reload -- so the sampler simply stops being
+    /// ticked for the whole death cam. The next tick it does get is after the respawn, with the bar
+    /// already down, and measuring to *that* tick charges the load screen to the boss.
+    ///
+    /// Measured, from bobler's `archipelago-2026-08-12 (3).log`: last sample `t=34.5s`, `END ...
+    /// after 60.1s`. 25.6 seconds of that was a death cam and a reload -- a 74% overstatement, and
+    /// it lands only on the fights the player LOST, which are the ones a difficulty complaint is
+    /// about. The three fights he won were all within 0.5s of their last sample, so it reads as
+    /// plausible unless you go looking at a death on purpose.
+    last_seen_ms: u64,
     /// Samples emitted for the current subject.
     samples: u32,
     /// Whether [`Step::Capped`] has already fired for the current subject.
@@ -113,6 +140,7 @@ impl FightSampler {
             subject: None,
             started_ms: 0,
             last_sample_ms: 0,
+            last_seen_ms: 0,
             samples: 0,
             capped: false,
         }
@@ -149,19 +177,13 @@ impl FightSampler {
             // No bar, and we were not following one.
             (0, None) => Step::Idle,
             // The bar we were following went away. This is the fight-length line.
-            (0, Some(prev)) => {
-                let elapsed = now_ms.saturating_sub(self.started_ms);
-                self.clear();
-                Step::End {
-                    npc_param_id: prev,
-                    elapsed_ms: elapsed,
-                }
-            }
+            (0, Some(prev)) => self.close(prev, now_ms),
             // A bar came up and we were following nothing.
             (id, None) => {
                 self.subject = Some(id);
                 self.started_ms = now_ms;
                 self.last_sample_ms = now_ms;
+                self.last_seen_ms = now_ms;
                 self.samples = 1; // the Start line IS the t=0 reading
                 self.capped = false;
                 Step::Start { npc_param_id: id }
@@ -169,17 +191,15 @@ impl FightSampler {
             // A DIFFERENT bar replaced ours. Close the old fight; the next tick opens the new one.
             // Deliberately not collapsed into one step: two events in one tick would mean either
             // dropping the End line or returning a pair, and the End line carries the fight length.
-            (id, Some(prev)) if id != prev => {
-                let elapsed = now_ms.saturating_sub(self.started_ms);
-                self.clear();
-                Step::End {
-                    npc_param_id: prev,
-                    elapsed_ms: elapsed,
-                }
-            }
+            (id, Some(prev)) if id != prev => self.close(prev, now_ms),
             // Same bar, still up: sample on the cadence.
             (id, Some(_)) => {
-                if now_ms.saturating_sub(self.last_sample_ms) < interval_ms {
+                // This tick SAW the bar. Recorded before the cadence check, because an observation
+                // is not the same event as a sample -- ticks arrive at frame rate and samples at
+                // 2 Hz, and the fight length must be measured against the former.
+                self.last_seen_ms = now_ms;
+                let due = self.last_sample_ms.saturating_add(interval_ms);
+                if now_ms < due {
                     return Step::Idle;
                 }
                 let elapsed = now_ms.saturating_sub(self.started_ms);
@@ -193,7 +213,15 @@ impl FightSampler {
                         elapsed_ms: elapsed,
                     };
                 }
-                self.last_sample_ms = now_ms;
+                // Advance the schedule by a whole period rather than to `now_ms`, so one late tick
+                // does not push every later sample later. Observed in the 08-12 log as `t=47.5 ->
+                // 48.1 -> 48.6`: the cadence had walked 100ms off the grid and kept it. Resync
+                // outright when more than a full period behind, which is a hitch, not jitter.
+                self.last_sample_ms = if now_ms.saturating_sub(due) >= interval_ms {
+                    now_ms
+                } else {
+                    due
+                };
                 self.samples = self.samples.saturating_add(1);
                 Step::Sample {
                     npc_param_id: id,
@@ -207,8 +235,25 @@ impl FightSampler {
         self.subject = None;
         self.started_ms = 0;
         self.last_sample_ms = 0;
+        self.last_seen_ms = 0;
         self.samples = 0;
         self.capped = false;
+    }
+
+    /// Close the current fight, reporting the length we can actually vouch for.
+    ///
+    /// Both callers (`bar dropped` and `a different bar replaced ours`) want identical accounting;
+    /// having one of them measure to `now_ms` and the other to `last_seen_ms` is precisely the
+    /// class of drift this module keeps getting bitten by.
+    fn close(&mut self, prev: i32, now_ms: u64) -> Step {
+        let elapsed_ms = self.last_seen_ms.saturating_sub(self.started_ms);
+        let unseen_ms = now_ms.saturating_sub(self.last_seen_ms);
+        self.clear();
+        Step::End {
+            npc_param_id: prev,
+            elapsed_ms,
+            unseen_ms,
+        }
     }
 }
 
@@ -277,6 +322,160 @@ pub fn format_sample(tag: &str, r: &Reading) -> String {
     )
 }
 
+/// How a fight ended, as far as the instrument can honestly tell.
+///
+/// 🛑 THE OLD `END` LINE SAID `bar down after Xs` FOR ALL FOUR CASES, which is true and useless.
+/// In bobler's 08-12 log three fights were kills and one was a death, and nothing in the line that
+/// summarises a fight distinguished them -- so any aggregate built on those durations silently
+/// mixed wins and losses, which are the two populations a difficulty question is trying to
+/// separate. The outcome was recoverable by hand from the preceding SAMPLE. That is not the same
+/// as being recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The boss was OBSERVED at 0 HP. The strongest of the three: we saw it, we did not infer it.
+    BossDown,
+    /// The player's HP hit 0 during this fight. Inferred from the death guard tripping, which is
+    /// the same signal that stops the sampler -- so it costs nothing and cannot disagree with it.
+    PlayerDown,
+    /// Neither. The bar went away for some other reason: fled, despawned, a cutscene, a reload, a
+    /// phase change that swapped the bar, or a fight still going when the log ended.
+    ///
+    /// 🛑 THIS IS A REAL ANSWER AND MUST NOT BE COLLAPSED INTO `PlayerDown`. "The bar vanished and
+    /// the player was on low HP" is the shape of a death AND the shape of running away, and this
+    /// module does not get to guess between them. The final HP pair rides on the line so the reader
+    /// can.
+    Unresolved,
+}
+
+impl Outcome {
+    /// The word that goes in the log line.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Outcome::BossDown => "BOSS DOWN",
+            Outcome::PlayerDown => "PLAYER DOWN",
+            Outcome::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// Classify a finished fight from the last reading we managed to take plus the death-guard latch.
+///
+/// `BossDown` wins a tie on purpose: an observed 0 beats an inferred one. If the boss was already
+/// at 0 in the last reading, the bar came down because the boss died, and a death afterwards -- in
+/// the death cam of a fight you actually won, or to a lingering hitbox -- does not change that.
+pub fn classify(last_boss: Option<Hp>, player_went_down: bool) -> Outcome {
+    if last_boss.is_some_and(|b| b.cur <= 0) {
+        return Outcome::BossDown;
+    }
+    if player_went_down {
+        return Outcome::PlayerDown;
+    }
+    Outcome::Unresolved
+}
+
+/// Format the one line that summarises a finished fight.
+///
+/// Same flat named-field shape as [`format_sample`], for the same reason: this is read by grep,
+/// months later, by someone who does not have this file open.
+pub fn format_end(
+    npc_param_id: i32,
+    outcome: Outcome,
+    elapsed_ms: u64,
+    unseen_ms: u64,
+    last: Option<(Hp, Hp)>,
+) -> String {
+    let secs = |ms: u64| format!("{}.{}", ms / 1000, (ms % 1000) / 100);
+    let tail = match last {
+        Some((boss, player)) => format!(
+            "last boss {}/{} ({}%) player {}/{} ({}%)",
+            boss.cur,
+            boss.max,
+            boss.pct(),
+            player.cur,
+            player.max,
+            player.pct(),
+        ),
+        // Not padding: a fight whose boss was never once readable is a different -- and worse --
+        // observation than one that ended at a known HP, and the line has to be able to say so.
+        None => "last unread (the boss was never found in the live sets)".to_string(),
+    };
+    format!(
+        "boss-fight END: npc_param {npc_param_id} outcome={} t={}s unseen={}s {tail}",
+        outcome.label(),
+        secs(elapsed_ms),
+        secs(unseen_ms),
+    )
+}
+
+/// Heartbeat for [`SampleGate`]: emit an unchanged reading at least this often.
+///
+/// A stalemate has to stay visible. Without a heartbeat, "the player and the boss traded nothing
+/// for forty seconds" and "the probe died" produce an identical gap in the log, and this repo has
+/// already learned that a silent gap in a trace reads as a broken instrument.
+pub const DEFAULT_HEARTBEAT_MS: u64 = 5_000;
+
+/// Suppresses SAMPLE lines whose numbers have not moved.
+///
+/// # Why this exists
+///
+/// Boss HP only changes when the boss is hit, but the sampler runs at a fixed 2 Hz. Measured over
+/// bobler's four fights on 2026-08-12: **412 SAMPLE lines carrying 36 distinct readings**
+/// (115 samples / 9 values, 154 / 13, 143 / 14). Twelve identical lines for every one that says
+/// something, and 412 of that session's 2715 lines.
+///
+/// ⭐ The cost was never really the bytes -- it was that the signal was unreadable. Fight 1
+/// deduplicated is eight numbers: `3826 -> 3294 -> 3100 -> 2568 -> 2036 -> 1770 -> 1402 -> 603 ->
+/// 0`, deltas `532, 194, 532, 532, 266, 368, 799, 603`, which is a visible ~266 per-hit quantum.
+/// Nobody had noticed it under a hundred duplicate lines.
+///
+/// 🛑 THE POLL RATE IS NOT WHAT CHANGED. The sampler still steps at 2 Hz, so a burst that takes the
+/// player from full to dead between two hits is still resolved -- that is why
+/// [`DEFAULT_INTERVAL_MS`] is 500 and not slower, and this gate must not be mistaken for a reason
+/// to raise it. Only the EMIT is conditional.
+#[derive(Debug, Default)]
+pub struct SampleGate {
+    /// The last `(boss, player)` pair actually written to the log.
+    last: Option<(Hp, Hp)>,
+    /// Wall clock of that write.
+    last_emit_ms: u64,
+}
+
+impl SampleGate {
+    /// `const` for the same reason [`FightSampler::new`] is: it lives in a `static Mutex`.
+    pub const fn new() -> Self {
+        Self {
+            last: None,
+            last_emit_ms: 0,
+        }
+    }
+
+    /// Forget everything. Called at [`Step::Start`], so a new fight always emits its `t=0` reading
+    /// even when it opens on exactly the numbers the previous fight closed on.
+    pub fn reset(&mut self) {
+        self.last = None;
+        self.last_emit_ms = 0;
+    }
+
+    /// Should this reading be written?
+    pub fn admit(&mut self, now_ms: u64, boss: Hp, player: Hp) -> bool {
+        self.admit_every(now_ms, boss, player, DEFAULT_HEARTBEAT_MS)
+    }
+
+    /// [`Self::admit`] with an explicit heartbeat, so the behaviour is testable without sleeping.
+    pub fn admit_every(&mut self, now_ms: u64, boss: Hp, player: Hp, heartbeat_ms: u64) -> bool {
+        let changed = self.last != Some((boss, player));
+        // A backwards clock (process restart) must not stall the heartbeat until the clock catches
+        // up again; `saturating_sub` yields 0, which is < heartbeat, so `changed` still governs.
+        let stale = now_ms.saturating_sub(self.last_emit_ms) >= heartbeat_ms;
+        if !changed && !stale {
+            return false;
+        }
+        self.last = Some((boss, player));
+        self.last_emit_ms = now_ms;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +489,29 @@ mod tests {
             player: Hp::new(412, 652),
             elapsed_ms,
         }
+    }
+
+    /// Tick the sampler at ~60 fps from `from_ms` to `to_ms` with the bar up, the way the client
+    /// actually does, and hand back how many SAMPLE steps came out.
+    ///
+    /// Several tests below used to jump straight from `Start` to the closing tick. That was always
+    /// unrealistic -- the probe is called every frame -- and now it is also misleading, because a
+    /// fight with no observations between its ends has a real `unseen` gap and SHOULD report one.
+    fn run_fight(s: &mut FightSampler, id: i32, from_ms: u64, to_ms: u64) -> u32 {
+        let mut samples = 0;
+        let mut t = from_ms;
+        while t < to_ms {
+            if let Step::Sample { .. } = s.step(t, Some(id)) {
+                samples += 1;
+            }
+            t += 16;
+        }
+        // Always land the last observation exactly on `to_ms`, so a test can name the instant the
+        // bar was last seen instead of whatever a 16ms stride happened to reach.
+        if let Step::Sample { .. } = s.step(to_ms, Some(id)) {
+            samples += 1;
+        }
+        samples
     }
 
     // -------------------------------------------------------------------------------------------
@@ -328,13 +550,17 @@ mod tests {
                 elapsed_ms: 1_000
             }
         );
+        // The client keeps ticking for the rest of the fight.
+        run_fight(&mut s, 11_050_800, 2_016, 94_488);
         // Bar drops -> the fight LENGTH, which is half the signal.
         assert_eq!(
             s.step(94_500, Some(0)),
             Step::End {
                 npc_param_id: 11_050_800,
-                elapsed_ms: 93_500
-            }
+                elapsed_ms: 93_488,
+                unseen_ms: 12,
+            },
+            "a fight the probe watched to the end has a length and essentially no unseen gap"
         );
         assert_eq!(s.subject(), None);
         assert_eq!(s.step(95_000, Some(0)), Step::Idle);
@@ -362,6 +588,68 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------------------
+    // 🛑 THE FIGHT LENGTH IS MEASURED TO THE LAST OBSERVATION -- client#184.
+    // -------------------------------------------------------------------------------------------
+
+    /// The motivating case for #184, replayed from bobler's log to the tenth of a second.
+    ///
+    /// Fight 2 of `archipelago-2026-08-12 (3).log`: last SAMPLE at `t=34.5s`, the player dies, and
+    /// the probe is not ticked again until after the respawn -- the death guard returns before
+    /// `step` is reached, and `read_player` is `None` through the reload. The old code measured to
+    /// the tick that noticed the bar was gone and reported `bar down after 60.1s`.
+    #[test]
+    fn a_death_does_not_charge_the_load_screen_to_the_boss() {
+        let mut s = FightSampler::new();
+        assert!(matches!(s.step(0, Some(42_600_110)), Step::Start { .. }));
+        run_fight(&mut s, 42_600_110, 16, 34_500);
+
+        // The player dies at 34.5s. NOTHING is ticked for 25.6 seconds: death cam, YOU DIED,
+        // reload, respawn. Then the first tick back finds the bar already down.
+        let end = s.step(60_100, Some(0));
+
+        assert_eq!(
+            end,
+            Step::End {
+                npc_param_id: 42_600_110,
+                elapsed_ms: 34_500,
+                unseen_ms: 25_600,
+            },
+            "the fight is 34.5s of observed fighting plus a 25.6s blind gap -- NOT a 60.1s boss"
+        );
+        let Step::End {
+            elapsed_ms,
+            unseen_ms,
+            ..
+        } = end
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            elapsed_ms + unseen_ms,
+            60_100,
+            "the two halves must still add up to the wall clock -- the old number is recoverable, \
+             it is just no longer the headline"
+        );
+    }
+
+    #[test]
+    fn a_fight_watched_to_the_end_reports_no_meaningful_gap() {
+        let mut s = FightSampler::new();
+        s.step(0, Some(7));
+        run_fight(&mut s, 7, 16, 57_888);
+        assert_eq!(
+            s.step(57_900, Some(0)),
+            Step::End {
+                npc_param_id: 7,
+                elapsed_ms: 57_888,
+                unseen_ms: 12,
+            },
+            "a kill is watched frame by frame, so unseen is one tick -- this is why the three \
+             fights bobler WON looked correct and only the death was wrong"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------------
     // 🛑 DON'T-KNOW IS NOT "NO" -- boss_grants property 3.
     // -------------------------------------------------------------------------------------------
 
@@ -382,13 +670,17 @@ mod tests {
             Some(999),
             "the subject must survive an unreachable stretch"
         );
-        // And the elapsed clock kept running across it, rather than restarting.
+        // And the elapsed clock kept running across it, rather than restarting: the bar is seen
+        // again on the far side, and the fight length spans the whole thing.
+        s.step(9_100, Some(999));
         assert_eq!(
             s.step(9_500, Some(0)),
             Step::End {
                 npc_param_id: 999,
-                elapsed_ms: 9_500
-            }
+                elapsed_ms: 9_100,
+                unseen_ms: 400,
+            },
+            "the clock spans the stutter (9.1s, not 0.4s) because started_ms was never reset"
         );
     }
 
@@ -396,11 +688,13 @@ mod tests {
     fn some_zero_is_an_answer_and_does_end_the_fight() {
         let mut s = FightSampler::new();
         s.step(0, Some(7));
+        run_fight(&mut s, 7, 16, 1_984);
         assert_eq!(
             s.step(2_000, Some(0)),
             Step::End {
                 npc_param_id: 7,
-                elapsed_ms: 2_000
+                elapsed_ms: 1_984,
+                unseen_ms: 16,
             },
             "Some(0) IS the game saying no bar is up -- unlike None, it is a real observation"
         );
@@ -414,11 +708,13 @@ mod tests {
     fn a_replacing_bar_closes_the_old_fight_and_opens_a_new_one() {
         let mut s = FightSampler::new();
         assert!(matches!(s.step(0, Some(100)), Step::Start { .. }));
+        run_fight(&mut s, 100, 16, 29_984);
         assert_eq!(
             s.step(30_000, Some(200)),
             Step::End {
                 npc_param_id: 100,
-                elapsed_ms: 30_000
+                elapsed_ms: 29_984,
+                unseen_ms: 16,
             }
         );
         assert_eq!(
@@ -426,6 +722,48 @@ mod tests {
             Step::Start { npc_param_id: 200 },
             "the replacing bar is picked up on the very next tick"
         );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Cadence.
+    // -------------------------------------------------------------------------------------------
+
+    /// The 08-12 log shows `t=47.5 -> 48.1 -> 48.6`: the schedule had walked off the grid and kept
+    /// the offset, because each sample re-based the next one on the tick that happened to deliver
+    /// it. On a machine whose frame rate is what is being complained about, that loses samples.
+    #[test]
+    fn a_late_tick_does_not_push_every_later_sample_later() {
+        let mut s = FightSampler::new();
+        assert!(matches!(s.step(0, Some(1)), Step::Start { .. }));
+        // Ticks arriving every 300ms -- slow, but comfortably faster than the 500ms period.
+        let mut samples = 0;
+        for t in (300..=2_100).step_by(300) {
+            if let Step::Sample { .. } = s.step(t as u64, Some(1)) {
+                samples += 1;
+            }
+        }
+        // Grid is 500/1000/1500/2000, so four are due by t=2100. Re-basing on the delivering tick
+        // yields only three (600, 1200, 1800) -- a 25% loss with no hitch in sight.
+        assert_eq!(
+            samples, 4,
+            "the schedule must stay on the 500ms grid rather than following the ticks that \
+             happened to deliver it, got {samples}"
+        );
+    }
+
+    #[test]
+    fn a_real_hitch_resyncs_rather_than_firing_a_burst() {
+        let mut s = FightSampler::new();
+        s.step(0, Some(1));
+        // A 4-second freeze. If the schedule caught up by whole periods it would owe 8 samples and
+        // fire them on consecutive ticks, which is a burst of duplicates, not a measurement.
+        assert!(matches!(s.step(4_000, Some(1)), Step::Sample { .. }));
+        assert_eq!(
+            s.step(4_100, Some(1)),
+            Step::Idle,
+            "after resyncing, the next sample is one full period away -- no catch-up burst"
+        );
+        assert!(matches!(s.step(4_500, Some(1)), Step::Sample { .. }));
     }
 
     // -------------------------------------------------------------------------------------------
@@ -439,6 +777,7 @@ mod tests {
         let mut samples = 0u32;
         let mut capped = 0u32;
         // Well past the cap.
+        let last_tick = (MAX_SAMPLES_PER_FIGHT + 200) as u64 * DEFAULT_INTERVAL_MS;
         for i in 1..=(MAX_SAMPLES_PER_FIGHT + 200) as u64 {
             match s.step(i * DEFAULT_INTERVAL_MS, Some(1)) {
                 Step::Sample { .. } => samples += 1,
@@ -452,13 +791,16 @@ mod tests {
             "the Start line counts as the first sample, so the cap admits CAP-1 more"
         );
         assert_eq!(capped, 1, "Capped must fire exactly once, not every tick");
-        // Still timing: the fight length is true even though the trace stopped.
+        // Still timing: the fight length is true even though the trace stopped. The bar was last
+        // SEEN on the final tick of the loop above, so that -- not the closing tick -- is the
+        // length, and the difference is stated as the gap.
         let end_at = (MAX_SAMPLES_PER_FIGHT as u64 + 400) * DEFAULT_INTERVAL_MS;
         assert_eq!(
             s.step(end_at, Some(0)),
             Step::End {
                 npc_param_id: 1,
-                elapsed_ms: end_at
+                elapsed_ms: last_tick,
+                unseen_ms: end_at - last_tick,
             }
         );
     }
@@ -489,6 +831,200 @@ mod tests {
             assert_eq!(s.step(t * 1_000, Some(0)), Step::Idle);
         }
         assert_eq!(s.subject(), None);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // The outcome -- client#184.
+    // -------------------------------------------------------------------------------------------
+
+    #[test]
+    fn an_observed_zero_is_a_kill() {
+        assert_eq!(
+            classify(Some(Hp::new(0, 3826)), false),
+            Outcome::BossDown,
+            "bobler's fights 1, 3 and 4 all ended on an observed boss 0/N"
+        );
+    }
+
+    #[test]
+    fn the_death_guard_latch_is_what_names_a_death() {
+        // Fight 2: the last reading the probe got was boss 626/1200, player 28/833. The player was
+        // NOT observed at 0 -- they died between samples -- so the HP pair alone cannot say this.
+        assert_eq!(
+            classify(Some(Hp::new(626, 1200)), true),
+            Outcome::PlayerDown,
+            "the last sample showed the player at 28 HP, not 0; only the guard knows they died"
+        );
+    }
+
+    #[test]
+    fn an_observed_kill_beats_an_inferred_death() {
+        assert_eq!(
+            classify(Some(Hp::new(0, 1200)), true),
+            Outcome::BossDown,
+            "dying in the death cam of a fight you won does not un-kill the boss"
+        );
+    }
+
+    #[test]
+    fn a_vanished_bar_with_a_live_player_is_not_guessed_at() {
+        assert_eq!(
+            classify(Some(Hp::new(626, 1200)), false),
+            Outcome::Unresolved,
+            "fled, despawned, cutscene, reload -- all real, none of them a death"
+        );
+        assert_eq!(
+            classify(None, false),
+            Outcome::Unresolved,
+            "a boss never found in the live sets tells us nothing about how it ended"
+        );
+    }
+
+    #[test]
+    fn a_never_read_boss_says_so_instead_of_printing_a_zero() {
+        let line = format_end(4242, Outcome::Unresolved, 1_000, 0, None);
+        assert!(
+            line.contains("last unread"),
+            "an unread boss must not be formatted as 0/0 -- that reads as a kill. Got: {line}"
+        );
+        assert!(
+            !line.contains("0/0"),
+            "and specifically must not print 0/0. Got: {line}"
+        );
+    }
+
+    #[test]
+    fn the_end_line_names_the_outcome_the_length_and_the_gap() {
+        // Bobler's fight 2, formatted the way it should have been logged.
+        let line = format_end(
+            42_600_110,
+            Outcome::PlayerDown,
+            34_500,
+            25_600,
+            Some((Hp::new(626, 1200), Hp::new(28, 833))),
+        );
+        assert_eq!(
+            line,
+            "boss-fight END: npc_param 42600110 outcome=PLAYER DOWN t=34.5s unseen=25.6s \
+             last boss 626/1200 (52%) player 28/833 (3%)"
+        );
+        assert!(
+            !line.contains("60.1"),
+            "the headline number must no longer be the one that included the load screen"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // The dedupe gate -- client#185.
+    // -------------------------------------------------------------------------------------------
+
+    /// The motivating case for #185, replayed from bobler's fight 1.
+    ///
+    /// 115 SAMPLE lines carried nine distinct boss HP values. Under the gate the same fight emits
+    /// those nine (plus whatever the heartbeat adds), and the damage curve becomes something you
+    /// can read off the log rather than something you have to write a script to recover.
+    #[test]
+    fn the_gate_turns_a_hundred_duplicate_lines_into_the_damage_curve() {
+        const CURVE: [i32; 9] = [3826, 3294, 3100, 2568, 2036, 1770, 1402, 603, 0];
+        let mut gate = SampleGate::new();
+        let player = Hp::new(377, 414);
+        let mut emitted = Vec::new();
+        // 115 samples at 2 Hz, holding each value for a stretch the way a real fight does.
+        for i in 0..115u64 {
+            let boss = Hp::new(CURVE[(i as usize * CURVE.len()) / 115], 3826);
+            // A heartbeat far longer than the fight, so this test measures ONLY the deduping.
+            if gate.admit_every(i * 500, boss, player, u64::MAX) {
+                emitted.push(boss.cur);
+            }
+        }
+        assert_eq!(
+            emitted,
+            CURVE.to_vec(),
+            "the gate must emit each distinct reading exactly once, in order"
+        );
+        assert_eq!(
+            emitted.len(),
+            9,
+            "115 samples in, 9 lines out -- that is the whole point"
+        );
+    }
+
+    #[test]
+    fn the_gate_lets_every_change_through_including_the_players_side() {
+        let mut gate = SampleGate::new();
+        let boss = Hp::new(1200, 1200);
+        assert!(gate.admit_every(0, boss, Hp::new(833, 833), u64::MAX));
+        assert!(
+            !gate.admit_every(500, boss, Hp::new(833, 833), u64::MAX),
+            "nothing moved"
+        );
+        assert!(
+            gate.admit_every(1_000, boss, Hp::new(284, 833), u64::MAX),
+            "the PLAYER took damage -- a change on either side is a change"
+        );
+        assert!(
+            gate.admit_every(1_500, boss, Hp::new(284, 900), u64::MAX),
+            "max_hp moving is a change too: it is the readback the scaler has never had"
+        );
+    }
+
+    #[test]
+    fn a_stalemate_still_reports_on_the_heartbeat() {
+        let mut gate = SampleGate::new();
+        let boss = Hp::new(1200, 1200);
+        let player = Hp::new(833, 833);
+        assert!(gate.admit_every(0, boss, player, 5_000));
+        assert!(!gate.admit_every(4_500, boss, player, 5_000));
+        assert!(
+            gate.admit_every(5_000, boss, player, 5_000),
+            "an unchanged fight must not be indistinguishable from a dead probe"
+        );
+        assert!(
+            !gate.admit_every(9_000, boss, player, 5_000),
+            "and the heartbeat re-bases on the line it just wrote"
+        );
+        assert!(gate.admit_every(10_000, boss, player, 5_000));
+    }
+
+    #[test]
+    fn a_new_fight_always_gets_its_t0_line() {
+        let mut gate = SampleGate::new();
+        let boss = Hp::new(1200, 1200);
+        let player = Hp::new(833, 833);
+        assert!(gate.admit_every(0, boss, player, u64::MAX));
+        assert!(!gate.admit_every(500, boss, player, u64::MAX));
+        // Same boss, re-fought at full HP after a death -- exactly bobler's fights 2 and 3. Without
+        // the reset the START line of the second fight would be suppressed as a duplicate, and the
+        // t=0 max_hp readback is the single most valuable line in the trace.
+        gate.reset();
+        assert!(
+            gate.admit_every(1_000, boss, player, u64::MAX),
+            "reset must let an identical opening reading through"
+        );
+    }
+
+    #[test]
+    fn a_backwards_clock_does_not_stall_the_gate() {
+        let mut gate = SampleGate::new();
+        let boss = Hp::new(1200, 1200);
+        let player = Hp::new(833, 833);
+        assert!(gate.admit_every(50_000, boss, player, 5_000));
+        // Process restart: the clock is now far behind last_emit_ms.
+        assert!(
+            !gate.admit_every(10, boss, player, 5_000),
+            "saturating_sub yields 0, so an unchanged reading is still suppressed"
+        );
+        assert!(
+            gate.admit_every(20, boss, Hp::new(1100, 1200), 5_000),
+            "but a real change is never suppressed, whatever the clock is doing"
+        );
+    }
+
+    #[test]
+    fn the_gate_const_ctor_and_default_cannot_drift() {
+        let a = SampleGate::new();
+        let b = SampleGate::default();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 
     // -------------------------------------------------------------------------------------------
@@ -551,5 +1087,10 @@ mod tests {
         // toast strings are ASCII only).
         let line = format_sample("SAMPLE", &reading(1_234));
         assert!(line.is_ascii(), "log line must be ASCII: {line}");
+        for outcome in [Outcome::BossDown, Outcome::PlayerDown, Outcome::Unresolved] {
+            let end = format_end(1, outcome, 1_000, 0, Some((Hp::new(1, 2), Hp::new(3, 4))));
+            assert!(end.is_ascii(), "END line must be ASCII: {end}");
+        }
+        assert!(format_end(1, Outcome::Unresolved, 0, 0, None).is_ascii());
     }
 }

@@ -6,9 +6,15 @@
 //!
 //! ```text
 //! boss-fight START:  t=0.0s  npc_param 11050800 npc_id 5240 region 11050 boss 19200/19200 (100%) player 652/652 (100%)
+//! boss-fight START carried: npc_param 11050800 npc_id 5240 speffects [7010]
 //! boss-fight SAMPLE: t=12.5s npc_param 11050800 npc_id 5240 region 11050 boss  8342/19200 ( 43%) player 412/652  ( 63%)
-//! boss-fight END:    t=93.5s npc_param 11050800 ...
+//! boss-fight END: npc_param 11050800 outcome=BOSS DOWN t=93.5s unseen=0.0s last boss 0/19200 (0%) player 412/652 (63%)
 //! ```
+//!
+//! SAMPLE lines are emitted **on change**, with a
+//! [`er_logic::boss_fight_sample::DEFAULT_HEARTBEAT_MS`] heartbeat so a stalemate still shows the
+//! fight is live. The poll is still 2 Hz -- see [`er_logic::boss_fight_sample::SampleGate`] for why
+//! those are different knobs and why only the second one moved (client#185).
 //!
 //! Derivable from that series with no further plumbing: hits-to-kill, damage-per-hit taken,
 //! time-to-kill, and -- the readback the scaler has never had -- **whether the applied tier moved
@@ -55,7 +61,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use eldenring::cs::{ChrIns, WorldChrMan};
-use er_logic::boss_fight_sample::{FightSampler, Hp, Reading, Step, format_sample};
+use er_logic::boss_fight_sample::{
+    FightSampler, Hp, Reading, SampleGate, Step, classify, format_end, format_sample,
+};
+use er_logic::scaling::is_scaling_speffect_with_downstates;
 use fromsoftware_shared::FromStatic;
 
 /// **ON by default.** `ER_BOSSFIGHT_PROBE=0` or `"probes": {"boss_fight": false}` silences it.
@@ -117,6 +126,25 @@ static CLOCK: OnceLock<Instant> = OnceLock::new();
 /// sets, so that failure is stated once rather than twice a second.
 static MISSING_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Suppresses SAMPLE lines whose numbers have not moved (client#185).
+static GATE: Mutex<SampleGate> = Mutex::new(SampleGate::new());
+
+/// The last `(boss, player)` pair this fight managed to read.
+///
+/// 🛑 THE END LINE CANNOT READ THE BOSS ITSELF. By the time the bar drops the boss is usually gone
+/// from the live sets -- which is why the old END line quoted no HP at all. Remembering the last
+/// reading costs one `Option` and is the difference between "bar down" and "BOSS DOWN".
+static LAST_SEEN: Mutex<Option<(Hp, Hp)>> = Mutex::new(None);
+
+/// Set when the death guard trips during a fight.
+///
+/// ⭐ THE GUARD IS ALREADY THE DEATH SIGNAL, so the outcome costs nothing. `lists_unsafe_to_touch`
+/// is the same test that stops the sampler, so the flag cannot disagree with the gap in the trace
+/// it explains. 🛑 It is deliberately NOT read from `deathlink.rs`: that module's two `hp <= 0`
+/// tests mean different things (see `er_logic::death_guard`), and borrowing one of them here would
+/// re-create the "one bit, two jobs" coupling that doc exists to prevent.
+static PLAYER_WENT_DOWN: AtomicBool = AtomicBool::new(false);
+
 fn now_ms() -> u64 {
     CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
@@ -136,14 +164,20 @@ pub fn tick() {
         return; // not in-world: no main player, nothing to sample, no state to change
     };
     if er_logic::death_guard::lists_unsafe_to_touch(player.cur) {
+        // 🛑 LATCH BEFORE RETURNING. This early return is the whole reason the fight length was
+        // wrong: from here until the respawn the sampler is not ticked at all, so it never sees
+        // the death and never sees the bar go down. One store turns that blind spot from a silent
+        // 25-second overstatement into a stated outcome (client#184).
+        PLAYER_WENT_DOWN.store(true, Ordering::Relaxed);
         return;
     }
 
+    let t = now_ms();
     let bar = crate::flags::boss_healthbar_npc_param_id();
     let Ok(mut sampler) = SAMPLER.lock() else {
         return;
     };
-    let step = sampler.step(now_ms(), bar);
+    let step = sampler.step(t, bar);
     // Drop the lock before doing any game reads or logging: the walk below is the expensive part
     // and it does not need the sampler.
     drop(sampler);
@@ -152,12 +186,29 @@ pub fn tick() {
         Step::Idle => {}
         Step::Start { npc_param_id } => {
             MISSING_REPORTED.store(false, Ordering::Relaxed);
-            emit("START", npc_param_id, 0, player);
+            PLAYER_WENT_DOWN.store(false, Ordering::Relaxed);
+            set_last_seen(None);
+            if let Ok(mut g) = GATE.lock() {
+                // A re-fight opens on the numbers the last one closed with -- bobler fought the
+                // same boss twice in four minutes. Without this the t=0 readback, the most
+                // valuable line in the trace, would be suppressed as a duplicate.
+                g.reset();
+            }
+            emit("START", npc_param_id, 0, player, t, EmitMode::Always);
         }
         Step::Sample {
             npc_param_id,
             elapsed_ms,
-        } => emit("SAMPLE", npc_param_id, elapsed_ms, player),
+        } => {
+            emit(
+                "SAMPLE",
+                npc_param_id,
+                elapsed_ms,
+                player,
+                t,
+                EmitMode::OnlyIfChanged,
+            );
+        }
         Step::Capped {
             npc_param_id,
             elapsed_ms,
@@ -172,22 +223,50 @@ pub fn tick() {
         Step::End {
             npc_param_id,
             elapsed_ms,
+            unseen_ms,
         } => {
-            // The END line is a duration statement, not a reading: by the time the bar drops the
-            // boss is usually gone from the sets, so quoting its HP here would mean quoting a
-            // number we could not read. Say the length, which is the thing END is for.
+            // The boss is usually gone from the live sets by now, so this quotes the LAST reading
+            // taken rather than trying to take a new one -- and says which it is.
+            let last = take_last_seen();
+            let outcome = classify(
+                last.map(|(boss, _)| boss),
+                PLAYER_WENT_DOWN.swap(false, Ordering::Relaxed),
+            );
             log::info!(
-                "boss-fight END: npc_param {npc_param_id} bar down after {}.{}s",
-                elapsed_ms / 1000,
-                (elapsed_ms % 1000) / 100
+                "{}",
+                format_end(npc_param_id, outcome, elapsed_ms, unseen_ms, last)
             );
         }
     }
 }
 
-/// Read, format and log one line.
-fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp) {
-    let Some((npc_id, boss)) = find_boss(npc_param_id) else {
+/// Whether a line is unconditional or subject to the dedupe gate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmitMode {
+    /// START. Never suppressed: it is the `max_hp` readback the whole trace hangs off.
+    Always,
+    /// SAMPLE. Written only when a number moved, or on the heartbeat.
+    OnlyIfChanged,
+}
+
+fn set_last_seen(v: Option<(Hp, Hp)>) {
+    if let Ok(mut slot) = LAST_SEEN.lock() {
+        *slot = v;
+    }
+}
+
+fn take_last_seen() -> Option<(Hp, Hp)> {
+    LAST_SEEN.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Read, remember, and (usually) log one line.
+///
+/// 🛑 THE READING IS REMEMBERED EVEN WHEN THE LINE IS SUPPRESSED. The gate decides what gets
+/// WRITTEN; `LAST_SEEN` is what END quotes. Tying the two together would mean a fight that ended
+/// during a run of unchanged samples reported stale HP.
+fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp, now_ms: u64, mode: EmitMode) {
+    let want_carried = mode == EmitMode::Always;
+    let Some((npc_id, boss, carried)) = find_boss(npc_param_id, want_carried) else {
         // The healthbar names a boss the live sets do not contain. Real and expected around phase
         // transitions and cutscenes -- but stated, because a silent gap in a trace is
         // indistinguishable from a boss that stopped taking damage.
@@ -200,6 +279,28 @@ fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp) {
         }
         return;
     };
+    set_last_seen(Some((boss, player)));
+
+    let write = match mode {
+        EmitMode::Always => {
+            // Prime the gate with this reading so the first SAMPLE after an unchanged START is
+            // suppressed rather than duplicating it.
+            if let Ok(mut g) = GATE.lock() {
+                g.admit(now_ms, boss, player);
+            }
+            true
+        }
+        EmitMode::OnlyIfChanged => match GATE.lock() {
+            Ok(mut g) => g.admit(now_ms, boss, player),
+            // A poisoned lock must not silence the instrument. Logging a duplicate is the
+            // documented degrade; losing the trace is not.
+            Err(_) => true,
+        },
+    };
+    if !write {
+        return;
+    }
+
     log::info!(
         "{}",
         format_sample(
@@ -214,6 +315,19 @@ fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp) {
             }
         )
     );
+    if want_carried {
+        // ⭐ THE LINE THAT SETTLES client#186. In bobler's 08-12 log the fight probe read
+        // npc_param 47500014 as 3826/3826 while all nine `enemy-scaling` census sightings of the
+        // same row read 6080/6080, and the log could not say whether the fought instance carried a
+        // rung -- because only the census printed one. Same filter as the census
+        // (`is_scaling_speffect_with_downstates`) on purpose: comparability with it is the entire
+        // reason this line exists.
+        log::info!(
+            "boss-fight START carried: npc_param {npc_param_id} npc_id {npc_id} speffects {:?} \
+             (scaling rungs + down-states only, the same filter the enemy-scaling census uses)",
+            carried
+        );
+    }
 }
 
 /// The local player's HP. `None` = not in-world.
@@ -224,23 +338,26 @@ fn read_player() -> Option<Hp> {
     Some(Hp::new(data.hp, data.max_hp))
 }
 
-/// `(npc_id, hp)` for the character carrying `npc_param_id`, over the same two sets the scaling
-/// sweep walks.
+/// `(npc_id, hp, carried scaling speffects)` for the character carrying `npc_param_id`, over the
+/// same two sets the scaling sweep walks.
+///
+/// `want_carried` is false on the 2 Hz path: the speffect walk is only asked for on START, where
+/// one allocation per fight is free, rather than twice a second for a list that does not move.
 ///
 /// 🛑 `ChrIns` does NOT implement `AsRef`, and `chr.as_ref()` does not compile -- the set iterators
 /// yield `&mut T: Subclass<ChrIns>` and the way this crate gets a `&ChrIns` out of one is to PASS
 /// it to a fn taking `&ChrIns` and let the coercion happen at the call site. `scaling.rs` pays for
 /// that lesson in a comment; this follows it rather than re-learning it on a CI round.
-fn find_boss(npc_param_id: i32) -> Option<(i32, Hp)> {
+fn find_boss(npc_param_id: i32, want_carried: bool) -> Option<(i32, Hp, Vec<i32>)> {
     let wcm = unsafe { WorldChrMan::instance() }.ok()?;
     for chr in crate::scaling::sweepable_characters(&wcm.open_field_chr_set.base) {
-        if let Some(found) = match_boss(chr, npc_param_id) {
+        if let Some(found) = match_boss(chr, npc_param_id, want_carried) {
             return Some(found);
         }
     }
     for slot in wcm.chr_sets.iter().flatten() {
         for chr in crate::scaling::sweepable_characters(slot) {
-            if let Some(found) = match_boss(chr, npc_param_id) {
+            if let Some(found) = match_boss(chr, npc_param_id, want_carried) {
                 return Some(found);
             }
         }
@@ -249,10 +366,19 @@ fn find_boss(npc_param_id: i32) -> Option<(i32, Hp)> {
 }
 
 /// The `&ChrIns`-taking half of [`find_boss`] -- see its doc for why this is a separate fn.
-fn match_boss(chr: &ChrIns, npc_param_id: i32) -> Option<(i32, Hp)> {
+fn match_boss(chr: &ChrIns, npc_param_id: i32, want_carried: bool) -> Option<(i32, Hp, Vec<i32>)> {
     if chr.npc_param_id != npc_param_id {
         return None;
     }
     let data = &chr.modules.data;
-    Some((chr.npc_id, Hp::new(data.hp, data.max_hp)))
+    let carried: Vec<i32> = if want_carried {
+        chr.special_effect
+            .entries()
+            .map(|e| e.param_id)
+            .filter(|&id| is_scaling_speffect_with_downstates(id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some((chr.npc_id, Hp::new(data.hp, data.max_hp), carried))
 }
