@@ -29,6 +29,15 @@ env:
 jobs:
   build:
     runs-on: windows-latest
+
+    # 🛑 DON'T RUN TWICE FOR THE SAME COMMIT. With `push: '**'` above, a branch in THIS repo fires
+    # `push`, and opening a PR from it fires `pull_request` for the same sha -- two identical
+    # windows-latest jobs, two of everything. Skip the pull_request copy when the PR comes from this
+    # repo (the push job already covered that sha), and keep it for FORKS, which produce no push
+    # event here and would otherwise go untested.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     steps:
     - uses: actions/checkout@v4
 
@@ -110,7 +119,17 @@ jobs:
     # playtest no longer waits on one person's environment. The hash-matched-pair rule in
     # release/DISTRIBUTION.md still governs what may be handed to a PLAYER: this .dll is paired with
     # nothing, so the artifact name carries the sha and the retention is short on purpose.
-    - run: cargo build --release
+    # 🛑 `-p eldenring-archipelago`, NOT the whole workspace. A bare `cargo build --release` is RED
+    # on main, and has been: `-D warnings` (set in this file's env) plus `--release` turns
+    # `unused import: regex_macro::regex` into an error in `ds3-archipelago` and `sdt-archipelago`,
+    # because that import is only reachable from `debug_assert!` and release compiles it away. It is
+    # not a release-build bug in those crates -- ds3-release.yaml does not set `-D warnings`, so
+    # their pipeline only warns. It is this file's stricter env meeting a profile it had never been
+    # run under.
+    #
+    # Fixing two other games' crates does not belong in a CI change, and `-p` sidesteps them
+    # entirely: they are siblings, not dependencies. Filed separately.
+    - run: cargo build --release -p eldenring-archipelago
 
     - uses: actions/upload-artifact@v4
       with:
