@@ -90,6 +90,12 @@ pub struct Overlay<G: Game> {
 
     /// Whether the dev console window (menu bar → Console) is currently visible.
     console_window_visible: bool,
+    /// Set by whichever of OUR keyboard surfaces drew and claimed the keys THIS frame -- the dev
+    /// console while focused, and the connect modal whenever it is up. Zeroed unconditionally at
+    /// the top of every [`Overlay::render`], so unlike `was_window_focused` it cannot outlive its
+    /// window: the surface that wants your keys has to re-assert it on every frame it wants them.
+    /// Read through [`Overlay::blocks_keyboard`]. See #202 for why that property is not optional.
+    keyboard_surface_active: bool,
 
     /// The text the user typed in the dev console input (separate buffer from `say_input` so both
     /// can exist without sharing state).
@@ -215,6 +221,7 @@ impl<G: Game> Overlay<G> {
             frames_since_new_logs: 0,
             settings_window_visible: false,
             console_window_visible: false,
+            keyboard_surface_active: false,
             console_input: Default::default(),
             focus_console_input_next_frame: false,
             was_main_menu: false,
@@ -233,9 +240,16 @@ impl<G: Game> Overlay<G> {
     /// its mutex is only locked once per render.
     /// Was the client's own window focused on the frame just drawn (root **and** child windows)?
     ///
-    /// `error_display` arms the input blocker from this: "the overlay is focused" is the question
-    /// the blocker actually wants, and `io.want_capture_keyboard` -- which it used to ask instead --
-    /// answers the narrower "a text field wants these keystrokes". See the comment at the call site.
+    /// 🛑 PRESENTATION ONLY -- window opacity, and nothing else. **Do not arm the input blocker
+    /// from this.** It used to, and "the main window has focus" is far too wide a question for
+    /// that: it is true while you are merely READING your item list, which cost the player their
+    /// movement for no benefit. [`Overlay::blocks_keyboard`] is the narrow question the blocker
+    /// wants.
+    ///
+    /// ⭐ Both opacity readers go through HERE rather than touching `was_window_focused` directly,
+    /// even though they run inside `render_main_window` where the two are identical. That keeps
+    /// [`effective_focus`] -- and with it #202's guard -- live and load-bearing, so the next reader
+    /// added outside the draw path inherits the fix instead of rediscovering the bug.
     ///
     /// Collapsed counts as NOT focused (`render` zeroes it), which is what you want: a collapsed
     /// title bar should not eat your movement keys. HIDDEN counts as not focused for the same
@@ -244,8 +258,24 @@ impl<G: Game> Overlay<G> {
         effective_focus(self.main_window_visible, self.was_window_focused)
     }
 
+    /// Whether one of OUR keyboard surfaces claimed the keys on the frame just drawn -- the dev
+    /// console while focused, or the connect modal while it is up.
+    ///
+    /// This is deliberately NARROWER than "the overlay is focused" (see [`Overlay::is_focused`]).
+    /// The say input needs no entry here: it is a real imgui text field, so `want_capture_keyboard`
+    /// covers it at the call site, and the blocker ORs the two.
+    pub fn blocks_keyboard(&self) -> bool {
+        self.keyboard_surface_active
+    }
+
     pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
         prof!(core.base_mut().profiler(), "AP overlay", {
+            // 🛑 UNCONDITIONAL, and FIRST. Every keyboard surface re-asserts below if it still wants
+            // the keys, so a surface that stops being drawn stops blocking on the very next frame.
+            // This is the property #202 lacked: a flag only a draw call refreshes, read by a
+            // per-frame decision, blocks forever the moment its window goes away.
+            self.keyboard_surface_active = false;
+
             self.main_window_visible = next_main_window_visible(
                 self.main_window_visible,
                 ui.is_key_pressed(Key::F5),
@@ -324,7 +354,7 @@ impl<G: Game> Overlay<G> {
             }
         });
 
-        let window_opacity = if self.was_window_focused {
+        let window_opacity = if self.is_focused() {
             1.0
         } else {
             self.unfocused_window_opacity
@@ -447,6 +477,13 @@ impl<G: Game> Overlay<G> {
             .resizable(false)
             .always_auto_resize(true)
             .build(|| {
+                // 🛑 UNCONDITIONAL, not focus-gated: this closure runs only while the modal is UP,
+                // and a modal already owns all imgui interaction, so there is nothing else to be
+                // focused. It is also the case Alaric actually reported in #196 ("mostly change
+                // connection"), and it must hold BEFORE the player clicks into a field -- which is
+                // exactly when `want_capture_keyboard` is still false and the old rule leaked
+                // arrows and the pad through to the character.
+                self.keyboard_surface_active = true;
                 {
                     let _item_width = ui.push_item_width(500. * self.font_scale);
                     ui.input_text("Server", &mut self.popup_url)
@@ -540,6 +577,14 @@ impl<G: Game> Overlay<G> {
             .size([460.0, 130.0], Condition::FirstUseEver)
             .collapsible(false)
             .build(|| {
+                // The console is a keyboard surface: you are here to TYPE. Claim on focus rather
+                // than on merely-open, so a console left open and clicked away from does not sit on
+                // the player's movement keys. `want_capture_keyboard` alone was not trusted here
+                // -- Alaric, 2026-08-14, on whether it ever fired for the console: "i'm not 100%
+                // sure it was working".
+                if ui.is_window_focused_with_flags(WindowFocusedFlags::ROOT_AND_CHILD_WINDOWS) {
+                    self.keyboard_surface_active = true;
+                }
                 ui.text("Dev console — output shows in the log window.");
                 ui.text("!markerprobe [set|verify|clear] · !flag <id> · !setflag <id> [0|1] · !warp <grace>");
                 ui.separator();
@@ -633,7 +678,7 @@ impl<G: Game> Overlay<G> {
     fn render_log_window(&mut self, ui: &Ui, core: &G::Core) {
         let style = ui.clone_style();
 
-        let scrollbar_bg_opacity = if self.was_window_focused { 1.0 } else { 0.0 };
+        let scrollbar_bg_opacity = if self.is_focused() { 1.0 } else { 0.0 };
         let scrollbar_bg_color = [0.0, 0.0, 0.0, scrollbar_bg_opacity];
         let _scrollbar_bg = ui.push_style_color(StyleColor::ScrollbarBg, scrollbar_bg_color);
 
