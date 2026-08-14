@@ -240,10 +240,16 @@ impl<G: Game> Overlay<G> {
     /// its mutex is only locked once per render.
     /// Was the client's own window focused on the frame just drawn (root **and** child windows)?
     ///
-    /// 🛑 PRESENTATION ONLY -- window opacity. **Do not arm the input blocker from this.** It used
-    /// to be, and "the main window has focus" is far too wide a question for that: it is true while
-    /// you are merely READING your item list, which cost the player their movement for no benefit.
-    /// [`Overlay::blocks_keyboard`] is the narrow question the blocker actually wants.
+    /// 🛑 PRESENTATION ONLY -- window opacity, and nothing else. **Do not arm the input blocker
+    /// from this.** It used to, and "the main window has focus" is far too wide a question for
+    /// that: it is true while you are merely READING your item list, which cost the player their
+    /// movement for no benefit. [`Overlay::blocks_keyboard`] is the narrow question the blocker
+    /// wants.
+    ///
+    /// ⭐ Both opacity readers go through HERE rather than touching `was_window_focused` directly,
+    /// even though they run inside `render_main_window` where the two are identical. That keeps
+    /// [`effective_focus`] -- and with it #202's guard -- live and load-bearing, so the next reader
+    /// added outside the draw path inherits the fix instead of rediscovering the bug.
     ///
     /// Collapsed counts as NOT focused (`render` zeroes it), which is what you want: a collapsed
     /// title bar should not eat your movement keys. HIDDEN counts as not focused for the same
@@ -348,7 +354,7 @@ impl<G: Game> Overlay<G> {
             }
         });
 
-        let window_opacity = if self.was_window_focused {
+        let window_opacity = if self.is_focused() {
             1.0
         } else {
             self.unfocused_window_opacity
@@ -672,7 +678,7 @@ impl<G: Game> Overlay<G> {
     fn render_log_window(&mut self, ui: &Ui, core: &G::Core) {
         let style = ui.clone_style();
 
-        let scrollbar_bg_opacity = if self.was_window_focused { 1.0 } else { 0.0 };
+        let scrollbar_bg_opacity = if self.is_focused() { 1.0 } else { 0.0 };
         let scrollbar_bg_color = [0.0, 0.0, 0.0, scrollbar_bg_opacity];
         let _scrollbar_bg = ui.push_style_color(StyleColor::ScrollbarBg, scrollbar_bg_color);
 
