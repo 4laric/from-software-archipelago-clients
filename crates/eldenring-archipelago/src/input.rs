@@ -38,6 +38,10 @@ use retour::GenericDetour;
 use shared::{InputBlocker, InputFlags};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, PAGE_READWRITE, VirtualProtect};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VK_APPS, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU,
+    VK_RSHIFT, VK_SHIFT,
+};
 use windows::core::{GUID, PCSTR, s};
 
 /// The currently-blocked input classes (an [`InputFlags`] bit set). Read by every hook; written by
@@ -110,17 +114,86 @@ unsafe extern "system" fn xinput_get_state_hook(user: u32, state: *mut XInputSta
     ret
 }
 
+/// The virtual keys these two hooks must keep telling the truth about, even while the keyboard is
+/// blocked: the MODIFIERS.
+///
+/// # Why there is an exemption at all (the copy/paste bug, 2026-08-13)
+///
+/// hudhook builds imgui's modifier state by ASKING WINDOWS, not from the WM_KEYDOWN it is already
+/// handling — `renderer/input.rs`:
+///
+/// ```text
+/// fn is_vk_down(vk: VIRTUAL_KEY) -> bool { GetKeyState(vk.0 as i32) < 0 }
+/// ...
+/// io.add_key_event(Key::ModCtrl,  is_vk_down(VK_CONTROL));
+/// io.add_key_event(Key::ModShift, is_vk_down(VK_SHIFT));
+/// io.add_key_event(Key::ModAlt,   is_vk_down(VK_MENU));
+/// io.add_key_event(Key::ModSuper, is_vk_down(VK_APPS));
+/// ```
+///
+/// So the overlay reads modifier state through the very API this module zeroes — and it zeroes it
+/// exactly when a text field has focus, because that is when `want_capture_keyboard` turns the
+/// Keyboard bit on. imgui was therefore told CTRL IS NOT HELD on every key event while typing, and
+/// **Ctrl+V, Ctrl+C, Ctrl+A and Ctrl+X could not fire in any text field in the overlay.** Typing
+/// worked, which is what made it look like a clipboard problem: characters arrive as `WM_CHAR`,
+/// which nothing here touches. `shared::clipboard::WindowsClipboardBackend` was installed and
+/// correct the whole time; imgui simply never asked it for anything.
+///
+/// # Why letting these through is safe
+///
+/// A bare modifier is not a game action, and the paths that ARE game actions stay blocked:
+/// gameplay reads DirectInput `GetDeviceState`, ER's menus read the buffered `GetDeviceData`, and
+/// both are still zeroed. What is left is a game menu being able to observe that Ctrl is held while
+/// the player types in our overlay, which does nothing in ER on its own.
+///
+/// ⚠️ It is an exemption, so keep it to modifiers. Letting a letter key through here would hand the
+/// menu path real keystrokes and re-open the defect this module exists to close (typing
+/// `!markerprobe` walking the character).
+const OVERLAY_MODIFIER_VKS: [u16; 10] = [
+    VK_SHIFT.0,
+    VK_CONTROL.0,
+    VK_MENU.0,
+    VK_APPS.0,
+    VK_LSHIFT.0,
+    VK_RSHIFT.0,
+    VK_LCONTROL.0,
+    VK_RCONTROL.0,
+    VK_LMENU.0,
+    VK_RMENU.0,
+];
+
+#[inline]
+fn is_overlay_modifier(vkey: i32) -> bool {
+    u16::try_from(vkey).is_ok_and(|v| OVERLAY_MODIFIER_VKS.contains(&v))
+}
+
 unsafe extern "system" fn get_keyboard_state_hook(buf: *mut u8) -> i32 {
     let hook = GETKEYBOARDSTATE_HOOK.get().unwrap();
     let ret = hook.call(buf);
     if ret != 0 && is_blocked(InputFlags::Keyboard) && !buf.is_null() {
+        // Save the modifier bytes, zero the rest, put them back. Same exemption as the
+        // `GetKeyState` hook below and for the same reason -- imgui and hudhook are free to read
+        // either API, and a fix that covered only one would be a fix that depends on which one
+        // they happen to call today.
+        //
+        // 🛑 A PLAIN LOOP, NOT `std::array::from_fn`. The module opts out of
+        // `unsafe_op_in_unsafe_fn`, but a CLOSURE body does not inherit its enclosing unsafe fn's
+        // context in edition 2024, so the raw deref inside `from_fn(|i| *buf.add(..))` is a hard
+        // error rather than a lint. Not worth an `unsafe {}` inside a closure to save two lines.
+        let mut saved = [0u8; OVERLAY_MODIFIER_VKS.len()];
+        for (i, vk) in OVERLAY_MODIFIER_VKS.iter().enumerate() {
+            saved[i] = *buf.add(*vk as usize);
+        }
         std::ptr::write_bytes(buf, 0, 256); // the full 256-key state -> nothing down
+        for (i, vk) in OVERLAY_MODIFIER_VKS.iter().enumerate() {
+            *buf.add(*vk as usize) = saved[i];
+        }
     }
     ret
 }
 
 unsafe extern "system" fn get_key_state_hook(vkey: i32) -> i16 {
-    if is_blocked(InputFlags::Keyboard) {
+    if is_blocked(InputFlags::Keyboard) && !is_overlay_modifier(vkey) {
         return 0; // key up, not toggled
     }
     GETKEYSTATE_HOOK.get().unwrap().call(vkey)
@@ -359,5 +432,71 @@ pub unsafe fn install() {
             Err(e) => log::warn!("input: DirectInput8Create hook failed: {e}"),
         },
         None => log::warn!("input: DirectInput8Create not found — kbd/mouse won't block"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE 11 MOTIVATING CASE. Ctrl+V did nothing in the overlay's text fields because
+    /// `get_key_state_hook` answered 0 for VK_CONTROL while the keyboard was blocked -- which is
+    /// exactly when a text field has focus. This is the assertion that would have caught it.
+    #[test]
+    fn ctrl_is_not_hidden_from_the_overlay() {
+        assert!(is_overlay_modifier(VK_CONTROL.0 as i32));
+        assert!(is_overlay_modifier(VK_LCONTROL.0 as i32));
+        assert!(is_overlay_modifier(VK_RCONTROL.0 as i32));
+    }
+
+    /// Every key hudhook reads through `GetKeyState` to build imgui's modifier state
+    /// (`renderer/input.rs::handle_input`). If hudhook grows another one, this list has to grow
+    /// with it or that modifier silently stops working in the overlay -- the same defect, one key
+    /// over. Listed by NAME here, so the next reader can diff it against that function.
+    #[test]
+    fn every_modifier_hudhook_asks_windows_about_is_exempt() {
+        for vk in [
+            VK_CONTROL,
+            VK_SHIFT,
+            VK_MENU,
+            VK_APPS, // io.add_key_event(Key::Mod*, ...)
+            VK_LSHIFT,
+            VK_RSHIFT, // the left/right split, same function
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_LMENU,
+            VK_RMENU,
+        ] {
+            assert!(
+                is_overlay_modifier(vk.0 as i32),
+                "vk {:#x} is not exempt",
+                vk.0
+            );
+        }
+    }
+
+    /// 🛑 THE EXEMPTION MUST STAY AN EXEMPTION. A letter key answering truthfully while blocked
+    /// hands ER's menu path real keystrokes, which is the defect this whole module exists to close
+    /// (typing `!markerprobe` walked the character). W/A/S/D and Escape are the ones that would
+    /// hurt most, so name them.
+    #[test]
+    fn ordinary_keys_are_still_hidden() {
+        for vk in [0x57, 0x41, 0x53, 0x44, 0x1B, 0x20, 0x0D, 0x56] {
+            assert!(
+                !is_overlay_modifier(vk),
+                "vk {vk:#x} leaked through the block"
+            );
+        }
+    }
+
+    /// `GetKeyState` takes an `i32` and Windows callers are not obliged to be sane. A negative or
+    /// out-of-range vkey must fall through to "blocked", never panic in a hook that runs on the
+    /// game's render thread.
+    #[test]
+    fn out_of_range_vkeys_do_not_panic_and_are_not_exempt() {
+        assert!(!is_overlay_modifier(-1));
+        assert!(!is_overlay_modifier(0x1_0000));
+        assert!(!is_overlay_modifier(i32::MIN));
+        assert!(!is_overlay_modifier(i32::MAX));
     }
 }
