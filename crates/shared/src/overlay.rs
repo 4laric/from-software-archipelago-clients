@@ -202,6 +202,18 @@ impl<G: Game> Overlay<G> {
     ///
     /// We don't store `core` directly in the overlay so that we can ensure that
     /// its mutex is only locked once per render.
+    /// Was the client's own window focused on the frame just drawn (root **and** child windows)?
+    ///
+    /// `error_display` arms the input blocker from this: "the overlay is focused" is the question
+    /// the blocker actually wants, and `io.want_capture_keyboard` -- which it used to ask instead --
+    /// answers the narrower "a text field wants these keystrokes". See the comment at the call site.
+    ///
+    /// Collapsed counts as NOT focused (`render` zeroes it), which is what you want: a collapsed
+    /// title bar should not eat your movement keys.
+    pub fn is_focused(&self) -> bool {
+        self.was_window_focused
+    }
+
     pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
         prof!(core.base_mut().profiler(), "AP overlay", {
             self.main_window_visible = next_main_window_visible(
