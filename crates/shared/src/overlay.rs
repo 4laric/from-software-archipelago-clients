@@ -162,6 +162,35 @@ fn next_main_window_visible(current: bool, f5_pressed: bool, disconnected: bool)
         || disconnected
 }
 
+/// Whether the client's own window holds focus **for input-blocking purposes**, as a pure function
+/// for the same reason [`next_main_window_visible`] is one.
+///
+/// 🛑 `was_window_focused` IS ONLY WRITTEN WHILE THE MAIN WINDOW IS DRAWN. `render_main_window` is
+/// its sole writer, and [`Overlay::render`] calls that only when `main_window_visible`. So hiding a
+/// FOCUSED overlay -- F5, or the menu bar's "Hide (F5)" -- freezes the field at `true` for as long
+/// as it stays hidden.
+///
+/// That is not cosmetic, because `crate::error_display` arms the game's input blocker from
+/// [`Overlay::is_focused`]: a stale `true` blocks the keyboard AND the pad in-game for good, and
+/// the only way out is F5 again plus a click elsewhere -- the one path that reaches the writer.
+/// error_display's own comment names F5 as the REMEDY ("you cannot dodge until you click away or
+/// hide it (F5)"); it was the trigger.
+///
+/// The regression came from one crate over. Before #196 the blocker asked
+/// `io.want_capture_keyboard`, which imgui recomputes every frame, so a hidden window could not
+/// wedge it. #196 swapped in a field that is only refreshed when a particular window renders, and
+/// its sibling comment claims `want_capture_*` and `is_focused()` "both describe THIS frame" --
+/// true of the first, not of the second once the window stops being drawn.
+///
+/// Gating the ACCESSOR on visibility, not zeroing the field at the hide site, is on purpose:
+/// there is then no frame on which a reader can observe the stale value at all, so the next hide
+/// path added cannot reintroduce this. It restores the invariant [`next_main_window_visible`]
+/// already states -- "Hiding must stay cosmetic ... Nothing may be gated on this flag except
+/// drawing."
+fn effective_focus(main_window_visible: bool, was_window_focused: bool) -> bool {
+    main_window_visible && was_window_focused
+}
+
 impl<G: Game> Overlay<G> {
     /// Creates a new instance of the overlay and the core mod logic.
     pub fn new() -> Self {
@@ -209,9 +238,10 @@ impl<G: Game> Overlay<G> {
     /// answers the narrower "a text field wants these keystrokes". See the comment at the call site.
     ///
     /// Collapsed counts as NOT focused (`render` zeroes it), which is what you want: a collapsed
-    /// title bar should not eat your movement keys.
+    /// title bar should not eat your movement keys. HIDDEN counts as not focused for the same
+    /// reason and a sharper one -- see [`effective_focus`], which is where that rule lives.
     pub fn is_focused(&self) -> bool {
-        self.was_window_focused
+        effective_focus(self.main_window_visible, self.was_window_focused)
     }
 
     pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
@@ -823,7 +853,7 @@ fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::next_main_window_visible;
+    use super::{effective_focus, next_main_window_visible};
 
     #[test]
     fn f5_toggles_while_connected() {
@@ -844,5 +874,24 @@ mod tests {
         assert!(next_main_window_visible(false, false, true));
         assert!(next_main_window_visible(true, true, true));
         assert!(next_main_window_visible(false, true, true));
+    }
+
+    /// The motivating case (bobler, 2026-08-14, client 0.4.2 `edaeb3b`): "do you know why f5
+    /// freezes my keyboard input". F5-hiding a FOCUSED overlay left `was_window_focused` frozen at
+    /// `true`, and `error_display` went on arming the game's input blocker from it -- so the
+    /// keyboard and pad stayed dead in-game until the window was shown again and clicked away from.
+    /// Hidden must read as unfocused however stale the underlying field is.
+    #[test]
+    fn a_hidden_overlay_never_reads_as_focused() {
+        assert!(!effective_focus(false, true));
+        assert!(!effective_focus(false, false));
+    }
+
+    /// The other half: gating on visibility must not cost a VISIBLE overlay its real focus, or
+    /// #196 is undone and WASD walks the character while the player reads their item list.
+    #[test]
+    fn a_visible_overlay_still_reports_its_own_focus() {
+        assert!(effective_focus(true, true));
+        assert!(!effective_focus(true, false));
     }
 }
