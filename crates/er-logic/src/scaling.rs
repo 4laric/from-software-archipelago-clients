@@ -784,6 +784,37 @@ pub fn is_scaling_speffect_with_downstates(param_id: i32) -> bool {
     is_scaling_speffect(param_id) || is_downstate_id(param_id)
 }
 
+/// Split a character's live speffect ids into `(scaling, other)`.
+///
+/// ⭐⭐⭐ THE MOTIVATING CASE IS client#189, AND IT IS A FILTER BLIND SPOT, NOT A SCALING BUG.
+/// `NpcParam 34600913` (the Leonine Misbegotten) holds `spEffectID28 = 4410`, and `SpEffectParam`
+/// `4410` is `maxHpRate 2.0`. So its true vanilla HP is `664 x 2 = 1328`, and it measured
+/// `1328 x 1.141 = 1515` on a clean stack and `1328 x 1.656 = 2199` on bobler's — our rung applied
+/// once, correctly, both times. Three hypotheses died before anyone read `NpcParam`, because the
+/// only instrument pointed at the fight printed `speffects [7010]`: `4410` is not a scaling row, so
+/// the filter dropped the one id that explained the number.
+///
+/// 🛑 A FILTERED LIST CANNOT ADJUDICATE AN UNEXPLAINED MULTIPLIER, which is the job the `START
+/// carried:` line was added for (client#187). The filtered half stays — comparability with the
+/// `enemy-scaling` census is why that line exists — and the dropped half is now printed beside it.
+///
+/// **`4410` is not rare: 63 `NpcParam` rows carry it, and 197 rows carry a `maxHpRate != 1` speffect
+/// in some slot other than the native ladder slot `spEffectID3`** (`19396` x3 on 51 rows,
+/// `20018027` x3 on 37, `12630` x0.01 on 9, …). Any check of the shape
+/// `expected = NpcParam.hp x rung` mis-reads every one of them, by up to 3x.
+pub fn partition_carried_speffects(ids: impl IntoIterator<Item = i32>) -> (Vec<i32>, Vec<i32>) {
+    let mut scaling = Vec::new();
+    let mut other = Vec::new();
+    for id in ids {
+        if is_scaling_speffect_with_downstates(id) {
+            scaling.push(id);
+        } else {
+            other.push(id);
+        }
+    }
+    (scaling, other)
+}
+
 /// Is this enemy ALREADY in the state the sweep wants, i.e. carrying `target` and nothing else in
 /// the clear space?
 ///
@@ -3266,6 +3297,55 @@ mod tests {
                 "{id} is not ours to clear"
             );
         }
+    }
+
+    #[test]
+    fn the_leonine_misbegottens_2x_row_survives_the_partition() {
+        // THE MOTIVATING CASE, client#189. `NpcParam 34600913` holds `spEffectID28 = 4410`, and
+        // `SpEffectParam 4410` is `maxHpRate 2.0` -- so the enemy's true vanilla HP is 664 x 2 =
+        // 1328. It measured 1515 under rung 7010 (1328 x 1.141) on a clean stack and 2199 under
+        // 7030 (1328 x 1.656) on bobler's. Correct scaling, both times.
+        //
+        // 🛑 The OLD boss-probe line filtered this walk with `is_scaling_speffect_with_downstates`
+        // and printed `speffects [7010]`: `4410` is not a scaling row, so the one id that explained
+        // the HP was the one id dropped. Three hypotheses died to that blind spot. The rung must
+        // still land in `scaling` (the census comparison depends on it) and `4410` must survive.
+        let live = [7010, 4410, 5851, 90030, 13074];
+        let (scaling, other) = partition_carried_speffects(live);
+        assert_eq!(
+            scaling,
+            vec![7010],
+            "the rung still reaches the census-comparable half"
+        );
+        assert!(
+            other.contains(&4410),
+            "4410 (maxHpRate 2.0) must survive the split -- it is the whole point of #189"
+        );
+        assert_eq!(
+            scaling.len() + other.len(),
+            live.len(),
+            "the partition drops nothing; a filtered list cannot adjudicate a multiplier"
+        );
+        // A down-state still counts as ours, so a boss carrying rung + band splits cleanly.
+        let (scaling, other) = partition_carried_speffects([7060, 7460, 4410]);
+        assert_eq!(scaling, vec![7060, 7460]);
+        assert_eq!(other, vec![4410]);
+
+        // ⭐ THE OLD PIPELINE, RECONSTRUCTED — the half of this test that would have gone red
+        // before the fix. `match_boss` used to apply the filter during the walk, so by the time
+        // anything could look at the list, `4410` was already gone and the log read `[7010]`.
+        // If someone re-adds a filter upstream, the probe returns to being blind and this is the
+        // shape to look for.
+        let filtered_at_the_walk: Vec<i32> = live
+            .into_iter()
+            .filter(|&id| is_scaling_speffect_with_downstates(id))
+            .collect();
+        let (_, other_under_old) = partition_carried_speffects(filtered_at_the_walk);
+        assert!(
+            other_under_old.is_empty(),
+            "the old filter-at-the-walk loses 4410 entirely -- that WAS the blind spot, and it is \
+             why the split must happen at the log site, not during the walk"
+        );
     }
 
     #[test]
