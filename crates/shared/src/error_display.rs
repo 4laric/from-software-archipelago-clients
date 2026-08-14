@@ -102,12 +102,12 @@ impl<G: Game> ErrorDisplay<G> {
 /// used to require. A controller player can essentially never satisfy that: they have no cursor
 /// over the window, so `want_capture_mouse` is false and the pad drove the character in every state
 /// except typing-with-the-mouse-hovering. Same defect as the keyboard one, one device over.
-fn input_flags(want_mouse: bool, want_keyboard: bool, overlay_focused: bool) -> InputFlags {
+fn input_flags(want_mouse: bool, want_keyboard: bool, keyboard_surface_active: bool) -> InputFlags {
     let mut flag = InputFlags::empty();
     if want_mouse {
         flag |= InputFlags::Mouse;
     }
-    if want_keyboard || overlay_focused {
+    if want_keyboard || keyboard_surface_active {
         flag |= InputFlags::Keyboard;
     }
     if flag.contains(InputFlags::Keyboard) {
@@ -133,36 +133,43 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
 
         // ---- INPUT BLOCKING, and it runs AFTER the frame's windows are submitted ----------------
         //
-        // WHY `is_focused()` AND NOT JUST `want_capture_keyboard` (Alaric, 2026-08-13: "input still
-        // bleeds through to the game even when client has focus"). `want_capture_keyboard` is
-        // imgui's "a text field wants these keystrokes" -- NOT "the overlay is focused". So with the
-        // overlay open, on top and clicked into, but no field active, it is FALSE, the Keyboard flag
-        // was never set, and every hook in eldenring-archipelago::input passed the real state
-        // through: WASD walked the character while the player was reading their item list.
+        // TWO TERMS, BOTH NARROW, ORed:
         //
-        // The module's own motivating case ("typing `!markerprobe` no longer walks/rolls your
-        // character") is the CONSOLE, where a text field IS focused. That is why that case worked
-        // and this one did not, and why it went unnoticed for so long.
+        //   * `want_capture_keyboard` -- imgui's "a text field wants these keystrokes". Covers the
+        //     say input in the main window, and the console input, for free.
+        //   * `blocks_keyboard()` -- OUR keyboard surfaces re-asserted this frame: the dev console
+        //     while focused, the connect modal while it is up. See `keyboard_surface_active`.
         //
-        // 🛑 THIS COSTS YOU MOVEMENT WHILE THE OVERLAY IS FOCUSED, deliberately, and Alaric accepted
-        // that trade explicitly. Click the overlay and you cannot dodge until you click away or hide
-        // it (F5). The alternative -- a modal that steals your keys only sometimes -- is what this
-        // is fixing.
+        // 🛑 WHAT THIS NO LONGER DOES (#196 -> Alaric, 2026-08-14). It used to add
+        // `Overlay::is_focused()` -- "the main window has focus" -- on the theory that a
+        // clicked-into overlay should never leak keys. Too wide: that is true while the player is
+        // merely READING their item list, so clicking the overlay cost them their dodge for no
+        // benefit, and via #202 could cost it permanently. The surfaces that actually want your
+        // keys are the ones you TYPE into, and they are enumerable, so they are enumerated.
+        //
+        // ⭐ #196's real motivating case survives, sharper: the CONNECT MODAL. That was the
+        // report ("mostly change connection"), and `want_capture_keyboard` does not cover it --
+        // the modal is up but no field is focused until you click one, so arrows and the pad drove
+        // the character behind the dialog. `blocks_keyboard()` claims while the modal draws.
+        //
+        // ⭐ The console claims explicitly too rather than riding `want_capture_keyboard`, because
+        // whether that ever fired for it was never confirmed (Alaric: "i'm not 100% sure it was
+        // working for console"). Two independent terms, either sufficient.
         //
         // ⭐ IT CANNOT LOCK YOU OUT of the overlay's own hotkeys. F5/F6 and the rest are read with
         // `ui.is_key_pressed`, i.e. from imgui's io, which hudhook fills from WM_KEYDOWN -- a path
         // this blocker does not touch. It only changes what the GAME sees.
         //
-        // The block is computed here rather than at the top of the frame so `want_capture_*` and
-        // `is_focused()` both describe THIS frame instead of the previous one. They used to be a
-        // frame stale together; now they are current together, which matters most on the frame the
-        // overlay opens.
-        let overlay_focused = self.overlay.as_ref().is_some_and(|o| o.is_focused());
+        // The block is computed here rather than at the top of the frame so both terms describe
+        // THIS frame. `keyboard_surface_active` is zeroed at the top of `Overlay::render` and
+        // re-asserted by whichever surface drew, so unlike #202's flag it cannot outlive its
+        // window.
+        let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
         let io = ui.io();
         self.input_blocker.block_only(input_flags(
             io.want_capture_mouse,
             io.want_capture_keyboard,
-            overlay_focused,
+            keyboard_surface_active,
         ));
     }
 
@@ -188,26 +195,49 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
 mod tests {
     use super::*;
 
-    /// RULE 11 MOTIVATING CASE. Alaric, 2026-08-13: "input still bleeds through to the game even
-    /// when client has focus". The overlay was open, on top and clicked into, with no text field
-    /// active -- so `want_capture_keyboard` was false and WASD walked his character.
+    /// RULE 11 MOTIVATING CASE, RESTATED 2026-08-14. The 2026-08-13 report behind #196 was "input
+    /// still bleeds through to the game even when client has focus", and it was answered with "the
+    /// main window is focused". Alaric narrowed it: "mostly change connection". So the surface that
+    /// must block with NO text field focused is the connect modal, which is up and owns interaction
+    /// before the player has clicked into Server or Slot -- precisely when `want_capture_keyboard`
+    /// is still false and arrows and the pad reached the character behind it.
     #[test]
-    fn a_focused_overlay_blocks_the_keyboard_with_no_text_field() {
+    fn a_keyboard_surface_blocks_with_no_text_field_focused() {
         let f = input_flags(false, false, true);
         assert!(f.contains(InputFlags::Keyboard));
         assert!(f.contains(InputFlags::GamePad));
     }
 
-    /// The case that always worked, and the reason the one above went unnoticed: the console has a
-    /// text field, so imgui asked for the keys itself.
+    /// 🛑 THE COST #196 CHARGED AND THIS STOPS CHARGING. Reading your item list is not typing: the
+    /// main window can be focused, clicked into and on top, and the game keeps its keys. This is
+    /// assertion that fails if anyone reintroduces `Overlay::is_focused()` at the call site -- the
+    /// only reason it can be written at all is that "the overlay is focused" is no longer an
+    /// argument to this function.
+    #[test]
+    fn reading_the_item_list_does_not_cost_you_your_dodge() {
+        assert!(input_flags(false, false, false).is_empty());
+        // ...and hovering it for the scrollbar still takes only the mouse.
+        let f = input_flags(true, false, false);
+        assert!(!f.contains(InputFlags::Keyboard));
+        assert!(!f.contains(InputFlags::GamePad));
+    }
+
+    /// The say input and the console input are real imgui text fields, so imgui asks for the keys
+    /// itself and this term alone is enough for them.
+    ///
+    /// 🛑 It is NOT trusted as the console's only cover. Whether it ever actually fired there was
+    /// never confirmed -- Alaric, 2026-08-14: "i'm not 100% sure it was working for console" -- so
+    /// the console ALSO claims explicitly while focused. Two independent terms, either sufficient;
+    /// this test pins the imgui one, `a_keyboard_surface_blocks_with_no_text_field_focused` pins
+    /// ours, and neither can quietly become load-bearing alone.
     #[test]
     fn a_text_field_still_blocks_the_keyboard_on_its_own() {
         assert!(input_flags(false, true, false).contains(InputFlags::Keyboard));
     }
 
     /// 🛑 THE PAD USED TO NEED BOTH. A controller player has no cursor over the window, so
-    /// `want_capture_mouse` is false and the old rule left the pad driving the character while they
-    /// read their item list.
+    /// `want_capture_mouse` is false and the old rule left the pad driving the character while the
+    /// connect dialog was up in front of them.
     #[test]
     fn the_pad_no_longer_needs_the_mouse_to_be_captured() {
         assert!(input_flags(false, true, false).contains(InputFlags::GamePad));
@@ -215,8 +245,8 @@ mod tests {
     }
 
     /// 🛑 AND THE GAME KEEPS ITS INPUT WHEN NOTHING OF OURS WANTS IT. This is the assertion that
-    /// stops the fix from becoming "the overlay eats everything forever" -- an unfocused, unhovered
-    /// overlay must block NOTHING, or the player cannot play with the client open at all.
+    /// stops the fix from becoming "the overlay eats everything forever" -- an overlay with no
+    /// keyboard surface up must block NOTHING, or the player cannot play with the client open.
     #[test]
     fn an_unfocused_overlay_blocks_nothing() {
         // `is_empty()`, not `assert_eq!(.., InputFlags::empty())`: the real `InputFlags` derives
