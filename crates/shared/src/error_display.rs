@@ -219,7 +219,12 @@ mod tests {
     /// overlay must block NOTHING, or the player cannot play with the client open at all.
     #[test]
     fn an_unfocused_overlay_blocks_nothing() {
-        assert_eq!(input_flags(false, false, false), InputFlags::empty());
+        // `is_empty()`, not `assert_eq!(.., InputFlags::empty())`: the real `InputFlags` derives
+        // only Debug/Clone/Copy, so `==` does not exist on it and assert_eq! will not compile.
+        // It did compile against a hand-written stub while proving this test out off Windows --
+        // 🛑 A STUB MORE CAPABLE THAN THE REAL TYPE IS A TEST THAT ONLY PASSES LOCALLY, and this is
+        // the one that got through. Mirror the real derives when stubbing, never improve on them.
+        assert!(input_flags(false, false, false).is_empty());
     }
 
     /// The mouse is still its own question: hovering an overlay window takes the cursor without
