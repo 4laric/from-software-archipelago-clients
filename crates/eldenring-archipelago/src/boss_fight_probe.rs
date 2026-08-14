@@ -64,7 +64,7 @@ use eldenring::cs::{ChrIns, WorldChrMan};
 use er_logic::boss_fight_sample::{
     FightSampler, Hp, Reading, SampleGate, Step, classify, format_end, format_sample,
 };
-use er_logic::scaling::is_scaling_speffect_with_downstates;
+use er_logic::scaling::partition_carried_speffects;
 use fromsoftware_shared::FromStatic;
 
 /// **ON by default.** `ER_BOSSFIGHT_PROBE=0` or `"probes": {"boss_fight": false}` silences it.
@@ -321,11 +321,25 @@ fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp, now_ms: u64, 
         // same row read 6080/6080, and the log could not say whether the fought instance carried a
         // rung -- because only the census printed one. Same filter as the census
         // (`is_scaling_speffect_with_downstates`) on purpose: comparability with it is the entire
-        // reason this line exists.
+        // reason this line exists, which is why the filter stayed and the dropped half moved to a
+        // line of its own rather than being folded in here.
+        let (scaling, other) = partition_carried_speffects(carried);
         log::info!(
             "boss-fight START carried: npc_param {npc_param_id} npc_id {npc_id} speffects {:?} \
              (scaling rungs + down-states only, the same filter the enemy-scaling census uses)",
-            carried
+            scaling
+        );
+        // ⭐ THE LINE THAT SETTLES client#189, and the one whose ABSENCE cost three wrong
+        // hypotheses. `4410` is `maxHpRate 2.0` and 63 NpcParam rows carry it; 197 rows carry some
+        // `maxHpRate != 1` row outside the native ladder slot. Without this, a boss holding a
+        // vanilla 2x reads as a clean `[7010]` and its HP looks like a scaling defect.
+        log::info!(
+            "boss-fight START speffects OTHER: npc_param {npc_param_id} npc_id {npc_id} \
+             {} entr(ies) {:?} -- everything the filter above drops. A row here CAN carry \
+             maxHpRate (e.g. 4410 = 2.0x), so expected HP is NpcParam.hp x those rates x the rung, \
+             never NpcParam.hp x the rung alone",
+            other.len(),
+            other
         );
     }
 }
@@ -371,12 +385,13 @@ fn match_boss(chr: &ChrIns, npc_param_id: i32, want_carried: bool) -> Option<(i3
         return None;
     }
     let data = &chr.modules.data;
+    // 🛑 UNFILTERED ON PURPOSE (client#189). This used to filter to
+    // `is_scaling_speffect_with_downstates` here, which threw away the ids the caller now needs --
+    // `4410` (`maxHpRate 2.0`) is not a scaling row, so a boss holding a 2x multiplier logged as
+    // `speffects [7010]`. The split happens at the log site instead, via
+    // `er_logic::scaling::partition_carried_speffects`, so both halves survive the walk.
     let carried: Vec<i32> = if want_carried {
-        chr.special_effect
-            .entries()
-            .map(|e| e.param_id)
-            .filter(|&id| is_scaling_speffect_with_downstates(id))
-            .collect()
+        chr.special_effect.entries().map(|e| e.param_id).collect()
     } else {
         Vec::new()
     };
