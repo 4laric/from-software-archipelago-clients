@@ -1406,6 +1406,14 @@ impl shared::Core for Core {
                         .as_ref()
                         .and_then(|g| g.location(id).map(|l| l.name().to_string()))
                 });
+                // ⭐ AND SAY IT WHERE THE PLAYER IS LOOKING (world#656). The rune NAMES have been in
+                // slot_data and in `parse`'s log line for months; AHHHREPTAR still had to read the
+                // spoiler to learn why four Great Runes ended nothing, because the log is the
+                // artifact we get AFTER a report and he was looking at the game. Same data, the
+                // channel the player actually reads.
+                if let Some(line) = crate::goal::describe_required_items(&goal_cfg) {
+                    self.log(ap::Print::message(line));
+                }
                 // Boss-lock mode A (SPEC-boss-lock-tracker.md): parse the bossLockItems metadata
                 // map into BossDef rows (gate=None for v0.2 — no sweepLockGates boss-key yet). This
                 // is a presentation/defeat-flag-watch layer only; it mints no AP item and no check.

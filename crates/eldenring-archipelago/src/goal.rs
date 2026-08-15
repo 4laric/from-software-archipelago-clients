@@ -226,23 +226,13 @@ pub fn log_goal(sd: &Value, resolve: impl Fn(i64) -> Option<String>) {
     }
 }
 
-/// True when EVERY goal location is done: flag goals via `flag_read` (vanilla event flags),
-/// checked goals via `is_checked` (server-truth checked set; caller pre-filters against
-/// `valid_locations` -- `is_local_location_checked` panics on datapackage-unknown ids).
-/// An empty config is never met.
-pub fn is_met(
-    cfg: &GoalConfig,
-    flag_read: impl Fn(u32) -> bool,
-    is_checked: impl Fn(i64) -> bool,
-    has_item: impl Fn(&str) -> bool,
-) -> bool {
-    if cfg.is_empty() {
-        return false;
-    }
-    cfg.flag_goals.iter().all(|&f| flag_read(f))
-        && cfg.checked_goals.iter().all(|&l| is_checked(l))
-        // HELD, not killed. See GoalConfig::item_goals.
-        && cfg.item_goals.iter().all(|n| has_item(n))
+/// The goal's ITEM requirement, as one line for the player-visible channel (world#656).
+///
+/// Thin wrapper: the sentence itself lives in [`er_logic::goal_text::required_items_line`] so it is
+/// host-tested rather than gated behind a Windows-only build. `None` when the goal needs no items,
+/// so a region_locks seed gains no banner line.
+pub fn describe_required_items(cfg: &GoalConfig) -> Option<String> {
+    er_logic::goal_text::required_items_line(&cfg.item_goals)
 }
 
 #[cfg(test)]
