@@ -294,7 +294,7 @@ fn fire_spawn(spec: SpawnSpec) -> bool {
     // row, not a private one, and this game puts basilisks near basilisks -- so the witness below
     // reports what the trap ADDED, never what happens to be standing.
     let baseline = count_live_npc_param(wcm, spec.npc_param_id);
-    let now = crate::flags::now_ms();
+    let now = now_ms();
     let mut burst = er_logic::spawn_burst::SpawnBurst::new(spec, baseline, now);
     // This tick's copy. The creator drains the slot before the next one is written.
     if burst.next_request(now).is_some() {
