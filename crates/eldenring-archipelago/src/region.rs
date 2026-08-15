@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use serde_json::Value;
 
@@ -35,6 +35,65 @@ static KICK_LATCH: Mutex<EnforcementLatch> = Mutex::new(EnforcementLatch::new())
 /// Latch so the random-start warp trigger fires once per session (the persistent `randomStartDoneFlag`
 /// is the cross-session guard; this is the in-session dedup, mirroring the standalone `START_LATCHED`).
 static START_LATCHED: AtomicBool = AtomicBool::new(false);
+
+/// The open flag of the region that owns the goal locations, or 0 = unknown (world#694).
+///
+/// Resolved once at connect from the tracker tables' COARSE key -- "the region whose lock decides
+/// in-logic" -- rather than from a location's fine display region. 0 means "could not resolve", and
+/// the notice is then simply absent: it warns, it does not gate, so don't-know costs nothing.
+static GOAL_ARENA_OPEN_FLAG: AtomicU32 = AtomicU32::new(0);
+
+/// Rising-edge latch for the goal-approach notice, so it says its line once per arrival rather
+/// than once per tick or once per reload.
+static GOAL_APPROACH: Mutex<er_logic::goal_approach::ApproachNotice> =
+    Mutex::new(er_logic::goal_approach::ApproachNotice::new());
+
+/// Install the goal region's open flag. Called at connect once the tracker tables and the region
+/// config both exist; `None` / unresolvable leaves it at 0 (notice absent).
+pub fn configure_goal_arena(open_flag: Option<u32>) {
+    GOAL_ARENA_OPEN_FLAG.store(open_flag.unwrap_or(0), Ordering::Relaxed);
+    match open_flag {
+        Some(f) => log::info!(
+            "goal-approach: armed on the goal region's open flag {f} -- a player who reaches the \
+             arena with Region Locks outstanding will be told once (world#694)"
+        ),
+        None => log::info!(
+            "goal-approach: INERT -- the goal locations do not resolve to one lock-bearing region \
+             (foreign apworld, natural_progression, or goal locations spanning regions)"
+        ),
+    }
+}
+
+/// Per-tick: warn ONCE on arriving at the goal arena while kept Region Locks are outstanding.
+///
+/// 🛑 THIS BLOCKS NOTHING, AND THAT IS THE RULING (world#694, option C). The complaint is SURPRISE,
+/// not reachability -- a player who knows the ending will not count may still choose to walk in.
+/// Option B (gate the arena) is the kick, and the kick is this repo's filed softlock precedent
+/// (#589); a toast has no failure mode at all because it has no authority.
+///
+/// Returns the player-facing line; the WORDS live in `er_logic::goal_approach` (host-tested,
+/// ASCII-swept), the same split `tick_kick` uses with `sealed_region_message`.
+pub fn tick_goal_approach(
+    cfg: &RegionConfig,
+    item_goals: &[String],
+    has_item: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let want = GOAL_ARENA_OPEN_FLAG.load(Ordering::Relaxed);
+    if want == 0 {
+        return None; // not resolved -> absent, never stuck
+    }
+    let pr = flags::play_region_id()?;
+    let sub = if pr >= 1_000_000 { pr / 100 } else { pr };
+    // The same covering-range lookup kick-watch does; the arena is "the buckets whose lock range
+    // names the goal region's open flag".
+    let in_arena = cfg
+        .area_lock_flags
+        .iter()
+        .any(|e| sub >= e[0] && sub <= e[1] && e[2] as u32 == want);
+    // `mut` on the guard: `poll` takes &mut self, and a temporary guard is not mutable.
+    let mut notice = GOAL_APPROACH.lock().ok()?;
+    notice.poll(in_arena, item_goals, has_item)
+}
 
 /// kick-watch diagnostic: last play_region_id seen by tick_kick (i32::MIN = none yet).
 static KICK_WATCH_LAST_PR: AtomicI32 = AtomicI32::new(i32::MIN);
