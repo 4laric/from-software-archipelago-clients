@@ -51,8 +51,8 @@ use eldenring::cs::{
 };
 use er_logic::safe_speffect_rows::TRAP_NO_FLASK;
 use er_logic::traps::{
-    NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, RUNEBEAR_SPAWN, SpawnSpec, Trap, classify_refusal,
-    rune_thief_target,
+    NO_FLASK_CORRECT_RATE, NO_FLASK_SECONDS, RUNEBEAR_SPAWN, RuneThiefAction, SpawnSpec, Trap,
+    classify_refusal, rune_thief_action,
 };
 use fromsoftware_shared::FromStatic;
 
@@ -223,7 +223,26 @@ fn fire_rune_thief() -> bool {
         log::warn!("trap rune_thief: rune count unreadable -- skipped");
         return false;
     };
-    let after = rune_thief_target(before);
+    // ⭐ DECIDE FROM THE COUNT, rather than writing first and calling a no-op a success
+    // (client#139). boblerrr fired this holding ZERO runes: it took nothing, toasted "half your
+    // runes are gone", and CONSUMED the item -- already marked received, never resent.
+    let after = match rune_thief_action(before) {
+        RuneThiefAction::Take(after) => after,
+        RuneThiefAction::Defer => {
+            // 🛑 REFUSING IS WHAT PUTS IT BACK. `poll_pending` re-pushes on `None` -- the same path
+            // mid-death and param-not-streamed already use -- so the trap lands when it can
+            // actually bite. `DEFER_WARN_MS` covers the "never holds runes" player with a warn
+            // rather than a drop, so this adds no way to lose the item.
+            //
+            // Deliberately silent to the player: a trap that announces itself in advance is not a
+            // trap. The log line is for us.
+            log::info!(
+                "trap rune_thief: 0 held -- deferred, not spent (client#139). It re-queues and \
+                 fires when the player has runes to lose"
+            );
+            return false;
+        }
+    };
     // Through `runes.rs`, never a private write: the module owns the single-writer discipline.
     if crate::runes::write(after, "trap: rune thief") {
         log::info!("trap rune_thief: {before} -> {after}");
