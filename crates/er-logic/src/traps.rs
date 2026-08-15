@@ -784,6 +784,51 @@ pub fn rune_thief_target(current: u32) -> u32 {
     current / 2
 }
 
+/// What Rune Thief should do with the rune count it just read (client#139).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuneThiefAction {
+    /// Take the runes down to this total, then consume the trap.
+    Take(u32),
+    /// 🛑 REFUSE. There is nothing to take, so firing would spend the item on a toast that lies.
+    ///
+    /// The caller returns "not fired", which puts the trap back on [`TrapQueue`] -- the same path
+    /// `fire` already uses for mid-death and param-not-streamed. It lands when it can actually
+    /// bite.
+    Defer,
+}
+
+/// Decide Rune Thief from the count, rather than writing first and calling a no-op a success.
+///
+/// # The motivating case (client#139)
+///
+/// boblerrr, 2026-08-10, reported as *"rune thief didn't work"*. The trap worked; the toast lied:
+///
+/// ```text
+/// 21:26:28  runes: write 0 -> 0 (trap: rune thief)
+/// 21:26:28  trap rune_thief: 0 -> 0
+/// 21:26:28  [APC] TRAP: Rune Thief -- half your runes are gone     <- he had none
+/// ...
+/// 21:55:47  trap rune_thief: 1901 -> 950                           <- correct
+/// ```
+///
+/// The arithmetic was never wrong -- `rune_thief_target(0) == 0` is deliberate. What was wrong is
+/// that a no-op write counted as success, so the trap **announced a loss that did not happen and
+/// was consumed**: the item is already marked received and the server will never resend it.
+///
+/// ⚠️ AND ZERO IS NOT AN EDGE CASE FOR THIS PLAYER. `runes: 0 held at world edge` appears at
+/// epochs 122-129 straight, and the firing landed in the same tick as a 23-check sweep burst --
+/// i.e. right after a boss kill, exactly when a player has just banked or just died. A trap that
+/// voids itself at 0 runes will void itself often.
+///
+/// 🛑 NO NEW WAY TO LOSE THE ITEM. Deferring re-queues rather than drops, and `DEFER_WARN_MS`
+/// already covers the pathological "never holds runes" player with a warn instead of a drop.
+pub fn rune_thief_action(current: u32) -> RuneThiefAction {
+    if current == 0 {
+        return RuneThiefAction::Defer;
+    }
+    RuneThiefAction::Take(rune_thief_target(current))
+}
+
 /// A trap that arrived while the player could not receive it.
 ///
 /// 🛑 WHY A QUEUE AND NOT A RETURN VALUE. Fired from a HOTKEY, "cannot act right now" is fine: the
@@ -854,6 +899,54 @@ impl TrapQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ THE RED-FIRST ASSERTION (client#139). boblerrr fired Rune Thief holding zero runes: it
+    /// took nothing, announced "half your runes are gone", and CONSUMED the item. Deferring is what
+    /// puts it back on the queue.
+    #[test]
+    fn rune_thief_at_zero_defers_instead_of_spending_itself() {
+        assert_eq!(rune_thief_action(0), RuneThiefAction::Defer);
+    }
+
+    /// The working firing from the same log: 1901 -> 950, and the trap is spent.
+    #[test]
+    fn rune_thief_with_runes_takes_half() {
+        assert_eq!(rune_thief_action(1901), RuneThiefAction::Take(950));
+        assert_eq!(rune_thief_action(2), RuneThiefAction::Take(1));
+    }
+
+    /// 🛑 ONE RUNE IS A REAL FIRING, NOT A NO-OP. `rune_thief_target(1) == 0` takes the player's
+    /// last rune -- a loss, however small -- so it must NOT be folded into the zero case. Getting
+    /// this wrong would defer a trap that had something to take.
+    #[test]
+    fn one_rune_is_taken_not_deferred() {
+        assert_eq!(rune_thief_action(1), RuneThiefAction::Take(0));
+        assert_ne!(rune_thief_action(1), RuneThiefAction::Defer);
+    }
+
+    /// The action never disagrees with the arithmetic it replaces -- `Take` always carries exactly
+    /// `rune_thief_target`, so the split cannot drift into a second copy of the rule.
+    #[test]
+    fn take_always_agrees_with_rune_thief_target() {
+        for n in [1u32, 2, 3, 7, 1901, u32::MAX] {
+            assert_eq!(
+                rune_thief_action(n),
+                RuneThiefAction::Take(rune_thief_target(n))
+            );
+        }
+    }
+
+    /// Deferring is not dropping: the caller re-queues, and only zero defers.
+    #[test]
+    fn only_zero_defers() {
+        assert!(matches!(rune_thief_action(0), RuneThiefAction::Defer));
+        for n in 1..64u32 {
+            assert!(
+                matches!(rune_thief_action(n), RuneThiefAction::Take(_)),
+                "{n} has something to take"
+            );
+        }
+    }
 
     #[test]
     fn rune_thief_halves_and_never_underflows() {
