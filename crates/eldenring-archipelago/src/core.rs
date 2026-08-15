@@ -1556,6 +1556,19 @@ impl shared::Core for Core {
                         log::warn!("{}", tracker_status.describe())
                     }
                 }
+                // ⭐ GOAL-APPROACH ARMING (world#694). The coarse key is "the region whose
+                // lock decides in-logic", which is exactly the question "is this the goal arena?",
+                // so the notice resolves through it rather than through a location's fine display
+                // region. Unresolvable -> 0 -> the notice is absent, never stuck.
+                let goal_ids: Vec<i64> = sd
+                    .get("goalLocations")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                    .unwrap_or_default();
+                let goal_arena_flag = tracker_tables
+                    .goal_lock_item(&goal_ids)
+                    .and_then(|item| region.region_open_flags.get(item).copied());
+                crate::region::configure_goal_arena(goal_arena_flag);
 
                 (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features)
             });
@@ -3217,6 +3230,20 @@ impl shared::Core for Core {
                 }
             }
             if let Some(m) = crate::region::tick_kick(cfg) {
+                region_msgs.push(m);
+            }
+            // ⭐ GOAL-APPROACH NOTICE (world#694, option C). Warns, never blocks: the complaint is
+            // SURPRISE, not reachability, and option B is the kick -- this repo's filed softlock
+            // precedent (#589). Reads only, so it cannot fail closed.
+            //
+            // `received_all` is the cumulative, reconnect-replayed received-name set, the same one
+            // `goal::is_met` tests HELD against -- so the notice and the goal can never disagree
+            // about which Locks the player has.
+            if let Some(goal) = self.goal.as_ref()
+                && let Some(m) = crate::region::tick_goal_approach(cfg, &goal.item_goals, &|n| {
+                    received_all.contains(n)
+                })
+            {
                 region_msgs.push(m);
             }
         }

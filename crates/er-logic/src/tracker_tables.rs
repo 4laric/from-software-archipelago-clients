@@ -54,6 +54,36 @@ pub struct TrackerTables {
     pub lock_items: HashMap<RegionId, String>,
 }
 
+impl TrackerTables {
+    /// The Region Lock item whose region owns EVERY one of `goal_locations`, when they agree
+    /// (world#694).
+    ///
+    /// 🛑 THE COARSE KEY, NOT THE FINE REGION. `coarse` is by definition "the region whose lock
+    /// decides in-logic", which is exactly the question being asked; the fine region is a visual
+    /// grouping and the two legitimately differ. Resolving through the fine name would be a
+    /// confidently-wrong answer of the kind [`crate::boss_fight_sample`]'s region note is about.
+    ///
+    /// `None` when the ids disagree, when any id is unknown to the tables, when the coarse key is
+    /// `""` (always accessible -- no lock decides it), or when the tables are empty. Every one of
+    /// those is "don't know", and the caller's only use for this is a NOTICE, so don't-know must
+    /// read as "say nothing" rather than as a guess.
+    pub fn goal_lock_item(&self, goal_locations: &[i64]) -> Option<&str> {
+        let mut agreed: Option<&RegionId> = None;
+        for &id in goal_locations {
+            let key = self.coarse.get(&(id as u64))?;
+            if key.is_empty() {
+                return None; // always-accessible: no lock decides this location
+            }
+            match agreed {
+                None => agreed = Some(key),
+                Some(k) if k == key => {}
+                Some(_) => return None, // two regions -> not one arena
+            }
+        }
+        self.lock_items.get(agreed?).map(|s| s.as_str())
+    }
+}
+
 /// Why the tables look the way they do. The caller logs this ONCE at connect: a feature is armed,
 /// or it says why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +190,54 @@ pub fn build_tracker_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tt() -> TrackerTables {
+        let mut t = TrackerTables::default();
+        for id in [10u64, 11, 12] {
+            t.coarse.insert(id, "Enir Ilim".to_string());
+        }
+        t.coarse.insert(20, "Liurnia".to_string());
+        t.coarse.insert(30, String::new()); // always accessible
+        t.lock_items
+            .insert("Enir Ilim".to_string(), "Enir Ilim Lock".to_string());
+        t.lock_items
+            .insert("Liurnia".to_string(), "Liurnia Lock".to_string());
+        t
+    }
+
+    /// ⭐ world#694: goal locations that agree on one coarse region resolve to that region's Lock.
+    #[test]
+    fn agreeing_goal_locations_resolve_to_one_lock() {
+        assert_eq!(tt().goal_lock_item(&[10, 11, 12]), Some("Enir Ilim Lock"));
+    }
+
+    /// 🛑 TWO REGIONS IS NOT ONE ARENA. Same rule `describe_goal` uses when it declines to name a
+    /// region: a disagreeing set means say nothing, not pick the first.
+    #[test]
+    fn disagreeing_goal_locations_resolve_to_nothing() {
+        assert_eq!(tt().goal_lock_item(&[10, 20]), None);
+    }
+
+    /// An id the tables do not know, an always-accessible coarse key, and empty tables are all
+    /// don't-know -- and the caller only drives a NOTICE, so don't-know must be silence.
+    #[test]
+    fn unknown_always_accessible_and_empty_are_all_none() {
+        assert_eq!(tt().goal_lock_item(&[10, 999]), None, "unknown id");
+        assert_eq!(tt().goal_lock_item(&[30]), None, "always accessible");
+        assert_eq!(
+            TrackerTables::default().goal_lock_item(&[10]),
+            None,
+            "no tables"
+        );
+    }
+
+    /// A coarse key with no lock item mapped is also don't-know rather than a fabricated name.
+    #[test]
+    fn a_coarse_key_with_no_lock_item_is_none() {
+        let mut t = tt();
+        t.lock_items.remove("Enir Ilim");
+        assert_eq!(t.goal_lock_item(&[10]), None);
+    }
     use serde_json::json;
 
     /// The exact shapes the contract declares, so a test passing here means the WIRE parses --
