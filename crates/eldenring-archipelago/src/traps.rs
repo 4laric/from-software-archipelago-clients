@@ -65,6 +65,14 @@ static PENDING: Mutex<Option<er_logic::traps::TrapQueue>> = Mutex::new(None);
 /// One warn per overdue head, not one per tick.
 static WARNED: AtomicBool = AtomicBool::new(false);
 
+/// The remainder of a `count > 1` spawn, issued one request per tick (client#206).
+///
+/// 🛑 SEPARATE FROM [`PENDING`], on purpose. `TrapQueue` holds traps that have not fired yet and
+/// whose delivery may be REFUSED and retried; a burst is a trap that HAS fired and is still
+/// arriving. Folding a half-delivered spawn back into the queue would make it eligible for the
+/// overdue warning and for re-firing, which is a different and worse bug than the one being fixed.
+static SPAWN_BURST: Mutex<Option<er_logic::spawn_burst::SpawnBurst>> = Mutex::new(None);
+
 /// Queue a trap that arrived as an AP item. Called from the receive loop, which knows the NAME.
 ///
 /// A name this build cannot read is logged and dropped ON PURPOSE: firing the wrong effect is
@@ -101,6 +109,13 @@ pub fn enqueue_by_item_name(name: &str, now_ms: u64) {
 /// `fire` (death guard, param streamed) -- a trap that cannot land this tick goes back to waiting
 /// rather than being consumed, which is the whole point of the queue.
 pub fn poll_pending(now_ms: u64) -> Option<Cow<'static, str>> {
+    // 🛑 THE BURST GOES FIRST, and it returns. A spawn that is still arriving owns this tick's
+    // request slot; letting a queued trap fire underneath it would put a second write on the same
+    // `init_data` before the creator drained the first -- which is the exact collapse #206 is
+    // about, re-created between two traps instead of within one.
+    if drive_spawn_burst() {
+        return None;
+    }
     let Ok(mut guard) = PENDING.lock() else {
         return None;
     };
@@ -203,6 +218,14 @@ fn fire_rune_thief() -> bool {
 /// All `count` requests go to that ONE identical point, also on purpose: the debug creator resolves
 /// the overlap itself, and any per-creature offset would re-introduce exactly the wall/cliff/floor
 /// risk reason 2 above exists to avoid -- multiplied by the count.
+///
+/// 🛑 ONE REQUEST PER TICK, AND THAT IS THE WHOLE OF client#206. `spawn_debug_character` writes a
+/// SINGLE shared `init_data` slot and raises one `spawn` flag; `CSDebugChrCreator` drains it on the
+/// next frame. A `for _ in 0..count` loop therefore overwrote the same slot `count` times before
+/// the creator ran once, and `traps: [basilisk]` put ONE basilisk on the ground. The remainder now
+/// rides in [`SPAWN_BURST`] and is issued by [`poll_pending`], one per tick, which is the machine
+/// this module already had. See `er_logic::spawn_burst` for the binding source that rules out the
+/// per-copy `event_entity_id` fix: three distinct ids are still three writes to one slot.
 fn fire_spawn(spec: SpawnSpec) -> bool {
     // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract every
     // other player write in this crate relies on.
@@ -227,13 +250,16 @@ fn fire_spawn(spec: SpawnSpec) -> bool {
         pos_y: pos.1,
         pos_z: pos.2,
     };
-    for _ in 0..spec.count {
+    let mut burst = er_logic::spawn_burst::SpawnBurst::new(spec);
+    // This tick's copy. The creator drains the slot before the next one is written.
+    if burst.next_request().is_some() {
         wcm.spawn_debug_character(&request);
     }
     log::info!(
-        "trap spawn: {} x c{} requested -- npc={} think={} chara_init={} at ({}, {}, {})",
-        spec.count,
+        "trap spawn: c{} x{} opening -- npc={} think={} chara_init={} at ({}, {}, {}). One request \
+         per tick; the total lands on the burst report (client#206)",
         spec.chr_id,
+        spec.count,
         spec.npc_param_id,
         spec.think_param_id,
         SpawnSpec::CHARA_INIT_PARAM_ID,
@@ -241,8 +267,83 @@ fn fire_spawn(spec: SpawnSpec) -> bool {
         pos.1,
         pos.2
     );
+    set_spawn_burst(burst);
     // 🛑 They are REQUESTS: the debug creator spawns on its own schedule, so `true` here means
     // "asked", not "standing there". The player finds out within a second either way.
+    true
+}
+
+fn set_spawn_burst(burst: er_logic::spawn_burst::SpawnBurst) {
+    if let Ok(mut slot) = SPAWN_BURST.lock() {
+        // An in-flight burst is REPLACED, not queued behind. Two spawn traps inside three frames
+        // is already a horde; holding the first one's tail would deliver it into the second's
+        // arena minutes later, somewhere the player is no longer standing.
+        *slot = (!burst.is_done()).then_some(burst);
+    }
+}
+
+/// Issue at most one queued spawn request this tick. `true` = this tick belonged to the burst.
+///
+/// 🛑 NO DEATH GUARD, for the same reason [`fire_spawn`] has none: this reads
+/// `modules.physics.position` and never touches `special_effect`. `in_world` is the precondition,
+/// and a burst that meets a load screen simply stops issuing -- the copies already standing are
+/// the joke, and re-opening the burst on the far side would drop creatures into a new map.
+fn drive_spawn_burst() -> bool {
+    let Ok(mut slot) = SPAWN_BURST.lock() else {
+        return false;
+    };
+    // Copied out, not borrowed: closing the burst below writes through `slot`, and `SpawnBurst` is
+    // `Copy` precisely so this costs nothing.
+    let Some(mut burst) = *slot else {
+        return false;
+    };
+    let report = |b: &er_logic::spawn_burst::SpawnBurst| {
+        // ⭐ The line that would have made #206 visible on day one: it names what was ASKED and
+        // what was ISSUED, where the old line named only `spec.count`. `observed` is None -- the
+        // client cannot count what the creator made without a walk this module does not do, and a
+        // number it does not have must not be printed as agreement.
+        log::info!(
+            "{}",
+            er_logic::spawn_burst::burst_report(b.spec_chr_id(), b.requested(), b.issued(), None)
+        );
+    };
+
+    // A burst that meets a load screen stops issuing. The copies already standing are the joke,
+    // and re-opening it on the far side would drop creatures into a map the player has left.
+    if !crate::flags::in_world() {
+        report(&burst);
+        *slot = None;
+        return false;
+    }
+    let Some(one) = burst.next_request() else {
+        report(&burst);
+        *slot = None;
+        return false;
+    };
+
+    // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract
+    // `fire_spawn` relies on.
+    let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
+        return false; // burst held, retried next tick
+    };
+    let Some(player) = wcm.main_player.as_ref() else {
+        return false;
+    };
+    let pos = player.chr_ins.modules.physics.position;
+    let request = ChrDebugSpawnRequest {
+        chr_id: one.chr_id,
+        chara_init_param_id: SpawnSpec::CHARA_INIT_PARAM_ID,
+        npc_param_id: one.npc_param_id,
+        npc_think_param_id: one.think_param_id,
+        event_entity_id: 0,
+        talk_id: 0,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        pos_z: pos.2,
+    };
+    wcm.spawn_debug_character(&request);
+    // Only now is the issue banked: an early return above leaves the burst exactly as it was.
+    *slot = Some(burst);
     true
 }
 
