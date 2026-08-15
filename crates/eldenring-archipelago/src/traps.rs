@@ -42,8 +42,9 @@
 //! carries a `reset()` for. Patch-then-apply costs one row write per keypress and cannot go stale.
 
 use std::borrow::Cow;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use eldenring::cs::{
     ChrDebugSpawnRequest, ChrInsExt, SoloParamRepository, SpEffectParam, WorldChrMan,
@@ -64,6 +65,45 @@ use fromsoftware_shared::FromStatic;
 static PENDING: Mutex<Option<er_logic::traps::TrapQueue>> = Mutex::new(None);
 /// One warn per overdue head, not one per tick.
 static WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Monotonic base for the burst's own timing (world#689).
+///
+/// 🛑 DELIBERATELY NOT `poll_pending`'s `now_ms`. That one is the UI toast clock, handed in by
+/// core.rs, and `fire` is also reachable from the F7/F8 keypress path which has no such value. The
+/// burst compares its own timestamps only against each other, so it needs ONE clock it always has
+/// -- the same `OnceLock<Instant>` shape `boss_fight_probe` and `detour` already use.
+static CLOCK: OnceLock<Instant> = OnceLock::new();
+
+fn now_ms() -> u64 {
+    CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Live characters standing on `npc_param_id`, over the same two sets the scaling sweep walks
+/// (world#689).
+///
+/// 🛑 `npc_param_id`, NOT `chr_id`. The model id (`c4150`) is shared by every row built on that
+/// model; the row is what the trap actually asked the creator for, and it is what `find_boss` keys
+/// on for the same reason. Keying the witness on the model would count a different creature as
+/// ours.
+///
+/// Read-only, and no new traversal: `sweepable_characters` is the walk `boss_fight_probe::find_boss`
+/// and the scaling sweep already share.
+fn count_live_npc_param(wcm: &WorldChrMan, npc_param_id: i32) -> u32 {
+    let mut n: u32 = 0;
+    for chr in crate::scaling::sweepable_characters(&wcm.open_field_chr_set.base) {
+        if chr.npc_param_id == npc_param_id {
+            n = n.saturating_add(1);
+        }
+    }
+    for slot in wcm.chr_sets.iter().flatten() {
+        for chr in crate::scaling::sweepable_characters(slot) {
+            if chr.npc_param_id == npc_param_id {
+                n = n.saturating_add(1);
+            }
+        }
+    }
+    n
+}
 
 /// The remainder of a `count > 1` spawn, issued one request per tick (client#206).
 ///
@@ -250,14 +290,20 @@ fn fire_spawn(spec: SpawnSpec) -> bool {
         pos_y: pos.1,
         pos_z: pos.2,
     };
-    let mut burst = er_logic::spawn_burst::SpawnBurst::new(spec);
+    // ⭐ COUNTED BEFORE ANYTHING IS ISSUED (world#689). The trap's `npc_param_id` is a curated
+    // row, not a private one, and this game puts basilisks near basilisks -- so the witness below
+    // reports what the trap ADDED, never what happens to be standing.
+    let baseline = count_live_npc_param(wcm, spec.npc_param_id);
+    let now = now_ms();
+    let mut burst = er_logic::spawn_burst::SpawnBurst::new(spec, baseline, now);
     // This tick's copy. The creator drains the slot before the next one is written.
-    if burst.next_request().is_some() {
+    if burst.next_request(now).is_some() {
         wcm.spawn_debug_character(&request);
     }
     log::info!(
-        "trap spawn: c{} x{} opening -- npc={} think={} chara_init={} at ({}, {}, {}). One request \
-         per tick; the total lands on the burst report (client#206)",
+        "trap spawn: c{} x{} opening -- npc={} think={} chara_init={} at ({}, {}, {}), {} already \
+         live on this row. One request per tick; what actually appeared lands on the burst report \
+         (client#206, world#689)",
         spec.chr_id,
         spec.count,
         spec.npc_param_id,
@@ -265,7 +311,8 @@ fn fire_spawn(spec: SpawnSpec) -> bool {
         SpawnSpec::CHARA_INIT_PARAM_ID,
         pos.0,
         pos.1,
-        pos.2
+        pos.2,
+        baseline
     );
     set_spawn_burst(burst);
     // 🛑 They are REQUESTS: the debug creator spawns on its own schedule, so `true` here means
@@ -278,7 +325,12 @@ fn set_spawn_burst(burst: er_logic::spawn_burst::SpawnBurst) {
         // An in-flight burst is REPLACED, not queued behind. Two spawn traps inside three frames
         // is already a horde; holding the first one's tail would deliver it into the second's
         // arena minutes later, somewhere the player is no longer standing.
-        *slot = (!burst.is_done()).then_some(burst);
+        //
+        // 🛑 A SPENT BURST IS STILL KEPT (world#689). It used to be dropped the moment it had
+        // nothing left to issue, which is correct for issuing and wrong for WITNESSING: a `x1`
+        // spawn is spent after its first request and is exactly the case nobody has ever verified.
+        // `drive_spawn_burst` closes it after the settle window instead.
+        *slot = Some(burst);
     }
 }
 
@@ -297,28 +349,55 @@ fn drive_spawn_burst() -> bool {
     let Some(mut burst) = *slot else {
         return false;
     };
-    let report = |b: &er_logic::spawn_burst::SpawnBurst| {
-        // ⭐ The line that would have made #206 visible on day one: it names what was ASKED and
-        // what was ISSUED, where the old line named only `spec.count`. `observed` is None -- the
-        // client cannot count what the creator made without a walk this module does not do, and a
-        // number it does not have must not be printed as agreement.
+    let now = now_ms();
+
+    // A burst that meets a load screen stops issuing, and cannot be verified: the creatures it did
+    // place are in a map the player has left, so no count taken here means anything.
+    if !crate::flags::in_world() {
         log::info!(
             "{}",
-            er_logic::spawn_burst::burst_report(b.spec_chr_id(), b.requested(), b.issued(), None)
+            er_logic::spawn_burst::burst_report(
+                burst.spec_chr_id(),
+                burst.requested(),
+                burst.issued(),
+                None
+            )
         );
-    };
-
-    // A burst that meets a load screen stops issuing. The copies already standing are the joke,
-    // and re-opening it on the far side would drop creatures into a map the player has left.
-    if !crate::flags::in_world() {
-        report(&burst);
         *slot = None;
         return false;
     }
-    let Some(one) = burst.next_request() else {
-        report(&burst);
+
+    // ⭐ THE WITNESS (world#689). The burst is spent and the settle window has closed, so a count
+    // taken now is a statement about what the creator actually made. Until then the burst is held:
+    // counting on the tick after the last request would read a creature that has not loaded and
+    // report a failure that did not happen.
+    if burst.verify_due(now) {
+        let observed = match unsafe { WorldChrMan::instance() } {
+            Ok(wcm) => {
+                let live = count_live_npc_param(wcm, burst.spec_npc_param_id());
+                Some(burst.observed_delta(live))
+            }
+            // Unreadable this tick. `None` prints as "not countable", never as agreement -- the
+            // whole point of #689 is that a number we do not have must not read as a success.
+            Err(_) => None,
+        };
+        log::info!(
+            "{}",
+            er_logic::spawn_burst::burst_report(
+                burst.spec_chr_id(),
+                burst.requested(),
+                burst.issued(),
+                observed
+            )
+        );
         *slot = None;
         return false;
+    }
+    // Spent but still settling: this tick belongs to the burst, so nothing else may write the
+    // creator's slot underneath it.
+    let Some(one) = burst.next_request(now) else {
+        *slot = Some(burst);
+        return true;
     };
 
     // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract

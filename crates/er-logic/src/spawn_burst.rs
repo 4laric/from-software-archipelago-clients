@@ -49,8 +49,37 @@
 //! so "asked 3, got 1" was invisible for as long as the trap has existed. [`SpawnBurst::issued`] is
 //! a count of requests that reached the creator on their own tick, which is a different and honest
 //! number, and [`burst_report`] is the line that states both.
+//!
+//! # The witness (world#689)
+//!
+//! `issued` is still not the same question as *did three basilisks appear*. #206 shipped with
+//! `observed: None` because the client could not count what the creator made; this module now
+//! carries the state machine that closes that, and it exists because **#206 was found by a human
+//! standing in the arena counting basilisks.** An instrument that reports its own request is not a
+//! witness to anything.
+//!
+//! Two things make the count honest, and both are the whole reason this is not a one-liner:
+//!
+//! * 🛑 **A BASELINE, NOT A RAW COUNT.** The trap's `npc_param_id` is a curated row, not a private
+//!   one -- the world can already contain creatures on it, and Elden Ring is a game where you fight
+//!   a basilisk near other basilisks. Reporting the live count would score a trap that spawned
+//!   NOTHING as a full success in any room that already had three. The burst records the count
+//!   BEFORE it issues anything and reports the delta.
+//! * 🛑 **A SETTLE DELAY.** `CSDebugChrCreator` drains its slot on its own schedule and the
+//!   character then has to load. Counting on the tick after the last request would read zero and
+//!   report a failure that did not happen -- the mirror image of the bug, and a worse one, because
+//!   a false alarm teaches a reader to stop believing the line.
 
 use crate::traps::SpawnSpec;
+
+/// How long after the LAST request to wait before counting what stands (world#689).
+///
+/// The creator drains one slot per frame and the character then loads, so the true settle is a
+/// handful of frames. Two seconds is deliberately generous: this line is a witness, not a gate, and
+/// nothing waits on it. Being late costs one log line's timestamp; being early costs a false
+/// "ASKED 3, GOT 0" on a trap that worked, which is the failure that would make the whole
+/// instrument ignorable.
+pub const SETTLE_MS: u64 = 2_000;
 
 /// A `count > 1` spawn, played out one request per tick.
 ///
@@ -62,13 +91,54 @@ pub struct SpawnBurst {
     spec: SpawnSpec,
     /// Requests handed out so far. Each one reached the creator on a tick of its own.
     issued: u32,
+    /// Live characters on this `npc_param_id` BEFORE the burst issued anything (world#689).
+    ///
+    /// 🛑 THE TRAP'S ROW IS NOT PRIVATE. Without this, a trap that spawned nothing in a room that
+    /// already held three basilisks reports a clean `3 standing`.
+    baseline: u32,
+    /// Wall clock of the last request, i.e. when the settle window starts.
+    last_issue_ms: u64,
 }
 
 impl SpawnBurst {
-    /// Open a burst for `spec`. Nothing is issued yet -- the first [`Self::next_request`] is the
-    /// first tick's request.
-    pub fn new(spec: SpawnSpec) -> Self {
-        Self { spec, issued: 0 }
+    /// Open a burst for `spec`, having already counted `baseline` live characters on its row.
+    ///
+    /// Nothing is issued yet -- the first [`Self::next_request`] is the first tick's request.
+    pub fn new(spec: SpawnSpec, baseline: u32, now_ms: u64) -> Self {
+        Self {
+            spec,
+            issued: 0,
+            baseline,
+            last_issue_ms: now_ms,
+        }
+    }
+
+    /// The row the witness counts on. Not the same id as [`Self::spec_chr_id`]: `chr_id` is the
+    /// model (`c4150`) and several rows can share one.
+    pub fn spec_npc_param_id(&self) -> i32 {
+        self.spec.npc_param_id
+    }
+
+    /// What the world held on this row before the burst opened.
+    pub fn baseline(&self) -> u32 {
+        self.baseline
+    }
+
+    /// Has the settle window closed, so a count taken now means something?
+    ///
+    /// Only ever true once the burst is spent: counting mid-burst would be reading a number that is
+    /// still being written.
+    pub fn verify_due(&self, now_ms: u64) -> bool {
+        self.is_done() && now_ms.saturating_sub(self.last_issue_ms) >= SETTLE_MS
+    }
+
+    /// How many of the creatures standing now are OURS, given the live count on this row.
+    ///
+    /// Saturating: a live count below the baseline means something died, despawned, or wandered
+    /// off between the two reads. That is `0` of ours confirmed, never a negative, and never a
+    /// wrap into a huge number that would read as wild success.
+    pub fn observed_delta(&self, live_now: u32) -> u32 {
+        live_now.saturating_sub(self.baseline)
     }
 
     /// How many the world asked for.
@@ -95,11 +165,14 @@ impl SpawnBurst {
     /// The returned spec carries `count: 1`, because it describes ONE creature: handing the caller
     /// a spec that still said `3` would leave a loop at the call site to be re-introduced by the
     /// next person to read it, which is the bug this module exists to remove.
-    pub fn next_request(&mut self) -> Option<SpawnSpec> {
+    pub fn next_request(&mut self, now_ms: u64) -> Option<SpawnSpec> {
         if self.is_done() {
             return None;
         }
         self.issued += 1;
+        // The settle window runs from the LAST request, not the first: a burst of eight staggered
+        // across eight ticks must not start its clock before the eighth has been made.
+        self.last_issue_ms = now_ms;
         let mut one = self.spec;
         one.count = 1;
         Some(one)
@@ -171,9 +244,9 @@ mod replay {
         assert_eq!(spec.count, 3, "the curated basilisk trap is three mists");
 
         let mut creator = SingleSlotCreator::default();
-        let mut burst = SpawnBurst::new(spec);
+        let mut burst = SpawnBurst::new(spec, 0, 0);
         // One request per tick, each with a frame in between for the creator to drain it.
-        while let Some(one) = burst.next_request() {
+        while let Some(one) = burst.next_request(0) {
             assert_eq!(one.count, 1, "each request describes exactly one creature");
             creator.request(one.chr_id);
             creator.run_frame();
@@ -232,14 +305,14 @@ mod replay {
     /// case -- so the staggered path is the ONLY spawn path and never grows a second one.
     #[test]
     fn a_burst_is_spent_exactly_once() {
-        let mut burst = SpawnBurst::new(basilisk_x3());
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 0);
         let mut issued = 0;
-        while burst.next_request().is_some() {
+        while burst.next_request(0).is_some() {
             issued += 1;
             assert!(issued <= 8, "MAX_SPAWN_COUNT is 8; a burst must terminate");
         }
         assert_eq!(issued, 3);
-        assert_eq!(burst.next_request(), None, "a spent burst issues nothing");
+        assert_eq!(burst.next_request(0), None, "a spent burst issues nothing");
         assert_eq!(burst.issued(), 3);
     }
 
@@ -261,6 +334,89 @@ mod replay {
         let unknown = burst_report(4150, 3, 3, None);
         assert!(!unknown.contains("3 standing"), "{unknown}");
         assert!(!unknown.contains("ASKED"), "{unknown}");
+    }
+
+    /// ⭐ THE RED-FIRST ASSERTION FOR THE WITNESS (world#689). A trap that spawns NOTHING in a
+    /// room that already holds three basilisks must report a failure, not `3 standing`.
+    ///
+    /// Driven with the raw live count instead of the delta, this fails -- which is exactly the
+    /// shape a one-line "just count them" fix would have shipped.
+    #[test]
+    fn a_room_that_already_had_basilisks_cannot_pass_for_a_successful_trap() {
+        let mut burst = SpawnBurst::new(basilisk_x3(), 3, 0);
+        while burst.next_request(0).is_some() {}
+
+        // The creator collapsed everything: the live count is still the three that were there.
+        let observed = burst.observed_delta(3);
+        assert_eq!(
+            observed, 0,
+            "none of the three standing are ours -- they were there before the trap fired"
+        );
+        let line = burst_report(4150, burst.requested(), burst.issued(), Some(observed));
+        assert!(
+            line.contains("ASKED 3, GOT 0"),
+            "a trap that spawned nothing must say so even in a room full of basilisks: {line}"
+        );
+    }
+
+    /// The happy path, in a room that already had some: baseline 2, five standing, three are ours.
+    #[test]
+    fn the_delta_is_what_the_trap_actually_added() {
+        let mut burst = SpawnBurst::new(basilisk_x3(), 2, 0);
+        while burst.next_request(0).is_some() {}
+        assert_eq!(burst.baseline(), 2);
+        assert_eq!(burst.observed_delta(5), 3);
+        let line = burst_report(4150, burst.requested(), burst.issued(), Some(3));
+        assert!(
+            !line.contains("ASKED"),
+            "three of ours is a full house: {line}"
+        );
+        assert!(line.contains("3 standing"), "{line}");
+    }
+
+    /// 🛑 A LIVE COUNT BELOW THE BASELINE IS NOT A NEGATIVE AND NOT A WRAP. Something died or
+    /// despawned between the two reads; that is zero of ours confirmed. An unsigned wrap here
+    /// would print a number in the billions and read as wild success.
+    #[test]
+    fn a_shrinking_world_reads_as_zero_not_as_a_wrap() {
+        let burst = SpawnBurst::new(basilisk_x3(), 4, 0);
+        assert_eq!(burst.observed_delta(1), 0);
+        assert_eq!(burst.observed_delta(0), 0);
+    }
+
+    /// The settle window opens only once the burst is spent, and it runs from the LAST request --
+    /// a burst staggered across eight ticks must not start its clock on the first.
+    #[test]
+    fn the_settle_window_runs_from_the_last_request() {
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 0);
+        assert!(
+            !burst.verify_due(SETTLE_MS * 10),
+            "an unspent burst is never due: the number is still being written"
+        );
+        burst.next_request(0);
+        burst.next_request(500);
+        assert!(!burst.verify_due(SETTLE_MS), "still one request to go");
+        burst.next_request(1_000); // the last one
+        assert!(burst.is_done());
+        assert!(
+            !burst.verify_due(1_000 + SETTLE_MS - 1),
+            "counting early reads a creature that has not loaded yet"
+        );
+        assert!(burst.verify_due(1_000 + SETTLE_MS));
+    }
+
+    /// A backwards clock must not stall the witness forever. `saturating_sub` yields 0, so the
+    /// window simply re-opens on the next tick that reads forward -- the same degrade
+    /// `SampleGate` documents for its heartbeat.
+    #[test]
+    fn a_backwards_clock_does_not_strand_the_witness() {
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 10_000);
+        while burst.next_request(10_000).is_some() {}
+        assert!(
+            !burst.verify_due(5),
+            "a clock that went backwards is not a due date"
+        );
+        assert!(burst.verify_due(10_000 + SETTLE_MS));
     }
 
     /// In-game strings are ASCII-only (repo rule); the report is a log line but shares the
