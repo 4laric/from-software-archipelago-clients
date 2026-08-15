@@ -158,7 +158,10 @@ mod tests {
             classify(ErrorKind::ConnectionRefused),
             Some(ConnectFailure::Refused)
         );
-        assert_eq!(classify(ErrorKind::TimedOut), Some(ConnectFailure::TimedOut));
+        assert_eq!(
+            classify(ErrorKind::TimedOut),
+            Some(ConnectFailure::TimedOut)
+        );
         for other in [
             ErrorKind::ConnectionReset,
             ErrorKind::ConnectionAborted,
@@ -166,7 +169,11 @@ mod tests {
             ErrorKind::PermissionDenied,
             ErrorKind::Other,
         ] {
-            assert_eq!(classify(other), None, "{other:?} is not this arm's business");
+            assert_eq!(
+                classify(other),
+                None,
+                "{other:?} is not this arm's business"
+            );
         }
     }
 
