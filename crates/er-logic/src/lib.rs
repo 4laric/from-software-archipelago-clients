@@ -74,6 +74,7 @@ pub mod shop_echo;
 pub mod shop_hints;
 pub mod shop_repoint;
 pub mod shop_repoint_replay;
+pub mod spawn_burst;
 pub mod spell_equip;
 pub mod start_backfill;
 pub mod startup_retry;
