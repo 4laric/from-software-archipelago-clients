@@ -323,15 +323,22 @@ pub fn run(row_flags: &[(u32, u32)]) -> bool {
         return true;
     }
     let mut wrote = 0;
+    // Same audit: `injected 0/534` is the clean idempotent re-run, and said nothing about which.
+    let mut write_tally = er_logic::applied_tally::AppliedTally::new();
     let mut qty_clamped = 0;
     for &(row, flag) in row_flags {
+        write_tally.walked += 1;
         match write_stock_flag(row, flag) {
             Some(old) if old != flag => {
                 wrote += 1;
+                write_tally.changed += 1;
                 log::info!("shop-flags WRITE: row {row} eventFlag_forStock {old} -> {flag}");
             }
-            Some(_) => { /* already correct (idempotent re-run) */ }
-            None => log::warn!("shop-flags WRITE: row {row} absent; skipped"),
+            Some(_) => write_tally.already += 1, // already correct (idempotent re-run)
+            None => {
+                write_tally.absent += 1;
+                log::warn!("shop-flags WRITE: row {row} absent; skipped");
+            }
         }
         // Stock parity with the old baker: a shop check fires its flag on the FIRST buy, but a vanilla
         // slot with sellQuantity>1 (e.g. row 100506 = 3) lets you re-buy past the check and waste runes.
@@ -344,8 +351,9 @@ pub fn run(row_flags: &[(u32, u32)]) -> bool {
         }
     }
     log::info!(
-        "shop-flags WRITE: === injected {wrote}/{} rows ({qty_clamped} sellQuantity clamped to 1) ===",
-        row_flags.len()
+        "shop-flags WRITE: === injected {wrote}/{} rows ({qty_clamped} sellQuantity clamped to 1)          === -- {}",
+        row_flags.len(),
+        write_tally.summary("rows")
     );
     // Wider pass: clamp EVERY shop check (goods + equipment) to one-time, by check-flag match. Same
     // rule as the empty path above: if the clamp could not run, RETRY -- never latch DONE over it. The
@@ -411,8 +419,13 @@ pub fn run_capital_release() -> bool {
         return false; // param repo not ready -- retry next tick, never latch over un-run work
     }
     let mut rekeyed = 0u32;
+    // Why the number is what it is (#200 audit). `0/4` was read as four failed rows in triage; it
+    // is the idempotent re-run, and the summary alone could not say so.
+    let mut tally = er_logic::applied_tally::AppliedTally::new();
     for &(row, from, to) in &rows {
+        tally.walked += 1;
         let Some(a) = release_flag_addr(row) else {
+            tally.absent += 1;
             log::warn!("capital release re-key: row {row} absent from ShopLineupParam; skipped");
             continue;
         };
@@ -421,6 +434,7 @@ pub fn run_capital_release() -> bool {
         // stock writes.
         let live = unsafe { p.read_unaligned() };
         if live == to {
+            tally.already += 1;
             continue; // already re-keyed (idempotent re-run / reconnect)
         }
         if live != from {
@@ -434,13 +448,15 @@ pub fn run_capital_release() -> bool {
         unsafe { p.write_unaligned(to) };
         let back = unsafe { p.read_unaligned() };
         rekeyed += 1;
+        tally.changed += 1;
         log::info!(
             "capital release re-key: row {row} eventFlag_forRelease {from} -> {to} (readback {back})"
         );
     }
     log::info!(
-        "capital release re-key: === {rekeyed}/{} row(s) re-keyed ===",
-        rows.len()
+        "capital release re-key: === {rekeyed}/{} row(s) re-keyed === -- {}",
+        rows.len(),
+        tally.summary("rows")
     );
     CAPITAL_RELEASE_DONE.store(true, Ordering::Relaxed);
     true
