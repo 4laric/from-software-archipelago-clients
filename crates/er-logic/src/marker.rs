@@ -455,7 +455,9 @@ mod tests {
 
     #[test]
     fn band_fits_reserved_headroom() {
-        assert!(FlagBand::WIDTH <= FlagBand::RESERVED);
+        // Both operands are consts, so this is checked at COMPILE time rather than at test time:
+        // a band that outgrew its reserved window can no longer wait for someone to run the suite.
+        const _: () = assert!(FlagBand::WIDTH <= FlagBand::RESERVED);
         // last used flag stays inside the reserved window
         assert!(B.cur(true, 31) < B.base + FlagBand::RESERVED);
     }

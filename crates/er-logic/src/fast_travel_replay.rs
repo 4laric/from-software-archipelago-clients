@@ -78,8 +78,10 @@ fn entering_a_boss_dungeon_must_not_set_the_bosss_defeat_flag() {
 /// With a known-good flag primed from the start graces, the gate opens with zero side effects.
 #[test]
 fn a_primed_known_good_flag_opens_the_gate_without_writing_anything() {
-    let mut s = Sim::default();
-    s.known_good = prime_known_good(&[START_GRACE]).unwrap();
+    let mut s = Sim {
+        known_good: prime_known_good(&[START_GRACE]).unwrap(),
+        ..Sim::default()
+    };
     s.tick(WYRM_DEFEAT, false, Policy::NeverSet);
     assert!(s.flags_written.is_empty(), "no writes");
     assert_eq!(
@@ -103,8 +105,10 @@ fn a_legitimately_open_gate_is_cached() {
 /// A whole run: spawn, dungeon, out, dungeon again. Never a single write.
 #[test]
 fn no_write_ever_happens_across_a_run() {
-    let mut s = Sim::default();
-    s.known_good = prime_known_good(&[START_GRACE]).unwrap_or(0);
+    let mut s = Sim {
+        known_good: prime_known_good(&[START_GRACE]).unwrap_or(0),
+        ..Sim::default()
+    };
     for (field, on) in [
         (WYRM_DEFEAT, false), // walk into Gael Tunnel
         (32_000_800, false),  // and another dungeon
@@ -161,8 +165,10 @@ fn field_zero_never_redirects_even_with_a_cached_flag() {
 
     // And as a timeline: primed known-good, then a field-0 tick (overworld / death transition).
     // The field must be left untouched -- no overwrite into a tearing-down map.
-    let mut s = Sim::default();
-    s.known_good = prime_known_good(&[START_GRACE]).unwrap();
+    let mut s = Sim {
+        known_good: prime_known_good(&[START_GRACE]).unwrap(),
+        ..Sim::default()
+    };
     s.tick(0, false, Policy::NeverSet);
     assert_eq!(s.field, 0, "field 0 left as-is: the gate wrote nothing");
     assert!(s.flags_written.is_empty());

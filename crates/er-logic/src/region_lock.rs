@@ -940,7 +940,6 @@ mod tests {
             flags: vec![11000800],
             count_items: vec!["A".into(), "B".into(), "C".into()],
             count: 2,
-            ..Default::default()
         }];
         let flag_on = |f: u32| f == 11000800;
         // count satisfied but item missing -> no fire.

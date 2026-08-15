@@ -294,14 +294,14 @@ mod tests {
         // punishing). Under `medium` it must land in the medium band -- not light.
         let heavy = 0.95 / m;
         assert!(
-            heavy >= LIGHT_MAX && heavy < MEDIUM_MAX,
+            (LIGHT_MAX..MEDIUM_MAX).contains(&heavy),
             "a 0.95 kit must land in MEDIUM, got {heavy}"
         );
 
         // Over-equipped to 1.5x the ceiling: still medium, still no free light roll.
         let overloaded = 1.50 / m;
         assert!(
-            overloaded >= LIGHT_MAX && overloaded < MEDIUM_MAX,
+            (LIGHT_MAX..MEDIUM_MAX).contains(&overloaded),
             "a 1.50 kit must still be medium, got {overloaded}"
         );
 

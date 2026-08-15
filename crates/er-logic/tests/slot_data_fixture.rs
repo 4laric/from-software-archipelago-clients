@@ -103,14 +103,14 @@ fn real_generated_slot_data_parses_through_every_er_logic_consumer() {
     //     {play_region_id: int} -- the sphere bridge has been dead at the wire since the runtime
     //     port (P1, er-completion-scaling). Downgraded to a loud line until the wire fix lands;
     //     flip back to assert! then.
-    if er_logic::options::parse_bool_option(&sd, "completion_scaling") {
-        if er_logic::scaling::parse_scaling_config(&sd).is_none() {
-            eprintln!(
-                "KNOWN-RED H4 wire drift: completion_scaling on but regionSphereTargets is not \
-                 client-parseable ({{name: frac}} vs {{play_region_id: int}}) -- see \
-                 er-completion-scaling P1; flip this back to assert! with the wire fix"
-            );
-        }
+    if er_logic::options::parse_bool_option(&sd, "completion_scaling")
+        && er_logic::scaling::parse_scaling_config(&sd).is_none()
+    {
+        eprintln!(
+            "KNOWN-RED H4 wire drift: completion_scaling on but regionSphereTargets is not \
+             client-parseable ({{name: frac}} vs {{play_region_id: int}}) -- see \
+             er-completion-scaling P1; flip this back to assert! with the wire fix"
+        );
     }
 
     // --- progressive tier table parses ---

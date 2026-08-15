@@ -137,9 +137,11 @@ mod replay {
 
     /// Replay a multi-connect timeline through the REAL [`process_received_item`], modelling the two
     /// watermarks and their persistence exactly as `net.rs` does:
+    ///
     ///   - `dispatched_through` is per-connect session state — reset to 0 by every `Connect`.
     ///   - `pushed_through` is backed by `persisted_index` (the on-disk `last_received_index`) — a
     ///     `Connect{persist_index:true}` resumes it, `false` loses it (resets to 0).
+    ///
     /// The persisted index advances whenever an item is genuinely granted (an `Enqueue`, and — as in
     /// `net.rs` — also on the skip-but-delivered outcomes, since the watermark tracks delivery). We
     /// mirror that by reading `pushed_through` back out of `process_received_item` after each item.

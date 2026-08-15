@@ -2732,7 +2732,7 @@ mod tests {
         );
         for f in [62010u32, 62011, 62012] {
             assert!(
-                off.flags.get(&f).is_none(),
+                !off.flags.contains_key(&f),
                 "reveal_all_maps OFF: world-map flag {f} not desired"
             );
         }
@@ -2760,7 +2760,7 @@ mod tests {
             ..Default::default()
         }));
         assert!(
-            unmet.flags.get(&9990).is_none(),
+            !unmet.flags.contains_key(&9990),
             "goal flag not desired until the goal is met"
         );
 
