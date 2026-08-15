@@ -128,17 +128,20 @@ jobs:
     # playtest no longer waits on one person's environment. The hash-matched-pair rule in
     # release/DISTRIBUTION.md still governs what may be handed to a PLAYER: this .dll is paired with
     # nothing, so the artifact name carries the sha and the retention is short on purpose.
-    # 🛑 `-p eldenring-archipelago`, NOT the whole workspace. A bare `cargo build --release` is RED
-    # on main, and has been: `-D warnings` (set in this file's env) plus `--release` turns
-    # `unused import: regex_macro::regex` into an error in `ds3-archipelago` and `sdt-archipelago`,
-    # because that import is only reachable from `debug_assert!` and release compiles it away. It is
-    # not a release-build bug in those crates -- ds3-release.yaml does not set `-D warnings`, so
-    # their pipeline only warns. It is this file's stricter env meeting a profile it had never been
-    # run under.
+    # 🛑 WORKSPACE-WIDE AGAIN as of 2026-08-15 (client#191). This step carried `-p
+    # eldenring-archipelago` for a knowing reason: a bare `cargo build --release` was RED, because
+    # `-D warnings` (set in this file's env) plus `--release` turned `unused import:
+    # regex_macro::regex` into an error in `ds3-archipelago` and `sdt-archipelago` -- the import is
+    # reached only from a `#[cfg(debug_assertions)]` arm and release compiles that away. Their own
+    # pipelines never saw it because ds3-release.yaml / sdt-release.yaml do not set `-D warnings`;
+    # it was this file's stricter env meeting a profile it had never been run under.
     #
-    # Fixing two other games' crates does not belong in a CI change, and `-p` sidesteps them
-    # entirely: they are siblings, not dependencies. Filed separately.
-    - run: cargo build --release -p eldenring-archipelago
+    # The import is now gated with the same cfg as its use site, so the deferral has nothing left to
+    # defer. Widening the step is the point: scoped to one crate, this gate could never have
+    # NOTICED the fix, and a release-only warning in a sibling crate would have gone on being
+    # invisible here forever. The .dll the artifact step uploads is unaffected -- a workspace
+    # release build still produces it.
+    - run: cargo build --release
 
     - uses: actions/upload-artifact@v4
       with:
