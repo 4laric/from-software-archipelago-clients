@@ -164,6 +164,16 @@ pub fn tick() {
         return; // not in-world: no main player, nothing to sample, no state to change
     };
     if er_logic::death_guard::lists_unsafe_to_touch(player.cur) {
+        // ⭐ KEEP THE READING THAT ENDED THE FIGHT (client#201). This early return used to discard
+        // it, and it is the ONLY reading in the whole fight taken after the damage that killed the
+        // player -- so `LAST_SEEN` kept the last pre-death sample and every lost fight closed on
+        // `player 414/414 (100%)` next to `outcome=PLAYER DOWN`. That pair was guaranteed by this
+        // return, not by anything the game memory did.
+        //
+        // 🛑 NO LIST IS WALKED HERE. `player` is already in hand -- it is the guard's own input --
+        // and the boss half of the pair is left exactly as it was, because this is precisely the
+        // tick `lists_unsafe_to_touch` exists to forbid walking the live sets on.
+        remember_death_reading(player);
         // 🛑 LATCH BEFORE RETURNING. This early return is the whole reason the fight length was
         // wrong: from here until the respawn the sampler is not ticked at all, so it never sees
         // the death and never sees the bar go down. One store turns that blind spot from a silent
@@ -257,6 +267,21 @@ fn set_last_seen(v: Option<(Hp, Hp)>) {
 
 fn take_last_seen() -> Option<(Hp, Hp)> {
     LAST_SEEN.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Replace the player half of the remembered pair with the death-tick reading (client#201).
+///
+/// Read-modify-write under ONE lock acquisition: the death tick races the END step that quotes the
+/// pair, and a peek-then-set would let a fight close on the reading this call is replacing.
+///
+/// A `None` slot stays `None`. That is [`er_logic::boss_fight_end_guard_replay::remember_on_death`]'s
+/// contract and it is the right one here: no fight in progress (the player died in the open world),
+/// or a fight whose boss was never once found in the live sets. Neither has a boss reading to pair
+/// this with, and `format_end` already has an honest line for the second.
+fn remember_death_reading(player: Hp) {
+    if let Ok(mut slot) = LAST_SEEN.lock() {
+        *slot = er_logic::boss_fight_end_guard_replay::remember_on_death(*slot, player);
+    }
 }
 
 /// Read, remember, and (usually) log one line.
