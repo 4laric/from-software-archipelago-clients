@@ -2826,9 +2826,9 @@ mod tests {
         // as the step between the two rungs. Over-reducing is a balance blemish; under-reducing
         // leaves the wall standing, which is the failure this phase exists to remove.
         let mut acted = 0;
-        for native in 0..NUM_TIERS {
-            for target in 0..native {
-                let want = SCALING_TIERS[target].attack / SCALING_TIERS[native].attack;
+        for (native, native_tier) in SCALING_TIERS.iter().enumerate().take(NUM_TIERS) {
+            for (target, target_tier) in SCALING_TIERS.iter().enumerate().take(native) {
+                let want = target_tier.attack / native_tier.attack;
                 let Some(state) = down_state_for(native, target) else {
                     continue;
                 };

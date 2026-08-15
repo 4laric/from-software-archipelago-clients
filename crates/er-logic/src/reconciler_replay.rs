@@ -210,7 +210,7 @@ mod replay {
         }
         for i in 0..k {
             permute(items, k - 1, f);
-            if k % 2 == 0 {
+            if k.is_multiple_of(2) {
                 items.swap(i, k - 1);
             } else {
                 items.swap(0, k - 1);

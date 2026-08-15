@@ -148,6 +148,13 @@ pub fn annotate(addr: usize) -> String {
 }
 
 #[cfg(test)]
+// 🛑 THE GROUPING IS THE POINT, so the lint is refused rather than obeyed here (client#198).
+// Every literal below is a fault address copied VERBATIM out of boblerrr's crash-2268.txt, and the
+// 4_4_3 split is what makes `0x2458_6050_000` readable as the same address as the raw
+// `0x2458604fff8` in the report. clippy's `0x0245_8605_0000` is the same number and breaks that
+// correspondence -- in the one module whose whole job is to be checked against a crash log by hand.
+// These grew a gate on 2026-08-15 when `--all-targets` first linted test code; they are not new.
+#[allow(clippy::unusual_byte_groupings)]
 mod tests {
     use super::*;
 

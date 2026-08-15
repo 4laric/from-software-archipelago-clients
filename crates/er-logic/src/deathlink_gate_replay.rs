@@ -126,10 +126,10 @@ mod replay {
             latch.kill_pending = true; // pre-fix: no gate, no dedup
             return;
         }
-        if should_apply_incoming_deathlink(enabled, *applied) {
-            if latch_incoming(latch, enabled) {
-                *applied = true;
-            }
+        // `&&` short-circuits exactly as the nesting did, so `latch_incoming`'s side effect is
+        // still reached only when the delivery-site decision says yes.
+        if should_apply_incoming_deathlink(enabled, *applied) && latch_incoming(latch, enabled) {
+            *applied = true;
         }
     }
 
