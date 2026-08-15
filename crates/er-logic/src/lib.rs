@@ -22,6 +22,7 @@ pub mod boss_fight_start_settle;
 pub mod boss_grants;
 pub mod boss_key_replay;
 pub mod capital;
+pub mod capital_guard;
 pub mod capital_replay;
 pub mod check_neutralise;
 pub mod client_features;
