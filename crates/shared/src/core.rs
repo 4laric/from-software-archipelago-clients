@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use std::{io, iter::ExactSizeIterator, mem};
+use std::{iter::ExactSizeIterator, mem};
 
 use anyhow::{Error, Result, bail};
 use archipelago_rs as ap;
@@ -260,20 +260,20 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
                 Error(err) if err.is_fatal() => {
                     let err = self.connection.as_ref().map(|c| c.err());
                     self.log(
+                        // client#181: the two socket-level kinds are OPPOSITE diagnoses and
+                        // used to share one sentence -- one that pointed at the URL, which this
+                        // arm has already excluded (the name resolved; the slot details were
+                        // never sent). See `connect_error` for the four rounds of triage that
+                        // cost.
                         if let Some(ap::Error::WebSocket(tungstenite::Error::Io(io))) = err
-                            && matches!(
-                                io.kind(),
-                                io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
-                            )
+                            && let Some(failure) = crate::connect_error::classify(io.kind())
                         {
                             vec![
                                 ap::RichText::Color {
-                                    text: "Connection refused. ".into(),
+                                    text: failure.headline().into(),
                                     color: ap::TextColor::Red,
                                 },
-                                "Make sure the server session is running and the URL is \
-                                 up-to-date."
-                                    .into(),
+                                failure.advice().into(),
                             ]
                         } else if state == ap::ConnectionStateType::Connected {
                             vec![
