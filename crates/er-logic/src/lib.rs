@@ -31,6 +31,7 @@ pub mod config_reload_replay;
 pub mod death_guard;
 pub mod deathlink;
 pub mod deathlink_gate_replay;
+pub mod downstate_watch;
 pub mod equip_load;
 pub mod esd_probe;
 pub mod fast_travel;
