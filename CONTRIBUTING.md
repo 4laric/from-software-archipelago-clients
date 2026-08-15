@@ -55,11 +55,56 @@ cross-compile (`--target x86_64-pc-windows-msvc` / `-gnu`) from another host.
 The DS3 and Sekiro DLLs build the same way from their crates.
 
 **CI** (`.github/workflows/test.yaml`) gates pushes to `main` and pull
-requests on a Windows runner: `cargo build`, then
-`cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago`,
-then `cargo fmt -- --check` and `cargo clippy -- -D warnings` (both hard
-gates, run after build/test so style failures never mask a broken build).
-Run all four locally before pushing.
+requests on a Windows runner.
+
+> 🛑 **That file is the source of truth for what runs, not this section.** The
+> list below has drifted from it three times: `shared` and `archipelago_rs`
+> were added to the test line, and a second `clippy` invocation and a release
+> build were added, while this paragraph still said "all four". Each drift told
+> a reader that a test ran when it did not. **When the answer matters, read the
+> workflow.** Nothing currently enforces that they agree -- see the PR that
+> rewrote this section for a sketch of the gate that would.
+
+As of 2026-08-15 the job runs, in this order:
+
+1. `cargo build` — debug, and deliberately first. Every step is fail-fast, so
+   **build and test run before style**: on this repo's first ever CI run a
+   `cargo fmt` failure skipped the build while three genuine compile errors sat
+   on `main`.
+2. `cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago
+   -p shared -p archipelago_rs` — **six** packages, not four. `shared` and
+   `archipelago_rs` each spent a period being built here but never tested,
+   which means their suites ran nowhere at all.
+3. `cargo fmt -- --check`
+4. `cargo clippy -- -D warnings` **and**
+   `cargo clippy --features=profile -- -D warnings` — **two** invocations. A
+   change that is clean under default features can still fail the `profile`
+   pass.
+5. `cargo build --release -p eldenring-archipelago`, uploaded as a downloadable
+   artifact. Scoped to that one package on purpose: a bare workspace release
+   build is red under `-D warnings`.
+
+Two things that make a local run differ from CI, and both are silent:
+
+* **`RUSTFLAGS: -Dwarnings` is set for the whole job.** A local `cargo build`
+  without it is not the same gate — warnings you never see are errors there.
+* **The toolchain is `nightly`**, pinned in `rust-toolchain.toml` and installed
+  explicitly by the workflow. Use nightly `rustfmt`, or `cargo fmt -- --check`
+  will disagree with CI over files it has no opinion about locally.
+
+Run the whole thing before pushing:
+
+```
+export RUSTFLAGS=-Dwarnings
+cargo build
+cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago -p shared -p archipelago_rs
+cargo fmt -- --check
+cargo clippy -- -D warnings
+cargo clippy --features=profile -- -D warnings
+```
+
+`cargo test -p er-logic` alone remains the cheap gate to run while you work;
+the block above is the one that has to pass before you push.
 
 ## Running your local Elden Ring client
 
