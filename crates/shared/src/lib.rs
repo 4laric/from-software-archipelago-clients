@@ -12,6 +12,7 @@ use windows::core::*;
 
 mod clipboard;
 mod config;
+mod connect_error;
 mod core;
 mod crash_handler;
 mod error_display;
