@@ -93,8 +93,9 @@
 //!
 //! Any of the three is a result. Attach the log to #346.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, FieldInsHandle, WorldChrMan};
 use fromsoftware_shared::FromStatic;
@@ -143,6 +144,20 @@ struct Watch {
     subject: FieldInsHandle,
     frames: u32,
     dumps: u32,
+}
+
+/// Ticks since the probe row was REMOVED from the player, `u32::MAX` = not removed yet
+/// (client#183). The restore half used to get no reads at all.
+static PLAYER_REMOVED_FRAMES: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Wall clock at the apply, so read labels can carry MEASURED milliseconds. ⚠️ The old label was
+/// `frames / 60`, which assumed 60fps; the log's own timestamps say those reads are ~2s apart, so
+/// `+4s` was out by ~1.75x -- on the one number this probe exists to produce.
+static PLAYER_APPLIED_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    static CLOCK: OnceLock<Instant> = OnceLock::new();
+    CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// Re-read the subject every this many ticks (~1s at 60fps) ...
@@ -293,6 +308,7 @@ fn player_tick() {
             return;
         }
         chr.apply_speffect(PLAYER_PROBE_ROW, false);
+        PLAYER_APPLIED_MS.store(now_ms(), Ordering::Relaxed);
         log::info!("[downstate-probe] applied {PLAYER_PROBE_ROW} to the PLAYER");
         dump(
             chr,
@@ -307,22 +323,45 @@ fn player_tick() {
     }
 
     let frames = PLAYER_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    if !frames.is_multiple_of(WATCH_INTERVAL) {
-        return;
+    let removed = match PLAYER_REMOVED_FRAMES.load(Ordering::Relaxed) {
+        u32::MAX => None,
+        n => {
+            PLAYER_REMOVED_FRAMES.store(n + 1, Ordering::Relaxed);
+            Some(n + 1)
+        }
+    };
+    let elapsed = now_ms().saturating_sub(PLAYER_APPLIED_MS.load(Ordering::Relaxed));
+    match er_logic::downstate_watch::step(frames, removed, WATCH_INTERVAL, WATCH_DUMPS) {
+        er_logic::downstate_watch::Step::Wait => {}
+        er_logic::downstate_watch::Step::Read { index, phase } => {
+            dump(
+                chr,
+                &format!(
+                    "{} (player)",
+                    er_logic::downstate_watch::read_label(index, phase, elapsed)
+                ),
+            );
+        }
+        er_logic::downstate_watch::Step::Remove => {
+            // 🛑 RESTORE IS MANDATORY, not politeness. `PLAYER_PROBE_ROW` is `effectEndurance -1`,
+            // so without this the player carries 0.25x max HP for the rest of the session. It fires
+            // on exactly the tick it always did -- what changed is that it no longer ENDS the probe.
+            dump(chr, "WATCH final read, before the removal (player)");
+            chr.remove_speffect(PLAYER_PROBE_ROW);
+            PLAYER_REMOVED_FRAMES.store(0, Ordering::Relaxed);
+            log::info!(
+                "[downstate-probe] removed {PLAYER_PROBE_ROW} from the player -- now watching the \
+                 RESTORE for {WATCH_DUMPS} reads at {WATCH_INTERVAL}-tick intervals (client#183: \
+                 the old probe dumped RESTORED on this same tick, inside the window it had just \
+                 proved was too early, so it never witnessed max HP come back)"
+            );
+        }
+        er_logic::downstate_watch::Step::Latch => {
+            dump(chr, "RESTORED (player, after a symmetric watch)");
+            DONE.store(true, Ordering::Relaxed);
+            log::info!("[downstate-probe] player watch complete -- latched for this session");
+        }
     }
-    let dumps = frames / WATCH_INTERVAL;
-    dump(chr, &format!("WATCH +{dumps}s (player)"));
-    if dumps < WATCH_DUMPS {
-        return;
-    }
-
-    // 🛑 RESTORE IS MANDATORY, not politeness. `PLAYER_PROBE_ROW` is `effectEndurance -1`, so
-    // without this the player carries 0.25x max HP for the rest of the session.
-    chr.remove_speffect(PLAYER_PROBE_ROW);
-    log::info!("[downstate-probe] removed {PLAYER_PROBE_ROW} from the player");
-    dump(chr, "RESTORED (player)");
-    DONE.store(true, Ordering::Relaxed);
-    log::info!("[downstate-probe] player watch complete -- latched for this session");
 }
 
 /// Per-tick entry point. Call from `update_live` while in-world; self-latching and env-gated.
