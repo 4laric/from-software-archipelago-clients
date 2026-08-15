@@ -4176,7 +4176,11 @@ impl Core {
         // HintSet inserts have to wait until the scan ends.
         let mut new_hints: Vec<HintEntry> = Vec::new();
         for (print, _) in self.base().logs().skip(start) {
-            let ap::Print::Hint { item, .. } = print else {
+            // ⭐ `found` HAS BEEN ON THE WIRE ALL ALONG (client#221). archipelago-rs parses it into
+            // `Print::Hint` and this loop dropped it, so a collected hint was indistinguishable
+            // from a live one and the panel header counted both -- bobler's screenshot read
+            // `Hints (9)` with checked locations in the list.
+            let ap::Print::Hint { item, found, .. } = print else {
                 continue;
             };
             let location_id = item.location().id() as u64;
@@ -4194,6 +4198,7 @@ impl Core {
                 item_name: item.item().name().to_string(),
                 other_player: other.name().to_string(),
                 for_us,
+                found: *found,
             });
         }
         self.hint_log_watermark = log_len;
@@ -4986,7 +4991,14 @@ impl Core {
 
                 // (d) Standing hints.
                 if ui.collapsing_header(
-                    format!("Hints ({})###trk-hints", hint_list.len()),
+                    // 🛑 OUTSTANDING, NOT len() (client#221). This number is what a player reads
+                    // as "how much is still out there", so it has to mean that. The LIST below
+                    // still draws every hint -- a found one records where something was, which is
+                    // worth keeping when reconstructing a run.
+                    format!(
+                        "Hints ({})###trk-hints",
+                        hint_list.iter().filter(|h| !h.found).count()
+                    ),
                     imgui::TreeNodeFlags::empty(),
                 ) {
                     if hint_list.is_empty() {
@@ -4998,10 +5010,16 @@ impl Core {
                         } else {
                             format!("hinted by {}", h.other_player)
                         };
-                        ui.text_colored(
-                            HINT_YELLOW,
-                            format!("  {} @ {} ({who})", h.item_name, display_loc(h.location_id)),
-                        );
+                        let line =
+                            format!("  {} @ {} ({who})", h.item_name, display_loc(h.location_id));
+                        // Found hints stay legible and stop competing for attention. `is_empty()`
+                        // above is deliberately unchanged: an all-found set is NOT empty, so it
+                        // must never print "  none yet" -- it prints `Hints (0)` over a dimmed list.
+                        if h.found {
+                            ui.text_disabled(line);
+                        } else {
+                            ui.text_colored(HINT_YELLOW, line);
+                        }
                     }
                 }
             });

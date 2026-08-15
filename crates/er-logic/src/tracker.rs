@@ -57,6 +57,18 @@ pub struct HintEntry {
     /// True when the hinted item is FOR us (someone else holds our check); false when the hint asks
     /// US to go get someone else's item.
     pub for_us: bool,
+    /// The server's `found` flag: the hinted location has been collected (client#221).
+    ///
+    /// 🛑 PARSED FOR MONTHS AND THROWN AWAY. `archipelago-rs` reads it off the wire
+    /// (`data/print.rs`, `Print::Hint { found, .. }`) and this struct had nowhere to put it, so a
+    /// hint that had been found was indistinguishable from a live one -- and the panel header,
+    /// which a player reads as "how much is still outstanding", counted both. bobler's screenshot
+    /// said `Hints (9)` with collected locations in the list.
+    ///
+    /// ⭐ THE DEDUP ALREADY DOES THE HARD PART. `insert` overwrites on re-insert (latest wins), so
+    /// a later `found: true` for the same location replaces the earlier `found: false` with no
+    /// change to the set's semantics. The only reason that did not work was this missing field.
+    pub found: bool,
 }
 
 /// Standing hint set, deduplicated by location id. Rebuilt each session from replay-on-connect.
@@ -92,6 +104,20 @@ impl HintSet {
 
     pub fn is_empty(&self) -> bool {
         self.by_location.is_empty()
+    }
+
+    /// Hints still worth acting on: the ones the server has NOT marked found (client#221).
+    ///
+    /// This is the number the Hints header shows. The header is what a player reads as "how much
+    /// is still outstanding", so it has to mean that; [`Self::len`] stays the size of the record,
+    /// which is what the list draws.
+    ///
+    /// 🛑 DELIBERATELY NOT A FILTER ON [`Self::iter`] OR [`Self::is_hinted`]. `is_hinted` feeds the
+    /// checks tree's hinted marking, and a checked location's marking is a different question --
+    /// changing both at once would make a regression in the tree impossible to attribute (the
+    /// ruling on #221 says so explicitly).
+    pub fn outstanding(&self) -> usize {
+        self.by_location.values().filter(|h| !h.found).count()
     }
 }
 
@@ -266,12 +292,111 @@ mod tests {
     }
 
     fn hint(location_id: u64, item: &str, player: &str, for_us: bool) -> HintEntry {
+        hint_found(location_id, item, player, for_us, false)
+    }
+
+    /// The same, with the server's `found` flag (client#221).
+    fn hint_found(
+        location_id: u64,
+        item: &str,
+        player: &str,
+        for_us: bool,
+        found: bool,
+    ) -> HintEntry {
         HintEntry {
+            found,
             location_id,
             item_name: item.to_string(),
             other_player: player.to_string(),
             for_us,
         }
+    }
+
+    /// ⭐ THE RED-FIRST ASSERTION (client#221). bobler's panel read `Hints (9)` with collected
+    /// locations still counted. The header must count only what is still outstanding.
+    #[test]
+    fn a_found_hint_stops_counting_but_stays_in_the_record() {
+        let mut hints = HintSet::new();
+        hints.insert(hint(10, "Godrick's Great Rune", "bobler", true));
+        hints.insert(hint(11, "Bolt of Gransax", "boblerflips", false));
+        assert_eq!(hints.outstanding(), 2, "both live to start with");
+
+        // The server streams the same location again with `found: true` once it is collected.
+        hints.insert(hint_found(
+            11,
+            "Bolt of Gransax",
+            "boblerflips",
+            false,
+            true,
+        ));
+
+        assert_eq!(hints.outstanding(), 1, "the found one stops counting");
+        assert_eq!(hints.len(), 2, "...and stays in the record, per the ruling");
+    }
+
+    /// 🛑 THE ALL-FOUND SET IS NOT AN EMPTY SET. The panel prints "  none yet" on `is_empty()`, and
+    /// a list of nine dimmed found hints reading "none yet" is exactly the kind of thing that ships
+    /// looking fine because nobody had nine found hints while testing.
+    #[test]
+    fn an_all_found_set_reads_zero_but_is_not_empty() {
+        let mut hints = HintSet::new();
+        hints.insert(hint_found(10, "A", "p", true, true));
+        hints.insert(hint_found(11, "B", "p", false, true));
+        assert_eq!(hints.outstanding(), 0, "the header reads Hints (0)");
+        assert!(
+            !hints.is_empty(),
+            "but the list is NOT empty -- no 'none yet'"
+        );
+        assert_eq!(hints.len(), 2);
+    }
+
+    /// 🛑 `is_hinted` IS DELIBERATELY UNCHANGED. It feeds the checks tree's hinted marking, and a
+    /// checked location's marking is a different question; the ruling says not to move both at
+    /// once, so that a tree regression stays attributable.
+    #[test]
+    fn found_does_not_change_is_hinted() {
+        let mut hints = HintSet::new();
+        hints.insert(hint_found(10, "A", "p", true, true));
+        assert!(
+            hints.is_hinted(10),
+            "a found hint is still a hint as far as the checks tree is concerned"
+        );
+    }
+
+    /// Reconnect: the server replays relevant hints INCLUDING found ones, so a restart must bring
+    /// it back dimmed and uncounted rather than as a fresh live hint. The dedup already does this;
+    /// this pins that the `found` flag survives the replay path.
+    #[test]
+    fn connect_replay_reinserts_a_found_hint_as_found() {
+        let mut hints = HintSet::new();
+        hints.insert(hint_found(10, "A", "p", true, true));
+        // Replay: same location, same metadata, arriving again.
+        assert!(
+            !hints.insert(hint_found(10, "A", "p", true, true)),
+            "a re-insert is not a new hint"
+        );
+        assert_eq!(hints.outstanding(), 0, "still uncounted after replay");
+        assert_eq!(hints.len(), 1, "and not duplicated");
+    }
+
+    /// ⚠️ AND THE FLAG CAN GO BACK. Nothing in the protocol promises `found` is monotonic, and the
+    /// set is latest-wins by construction -- so a later `found: false` must restore the count
+    /// rather than being quietly ignored.
+    #[test]
+    fn latest_wins_in_both_directions() {
+        let mut hints = HintSet::new();
+        hints.insert(hint_found(10, "A", "p", true, true));
+        assert_eq!(hints.outstanding(), 0);
+        hints.insert(hint_found(10, "A", "p", true, false));
+        assert_eq!(hints.outstanding(), 1, "latest wins, both ways");
+    }
+
+    /// An empty set is still empty, and still reads zero -- the ordinary case must not regress.
+    #[test]
+    fn an_empty_set_is_still_empty() {
+        let hints = HintSet::new();
+        assert_eq!(hints.outstanding(), 0);
+        assert!(hints.is_empty());
     }
 
     #[test]
