@@ -1631,7 +1631,21 @@ impl shared::Core for Core {
                 self.flag_poll = Some(fp);
                 self.start = Some(start);
                 self.scout = Some(scout);
+                // ⭐ AND SAY IT WHERE THE PLAYER IS LOOKING (world#656). The rune NAMES have been
+                // in slot_data and in `goal::parse`'s log line for months; AHHHREPTAR still had to
+                // read the spoiler to learn why four Great Runes ended nothing, because the log is
+                // the artifact we get AFTER a report and he was looking at the game. Same data, on
+                // the channel the player actually reads.
+                //
+                // 🛑 HERE, NOT AT THE PARSE SITE. `self.log` needs `&mut self` and the parse runs
+                // inside `self.client().map(|client| ..)`, which already holds `self` borrowed
+                // (E0500). This is the first point after that closure where the goal config exists
+                // and `self` is free.
+                let goal_banner = crate::goal::describe_required_items(&goal_cfg);
                 self.goal = Some(goal_cfg);
+                if let Some(line) = goal_banner {
+                    self.log(ap::Print::message(line));
+                }
                 log::info!(
                     "slot_data parsed: {} boss-lock def(s) (mode A Felled trophies)",
                     boss_defs.len()

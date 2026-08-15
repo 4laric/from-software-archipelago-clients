@@ -245,6 +245,15 @@ pub fn is_met(
         && cfg.item_goals.iter().all(|n| has_item(n))
 }
 
+/// The goal's ITEM requirement, as one line for the player-visible channel (world#656).
+///
+/// Thin wrapper: the sentence itself lives in [`er_logic::goal_text::required_items_line`] so it is
+/// host-tested rather than gated behind a Windows-only build. `None` when the goal needs no items,
+/// so a region_locks seed gains no banner line.
+pub fn describe_required_items(cfg: &GoalConfig) -> Option<String> {
+    er_logic::goal_text::required_items_line(&cfg.item_goals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
