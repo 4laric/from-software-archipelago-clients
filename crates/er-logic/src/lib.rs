@@ -67,6 +67,7 @@ pub mod reconciler_replay;
 pub mod region_lock;
 pub mod region_lock_replay;
 pub mod region_locks;
+pub mod rescale_watch;
 pub mod rune_log;
 pub mod safe_speffect_rows;
 pub mod save_state;
