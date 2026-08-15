@@ -79,15 +79,33 @@ pub fn maybe_apply() -> u32 {
         Ok(r) => r,
         Err(_) => return 0, // repo not ready; try again next tick
     };
-    let mut changed = 0u32;
+    // 🛑 COUNT THE WALK, NOT JUST THE CHANGES (client#139 audit). `rows_mut` yields nothing when
+    // the param table is up but not yet populated, and this function used to latch APPLIED anyway
+    // -- so a pass that walked ZERO rows marked itself done and the clamp never ran again for the
+    // session, logging a cheerful `clamped 0`. `shop_flags` states the rule this broke ("if the
+    // clamp could not run, RETRY -- never latch DONE over it") and `spell_slot_length` guards it
+    // with an explicit `rows == 0` return. This one did neither.
+    let mut tally = er_logic::applied_tally::AppliedTally::new();
     for (id, row) in repo.rows_mut::<EquipMtrlSetParam>() {
-        changed += flatten_row(id, row, cap);
+        tally.walked += 1;
+        let n = flatten_row(id, row, cap);
+        if n > 0 {
+            tally.changed += n;
+        } else {
+            tally.already += 1;
+        }
+    }
+    if !tally.ran() {
+        log::info!("{}", tally.summary("flatten_regular_upgrades"));
+        return 0; // NOT latched -- retried next tick
     }
     APPLIED.store(cap, Ordering::SeqCst);
     log::info!(
-        "flatten_regular_upgrades: === clamped {changed} regular-stone material slot(s) to {cap} ==="
+        "flatten_regular_upgrades: clamped {} regular-stone material slot(s) to {cap} ({})",
+        tally.changed,
+        tally.summary("rows")
     );
-    changed
+    tally.changed
 }
 
 fn flatten_row(id: u32, row: &mut EQUIP_MTRL_SET_PARAM_ST, cap: i32) -> u32 {
