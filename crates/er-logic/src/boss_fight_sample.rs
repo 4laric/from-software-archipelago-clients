@@ -399,8 +399,21 @@ pub fn format_end(
         // observation than one that ended at a known HP, and the line has to be able to say so.
         None => "last unread (the boss was never found in the live sets)".to_string(),
     };
+    // 🛑 THE LINE CHECKS ITSELF (client#201). The outcome and the HP pair come from two
+    // independent signals -- the death-guard latch and the last remembered reading -- and until
+    // this call nothing compared them, so `PLAYER DOWN ... player 414/414 (100%)` printed as an
+    // ordinary result 113 samples running. The verdict is appended to the line rather than logged
+    // beside it because the failure mode is a line that READS like a measurement: a reader who
+    // greps one END line has to see the fault on the line they got.
+    let fault = match crate::boss_fight_end_guard_replay::end_instrument_fault(outcome, last) {
+        Some(reason) => format!(
+            " -- {}: {reason}",
+            crate::boss_fight_end_guard_replay::INSTRUMENT_FAULT
+        ),
+        None => String::new(),
+    };
     format!(
-        "boss-fight END: npc_param {npc_param_id} outcome={} t={}s unseen={}s {tail}",
+        "boss-fight END: npc_param {npc_param_id} outcome={} t={}s unseen={}s {tail}{fault}",
         outcome.label(),
         secs(elapsed_ms),
         secs(unseen_ms),

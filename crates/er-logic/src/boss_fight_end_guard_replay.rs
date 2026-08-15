@@ -225,7 +225,10 @@ mod replay {
             Hp::new(-77, 414),
         );
         let (_, player) = remembered.unwrap();
-        assert_eq!(player.cur, -77, "the raw reading is not rounded on the way in");
+        assert_eq!(
+            player.cur, -77,
+            "the raw reading is not rounded on the way in"
+        );
         assert_eq!(player.pct(), 0);
         assert_eq!(
             end_instrument_fault(Outcome::PlayerDown, remembered),
