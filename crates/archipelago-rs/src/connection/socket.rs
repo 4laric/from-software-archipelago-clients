@@ -71,7 +71,7 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
         async_stream.writable().await?;
         let maybe_tls_stream = match tungstenite::client::uri_mode(request.uri())? {
             Mode::Plain => {
-                debug!("Upgrading to WebSocket...");
+                info!("Upgrading to WebSocket...");
                 MaybeTlsStream::Plain(stream)
             }
             #[cfg(any(feature = "rustls", feature = "native-tls"))]
@@ -85,24 +85,24 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
             .await
             {
                 Ok(stream) => {
-                    debug!("Upgrading to WebSocket...");
+                    info!("Upgrading to WebSocket...");
                     stream
                 }
                 Err(Error::WebSocket(tungstenite::Error::Tls(err))) => {
-                    debug!(
+                    info!(
                         "Upgrading to TLS failed: {err}\n\
                              Attempting plain TCP connection..."
                     );
                     let (stream, async_stream_) = Self::connect_tcp(&domain, port).await?;
                     async_stream = async_stream_;
-                    debug!("Upgrading to WebSocket...");
+                    info!("Upgrading to WebSocket...");
                     MaybeTlsStream::Plain(stream)
                 }
                 Err(err) => return Err(err),
             },
             #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
             Mode::Tls => {
-                debug!("No TLS features are enabled, upgrading to unencrypted WebSocket...");
+                info!("No TLS features are enabled, upgrading to unencrypted WebSocket...");
                 MaybeTlsStream::Plain(stream)
             }
         };
@@ -111,7 +111,7 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
         loop {
             match handshake.handshake() {
                 Ok((inner, response)) => {
-                    debug!(
+                    info!(
                         "WebSocket response: {}\n{:?}",
                         response.status(),
                         response.headers()
@@ -141,7 +141,7 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
         domain: &str,
         port: u16,
     ) -> Result<(SyncTcpStream, Arc<Async<SyncTcpStream>>), Error> {
-        debug!("Establishing TCP connection to {domain}:{port}...");
+        info!("Establishing TCP connection to {domain}:{port}...");
         let stream = match AsyncTcpStream::connect(format!("{domain}:{port}")).await {
             Ok(stream) => stream,
             Err(err) => {
@@ -180,7 +180,7 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
         async_stream.writable().await?;
         #[cfg(feature = "rustls")]
         {
-            debug!("Upgrading to TLS using rustls...");
+            info!("Upgrading to TLS using rustls...");
             match Self::try_rust_tls(async_stream, &mut stream, domain, rustls_config).await {
                 Ok(conn) => {
                     return Ok(MaybeTlsStream::Rustls(rustls::StreamOwned::new(
@@ -189,7 +189,7 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
                 }
                 #[cfg(feature = "native-tls")]
                 Err(Error::WebSocket(tungstenite::Error::Tls(err))) => {
-                    debug!(
+                    info!(
                         "Upgrading to TLS using rustls failed: {err}\n\
                          Falling back to native-tls..."
                     );
@@ -200,7 +200,7 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
 
         #[cfg(feature = "native-tls")]
         {
-            debug!("Upgrading to TLS using native-tls...");
+            info!("Upgrading to TLS using native-tls...");
             Self::try_native_tls(async_stream, stream, domain)
                 .await
                 .map(MaybeTlsStream::NativeTls)
@@ -257,14 +257,14 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
         stream: SyncTcpStream,
         domain: &str,
     ) -> Result<TlsStream<SyncTcpStream>, Error> {
-        info!("Using nativels!");
+        info!("Upgrading to TLS using native-tls (rustls unavailable or declined).");
         let connector = TlsConnector::new()
             .map_err(|e| tungstenite::Error::Tls(TlsError::Native(Box::new(e))))?;
         let mut handshake = connector.connect(domain, stream);
         loop {
             match handshake {
                 Ok(socket) => {
-                    debug!("Upgrading to WebSocket...");
+                    info!("Upgrading to WebSocket...");
                     return Ok(socket);
                 }
                 Err(TlsHandshakeError::Failure(err)) => {
