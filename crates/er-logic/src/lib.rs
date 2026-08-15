@@ -53,6 +53,7 @@ pub mod native_tiers;
 pub mod options;
 pub mod ownership;
 pub mod physick;
+pub mod pot_cap_tally;
 pub mod progressive;
 pub mod receive;
 pub mod receive_probe;

@@ -314,7 +314,25 @@ pub fn on_world_edge() -> u64 {
     log::info!(
         "inventory-ptr: retired at world edge (epoch {e}) -- re-priming before the next grant"
     );
+    flush_pot_cap_tally(e);
     e
+}
+
+/// Report and reset the capped-grant counters (world#692).
+///
+/// The world edge is where the number is both stable and meaningful: the cap frees up as the player
+/// consumes pots, so this boundary is also the one any future RETRY would run at. A quiet edge logs
+/// nothing -- which is what makes a line that does appear worth reading.
+///
+/// 🛑 WARN, NOT INFO. Every item in this line is an AP delivery the watermark has already advanced
+/// past; it is the one place the loss is stated as a total rather than as a single example.
+fn flush_pot_cap_tally(epoch: u64) {
+    let Ok(mut tally) = POT_CAP_TALLY.lock() else {
+        return;
+    };
+    if let Some(line) = tally.flush() {
+        log::warn!("{line} [epoch {epoch}]");
+    }
 }
 
 /// Called from the LuaWarp detour the moment ANY warp (menu or client) is REQUESTED -- the
@@ -425,7 +443,22 @@ fn count_held_goods_row(row: i32) -> Option<i32> {
 /// re-checks on the next pot grant).
 /// One announce-bit per `POT_DELIVERY_CAPS` row, so a capped pot says so ONCE per session instead of
 /// once per grant or never.
+///
+/// 🛑 STILL ONE-SHOT, AND STILL THE RIGHT SHAPE FOR THIS LINE. The WARN carries the full
+/// explanation of the failure mode; repeating that paragraph twice a second would be the noise it
+/// was added to suppress. What it must no longer do is stand in for a COUNT -- see [`POT_CAP_TALLY`].
 static POT_CAP_ANNOUNCED: AtomicU32 = AtomicU32::new(0);
+
+/// Every capped grant since the last world edge, per row (world#692).
+///
+/// ⭐ THE ANNOUNCE-BIT ABOVE IS NOT A MEASUREMENT AND NEVER WAS. Its own WARN says so out loud --
+/// "Further caps on this row are silent" -- so bobler's 2026-08-15 log records exactly one cap on
+/// `0x40002526` and cannot say whether that was the only one or the first of fifty. #692 asks
+/// whether a capped grant should be retried at the next world edge or dropped without an ack, and
+/// those are opposite answers for a one-off and for a steady drip. This tally is what lets the next
+/// log tell them apart.
+static POT_CAP_TALLY: Mutex<er_logic::pot_cap_tally::PotCapTally> =
+    Mutex::new(er_logic::pot_cap_tally::PotCapTally::new());
 
 fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
     // `position` + index, NOT `enumerate().find(|(_, &(id, _))| ..)`: the latter mixes an explicit
@@ -448,6 +481,11 @@ fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
             // 🛑 A seed that hands out MORE start pots than the cap can never deliver the remainder;
             // this line is how that becomes visible instead of silent.
             if allowed < qty {
+                // 🛑 COUNT FIRST, ANNOUNCE SECOND, and never inside the announce branch: the whole
+                // defect in #692 is a number that only ever incremented on the tick a bit flipped.
+                if let Ok(mut tally) = POT_CAP_TALLY.lock() {
+                    tally.record(full_id, qty, allowed);
+                }
                 let bit = 1u32 << idx;
                 if (POT_CAP_ANNOUNCED.fetch_or(bit, Ordering::Relaxed) & bit) == 0 {
                     log::warn!(
