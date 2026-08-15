@@ -56,6 +56,13 @@ pub struct CapitalConfig {
     /// armor rows release on 9116 itself; re-keyed to 118 so the OFF-default cannot de-stock
     /// them). `capitalReleaseRows`.
     pub release_rows: Vec<(u32, u32, u32)>,
+    /// The vanilla world-burn flag (300), used ONLY to corroborate an ON write inferred from the
+    /// player's position (client#200). `capitalWorldBurnFlag`.
+    ///
+    /// 🛑 OPTIONAL, AND ITS ABSENCE CHANGES NOTHING. It was emitted in slot_data long before
+    /// anything read it; a seed from an apworld that omits it keeps exactly the behaviour it
+    /// shipped with. See `capital_guard::decide_from_position`.
+    pub world_burn_flag: Option<u32>,
 }
 
 /// Parse the capital keys out of slot_data. `None` = INERT (option off / old apworld / a
@@ -88,11 +95,19 @@ pub fn parse(sd: &Value) -> Option<CapitalConfig> {
                 .collect()
         })
         .unwrap_or_default();
+    // Optional, and NOT part of the `return None` validation above: a missing corroborator must
+    // leave the reconciler configured and working, not switch it off.
+    let world_burn_flag = sd
+        .get("capitalWorldBurnFlag")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .filter(|&f| f != 0);
     Some(CapitalConfig {
         burn_flag,
         burn_done_flag,
         sets: CapitalSets { ashen, royal },
         release_rows,
+        world_burn_flag,
     })
 }
 
@@ -163,13 +178,13 @@ pub fn capital_flag_state_for_warp_target(sets: &CapitalSets, target: u32) -> Op
 /// reconciler never toggles gratuitously). The caller re-applies every tick until the readback
 /// matches; no latch, no cursor.
 pub fn reconcile_write(burn_done: bool, desired: Option<bool>, current: bool) -> Option<bool> {
-    if !burn_done {
-        return None; // pre-burn / mid-burn: INERT by design (the arming gate)
-    }
-    match desired {
-        Some(want) if want != current => Some(want),
-        _ => None,
-    }
+    // 🛑 ONE DECISION, NOT A DRIFTING TWIN (client#200). This is now a projection of
+    // `capital_guard::decide`, which returns the same answer plus the REASON when it declines.
+    // Three different declines -- not armed, unresolvable, already correct -- used to collapse into
+    // one `None` here, and both call sites only log inside `if let Some(w)`; that is why 66 warps
+    // in bobler's 2026-08-15 log produced no evidence at all. Callers that only need the value keep
+    // this signature byte for byte.
+    crate::capital_guard::decide(burn_done, desired, current).write()
 }
 
 #[cfg(test)]

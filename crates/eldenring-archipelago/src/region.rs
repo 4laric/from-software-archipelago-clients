@@ -850,6 +850,15 @@ static CAPITAL: Mutex<Option<er_logic::capital::CapitalConfig>> = Mutex::new(Non
 /// reads set in a session (re-armed on each configure).
 static CAPITAL_ARMED_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// States a per-tick decline once per CHANGE, not once per tick (client#200).
+///
+/// The latch runs every frame and the answer is `AlreadyCorrect` almost always -- bobler's whole
+/// 2026-08-15 log is that case, 66 warps' worth, and it produced no evidence because nothing
+/// logged it. A transition is the event worth a line; `ContradictedOn` appearing at all is the
+/// event this exists for.
+static CAPITAL_DECLINE: Mutex<er_logic::capital_guard::DeclineLatch> =
+    Mutex::new(er_logic::capital_guard::DeclineLatch::new());
+
 /// Called by core.rs once slot_data is parsed (beside `region::parse`). The five `capital*`
 /// keys travel together; absent keys are the off-wire (`capital_reconciler: false`, or an
 /// apworld that predates the feature) -- the client logs INERT and never touches 9116.
@@ -922,20 +931,56 @@ pub fn tick_capital() {
                 .and_then(|pr| er_logic::capital::capital_flag_state(&cfg.sets, pr))
         });
     let current = flags::get_event_flag(cfg.burn_flag);
-    if let Some(w) = er_logic::capital::reconcile_write(armed, desired, current) {
-        let _ = flags::try_set_event_flag(cfg.burn_flag, w);
-        let stuck = flags::get_event_flag(cfg.burn_flag) == w;
-        log::info!(
-            "capital reconcile: flag {} -> {} (play_region {:?}); readback {}",
-            cfg.burn_flag,
-            if w { "ON" } else { "OFF" },
-            flags::play_region_id(),
-            if stuck {
-                "STUCK"
-            } else {
-                "PENDING -- re-applying next tick"
+    // ⭐ THE CORROBORATOR (client#200). Read only to justify an ON inferred from POSITION; `None`
+    // when the apworld does not emit the key, which leaves behaviour exactly as it shipped.
+    let world_burnt = cfg.world_burn_flag.map(flags::get_event_flag);
+    let decision =
+        er_logic::capital_guard::decide_from_position(armed, desired, current, world_burnt);
+    match decision {
+        er_logic::capital_guard::Decision::Write(w) => {
+            if let Ok(mut l) = CAPITAL_DECLINE.lock() {
+                l.on_write();
             }
-        );
+            let _ = flags::try_set_event_flag(cfg.burn_flag, w);
+            let stuck = flags::get_event_flag(cfg.burn_flag) == w;
+            log::info!(
+                // `readback STUCK` means the write TOOK -- readback == what was written. It has
+                // been read as "jammed" at least once, in triage, on this exact line, so the line
+                // now says which it means.
+                "capital reconcile: flag {} -> {} (play_region {:?}, world-burn {:?}); readback                  {}",
+                cfg.burn_flag,
+                if w { "ON" } else { "OFF" },
+                flags::play_region_id(),
+                world_burnt,
+                if stuck {
+                    "STUCK (the write took)"
+                } else {
+                    "PENDING (the write was lost) -- re-applying next tick"
+                }
+            );
+        }
+        er_logic::capital_guard::Decision::Declined(d) => {
+            let admitted = CAPITAL_DECLINE.lock().ok().and_then(|mut l| l.admit(d));
+            if let Some(d) = admitted {
+                // 🛑 The refusal is a WARN and everything else is INFO: a contradiction between
+                // where the player is standing and what the world-burn flag says is the thing
+                // #200 exists to surface, and it must not read like routine chatter.
+                if d == er_logic::capital_guard::Decline::ContradictedOn {
+                    log::warn!(
+                        "capital reconcile: NO WRITE (play_region {:?}, world-burn {:?}) -- {}",
+                        flags::play_region_id(),
+                        world_burnt,
+                        d.reason()
+                    );
+                } else {
+                    log::info!(
+                        "capital reconcile: no write (play_region {:?}) -- {}",
+                        flags::play_region_id(),
+                        d.reason()
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -951,19 +996,36 @@ pub fn capital_warp_intercept(grace_entity_id: u32) {
     let armed = flags::get_event_flag(cfg.burn_done_flag);
     let desired = er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, grace_entity_id);
     let current = flags::get_event_flag(cfg.burn_flag);
-    if let Some(w) = er_logic::capital::reconcile_write(armed, desired, current) {
-        let _ = flags::try_set_event_flag(cfg.burn_flag, w);
-        let stuck = flags::get_event_flag(cfg.burn_flag) == w;
-        log::info!(
-            "capital warp intercept: target {grace_entity_id} -> flag {} {}; readback {}",
-            cfg.burn_flag,
-            if w { "ON" } else { "OFF" },
-            if stuck {
-                "STUCK"
-            } else {
-                "PENDING -- the per-tick latch converges after the load"
-            }
-        );
+    // 🛑 `decide`, NOT `decide_from_position`: a warp TARGET is explicit player intent, chosen
+    // before the load, and setting 9116 ON from one is exactly what this seam is for. The finale
+    // must still work. Only the per-tick latch, which infers from where the player ended up, has
+    // to justify an ON (client#200).
+    match er_logic::capital_guard::decide(armed, desired, current) {
+        er_logic::capital_guard::Decision::Write(w) => {
+            let _ = flags::try_set_event_flag(cfg.burn_flag, w);
+            let stuck = flags::get_event_flag(cfg.burn_flag) == w;
+            log::info!(
+                "capital warp intercept: target {grace_entity_id} -> flag {} {}; readback {}",
+                cfg.burn_flag,
+                if w { "ON" } else { "OFF" },
+                if stuck {
+                    "STUCK (the write took)"
+                } else {
+                    // ⚠️ Only true for a capital-bucket destination: `capital_flag_state` is
+                    // scoped to {11050, 19000, 11000} and returns None everywhere else, so for a
+                    // Roundtable or overworld target there is no latch to converge. Said plainly
+                    // rather than reassuringly.
+                    "PENDING (the write was lost) -- the per-tick latch converges only if the                      destination is a capital bucket; anywhere else this write is simply gone"
+                }
+            );
+        }
+        // ⭐ ONE LINE PER DECLINED WARP, unconditionally. bobler's log carries 66 warps and not one
+        // intercept line, because all 66 were `AlreadyCorrect` and nothing said so -- which was
+        // indistinguishable from the reconciler being inert. 66 lines a session is nothing.
+        er_logic::capital_guard::Decision::Declined(d) => log::info!(
+            "capital warp intercept: target {grace_entity_id} -> no write -- {}",
+            d.reason()
+        ),
     }
 }
 
