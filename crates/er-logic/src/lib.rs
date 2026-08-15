@@ -18,6 +18,7 @@ pub mod auto_equip;
 pub mod boss_felled;
 pub mod boss_fight_end_guard_replay;
 pub mod boss_fight_sample;
+pub mod boss_fight_start_settle;
 pub mod boss_grants;
 pub mod boss_key_replay;
 pub mod capital;

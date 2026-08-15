@@ -136,6 +136,17 @@ static GATE: Mutex<SampleGate> = Mutex::new(SampleGate::new());
 /// reading costs one `Option` and is the difference between "bar down" and "BOSS DOWN".
 static LAST_SEEN: Mutex<Option<(Hp, Hp)>> = Mutex::new(None);
 
+/// Holds `START` until `play_region` stops moving (client#195).
+///
+/// 🛑 THE FOG-LOAD FRAME IS NOT A READING. `Step::Start` fires on the healthbar edge, inside the
+/// frame the fog gate is still loading, so region / `max_hp` / carried speffects were all read one
+/// frame early -- Loretta's `4214/4214` against a settled `2122/2122`, and a `START carried:`
+/// naming `[7060, 7460]`, rows that were never issued to any region in that whole session. The raw
+/// read is still written, marked, because `4214/2122 = 1.9859` is itself the evidence #188/#183 are
+/// about.
+static START_GATE: Mutex<er_logic::boss_fight_start_settle::StartGate> =
+    Mutex::new(er_logic::boss_fight_start_settle::StartGate::new());
+
 /// Set when the death guard trips during a fight.
 ///
 /// ⭐ THE GUARD IS ALREADY THE DEATH SIGNAL, so the outcome costs nothing. `lists_unsafe_to_touch`
@@ -204,20 +215,59 @@ pub fn tick() {
                 // valuable line in the trace, would be suppressed as a duplicate.
                 g.reset();
             }
-            emit("START", npc_param_id, 0, player, t, EmitMode::Always);
+            if let Ok(mut g) = START_GATE.lock() {
+                g.open(t);
+            }
+            // The pre-settle read, marked. It is NOT the fight's START and nothing downstream may
+            // take a number from it -- but it is kept, because the gap between it and the settled
+            // line is a reading about when `max_hp` recomputes after a `maxHpRate` speffect moves.
+            emit("START raw", npc_param_id, 0, player, t, EmitMode::Always);
         }
         Step::Sample {
             npc_param_id,
             elapsed_ms,
         } => {
-            emit(
-                "SAMPLE",
-                npc_param_id,
-                elapsed_ms,
-                player,
-                t,
-                EmitMode::OnlyIfChanged,
-            );
+            use er_logic::boss_fight_start_settle::StartEmit;
+            // ⭐ START IS EMITTED FROM THE FIRST STABLE SAMPLE (client#195), which is #195's own
+            // preferred shape: the edge stays observable on the `START raw` line above, and the
+            // headline numbers come from a tick where the region has stopped moving.
+            // ONE lock, both answers: `poll` decides this tick and `settled` says whether a
+            // headline exists yet. Taking the lock twice would be two reads of a value that can
+            // change between them.
+            let (step, settled) = match START_GATE.lock() {
+                // A poisoned lock must not strand the fight without a START. Degrade to the old
+                // behaviour -- an early START is worse than no START, but only just, and a fight
+                // with no headline line at all is unreadable.
+                Err(_) => (StartEmit::Settled, true),
+                Ok(mut g) => {
+                    let step = g.poll(t, crate::flags::play_region_id());
+                    (step, g.settled())
+                }
+            };
+            match step {
+                // Unsuppressed, and it re-primes the dedupe gate: this is the `max_hp` readback the
+                // whole trace hangs off, and it must not be eaten as a duplicate of the raw line it
+                // exists to correct.
+                StartEmit::Settled => emit(
+                    "START",
+                    npc_param_id,
+                    elapsed_ms,
+                    player,
+                    t,
+                    EmitMode::Always,
+                ),
+                // Still settling: no SAMPLE may be written under a headline that does not exist
+                // yet. The fight is still being timed and `unseen` still accounts for the gap.
+                _ if !settled => {}
+                _ => emit(
+                    "SAMPLE",
+                    npc_param_id,
+                    elapsed_ms,
+                    player,
+                    t,
+                    EmitMode::OnlyIfChanged,
+                ),
+            }
         }
         Step::Capped {
             npc_param_id,
@@ -350,7 +400,7 @@ fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp, now_ms: u64, 
         // line of its own rather than being folded in here.
         let (scaling, other) = partition_carried_speffects(carried);
         log::info!(
-            "boss-fight START carried: npc_param {npc_param_id} npc_id {npc_id} speffects {:?} \
+            "boss-fight {tag} carried: npc_param {npc_param_id} npc_id {npc_id} speffects {:?} \
              (scaling rungs + down-states only, the same filter the enemy-scaling census uses)",
             scaling
         );
@@ -359,7 +409,7 @@ fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp, now_ms: u64, 
         // `maxHpRate != 1` row outside the native ladder slot. Without this, a boss holding a
         // vanilla 2x reads as a clean `[7010]` and its HP looks like a scaling defect.
         log::info!(
-            "boss-fight START speffects OTHER: npc_param {npc_param_id} npc_id {npc_id} \
+            "boss-fight {tag} speffects OTHER: npc_param {npc_param_id} npc_id {npc_id} \
              {} entr(ies) {:?} -- everything the filter above drops. A row here CAN carry \
              maxHpRate (e.g. 4410 = 2.0x), so expected HP is NpcParam.hp x those rates x the rung, \
              never NpcParam.hp x the rung alone",
