@@ -100,8 +100,17 @@ jobs:
     # clippy had never once linted, because Actions is disabled by default on forks and this repo is one.
     # All 44 are now cleared, so clippy blocks again. It is a HARD gate: the debt got in precisely because
     # nothing was stopping it.
-    - run: cargo clippy -- -D warnings
-    - run: cargo clippy --features=profile -- -D warnings
+    #
+    # 🛑 `--all-targets` ADDED 2026-08-15 (client#198). Without it clippy lints the LIB targets
+    # only, so `#[cfg(test)]` code -- which in `er-logic` means the `*_replay.rs` harnesses, i.e.
+    # the acceptance tests for the whole crate -- was never linted at all. 18 errors were sitting
+    # behind the flag on the commit that added it, cleared in the commit before this one. Order
+    # mattered: the flag first would have reddened `main` for everyone else's branches.
+    #
+    # This is the same lesson as `-p shared` / `-p archipelago_rs` in the test step above, one gate
+    # over: a check that silently excludes the test code reports on less than a reader assumes.
+    - run: cargo clippy --all-targets -- -D warnings
+    - run: cargo clippy --all-targets --features=profile -- -D warnings
 
     # -------------------------------------------------------------------------------------------
     # THE ARTIFACT. Until now this job built the .dll and threw it away, so the only machine that
