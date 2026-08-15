@@ -81,6 +81,16 @@ static STATUS_HIST: [AtomicU32; 6] = [
 ];
 /// One-shot release log per transition.
 static RELEASE_LOGGED: Mutex<bool> = Mutex::new(true);
+
+/// Outstanding rung writes, waiting to see whether `max_hp` followed (client#188/#186/#183).
+///
+/// ⭐ APPLYING A RUNG IS TWO EVENTS -- we write a speffect, and the engine recomputes `max_hp` --
+/// and this census has only ever observed the first. #188's controlled pair proved a write to an
+/// `unloaded` chr leaves `max_hp` on the old tier's number, and #186 is that same enemy read by two
+/// instruments at two moments. `(re)scaled N` counts both, so it has been over-reporting since it
+/// shipped.
+static RESCALE_WATCH: Mutex<er_logic::rescale_watch::RescaleWatch> =
+    Mutex::new(er_logic::rescale_watch::RescaleWatch::new());
 /// The area reading this region resolved while it still had a vanilla sample to read. Pure policy +
 /// host tests in `er_logic::scaling::AreaAnchor`; this is only the residence. Without it a character
 /// that instantiates AFTER the region's first sweep can never be placed — see the type's docs for
@@ -372,6 +382,11 @@ pub fn notify_transition() {
     if let Ok(mut logged) = RELEASE_LOGGED.lock() {
         *logged = false;
     }
+    // A load re-derives every character, so writes owed by the previous world are not owed by this
+    // one -- and their instance handles are about to be reused by different enemies.
+    if let Ok(mut w) = RESCALE_WATCH.lock() {
+        w.reset();
+    }
 }
 
 /// The tracker's "what is my scaling here" row, for `bucket` (= `play_region_id / 100`).
@@ -522,7 +537,14 @@ pub fn configure(sd: &Value) {
 #[derive(Default)]
 struct SweepTally {
     /// (Re)applied the tier -- the number the log line has always printed.
+    ///
+    /// ⚠️ THIS COUNTS WRITES, NOT RESULTS. #188 proved a write to an `unloaded` chr leaves
+    /// `max_hp` on the old tier's value, so this number has always over-reported what actually
+    /// changed. Read it beside `scaled_unloaded`.
     scaled: u32,
+    /// Of `scaled`, how many went to an `unloaded` character -- i.e. how many are writes whose
+    /// `max_hp` recompute is still owed (client#188).
+    scaled_unloaded: u32,
     /// Unrunged, we HAD a native tier, and the target was WEAKER: a down state was applied (#346
     /// phase 1b). 🛑 These enemies do NOT carry the region's rung -- see `ScaleAction::Down`.
     scaled_down: u32,
@@ -1099,7 +1121,8 @@ pub fn tick() -> Option<String> {
             log::info!(
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
-                 atk{}); (re)scaled {} enemy(ies); unrunged {} (up-scaled by native tier {}, left \
+                 atk{}); (re)scaled {} enemy(ies) ({} of them UNLOADED, so their max_hp \
+                 recompute is still owed -- client#188); unrunged {} (up-scaled by native tier {}, left \
                  vanilla {}, npc_param_ids {:?}), down-scaled {} (settled {}, kept {}, cleared {}), \
                  area-down {} across {} row(s) {:?}; other-in-range {} {:?}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?}{} from {} \
@@ -1108,6 +1131,7 @@ pub fn tick() -> Option<String> {
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
+                tally.scaled_unloaded,
                 tally.unrunged,
                 tally.scaled_by_native,
                 tally.left_vanilla,
@@ -1287,6 +1311,30 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
         // the population we changed rather than the population that is there.
         tally.note_sample(chr, status_label(status), &carried);
     }
+    // ⭐ THE OTHER HALF OF THE WRITE (client#188/#186). Every character the sweep walks is re-read
+    // here, so this is where a rung applied on an earlier tick finally reports whether `max_hp`
+    // followed. Unconditional on `sample_on`: the verdict is the measurement four issues are
+    // waiting on, and it is at most one line per write.
+    //
+    // 🛑 `Unloaded` is the only status treated as not-loaded. #188's pair contrasts `ready` with
+    // `unloaded`, and `ready` recomputed -- so anything that is not explicitly unloaded counts as
+    // loaded here, which is what makes a StaleLoaded verdict the anomaly rather than a definition.
+    if let Ok(mut w) = RESCALE_WATCH.lock()
+        && let Some(v) = w.observe(
+            instance_key(chr),
+            chr.modules.data.max_hp,
+            !matches!(status, ChrLoadStatus::Unloaded),
+            now_ms(),
+        )
+    {
+        let line =
+            er_logic::rescale_watch::verdict_line(chr.npc_param_id, 0, chr.modules.data.max_hp, v);
+        if v.is_anomaly() {
+            log::warn!("{line}");
+        } else if !matches!(v, er_logic::rescale_watch::Verdict::Recomputed { .. }) {
+            log::info!("{line}");
+        }
+    }
     if settled_on_target(&carried, target) {
         return; // carrying the tier and NOTHING else -- the only state worth leaving alone
     }
@@ -1439,6 +1487,33 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
     for id in stale {
         chr.remove_speffect(id);
     }
+    // Read BEFORE the write: the watch compares against the value the rung is meant to move.
+    let max_hp_before = chr.modules.data.max_hp;
     chr.apply_speffect(target, false);
     tally.scaled += 1;
+    // 🛑 THE WRITE IS NOT THE RESULT (client#188). An `unloaded` chr accepts the speffect and keeps
+    // the old tier's `max_hp`; 7/7 loaded followed the rung in #188's pair and 0/6 unloaded did. So
+    // the count is split, and the write is remembered so the next sample can say which happened.
+    if matches!(status, ChrLoadStatus::Unloaded) {
+        tally.scaled_unloaded += 1;
+    }
+    if let Ok(mut w) = RESCALE_WATCH.lock() {
+        w.note_applied(instance_key(chr), chr.npc_param_id, max_hp_before, now_ms());
+    }
+}
+
+/// A stable per-INSTANCE key. 🛑 `npc_param_id` is a ROW, not an instance -- #186 spent two issues
+/// on ten sightings that may or may not have been one character. `FieldInsHandle` is the identity
+/// the engine itself uses, and it is what `scale_one` already compares against for the player.
+///
+/// Hashed rather than bit-packed: `FieldInsSelector` and `BlockId` are `bitfield!` tuple structs
+/// whose inner field is PRIVATE, so `.0` is not reachable from here -- but `FieldInsHandle` derives
+/// `Hash`, which is a public, total function of exactly those bits. Collision across the watch's
+/// 512-entry cap is not a real risk, and a collision would cost one wrong verdict line, not a wrong
+/// write: nothing acts on this key.
+fn instance_key(chr: &ChrIns) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    chr.field_ins_handle.hash(&mut h);
+    h.finish()
 }
