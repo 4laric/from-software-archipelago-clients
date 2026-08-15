@@ -45,6 +45,18 @@
 /// has not followed its rung is the #186 shape and is worth a line.
 pub const SETTLE_GRACE_MS: u64 = 1_000;
 
+/// How many times a stale write may be RE-APPLIED before we stop and say so.
+///
+/// ⭐ BOUNDED ON PURPOSE. The retry exists because a write to an `unloaded` chr does not recompute
+/// (#188: 0/6 followed), and re-applying when it loads is what finishes the job. But an entity that
+/// never recomputes however many times we write must not be re-written every sweep forever -- that
+/// is churn on a path walking ~340 entities a tick, and it would bury the finding.
+///
+/// 🛑 EXHAUSTING THE BUDGET ON A **LOADED** CHR IS THE ANSWER TO #186's OPEN QUESTION. If `ready`
+/// were sufficient, a loaded retry always takes. `RetriesExhausted { loaded: true }` says it is not
+/// -- in one line, from a real session, without anyone designing a second experiment.
+pub const MAX_REAPPLY: u32 = 3;
+
 /// How long before a still-stale write is called permanent rather than slow. #186's readings held
 /// for 56 s; 30 s is comfortably past any recompute window and still inside a single fight.
 pub const STALE_VERDICT_MS: u64 = 30_000;
@@ -59,6 +71,11 @@ pub enum Verdict {
     /// defect in the write; it is a write that is not finished, and the fix is to re-apply when it
     /// loads rather than to count it done.
     StaleUnloaded { after_ms: u64 },
+    /// Re-applied [`MAX_REAPPLY`] times and `max_hp` still has not followed.
+    ///
+    /// On an `unloaded` entity this cannot happen (it is never retried). On a LOADED one it is
+    /// #186's reading, reached by experiment rather than by comparing two logs.
+    RetriesExhausted { after_ms: u64, loaded: bool },
     /// 🛑 Still on the old number while LOADED, past the grace window. This is the reading #186
     /// saw and #188 could not explain, and it is the one that decides whether `ready` is
     /// sufficient. If this verdict never appears in a playtest, the loaded rule holds and #186 was
@@ -69,7 +86,10 @@ pub enum Verdict {
 impl Verdict {
     /// Is this the reading that changes the diagnosis?
     pub fn is_anomaly(&self) -> bool {
-        matches!(self, Verdict::StaleLoaded { .. })
+        matches!(
+            self,
+            Verdict::StaleLoaded { .. } | Verdict::RetriesExhausted { loaded: true, .. }
+        )
     }
 }
 
@@ -86,6 +106,25 @@ struct Pending {
     applied_ms: u64,
     /// Already reported, so a long-lived stale entry says its line once rather than per tick.
     reported: bool,
+    /// How many times this write has been RE-APPLIED (client#188).
+    retries: u32,
+}
+
+/// What the sweep should do about one watched entity this tick (client#188).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Nothing: not watched, or still inside the grace window.
+    Wait,
+    /// ⭐ RE-APPLY THE RUNG. The entity is LOADED and its `max_hp` still has not followed, so the
+    /// write is unfinished -- re-applying is what makes the engine recompute.
+    ///
+    /// 🛑 THE SWEEP CANNOT REACH THIS ON ITS OWN. `settled_on_target` returns early for a chr
+    /// carrying the target rung and nothing else -- exactly what an unloaded write leaves behind --
+    /// so the ordinary path skips it forever. That early return is right for every other purpose;
+    /// this is the one case that has to go around it.
+    Reapply,
+    /// A decidable observation, for the log.
+    Report(Verdict),
 }
 
 /// Remembers rung writes and re-reads them, so "we wrote it" stops standing in for "it took".
@@ -132,39 +171,50 @@ impl RescaleWatch {
             max_hp_before,
             applied_ms: now_ms,
             reported: false,
+            retries: 0,
         });
     }
 
-    /// Re-read an entity we are waiting on. `Some(verdict)` the first time it is decidable.
+    /// Decide this entity's fate: re-apply, report, or wait (client#188).
     ///
-    /// 🛑 A CHANGED `max_hp` IS THE ONLY PROOF OF A RECOMPUTE, and it is checked before the clock:
-    /// an entity that moved inside the grace window is still a success, not an unknown.
-    pub fn observe(
-        &mut self,
-        key: u64,
-        max_hp_now: i32,
-        loaded: bool,
-        now_ms: u64,
-    ) -> Option<Verdict> {
-        let idx = self.pending.iter().position(|p| p.key == key)?;
+    /// # Why the retry is driven from here rather than from the sweep
+    ///
+    /// The sweep does not know which entities carry an unfinished write -- it sees a chr holding
+    /// the target rung and correctly leaves it alone. This watch is the only thing that knows a
+    /// write was made and did not take, so it is the only thing that can ask for exactly those
+    /// entities to be re-applied. Self-limiting by construction: an entity nobody wrote to is never
+    /// returned.
+    pub fn poll(&mut self, key: u64, max_hp_now: i32, loaded: bool, now_ms: u64) -> Action {
+        let Some(idx) = self.pending.iter().position(|p| p.key == key) else {
+            return Action::Wait;
+        };
         let p = self.pending[idx];
         let after_ms = now_ms.saturating_sub(p.applied_ms);
         if max_hp_now != p.max_hp_before {
             self.pending.remove(idx);
-            return Some(Verdict::Recomputed { after_ms });
+            return Action::Report(Verdict::Recomputed { after_ms });
         }
         if after_ms < SETTLE_GRACE_MS {
-            return None; // the engine may simply not have run yet
+            return Action::Wait; // the engine may simply not have run yet
         }
-        if self.pending[idx].reported {
-            return None; // said once
+        // An unloaded chr cannot recompute, so there is nothing to retry -- wait for it to load.
+        if !loaded {
+            if self.pending[idx].reported {
+                return Action::Wait;
+            }
+            self.pending[idx].reported = true;
+            return Action::Report(Verdict::StaleUnloaded { after_ms });
         }
-        self.pending[idx].reported = true;
-        Some(if loaded {
-            Verdict::StaleLoaded { after_ms }
-        } else {
-            Verdict::StaleUnloaded { after_ms }
-        })
+        if p.retries >= MAX_REAPPLY {
+            if self.pending[idx].reported {
+                return Action::Wait;
+            }
+            self.pending[idx].reported = true;
+            return Action::Report(Verdict::RetriesExhausted { after_ms, loaded });
+        }
+        self.pending[idx].retries += 1;
+        self.pending[idx].applied_ms = now_ms; // the retry restarts the window it is measured over
+        Action::Reapply
     }
 
     /// Entities still waiting, and writes forgotten to the cap.
@@ -201,6 +251,16 @@ pub fn verdict_line(npc_param_id: i32, expected: i32, observed: i32, v: Verdict)
              -- UNLOADED, so the write is not finished (expected {expected}). Re-apply when it \
              loads; do not count it as scaled (client#188)"
         ),
+        Verdict::RetriesExhausted { after_ms, loaded } if loaded => format!(
+            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} after \
+             {MAX_REAPPLY} re-applications and {after_ms}ms while LOADED (expected {expected}) -- \
+             `ready` is NOT sufficient for a recompute, which is #186's reading reproduced by \
+             experiment (client#188)"
+        ),
+        Verdict::RetriesExhausted { after_ms, .. } => format!(
+            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} after {after_ms}ms \
+             -- unloaded throughout, never retried (client#188)"
+        ),
         Verdict::StaleLoaded { after_ms } => format!(
             "enemy-scaling recompute: npc_param {npc_param_id} still {observed} after {after_ms}ms \
              while LOADED (expected {expected}) -- `ready` is NOT sufficient for a recompute. This \
@@ -212,6 +272,106 @@ pub fn verdict_line(npc_param_id: i32, expected: i32, observed: i32, v: Verdict)
 #[cfg(test)]
 mod replay {
     use super::*;
+
+    /// ⭐ THE RED-FIRST ASSERTION FOR THE FIX (client#188). The write to the UNLOADED half of the
+    /// controlled pair never recomputed -- 0/6 followed. When that chr finally loads, the sweep
+    /// skips it (it carries the rung, so `settled_on_target` returns early), so the ONLY thing that
+    /// can finish the job is a re-apply, and the watch is the only thing that knows to ask.
+    #[test]
+    fn a_stale_write_is_re_applied_once_the_chr_loads() {
+        let mut w = RescaleWatch::new();
+        w.note_applied(UNLOADED_KEY, 504_020_188, STALE_HP, 0);
+
+        // While unloaded: reported once, never retried -- it cannot recompute, so a retry is churn.
+        assert_eq!(
+            w.poll(UNLOADED_KEY, STALE_HP, false, 2_000),
+            Action::Report(Verdict::StaleUnloaded { after_ms: 2_000 })
+        );
+        assert_eq!(w.poll(UNLOADED_KEY, STALE_HP, false, 3_000), Action::Wait);
+
+        // It loads, still stale -> re-apply.
+        assert_eq!(w.poll(UNLOADED_KEY, STALE_HP, true, 4_000), Action::Reapply);
+    }
+
+    /// And the retry is what proves itself: after the re-apply, a moved `max_hp` retires the write.
+    #[test]
+    fn a_successful_retry_reports_recomputed_and_retires() {
+        let mut w = RescaleWatch::new();
+        w.note_applied(1, 1, STALE_HP, 0);
+        assert_eq!(w.poll(1, STALE_HP, true, 2_000), Action::Reapply);
+        assert_eq!(
+            w.poll(1, RECOMPUTED_HP, true, 2_500),
+            Action::Report(Verdict::Recomputed { after_ms: 500 }),
+            "the window restarts at the retry, so this measures the RETRY's latency"
+        );
+        assert_eq!(w.outstanding().0, 0);
+    }
+
+    /// 🛑 BOUNDED. An entity that never follows must not be re-written every sweep for the session
+    /// -- that is churn on a path walking ~340 entities a tick.
+    #[test]
+    fn retries_are_bounded_and_then_stated() {
+        let mut w = RescaleWatch::new();
+        w.note_applied(1, 47_500_014, 6080, 0);
+        let mut t = 2_000;
+        for _ in 0..MAX_REAPPLY {
+            assert_eq!(w.poll(1, 6080, true, t), Action::Reapply);
+            t += 2_000;
+        }
+        let a = w.poll(1, 6080, true, t);
+        assert_eq!(
+            a,
+            Action::Report(Verdict::RetriesExhausted {
+                after_ms: 2_000,
+                loaded: true
+            })
+        );
+        assert_eq!(w.poll(1, 6080, true, t + 5_000), Action::Wait, "said once");
+    }
+
+    /// ⭐ AND THAT EXHAUSTION IS THE ANSWER TO #186's OPEN QUESTION. If `ready` were sufficient a
+    /// loaded retry always takes; an exhausted budget on a LOADED chr says it is not, and it is
+    /// flagged as the anomaly so it reaches the log as a WARN.
+    #[test]
+    fn loaded_exhaustion_is_the_anomaly_that_settles_186() {
+        let v = Verdict::RetriesExhausted {
+            after_ms: 8_000,
+            loaded: true,
+        };
+        assert!(
+            v.is_anomaly(),
+            "this is the reading that decides the cluster"
+        );
+        let line = verdict_line(47_500_014, 3826, 6080, v);
+        assert!(line.contains("NOT sufficient"), "{line}");
+        assert!(line.contains("client#188"), "{line}");
+
+        // The unloaded flavour is ordinary and must NOT be an anomaly.
+        assert!(!Verdict::RetriesExhausted {
+            after_ms: 8_000,
+            loaded: false
+        }
+        .is_anomaly());
+    }
+
+    /// 🛑 AN ENTITY WE NEVER WROTE TO IS NEVER RE-APPLIED. The retry is self-limiting: the sweep
+    /// asks about every character it walks, and only the ones carrying an unfinished write come
+    /// back Reapply.
+    #[test]
+    fn an_unwatched_entity_is_never_re_applied() {
+        let mut w = RescaleWatch::new();
+        assert_eq!(w.poll(999, 1, true, 60_000), Action::Wait);
+    }
+
+    /// Inside the grace window nothing is re-applied -- the engine may simply not have run, and a
+    /// retry there would measure our own impatience.
+    #[test]
+    fn no_retry_inside_the_grace_window() {
+        let mut w = RescaleWatch::new();
+        w.note_applied(1, 1, STALE_HP, 0);
+        assert_eq!(w.poll(1, STALE_HP, true, SETTLE_GRACE_MS - 1), Action::Wait);
+        assert_eq!(w.poll(1, STALE_HP, true, SETTLE_GRACE_MS), Action::Reapply);
+    }
 
     /// #188's controlled pair: same base 1939, same scan, same write, differing only in load
     /// status. `504020088` was `ready` and followed to 2212; `504020188` was `unloaded` and kept
@@ -230,13 +390,13 @@ mod replay {
         w.note_applied(UNLOADED_KEY, 504_020_188, STALE_HP, 0);
 
         assert_eq!(
-            w.observe(READY_KEY, RECOMPUTED_HP, true, 900),
-            Some(Verdict::Recomputed { after_ms: 900 }),
+            w.poll(READY_KEY, RECOMPUTED_HP, true, 900),
+            Action::Report(Verdict::Recomputed { after_ms: 900 }),
             "the loaded one followed its rung"
         );
         assert_eq!(
-            w.observe(UNLOADED_KEY, STALE_HP, false, 1_500),
-            Some(Verdict::StaleUnloaded { after_ms: 1_500 }),
+            w.poll(UNLOADED_KEY, STALE_HP, false, 1_500),
+            Action::Report(Verdict::StaleUnloaded { after_ms: 1_500 }),
             "the unloaded one did not, and that is the expected answer -- not a defect"
         );
     }
@@ -247,10 +407,10 @@ mod replay {
     fn a_loaded_entity_that_never_follows_is_flagged_as_the_anomaly() {
         let mut w = RescaleWatch::new();
         w.note_applied(1, 47_500_014, 6080, 0);
-        let v = w
-            .observe(1, 6080, true, 56_000)
-            .expect("past the grace window this is decidable");
-        assert_eq!(v, Verdict::StaleLoaded { after_ms: 56_000 });
+        // Past the grace window and LOADED, the watch now RETRIES rather than merely reporting --
+        // the report comes when the budget is spent (`retries_are_bounded_and_then_stated`).
+        assert_eq!(w.poll(1, 6080, true, 56_000), Action::Reapply);
+        let v = Verdict::StaleLoaded { after_ms: 56_000 };
         assert!(v.is_anomaly(), "this is the reading worth a playtest");
         let line = verdict_line(47_500_014, 3826, 6080, v);
         assert!(line.contains("NOT sufficient"), "{line}");
@@ -264,8 +424,8 @@ mod replay {
         let mut w = RescaleWatch::new();
         w.note_applied(1, 504_020_088, STALE_HP, 0);
         assert_eq!(
-            w.observe(1, RECOMPUTED_HP, true, 16),
-            Some(Verdict::Recomputed { after_ms: 16 })
+            w.poll(1, RECOMPUTED_HP, true, 16),
+            Action::Report(Verdict::Recomputed { after_ms: 16 })
         );
     }
 
@@ -275,8 +435,8 @@ mod replay {
     fn unchanged_inside_the_grace_window_says_nothing() {
         let mut w = RescaleWatch::new();
         w.note_applied(1, 1, STALE_HP, 0);
-        assert_eq!(w.observe(1, STALE_HP, true, SETTLE_GRACE_MS - 1), None);
-        assert!(w.observe(1, STALE_HP, true, SETTLE_GRACE_MS).is_some());
+        assert_eq!(w.poll(1, STALE_HP, true, SETTLE_GRACE_MS - 1), Action::Wait);
+        assert_ne!(w.poll(1, STALE_HP, true, SETTLE_GRACE_MS), Action::Wait);
     }
 
     /// Said once. The sweep re-walks every character every tick; a stale entity must not log at
@@ -285,9 +445,12 @@ mod replay {
     fn a_stale_verdict_is_stated_once() {
         let mut w = RescaleWatch::new();
         w.note_applied(1, 1, STALE_HP, 0);
-        assert!(w.observe(1, STALE_HP, false, 2_000).is_some());
+        assert!(matches!(
+            w.poll(1, STALE_HP, false, 2_000),
+            Action::Report(_)
+        ));
         for t in 3..500 {
-            assert_eq!(w.observe(1, STALE_HP, false, t * 1_000), None);
+            assert_eq!(w.poll(1, STALE_HP, false, t * 1_000), Action::Wait);
         }
     }
 
@@ -296,8 +459,11 @@ mod replay {
     fn a_recompute_retires_the_write() {
         let mut w = RescaleWatch::new();
         w.note_applied(1, 1, STALE_HP, 0);
-        assert!(w.observe(1, RECOMPUTED_HP, true, 500).is_some());
-        assert_eq!(w.observe(1, RECOMPUTED_HP, true, 900), None, "retired");
+        assert!(matches!(
+            w.poll(1, RECOMPUTED_HP, true, 500),
+            Action::Report(Verdict::Recomputed { .. })
+        ));
+        assert_eq!(w.poll(1, RECOMPUTED_HP, true, 900), Action::Wait, "retired");
         assert_eq!(w.outstanding().0, 0);
     }
 
@@ -308,13 +474,13 @@ mod replay {
         let mut w = RescaleWatch::new();
         w.note_applied(1, 1, 100, 0);
         assert!(
-            w.observe(1, 100, true, 5_000).is_some(),
+            w.poll(1, 100, true, 5_000) != Action::Wait,
             "first is decidable"
         );
         w.note_applied(1, 1, 100, 10_000);
         assert_eq!(
-            w.observe(1, 100, true, 10_500),
-            None,
+            w.poll(1, 100, true, 10_500),
+            Action::Wait,
             "the new window has not elapsed"
         );
         assert_eq!(w.outstanding().0, 1, "still one entity, not two");
@@ -325,7 +491,7 @@ mod replay {
     #[test]
     fn an_unwatched_entity_yields_nothing() {
         let mut w = RescaleWatch::new();
-        assert_eq!(w.observe(99, 1, true, 10_000), None);
+        assert_eq!(w.poll(99, 1, true, 10_000), Action::Wait);
     }
 
     /// The cap holds and the drop is COUNTED. An instrument that quietly forgets is how #186
@@ -362,7 +528,7 @@ mod replay {
         w.note_applied(1, 1, 1, 0);
         w.reset();
         assert_eq!(w.outstanding(), (0, 0));
-        assert_eq!(w.observe(1, 2, true, 5_000), None);
+        assert_eq!(w.poll(1, 2, true, 5_000), Action::Wait);
     }
 
     /// Every line is ASCII (repo rule 10).

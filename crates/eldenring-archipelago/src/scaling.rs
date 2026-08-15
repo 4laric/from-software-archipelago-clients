@@ -545,6 +545,12 @@ struct SweepTally {
     /// Of `scaled`, how many went to an `unloaded` character -- i.e. how many are writes whose
     /// `max_hp` recompute is still owed (client#188).
     scaled_unloaded: u32,
+    /// Rungs RE-APPLIED this sweep to finish a write that never moved `max_hp` (client#188).
+    ///
+    /// ⭐ THIS IS THE FIX WORKING, and it should trend to zero as a region settles. Persistently
+    /// non-zero after convergence means retries are being spent without taking -- the
+    /// `RetriesExhausted` population, and #186's open question answered the wrong way.
+    reapplied: u32,
     /// Unrunged, we HAD a native tier, and the target was WEAKER: a down state was applied (#346
     /// phase 1b). 🛑 These enemies do NOT carry the region's rung -- see `ScaleAction::Down`.
     scaled_down: u32,
@@ -1121,8 +1127,9 @@ pub fn tick() -> Option<String> {
             log::info!(
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
-                 atk{}); (re)scaled {} enemy(ies) ({} of them UNLOADED, so their max_hp \
-                 recompute is still owed -- client#188); unrunged {} (up-scaled by native tier {}, left \
+                 atk{}); (re)scaled {} enemy(ies) ({} of them UNLOADED, whose max_hp recompute \
+                 is still owed until they load; {} rung(s) RE-APPLIED to finish an earlier write \
+                 -- client#188); unrunged {} (up-scaled by native tier {}, left \
                  vanilla {}, npc_param_ids {:?}), down-scaled {} (settled {}, kept {}, cleared {}), \
                  area-down {} across {} row(s) {:?}; other-in-range {} {:?}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?}{} from {} \
@@ -1132,6 +1139,7 @@ pub fn tick() -> Option<String> {
                 if dlc_region { ", DLC region" } else { "" },
                 tally.scaled,
                 tally.scaled_unloaded,
+                tally.reapplied,
                 tally.unrunged,
                 tally.scaled_by_native,
                 tally.left_vanilla,
@@ -1319,21 +1327,49 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
     // 🛑 `Unloaded` is the only status treated as not-loaded. #188's pair contrasts `ready` with
     // `unloaded`, and `ready` recomputed -- so anything that is not explicitly unloaded counts as
     // loaded here, which is what makes a StaleLoaded verdict the anomaly rather than a definition.
-    if let Ok(mut w) = RESCALE_WATCH.lock()
-        && let Some(v) = w.observe(
+    // ⭐ AND FINISH THE WRITE IF IT DID NOT TAKE (client#188). The watch is the only thing that
+    // knows a rung was written to this entity and `max_hp` never followed -- the sweep itself sees a
+    // chr carrying the target rung and correctly leaves it alone at `settled_on_target` just below,
+    // which is exactly WHY an unloaded write was permanent. 0/6 unloaded writes recomputed in the
+    // controlled pair; 7/7 loaded ones did.
+    let reapply = match RESCALE_WATCH.lock() {
+        Err(_) => false,
+        Ok(mut w) => match w.poll(
             instance_key(chr),
             chr.modules.data.max_hp,
             !matches!(status, ChrLoadStatus::Unloaded),
             now_ms(),
-        )
-    {
-        let line =
-            er_logic::rescale_watch::verdict_line(chr.npc_param_id, 0, chr.modules.data.max_hp, v);
-        if v.is_anomaly() {
-            log::warn!("{line}");
-        } else if !matches!(v, er_logic::rescale_watch::Verdict::Recomputed { .. }) {
-            log::info!("{line}");
+        ) {
+            er_logic::rescale_watch::Action::Wait => false,
+            er_logic::rescale_watch::Action::Reapply => true,
+            er_logic::rescale_watch::Action::Report(v) => {
+                let line = er_logic::rescale_watch::verdict_line(
+                    chr.npc_param_id,
+                    0,
+                    chr.modules.data.max_hp,
+                    v,
+                );
+                if v.is_anomaly() {
+                    log::warn!("{line}");
+                } else if !matches!(v, er_logic::rescale_watch::Verdict::Recomputed { .. }) {
+                    log::info!("{line}");
+                }
+                false
+            }
+        },
+    };
+    if reapply {
+        // Remove-then-re-add: re-applying an effect the chr already carries is what makes the
+        // engine recompute. The guard above is dropped before the chr is touched, so no game write
+        // ever happens while the watch is held.
+        chr.remove_speffect(target);
+        let before = chr.modules.data.max_hp;
+        chr.apply_speffect(target, false);
+        tally.reapplied += 1;
+        if let Ok(mut w) = RESCALE_WATCH.lock() {
+            w.note_applied(instance_key(chr), chr.npc_param_id, before, now_ms());
         }
+        return; // this entity's work for this tick IS the retry
     }
     if settled_on_target(&carried, target) {
         return; // carrying the tier and NOTHING else -- the only state worth leaving alone
