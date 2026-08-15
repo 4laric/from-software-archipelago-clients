@@ -20,6 +20,58 @@
 //! READS BACK set ([`retire`]). This is the house rule from CONTRIBUTING ("Reconcile, don't
 //! dispatch"): never advance a cursor past a write you did not verify landed.
 
+/// Why a granted member contributed no owed flag. Every field is a BENIGN, documented reason --
+/// the point is that the log could not tell them apart (world#697).
+///
+/// ⭐ THE MOTIVATING CASE. islam's 2026-08-15 log:
+///
+/// ```text
+/// 12:23:45  Boss sweep (Liurnia) [trigger flag 1034500800] -- 19 check(s) granted.
+/// 12:23:45  sweep-flush: 14 swept member flag(s) confirmed set (0 still owed)
+/// ```
+///
+/// 19 granted, 14 confirmed, nothing owed. Read against a sweep in the same session that reported
+/// 55 granted and 55 confirmed, that looks like five flags quietly lost -- and #697 reasonably
+/// called it a reconciler reporting a clean run over a shortfall (rule 2). It is not: all three of
+/// the filters below are deliberate, and any mix of them explains the gap exactly. But the summary
+/// line carried one number and no way to check, which is the same defect one layer over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AssertSkips {
+    /// Members whose detection flag is `0`: no flag to set, skipped rather than guessed at.
+    pub no_flag: u32,
+    /// Members sharing a flag already accounted for -- co-check siblings legitimately do.
+    pub shared: u32,
+    /// Members whose flag was ALREADY set before the sweep fired. On a trigger that flipped
+    /// without a boss fight this is the expected shape: the player had already collected some of
+    /// those pickups by hand.
+    pub already_set: u32,
+}
+
+impl AssertSkips {
+    pub fn total(&self) -> u32 {
+        self.no_flag + self.shared + self.already_set
+    }
+
+    /// The clause that explains a `granted != asserted` gap, or `None` when there is no gap.
+    ///
+    /// 🛑 STATED, NOT INFERRED. Without this the reader has to hold the sweep's member list, the
+    /// co-check map and the world's flag state in their head to decide whether a smaller number is
+    /// fine. #697 shows what happens when they cannot: a healthy line is filed as a bug.
+    pub fn explain(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} member(s) needed no flag asserted: {} already set, {} sharing a flag with a \
+             sibling, {} carrying no detection flag",
+            self.total(),
+            self.already_set,
+            self.shared,
+            self.no_flag
+        ))
+    }
+}
+
 /// The flags a sweep owes: every granted member whose own detection flag is not set yet.
 ///
 /// `members` is `(location, detection flag)`; a member with no flag (0) is skipped rather than
@@ -40,9 +92,100 @@ pub fn retire(pending: &mut Vec<u32>, is_set: impl Fn(u32) -> bool) {
     pending.retain(|&flag| !is_set(flag));
 }
 
+/// [`flags_to_assert`], plus a count of why each skipped member was skipped (world#697).
+///
+/// Same filter, same order, same result -- `flags_to_assert` is this function's first return value
+/// and stays the API for callers that do not report. One walk, so the counts cannot disagree with
+/// the flags.
+pub fn flags_to_assert_counted(
+    members: &[(i64, u32)],
+    is_set: impl Fn(u32) -> bool,
+) -> (Vec<u32>, AssertSkips) {
+    let mut owed: Vec<u32> = Vec::new();
+    let mut skips = AssertSkips::default();
+    for &(_loc, flag) in members {
+        if flag == 0 {
+            skips.no_flag += 1;
+        } else if owed.contains(&flag) {
+            skips.shared += 1;
+        } else if is_set(flag) {
+            skips.already_set += 1;
+        } else {
+            owed.push(flag);
+        }
+    }
+    (owed, skips)
+}
+
 #[cfg(test)]
 mod replay {
     use super::*;
+
+    /// ⭐ islam's Adula sweep, world#697: 19 granted, 14 asserted, and the five that were not are
+    /// all benign. Driven with a flag profile that reproduces the reported numbers exactly.
+    #[test]
+    fn the_adula_sweep_gap_is_fully_explained() {
+        // 19 members: 14 needing assertion, 3 already set, 1 sharing a sibling's flag, 1 flagless.
+        let mut members: Vec<(i64, u32)> = (0..14).map(|i| (i as i64, 1000 + i as u32)).collect();
+        members.push((100, 2001)); // already set
+        members.push((101, 2002)); // already set
+        members.push((102, 2003)); // already set
+        members.push((103, 1000)); // co-check sibling: shares member 0's flag
+        members.push((104, 0)); //    no detection flag
+        assert_eq!(members.len(), 19);
+
+        let already: [u32; 3] = [2001, 2002, 2003];
+        let (owed, skips) = flags_to_assert_counted(&members, |f| already.contains(&f));
+
+        assert_eq!(owed.len(), 14, "the 14 in islam's sweep-flush line");
+        assert_eq!(skips.already_set, 3);
+        assert_eq!(skips.shared, 1);
+        assert_eq!(skips.no_flag, 1);
+        assert_eq!(skips.total(), 5, "19 granted - 14 asserted");
+
+        let line = skips.explain().expect("a gap must explain itself");
+        assert!(line.contains("5 member(s)"), "{line}");
+        assert!(line.contains("3 already set"), "{line}");
+    }
+
+    /// 🛑 THE COUNTED WALK MUST NOT DISAGREE WITH THE UNCOUNTED ONE. They are the same filter and
+    /// a caller that reports must get the same flags as one that does not.
+    #[test]
+    fn counted_and_uncounted_agree() {
+        let members = [(1, 10u32), (2, 0), (3, 10), (4, 20), (5, 30)];
+        let already = |f: u32| f == 30;
+        let plain = flags_to_assert(&members, already);
+        let (counted, skips) = flags_to_assert_counted(&members, already);
+        assert_eq!(plain, counted);
+        assert_eq!(skips.total() as usize + counted.len(), members.len());
+    }
+
+    /// No gap, no clause: a sweep where every member needed asserting says nothing extra, which is
+    /// what keeps the explanation worth reading when it does appear.
+    #[test]
+    fn a_clean_sweep_explains_nothing() {
+        let members = [(1, 10u32), (2, 20), (3, 30)];
+        let (owed, skips) = flags_to_assert_counted(&members, |_| false);
+        assert_eq!(owed.len(), 3);
+        assert_eq!(skips.total(), 0);
+        assert_eq!(skips.explain(), None);
+    }
+
+    /// The explanation is ASCII (repo rule 10) and names all three reasons even at zero, so a
+    /// reader never has to wonder which bucket was omitted.
+    #[test]
+    fn the_explanation_is_ascii_and_names_every_bucket() {
+        let skips = AssertSkips {
+            no_flag: 0,
+            shared: 0,
+            already_set: 2,
+        };
+        let line = skips.explain().unwrap();
+        assert!(line.is_ascii(), "{line}");
+        for want in ["already set", "sharing a flag", "no detection flag"] {
+            assert!(line.contains(want), "{want} missing from: {line}");
+        }
+    }
     use std::collections::HashSet;
 
     /// Two swept members from the Summonwater group (flags from the 2026-07-24 log).
