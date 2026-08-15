@@ -7,6 +7,12 @@ use archipelago_rs::{self as ap, RichText};
 use darksouls3::{app_menu::*, cs::*, param::*, sprj::*};
 use fromsoftware_shared::{FromStatic, Superclass};
 use log::*;
+// 🛑 GATED TO MATCH ITS ONLY USE SITE (client#191). `regex!` is reached from exactly one
+// arm, `"!setevent"`, which is itself `#[cfg(debug_assertions)]`. A release build compiles
+// that arm away and the import becomes unused -- a warning, and `test.yaml` sets
+// `RUSTFLAGS: -Dwarnings`, so it is an ERROR there and only there. Gating the import with the
+// same cfg as its use keeps the two in step instead of leaving a dangling `use`.
+#[cfg(debug_assertions)]
 use regex_macro::regex;
 
 use crate::item::{EquipParamExt, ItemIdExt};
