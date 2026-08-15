@@ -2805,9 +2805,22 @@ impl shared::Core for Core {
             // that opens and gives nothing. Stage the owed flags, then re-assert every tick until
             // each reads back (reconcile, don't dispatch -- the sweep never fires twice).
             if !swept_members.is_empty() {
-                let owed = er_logic::sweep_flush::flags_to_assert(&swept_members, |f| {
-                    crate::flags::get_event_flag(f)
-                });
+                // ⭐ COUNTED (world#697). islam's Adula sweep logged `19 check(s) granted` and
+                // `14 ... confirmed set (0 still owed)`, and the five-member gap was filed as a
+                // reconciler losing writes. It was not -- all three skip reasons below are
+                // deliberate -- but the line carried one number and no way to check, so a healthy
+                // result read as a failure. Now it says which.
+                let (owed, skips) =
+                    er_logic::sweep_flush::flags_to_assert_counted(&swept_members, |f| {
+                        crate::flags::get_event_flag(f)
+                    });
+                if let Some(why) = skips.explain() {
+                    log::info!(
+                        "sweep-flush: {} member(s) granted, {} flag(s) to assert -- {why}",
+                        swept_members.len(),
+                        owed.len()
+                    );
+                }
                 for f in owed {
                     if !self.sweep_flag_pending.contains(&f) {
                         self.sweep_flag_pending.push(f);
