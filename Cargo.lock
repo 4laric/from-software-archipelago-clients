@@ -658,6 +658,7 @@ dependencies = [
  "imgui",
  "log",
  "oneshot",
+ "pelite",
  "retour",
  "serde",
  "serde_json",
