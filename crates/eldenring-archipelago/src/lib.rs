@@ -25,6 +25,7 @@ mod flask;
 mod fmg_inject;
 mod fogwall;
 mod game;
+mod game_version_gate;
 mod goal;
 mod hook_impl;
 mod icon_seam_probe;
@@ -81,6 +82,17 @@ extern "system" fn DllMain(_hinst: HINSTANCE, call_reason: u32, _reserved: *mut 
 
     shared::handle_panics::<game::EldenRing>();
     shared::start_logger();
+
+    // THE VERSION GATE, and it runs before anything else can touch an RVA. `eldenring::rva::get()`
+    // panics on an executable it has no table for, so without this the player's first and only
+    // signal is `Rust panic: Unsupported game version <x>` over twenty frames of `DllMain`
+    // (Duskerno, Nexus, 2026-08-15). Refusing here leaves the game running vanilla, which is the
+    // outcome a player can actually act on. See clients#233.
+    if let Err(message) = game_version_gate::check() {
+        log::error!("{message}");
+        game_version_gate::show(&message);
+        return true;
+    }
 
     // The AddItemFunc detour is installed lazily from `Core::update_live` (needs the module loaded
     // + must run off the loader lock), not here. It suppresses synthetic placeholders so they never
