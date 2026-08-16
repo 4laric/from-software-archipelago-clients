@@ -203,6 +203,33 @@ pub fn on_shop_open(begin: i32, end: i32) {
         t.unclassified,
         t.already_hinted,
     );
+    // ⭐⭐⭐ SAY WHAT THE SHELF ACTUALLY HOLDS, NOT JUST WHICH IDS WE HINTED.
+    //
+    // Funnyfail, Nexus 2026-08-16: "all AP items from Kale look like they are 'Arrows(10)' for the
+    // OoT player, but in reality they are completely different items." Three readings survived a
+    // day of argument -- Elden Ring genuinely placed several copies of the same OoT filler; some
+    // OoT-side view collapses them; our own display collapses them -- and NONE of them could be
+    // settled from a log, because the line above prints ap-ids and stops. The seed would have
+    // answered it, and asking for a seed costs days through a third party.
+    //
+    // `scout_proof::lookup` has had the name, the owner and the game all along, one call away from
+    // the plan we just built. One line makes the next report of this shape self-diagnosing: identical
+    // names here means the placement really is duplicated and nothing is broken; distinct names here
+    // means our side is right and the collapse is downstream of us. Either way nobody has to ask.
+    if !plan.locations.is_empty() {
+        let held: Vec<String> = plan
+            .locations
+            .iter()
+            .map(|loc| match crate::scout_proof::lookup(*loc) {
+                Some(s) => format!("{loc}={} -> {} ({})", s.name, s.owner, s.game),
+                // The plan only admits locations the scout classified, so this is unreachable in
+                // practice -- printed rather than skipped so a silent hole never looks like a short
+                // list. Same rule as the tally above.
+                None => format!("{loc}=<unscouted>"),
+            })
+            .collect();
+        log::info!("shop-hints: shelf holds {}", held.join(" | "));
+    }
     if plan.locations.is_empty() {
         return;
     }
