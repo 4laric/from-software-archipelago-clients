@@ -1565,10 +1565,10 @@ impl shared::Core for Core {
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
                     .unwrap_or_default();
-                let goal_arena_flag = tracker_tables
-                    .goal_lock_item(&goal_ids)
+                let goal_lock_item = tracker_tables.goal_lock_item(&goal_ids);
+                let goal_arena_flag = goal_lock_item
                     .and_then(|item| region.region_open_flags.get(item).copied());
-                crate::region::configure_goal_arena(goal_arena_flag);
+                crate::region::configure_goal_arena(goal_arena_flag, goal_lock_item);
 
                 (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features)
             });
@@ -3246,6 +3246,19 @@ impl shared::Core for Core {
             {
                 region_msgs.push(m);
             }
+            // ⭐ GOAL GATE (world#768). The goal region's Lock is not in the pool; this opens the
+            // region once every OTHER goal item is held. Unlike the notice above it WRITES, so it
+            // re-applies until readback confirms and fails OPEN -- see tick_goal_gate.
+            //
+            // Same `received_all` source as the notice and as `goal::is_met`, so the gate, the
+            // warning and the goal can never disagree about which items the player holds.
+            if let Some(goal) = self.goal.as_ref()
+                && let Some(m) = crate::region::tick_goal_gate(cfg, &goal.item_goals, &|n| {
+                    received_all.contains(n)
+                })
+            {
+                region_msgs.push(m);
+            }
         }
         // 6b. Capital-version per-tick latch (self-configured; INERT until slot_data spoke and
         //     the burn-done flag is set). Holds 9116 matched to the capital the player is
@@ -3671,6 +3684,10 @@ impl shared::Core for Core {
                     now,
                 );
             }
+            // world#768: tick_goal_gate WRITES the goal region's open flag + grace bundle, and a
+            // map load reverts flag writes -- so its convergence latch must drop here or it will
+            // believe it already succeeded and never re-apply (#200's shape).
+            crate::region::reset();
             crate::check_lots::reset();
             // Same stream-in revert, same re-arm: the whetblade getItemFlagId repoints are
             // ItemLotParam writes too, and a reverted one flips a whetblade check back onto the

@@ -48,10 +48,38 @@ static GOAL_ARENA_OPEN_FLAG: AtomicU32 = AtomicU32::new(0);
 static GOAL_APPROACH: Mutex<er_logic::goal_approach::ApproachNotice> =
     Mutex::new(er_logic::goal_approach::ApproachNotice::new());
 
+/// The goal region's own LOCK ITEM NAME, resolved at connect beside its open flag.
+///
+/// The gate needs the name as well as the flag: `goal_gate::decide` excludes the goal region's own
+/// lock from the requirement list, because that lock is the thing being GRANTED and requiring it
+/// would be requiring the output as an input. Empty string = unresolved.
+static GOAL_LOCK_ITEM: Mutex<String> = Mutex::new(String::new());
+
+/// Latched once the gate has opened the goal region this world-load, so the convergence loop stops
+/// and the log line is said once rather than per tick.
+static GOAL_GATE_OPENED: AtomicBool = AtomicBool::new(false);
+/// Rising-edge latch for the WITHHELD line, so "still shut, N outstanding" is not spammed.
+static GOAL_GATE_SAID_SHUT: AtomicBool = AtomicBool::new(false);
+
+/// Re-arm at the in-world edge (`test_gf_client_resets_are_called`).
+///
+/// 🛑 THIS MODULE NOW WRITES GAME STATE, so it is subject to the reset rule rather than exempt from
+/// it. `tick_goal_gate` sets the goal region's open flag and grace bundle, and a map load reverts
+/// flag writes -- so the latch must drop or the convergence loop will believe it already succeeded
+/// and never re-apply. That is #200's exact shape: the capital reconciler wrote once, trusted the
+/// latch, and left a player in a burnt world.
+pub fn reset() {
+    GOAL_GATE_OPENED.store(false, Ordering::Relaxed);
+    GOAL_GATE_SAID_SHUT.store(false, Ordering::Relaxed);
+}
+
 /// Install the goal region's open flag. Called at connect once the tracker tables and the region
 /// config both exist; `None` / unresolvable leaves it at 0 (notice absent).
-pub fn configure_goal_arena(open_flag: Option<u32>) {
+pub fn configure_goal_arena(open_flag: Option<u32>, lock_item: Option<&str>) {
     GOAL_ARENA_OPEN_FLAG.store(open_flag.unwrap_or(0), Ordering::Relaxed);
+    if let Ok(mut g) = GOAL_LOCK_ITEM.lock() {
+        *g = lock_item.unwrap_or_default().to_string();
+    }
     match open_flag {
         Some(f) => log::info!(
             "goal-approach: armed on the goal region's open flag {f} -- a player who reaches the \
@@ -93,6 +121,102 @@ pub fn tick_goal_approach(
     // `mut` on the guard: `poll` takes &mut self, and a temporary guard is not mutable.
     let mut notice = GOAL_APPROACH.lock().ok()?;
     notice.poll(in_arena, item_goals, has_item)
+}
+
+/// Per-tick: OPEN the goal region once every other goal item is held (world#768).
+///
+/// The goal region's own Lock is no longer in the item pool, so nothing arrives and the client has
+/// to reach the same end state itself: set the region's open flag plus its `lock_reveal_flags`
+/// bundle -- byte for byte the flags a Lock receipt produces via
+/// `ItemSemantics::RegionFlags([open] + bundle)`.
+///
+/// 🛑 THIS ONE HAS AUTHORITY, unlike its neighbour `tick_goal_approach`, so it is written to fail in
+/// the survivable direction:
+///
+/// * **An unresolvable gate OPENS.** The Lock is not in the pool, so a gate that cannot resolve and
+///   refuses to open is an unwinnable seed -- plus every foreign item fill placed inside the region
+///   (world#589: forty-two of them, on one seed). A spoiled ending is the cheaper failure.
+/// * **The write RE-APPLIES until readback confirms.** `try_set_event_flag` reports whether the
+///   write landed; the latch is only taken once `get_event_flag` agrees. Writing once and trusting
+///   the latch is #200, which put a player in a burnt world.
+/// * **The latch drops at the in-world edge** (`reset()`), because a map load reverts flag writes.
+///
+/// Returns a player-facing line on the rising edge only.
+pub fn tick_goal_gate(
+    cfg: &RegionConfig,
+    item_goals: &[String],
+    has_item: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    if !flags::in_world() {
+        return None; // writes at menu/load are silently discarded (SWEEP R3)
+    }
+    let want = GOAL_ARENA_OPEN_FLAG.load(Ordering::Relaxed);
+    if want == 0 {
+        return None; // no goal region resolved -> nothing to gate, and nothing withheld either
+    }
+    let lock_item = GOAL_LOCK_ITEM.lock().ok().map(|g| g.clone()).unwrap_or_default();
+    let gate = er_logic::goal_gate::GoalGate {
+        item_goals: item_goals.to_vec(),
+        goal_lock_item: (!lock_item.is_empty()).then(|| lock_item.clone()),
+    };
+    let decision = er_logic::goal_gate::decide(&gate, has_item);
+
+    if !decision.opens() {
+        // Say the outstanding list ONCE, then stay quiet until something changes it.
+        if !GOAL_GATE_SAID_SHUT.swap(true, Ordering::Relaxed) {
+            log::info!("{}", er_logic::goal_gate::status_line(&decision, &lock_item));
+        }
+        return None;
+    }
+
+    // Converged already this world-load? Nothing to write, nothing to say.
+    if GOAL_GATE_OPENED.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    // The exact flag set a Lock receipt would produce for this region.
+    let mut to_set = vec![want];
+    if !lock_item.is_empty()
+        && let Some(bundle) = cfg.lock_reveal_flags.get(&lock_item)
+    {
+        to_set.extend(bundle.iter().copied());
+    }
+    if !lock_item.is_empty()
+        && let Some(graces) = cfg.region_graces.get(&lock_item)
+    {
+        to_set.extend(graces.iter().copied());
+    }
+
+    // WRITE, then READ BACK. Every flag has to agree before the latch is taken; anything short of
+    // that leaves the loop armed and we try again next tick.
+    let mut all_confirmed = true;
+    for f in &to_set {
+        if !flags::get_event_flag(*f) {
+            let _ = flags::try_set_event_flag(*f, true);
+        }
+        if !flags::get_event_flag(*f) {
+            all_confirmed = false;
+        }
+    }
+    if !all_confirmed {
+        return None; // still converging -- re-applied next tick, never latched on faith
+    }
+
+    GOAL_GATE_OPENED.store(true, Ordering::Relaxed);
+    log::info!(
+        "goal-gate: CONVERGED -- {} flag(s) set and read back for {lock_item} ({} decision)",
+        to_set.len(),
+        if matches!(decision, er_logic::goal_gate::Decision::OpenUnresolvable { .. }) {
+            "unresolvable-open"
+        } else {
+            "all goal items held"
+        }
+    );
+    if let er_logic::goal_gate::Decision::OpenUnresolvable { why } = &decision {
+        log::warn!("goal-gate: OPENED WITHOUT A GATE -- {why}");
+    }
+    // ASCII ONLY -- the game's font has no typographic quotes or dashes.
+    Some("Every goal item is held. The path to the ending is open.".to_string())
 }
 
 /// kick-watch diagnostic: last play_region_id seen by tick_kick (i32::MIN = none yet).

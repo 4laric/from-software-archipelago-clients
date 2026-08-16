@@ -42,6 +42,7 @@ pub mod flask_reconcile;
 pub mod fmg_groups;
 pub mod game_version;
 pub mod goal_approach;
+pub mod goal_gate;
 pub mod goal_text;
 pub mod grace;
 pub mod grace_flush_replay;
