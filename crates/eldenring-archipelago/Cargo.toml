@@ -31,8 +31,15 @@ archipelago_rs.workspace = true        # ensure the workspace is on 3.0.1 (try-a
 # game). Within this crate that gives ONE fromsoftware-shared (0.14) copy, so CSTaskImp's
 # `SharedTaskImp` impl and our `use fromsoftware_shared::SharedTaskImpExt` agree. The framework
 # (shared)/ds3/sekiro keep their own 0.13 copy untouched — the two never trade fss types across
-# `shared::Game` (which exposes only `impl FnMut`/`bool`/hudhook). Pin the resolved SHA after build.
-fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs", branch = "main" }
+# `shared::Game` (which exposes only `impl FnMut`/`bool`/hudhook).
+# 🛑 PINNED, not floated (#241). This file said "Pin the resolved SHA after build" for months while
+# both entries tracked `branch = "main"`, so every build re-resolved whatever upstream HEAD was that
+# day. The RVA table that decides which Elden Ring executable this build supports lives in THIS
+# dependency -- it is the table #233's gate reports against -- and Tarnished Edition (2026-08-28)
+# bumps that executable. A release has to be able to say which revision answered for it.
+# The rev below is the SHA `branch = "main"` had ALREADY resolved to, so this pin changes no code;
+# it only stops the next change from being silent. Bump it deliberately, in its own PR.
+fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs", rev = "8c67a84f394bd58efdb06a5be47f988e0c1a9995" }
 hudhook.workspace = true
 # Item-tracker overlay window (shared::Core render_overlay_* hooks take &imgui::Ui). Same spec as
 # crates/shared so the workspace [patch.crates-io] git pin resolves both to ONE imgui instance.
@@ -51,7 +58,7 @@ oneshot = { version = "0.2.1", features = ["std"] }   # scout_proof: archipelago
 # current game (893cdd37 only had 2.6.1.x). Must track the SAME ref as fromsoftware-shared above so
 # they're ONE source instance (one fss copy → SharedTaskImp/SharedTaskImpExt resolve). Isolated from
 # the workspace's 0.13 by being a different git ref than the framework's default-branch source.
-eldenring = { git = "https://github.com/vswarte/fromsoftware-rs", branch = "main" }
+eldenring = { git = "https://github.com/vswarte/fromsoftware-rs", rev = "8c67a84f394bd58efdb06a5be47f988e0c1a9995" }
 # ER pure-logic crates (host-tested).
 er-codec = { path = "../er-codec" }
 er-logic = { path = "../er-logic" }
