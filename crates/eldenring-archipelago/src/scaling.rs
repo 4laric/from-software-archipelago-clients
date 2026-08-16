@@ -592,6 +592,17 @@ struct SweepTally {
     left_vanilla_ids: IdSample,
     /// Unrunged, but we HAD a native tier and the target beat it, so it scaled up.
     scaled_by_native: u32,
+    /// Writes whose `max_hp` was CONFIRMED to follow the rung, this sweep.
+    ///
+    /// ⭐ Without this the census reported failures and nothing else, so "does the recompute ever
+    /// work?" could not be answered from a log at all -- and it is the question the whole cluster
+    /// turns on. Read it against `recompute_failed_loaded`: the two together are a success rate.
+    recomputed: u32,
+    /// Writes that exhausted their retries while LOADED -- the anomaly class (client#188/#235).
+    recompute_failed_loaded: u32,
+    /// Distinct `npc_param_id`s of the above, so the failing population can be NAMED rather than
+    /// counted. These are the rows any fix has to be tested against.
+    recompute_failed_ids: IdSample,
     /// Carried something the clear catches that is not a rung (`7210..`, `7800..`).
     other_in_range: u32,
     /// Distinct `npc_param_id`s of unrunged entities, capped -- enough to NAME the offender in one
@@ -717,6 +728,7 @@ impl SweepTally {
     fn new() -> Self {
         Self {
             unrunged_ids: IdSample::new(UNRUNGED_ID_CAP),
+            recompute_failed_ids: IdSample::new(UNRUNGED_ID_CAP),
             left_vanilla_ids: IdSample::new(UNRUNGED_ID_CAP),
             area_down_ids: IdSample::new(UNRUNGED_ID_CAP),
             area_moved_ids: IdSample::new(UNRUNGED_ID_CAP),
@@ -1150,8 +1162,9 @@ pub fn tick() -> Option<String> {
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies) ({} of them UNLOADED, whose max_hp recompute \
                  is still owed until they load; {} rung(s) RE-APPLIED to finish an earlier write \
-                 -- client#188); unrunged {} (up-scaled by native tier {}, left \
-                 vanilla {} {}, npc_param_ids {}), down-scaled {} (settled {}, kept {}, cleared {}), \
+                 -- client#188; recompute CONFIRMED {}, FAILED-while-loaded {} {}); unrunged {} \
+                 (up-scaled by native tier {}, left vanilla {} {}, npc_param_ids {}), \
+                 down-scaled {} (settled {}, kept {}, cleared {}), \
                  area-down {} across {} row(s) {}; other-in-range {} {}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?}{} from {} \
                  vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {}, \
@@ -1161,6 +1174,9 @@ pub fn tick() -> Option<String> {
                 tally.scaled,
                 tally.scaled_unloaded,
                 tally.reapplied,
+                tally.recomputed,
+                tally.recompute_failed_loaded,
+                tally.recompute_failed_ids.render(),
                 tally.unrunged,
                 tally.scaled_by_native,
                 tally.left_vanilla,
@@ -1365,16 +1381,32 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
             er_logic::rescale_watch::Action::Wait => false,
             er_logic::rescale_watch::Action::Reapply => true,
             er_logic::rescale_watch::Action::Report(v) => {
-                let line = er_logic::rescale_watch::verdict_line(
-                    chr.npc_param_id,
-                    0,
-                    chr.modules.data.max_hp,
-                    v,
-                );
-                if v.is_anomaly() {
-                    log::warn!("{line}");
-                } else if !matches!(v, er_logic::rescale_watch::Verdict::Recomputed { .. }) {
-                    log::info!("{line}");
+                // 🛑 COUNT THE SUCCESSES. A `Recomputed` verdict used to be dropped on the floor --
+                // not logged, not tallied -- so a session could show 13,487 failure lines and
+                // NOTHING about whether the mechanism works at all. I read one that way and
+                // concluded the recompute never succeeds; that was an absence in the LOG, not in
+                // the world (this module's own controlled pair recorded 7/7 loaded writes
+                // recomputing). A success rate is the first number client#235's item 2 needs, and
+                // it did not exist.
+                //
+                // COUNTED, not logged: one line per confirmed recompute is thousands a session, and
+                // the census already carries the per-sweep numbers beside it.
+                if matches!(v, er_logic::rescale_watch::Verdict::Recomputed { .. }) {
+                    tally.recomputed = tally.recomputed.saturating_add(1);
+                } else {
+                    let line = er_logic::rescale_watch::verdict_line(
+                        chr.npc_param_id,
+                        chr.modules.data.max_hp,
+                        v,
+                    );
+                    if v.is_anomaly() {
+                        tally.recompute_failed_loaded =
+                            tally.recompute_failed_loaded.saturating_add(1);
+                        tally.recompute_failed_ids.note(chr.npc_param_id);
+                        log::warn!("{line}");
+                    } else {
+                        log::info!("{line}");
+                    }
                 }
                 false
             }
