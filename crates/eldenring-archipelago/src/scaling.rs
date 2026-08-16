@@ -581,6 +581,15 @@ struct SweepTally {
     /// Unrunged AND left completely untouched -- either we have no native tier for it, or the
     /// target is not stronger than the one we have.
     left_vanilla: u32,
+    /// Distinct `npc_param_id`s of the above.
+    ///
+    /// 🛑 THIS IS THE ACTIONABLE SET AND IT HAD NO LIST FOR MONTHS. `npc_param_ids` beside it names
+    /// `unrunged`, which is the SUPERSET -- most of those settle, and the ones that ship vanilla are
+    /// the residue. Roundtable Hold measured `unrunged 30 ... left vanilla 11` on all 24 sweeps of
+    /// bobler's 2026-08-16 session, and the eleven were unnameable from any log: they are exactly
+    /// the rows that need a `NATIVE_TIERS` entry or an `AREA_TIERS` claim, and nothing could say
+    /// which they were (clients#235, world#688).
+    left_vanilla_ids: IdSample,
     /// Unrunged, but we HAD a native tier and the target beat it, so it scaled up.
     scaled_by_native: u32,
     /// Writes whose `max_hp` was CONFIRMED to follow the rung, this sweep.
@@ -720,6 +729,7 @@ impl SweepTally {
         Self {
             unrunged_ids: IdSample::new(UNRUNGED_ID_CAP),
             recompute_failed_ids: IdSample::new(UNRUNGED_ID_CAP),
+            left_vanilla_ids: IdSample::new(UNRUNGED_ID_CAP),
             area_down_ids: IdSample::new(UNRUNGED_ID_CAP),
             area_moved_ids: IdSample::new(UNRUNGED_ID_CAP),
             other_ids: IdSample::new(UNRUNGED_ID_CAP),
@@ -1152,8 +1162,9 @@ pub fn tick() -> Option<String> {
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies) ({} of them UNLOADED, whose max_hp recompute \
                  is still owed until they load; {} rung(s) RE-APPLIED to finish an earlier write \
-                 -- client#188; recompute CONFIRMED {}, FAILED-while-loaded {} {}); unrunged {} (up-scaled by native tier {}, left \
-                 vanilla {}, npc_param_ids {}), down-scaled {} (settled {}, kept {}, cleared {}), \
+                 -- client#188; recompute CONFIRMED {}, FAILED-while-loaded {} {}); unrunged {} \
+                 (up-scaled by native tier {}, left vanilla {} {}, npc_param_ids {}), \
+                 down-scaled {} (settled {}, kept {}, cleared {}), \
                  area-down {} across {} row(s) {}; other-in-range {} {}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?}{} from {} \
                  vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {}, \
@@ -1169,6 +1180,7 @@ pub fn tick() -> Option<String> {
                 tally.unrunged,
                 tally.scaled_by_native,
                 tally.left_vanilla,
+                tally.left_vanilla_ids.render(),
                 tally.unrunged_ids.render(),
                 tally.scaled_down,
                 tally.settled_down,
@@ -1502,6 +1514,11 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
     ) {
         ScaleAction::NoTouch => {
             tally.left_vanilla += 1;
+            // NAME it. `scale_action` returned NoTouch, so this enemy carries no rung, has no
+            // native tier we will claim, and the area did not vouch for it either -- it ships at
+            // full vanilla strength in a region we have scaled around it. That is the #346
+            // population, and until now the census could count it but not identify it.
+            tally.left_vanilla_ids.note(chr.npc_param_id);
             return;
         }
         ScaleAction::Apply => {

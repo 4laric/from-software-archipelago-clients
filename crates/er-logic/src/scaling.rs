@@ -3615,4 +3615,51 @@ mod tests {
         // And an unrunged enemy in a deep sphere still scales UP; the skip is bottom-rung only.
         assert!(!skip_unrunged_at_floor(false, NUM_TIERS - 1));
     }
+    /// ROUNDTABLE HOLD, measured. bobler's 2026-08-16 session logged bucket 11100 twenty-four times
+    /// and every line was identical:
+    ///
+    /// ```text
+    /// (re)scaled 0 | unrunged 30 | up-scaled by native tier 0 | left vanilla 11 | settled 19
+    /// area-index None UNKNOWN from 0 vanilla-shaped []
+    /// ```
+    ///
+    /// This is that row's shape as a decision: no ladder rung, no down state carried, an
+    /// `npc_param_id` with no `NATIVE_TIERS` entry, and `area_tier: None` because the bucket has no
+    /// baked row and never reaches `MIN_AREA_SAMPLE` live. Every one of the three ways to place an
+    /// enemy is unavailable at once, so `NoTouch` is the only answer -- which is why #698's
+    /// floor-pin is necessary and not sufficient there, and why naming the eleven is the next step
+    /// rather than another scaling change.
+    ///
+    /// 🛑 Asserted at EVERY target tier: the point is that depth does not help. A test at one tier
+    /// would pass for the wrong reason on a lattice change.
+    #[test]
+    fn an_unrunged_enemy_with_no_native_tier_and_no_area_is_left_vanilla_at_every_depth() {
+        // An id far outside NATIVE_TIERS, so `presumed_native_tier{,_down}` can only answer None.
+        let orphan = 999_999_999;
+        assert!(
+            native_tier(orphan).is_none(),
+            "fixture broken: {orphan} must have no native tier for this test to mean anything"
+        );
+        for target in 0..NUM_TIERS {
+            assert_eq!(
+                scale_action(false, false, orphan, target, None),
+                ScaleAction::NoTouch,
+                "target tier {target}: with no rung, no native tier and no area, there is nothing \
+                 to place this enemy from -- it must stay vanilla rather than be guessed at"
+            );
+        }
+    }
+
+    /// The counterpart, and the reason the Roundtable case is a DATA gap rather than a code one:
+    /// give the same enemy an area to stand on and it places immediately. So the fix for bucket
+    /// 11100 is an `AREA_TIERS` claim for m11_10 (or per-row native tiers), not a change here.
+    #[test]
+    fn the_same_enemy_places_the_moment_the_area_vouches_for_it() {
+        let orphan = 999_999_999;
+        assert_eq!(
+            scale_action(false, false, orphan, 9, Some(3)),
+            ScaleAction::Apply,
+            "an area index below the target is exactly what the area fallback exists to act on"
+        );
+    }
 }
