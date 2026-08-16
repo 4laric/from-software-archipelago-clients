@@ -68,9 +68,7 @@ pub enum Decision {
     Open,
     /// The gate could not be resolved, so it opens rather than risking an unwinnable seed.
     /// The caller MUST log this at warn: it means the seed is playable but the arena is unguarded.
-    OpenUnresolvable {
-        why: &'static str,
-    },
+    OpenUnresolvable { why: &'static str },
 }
 
 impl Decision {
@@ -129,12 +127,10 @@ pub fn decide(gate: &GoalGate, held: &dyn Fn(&str) -> bool) -> Decision {
 /// The one-line status for the log. Callers latch on the transition, not on this string.
 pub fn status_line(d: &Decision, goal_region: &str) -> String {
     match d {
-        Decision::Open => format!(
-            "goal-gate: every goal item is held -- opening {goal_region}"
-        ),
-        Decision::OpenUnresolvable { why } => format!(
-            "goal-gate: OPENING {goal_region} WITHOUT A GATE -- {why}"
-        ),
+        Decision::Open => format!("goal-gate: every goal item is held -- opening {goal_region}"),
+        Decision::OpenUnresolvable { why } => {
+            format!("goal-gate: OPENING {goal_region} WITHOUT A GATE -- {why}")
+        }
         Decision::Withhold { outstanding } => format!(
             "goal-gate: {} goal item(s) outstanding, {goal_region} stays shut -- {}",
             outstanding.len(),
@@ -167,7 +163,9 @@ mod tests {
         let d = decide(&g, &holding(&["Limgrave Lock"]));
         assert_eq!(
             d,
-            Decision::Withhold { outstanding: vec!["Caelid Lock".into()] }
+            Decision::Withhold {
+                outstanding: vec!["Caelid Lock".into()]
+            }
         );
         assert!(!d.opens());
     }
@@ -178,7 +176,10 @@ mod tests {
             &["Limgrave Lock", "Caelid Lock", "Ashen Capital Lock"],
             Some("Ashen Capital Lock"),
         );
-        assert_eq!(decide(&g, &holding(&["Limgrave Lock", "Caelid Lock"])), Decision::Open);
+        assert_eq!(
+            decide(&g, &holding(&["Limgrave Lock", "Caelid Lock"])),
+            Decision::Open
+        );
     }
 
     #[test]
@@ -198,7 +199,10 @@ mod tests {
         );
         assert!(!decide(&g, &holding(&["Godrick's Great Rune"])).opens());
         assert_eq!(
-            decide(&g, &holding(&["Godrick's Great Rune", "Rykard's Great Rune"])),
+            decide(
+                &g,
+                &holding(&["Godrick's Great Rune", "Rykard's Great Rune"])
+            ),
             Decision::Open
         );
     }
@@ -217,18 +221,29 @@ mod tests {
     fn an_empty_goal_opens() {
         // No requirements at all (region_locks goal on a seed with nothing kept, or a foreign
         // apworld's shape). Nothing to wait for.
-        assert_eq!(decide(&gate(&[], Some("Ashen Capital Lock")), &holding(&[])), Decision::Open);
+        assert_eq!(
+            decide(&gate(&[], Some("Ashen Capital Lock")), &holding(&[])),
+            Decision::Open
+        );
     }
 
     #[test]
     fn outstanding_is_sorted_and_deduped_for_a_stable_log_line() {
         let g = gate(
-            &["Caelid Lock", "Altus Lock", "Caelid Lock", "Ashen Capital Lock"],
+            &[
+                "Caelid Lock",
+                "Altus Lock",
+                "Caelid Lock",
+                "Ashen Capital Lock",
+            ],
             Some("Ashen Capital Lock"),
         );
         match decide(&g, &holding(&[])) {
             Decision::Withhold { outstanding } => {
-                assert_eq!(outstanding, vec!["Altus Lock".to_string(), "Caelid Lock".to_string()])
+                assert_eq!(
+                    outstanding,
+                    vec!["Altus Lock".to_string(), "Caelid Lock".to_string()]
+                )
             }
             other => panic!("expected Withhold, got {other:?}"),
         }
@@ -236,7 +251,10 @@ mod tests {
 
     #[test]
     fn status_line_says_which_items_are_outstanding() {
-        let g = gate(&["Caelid Lock", "Ashen Capital Lock"], Some("Ashen Capital Lock"));
+        let g = gate(
+            &["Caelid Lock", "Ashen Capital Lock"],
+            Some("Ashen Capital Lock"),
+        );
         let s = status_line(&decide(&g, &holding(&[])), "Ashen Capital");
         assert!(s.contains("Caelid Lock"), "{s}");
         assert!(s.contains("Ashen Capital"), "{s}");

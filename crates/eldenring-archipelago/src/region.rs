@@ -154,7 +154,11 @@ pub fn tick_goal_gate(
     if want == 0 {
         return None; // no goal region resolved -> nothing to gate, and nothing withheld either
     }
-    let lock_item = GOAL_LOCK_ITEM.lock().ok().map(|g| g.clone()).unwrap_or_default();
+    let lock_item = GOAL_LOCK_ITEM
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     let gate = er_logic::goal_gate::GoalGate {
         item_goals: item_goals.to_vec(),
         goal_lock_item: (!lock_item.is_empty()).then(|| lock_item.clone()),
@@ -164,7 +168,10 @@ pub fn tick_goal_gate(
     if !decision.opens() {
         // Say the outstanding list ONCE, then stay quiet until something changes it.
         if !GOAL_GATE_SAID_SHUT.swap(true, Ordering::Relaxed) {
-            log::info!("{}", er_logic::goal_gate::status_line(&decision, &lock_item));
+            log::info!(
+                "{}",
+                er_logic::goal_gate::status_line(&decision, &lock_item)
+            );
         }
         return None;
     }
@@ -206,7 +213,10 @@ pub fn tick_goal_gate(
     log::info!(
         "goal-gate: CONVERGED -- {} flag(s) set and read back for {lock_item} ({} decision)",
         to_set.len(),
-        if matches!(decision, er_logic::goal_gate::Decision::OpenUnresolvable { .. }) {
+        if matches!(
+            decision,
+            er_logic::goal_gate::Decision::OpenUnresolvable { .. }
+        ) {
             "unresolvable-open"
         } else {
             "all goal items held"
