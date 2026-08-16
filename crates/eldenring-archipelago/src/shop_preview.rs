@@ -236,7 +236,8 @@ pub fn run() -> bool {
             shared_rows += 1;
             er_logic::name_override::shop_shared_label(distinct)
         } else {
-            lbls.pop().expect("entry() only exists because something was pushed")
+            lbls.pop()
+                .expect("entry() only exists because something was pushed")
         };
         nmap.insert(gid, lbl.name.encode_utf16().collect());
         let u: Vec<u16> = lbl.caption.encode_utf16().collect();
