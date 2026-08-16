@@ -70,17 +70,21 @@ pub enum Verdict {
     /// EXPECTED** -- an unloaded chr accepts the speffect and does not recompute. It is not a
     /// defect in the write; it is a write that is not finished, and the fix is to re-apply when it
     /// loads rather than to count it done.
-    StaleUnloaded { after_ms: u64 },
+    StaleUnloaded { after_ms: u64, unchanged_from: i32 },
     /// Re-applied [`MAX_REAPPLY`] times and `max_hp` still has not followed.
     ///
     /// On an `unloaded` entity this cannot happen (it is never retried). On a LOADED one it is
     /// #186's reading, reached by experiment rather than by comparing two logs.
-    RetriesExhausted { after_ms: u64, loaded: bool },
+    RetriesExhausted {
+        after_ms: u64,
+        loaded: bool,
+        unchanged_from: i32,
+    },
     /// 🛑 Still on the old number while LOADED, past the grace window. This is the reading #186
     /// saw and #188 could not explain, and it is the one that decides whether `ready` is
     /// sufficient. If this verdict never appears in a playtest, the loaded rule holds and #186 was
     /// a build that has since changed; if it does, `ready` is necessary and not sufficient.
-    StaleLoaded { after_ms: u64 },
+    StaleLoaded { after_ms: u64, unchanged_from: i32 },
 }
 
 impl Verdict {
@@ -203,14 +207,21 @@ impl RescaleWatch {
                 return Action::Wait;
             }
             self.pending[idx].reported = true;
-            return Action::Report(Verdict::StaleUnloaded { after_ms });
+            return Action::Report(Verdict::StaleUnloaded {
+                after_ms,
+                unchanged_from: p.max_hp_before,
+            });
         }
         if p.retries >= MAX_REAPPLY {
             if self.pending[idx].reported {
                 return Action::Wait;
             }
             self.pending[idx].reported = true;
-            return Action::Report(Verdict::RetriesExhausted { after_ms, loaded });
+            return Action::Report(Verdict::RetriesExhausted {
+                after_ms,
+                loaded,
+                unchanged_from: p.max_hp_before,
+            });
         }
         self.pending[idx].retries += 1;
         self.pending[idx].applied_ms = now_ms; // the retry restarts the window it is measured over
@@ -240,31 +251,53 @@ impl RescaleWatch {
 }
 
 /// The line one decidable verdict logs. ASCII (repo rule 10).
-pub fn verdict_line(npc_param_id: i32, expected: i32, observed: i32, v: Verdict) -> String {
+///
+/// 🛑 THERE IS NO `expected` ARGUMENT, and there never should have been one. It used to take an
+/// `expected: i32` that the single caller passed as a literal `0`, so 13,487 warnings in one session
+/// read `(expected 0)` -- a number that looks like a target `max_hp` and is not one. We do not KNOW
+/// the target `max_hp`; the engine computes it from the rung. The only thing we know, and the only
+/// thing the watch tests, is that it should have CHANGED. So the line says what it is unchanged
+/// from.
+pub fn verdict_line(npc_param_id: i32, observed: i32, v: Verdict) -> String {
     match v {
         Verdict::Recomputed { after_ms } => format!(
             "enemy-scaling recompute: npc_param {npc_param_id} max_hp followed the rung after \
              {after_ms}ms (now {observed})"
         ),
-        Verdict::StaleUnloaded { after_ms } => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} after {after_ms}ms \
-             -- UNLOADED, so the write is not finished (expected {expected}). Re-apply when it \
-             loads; do not count it as scaled (client#188)"
+        Verdict::StaleUnloaded {
+            after_ms,
+            unchanged_from,
+        } => format!(
+            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
+             {unchanged_from}) after {after_ms}ms -- UNLOADED, so the write is not finished. \
+             Re-apply when it loads; do not count it as scaled (client#188)"
         ),
-        Verdict::RetriesExhausted { after_ms, loaded } if loaded => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} after \
-             {MAX_REAPPLY} re-applications and {after_ms}ms while LOADED (expected {expected}) -- \
-             `ready` is NOT sufficient for a recompute, which is #186's reading reproduced by \
+        Verdict::RetriesExhausted {
+            after_ms,
+            loaded,
+            unchanged_from,
+        } if loaded => format!(
+            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
+             {unchanged_from}) after {MAX_REAPPLY} re-applications and {after_ms}ms while LOADED \
+             -- `ready` is NOT sufficient for a recompute, which is #186's reading reproduced by \
              experiment (client#188)"
         ),
-        Verdict::RetriesExhausted { after_ms, .. } => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} after {after_ms}ms \
-             -- unloaded throughout, never retried (client#188)"
+        Verdict::RetriesExhausted {
+            after_ms,
+            unchanged_from,
+            ..
+        } => format!(
+            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
+             {unchanged_from}) after {after_ms}ms -- unloaded throughout, never retried \
+             (client#188)"
         ),
-        Verdict::StaleLoaded { after_ms } => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} after {after_ms}ms \
-             while LOADED (expected {expected}) -- `ready` is NOT sufficient for a recompute. This \
-             is the #186 reading, and it decides the cluster (client#188)"
+        Verdict::StaleLoaded {
+            after_ms,
+            unchanged_from,
+        } => format!(
+            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
+             {unchanged_from}) after {after_ms}ms while LOADED -- `ready` is NOT sufficient for a \
+             recompute. This is the #186 reading, and it decides the cluster (client#188)"
         ),
     }
 }
@@ -285,7 +318,10 @@ mod replay {
         // While unloaded: reported once, never retried -- it cannot recompute, so a retry is churn.
         assert_eq!(
             w.poll(UNLOADED_KEY, STALE_HP, false, 2_000),
-            Action::Report(Verdict::StaleUnloaded { after_ms: 2_000 })
+            Action::Report(Verdict::StaleUnloaded {
+                after_ms: 2_000,
+                unchanged_from: STALE_HP,
+            })
         );
         assert_eq!(w.poll(UNLOADED_KEY, STALE_HP, false, 3_000), Action::Wait);
 
@@ -323,7 +359,8 @@ mod replay {
             a,
             Action::Report(Verdict::RetriesExhausted {
                 after_ms: 2_000,
-                loaded: true
+                loaded: true,
+                unchanged_from: 6080
             })
         );
         assert_eq!(w.poll(1, 6080, true, t + 5_000), Action::Wait, "said once");
@@ -337,19 +374,21 @@ mod replay {
         let v = Verdict::RetriesExhausted {
             after_ms: 8_000,
             loaded: true,
+            unchanged_from: 6080,
         };
         assert!(
             v.is_anomaly(),
             "this is the reading that decides the cluster"
         );
-        let line = verdict_line(47_500_014, 3826, 6080, v);
+        let line = verdict_line(47_500_014, 6080, v);
         assert!(line.contains("NOT sufficient"), "{line}");
         assert!(line.contains("client#188"), "{line}");
 
         // The unloaded flavour is ordinary and must NOT be an anomaly.
         assert!(!Verdict::RetriesExhausted {
             after_ms: 8_000,
-            loaded: false
+            loaded: false,
+            unchanged_from: 6080
         }
         .is_anomaly());
     }
@@ -396,7 +435,10 @@ mod replay {
         );
         assert_eq!(
             w.poll(UNLOADED_KEY, STALE_HP, false, 1_500),
-            Action::Report(Verdict::StaleUnloaded { after_ms: 1_500 }),
+            Action::Report(Verdict::StaleUnloaded {
+                after_ms: 1_500,
+                unchanged_from: STALE_HP,
+            }),
             "the unloaded one did not, and that is the expected answer -- not a defect"
         );
     }
@@ -410,9 +452,12 @@ mod replay {
         // Past the grace window and LOADED, the watch now RETRIES rather than merely reporting --
         // the report comes when the budget is spent (`retries_are_bounded_and_then_stated`).
         assert_eq!(w.poll(1, 6080, true, 56_000), Action::Reapply);
-        let v = Verdict::StaleLoaded { after_ms: 56_000 };
+        let v = Verdict::StaleLoaded {
+            after_ms: 56_000,
+            unchanged_from: 6080,
+        };
         assert!(v.is_anomaly(), "this is the reading worth a playtest");
-        let line = verdict_line(47_500_014, 3826, 6080, v);
+        let line = verdict_line(47_500_014, 6080, v);
         assert!(line.contains("NOT sufficient"), "{line}");
         assert!(line.contains("client#188"), "{line}");
     }
@@ -531,15 +576,84 @@ mod replay {
         assert_eq!(w.poll(1, 2, true, 5_000), Action::Wait);
     }
 
+    /// 🛑 NO LINE MAY SAY `expected 0`.
+    ///
+    /// `verdict_line` used to take an `expected: i32` that its ONE caller passed as the literal
+    /// `0`, so every warning read `(expected 0)` -- a number shaped exactly like a target `max_hp`
+    /// and not one. 13,487 of those in a single session. We do not know the target `max_hp` (the
+    /// engine derives it from the rung); the only thing the watch tests is that it should have
+    /// MOVED, so the line says what it failed to move FROM.
+    #[test]
+    fn no_verdict_claims_an_expected_value_it_does_not_have() {
+        for v in [
+            Verdict::StaleUnloaded {
+                after_ms: 2_000,
+                unchanged_from: 6080,
+            },
+            Verdict::StaleLoaded {
+                after_ms: 56_000,
+                unchanged_from: 6080,
+            },
+            Verdict::RetriesExhausted {
+                after_ms: 8_000,
+                loaded: true,
+                unchanged_from: 6080,
+            },
+            Verdict::RetriesExhausted {
+                after_ms: 8_000,
+                loaded: false,
+                unchanged_from: 6080,
+            },
+        ] {
+            let line = verdict_line(47_500_014, 6080, v);
+            assert!(
+                !line.contains("expected"),
+                "no invented expectation: {line}"
+            );
+            assert!(
+                line.contains("unchanged from 6080"),
+                "a non-move must say what it did not move from: {line}"
+            );
+        }
+    }
+
+    /// The success verdict is the one the census now COUNTS, and it must stay distinguishable from
+    /// the failures by pattern rather than by reading its text -- the caller branches on it to
+    /// decide between a tally bump and a log line.
+    #[test]
+    fn a_confirmed_recompute_is_neither_an_anomaly_nor_a_non_move() {
+        let v = Verdict::Recomputed { after_ms: 900 };
+        assert!(!v.is_anomaly());
+        let line = verdict_line(47_500_014, 7141, v);
+        assert!(line.contains("followed the rung"), "{line}");
+        assert!(!line.contains("unchanged from"), "{line}");
+    }
+
     /// Every line is ASCII (repo rule 10).
     #[test]
     fn the_lines_are_ascii() {
         for v in [
             Verdict::Recomputed { after_ms: 1 },
-            Verdict::StaleUnloaded { after_ms: 2_000 },
-            Verdict::StaleLoaded { after_ms: 56_000 },
+            Verdict::StaleUnloaded {
+                after_ms: 2_000,
+                unchanged_from: 6080,
+            },
+            Verdict::StaleLoaded {
+                after_ms: 56_000,
+                unchanged_from: 6080,
+            },
+            Verdict::RetriesExhausted {
+                after_ms: 8_000,
+                loaded: true,
+                unchanged_from: 6080,
+            },
+            Verdict::RetriesExhausted {
+                after_ms: 8_000,
+                loaded: false,
+                unchanged_from: 6080,
+            },
         ] {
-            assert!(verdict_line(47_500_014, 3826, 6080, v).is_ascii());
+            assert!(verdict_line(47_500_014, 6080, v).is_ascii());
         }
     }
 }
