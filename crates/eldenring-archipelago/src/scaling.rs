@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
 use eldenring::position::HavokPosition;
+use er_logic::id_sample::IdSample;
 use er_logic::scaling::{
     AreaAnchor, AreaSource, NUM_TIERS, RegionToastLedger, ScaleAction, ScalingConfig, ScalingKind,
     area_tier_from_histogram, baked_area_tier, band_native_tier, is_dlc_bucket,
@@ -571,7 +572,7 @@ struct SweepTally {
     /// Distinct `npc_param_id`s of the above, capped. Deliberately NOT merged into
     /// `area_moved_ids`: up-placement and down-placement obey different rules now, and one list
     /// would hide which rule moved a given enemy.
-    area_down_ids: Vec<i32>,
+    area_down_ids: IdSample,
     /// Carried a down state that is no longer warranted -- stripped, with nothing applied in its
     /// place. Non-zero here means a region's target moved up under enemies we had cut.
     cleared_down: u32,
@@ -588,7 +589,7 @@ struct SweepTally {
     /// log without turning a per-sweep line into a wall of ids. 🛑 `npc_param_id`, not `npc_id`:
     /// only the former joins to `NpcParam`, and the first version of this census logged the latter,
     /// which is why it named ids like `8000` that do not exist in the table at all.
-    unrunged_ids: Vec<i32>,
+    unrunged_ids: IdSample,
     /// Carried a BAND row and NO ladder rung. The class the band-as-native-tier ruling is about.
     band_only: u32,
     /// Carried a BAND row AND a ladder rung -- these take the Replace path today, which strips the
@@ -629,11 +630,15 @@ struct SweepTally {
     /// `UNRUNGED_ID_CAP`. Weeping logged `area-placed 5` for a sweep that moved an unknown number of
     /// entities across 5 distinct rows -- a number that reads like a count, caps at 12, and cannot
     /// be reasoned from. A census that cannot be reasoned from is worse than no census.
+    ///
+    /// ⭐ The "distinct rows" half is now `IdSample::distinct()`, which counts every id it saw
+    /// rather than the ones it kept, so that number is no longer capped at 12 either (clients#235).
+    /// This field stays: DISTINCT ROWS and ENTITIES MOVED are still two different questions.
     area_moved: u32,
     /// Distinct `npc_param_id`s that reached the tier ONLY because the area vouched for them --
     /// capped and deduplicated, like every other census list. This one is for READING (which rows
     /// did we infer a strength for), never for counting; `area_moved` is the count.
-    area_moved_ids: Vec<i32>,
+    area_moved_ids: IdSample,
     /// Entities found carrying our target rung AND something else in the clear space.
     ///
     /// These are now CLEARED rather than skipped (see `scale_one`), so this is a CONVERGENCE
@@ -668,10 +673,15 @@ struct SweepTally {
     /// all of `NpcParam` carry a non-ladder in-range effect innately, so nearly all of those 199 are
     /// applied at RUNTIME by something we have not identified. Naming them is how that stops being a
     /// mystery (candidates: the `7800..7902` spCategory-140 block, the `7400..7680` co-op ladder).
-    other_ids: Vec<i32>,
+    other_ids: IdSample,
 }
 
-/// Cap on `SweepTally::unrunged_ids`. A census, not a dump.
+/// Cap on how many ids each census list PRINTS. A census, not a dump.
+///
+/// 🛑 It caps the printing, not the counting. `IdSample` keeps the distinct population behind it and
+/// renders `+N more of M distinct` when it withholds anything, because for one session 63 of 76
+/// census lines claimed more than they printed with no marker at all, and a reader takes the list
+/// for the population (clients#235).
 const UNRUNGED_ID_CAP: usize = 12;
 /// Cap on `SweepTally::sample`. Enough tuples to see a pattern, few enough to read.
 const SAMPLE_CAP: usize = 24;
@@ -693,11 +703,21 @@ fn sampling() -> bool {
 }
 
 impl SweepTally {
+    /// 🛑 The id samples must be constructed with their cap; `Default` would give them cap 0 and
+    /// every list would render as `[, +N more of N distinct]` -- honest, and useless.
+    fn new() -> Self {
+        Self {
+            unrunged_ids: IdSample::new(UNRUNGED_ID_CAP),
+            area_down_ids: IdSample::new(UNRUNGED_ID_CAP),
+            area_moved_ids: IdSample::new(UNRUNGED_ID_CAP),
+            other_ids: IdSample::new(UNRUNGED_ID_CAP),
+            ..Default::default()
+        }
+    }
+
     fn note_unrunged(&mut self, npc_param_id: i32) {
         self.unrunged += 1;
-        if self.unrunged_ids.len() < UNRUNGED_ID_CAP && !self.unrunged_ids.contains(&npc_param_id) {
-            self.unrunged_ids.push(npc_param_id);
-        }
+        self.unrunged_ids.note(npc_param_id);
     }
 
     fn note_pair(&mut self, band: usize, table: usize) {
@@ -718,19 +738,12 @@ impl SweepTally {
     /// capped like every other census list -- this one is meant to be READ, not counted.
     fn note_area_down(&mut self, npc_param_id: i32) {
         self.area_down = self.area_down.saturating_add(1);
-        if self.area_down_ids.len() < UNRUNGED_ID_CAP && !self.area_down_ids.contains(&npc_param_id)
-        {
-            self.area_down_ids.push(npc_param_id);
-        }
+        self.area_down_ids.note(npc_param_id);
     }
 
     fn note_area_moved(&mut self, npc_param_id: i32) {
         self.area_moved = self.area_moved.saturating_add(1);
-        if self.area_moved_ids.len() < UNRUNGED_ID_CAP
-            && !self.area_moved_ids.contains(&npc_param_id)
-        {
-            self.area_moved_ids.push(npc_param_id);
-        }
+        self.area_moved_ids.note(npc_param_id);
     }
 
     /// Count one vanilla-shaped neighbour toward the area signal. Base-game rungs only -- a DLC rung
@@ -755,9 +768,7 @@ impl SweepTally {
     }
 
     fn note_other(&mut self, param_id: i32) {
-        if self.other_ids.len() < UNRUNGED_ID_CAP && !self.other_ids.contains(&param_id) {
-            self.other_ids.push(param_id);
-        }
+        self.other_ids.note(param_id);
     }
 }
 
@@ -885,7 +896,7 @@ pub fn tick() -> Option<String> {
     let target_tier = dbg.tier;
 
     let sample_on = sampling();
-    let mut tally = SweepTally::default();
+    let mut tally = SweepTally::new();
 
     // PASS ONE -- read the region before deciding anything about it. Mutates nothing; the whole
     // point is that every enemy in pass two is judged against the SAME, COMPLETE area reading.
@@ -1130,10 +1141,10 @@ pub fn tick() -> Option<String> {
                  atk{}); (re)scaled {} enemy(ies) ({} of them UNLOADED, whose max_hp recompute \
                  is still owed until they load; {} rung(s) RE-APPLIED to finish an earlier write \
                  -- client#188); unrunged {} (up-scaled by native tier {}, left \
-                 vanilla {}, npc_param_ids {:?}), down-scaled {} (settled {}, kept {}, cleared {}), \
-                 area-down {} across {} row(s) {:?}; other-in-range {} {:?}; band-only {}, \
+                 vanilla {}, npc_param_ids {}), down-scaled {} (settled {}, kept {}, cleared {}), \
+                 area-down {} across {} row(s) {}; other-in-range {} {}; band-only {}, \
                  band+rung {} {:?}, band_vs_table {:?}, residue {}; area-index {:?}{} from {} \
-                 vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {:?}, \
+                 vanilla-shaped {:?}; area-placed {} unrunged across {} distinct row(s) {}, \
                  still NoTouch {}",
                 NUM_TIERS - 1,
                 if dlc_region { ", DLC region" } else { "" },
@@ -1143,16 +1154,16 @@ pub fn tick() -> Option<String> {
                 tally.unrunged,
                 tally.scaled_by_native,
                 tally.left_vanilla,
-                tally.unrunged_ids,
+                tally.unrunged_ids.render(),
                 tally.scaled_down,
                 tally.settled_down,
                 tally.kept_down,
                 tally.cleared_down,
                 tally.area_down,
-                tally.area_down_ids.len(),
-                tally.area_down_ids,
+                tally.area_down_ids.distinct(),
+                tally.area_down_ids.render(),
                 tally.other_in_range,
-                tally.other_ids,
+                tally.other_ids.render(),
                 tally.band_only,
                 tally.band_and_rung,
                 tally.rung_band_pairs,
@@ -1171,8 +1182,8 @@ pub fn tick() -> Option<String> {
                 area_total,
                 area_dist,
                 tally.area_moved,
-                tally.area_moved_ids.len(),
-                tally.area_moved_ids,
+                tally.area_moved_ids.distinct(),
+                tally.area_moved_ids.render(),
                 tally.left_vanilla,
             );
         }
