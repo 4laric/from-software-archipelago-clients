@@ -3256,8 +3256,12 @@ impl shared::Core for Core {
         //     rooms, so a place key would arm the wrong fight (Alaric, 2026-08-06).
         //
         //     `present` is a LOAD test -- "is c4710 instantiated anywhere" -- so it goes true the
-        //     moment the area streams in. That is right for the GRANT (hand the player the tool
-        //     before the fight, wherever the randomiser put him) and wrong for the HOLD.
+        //     moment the area streams in. It used to key the GRANT as well, on the argument that
+        //     the player should hold the tool before the fight wherever the randomiser put him.
+        //     🛑 #594 RETIRED THAT (Alaric, 2026-08-16): a world-wide bool cannot say "near", and
+        //     it granted off an instance 157.3 m away with no bar up. `boss_present` is now read
+        //     for the DIAGNOSTIC only -- it is what tells a reader "he was loaded, just not here".
+        //     The grant and the hold both key on `rykard_fight_on` below.
         let boss_present = if can_grant {
             crate::scaling::any_character_present(er_logic::boss_grants::RYKARD_CHR_ID)
         } else {
@@ -3324,7 +3328,16 @@ impl shared::Core for Core {
                 }
             }
             let mut game = EldenRingHook;
-            if let Some(m) = er_logic::boss_grants::tick(&mut game, boss_present, holds) {
+            // #594: the GRANT keys on `rykard_fight_on`, not on `boss_present`. `boss_present` is a
+            // world-wide load test and it granted off an instance 157 m away with no fight running.
+            // `boss_present` is still read, and still printed by the diagnostic above, because
+            // "was he loaded at all" is what separates "the randomiser moved him" from "you are
+            // nowhere near him" -- it just no longer DECIDES.
+            // ⭐ ORDER IS LOAD-BEARING and already correct: `set_weapons_paused` is read AFTER this
+            // enqueue, so the queue is non-empty when the hold is evaluated and the pause cannot arm
+            // on the same tick that hands over the spear. See the note at the `set_weapons_paused`
+            // call -- it moved down for the fight-equip path and this rides the same fix.
+            if let Some(m) = er_logic::boss_grants::tick(&mut game, rykard_fight_on, holds) {
                 // EQUIP IT. `enqueue` self-gates on the auto_equip option AND on the category, so
                 // this is a no-op for anyone who turned auto_equip off. Pass the BASE id, exactly
                 // as the receive path passes its raw full_id: the auto_equip::enqueue_id seam is

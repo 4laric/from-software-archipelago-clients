@@ -109,11 +109,35 @@ pub fn is_rykard(npc_param_id: i32) -> bool {
 
 /// THE DECISION. `Some(full_id)` = grant now; `None` = do nothing.
 ///
-/// `present` = is the character loaded, `holds` = does the player already have one. Either input
-/// being `None` means the read failed this tick, and both failure modes resolve to "do nothing"
-/// (property 3).
-pub fn boss_grant_action(present: Option<bool>, holds: Option<bool>) -> Option<i32> {
-    match (present, holds) {
+/// `fight_on` = is the boss healthbar showing Rykard RIGHT NOW, `holds` = does the player already
+/// have one. Either input being `None` means the read failed this tick, and both failure modes
+/// resolve to "do nothing" (property 3).
+///
+/// ⭐⭐⭐ IT USED TO BE THE LOAD TEST, AND THE TRADE-OFF IS DELIBERATE (#594, Alaric 2026-08-16).
+/// `any_character_present` answers "is c4710 instantiated anywhere in the world", which goes true
+/// the moment the area streams in. That was chosen so the player would hold the spear BEFORE
+/// walking into the arena, wherever an enemy randomiser had put Rykard. It cost more than it
+/// bought: bobler's 2026-08-16 log grants off
+///
+/// ```text
+/// boss-grant: no boss healthbar up | c4710 loaded = yes | already holds the spear = no -> GRANTING
+/// serpent-hunter sightings: c4710 x1 -- npc_param 47101038 (ready) 157.3m
+/// ```
+///
+/// -- one instance, `ready`, **157 metres away**, no fight in progress; and the 2026-08-12 report
+/// behind this issue granted from a DIFFERENT MAP. A world-wide bool cannot say "near", so the
+/// question moved to one the game answers exactly: is the bar up, and is it him.
+///
+/// 🛑 THE COST, ACCEPTED ON PURPOSE: the spear now arrives as the healthbar comes up rather than at
+/// area load. `spear_to_hand` equips on the same tick, so it is in hand for the fight it is for --
+/// but a player who expected it in the bag on approach will not find it there. Alaric ruled this
+/// acceptable; do not "fix" it back to the load test without re-reading #594.
+///
+/// ⭐ The enemy-randomiser property is UNCHANGED. This is still keyed on `c4710` and never on the
+/// arena, so the spear still follows Rykard wherever he was moved to -- it now additionally
+/// requires that you are actually fighting him.
+pub fn boss_grant_action(fight_on: Option<bool>, holds: Option<bool>) -> Option<i32> {
+    match (fight_on, holds) {
         (Some(true), Some(false)) => Some(SERPENT_HUNTER_BASE),
         _ => None,
     }
@@ -306,7 +330,13 @@ pub fn grant_diagnosis(
     if bar.is_none() && present != Some(true) {
         return None;
     }
-    let granting = boss_grant_action(present, holds).is_some();
+    // 🛑 DERIVED FROM `healthbar_npc_param_id`, THE SAME INPUT THIS FUNCTION RENDERS -- never from
+    // `present`. Since #594 the decision keys on the FIGHT, not on the load, so a diagnostic that
+    // fed `present` to `boss_grant_action` would print "GRANTING" for exactly the case the change
+    // exists to stop. `present` survives below as TEXT only: "was c4710 loaded" is still the thing
+    // a reader needs to tell "the randomiser moved him" from "you are nowhere near him".
+    let fight_on = healthbar_shows(RYKARD_CHR_ID, healthbar_npc_param_id);
+    let granting = boss_grant_action(fight_on, holds).is_some();
     let bar_txt = match bar {
         Some(id) if is_rykard(id) => {
             format!("healthbar npc_param {id} = chr {}, IS Rykard", id / 10_000)
@@ -372,8 +402,8 @@ pub fn should_pause_weapon_equips(present: Option<bool>, queue_empty: bool, paus
 /// Production adapter. A `false` from `grant_full_id` means no inventory pointer this tick; we say
 /// nothing and the next tick retries, which is why the POSSESSION latch and not a "we tried" flag
 /// is what stops the second copy.
-pub fn tick(hook: &mut dyn GameHook, present: Option<bool>, holds: Option<bool>) -> Option<String> {
-    let full_id = boss_grant_action(present, holds)?;
+pub fn tick(hook: &mut dyn GameHook, fight_on: Option<bool>, holds: Option<bool>) -> Option<String> {
+    let full_id = boss_grant_action(fight_on, holds)?;
     if hook.grant_full_id(full_id, 1) {
         Some("Serpent-Hunter granted for Rykard".to_string())
     } else {
@@ -637,7 +667,8 @@ mod tests {
                     let Some(d) = grant_diagnosis(bar, present, holds) else {
                         continue;
                     };
-                    let decided = boss_grant_action(present, holds).is_some();
+                    let decided =
+                        boss_grant_action(healthbar_shows(RYKARD_CHR_ID, bar), holds).is_some();
                     assert_eq!(
                         d.contains("GRANTING"),
                         decided,
@@ -646,6 +677,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_loaded_rykard_with_no_healthbar_is_not_a_fight() {
+        // ⭐⭐⭐ MOTIVATING CASE (rule 11), #594, bobler 2026-08-16 12:56:57. One c4710 instance,
+        // `ready`, 157.3 m away, no bar up -- and the spear was granted. The presence bool was
+        // `Some(true)` and honestly so; it just answers a question about the WORLD when the
+        // decision needed one about the FIGHT.
+        //
+        // Before this change `boss_grant_action(Some(true), Some(false))` was reached with the LOAD
+        // answer and returned a full id. Now the load answer never reaches it, and the fight answer
+        // for "no bar up" is `Some(false)`.
+        assert_eq!(healthbar_shows(RYKARD_CHR_ID, Some(0)), Some(false));
+        assert_eq!(boss_grant_action(Some(false), Some(false)), None);
+
+        // ...and the diagnostic agrees, off the same input the caller passes it.
+        let d = grant_diagnosis(Some(0), Some(true), Some(false)).unwrap();
+        assert!(d.contains("c4710 loaded = yes"), "{d}");
+        assert!(d.contains("no grant"), "{d}");
+        assert!(!d.contains("GRANTING"), "{d}");
+
+        // The fight itself still grants, which is the half that must not regress.
+        assert_eq!(healthbar_shows(RYKARD_CHR_ID, Some(47101038)), Some(true));
+        assert_eq!(
+            boss_grant_action(Some(true), Some(false)),
+            Some(SERPENT_HUNTER_BASE)
+        );
+        let g = grant_diagnosis(Some(47101038), Some(true), Some(false)).unwrap();
+        assert!(g.contains("GRANTING"), "{g}");
     }
 
     #[test]
