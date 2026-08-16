@@ -147,9 +147,53 @@ pub fn shop_lock_label(item_name: &str) -> ShopLabel {
     }
 }
 
+/// The GoodsName + Caption for a goods row that MORE THAN ONE shop slot points at.
+///
+/// ⭐⭐⭐ AN HONEST SHARED NAME BEATS A CONFIDENT WRONG ONE (Alaric, 2026-08-16, on Funnyfail's Nexus
+/// report: *"all AP items from Kale look like they are 'Arrows(10)' for the OoT player, but in
+/// reality they are completely different items"*).
+///
+/// An FMG name belongs to a goods ROW, not to a shop slot, and the spare-row pool is 65 against as
+/// many as 501 shop checks -- so surplus slots share a row. Whichever slot's name was written last
+/// then spoke for all of them, and "Arrows (10)" was a REAL item name, correctly scouted, applied to
+/// three things that were not it. That is the worst possible failure: indistinguishable from working.
+///
+/// This does not fix the sharing -- the pool cannot grow (`tools/datamine_spare_goods.py`: a spare
+/// must already own an FMG entry to be renameable at all) and the write is once-per-session. It
+/// makes the sharing VISIBLE, so a player reads "several items" and goes to the tracker instead of
+/// buying what they think is a second copy of something.
+///
+/// 🛑 ASCII ONLY -- this text renders in-game.
+pub fn shop_shared_label(slots: usize) -> ShopLabel {
+    ShopLabel {
+        name: "Archipelago Items".to_string(),
+        caption: format!(
+            "AP: {slots} DIFFERENT items share this shelf slot's name.\n\
+             Elden Ring gives one name to one item row, and there are more Archipelago \n\
+             checks in this shop than spare rows to name them with.\n\
+             What you buy IS the right item -- only the label is shared.\n\
+             Check the multiworld tracker to see what each slot really holds."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_row_says_so_instead_of_naming_one_of_its_items() {
+        // MOTIVATING CASE (rule 11), Funnyfail 2026-08-16 + bobler's slot_data, where locations
+        // 7770048/7770049/7770050 all mapped to goods 1073751324. Before this, the row rendered
+        // whichever of the three was written last -- a real item name, for two items it was not.
+        let l = shop_shared_label(3);
+        assert_eq!(l.name, "Archipelago Items");
+        assert!(l.caption.contains("3 DIFFERENT items"), "{}", l.caption);
+        // It must not name an item, or it is the same lie with extra steps.
+        assert!(!l.caption.contains("Arrows"));
+        // 🛑 In-game text is ASCII only.
+        assert!(l.name.is_ascii() && l.caption.is_ascii());
+    }
 
     #[test]
     fn shop_label_progression_lock() {

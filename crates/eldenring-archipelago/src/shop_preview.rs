@@ -160,6 +160,9 @@ pub fn run() -> bool {
 
     // FOREIGN / gem slots only — own-world slots are sold natively by shop_sell. Per-category override
     // maps (name 10, info 20, caption 24) deduped by good id (the FMG entry is global).
+    // goods row -> every label the slots pointing at it produced. See the fold below for why this
+    // is not a `HashMap<u32, Label>` with an insert.
+    let mut by_row: HashMap<u32, Vec<er_logic::name_override::ShopLabel>> = HashMap::new();
     let mut nmap: HashMap<u32, Vec<u16>> = HashMap::new();
     let mut imap: HashMap<u32, Vec<u16>> = HashMap::new();
     let mut cmap: HashMap<u32, Vec<u16>> = HashMap::new();
@@ -209,6 +212,32 @@ pub fn run() -> bool {
             overridden += 1;
             er_logic::name_override::shop_label(&s.name, &s.owner, &s.game, s.kind)
         };
+        // 🛑 COLLECT, DO NOT INSERT. `nmap.insert(gid, ..)` OVERWRITES, and gid is the goods ROW --
+        // so when several slots share a row (the spare pool is 65 against up to 501 shop checks) the
+        // last write silently spoke for all of them. Funnyfail, 2026-08-16: "all AP items from Kale
+        // look like they are 'Arrows(10)'". That name was REAL and correctly scouted; it just
+        // belonged to one of the three. Gather per row, decide after.
+        by_row.entry(gid).or_default().push(lbl);
+    }
+
+    // ⭐ ONE ROW, ONE TRUTH. A row claimed by a single slot keeps that slot's real name. A row several
+    // slots share says so, in the player's words, instead of picking one of them and sounding sure.
+    // Labels are compared, not counted: two slots holding the SAME item name on one row is not a
+    // collision and must keep the specific name.
+    let mut shared_rows = 0u32;
+    for (gid, mut lbls) in by_row {
+        let distinct = {
+            let mut names: Vec<&str> = lbls.iter().map(|l| l.name.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            names.len()
+        };
+        let lbl = if distinct > 1 {
+            shared_rows += 1;
+            er_logic::name_override::shop_shared_label(distinct)
+        } else {
+            lbls.pop().expect("entry() only exists because something was pushed")
+        };
         nmap.insert(gid, lbl.name.encode_utf16().collect());
         let u: Vec<u16> = lbl.caption.encode_utf16().collect();
         imap.insert(gid, u.clone());
@@ -250,7 +279,9 @@ pub fn run() -> bool {
     let c = crate::fmg_inject::extend_swap_overrides(GOODS_CAPTION_CAT, &caps);
     log::info!(
         "shop-preview: {overridden} foreign/gem slot(s) + {locks} region-lock slot(s) marked ({} distinct, \
-         {native} own-world via shop_sell, {protected} left vanilla to protect a real good's shared FMG entry) \
+         {native} own-world via shop_sell, {protected} left vanilla to protect a real good's shared FMG entry, \
+         {shared_rows} row(s) SHARED by slots holding different items -> labelled 'Archipelago Items' rather \
+         than named after one of them, world#231) \
          -> extend-swap names={n} infos={i} captions={c}",
         names.len()
     );
