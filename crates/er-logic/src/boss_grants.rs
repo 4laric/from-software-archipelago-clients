@@ -402,7 +402,11 @@ pub fn should_pause_weapon_equips(present: Option<bool>, queue_empty: bool, paus
 /// Production adapter. A `false` from `grant_full_id` means no inventory pointer this tick; we say
 /// nothing and the next tick retries, which is why the POSSESSION latch and not a "we tried" flag
 /// is what stops the second copy.
-pub fn tick(hook: &mut dyn GameHook, fight_on: Option<bool>, holds: Option<bool>) -> Option<String> {
+pub fn tick(
+    hook: &mut dyn GameHook,
+    fight_on: Option<bool>,
+    holds: Option<bool>,
+) -> Option<String> {
     let full_id = boss_grant_action(fight_on, holds)?;
     if hook.grant_full_id(full_id, 1) {
         Some("Serpent-Hunter granted for Rykard".to_string())

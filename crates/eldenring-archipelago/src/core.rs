@@ -3334,9 +3334,10 @@ impl shared::Core for Core {
             // "was he loaded at all" is what separates "the randomiser moved him" from "you are
             // nowhere near him" -- it just no longer DECIDES.
             // ⭐ ORDER IS LOAD-BEARING and already correct: `set_weapons_paused` is read AFTER this
-            // enqueue, so the queue is non-empty when the hold is evaluated and the pause cannot arm
-            // on the same tick that hands over the spear. See the note at the `set_weapons_paused`
-            // call -- it moved down for the fight-equip path and this rides the same fix.
+            // enqueue, so the queue is non-empty when the hold is evaluated and the pause cannot
+            // arm on the same tick that hands over the spear. See the note at the
+            // `set_weapons_paused` call -- it moved down for the fight-equip path, and this rides
+            // the same fix.
             if let Some(m) = er_logic::boss_grants::tick(&mut game, rykard_fight_on, holds) {
                 // EQUIP IT. `enqueue` self-gates on the auto_equip option AND on the category, so
                 // this is a no-op for anyone who turned auto_equip off. Pass the BASE id, exactly
