@@ -341,7 +341,9 @@ fn remember_death_reading(player: Hp) {
 /// during a run of unchanged samples reported stale HP.
 fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp, now_ms: u64, mode: EmitMode) {
     let want_carried = mode == EmitMode::Always;
-    let Some((npc_id, boss, carried)) = find_boss(npc_param_id, want_carried) else {
+    let Some((instance_key, npc_id, boss, carried, row_matches)) =
+        find_boss(npc_param_id, want_carried)
+    else {
         // The healthbar names a boss the live sets do not contain. Real and expected around phase
         // transitions and cutscenes -- but stated, because a silent gap in a trace is
         // indistinguishable from a boss that stopped taking damage.
@@ -377,7 +379,7 @@ fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp, now_ms: u64, 
     }
 
     log::info!(
-        "{}",
+        "{} instance {instance_key} row_matches {row_matches}",
         format_sample(
             tag,
             &Reading {
@@ -400,7 +402,8 @@ fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp, now_ms: u64, 
         // line of its own rather than being folded in here.
         let (scaling, other) = partition_carried_speffects(carried);
         log::info!(
-            "boss-fight {tag} carried: npc_param {npc_param_id} npc_id {npc_id} speffects {:?} \
+            "boss-fight {tag} carried: instance {instance_key} npc_param {npc_param_id} \
+             npc_id {npc_id} speffects {:?} \
              (scaling rungs + down-states only, the same filter the enemy-scaling census uses)",
             scaling
         );
@@ -409,7 +412,8 @@ fn emit(tag: &str, npc_param_id: i32, elapsed_ms: u64, player: Hp, now_ms: u64, 
         // `maxHpRate != 1` row outside the native ladder slot. Without this, a boss holding a
         // vanilla 2x reads as a clean `[7010]` and its HP looks like a scaling defect.
         log::info!(
-            "boss-fight {tag} speffects OTHER: npc_param {npc_param_id} npc_id {npc_id} \
+            "boss-fight {tag} speffects OTHER: instance {instance_key} npc_param \
+             {npc_param_id} npc_id {npc_id} \
              {} entr(ies) {:?} -- everything the filter above drops. A row here CAN carry \
              maxHpRate (e.g. 4410 = 2.0x), so expected HP is NpcParam.hp x those rates x the rung, \
              never NpcParam.hp x the rung alone",
@@ -437,25 +441,33 @@ fn read_player() -> Option<Hp> {
 /// yield `&mut T: Subclass<ChrIns>` and the way this crate gets a `&ChrIns` out of one is to PASS
 /// it to a fn taking `&ChrIns` and let the coercion happen at the call site. `scaling.rs` pays for
 /// that lesson in a comment; this follows it rather than re-learning it on a CI round.
-fn find_boss(npc_param_id: i32, want_carried: bool) -> Option<(i32, Hp, Vec<i32>)> {
+fn find_boss(npc_param_id: i32, want_carried: bool) -> Option<(u64, i32, Hp, Vec<i32>, usize)> {
     let wcm = unsafe { WorldChrMan::instance() }.ok()?;
+    let mut found = None;
+    let mut matches = 0usize;
     for chr in crate::scaling::sweepable_characters(&wcm.open_field_chr_set.base) {
-        if let Some(found) = match_boss(chr, npc_param_id, want_carried) {
-            return Some(found);
+        if let Some(candidate) = match_boss(chr, npc_param_id, want_carried) {
+            matches += 1;
+            found.get_or_insert(candidate);
         }
     }
     for slot in wcm.chr_sets.iter().flatten() {
         for chr in crate::scaling::sweepable_characters(slot) {
-            if let Some(found) = match_boss(chr, npc_param_id, want_carried) {
-                return Some(found);
+            if let Some(candidate) = match_boss(chr, npc_param_id, want_carried) {
+                matches += 1;
+                found.get_or_insert(candidate);
             }
         }
     }
-    None
+    found.map(|(key, npc_id, hp, carried)| (key, npc_id, hp, carried, matches))
 }
 
 /// The `&ChrIns`-taking half of [`find_boss`] -- see its doc for why this is a separate fn.
-fn match_boss(chr: &ChrIns, npc_param_id: i32, want_carried: bool) -> Option<(i32, Hp, Vec<i32>)> {
+fn match_boss(
+    chr: &ChrIns,
+    npc_param_id: i32,
+    want_carried: bool,
+) -> Option<(u64, i32, Hp, Vec<i32>)> {
     if chr.npc_param_id != npc_param_id {
         return None;
     }
@@ -470,5 +482,10 @@ fn match_boss(chr: &ChrIns, npc_param_id: i32, want_carried: bool) -> Option<(i3
     } else {
         Vec::new()
     };
-    Some((chr.npc_id, Hp::new(data.hp, data.max_hp), carried))
+    Some((
+        crate::scaling::instance_key(chr),
+        chr.npc_id,
+        Hp::new(data.hp, data.max_hp),
+        carried,
+    ))
 }
