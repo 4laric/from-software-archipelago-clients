@@ -144,8 +144,8 @@ pub fn decide_from_position(
 /// region. The game's warp is asynchronous: the hook runs before the load, and without this seam
 /// the next frame can immediately undo the intercept from the stale pre-warp position.
 pub fn desired_across_warp(
-    source_region: Option<u32>,
-    current_region: Option<u32>,
+    source_region: Option<i32>,
+    current_region: Option<i32>,
     warp_desired: bool,
     position_desired: Option<bool>,
 ) -> (Option<bool>, bool) {

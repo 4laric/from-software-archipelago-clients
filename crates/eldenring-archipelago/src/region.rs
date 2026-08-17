@@ -1054,7 +1054,7 @@ static CAPITAL_DECLINE: Mutex<er_logic::capital_guard::DeclineLatch> =
 
 /// Warp-target decision plus the play-region observed when the asynchronous warp began. While the
 /// position reader still reports that source, the target wins over the stale position.
-static CAPITAL_PENDING_WARP: Mutex<Option<(Option<u32>, bool)>> = Mutex::new(None);
+static CAPITAL_PENDING_WARP: Mutex<Option<(Option<i32>, bool)>> = Mutex::new(None);
 
 /// Called by core.rs once slot_data is parsed (beside `region::parse`). The five `capital*`
 /// keys travel together; absent keys are the off-wire (`capital_reconciler: false`, or an
