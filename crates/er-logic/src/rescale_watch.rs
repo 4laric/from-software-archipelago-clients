@@ -19,12 +19,13 @@
 //! * **#183** -- the down-palette rows DO read on the player, and the RESTORE is unwitnessed. Same
 //!   shape: we watch the write and not the effect.
 //!
-//! # 🛑 THE OPEN CONTRADICTION THIS MODULE EXISTS TO SETTLE
+//! # The contradiction is settled
 //!
-//! #188's own note flags it: the controlled pair says `ready` recomputes, but **#186's data has two
-//! `ready` samples that stayed stale for 56 seconds**. Different builds, so either the behaviour
-//! changed, or -- and this is the live possibility -- **`ready` is necessary but not sufficient**,
-//! and those two were sampled inside a recompute window nobody has measured.
+//! Bobler's 2026-08-17 playtest reproduced three `ready` entities that stayed stale after three
+//! remove/re-apply cycles. `ready` is therefore not sufficient, and repeating the same write is not
+//! a recompute primitive. The same log supplied the missing unload edge: `npc_param 49801020`
+//! accepted `7010` while unloaded, kept the old `6577` then loaded at `2792`, exactly
+//! `NpcParam.hp 2447 * 1.141`. Loading rebuilt HP from the carried rung without a retry.
 //!
 //! "Stale for one tick" and "stale indefinitely" are the same reading today. They are opposite
 //! diagnoses: the first is a sampling artifact and needs no fix, the second is enemies standing at
@@ -45,18 +46,6 @@
 /// has not followed its rung is the #186 shape and is worth a line.
 pub const SETTLE_GRACE_MS: u64 = 1_000;
 
-/// How many times a stale write may be RE-APPLIED before we stop and say so.
-///
-/// ⭐ BOUNDED ON PURPOSE. The retry exists because a write to an `unloaded` chr does not recompute
-/// (#188: 0/6 followed), and re-applying when it loads is what finishes the job. But an entity that
-/// never recomputes however many times we write must not be re-written every sweep forever -- that
-/// is churn on a path walking ~340 entities a tick, and it would bury the finding.
-///
-/// 🛑 EXHAUSTING THE BUDGET ON A **LOADED** CHR IS THE ANSWER TO #186's OPEN QUESTION. If `ready`
-/// were sufficient, a loaded retry always takes. `RetriesExhausted { loaded: true }` says it is not
-/// -- in one line, from a real session, without anyone designing a second experiment.
-pub const MAX_REAPPLY: u32 = 3;
-
 /// How long before a still-stale write is called permanent rather than slow. #186's readings held
 /// for 56 s; 30 s is comfortably past any recompute window and still inside a single fight.
 pub const STALE_VERDICT_MS: u64 = 30_000;
@@ -67,19 +56,9 @@ pub enum Verdict {
     /// `max_hp` moved to the expected value. The write worked.
     Recomputed { after_ms: u64 },
     /// Still on the old number, and the character is `unloaded`. **This is #188's answer and it is
-    /// EXPECTED** -- an unloaded chr accepts the speffect and does not recompute. It is not a
-    /// defect in the write; it is a write that is not finished, and the fix is to re-apply when it
-    /// loads rather than to count it done.
+    /// EXPECTED** -- an unloaded chr accepts the speffect and does not recompute immediately.
+    /// Bobler's 2026-08-17 load edge proves construction later derives HP from the carried rung.
     StaleUnloaded { after_ms: u64, unchanged_from: i32 },
-    /// Re-applied [`MAX_REAPPLY`] times and `max_hp` still has not followed.
-    ///
-    /// On an `unloaded` entity this cannot happen (it is never retried). On a LOADED one it is
-    /// #186's reading, reached by experiment rather than by comparing two logs.
-    RetriesExhausted {
-        after_ms: u64,
-        loaded: bool,
-        unchanged_from: i32,
-    },
     /// 🛑 Still on the old number while LOADED, past the grace window. This is the reading #186
     /// saw and #188 could not explain, and it is the one that decides whether `ready` is
     /// sufficient. If this verdict never appears in a playtest, the loaded rule holds and #186 was
@@ -90,10 +69,7 @@ pub enum Verdict {
 impl Verdict {
     /// Is this the reading that changes the diagnosis?
     pub fn is_anomaly(&self) -> bool {
-        matches!(
-            self,
-            Verdict::StaleLoaded { .. } | Verdict::RetriesExhausted { loaded: true, .. }
-        )
+        matches!(self, Verdict::StaleLoaded { .. })
     }
 }
 
@@ -110,8 +86,6 @@ struct Pending {
     applied_ms: u64,
     /// Already reported, so a long-lived stale entry says its line once rather than per tick.
     reported: bool,
-    /// How many times this write has been RE-APPLIED (client#188).
-    retries: u32,
 }
 
 /// What the sweep should do about one watched entity this tick (client#188).
@@ -119,14 +93,6 @@ struct Pending {
 pub enum Action {
     /// Nothing: not watched, or still inside the grace window.
     Wait,
-    /// ⭐ RE-APPLY THE RUNG. The entity is LOADED and its `max_hp` still has not followed, so the
-    /// write is unfinished -- re-applying is what makes the engine recompute.
-    ///
-    /// 🛑 THE SWEEP CANNOT REACH THIS ON ITS OWN. `settled_on_target` returns early for a chr
-    /// carrying the target rung and nothing else -- exactly what an unloaded write leaves behind --
-    /// so the ordinary path skips it forever. That early return is right for every other purpose;
-    /// this is the one case that has to go around it.
-    Reapply,
     /// A decidable observation, for the log.
     Report(Verdict),
 }
@@ -175,19 +141,10 @@ impl RescaleWatch {
             max_hp_before,
             applied_ms: now_ms,
             reported: false,
-            retries: 0,
         });
     }
 
-    /// Decide this entity's fate: re-apply, report, or wait (client#188).
-    ///
-    /// # Why the retry is driven from here rather than from the sweep
-    ///
-    /// The sweep does not know which entities carry an unfinished write -- it sees a chr holding
-    /// the target rung and correctly leaves it alone. This watch is the only thing that knows a
-    /// write was made and did not take, so it is the only thing that can ask for exactly those
-    /// entities to be re-applied. Self-limiting by construction: an entity nobody wrote to is never
-    /// returned.
+    /// Decide this entity's fate: report a result once, or keep waiting (client#188).
     pub fn poll(&mut self, key: u64, max_hp_now: i32, loaded: bool, now_ms: u64) -> Action {
         let Some(idx) = self.pending.iter().position(|p| p.key == key) else {
             return Action::Wait;
@@ -212,20 +169,14 @@ impl RescaleWatch {
                 unchanged_from: p.max_hp_before,
             });
         }
-        if p.retries >= MAX_REAPPLY {
-            if self.pending[idx].reported {
-                return Action::Wait;
-            }
-            self.pending[idx].reported = true;
-            return Action::Report(Verdict::RetriesExhausted {
-                after_ms,
-                loaded,
-                unchanged_from: p.max_hp_before,
-            });
+        if self.pending[idx].reported {
+            return Action::Wait;
         }
-        self.pending[idx].retries += 1;
-        self.pending[idx].applied_ms = now_ms; // the retry restarts the window it is measured over
-        Action::Reapply
+        self.pending[idx].reported = true;
+        Action::Report(Verdict::StaleLoaded {
+            after_ms,
+            unchanged_from: p.max_hp_before,
+        })
     }
 
     /// Entities still waiting, and writes forgotten to the cap.
@@ -269,27 +220,8 @@ pub fn verdict_line(npc_param_id: i32, observed: i32, v: Verdict) -> String {
             unchanged_from,
         } => format!(
             "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
-             {unchanged_from}) after {after_ms}ms -- UNLOADED, so the write is not finished. \
-             Re-apply when it loads; do not count it as scaled (client#188)"
-        ),
-        Verdict::RetriesExhausted {
-            after_ms,
-            loaded,
-            unchanged_from,
-        } if loaded => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
-             {unchanged_from}) after {MAX_REAPPLY} re-applications and {after_ms}ms while LOADED \
-             -- `ready` is NOT sufficient for a recompute, which is #186's reading reproduced by \
-             experiment (client#188)"
-        ),
-        Verdict::RetriesExhausted {
-            after_ms,
-            unchanged_from,
-            ..
-        } => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
-             {unchanged_from}) after {after_ms}ms -- unloaded throughout, never retried \
-             (client#188)"
+             {unchanged_from}) after {after_ms}ms -- UNLOADED. The rung is carried; max_hp is \
+             deferred until construction on load, not forced by re-application (client#188)"
         ),
         Verdict::StaleLoaded {
             after_ms,
@@ -306,12 +238,10 @@ pub fn verdict_line(npc_param_id: i32, observed: i32, v: Verdict) -> String {
 mod replay {
     use super::*;
 
-    /// ⭐ THE RED-FIRST ASSERTION FOR THE FIX (client#188). The write to the UNLOADED half of the
-    /// controlled pair never recomputed -- 0/6 followed. When that chr finally loads, the sweep
-    /// skips it (it carries the rung, so `settled_on_target` returns early), so the ONLY thing that
-    /// can finish the job is a re-apply, and the watch is the only thing that knows to ask.
+    /// Bobler's 2026-08-17 edge: the unloaded write reads stale in place, then construction derives
+    /// the correct HP from the rung without a second write.
     #[test]
-    fn a_stale_write_is_re_applied_once_the_chr_loads() {
+    fn an_unloaded_write_recomputes_on_load_without_a_retry() {
         let mut w = RescaleWatch::new();
         w.note_applied(UNLOADED_KEY, 504_020_188, STALE_HP, 0);
 
@@ -325,91 +255,35 @@ mod replay {
         );
         assert_eq!(w.poll(UNLOADED_KEY, STALE_HP, false, 3_000), Action::Wait);
 
-        // It loads, still stale -> re-apply.
-        assert_eq!(w.poll(UNLOADED_KEY, STALE_HP, true, 4_000), Action::Reapply);
-    }
-
-    /// And the retry is what proves itself: after the re-apply, a moved `max_hp` retires the write.
-    #[test]
-    fn a_successful_retry_reports_recomputed_and_retires() {
-        let mut w = RescaleWatch::new();
-        w.note_applied(1, 1, STALE_HP, 0);
-        assert_eq!(w.poll(1, STALE_HP, true, 2_000), Action::Reapply);
         assert_eq!(
-            w.poll(1, RECOMPUTED_HP, true, 2_500),
-            Action::Report(Verdict::Recomputed { after_ms: 500 }),
-            "the window restarts at the retry, so this measures the RETRY's latency"
+            w.poll(UNLOADED_KEY, RECOMPUTED_HP, true, 4_000),
+            Action::Report(Verdict::Recomputed { after_ms: 4_000 })
         );
         assert_eq!(w.outstanding().0, 0);
     }
 
-    /// 🛑 BOUNDED. An entity that never follows must not be re-written every sweep for the session
-    /// -- that is churn on a path walking ~340 entities a tick.
+    /// An entity we never wrote to is not ours to diagnose.
     #[test]
-    fn retries_are_bounded_and_then_stated() {
-        let mut w = RescaleWatch::new();
-        w.note_applied(1, 47_500_014, 6080, 0);
-        let mut t = 2_000;
-        for _ in 0..MAX_REAPPLY {
-            assert_eq!(w.poll(1, 6080, true, t), Action::Reapply);
-            t += 2_000;
-        }
-        let a = w.poll(1, 6080, true, t);
-        assert_eq!(
-            a,
-            Action::Report(Verdict::RetriesExhausted {
-                after_ms: 2_000,
-                loaded: true,
-                unchanged_from: 6080
-            })
-        );
-        assert_eq!(w.poll(1, 6080, true, t + 5_000), Action::Wait, "said once");
-    }
-
-    /// ⭐ AND THAT EXHAUSTION IS THE ANSWER TO #186's OPEN QUESTION. If `ready` were sufficient a
-    /// loaded retry always takes; an exhausted budget on a LOADED chr says it is not, and it is
-    /// flagged as the anomaly so it reaches the log as a WARN.
-    #[test]
-    fn loaded_exhaustion_is_the_anomaly_that_settles_186() {
-        let v = Verdict::RetriesExhausted {
-            after_ms: 8_000,
-            loaded: true,
-            unchanged_from: 6080,
-        };
-        assert!(
-            v.is_anomaly(),
-            "this is the reading that decides the cluster"
-        );
-        let line = verdict_line(47_500_014, 6080, v);
-        assert!(line.contains("NOT sufficient"), "{line}");
-        assert!(line.contains("client#188"), "{line}");
-
-        // The unloaded flavour is ordinary and must NOT be an anomaly.
-        assert!(!Verdict::RetriesExhausted {
-            after_ms: 8_000,
-            loaded: false,
-            unchanged_from: 6080
-        }
-        .is_anomaly());
-    }
-
-    /// 🛑 AN ENTITY WE NEVER WROTE TO IS NEVER RE-APPLIED. The retry is self-limiting: the sweep
-    /// asks about every character it walks, and only the ones carrying an unfinished write come
-    /// back Reapply.
-    #[test]
-    fn an_unwatched_entity_is_never_re_applied() {
+    fn an_unwatched_entity_is_never_acted_on() {
         let mut w = RescaleWatch::new();
         assert_eq!(w.poll(999, 1, true, 60_000), Action::Wait);
     }
 
-    /// Inside the grace window nothing is re-applied -- the engine may simply not have run, and a
-    /// retry there would measure our own impatience.
+    /// Inside the grace window the engine may simply not have run. At the boundary, report the
+    /// loaded stale state once; do not repeat a write the playtest proved ineffective.
     #[test]
-    fn no_retry_inside_the_grace_window() {
+    fn loaded_stale_is_reported_once_after_the_grace_window() {
         let mut w = RescaleWatch::new();
         w.note_applied(1, 1, STALE_HP, 0);
         assert_eq!(w.poll(1, STALE_HP, true, SETTLE_GRACE_MS - 1), Action::Wait);
-        assert_eq!(w.poll(1, STALE_HP, true, SETTLE_GRACE_MS), Action::Reapply);
+        assert_eq!(
+            w.poll(1, STALE_HP, true, SETTLE_GRACE_MS),
+            Action::Report(Verdict::StaleLoaded {
+                after_ms: SETTLE_GRACE_MS,
+                unchanged_from: STALE_HP,
+            })
+        );
+        assert_eq!(w.poll(1, STALE_HP, true, SETTLE_GRACE_MS + 1), Action::Wait);
     }
 
     /// #188's controlled pair: same base 1939, same scan, same write, differing only in load
@@ -449,13 +323,11 @@ mod replay {
     fn a_loaded_entity_that_never_follows_is_flagged_as_the_anomaly() {
         let mut w = RescaleWatch::new();
         w.note_applied(1, 47_500_014, 6080, 0);
-        // Past the grace window and LOADED, the watch now RETRIES rather than merely reporting --
-        // the report comes when the budget is spent (`retries_are_bounded_and_then_stated`).
-        assert_eq!(w.poll(1, 6080, true, 56_000), Action::Reapply);
         let v = Verdict::StaleLoaded {
             after_ms: 56_000,
             unchanged_from: 6080,
         };
+        assert_eq!(w.poll(1, 6080, true, 56_000), Action::Report(v));
         assert!(v.is_anomaly(), "this is the reading worth a playtest");
         let line = verdict_line(47_500_014, 6080, v);
         assert!(line.contains("NOT sufficient"), "{line}");
@@ -594,16 +466,6 @@ mod replay {
                 after_ms: 56_000,
                 unchanged_from: 6080,
             },
-            Verdict::RetriesExhausted {
-                after_ms: 8_000,
-                loaded: true,
-                unchanged_from: 6080,
-            },
-            Verdict::RetriesExhausted {
-                after_ms: 8_000,
-                loaded: false,
-                unchanged_from: 6080,
-            },
         ] {
             let line = verdict_line(47_500_014, 6080, v);
             assert!(
@@ -640,16 +502,6 @@ mod replay {
             },
             Verdict::StaleLoaded {
                 after_ms: 56_000,
-                unchanged_from: 6080,
-            },
-            Verdict::RetriesExhausted {
-                after_ms: 8_000,
-                loaded: true,
-                unchanged_from: 6080,
-            },
-            Verdict::RetriesExhausted {
-                after_ms: 8_000,
-                loaded: false,
                 unchanged_from: 6080,
             },
         ] {

@@ -28,7 +28,6 @@ mod game;
 mod game_version_gate;
 mod goal;
 mod hook_impl;
-mod icon_seam_probe;
 mod input;
 mod inventory;
 mod key_resolver;

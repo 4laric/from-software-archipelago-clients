@@ -1,8 +1,9 @@
-//! STEP 0 — the "pre-scout proof" for the shop-name-preview feature. ZERO reverse-engineering: it
-//! proves the *data half* of shop previews end-to-end (ask AP what items sit at the seed's check
-//! locations, get back real item names + owning player, log them) without touching the game at all.
-//! If the log shows correct names, only the in-game UI hook (`MsgRepositoryImp::LookupEntry`, a
-//! separate effort — see `er_logic::name_override`) remains. See PRE-SCOUT-PROOF.md.
+//! Connect-time item scout and cache for shop names, previews, native wares and lock hints.
+//!
+//! Bobler's 2026-08-17 playtest returned all 1,760 requested locations and the downstream shop
+//! pass reported zero missing scout entries. The data path is no longer a probe: it is production
+//! infrastructure. Keep the one-line request/result telemetry, but never dump the whole seed's
+//! item table into the log again.
 //!
 //! ── How the scout API works (verified against third_party/archipelago_rs) ────────────────────────
 //! `Client::scout_locations(locations, CreateAsHint) -> oneshot::Receiver<Result<Vec<LocatedItem>,
@@ -144,7 +145,7 @@ const MAX_SCOUT_RETRIES: u32 = 3;
 /// State for the in-flight scout. Lives across serve-loop iterations because the result arrives on a
 /// later poll, not inline. Construct after slot_data is parsed; drive `pump()` every loop tick.
 pub struct ScoutProof {
-    /// `Some` until the scout has been issued (we only scout once for the proof).
+    /// `Some` until the scout has been issued.
     pending_request: Option<Vec<i64>>,
     /// The full location set, kept so a FAILED scout can re-arm `pending_request` (R8, SWEEP).
     locations: Vec<i64>,
@@ -157,10 +158,9 @@ pub struct ScoutProof {
 }
 
 impl ScoutProof {
-    /// `locations` = the check locations to scout. For the PROOF this is the keys of slot_data
-    /// `locationFlags` (already parsed in net.rs via `i64_to_u32_map`; pass `map.keys().copied()
-    /// .collect()`). The REAL feature scouts only the shop-slot locations once the apworld emits a
-    /// shop-slot -> location map; the proof just needs a known-good set.
+    /// `locations` = the check locations to scout, currently the keys of slot_data
+    /// `locationFlags` (already parsed in net.rs via `i64_to_u32_map`). Consumers share this cache,
+    /// so it deliberately covers the whole local location set rather than only shop slots.
     pub fn new(locations: Vec<i64>) -> Self {
         Self {
             locations: locations.clone(),
@@ -189,12 +189,12 @@ impl ScoutProof {
         //    spend; we only want the item info echoed back to the client.
         if let Some(locations) = self.pending_request.take() {
             if locations.is_empty() {
-                log::info!("AP scout-proof: no locations to scout (locationFlags empty); skipping");
+                log::info!("AP item scout: no locations to scout (locationFlags empty); skipping");
                 self.done = true;
                 return;
             }
             log::info!(
-                "AP scout-proof: scouting {} location(s) (CreateAsHint::No)",
+                "AP item scout: requesting {} location(s) (CreateAsHint::No)",
                 locations.len()
             );
             self.rx = Some(client.scout_locations(locations, CreateAsHint::No));
@@ -211,22 +211,13 @@ impl ScoutProof {
                 self.done = true;
                 store(&items); // populate the cache fmg_inject reads (names + captions)
                 log::info!(
-                    "AP scout-proof: received info for {} location(s) ===",
+                    "AP item scout: cache ready with {} location(s)",
                     items.len()
                 );
-                for li in &items {
-                    let loc_id = li.location().id();
-                    let item_name = li.item().name(); // ustr::Ustr (Display / AsRef<str>)
-                    let owner = li.receiver().alias(); // owning player's alias
-                    let line =
-                        er_logic::name_override::display_name(item_name.as_str(), Some(owner));
-                    log::info!("AP scout-proof: location {loc_id} -> {line}");
-                }
-                log::info!("AP scout-proof: === data path PROVEN (names above) ===");
             }
             Ok(Err(e)) => {
                 self.rx = None;
-                log::warn!("AP scout-proof: server returned an error for the scout: {e}");
+                log::warn!("AP item scout: server returned an error: {e}");
                 self.fail_or_retry();
             }
             Err(TryRecvError::Empty) => { /* still pending; try again next tick */ }
@@ -234,9 +225,7 @@ impl ScoutProof {
                 // Sender dropped: the connection went away before the reply arrived. NOTHING
                 // rebuilds this on reconnect (R8, SWEEP), so re-arm instead of latching done.
                 self.rx = None;
-                log::warn!(
-                    "AP scout-proof: scout receiver dropped before a reply (connection lost?)"
-                );
+                log::warn!("AP item scout: receiver dropped before a reply (connection lost?)");
                 self.fail_or_retry();
             }
         }
@@ -251,7 +240,7 @@ impl ScoutProof {
             self.retries += 1;
             self.pending_request = Some(self.locations.clone());
             log::warn!(
-                "AP scout-proof: re-arming scout, retry {}/{}",
+                "AP item scout: re-arming, retry {}/{}",
                 self.retries,
                 MAX_SCOUT_RETRIES
             );
@@ -259,7 +248,7 @@ impl ScoutProof {
             self.done = true;
             store(&[]);
             log::error!(
-                "AP scout-proof: scout failed after {} retries -- shop naming/preview DEGRADED this session (AP#<id> fallbacks)",
+                "AP item scout: failed after {} retries -- shop naming/preview DEGRADED this session (AP#<id> fallbacks)",
                 MAX_SCOUT_RETRIES
             );
         }

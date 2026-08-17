@@ -148,7 +148,7 @@ pub fn on_shop_open(begin: i32, end: i32) {
         log::info!(
             "shop-hints: shop opened over rows {lo}..={hi} before the connect scout replied, so \
              nothing can be classified as own or foreign yet -- DEFERRED, not skipped; re-open the \
-             shop once connected. (If this never stops, the scout failed -- grep 'AP scout-proof'.)"
+             shop once connected. (If this never stops, the scout failed -- grep 'AP item scout'.)"
         );
         return;
     }

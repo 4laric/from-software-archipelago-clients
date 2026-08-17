@@ -25,15 +25,17 @@
 //! # What this module is
 //!
 //! The pure half. It computes the splice geometry and classifies a module list; it reads no game
-//! memory. `eldenring_archipelago::icon_seam_probe` is the I/O half and only *reports* -- writing
-//! into a live texture is not something to attempt before the read side is understood.
+//! memory. The former `eldenring_archipelago::icon_seam_probe` was the I/O half. Bobler's
+//! 2026-08-17 playtest found `oo2core_6_win64.dll` loaded and confirmed the geometry below:
+//! decompression is reachable, the mip-0 payload is 25,600 bytes, and no lower mip is block-aligned.
+//! That default-on probe is retired; repeating those constants at every player produces no evidence.
 //!
 //! 🛑 THE SEAM ITSELF IS NOT REACHABLE YET, and that is the finding, not an omission.
 //! `fromsoftware-rs` binds `FD4ResCap`, `FD4ResCapHolder`, `FD4ResRep` and `DLFileDeviceManager`,
 //! but its Elden Ring crate exposes **32 singletons** and not one of them is a file device, a
 //! resource repository or a texture manager. The types exist; the entry point does not. Getting one
-//! means a pointer chase or an AOB scan, which is a research task and wants evidence first --
-//! starting with whether the game's own Oodle is even in the process, which is what the probe asks.
+//! means a pointer chase or an AOB scan. The next useful experiments are visual: whether the loader
+//! accepts a non-KRAK DCX, and whether a mip-0-only flower remains correct at every UI scale.
 
 /// Bytes per 4x4 block. BC1 is 8; every other BC format the atlases use is 16.
 pub const BC_BLOCK_BYTES_DEFAULT: usize = 16;

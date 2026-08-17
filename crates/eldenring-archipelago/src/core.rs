@@ -3684,11 +3684,6 @@ impl shared::Core for Core {
         // read-only diagnostic in the tick: everything above it has finished touching the character
         // sets, so the HP it reads is the HP the frame ends with.
         crate::boss_fight_probe::tick();
-        // One-shot and self-latching, so the tick cost after the first call is an atomic load.
-        // Rides here rather than on an init path because it wants the module list AFTER the game
-        // has finished loading whatever it loads.
-        crate::icon_seam_probe::run_once();
-
         // 8c. Ticker-only pickup notifs: set showDialogCondType=0 game-wide so AP grants show the
         //     native right-side ticker, not the blocking "NEW Y:OK" modal (was a retired-baker
         //     regulation edit; ported to runtime, latched once applied).
