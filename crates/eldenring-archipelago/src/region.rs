@@ -1084,21 +1084,6 @@ pub fn configure_capital(sd: &Value) {
     *CAPITAL.lock().unwrap() = cfg;
 }
 
-/// The pending GAME-MENU fast-travel destination (bonfire ENTITY id) while a menu grace warp
-/// is resolving, or None when no menu warp is in flight.
-///
-/// SUPERSEDED BY THE LuaWarp HOOK (warp_hook.rs) -- CONFIRMED in-game 2026-07-15. The hook
-/// detours the warp entry and pushes EVERY warp target straight into `capital_warp_intercept`
-/// at the moment of warp, menu-initiated included: two menu fast-travels logged
-/// `LuaWarp hook: warp arg ...` with no `warp: requested` companion, proving map fast-travel
-/// routes through the same LuaWarp the client calls. So this poll-style seam is never needed
-/// and stays permanently `None`. Kept (not deleted) so `tick_capital`'s intercept-then-latch
-/// chain reads cleanly and as a documented no-op fallback surface. The per-tick play_region
-/// latch remains the standing defense against anything flipping 9116 mid-session.
-pub fn capital_pending_warp_target() -> Option<u32> {
-    None
-}
-
 /// Per-tick 9116 latch: standing in an Ashen bucket -> hold ON; in a Royal bucket -> hold OFF;
 /// elsewhere -> leave the flag alone (the next warp's intercept restores the Royal default).
 /// Defends against anything flipping 9116 mid-session -- the map version would swap under the
