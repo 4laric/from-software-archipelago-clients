@@ -145,6 +145,8 @@ pub fn tick_goal_approach(
 pub fn tick_goal_gate(
     cfg: &RegionConfig,
     item_goals: &[String],
+    rune_goals: &[String],
+    runes_required: usize,
     has_item: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
     if !flags::in_world() {
@@ -161,6 +163,8 @@ pub fn tick_goal_gate(
         .unwrap_or_default();
     let gate = er_logic::goal_gate::GoalGate {
         item_goals: item_goals.to_vec(),
+        rune_goals: rune_goals.to_vec(),
+        runes_required,
         goal_lock_item: (!lock_item.is_empty()).then(|| lock_item.clone()),
     };
     let decision = er_logic::goal_gate::decide(&gate, has_item);

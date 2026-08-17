@@ -1,55 +1,32 @@
-//! The sentences the goal shows the PLAYER, as opposed to the ones it writes to the log
-//! (world#656).
-//!
-//! # The motivating case
-//!
-//! **AHHHREPTAR**, v0.4.0, 2026-08-14: he finished a `great_runes` seed holding four Great Runes
-//! and no victory was sent. His own diagnosis, arrived at by reading the spoiler log:
-//!
-//! > I think it expected me to get a very specific four great runes, rather than just any four of
-//! > the six.
-//!
-//! Correct. `core._resolve_required_runes` is `sorted(avail)[:want]`, so at `goal_great_runes: 4`
-//! the required set is a specific four, and four others complete nothing.
-//!
-//! # 🛑 THE DATA WAS NEVER MISSING. THE CHANNEL WAS.
-//!
-//! It is tempting to read #656 as "the required names are discarded at generation time". They are
-//! not, and that matters for the size of the fix:
-//!
-//! * the apworld emits them -- `"great_rune_items": list(required)` is in slot_data;
-//! * the contract declares them -- `contract_gen.rs` carries `great_rune_items`;
-//! * the client parses them into `GoalConfig::item_goals` and **already logs the names**.
-//!
-//! Every half worked, and a player still had to open the spoiler. `log::info!` goes to
-//! `archipelago-<date>.log`, which is the artifact we receive *after* someone reports a problem;
-//! the player is looking at the game. So this is not a new contract key, not a three-repo change,
-//! and not a generation fix -- it is the same string on the channel the player actually reads.
-//!
-//! # What the sentence has to say
-//!
-//! `release/EldenRing.yaml` promises "collect `goal_great_runes` Great Runes", which reads as **any
-//! N**, and the yaml comment carefully heads off a *lesser* misreading (that killing the bearer
-//! counts) while leaving the one that actually ends runs. So the line has to carry both facts:
-//! HOLD them, and they are a SPECIFIC set. Saying only "you must hold N items" would reproduce the
-//! template's own ambiguity in a second place.
+//! Player-facing description of held-item goal requirements (world#813).
 
-/// One line naming every item the goal requires, or `None` when it requires none.
-///
-/// Deliberately says "a SPECIFIC set chosen for this seed" rather than listing a count alone: the
-/// count is exactly what the yaml already promises, and the count is what misled the player this
-/// exists for.
-pub fn required_items_line(items: &[String]) -> Option<String> {
-    if items.is_empty() {
+/// Describe required Region Locks and the count-based Great Rune goal.
+pub fn required_items_line(
+    items: &[String],
+    rune_items: &[String],
+    runes_required: usize,
+) -> Option<String> {
+    let rune_count = runes_required.min(rune_items.len());
+    if items.is_empty() && rune_count == 0 {
         return None;
     }
-    Some(format!(
-        "goal: you must HOLD these {} item(s) -- killing the boss that vanilla-drops one is NOT \
-         enough, and they are a SPECIFIC set chosen for this seed, not any {} of a kind: {}",
-        items.len(),
-        items.len(),
-        items.join(", ")
-    ))
+    let mut parts = Vec::new();
+    if !items.is_empty() {
+        parts.push(format!(
+            "you must HOLD these {} item(s): {}",
+            items.len(),
+            items.join(", ")
+        ));
+    }
+    if rune_count != 0 {
+        parts.push(format!(
+            "hold any {} of these {} Great Runes: {}",
+            rune_count,
+            rune_items.len(),
+            rune_items.join(", ")
+        ));
+    }
+    Some(format!("goal: {}", parts.join("; ")))
 }
 
 #[cfg(test)]
@@ -60,73 +37,43 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    /// ⭐ AHHHREPTAR's seed. He held four Great Runes and the run did not end; the line has to name
-    /// WHICH four, and say they are a specific set rather than any four.
     #[test]
-    fn the_line_names_the_runes_and_says_they_are_specific() {
-        let line = required_items_line(&v(&[
+    fn any_four_of_seven_is_explicit() {
+        let runes = v(&[
             "Godrick's Great Rune",
+            "Great Rune of the Unborn",
             "Malenia's Great Rune",
             "Mohg's Great Rune",
             "Morgott's Great Rune",
-        ]))
-        .expect("a goal with items produces a line");
-        for name in [
-            "Godrick's Great Rune",
-            "Malenia's Great Rune",
-            "Mohg's Great Rune",
-            "Morgott's Great Rune",
-        ] {
-            assert!(line.contains(name), "every required item is named: {line}");
-        }
-        assert!(
-            line.contains("SPECIFIC"),
-            "a count alone is what the yaml already promises, and what misled him: {line}"
-        );
-        assert!(
-            line.contains("HOLD"),
-            "the other half of the yaml's promise: {line}"
-        );
+            "Radahn's Great Rune",
+            "Rykard's Great Rune",
+        ]);
+        let line = required_items_line(&[], &runes, 4).unwrap();
+        assert!(line.contains("any 4 of these 7 Great Runes"), "{line}");
+        assert!(!line.contains("SPECIFIC"), "{line}");
     }
 
-    /// 🛑 A REGION_LOCKS SEED GAINS NO BANNER. Most seeds require no items; a line saying so would
-    /// be noise on every connect, and noise is how the existing log line got ignored.
     #[test]
-    fn no_items_means_no_line() {
-        assert_eq!(required_items_line(&[]), None);
-    }
-
-    /// The item list is not only Great Runes -- `goalRequiredItems` puts the kept Region Locks in
-    /// the same bucket, and a great_runes seed needs the runes AND the locks. One line, all of it.
-    #[test]
-    fn region_locks_ride_the_same_line() {
-        let line = required_items_line(&v(&[
-            "Godrick's Great Rune",
-            "Liurnia Lock",
-            "Rauh Base Lock",
-        ]))
+    fn locks_and_runes_are_described_separately() {
+        let line = required_items_line(
+            &v(&["Liurnia Lock", "Stormveil Lock"]),
+            &v(&["Godrick's Great Rune", "Rykard's Great Rune"]),
+            1,
+        )
         .unwrap();
-        assert!(
-            line.contains("Liurnia Lock") && line.contains("Rauh Base Lock"),
-            "{line}"
-        );
-        assert!(line.contains("3 item(s)"), "{line}");
+        assert!(line.contains("HOLD these 2 item(s)"), "{line}");
+        assert!(line.contains("any 1 of these 2 Great Runes"), "{line}");
     }
 
-    /// A single requirement still reads as a sentence rather than a fragment.
     #[test]
-    fn one_item_is_still_a_sentence() {
-        let line = required_items_line(&v(&["Godrick's Great Rune"])).unwrap();
-        assert!(line.contains("1 item(s)"), "{line}");
-        assert!(line.contains("Godrick's Great Rune"), "{line}");
+    fn no_requirements_means_no_line() {
+        assert_eq!(required_items_line(&[], &[], 0), None);
     }
 
-    /// In-game strings are ASCII-only (repo rule 10). Item names come off the wire, so the check is
-    /// on the FRAME rather than on the whole line -- a foreign apworld may legitimately send
-    /// non-ASCII names and that must not be this function's problem.
     #[test]
-    fn the_frame_is_ascii() {
-        let line = required_items_line(&v(&["A", "B"])).unwrap();
-        assert!(line.is_ascii(), "{line}");
+    fn frame_is_ascii() {
+        assert!(required_items_line(&v(&["A"]), &v(&["B"]), 1)
+            .unwrap()
+            .is_ascii());
     }
 }

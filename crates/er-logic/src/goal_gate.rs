@@ -87,8 +87,11 @@ impl Decision {
 /// map or the region table would reintroduce precisely that drift.
 #[derive(Debug, Clone, Default)]
 pub struct GoalGate {
-    /// Every item the goal requires the player to HOLD (locks + great runes, per the wire).
+    /// Every non-rune item the goal requires the player to HOLD.
     pub item_goals: Vec<String>,
+    /// Full eligible Great Rune set and the number required from it.
+    pub rune_goals: Vec<String>,
+    pub runes_required: usize,
     /// The goal region's own lock item name, if it could be resolved. `None` => unresolvable.
     pub goal_lock_item: Option<String>,
 }
@@ -107,19 +110,27 @@ pub fn decide(gate: &GoalGate, held: &dyn Fn(&str) -> bool) -> Decision {
 
     // The goal region's own lock is excluded: it is the thing being granted, so requiring it would
     // be requiring the output as an input.
-    let outstanding: BTreeSet<&str> = gate
+    let mut outstanding: BTreeSet<String> = gate
         .item_goals
         .iter()
         .map(String::as_str)
         .filter(|name| *name != goal_lock)
         .filter(|name| !held(name))
+        .map(str::to_owned)
         .collect();
+    let held_runes = gate.rune_goals.iter().filter(|name| held(name)).count();
+    if held_runes < gate.runes_required {
+        outstanding.insert(format!(
+            "Great Runes ({held_runes}/{})",
+            gate.runes_required
+        ));
+    }
 
     if outstanding.is_empty() {
         Decision::Open
     } else {
         Decision::Withhold {
-            outstanding: outstanding.into_iter().map(str::to_owned).collect(),
+            outstanding: outstanding.into_iter().collect(),
         }
     }
 }
@@ -146,6 +157,8 @@ mod tests {
     fn gate(items: &[&str], lock: Option<&str>) -> GoalGate {
         GoalGate {
             item_goals: items.iter().map(|s| s.to_string()).collect(),
+            rune_goals: Vec::new(),
+            runes_required: 0,
             goal_lock_item: lock.map(str::to_owned),
         }
     }
@@ -193,10 +206,16 @@ mod tests {
     fn natural_progression_is_the_rune_count_alone_with_no_branch() {
         // NP mints no lock items, so the wire carries runes only -- and the single rule reduces to
         // "hold the runes" without this module knowing the mode exists (world#768, Alaric).
-        let g = gate(
-            &["Godrick's Great Rune", "Rykard's Great Rune"],
-            Some("Ashen Capital Lock"),
-        );
+        let mut g = gate(&[], Some("Ashen Capital Lock"));
+        g.rune_goals = [
+            "Godrick's Great Rune",
+            "Rykard's Great Rune",
+            "Radahn's Great Rune",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        g.runes_required = 2;
         assert!(!decide(&g, &holding(&["Godrick's Great Rune"])).opens());
         assert_eq!(
             decide(

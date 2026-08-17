@@ -25,7 +25,7 @@ pub struct GoalConfig {
     pub flag_goals: Vec<u32>,
     /// Goal location ids with no detection-flag entry: done when the checked set has them.
     pub checked_goals: Vec<i64>,
-    /// `great_rune_items` -- item NAMES the player must HOLD (have RECEIVED) before Goal can fire.
+    /// `goalRequiredItems` -- item NAMES the player must HOLD before Goal can fire.
     ///
     /// THE BUG THIS FIXES. The `great_runes` ending's own docstring promises "ALSO **collect** Great
     /// Runes", and AP's victory rule is exactly that: `state.has(rune)`. But the client's goal was
@@ -49,11 +49,18 @@ pub struct GoalConfig {
     /// Absent on a foreign apworld, on natural_progression (which mints no Lock items at all), and
     /// on any pre-0.2.18 seed -> empty -> no added requirement, exactly as before.
     pub item_goals: Vec<String>,
+    /// Full set of Great Rune names eligible for the count-based ending.
+    pub rune_goals: Vec<String>,
+    /// Number of distinct names from `rune_goals` the player must hold.
+    pub runes_required: usize,
 }
 
 impl GoalConfig {
     pub fn is_empty(&self) -> bool {
-        self.flag_goals.is_empty() && self.checked_goals.is_empty() && self.item_goals.is_empty()
+        self.flag_goals.is_empty()
+            && self.checked_goals.is_empty()
+            && self.item_goals.is_empty()
+            && self.runes_required == 0
     }
 }
 
@@ -77,15 +84,22 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
             })
             .unwrap_or_default()
     }
-    let runes = str_list(sd, "great_rune_items");
+    let rune_goals = str_list(sd, "great_rune_items");
+    let runes_required = sd
+        .get("great_runes_required")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or_else(|| rune_goals.len())
+        .min(rune_goals.len());
     // `goalRequiredItems`: the kept Region Locks the world's own completion_condition requires.
     // Additive, never replacing -- a great_runes seed needs the runes AND the locks.
     let locks = str_list(sd, "goalRequiredItems");
-    if !runes.is_empty() {
+    if runes_required != 0 {
         log::info!(
-            "goal: {} item(s) must be HELD, not merely their boss killed: {}",
-            runes.len(),
-            runes.join(", ")
+            "goal: hold any {} of these {} Great Runes: {}",
+            runes_required,
+            rune_goals.len(),
+            rune_goals.join(", ")
         );
     }
     if !locks.is_empty() {
@@ -95,8 +109,7 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
             locks.len()
         );
     }
-    let mut item_goals: Vec<String> = runes;
-    item_goals.extend(locks);
+    let item_goals = locks;
     let ids: Vec<i64> = sd
         .get("goalLocations")
         .and_then(|v| v.as_array())
@@ -161,6 +174,8 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
         flag_goals,
         checked_goals,
         item_goals,
+        rune_goals,
+        runes_required,
     }
 }
 
@@ -241,8 +256,8 @@ pub fn is_met(
     }
     cfg.flag_goals.iter().all(|&f| flag_read(f))
         && cfg.checked_goals.iter().all(|&l| is_checked(l))
-        // HELD, not killed. See GoalConfig::item_goals.
         && cfg.item_goals.iter().all(|n| has_item(n))
+        && cfg.rune_goals.iter().filter(|n| has_item(n)).count() >= cfg.runes_required
 }
 
 /// The goal's ITEM requirement, as one line for the player-visible channel (world#656).
@@ -251,7 +266,7 @@ pub fn is_met(
 /// host-tested rather than gated behind a Windows-only build. `None` when the goal needs no items,
 /// so a region_locks seed gains no banner line.
 pub fn describe_required_items(cfg: &GoalConfig) -> Option<String> {
-    er_logic::goal_text::required_items_line(&cfg.item_goals)
+    er_logic::goal_text::required_items_line(&cfg.item_goals, &cfg.rune_goals, cfg.runes_required)
 }
 
 #[cfg(test)]
@@ -378,7 +393,8 @@ mod foreign_goal {
             &json!({"goalLocations": [10], "great_rune_items": ["Godrick's Great Rune"]}),
             &lf(&[(10, 800)]),
         );
-        assert_eq!(cfg.item_goals, vec!["Godrick's Great Rune".to_string()]);
+        assert_eq!(cfg.rune_goals, vec!["Godrick's Great Rune".to_string()]);
+        assert_eq!(cfg.runes_required, 1);
         assert!(
             !is_met(&cfg, |_| true, |_| true, |_| false),
             "boss dead and every location checked, but the rune was never RECEIVED -- Goal must not fire"
@@ -392,23 +408,31 @@ mod foreign_goal {
     }
 
     #[test]
-    fn every_item_goal_is_required() {
+    fn any_required_number_of_eligible_runes_is_enough() {
         let cfg = parse(
-            &json!({"goalLocations": [], "great_rune_items": ["A", "B"]}),
+            &json!({
+                "goalLocations": [],
+                "great_rune_items": ["A", "B", "C"],
+                "great_runes_required": 2
+            }),
             &lf(&[]),
         );
         assert!(
             !is_met(&cfg, |_| true, |_| true, |n| n == "A"),
-            "holding one of two is not done"
+            "holding one of three is not enough for a two-rune goal"
         );
         assert!(is_met(&cfg, |_| true, |_| true, |n| n == "A" || n == "B"));
+        assert!(is_met(&cfg, |_| true, |_| true, |n| n == "A" || n == "C"));
     }
 
     #[test]
     fn item_goals_alone_are_a_valid_goal() {
         // is_empty() must account for item_goals, or a goal made only of items would read as EMPTY
         // and "can never be met" -- the exact fail-closed branch that would silently brick the ending.
-        let cfg = parse(&json!({"great_rune_items": ["A"]}), &lf(&[]));
+        let cfg = parse(
+            &json!({"great_rune_items": ["A"], "great_runes_required": 1}),
+            &lf(&[]),
+        );
         assert!(!cfg.is_empty());
         assert!(is_met(&cfg, |_| true, |_| true, |n| n == "A"));
     }
@@ -448,17 +472,18 @@ mod foreign_goal {
 
     #[test]
     fn required_locks_compose_with_great_runes_rather_than_replacing_them() {
-        // A great_runes seed needs the runes AND the locks. Neither key may shadow the other --
-        // they arrive as two separate slot_data keys and must both land in item_goals.
+        // A great_runes seed needs the rune COUNT AND every lock. Neither key may shadow the other.
         let cfg = parse(
             &json!({
                 "goalLocations": [],
-                "great_rune_items": ["Godrick's Great Rune"],
+                "great_rune_items": ["Godrick's Great Rune", "Rykard's Great Rune"],
+                "great_runes_required": 1,
                 "goalRequiredItems": ["Limgrave Lock"]
             }),
             &lf(&[]),
         );
-        assert_eq!(cfg.item_goals.len(), 2, "one key overwrote the other");
+        assert_eq!(cfg.item_goals, vec!["Limgrave Lock"]);
+        assert_eq!(cfg.runes_required, 1);
         assert!(
             !is_met(&cfg, |_| true, |_| true, |n| n == "Limgrave Lock"),
             "locks held but the rune was never received"

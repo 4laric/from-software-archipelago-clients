@@ -3311,9 +3311,13 @@ impl shared::Core for Core {
             // Same `received_all` source as the notice and as `goal::is_met`, so the gate, the
             // warning and the goal can never disagree about which items the player holds.
             if let Some(goal) = self.goal.as_ref()
-                && let Some(m) = crate::region::tick_goal_gate(cfg, &goal.item_goals, &|n| {
-                    received_all.contains(n)
-                })
+                && let Some(m) = crate::region::tick_goal_gate(
+                    cfg,
+                    &goal.item_goals,
+                    &goal.rune_goals,
+                    goal.runes_required,
+                    &|n| received_all.contains(n),
+                )
             {
                 region_msgs.push(m);
             }
