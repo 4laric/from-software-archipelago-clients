@@ -7,12 +7,20 @@
 //! received rune is usable immediately (Divine Altar activation) WITHOUT the Divine Tower trip --
 //! which under num_regions may sit in a sealed region. All idempotent: flags are save-persisted.
 //!
-//! NOTE: the AP catalog already maps each great rune to its RESTORED goods row (FullID
-//! 0x40000000 | 191..196), so the base item grant already gives the usable rune. We therefore ONLY
-//! set the flag here -- we must NOT additively grant the goods a second time (that double-granted the
-//! rune -> in-game "maximum allowed in inventory").
+//! The AP catalog maps each great rune to the boss-drop goods row (8148-8153). The restore flag makes
+//! that received row usable and, crucially, disarms the Divine-Tower award event. We therefore ONLY
+//! set the flag here -- granting the restored goods too would create the duplicate this module exists
+//! to prevent.
 
 use crate::flags;
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+/// Restore flags for Great Runes that exist in THIS seed's item map. These are armed at slot-data
+/// parse time, before receipt: event 90005110 does not check possession of the boss-drop rune before
+/// awarding its vanilla restored copy, so receipt-only reconciliation loses when the altar is used
+/// first (#731). Empty until configured, and cleared on a seed switch.
+static SEED_GREAT_RUNE_FLAGS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Companion items whose possession is gated by a vanilla "obtained" event flag.
 ///
@@ -66,6 +74,47 @@ fn entries() -> impl Iterator<Item = (&'static str, &'static [u32])> {
                 .iter()
                 .map(|w| (w.name, w.affinity_flags)),
         )
+}
+
+fn seed_great_rune_flags(names: &[String]) -> Vec<u32> {
+    let names: HashSet<&str> = names.iter().map(String::as_str).collect();
+    KEY_ITEM_ACQUIRE_FLAGS
+        .iter()
+        .filter(|(name, _)| names.contains(*name))
+        .flat_map(|(_, fs)| fs.iter().copied())
+        .filter(|f| (191..=196).contains(f))
+        .collect()
+}
+
+/// Configure the altar-disarm set from the seed's `apIdsToItemIds` names. Deriving from the seed
+/// map keeps foreign/older worlds additive: only runes the server says can arrive are touched.
+pub fn configure_seed_great_runes(names: &[String]) {
+    let configured = seed_great_rune_flags(names);
+    log::info!(
+        "great-rune altars: {} restore flag(s) armed from the seed item map",
+        configured.len()
+    );
+    *SEED_GREAT_RUNE_FLAGS.lock().unwrap() = configured;
+}
+
+/// Clear seed-scoped configuration before parsing a different room.
+pub fn reset_seed_great_runes() {
+    SEED_GREAT_RUNE_FLAGS.lock().unwrap().clear();
+}
+
+/// Disarm vanilla's altar awards before the matching AP rune arrives. The event flag is the latch;
+/// retry every stable tick because menu/load-time writes can be discarded by the game.
+pub fn tick_seed_great_rune_altars() {
+    let configured = SEED_GREAT_RUNE_FLAGS.lock().unwrap().clone();
+    let mut applied = 0u32;
+    for f in configured {
+        if !flags::get_event_flag(f) && flags::try_set_event_flag(f, true) {
+            applied += 1;
+        }
+    }
+    if applied > 0 {
+        log::info!("great-rune altars: {applied} restore flag(s) applied before vanilla award");
+    }
 }
 
 /// The vanilla obtained / great-rune restored flag(s) mapped to a received item `name` (empty if
@@ -131,6 +180,16 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_runes_disarm_only_their_own_altars_before_receipt() {
+        let names = vec![
+            "Rykard's Great Rune".to_string(),
+            "Malenia's Great Rune".to_string(),
+            "Rune Arc".to_string(),
+        ];
+        assert_eq!(seed_great_rune_flags(&names), vec![194, 196]);
+    }
 
     /// The motivating case (rule 11): a pool-received whetblade must unlock ITS FULL affinity set,
     /// FIRST affinity included -- the Hexinton CE table showed the pickup flag IS that unlock, so

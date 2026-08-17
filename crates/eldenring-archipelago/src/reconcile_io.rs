@@ -247,7 +247,8 @@ fn inventory_has_goods(goods: i32) -> bool {
     // every tick — check the two other places the game keeps a good the player owns.
     //
     // 1. the great-rune equip slot, where an equipped rune may be the only place the row is visible.
-    if great_rune_slot_row(pgd.equipment.equip_item_data.great_rune.gaitem_handle) == Some(want_row)
+    if great_rune_slot_row(pgd.equipment.equip_item_data.great_rune.gaitem_handle)
+        .is_some_and(|row| er_logic::great_runes::equipped_row_satisfies(want_row, row))
     {
         return true;
     }

@@ -943,6 +943,19 @@ impl shared::Core for Core {
                 // `reduce_non_somber_upgrade_cost` (bool toggle -> cap 1).
                 crate::upgrade_cost::set_flatten(er_logic::options::parse_flatten_cap(sd));
                 let map = i64_map(sd.get("apIdsToItemIds"));
+                // Disarm each Divine-Tower vanilla award BEFORE its AP rune is received. Event
+                // 90005110 awards the restored rune without checking possession of the boss-drop
+                // row, so receipt-only flag reconciliation can lose this race (#731). Resolve the
+                // names from this seed's own map rather than assuming a fixed rune roster.
+                let seed_item_names: Vec<String> = client
+                    .game(client.this_player().game())
+                    .map(|g| {
+                        map.keys()
+                            .filter_map(|id| g.item(*id).map(|it| it.name().to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                crate::keyitems::configure_seed_great_runes(&seed_item_names);
                 // The GOODS rows this seed can actually GRANT. shop_icon / shop_preview must never
                 // repaint one of these: EquipParamGoods.iconId and the GoodsName FMG entry are SHARED
                 // per good id, so flowering the vanilla ware behind a shop slot re-icons and renames
@@ -980,17 +993,9 @@ impl shared::Core for Core {
                 // received (tick_baked_fallback below) -- the real foreign apworld ships its
                 // whole item table even on no-lock seeds, so table presence must never arm.
                 if crate::region::foreign_seed_without_region_keys(sd) {
-                    let names: Vec<String> = client
-                        .game(client.this_player().game())
-                        .map(|g| {
-                            map.keys()
-                                .filter_map(|id| g.item(*id).map(|it| it.name().to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
                     crate::region::prepare_baked_fallback(
                         &mut region,
-                        names.iter().map(|s| s.as_str()),
+                        seed_item_names.iter().map(|s| s.as_str()),
                     );
                 }
                 let fogwall = crate::fogwall::parse(sd);
@@ -2286,9 +2291,9 @@ impl shared::Core for Core {
                             && crate::reconcile_io::owns_ledger())
                         {
                             if dispatch.hook.grant_full_id(full_id, qty) {
-                                // Great-rune "restored" flag is set by keyitems::set_acquire_flags
-                                // (191-196); the AP item already grants the restored goods row, so
-                                // there is no additive goods grant here (that double-granted the rune).
+                                // Great-rune restore flag is set by keyitems::set_acquire_flags
+                                // (191-196); the AP item grants boss-drop row 8148-8153, so there is
+                                // no additive restored-goods grant here (that duplicates the rune).
                             } else {
                                 // H3: the grant did NOT place — hold received_through at this item
                                 // and stop so the tail replays in order next tick (never advance the
@@ -3200,6 +3205,13 @@ impl shared::Core for Core {
         // Player-facing overlay messages from the region ticks (warp requested / arrival /
         // kick) -- collected here because cfg borrows self, logged after the borrow ends.
         let mut region_msgs: Vec<String> = Vec::new();
+        if can_grant {
+            // Unlike received-key flags, these are deliberately armed from the SEED roster,
+            // before receipt, so a Divine Tower cannot mint a duplicate vanilla Great Rune.
+            // Keep this outside the reconciler ownership branch: DesiredInputs only contains
+            // received items and therefore cannot represent the pre-receipt altar disarm.
+            crate::keyitems::tick_seed_great_rune_altars();
+        }
         if let Some(cfg) = self.region.as_ref() {
             if let Some(m) = crate::region::tick_random_start_warp(cfg) {
                 region_msgs.push(m);
@@ -4120,6 +4132,7 @@ impl Core {
         self.received_through = 0;
         self.dispatched_through = 0;
         self.item_map = None;
+        crate::keyitems::reset_seed_great_runes();
         self.item_counts.clear();
         self.region = None;
         self.fogwall = None;
