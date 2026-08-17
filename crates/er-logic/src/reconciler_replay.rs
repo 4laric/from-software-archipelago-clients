@@ -989,7 +989,7 @@ mod replay {
         /// The player action at the Roundtable grace, 2026-07-29 ~01:36:10: equip the rune.
         fn equip_great_rune(&mut self, goods: GoodsId) {
             self.inner.drop_good(goods);
-            self.equipped_great_rune = Some(goods);
+            self.equipped_great_rune = crate::great_runes::restored_row_for_received(goods);
             self.inner.refuse_unique_adds = true;
         }
 
@@ -1020,7 +1020,10 @@ mod replay {
             // UNION the great-rune equip slot UNION the storage box. Drop either out-of-bag term
             // (that is what `PossessionReads` is for) and the matching acceptance test below reds.
             self.inner.has_good(g)
-                || (self.reads.equip_slot && self.equipped_great_rune == Some(g))
+                || (self.reads.equip_slot
+                    && self
+                        .equipped_great_rune
+                        .is_some_and(|row| crate::great_runes::equipped_row_satisfies(g, row)))
                 || (self.reads.storage && self.stored_goods.contains(&g))
         }
         fn grant_good(&mut self, g: GoodsId, comp: &[FlagId]) -> bool {
@@ -1032,8 +1035,8 @@ mod replay {
     }
 
     /// Morgott's Great Rune exactly as the live mapper builds it (`core.rs` -> `KeyItem` via
-    /// `keyitems::acquire_flags`): goods row 193 -- the RESTORED row, not the 8150 vanilla drop that
-    /// shares its display name -- with restored flag 193.
+    /// `keyitems::acquire_flags`): boss-drop goods row 8150 plus restored flag 193. The flag makes
+    /// the AP-received row usable and disarms the Divine-Tower award; there is no second goods grant.
     fn morgott_rune_inputs() -> DesiredInputs {
         DesiredInputs {
             seed: SEED.into(),
@@ -1042,7 +1045,7 @@ mod replay {
                 index: 0,
                 name: "Morgott's Great Rune".into(),
                 semantics: ItemSemantics::KeyItem {
-                    goods: 193,
+                    goods: 8150,
                     obtained_flags: vec![193],
                 },
             }],
@@ -1075,7 +1078,7 @@ mod replay {
     /// slot, the reconciler emits zero re-grants for an equipped rune.
     #[test]
     fn an_equipped_great_rune_reads_as_possessed_and_never_re_grants_replay() {
-        const MORGOTT: GoodsId = 193;
+        const MORGOTT: GoodsId = 8150;
         const TICKS_AFTER_EQUIP: usize = 400;
 
         for reads_equip_slot in [false, true] {
