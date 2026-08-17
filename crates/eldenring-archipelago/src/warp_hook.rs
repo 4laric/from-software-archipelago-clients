@@ -1,9 +1,9 @@
 //! LuaWarp hook -- capture the pending fast-travel TARGET at the moment of warp and push it
 //! into the capital-version reconciler. Confirmed in-game 2026-07-15 (see region.rs).
 //!
-//! THE SEAM (SPEC-capital-reconciler.md): `region::capital_pending_warp_target()` has no crate
-//! API for the engine's queued MENU fast-travel destination, so a map fast-travel only gets its
-//! 9116 correction one tick AFTER the load (the per-tick latch), not before. This hook fills the
+//! THE SEAM (SPEC-capital-reconciler.md): there is no crate API for the engine's queued MENU
+//! fast-travel destination, so a map fast-travel would otherwise get its 9116 correction one tick
+//! AFTER the load (the per-tick latch), not before. This hook fills the
 //! seam push-style instead: detour the game's own `LuaWarp` entry — the function
 //! `warp::warp_to_grace` already calls, RVA + prologue signature pinned there — and hand EVERY
 //! warp's target to `region::capital_warp_intercept` before the load resolves.
@@ -15,7 +15,7 @@
 //! `warp: requested grace warp` line (that one only comes from `warp_to_grace`) — proves menu
 //! warps route through LuaWarp and the seam is filled. A menu fast-travel that produces NO
 //! `LuaWarp hook:` line means menu warps take another path, and we pivot back to a poll-style
-//! seam that `capital_pending_warp_target` would otherwise poll (now permanently None; see region.rs).
+//! seam with a different engine hook.
 //!
 //! Install: from `core::update_live` (game thread, same timing as the AddItemFunc detour in
 //! detour.rs, whose structure this module copies). Degrade, don't crash: a prologue-signature
