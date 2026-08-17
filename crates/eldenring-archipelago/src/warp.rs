@@ -21,6 +21,9 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use eldenring::cs::{BonfireWarpParam, SoloParamRepository};
+use fromsoftware_shared::FromStatic;
+
 /// `LuaWarp` entry, 2.6.2.0. Re-resolve via the module AOB above on a game update.
 pub(crate) const LUA_WARP_FUNC_RVA: usize = 0x0059_9C10;
 /// First 16 bytes at the entry (standard prologue), read from the pinned exe. A mismatch means
@@ -40,6 +43,22 @@ pub(crate) type LuaWarpFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u32) 
 
 /// One-time confirm log guard: 0 = unprobed, 1 = probed (result may still be per-call).
 static PROBE_LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+/// Resolve a grace's warp-unlock flag into the entity id accepted by [`warp_to_grace`].
+///
+/// Both fields come from the live `BonfireWarpParam`; there is deliberately no baked flag/entity
+/// table to drift on a game update. `None` means the param repository is not ready or no row owns
+/// that flag, and the console prints that degradation rather than inventing a mapping.
+pub(crate) fn grace_entity_for_unlock_flag(unlock_flag: u32) -> Option<u32> {
+    // SAFETY: read-only FD4 singleton access on the game thread (the console command runs from
+    // FrameBegin). A pre-world/not-ready repository returns Err and therefore None.
+    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
+    er_logic::grace::entity_for_unlock_flag(
+        repo.rows::<BonfireWarpParam>()
+            .map(|(_, row)| (row.eventflag_id(), row.bonfire_entity_id())),
+        unlock_flag,
+    )
+}
 
 pub(crate) fn current_module_base() -> Option<usize> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
