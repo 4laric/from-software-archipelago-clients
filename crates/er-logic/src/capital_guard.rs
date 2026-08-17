@@ -140,6 +140,22 @@ pub fn decide_from_position(
     }
 }
 
+/// Keep a warp-target decision authoritative while the position reader still reports the source
+/// region. The game's warp is asynchronous: the hook runs before the load, and without this seam
+/// the next frame can immediately undo the intercept from the stale pre-warp position.
+pub fn desired_across_warp(
+    source_region: Option<u32>,
+    current_region: Option<u32>,
+    warp_desired: bool,
+    position_desired: Option<bool>,
+) -> (Option<bool>, bool) {
+    if source_region == current_region {
+        (Some(warp_desired), true)
+    } else {
+        (position_desired, false)
+    }
+}
+
 /// Emits a decline once per CHANGE rather than once per tick.
 ///
 /// The latch runs every tick and the answer is `AlreadyCorrect` almost always; logging that at
@@ -187,6 +203,19 @@ mod replay {
             "ON from position alone is what made bobler's world permanent"
         );
         assert_eq!(d.write(), None);
+    }
+
+    #[test]
+    fn stale_source_position_cannot_undo_an_outbound_warp() {
+        let (desired, keep_pending) =
+            desired_across_warp(Some(1_105_011), Some(1_105_011), false, Some(true));
+        assert_eq!(desired, Some(false));
+        assert!(keep_pending);
+
+        let (desired, keep_pending) =
+            desired_across_warp(Some(1_105_011), Some(6_301_000), false, None);
+        assert_eq!(desired, None);
+        assert!(!keep_pending);
     }
 
     /// 🛑 THE FINALE MUST STILL WORK. The same observation through the WARP-TARGET seam is explicit

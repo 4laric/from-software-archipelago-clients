@@ -1052,11 +1052,16 @@ static CAPITAL_ARMED_LOGGED: AtomicBool = AtomicBool::new(false);
 static CAPITAL_DECLINE: Mutex<er_logic::capital_guard::DeclineLatch> =
     Mutex::new(er_logic::capital_guard::DeclineLatch::new());
 
+/// Warp-target decision plus the play-region observed when the asynchronous warp began. While the
+/// position reader still reports that source, the target wins over the stale position.
+static CAPITAL_PENDING_WARP: Mutex<Option<(Option<u32>, bool)>> = Mutex::new(None);
+
 /// Called by core.rs once slot_data is parsed (beside `region::parse`). The five `capital*`
 /// keys travel together; absent keys are the off-wire (`capital_reconciler: false`, or an
 /// apworld that predates the feature) -- the client logs INERT and never touches 9116.
 pub fn configure_capital(sd: &Value) {
     CAPITAL_ARMED_LOGGED.store(false, Ordering::Relaxed);
+    *CAPITAL_PENDING_WARP.lock().unwrap() = None;
     let cfg = er_logic::capital::parse(sd);
     match &cfg {
         Some(c) => log::info!(
@@ -1115,14 +1120,27 @@ pub fn tick_capital() {
             cfg.burn_flag
         );
     }
-    // Menu fast-travel seam first (decide from the TARGET before the load when available;
-    // today the seam returns None and the latch corrects one tick after the load instead).
-    let desired = capital_pending_warp_target()
-        .and_then(|t| er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, t))
-        .or_else(|| {
-            flags::play_region_id()
-                .and_then(|pr| er_logic::capital::capital_flag_state(&cfg.sets, pr))
-        });
+    let play_region = flags::play_region_id();
+    let position_desired =
+        play_region.and_then(|pr| er_logic::capital::capital_flag_state(&cfg.sets, pr));
+    let desired = {
+        let mut pending = CAPITAL_PENDING_WARP.lock().unwrap();
+        match *pending {
+            Some((source, warp_desired)) => {
+                let (desired, keep) = er_logic::capital_guard::desired_across_warp(
+                    source,
+                    play_region,
+                    warp_desired,
+                    position_desired,
+                );
+                if !keep {
+                    *pending = None;
+                }
+                desired
+            }
+            None => position_desired,
+        }
+    };
     let current = flags::get_event_flag(cfg.burn_flag);
     // ⭐ THE CORROBORATOR (client#200). Read only to justify an ON inferred from POSITION; `None`
     // when the apworld does not emit the key, which leaves behaviour exactly as it shipped.
@@ -1189,6 +1207,9 @@ pub fn capital_warp_intercept(grace_entity_id: u32) {
     let armed = flags::get_event_flag(cfg.burn_done_flag);
     let desired = er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, grace_entity_id);
     let current = flags::get_event_flag(cfg.burn_flag);
+    if let Some(want) = desired {
+        *CAPITAL_PENDING_WARP.lock().unwrap() = Some((flags::play_region_id(), want));
+    }
     // 🛑 `decide`, NOT `decide_from_position`: a warp TARGET is explicit player intent, chosen
     // before the load, and setting 9116 ON from one is exactly what this seam is for. The finale
     // must still work. Only the per-tick latch, which infers from where the player ended up, has
