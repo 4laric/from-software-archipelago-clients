@@ -213,32 +213,29 @@ fn pre_burn_the_reconciler_never_writes() {
     );
 }
 
-/// The scoped latch: outside the capital buckets the flag is left ALONE (holding OFF globally
-/// would fight m13's setter and re-trigger $Event(900)'s wait gratuitously). The next warp's
-/// intercept — not the latch — is what restores the Royal default out there.
+/// Once the burn-done latch arms the reconciler, every known non-Ashen position restores Royal.
+/// The arming gate is what prevents this from fighting m13 during the burn.
 #[test]
-fn outside_the_capitals_the_latch_leaves_the_flag_alone() {
+fn outside_the_capitals_the_latch_restores_the_royal_state() {
     let mut s = Sim::new();
     s.burn();
     // Post-burn the player is warped into Ashen with 9116 ON. Suppose they walk/fall out into
-    // a non-capital bucket without warping: the latch has no opinion there.
+    // a non-capital bucket without warping: the position latch must still recover the save.
     s.bucket = LIMGRAVE;
     let writes_before = s.client_writes.len();
     s.tick(POLICY);
     s.tick(POLICY);
     assert!(
-        s.flag_9116,
-        "elsewhere -> leave alone: ON survives until a warp says otherwise"
+        !s.flag_9116,
+        "a known position outside Ashen restores the Royal state"
     );
     assert_eq!(
         s.client_writes.len(),
-        writes_before,
-        "no gratuitous toggles"
+        writes_before + 1,
+        "one correcting write, then the latch converges"
     );
-    // The next warp (anywhere non-Ashen) is what writes OFF.
+    // A later non-Ashen warp is already correct and adds no write.
     s.warp(ROUNDTABLE_GRACE, POLICY);
-    assert!(
-        !s.flag_9116,
-        "the warp intercept, not the latch, restores the Royal default"
-    );
+    assert!(!s.flag_9116);
+    assert_eq!(s.client_writes.len(), writes_before + 1);
 }

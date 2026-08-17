@@ -23,9 +23,8 @@
 //!   * Arming gate: INERT until the burn-done latch (flag 118, `common.emevd` $Event(900)'s
 //!     final step, monotonic) reads set — the first burn is 100% the game's own sequence, and
 //!     writing 9116 between Maliketh's death and 118 would fight the in-flight burn.
-//!   * The latch is SCOPED to the capital buckets: elsewhere -> `None` (leave the flag alone).
-//!     Holding OFF globally would fight m13's setter during the burn; outside the capitals the
-//!     next warp's intercept restores the Royal default instead.
+//!   * Once armed, every known position outside Ashen/Throne holds the reversible capital state
+//!     OFF. The burn-done gate prevents this from fighting m13's setter during the burn.
 //!   * Reconcile-don't-dispatch: write only on readback mismatch, re-apply per tick until it
 //!     sticks, no cursor ever advances.
 
@@ -56,13 +55,16 @@ pub struct CapitalConfig {
     /// armor rows release on 9116 itself; re-keyed to 118 so the OFF-default cannot de-stock
     /// them). `capitalReleaseRows`.
     pub release_rows: Vec<(u32, u32, u32)>,
-    /// The vanilla world-burn flag (300), used ONLY to corroborate an ON write inferred from the
-    /// player's position (client#200). `capitalWorldBurnFlag`.
+    /// The reversible vanilla world-burn flag (300), held with the map selector so leaving Ashen
+    /// restores the unburnt world and entering it retains the finale arena. `capitalWorldBurnFlag`.
     ///
     /// 🛑 OPTIONAL, AND ITS ABSENCE CHANGES NOTHING. It was emitted in slot_data long before
     /// anything read it; a seed from an apworld that omits it keeps exactly the behaviour it
-    /// shipped with. See `capital_guard::decide_from_position`.
+    /// shipped with; only 9116 is then reconciled.
     pub world_burn_flag: Option<u32>,
+    /// The vanilla pre-burn world-state flag (302). When entering Ashen it must be cleared;
+    /// elsewhere it is deliberately left alone. `capitalPreBurnFlag`.
+    pub pre_burn_flag: Option<u32>,
 }
 
 /// Parse the capital keys out of slot_data. `None` = INERT (option off / old apworld / a
@@ -102,13 +104,57 @@ pub fn parse(sd: &Value) -> Option<CapitalConfig> {
         .and_then(|v| v.as_u64())
         .map(|n| n as u32)
         .filter(|&f| f != 0);
+    let pre_burn_flag = sd
+        .get("capitalPreBurnFlag")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .filter(|&f| f != 0);
     Some(CapitalConfig {
         burn_flag,
         burn_done_flag,
         sets: CapitalSets { ashen, royal },
         release_rows,
         world_burn_flag,
+        pre_burn_flag,
     })
+}
+
+/// Current values of the three reversible capital-state flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapitalState {
+    pub burn: bool,
+    pub world_burn: Option<bool>,
+    pub pre_burn: Option<bool>,
+}
+
+/// Mismatched flag writes needed to reach one capital version.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapitalWrites {
+    pub burn: Option<bool>,
+    pub world_burn: Option<bool>,
+    pub pre_burn: Option<bool>,
+}
+
+/// Reconcile the complete capital state, not only map selector 9116.
+///
+/// World-burn follows the same desired state as 9116. Pre-burn is asymmetric: Ashen requires it
+/// OFF, while Royal/outside leaves it untouched, matching the apworld contract.
+pub fn reconcile_state(
+    burn_done: bool,
+    desired: Option<bool>,
+    current: CapitalState,
+) -> CapitalWrites {
+    let Some(want) = desired.filter(|_| burn_done) else {
+        return CapitalWrites::default();
+    };
+    CapitalWrites {
+        burn: (current.burn != want).then_some(want),
+        world_burn: current
+            .world_burn
+            .filter(|&value| value != want)
+            .map(|_| want),
+        pre_burn: (want && current.pre_burn == Some(true)).then_some(false),
+    }
 }
 
 fn int_list(v: &Value) -> Option<Vec<i32>> {
@@ -126,18 +172,15 @@ fn bucket_of_play_region(pr: i32) -> i32 {
     }
 }
 
-/// Per-tick latch: what 9116 must be while STANDING at `play_region`.
-/// `Some(true)` = hold ON (Ashen/Throne bucket), `Some(false)` = hold OFF (Royal bucket),
-/// `None` = leave the flag alone (everywhere else — the scoped-latch refinement; the next
-/// warp's intercept restores the Royal default instead).
+/// Per-tick latch: what the reversible capital state must be while STANDING at `play_region`.
+/// `Some(true)` = hold ON (Ashen/Throne bucket); every other known region holds OFF. An unreadable
+/// position is represented by the caller not invoking this function, rather than a guessed id.
 pub fn capital_flag_state(sets: &CapitalSets, play_region: i32) -> Option<bool> {
     let b = bucket_of_play_region(play_region);
     if sets.ashen.contains(&b) {
         Some(true)
-    } else if sets.royal.contains(&b) {
-        Some(false)
     } else {
-        None
+        Some(false)
     }
 }
 
@@ -217,17 +260,17 @@ mod tests {
     }
 
     #[test]
-    fn elsewhere_the_latch_leaves_the_flag_alone() {
+    fn anywhere_outside_ashen_holds_the_royal_state() {
         let s = sets();
         assert_eq!(
             capital_flag_state(&s, 11_100),
-            None,
-            "Roundtable is never a capital"
+            Some(false),
+            "Roundtable holds the Royal state"
         );
-        assert_eq!(capital_flag_state(&s, 60_000), None, "Limgrave");
+        assert_eq!(capital_flag_state(&s, 60_000), Some(false), "Limgrave");
         assert_eq!(
             capital_flag_state(&s, 6_100_000),
-            None,
+            Some(false),
             "7-digit non-capital"
         );
     }
@@ -302,6 +345,72 @@ mod tests {
     }
 
     #[test]
+    fn complete_state_follows_ashen_and_royal() {
+        let burnt = CapitalState {
+            burn: true,
+            world_burn: Some(true),
+            pre_burn: Some(false),
+        };
+        assert_eq!(
+            reconcile_state(true, Some(false), burnt),
+            CapitalWrites {
+                burn: Some(false),
+                world_burn: Some(false),
+                pre_burn: None,
+            },
+            "leaving Ashen must clear both selectors; 9116 alone leaves the world burnt"
+        );
+
+        let royal = CapitalState {
+            burn: false,
+            world_burn: Some(false),
+            pre_burn: Some(true),
+        };
+        assert_eq!(
+            reconcile_state(true, Some(true), royal),
+            CapitalWrites {
+                burn: Some(true),
+                world_burn: Some(true),
+                pre_burn: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn goal_gate_world_burn_is_cleared_even_when_9116_is_already_off() {
+        let after_goal_gate = CapitalState {
+            burn: false,
+            world_burn: Some(true),
+            pre_burn: Some(false),
+        };
+        assert_eq!(
+            reconcile_state(true, Some(false), after_goal_gate),
+            CapitalWrites {
+                burn: None,
+                world_burn: Some(false),
+                pre_burn: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pre_burn_is_untouched_outside_ashen_and_everything_is_armed() {
+        let current = CapitalState {
+            burn: false,
+            world_burn: Some(false),
+            pre_burn: Some(true),
+        };
+        assert_eq!(
+            reconcile_state(true, Some(false), current),
+            CapitalWrites::default()
+        );
+        assert_eq!(
+            reconcile_state(false, Some(true), current),
+            CapitalWrites::default()
+        );
+    }
+
+    #[test]
     fn parse_requires_all_keys_together_and_nonempty_sides() {
         let full = json!({
             "capitalBurnFlag": 9116,
@@ -310,6 +419,8 @@ mod tests {
             "capitalRoyalPlayRegions": [11000],
             "capitalReleaseRows": [[101516, 9116, 118], [101517, 9116, 118],
                                     [101518, 9116, 118], [101519, 9116, 118]],
+            "capitalWorldBurnFlag": 300,
+            "capitalPreBurnFlag": 302,
         });
         let c = parse(&full).expect("full emission parses");
         assert_eq!(c.burn_flag, 9116);
@@ -323,6 +434,8 @@ mod tests {
         );
         assert_eq!(c.release_rows.len(), 4);
         assert_eq!(c.release_rows[0], (101516, 9116, 118));
+        assert_eq!(c.world_burn_flag, Some(300));
+        assert_eq!(c.pre_burn_flag, Some(302));
 
         // Absent keys are the off-wire (option off / old apworld): INERT, not an error.
         assert_eq!(parse(&json!({})), None);
