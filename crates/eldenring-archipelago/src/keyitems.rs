@@ -5,7 +5,8 @@
 //! such an item is RECEIVED, we set that flag so the feature actually opens. Great runes set their
 //! "restored" event flag (191-196; the SetEventFlagID in Divine-Tower common event 90005110) so the
 //! received rune is usable immediately (Divine Altar activation) WITHOUT the Divine Tower trip --
-//! which under num_regions may sit in a sealed region. All idempotent: flags are save-persisted.
+//! which under num_regions may sit in a sealed region. Leyndell's separate two-rune threshold is
+//! reconciled from AP receipts below. All idempotent: flags are save-persisted.
 //!
 //! The AP catalog maps each great rune to the boss-drop goods row (8148-8153). The restore flag makes
 //! that received row usable and, crucially, disarms the Divine-Tower award event. We therefore ONLY
@@ -60,6 +61,25 @@ const KEY_ITEM_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Mohg's Great Rune", &[195]),
     ("Malenia's Great Rune", &[196]),
 ];
+
+const GREAT_RUNE_NAMES: &[&str] = &[
+    "Godrick's Great Rune",
+    "Radahn's Great Rune",
+    "Morgott's Great Rune",
+    "Rykard's Great Rune",
+    "Mohg's Great Rune",
+    "Malenia's Great Rune",
+    "Great Rune of the Unborn",
+];
+
+const LEYNDELL_TWO_RUNES_FLAG: u32 = 182;
+
+fn received_great_rune_count(received: &HashSet<String>) -> usize {
+    GREAT_RUNE_NAMES
+        .iter()
+        .filter(|name| received.contains(**name))
+        .count()
+}
 
 /// Every (item name, obtained flags) pair this module applies: the two local tables plus the
 /// whetblade affinity sets from `er_logic::whetblade` -- ONE source shared with the check repoint,
@@ -175,6 +195,22 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
             );
         }
     }
+
+    // The physical seal is `EventFlag(182) && EventFlag(105)`. Common event 730 derives 182 from
+    // possession flags 171-177, but event 6905 populates those only once from vanilla boss flags,
+    // before late AP receipts. Do NOT set 171-177 here: 171-176 are the randomized Great Rune
+    // location flags and 177 belongs to the same vanilla family, so doing so would spend checks.
+    // Reconcile the non-location threshold output directly once AP has delivered any two runes.
+    if received_great_rune_count(received) >= 2
+        && !flags::get_event_flag(LEYNDELL_TWO_RUNES_FLAG)
+        && flags::try_set_event_flag(LEYNDELL_TWO_RUNES_FLAG, true)
+    {
+        log::info!(
+            "great runes: {} AP-received -- Leyndell two-rune threshold flag {} applied",
+            received_great_rune_count(received),
+            LEYNDELL_TWO_RUNES_FLAG
+        );
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +225,36 @@ mod tests {
             "Rune Arc".to_string(),
         ];
         assert_eq!(seed_great_rune_flags(&names), vec![194, 196]);
+    }
+
+    #[test]
+    fn ap_rune_count_includes_all_seven_identities() {
+        let received: HashSet<String> = GREAT_RUNE_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(received_great_rune_count(&received), 7);
+    }
+
+    #[test]
+    fn unrelated_items_and_duplicates_do_not_inflate_the_rune_count() {
+        let received = HashSet::from([
+            "Godrick's Great Rune".to_string(),
+            "Great Rune of the Unborn".to_string(),
+            "Rune Arc".to_string(),
+        ]);
+        assert_eq!(received_great_rune_count(&received), 2);
+    }
+
+    #[test]
+    fn leyndell_fix_never_adds_location_flags_to_receive_mapping() {
+        for &name in GREAT_RUNE_NAMES {
+            let flags = acquire_flags(name);
+            assert!(
+                flags.iter().all(|f| !(171..=177).contains(f)),
+                "{name}: possession/location flag leaked into receive mapping"
+            );
+        }
     }
 
     /// The motivating case (rule 11): a pool-received whetblade must unlock ITS FULL affinity set,
