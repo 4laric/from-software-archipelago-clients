@@ -436,6 +436,15 @@ pub trait Core: Send + Sized {
         false
     }
 
+    /// Usage strings for the game-specific dev console.
+    ///
+    /// The overlay renders this exact slice; implementations should also derive their `!help`
+    /// output from it so the visible command list has one owner. Empty by default because each
+    /// game's dispatcher is different.
+    fn console_command_usages(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether this slot participates in DeathLink, or `None` while the answer is not yet known.
     ///
     /// Drives the `DeathLink` connection tag (see [`Self::reconcile_death_link_tag`]). The tag is

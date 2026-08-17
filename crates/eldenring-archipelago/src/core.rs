@@ -31,6 +31,45 @@ const SURFACE_ORANGE: [f32; 4] = [0.9882, 0.6863, 0.2431, 1.0];
 /// Dim gray for locked-region headers in the tracker window (mirrors imgui's TextDisabled).
 const LOCKED_GRAY: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
 
+// ONE command registry owns dispatch recognition, the overlay hint and `!help` (#217). Adding a
+// row updates both visible lists; the exhaustive `match ConsoleCommand` in handle_command then
+// refuses to compile until the new command has a handler.
+macro_rules! console_commands {
+    ($( $variant:ident => $name:literal => $usage:literal ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum ConsoleCommand {
+            $( $variant ),+
+        }
+
+        impl ConsoleCommand {
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            fn name(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $name ),+
+                }
+            }
+
+            fn parse(input: &str) -> Option<Self> {
+                Self::ALL.iter().copied().find(|command| command.name() == input)
+            }
+        }
+
+        const CONSOLE_COMMAND_USAGES: &[&str] = &[$($usage),+];
+    };
+}
+
+console_commands! {
+    Flag => "!flag" => "!flag <id>",
+    SetFlag => "!setflag" => "!setflag <id> [0|1]",
+    Region => "!region" => "!region",
+    Warp => "!warp" => "!warp <grace entity id>",
+    Grace => "!grace" => "!grace <name substring>",
+    MarkerProbe => "!markerprobe" => "!markerprobe [set|verify|clear]",
+    Give => "!give" => "!give <fullId> [qty]",
+    Help => "!help" => "!help",
+}
+
 /// Parsed `regionAttunement` entry (attunement_gate, SPEC-gf-boss-lock-tracker). Absent/empty
 /// slot_data => the feature is off. `members` are the region's freely-reachable in-region check AP
 /// ids (the attunement denominator); `bloom_flags` are the graces revealed on attunement.
@@ -257,8 +296,11 @@ impl shared::Core for Core {
     /// Debug console commands, typed into the overlay's say input (2026-07-01, playtest tooling).
     /// Unrecognized "!" commands fall through to server chat.
     fn handle_command(&mut self, command: &str, arg: Option<&str>) -> bool {
+        let Some(command) = ConsoleCommand::parse(command) else {
+            return false;
+        };
         match command {
-            "!flag" => {
+            ConsoleCommand::Flag => {
                 match arg.and_then(|a| a.trim().parse::<u32>().ok()) {
                     Some(f) => {
                         let v = crate::flags::get_event_flag(f);
@@ -268,7 +310,7 @@ impl shared::Core for Core {
                 }
                 true
             }
-            "!setflag" => {
+            ConsoleCommand::SetFlag => {
                 let parts: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
                 match parts.first().and_then(|s| s.parse::<u32>().ok()) {
                     Some(f) => {
@@ -283,12 +325,12 @@ impl shared::Core for Core {
                 }
                 true
             }
-            "!region" => {
+            ConsoleCommand::Region => {
                 let pr = crate::flags::play_region_id();
                 self.log(ap::Print::message(format!("play_region = {pr:?}")));
                 true
             }
-            "!warp" => {
+            ConsoleCommand::Warp => {
                 // Playtest tooling for the pure-runtime warp primitive (also unblocks a
                 // random-start seed by hand if the auto-warp misfires). Full grace ENTITY id,
                 // e.g. `!warp 11102950` = Table of Lost Grace (Roundtable Hold).
@@ -306,7 +348,7 @@ impl shared::Core for Core {
                 }
                 true
             }
-            "!grace" => {
+            ConsoleCommand::Grace => {
                 let Some(q) = arg.map(|s| s.to_lowercase()) else {
                     self.log(ap::Print::message(
                         "usage: !grace <name substring>".to_string(),
@@ -317,18 +359,22 @@ impl shared::Core for Core {
                 if let Some(cfg) = self.region.as_ref() {
                     for (name, &f) in &cfg.grace_items {
                         if name.to_lowercase().contains(&q) {
-                            lines.push(format!(
-                                "{name}: flag {f} = {}",
-                                crate::flags::get_event_flag(f)
+                            lines.push(er_logic::grace::console_grace_line(
+                                name,
+                                f,
+                                crate::flags::get_event_flag(f),
+                                crate::warp::grace_entity_for_unlock_flag(f),
                             ));
                         }
                     }
                     for (name, fs) in &cfg.region_graces {
                         if name.to_lowercase().contains(&q) {
                             for &f in fs {
-                                lines.push(format!(
-                                    "{name} bundle: flag {f} = {}",
-                                    crate::flags::get_event_flag(f)
+                                lines.push(er_logic::grace::console_grace_line(
+                                    &format!("{name} bundle"),
+                                    f,
+                                    crate::flags::get_event_flag(f),
+                                    crate::warp::grace_entity_for_unlock_flag(f),
                                 ));
                             }
                         }
@@ -342,7 +388,7 @@ impl shared::Core for Core {
                 }
                 true
             }
-            "!markerprobe" => {
+            ConsoleCommand::MarkerProbe => {
                 // Dev harness for the save-embedded reconcile marker band (docs/EVENT-FLAG-SPACE.md).
                 // Drives the ONE check er-logic's host tests cannot: that the PLACEHOLDER band is real,
                 // save-persisted, and vanilla-free. Verify sequence: on a clean save `!markerprobe`
@@ -412,7 +458,7 @@ impl shared::Core for Core {
                 }
                 true
             }
-            "!give" => {
+            ConsoleCommand::Give => {
                 // PROBE, not a cheat: the one question params cannot answer is whether a goods row has
                 // an FMG NAME (names live in the msgbnd), and the only way to see a name is to hold the
                 // item. Finding the SECOND placeholder row -- the unblock for repointing shop slots
@@ -454,15 +500,15 @@ impl shared::Core for Core {
                 }
                 true
             }
-            "!help" => {
-                self.log(ap::Print::message(
-                    "!flag <id> | !setflag <id> [0|1] | !region | !grace <name substring> | !markerprobe [set|verify|clear] | !give <fullId> [qty]"
-                        .to_string(),
-                ));
+            ConsoleCommand::Help => {
+                self.log(ap::Print::message(CONSOLE_COMMAND_USAGES.join(" | ")));
                 true
             }
-            _ => false,
         }
+    }
+
+    fn console_command_usages(&self) -> &'static [&'static str] {
+        CONSOLE_COMMAND_USAGES
     }
 
     fn new() -> Result<Self> {
@@ -5273,6 +5319,32 @@ fn i64_to_u32_map(v: Option<&Value>) -> HashMap<i64, u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use super::{CONSOLE_COMMAND_USAGES, ConsoleCommand};
+
+    #[test]
+    fn console_registry_has_one_unique_usage_for_every_command() {
+        assert_eq!(ConsoleCommand::ALL.len(), CONSOLE_COMMAND_USAGES.len());
+
+        let mut names = HashSet::new();
+        let mut usages = HashSet::new();
+        for (command, usage) in ConsoleCommand::ALL
+            .iter()
+            .copied()
+            .zip(CONSOLE_COMMAND_USAGES.iter().copied())
+        {
+            let name = command.name();
+            assert!(names.insert(name), "duplicate console command {name}");
+            assert!(usages.insert(usage), "duplicate console usage {usage}");
+            assert!(
+                usage.starts_with(name),
+                "usage {usage:?} must begin with command {name:?}"
+            );
+            assert_eq!(ConsoleCommand::parse(name), Some(command));
+        }
+    }
+
     /// RETIRED 2026-07-11 -- this test pinned a FICTION and that is why it never fired.
     ///
     /// It asserted the crate version sits inside a semver BAND (">=0.1.0-beta.4 <0.1.0-beta.5")

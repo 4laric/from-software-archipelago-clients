@@ -586,7 +586,10 @@ impl<G: Game> Overlay<G> {
                     self.keyboard_surface_active = true;
                 }
                 ui.text("Dev console — output shows in the log window.");
-                ui.text("!markerprobe [set|verify|clear] · !flag <id> · !setflag <id> [0|1] · !warp <grace>");
+                let usages = core.console_command_usages();
+                if !usages.is_empty() {
+                    ui.text_wrapped(usages.join(" · "));
+                }
                 ui.separator();
 
                 if mem::take(&mut self.focus_console_input_next_frame) {
