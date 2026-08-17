@@ -120,7 +120,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Limgrave",
         lock_item: "Limgrave Lock",
         open_flag: Some(73100),
-        play_regions: &[30020, 30040, 30110, 31000, 31030, 31150, 31170, 32010, 34100, 61000, 61010],
+        play_regions: &[30020, 30040, 30110, 31000, 31030, 31150, 31170, 32010, 61000, 61010],
     },
     BakedRegionLock {
         region: "Liurnia",
@@ -186,7 +186,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Stormveil",
         lock_item: "Stormveil Lock",
         open_flag: Some(71003),
-        play_regions: &[10000],
+        play_regions: &[10000, 34100],
     },
     BakedRegionLock {
         region: "Weeping",
