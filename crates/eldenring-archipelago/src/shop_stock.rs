@@ -84,8 +84,6 @@ pub fn run() -> bool {
     let mut missing = 0usize;
     let mut todo: Vec<u32> = Vec::new();
     let mut rolled: Vec<(u32, i32, i32)> = Vec::new();
-    // (row id, equipType, equipId) for every row this pass writes -- input to the render guard.
-    let mut guard_rows: Vec<(u32, u8, i32)> = Vec::new();
 
     // The `instance_mut()` borrow is scoped to THIS BLOCK on purpose. shop_flags' stock-flag
     // helpers re-enter the repo through `instance()`, so the flag pass below must not run while a
@@ -118,7 +116,6 @@ pub fn run() -> bool {
             // `set_value` CONFIRMED to exist by the Windows build 2026-07-11 -- the raw +0x04 write is
             // not needed (VALUE_OFF is kept only as documentation of the row layout).
             row.set_value(price);
-            guard_rows.push((row_id, etype, gid));
             // sellQuantity stays -1: infinite stock is the whole point.
             //
             // 🛑 ZERO THE STOCK FLAG. Paramdex calls eventFlag_forStock the "flag holding the count"
@@ -155,16 +152,6 @@ pub fn run() -> bool {
                 log::info!("shop-stock: row {row_id} stock flag {old} -> 0");
             }
             None => log::warn!("shop-stock: row {row_id} stock flag not writable"),
-        }
-    }
-    // RENDER GUARD -- this pass writes `value` too, and a row priced below its ware's own
-    // `sellValue` is EXCLUDED from the purchase menu outright (see `shop_value`). The apworld
-    // derives these prices from the item so most clear the threshold, but "most" is not a gate.
-    // Own block: the borrow above is deliberately scoped, and this needs its own.
-    {
-        // SAFETY: as above -- FD4 singleton, game thread, in-world, caller gates.
-        if let Ok(repo) = unsafe { SoloParamRepository::instance_mut() } {
-            crate::shop_value::render_guard(repo, &guard_rows, "shop_stock");
         }
     }
     for (row_id, gid, price) in rolled {

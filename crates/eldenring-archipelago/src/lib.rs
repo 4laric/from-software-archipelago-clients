@@ -56,7 +56,6 @@ mod shop_prices;
 mod shop_repoint;
 mod shop_sell;
 mod shop_stock;
-mod shop_value;
 mod spell_slot_length;
 mod start_item_backfill;
 mod startgrants;
