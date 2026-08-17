@@ -287,8 +287,6 @@ pub fn run() -> bool {
     // Traced rows and the ware they end up selling, captured in the SCAN so the dump still fires on
     // an idempotent re-run (when `plan` is empty because every row is already correct).
     let mut traced_wares: Vec<(u32, i32, u8)> = Vec::new();
-    // (row id, equipType, equipId) for every row this pass sells -- input to the sellValue clamp.
-    let mut traced_all: Vec<(u32, u8, i32)> = Vec::new();
     let need_preview_fallback = !crate::shop_preview::is_configured();
     // Which configured flags actually landed on a live ShopLineupParam row. A flag in flag_to_loc with
     // NO live row is the interesting case: the location says "this check is a shop purchase guarded by
@@ -424,9 +422,6 @@ pub fn run() -> bool {
         // that in Alaric's 2026-07-25 log: `shop-repoint: repointed 354 ... 0 owned by shop_sell`.
         // A row this pass has DECIDED to sell natively is owned whether or not the write was needed.
         owned.insert(id);
-        // Every row this pass sells, for the sellValue clamp below. Collected in the SCAN and not
-        // from `plan`, so an idempotent re-run (plan empty, every row already correct) still clamps.
-        traced_all.push((id, etype, new_eid));
         if traced {
             traced_wares.push((id, new_eid, etype));
         }
@@ -540,13 +535,6 @@ pub fn run() -> bool {
             mismatched[..mismatched.len().min(10)].join(" | ")
         );
     }
-    // CLAMP THE PRICE ABOVE THE WARE'S sellValue. A row whose `value` is below its ware's own
-    // `sellValue` is EXCLUDED from the purchase menu entirely -- see `shop_value` for the evidence.
-    // This is not a rune concern: `Veteran's Helm` (sellValue 1000) written onto a 600-value slot
-    // vanished, which makes it a CHECK-AVAILABILITY bug for any reward on an under-priced slot.
-    // Uses the ids this pass decided to sell, not a re-read of the row, so it cannot disagree with
-    // the write above.
-    crate::shop_value::render_guard(repo, &traced_all, "shop_sell");
     // THE WARE'S OWN SORT FIELDS. 2026-07-30: the read-back proved every write lands and sticks, so
     // the missing shop rows are written correctly and hidden by the MENU. The menu renders sorted by
     // WARE, not row order (Corhyn's shelf opens with row 100356, his 600-rune slot), so the ware's
