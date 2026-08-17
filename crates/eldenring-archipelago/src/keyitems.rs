@@ -72,7 +72,10 @@ const GREAT_RUNE_NAMES: &[&str] = &[
     "Great Rune of the Unborn",
 ];
 
-const LEYNDELL_TWO_RUNES_FLAG: u32 = 182;
+// The physical seal checks BOTH flags. Vanilla normally supplies 105 through Roundtable/Finger
+// Reader progression and derives 182 from the rune-location flags, but either half can be absent
+// when AP supplies the runes and starts the player past that quest sequence.
+const LEYNDELL_TWO_RUNES_FLAGS: &[u32] = &[105, 182];
 
 fn received_great_rune_count(received: &HashSet<String>) -> usize {
     GREAT_RUNE_NAMES
@@ -198,17 +201,23 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
 
     // The physical seal is `EventFlag(182) && EventFlag(105)`. Common event 730 derives 182 from
     // possession flags 171-177, but event 6905 populates those only once from vanilla boss flags,
-    // before late AP receipts. Do NOT set 171-177 here: 171-176 are the randomized Great Rune
-    // location flags and 177 belongs to the same vanilla family, so doing so would spend checks.
-    // Reconcile the non-location threshold output directly once AP has delivered any two runes.
-    if received_great_rune_count(received) >= 2
-        && !flags::get_event_flag(LEYNDELL_TWO_RUNES_FLAG)
-        && flags::try_set_event_flag(LEYNDELL_TWO_RUNES_FLAG, true)
-    {
+    // before late AP receipts. Flag 105 normally arrives through Roundtable/Finger Reader
+    // progression, which a random start can bypass. Do NOT set 171-177 here: 171-176 are the
+    // randomized Great Rune location flags and 177 belongs to the same vanilla family, so doing so
+    // would spend checks. Reconcile both non-location prerequisites once AP has delivered two runes.
+    let rune_count = received_great_rune_count(received);
+    let mut applied = Vec::new();
+    if rune_count >= 2 {
+        for &flag in LEYNDELL_TWO_RUNES_FLAGS {
+            if !flags::get_event_flag(flag) && flags::try_set_event_flag(flag, true) {
+                applied.push(flag);
+            }
+        }
+    }
+    if !applied.is_empty() {
         log::info!(
-            "great runes: {} AP-received -- Leyndell two-rune threshold flag {} applied",
-            received_great_rune_count(received),
-            LEYNDELL_TWO_RUNES_FLAG
+            "great runes: {rune_count} AP-received -- Leyndell gate prerequisite flag(s) \
+             {applied:?} applied"
         );
     }
 }
@@ -255,6 +264,16 @@ mod tests {
                 "{name}: possession/location flag leaked into receive mapping"
             );
         }
+    }
+
+    #[test]
+    fn leyndell_gate_reconciles_both_non_location_prerequisites() {
+        assert_eq!(LEYNDELL_TWO_RUNES_FLAGS, &[105, 182]);
+        assert!(
+            LEYNDELL_TWO_RUNES_FLAGS
+                .iter()
+                .all(|flag| !(171..=177).contains(flag))
+        );
     }
 
     /// The motivating case (rule 11): a pool-received whetblade must unlock ITS FULL affinity set,
