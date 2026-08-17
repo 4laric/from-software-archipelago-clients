@@ -1069,8 +1069,10 @@ pub fn configure_capital(sd: &Value) {
     let cfg = er_logic::capital::parse(sd);
     match &cfg {
         Some(c) => log::info!(
-            "capital reconciler configured: burn flag {}, done latch {}, ashen {:?}, royal {:?}, {} release row(s)",
+            "capital reconciler configured: burn flag {}, world-burn {:?}, pre-burn {:?}, done latch {}, ashen {:?}, royal {:?}, {} release row(s)",
             c.burn_flag,
+            c.world_burn_flag,
+            c.pre_burn_flag,
             c.burn_done_flag,
             c.sets.ashen,
             c.sets.royal,
@@ -1088,10 +1090,44 @@ pub fn configure_capital(sd: &Value) {
     *CAPITAL.lock().unwrap() = cfg;
 }
 
-/// Per-tick 9116 latch: standing in an Ashen bucket -> hold ON; in a Royal bucket -> hold OFF;
-/// elsewhere -> leave the flag alone (the next warp's intercept restores the Royal default).
-/// Defends against anything flipping 9116 mid-session -- the map version would swap under the
-/// player on the next load. Self-configured (no RegionConfig borrow); call every update tick.
+fn capital_state(cfg: &er_logic::capital::CapitalConfig) -> er_logic::capital::CapitalState {
+    er_logic::capital::CapitalState {
+        burn: flags::get_event_flag(cfg.burn_flag),
+        world_burn: cfg.world_burn_flag.map(flags::get_event_flag),
+        pre_burn: cfg.pre_burn_flag.map(flags::get_event_flag),
+    }
+}
+
+fn apply_capital_writes(
+    cfg: &er_logic::capital::CapitalConfig,
+    writes: er_logic::capital::CapitalWrites,
+) -> bool {
+    // Entering Ashen follows common.emevd's safe order: retire the opposite state, establish the
+    // burnt world, then select its map. That prevents an Ashen load without the finale arena.
+    if let (Some(flag), Some(value)) = (cfg.pre_burn_flag, writes.pre_burn) {
+        let _ = flags::try_set_event_flag(flag, value);
+    }
+    if let (Some(flag), Some(value)) = (cfg.world_burn_flag, writes.world_burn) {
+        let _ = flags::try_set_event_flag(flag, value);
+    }
+    if let Some(value) = writes.burn {
+        let _ = flags::try_set_event_flag(cfg.burn_flag, value);
+    }
+
+    writes.pre_burn.is_none_or(|value| {
+        cfg.pre_burn_flag
+            .is_none_or(|f| flags::get_event_flag(f) == value)
+    }) && writes.world_burn.is_none_or(|value| {
+        cfg.world_burn_flag
+            .is_none_or(|f| flags::get_event_flag(f) == value)
+    }) && writes
+        .burn
+        .is_none_or(|value| flags::get_event_flag(cfg.burn_flag) == value)
+}
+
+/// Per-tick capital-state latch: standing in Ashen/Throne holds 9116 + world-burn ON and pre-burn
+/// OFF; every other known position holds the reversible selectors OFF. Defends against the goal
+/// gate or vanilla flipping the state mid-session. Self-configured; call every update tick.
 pub fn tick_capital() {
     let guard = CAPITAL.lock().unwrap();
     let Some(cfg) = guard.as_ref() else { return };
@@ -1130,56 +1166,35 @@ pub fn tick_capital() {
             None => position_desired,
         }
     };
-    let current = flags::get_event_flag(cfg.burn_flag);
-    // ⭐ THE CORROBORATOR (client#200). Read only to justify an ON inferred from POSITION; `None`
-    // when the apworld does not emit the key, which leaves behaviour exactly as it shipped.
-    let world_burnt = cfg.world_burn_flag.map(flags::get_event_flag);
-    let decision =
-        er_logic::capital_guard::decide_from_position(armed, desired, current, world_burnt);
-    match decision {
-        er_logic::capital_guard::Decision::Write(w) => {
-            if let Ok(mut l) = CAPITAL_DECLINE.lock() {
-                l.on_write();
-            }
-            let _ = flags::try_set_event_flag(cfg.burn_flag, w);
-            let stuck = flags::get_event_flag(cfg.burn_flag) == w;
-            log::info!(
-                // `readback STUCK` means the write TOOK -- readback == what was written. It has
-                // been read as "jammed" at least once, in triage, on this exact line, so the line
-                // now says which it means.
-                "capital reconcile: flag {} -> {} (play_region {:?}, world-burn {:?}); readback                  {}",
-                cfg.burn_flag,
-                if w { "ON" } else { "OFF" },
-                flags::play_region_id(),
-                world_burnt,
-                if stuck {
-                    "STUCK (the write took)"
-                } else {
-                    "PENDING (the write was lost) -- re-applying next tick"
-                }
-            );
+    let current = capital_state(cfg);
+    let writes = er_logic::capital::reconcile_state(armed, desired, current);
+    if writes != er_logic::capital::CapitalWrites::default() {
+        if let Ok(mut l) = CAPITAL_DECLINE.lock() {
+            l.on_write();
         }
-        er_logic::capital_guard::Decision::Declined(d) => {
-            let admitted = CAPITAL_DECLINE.lock().ok().and_then(|mut l| l.admit(d));
-            if let Some(d) = admitted {
-                // 🛑 The refusal is a WARN and everything else is INFO: a contradiction between
-                // where the player is standing and what the world-burn flag says is the thing
-                // #200 exists to surface, and it must not read like routine chatter.
-                if d == er_logic::capital_guard::Decline::ContradictedOn {
-                    log::warn!(
-                        "capital reconcile: NO WRITE (play_region {:?}, world-burn {:?}) -- {}",
-                        flags::play_region_id(),
-                        world_burnt,
-                        d.reason()
-                    );
-                } else {
-                    log::info!(
-                        "capital reconcile: no write (play_region {:?}) -- {}",
-                        flags::play_region_id(),
-                        d.reason()
-                    );
-                }
+        let stuck = apply_capital_writes(cfg, writes);
+        log::info!(
+            "capital reconcile: writes {:?} (play_region {:?}, before {:?}); readback {}",
+            writes,
+            flags::play_region_id(),
+            current,
+            if stuck {
+                "STUCK (the writes took)"
+            } else {
+                "PENDING (a write was lost) -- re-applying next tick"
             }
+        );
+    } else if let er_logic::capital_guard::Decision::Declined(d) =
+        er_logic::capital_guard::decide(armed, desired, current.burn)
+    {
+        let admitted = CAPITAL_DECLINE.lock().ok().and_then(|mut l| l.admit(d));
+        if let Some(d) = admitted {
+            log::info!(
+                "capital reconcile: no write (play_region {:?}, state {:?}) -- {}",
+                flags::play_region_id(),
+                current,
+                d.reason()
+            );
         }
     }
 }
@@ -1195,40 +1210,38 @@ pub fn capital_warp_intercept(grace_entity_id: u32) {
     let Some(cfg) = guard.as_ref() else { return };
     let armed = flags::get_event_flag(cfg.burn_done_flag);
     let desired = er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, grace_entity_id);
-    let current = flags::get_event_flag(cfg.burn_flag);
+    let current = capital_state(cfg);
     if let Some(want) = desired {
         *CAPITAL_PENDING_WARP.lock().unwrap() = Some((flags::play_region_id(), want));
     }
-    // 🛑 `decide`, NOT `decide_from_position`: a warp TARGET is explicit player intent, chosen
-    // before the load, and setting 9116 ON from one is exactly what this seam is for. The finale
-    // must still work. Only the per-tick latch, which infers from where the player ended up, has
-    // to justify an ON (client#200).
-    match er_logic::capital_guard::decide(armed, desired, current) {
-        er_logic::capital_guard::Decision::Write(w) => {
-            let _ = flags::try_set_event_flag(cfg.burn_flag, w);
-            let stuck = flags::get_event_flag(cfg.burn_flag) == w;
-            log::info!(
-                "capital warp intercept: target {grace_entity_id} -> flag {} {}; readback {}",
-                cfg.burn_flag,
-                if w { "ON" } else { "OFF" },
-                if stuck {
-                    "STUCK (the write took)"
-                } else {
-                    // ⚠️ Only true for a capital-bucket destination: `capital_flag_state` is
-                    // scoped to {11050, 19000, 11000} and returns None everywhere else, so for a
-                    // Roundtable or overworld target there is no latch to converge. Said plainly
-                    // rather than reassuringly.
-                    "PENDING (the write was lost) -- the per-tick latch converges only if the                      destination is a capital bucket; anywhere else this write is simply gone"
-                }
-            );
+    // A warp TARGET is explicit player intent. Apply the whole state before the asynchronous load
+    // resolves so an Ashen target gets its arena and every other target restores Royal.
+    let writes = er_logic::capital::reconcile_state(armed, desired, current);
+    if writes != er_logic::capital::CapitalWrites::default() {
+        let stuck = apply_capital_writes(cfg, writes);
+        log::info!(
+            "capital warp intercept: target {grace_entity_id} -> writes {:?} (before {:?}); readback {}",
+            writes,
+            current,
+            if stuck {
+                "STUCK (the writes took)"
+            } else {
+                "PENDING (a write was lost) -- the per-tick latch converges only in a capital bucket"
+            }
+        );
+    } else {
+        match er_logic::capital_guard::decide(armed, desired, current.burn) {
+            // ⭐ ONE LINE PER DECLINED WARP, unconditionally. bobler's log carries 66 warps and not one
+            // intercept line, because all 66 were `AlreadyCorrect` and nothing said so -- which was
+            // indistinguishable from the reconciler being inert. 66 lines a session is nothing.
+            er_logic::capital_guard::Decision::Declined(d) => log::info!(
+                "capital warp intercept: target {grace_entity_id} -> no write -- {}",
+                d.reason()
+            ),
+            er_logic::capital_guard::Decision::Write(_) => {
+                unreachable!("state planner lost a write")
+            }
         }
-        // ⭐ ONE LINE PER DECLINED WARP, unconditionally. bobler's log carries 66 warps and not one
-        // intercept line, because all 66 were `AlreadyCorrect` and nothing said so -- which was
-        // indistinguishable from the reconciler being inert. 66 lines a session is nothing.
-        er_logic::capital_guard::Decision::Declined(d) => log::info!(
-            "capital warp intercept: target {grace_entity_id} -> no write -- {}",
-            d.reason()
-        ),
     }
 }
 
