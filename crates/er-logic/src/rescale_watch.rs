@@ -209,27 +209,35 @@ impl RescaleWatch {
 /// the target `max_hp`; the engine computes it from the rung. The only thing we know, and the only
 /// thing the watch tests, is that it should have CHANGED. So the line says what it is unchanged
 /// from.
-pub fn verdict_line(npc_param_id: i32, observed: i32, v: Verdict) -> String {
+pub fn verdict_line(
+    instance_key: u64,
+    npc_param_id: i32,
+    observed: i32,
+    load_status: &str,
+    v: Verdict,
+) -> String {
     match v {
         Verdict::Recomputed { after_ms } => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} max_hp followed the rung after \
-             {after_ms}ms (now {observed})"
+            "enemy-scaling recompute: instance {instance_key} npc_param {npc_param_id} \
+             max_hp followed the rung after {after_ms}ms (now {observed}, status {load_status})"
         ),
         Verdict::StaleUnloaded {
             after_ms,
             unchanged_from,
         } => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
-             {unchanged_from}) after {after_ms}ms -- UNLOADED. The rung is carried; max_hp is \
+            "enemy-scaling recompute: instance {instance_key} npc_param {npc_param_id} still \
+             {observed} (unchanged from {unchanged_from}) after {after_ms}ms -- UNLOADED \
+             (status {load_status}). The rung is carried; max_hp is \
              deferred until construction on load, not forced by re-application (client#188)"
         ),
         Verdict::StaleLoaded {
             after_ms,
             unchanged_from,
         } => format!(
-            "enemy-scaling recompute: npc_param {npc_param_id} still {observed} (unchanged from \
-             {unchanged_from}) after {after_ms}ms while LOADED -- `ready` is NOT sufficient for a \
-             recompute. This is the #186 reading, and it decides the cluster (client#188)"
+            "enemy-scaling recompute: instance {instance_key} npc_param {npc_param_id} still \
+             {observed} (unchanged from {unchanged_from}) after {after_ms}ms while LOADED \
+             (status {load_status}) -- loaded/ready is NOT sufficient for a recompute \
+             (client#251)"
         ),
     }
 }
@@ -329,9 +337,9 @@ mod replay {
         };
         assert_eq!(w.poll(1, 6080, true, 56_000), Action::Report(v));
         assert!(v.is_anomaly(), "this is the reading worth a playtest");
-        let line = verdict_line(47_500_014, 6080, v);
+        let line = verdict_line(1, 47_500_014, 6080, "ready", v);
         assert!(line.contains("NOT sufficient"), "{line}");
-        assert!(line.contains("client#188"), "{line}");
+        assert!(line.contains("client#251"), "{line}");
     }
 
     /// 🛑 A CHANGED VALUE BEATS THE CLOCK. An entity that recomputes inside the grace window is a
@@ -467,7 +475,7 @@ mod replay {
                 unchanged_from: 6080,
             },
         ] {
-            let line = verdict_line(47_500_014, 6080, v);
+            let line = verdict_line(1, 47_500_014, 6080, "ready", v);
             assert!(
                 !line.contains("expected"),
                 "no invented expectation: {line}"
@@ -486,7 +494,7 @@ mod replay {
     fn a_confirmed_recompute_is_neither_an_anomaly_nor_a_non_move() {
         let v = Verdict::Recomputed { after_ms: 900 };
         assert!(!v.is_anomaly());
-        let line = verdict_line(47_500_014, 7141, v);
+        let line = verdict_line(1, 47_500_014, 7141, "ready", v);
         assert!(line.contains("followed the rung"), "{line}");
         assert!(!line.contains("unchanged from"), "{line}");
     }
@@ -505,7 +513,24 @@ mod replay {
                 unchanged_from: 6080,
             },
         ] {
-            assert!(verdict_line(47_500_014, 6080, v).is_ascii());
+            assert!(verdict_line(1, 47_500_014, 6080, "ready", v).is_ascii());
         }
+    }
+
+    #[test]
+    fn verdicts_carry_the_instance_key_and_exact_status() {
+        let line = verdict_line(
+            0x1234_abcd,
+            46_801_940,
+            4554,
+            "active",
+            Verdict::StaleLoaded {
+                after_ms: 1_000,
+                unchanged_from: 4554,
+            },
+        );
+        assert!(line.contains("instance 305441741"), "{line}");
+        assert!(line.contains("status active"), "{line}");
+        assert!(line.contains("client#251"), "{line}");
     }
 }

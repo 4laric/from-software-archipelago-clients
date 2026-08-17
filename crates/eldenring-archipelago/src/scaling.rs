@@ -67,7 +67,7 @@ struct SweepCtx<'a> {
 ///
 /// Named because clippy's `type_complexity` is right about the raw tuple, and because the field
 /// order is the thing a reader of a log line has to match up against.
-type SampleRow = (i32, i32, i32, i32, &'static str, Vec<i32>);
+type SampleRow = (u64, i32, i32, i32, i32, &'static str, Vec<i32>);
 
 /// Per-sweep tally of the `chr_load_status` of every entry we walked, indexed by `status_slot`.
 /// Diagnostic ONLY -- nothing filters on it. It exists because the last thing that DID filter on it
@@ -773,6 +773,7 @@ impl SweepTally {
     fn note_sample(&mut self, chr: &ChrIns, status: &'static str, carried: &[i32]) {
         if self.sample.len() < SAMPLE_CAP {
             self.sample.push((
+                instance_key(chr),
                 chr.npc_param_id,
                 chr.npc_id,
                 chr.modules.data.hp,
@@ -1114,7 +1115,7 @@ pub fn tick() -> Option<String> {
             // for the sessions that are not running the experiment.
             log::info!(
                 "enemy-scaling: SAMPLE region {region} target {target} \
-                 (npc_param_id, npc_id, hp, max_hp, load_status, carried): {:?}",
+                 (instance_key, npc_param_id, npc_id, hp, max_hp, load_status, carried): {:?}",
                 tally.sample
             );
         }
@@ -1385,8 +1386,10 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
                     tally.recomputed = tally.recomputed.saturating_add(1);
                 } else {
                     let line = er_logic::rescale_watch::verdict_line(
+                        instance_key(chr),
                         chr.npc_param_id,
                         chr.modules.data.max_hp,
+                        status_label(status),
                         v,
                     );
                     if v.is_anomaly() {
@@ -1582,7 +1585,7 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
 /// `Hash`, which is a public, total function of exactly those bits. Collision across the watch's
 /// 512-entry cap is not a real risk, and a collision would cost one wrong verdict line, not a wrong
 /// write: nothing acts on this key.
-fn instance_key(chr: &ChrIns) -> u64 {
+pub(crate) fn instance_key(chr: &ChrIns) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     chr.field_ins_handle.hash(&mut h);
