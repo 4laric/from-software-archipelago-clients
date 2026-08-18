@@ -196,8 +196,9 @@ mod tests {
 /// Parse `progressiveGrants` slot_data into the per-name tier config. Tolerant: a tier may carry
 /// `goodsList` (array) or `goods` (single), plus optional `flags` and an optional boolean
 /// `consumed` (absent/false = OWNED, self-healing; true = spendable, granted once via the ledger —
-/// see [`ProgTier::consumed`]); a fully-empty tier is dropped
-/// (the deliberate fix for the C++ "key goods not found" abort). Absent key -> empty config.
+/// see [`ProgTier::consumed`]). A fully-empty tier is dropped unless it explicitly carries
+/// `"noop": true`; explicit no-ops preserve an alternating ladder's copy index without invoking
+/// the old C++ "key goods not found" path. Absent key -> empty config.
 pub fn parse(slot_data: &serde_json::Value) -> HashMap<String, Vec<ProgTier>> {
     let mut out = HashMap::new();
     let Some(obj) = slot_data
@@ -236,7 +237,8 @@ pub fn parse(slot_data: &serde_json::Value) -> HashMap<String, Vec<ProgTier>> {
                 })
                 .unwrap_or_default();
             let consumed = t.get("consumed").and_then(|v| v.as_bool()).unwrap_or(false);
-            if goods.is_empty() && flags.is_empty() {
+            let noop = t.get("noop").and_then(|v| v.as_bool()).unwrap_or(false);
+            if goods.is_empty() && flags.is_empty() && !noop {
                 continue; // drop empty tier
             }
             tiers.push(ProgTier {
@@ -295,6 +297,26 @@ mod parse_tests {
             !tiers[2].consumed,
             "ABSENT consumed defaults to owned (today's ladders unchanged)"
         );
+    }
+
+    #[test]
+    fn explicit_noop_preserves_an_alternating_ladder_index() {
+        let sd = serde_json::json!({ "progressiveGrants": {
+            "Progressive Flask Upgrade": [
+                { "noop": true },
+                { "goods": 10020, "flags": [], "consumed": true },
+                { "noop": true }
+            ]
+        }});
+        let tiers = &parse(&sd)["Progressive Flask Upgrade"];
+        assert_eq!(
+            tiers.len(),
+            3,
+            "charge rungs must not collapse the potency schedule"
+        );
+        assert!(tiers[0].goods.is_empty() && tiers[0].flags.is_empty());
+        assert_eq!(tiers[1].goods, vec![10020]);
+        assert!(tiers[2].goods.is_empty() && tiers[2].flags.is_empty());
     }
 
     #[test]
