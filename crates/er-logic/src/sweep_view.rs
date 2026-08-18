@@ -9,11 +9,10 @@
 //! was, or whether it was waiting on a kill or on a lock item. This module turns each group into one
 //! readable row.
 //!
-//! ⭐ NOTHING HERE IS A SPOILER. Every number is derived from data the tracker already shows: the
-//! member locations are ordinary rows in their region's list, and the region name is already the
-//! header above them. This states a relationship the player could work out by hand, which is the
-//! opposite of the lock-hint economy (`lock_hint_economy`), where naming the region IS the thing
-//! being charged for.
+//! A pending group's exact size is routing information: it tells the player which boss pays best.
+//! The group and its state remain visible before firing, but its `members` and `checked` counts do
+//! not. Once the sweep fires, those counts become confirmation of what happened rather than a way
+//! to choose the next boss, so `group_label` reveals them (#160, Alaric's 2026-08-17 ruling).
 //!
 //! THAT LAST CLAIM HOLDS ONLY WHILE THE HEADER IS REVEALED (2026-08-10). Under
 //! `lock_hint_economy::conceal_region` a LOCKED region's header reads "Locked region", so a sweep
@@ -87,10 +86,14 @@ pub fn group_label(v: &SweepGroupView<'_>) -> String {
         (None, Some(_)) => "locked region".to_string(),
         (None, None) => "unplaced".to_string(),
     };
-    format!(
-        "{who} -- {}/{} checks [flag {}]",
-        v.checked, v.members, v.flag
-    )
+    if v.fired {
+        format!(
+            "{who} -- {}/{} checks [flag {}]",
+            v.checked, v.members, v.flag
+        )
+    } else {
+        format!("{who} -- checks hidden until fired [flag {}]", v.flag)
+    }
 }
 
 /// The state suffix: what this group is waiting for, in the player's terms.
@@ -229,7 +232,8 @@ mod tests {
         // `boss` is None for every group in the session. The flag is the only stable handle.
         let s = group_label(&v(20000800, Some("Shadow Keep"), 49, 0, false));
         assert!(s.contains("20000800"), "{s}");
-        assert!(s.contains("0/49"), "{s}");
+        assert!(!s.contains("0/49"), "pending count leaked: {s}");
+        assert!(s.contains("hidden until fired"), "{s}");
         assert!(s.contains("Shadow Keep"), "{s}");
 
         let unplaced = group_label(&v(20000800, None, 49, 0, false));
@@ -305,6 +309,19 @@ mod tests {
             group_state(&v(1, None, 49, 0, false)),
             "waiting on the boss"
         );
+    }
+
+    #[test]
+    fn exact_counts_are_hidden_while_pending_and_revealed_after_firing() {
+        // #160: both halves are routing information before the boss dies. Hiding only `members`
+        // while retaining `checked` would still leak the allocation through the ordinary rows.
+        let pending = group_label(&v(1, Some("Shadow Keep"), 108, 17, false));
+        assert!(!pending.contains("108"), "member count leaked: {pending}");
+        assert!(!pending.contains("17"), "checked count leaked: {pending}");
+        assert!(pending.contains("hidden until fired"), "{pending}");
+
+        let fired = group_label(&v(1, Some("Shadow Keep"), 108, 17, true));
+        assert!(fired.contains("17/108 checks"), "{fired}");
     }
 
     #[test]
