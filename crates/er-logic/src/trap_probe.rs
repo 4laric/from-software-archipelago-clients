@@ -17,9 +17,9 @@
 //! * **Nightfall** -- environmental. Costs the player nothing directly; changes the world around
 //!   them. `WorldAreaTime::request_time` is a typed one-call primitive, and the game crate carries
 //!   `AiSightTimeOfDay`, so enemy sight really does change with it.
-//! * **Stamina Halved** -- mechanical, and bobler's own ask. A ceiling held for 30s by
-//!   [`Deadline`], not a param edit: `CSChrDataModule::stamina` is a plain `i32` that the game
-//!   clamps and regenerates for us.
+//! * **Stamina Halved** -- mechanical, and bobler's own ask. The maximum is halved for 30s by
+//!   [`Deadline`]; current stamina is capped once when the effect lands, then ordinary game drain
+//!   and regeneration run inside the smaller bar.
 //! * **Blackout** -- sensory. The cheap stand-in for the blindness trap, without chasing the
 //!   Curseblade speffect or writing an unknown gparam id.
 //!
@@ -188,24 +188,23 @@ const _: () = assert!(
     "longer than a boss fight is a broken save, not a trap"
 );
 
-/// The stamina ceiling to hold, given the player's max.
+/// The temporary maximum to hold, given the player's original max.
 ///
 /// Integer halving, floored at 0: `max_stamina` comes off a live module, and a negative or absurd
 /// read must not become a worse write. A ceiling of 0 is survivable (no sprint, no roll, full
 /// regen the moment it lifts); a NEGATIVE one written into `stamina` would not be.
-pub fn stamina_ceiling(max_stamina: i32) -> i32 {
+pub fn stamina_limit(max_stamina: i32) -> i32 {
     (max_stamina / 2).max(0)
 }
 
-/// What to write into `stamina`, or `None` when it is already at or under the ceiling.
+/// Cap current stamina once when the smaller maximum is installed.
 ///
 /// ⭐ RETURNS `None` FOR THE COMMON CASE ON PURPOSE. The clamp runs every tick for 30 seconds, and
 /// a player who is already exhausted must not have their stamina RE-WRITTEN each frame -- that
 /// stamps on the engine's own regeneration mid-update, and it is the difference between "half
 /// stamina" and "stamina pinned to exactly half, visibly never regenerating".
-pub fn stamina_clamp(current: i32, max_stamina: i32) -> Option<i32> {
-    let ceiling = stamina_ceiling(max_stamina);
-    (current > ceiling).then_some(ceiling)
+pub fn initial_stamina_cap(current: i32, limited_max: i32) -> Option<i32> {
+    (current > limited_max).then_some(limited_max)
 }
 
 /// Everything the client must remember between ticks. One struct, so the tick has one thing to
@@ -296,14 +295,14 @@ mod tests {
     }
 
     #[test]
-    fn the_stamina_ceiling_holds_for_its_whole_duration_and_then_lifts() {
+    fn the_stamina_limit_holds_for_its_whole_duration_and_then_lifts() {
         let mut state = ProbeState::new();
         state.arm(FeelEffect::StaminaHalved, 100);
         assert!(state.stamina.holds(100));
         assert!(state.stamina.holds(100 + STAMINA_HALVED_MS - 1));
         assert!(
             !state.stamina.holds(100 + STAMINA_HALVED_MS),
-            "the ceiling lifts on its own -- nothing restores stamina by hand"
+            "the temporary maximum expires on its own"
         );
         assert!(
             state.stamina.take_if_elapsed(100 + STAMINA_HALVED_MS),
@@ -336,22 +335,23 @@ mod tests {
         assert!(d.holds(u64::MAX - 1));
     }
 
-    /// ⭐ The clamp declines to write when there is nothing to do. Rewriting an already-low value
-    /// every frame is what turns "half stamina" into "stamina that visibly never regenerates".
+    /// Current stamina is capped ONCE when the smaller maximum lands. The sustain loop never calls
+    /// this function, so ordinary regeneration is not replaced by a per-frame write.
     #[test]
-    fn the_clamp_only_writes_when_it_must() {
-        assert_eq!(stamina_clamp(160, 160), Some(80));
-        assert_eq!(stamina_clamp(81, 160), Some(80));
-        assert_eq!(stamina_clamp(80, 160), None, "already at the ceiling");
-        assert_eq!(stamina_clamp(12, 160), None, "already exhausted");
+    fn the_initial_cap_only_writes_when_it_must() {
+        assert_eq!(initial_stamina_cap(160, 80), Some(80));
+        assert_eq!(initial_stamina_cap(81, 80), Some(80));
+        assert_eq!(initial_stamina_cap(80, 80), None, "already at the maximum");
+        assert_eq!(initial_stamina_cap(12, 80), None, "already exhausted");
     }
 
     #[test]
-    fn the_ceiling_is_never_negative() {
+    fn the_limit_is_never_negative() {
         // `max_stamina` comes off a live module; a garbage read must not become a garbage write.
-        assert_eq!(stamina_ceiling(-40), 0);
-        assert_eq!(stamina_ceiling(0), 0);
-        assert_eq!(stamina_ceiling(1), 0);
+        assert_eq!(stamina_limit(-40), 0);
+        assert_eq!(stamina_limit(0), 0);
+        assert_eq!(stamina_limit(1), 0);
+        assert_eq!(stamina_limit(160), 80);
     }
 
     #[test]
