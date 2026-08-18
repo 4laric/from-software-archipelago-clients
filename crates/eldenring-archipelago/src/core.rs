@@ -1008,6 +1008,10 @@ impl shared::Core for Core {
                 crate::merchant_bells::set_enabled(
                     er_logic::options::parse_merchant_bells_on_talk(sd),
                 );
+                crate::region::configure_goal_gate_policy(
+                    sd.pointer("/options/goal_region_unlock_policy")
+                        .and_then(|v| v.as_i64()) == Some(1),
+                );
                 // Accepts our `no_weapon_requirements` OR Bedrock/fswap's
                 // `remove_weapon_and_spell_requirements` (same client feature, two apworld names).
                 crate::no_weapon_reqs::set_enabled(er_logic::options::parse_no_weapon_reqs(sd));
@@ -1781,6 +1785,12 @@ impl shared::Core for Core {
                 // Assign the progression surface parsed inside the slot_data closure above (where
                 // `sd` was in scope).
                 self.progression_surface = progression_surface;
+                crate::shop_hints::configure_completion_surface(
+                    self.progression_surface
+                        .iter()
+                        .map(|&id| id as i64)
+                        .collect(),
+                );
                 self.region_table = tracker_tables.region;
                 self.coarse_table = tracker_tables.coarse;
                 self.coarse_lock_items = tracker_tables.lock_items;
@@ -1802,6 +1812,8 @@ impl shared::Core for Core {
                     &crate::feature_handshake::ProbeCtx {
                         region: self.region.as_ref(),
                         armor_bundles: !self.armor_bundles.is_empty(),
+                        region_completion_goal_gate:
+                            crate::region::goal_gate_uses_region_completion(),
                     },
                 );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A
@@ -3351,6 +3363,31 @@ impl shared::Core for Core {
             // `received_all` is the cumulative stream.
             crate::keyitems::tick_leyndell_gate_flags(&received_all);
         }
+        let mut region_completion_ready = true;
+        let incomplete_regions = if crate::region::goal_gate_uses_region_completion() {
+            match crate::shop_views::ready_and_viewed() {
+                None => {
+                    region_completion_ready = false;
+                    None
+                }
+                Some(viewed) => {
+                    let checked: HashSet<u64> = self
+                        .client_mut()
+                        .map(|c| c.checked_locations().map(|l| l.id() as u64).collect())
+                        .unwrap_or_default();
+                    let goal_region = crate::region::goal_region_name();
+                    Some(er_logic::region_completion::incomplete_regions(
+                        &self.progression_surface,
+                        &self.region_table,
+                        goal_region.as_deref(),
+                        &checked,
+                        &viewed,
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         if let Some(cfg) = self.region.as_ref() {
             if let Some(m) = crate::region::tick_random_start_warp(cfg) {
                 region_msgs.push(m);
@@ -3404,12 +3441,14 @@ impl shared::Core for Core {
             // Same `received_all` source as the notice and as `goal::is_met`, so the gate, the
             // warning and the goal can never disagree about which items the player holds.
             if let Some(goal) = self.goal.as_ref()
+                && region_completion_ready
                 && let Some(m) = crate::region::tick_goal_gate(
                     cfg,
                     &goal.item_goals,
                     &goal.rune_goals,
                     goal.runes_required,
                     &|n| received_all.contains(n),
+                    incomplete_regions.as_deref(),
                 )
             {
                 region_msgs.push(m);
@@ -3836,6 +3875,9 @@ impl shared::Core for Core {
         // HERE, where a live client is free. One create_hints packet per shop open.
         if let Some(client) = self.client_mut() {
             crate::shop_hints::pump(client);
+        }
+        if let Some(client) = self.client_mut() {
+            crate::shop_views::pump(client);
         }
         // Re-arm the ItemLotParam blank passes on a map-(re)load edge. check_lots / enemy_drops latch
         // DONE after their first successful in-world pass and are otherwise reset ONLY on reconnect
@@ -4412,6 +4454,7 @@ impl Core {
         // seed's purchases -- and its location ids would be meaningless here anyway. Re-read from
         // the server on the next pump.
         self.lock_hints.reset();
+        crate::shop_views::reset();
         // ...and so must everything derived from it: a new seed's balance is a different number
         // against a different set of locks, and the intro notice is news again.
         self.lock_hint_hud = None;
