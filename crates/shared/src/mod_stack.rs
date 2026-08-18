@@ -106,15 +106,19 @@ const NAMED_RANDOMIZER_SUFFIXES: &[(&str, &str)] =
 /// world repo tells players outright not to load `RandomizerHelper.dll`, calling it the single most
 /// common way to end up with a connected client that cannot give you anything.
 ///
-/// 🛑 A HIT IS NOT A DIAGNOSIS. Presence is not sufficient for the defect -- boblerrr's 2026-08-07
-/// log carried this DLL *and* eleven healthy `AddItemFunc detour installed` lines. The warning says
-/// "this is in your process and it is known to break receives", not "this is your bug".
+/// This used to produce a warning. That was not safe enough: the helper hooks the same item-grant
+/// path as AP and has now repeatedly produced connected games that silently receive nothing. The
+/// Elden Ring entry point calls [`wait_for_blocking_incompatibility`] and refuses to initialise
+/// when found.
 const DENY_MODULES: &[(&str, &str)] = &[(
     "randomizerhelper.dll",
-    "our own setup docs say never to load it -- it is the most common cause of a connected client \
-     that cannot grant items. Presence is not proof it is biting you; if receives work, it is not. \
-     Take it out before reporting a receive bug",
+    "it hooks item granting and can leave a connected Archipelago game unable to receive items",
 )];
+
+const INCOMPATIBLE_MESSAGE: &str = "RandomizerHelper.dll is incompatible with Elden Ring \
+Archipelago. It hooks item granting and can leave a connected game unable to receive AP items.\n\n\
+Remove RandomizerHelper.dll from the randomizer DLL list/output, then relaunch Elden Ring.\n\n\
+The Archipelago client has not started.";
 
 /// What the loaded-module list says. Split from the enumeration so [`triage_modules`] is testable.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -173,6 +177,61 @@ pub fn triage_modules(paths: &[PathBuf], windows_dir: Option<&Path>) -> ModuleRe
     report.non_system.sort();
     report.non_system.dedup();
     report
+}
+
+fn report_contains_denied_file(report: &Report) -> bool {
+    report
+        .foreign
+        .iter()
+        .chain(&report.ambiguous)
+        .chain(&report.ours)
+        .chain(&report.other)
+        .any(|name| {
+            DENY_MODULES
+                .iter()
+                .any(|(denied, _)| name.trim_end_matches('/').eq_ignore_ascii_case(denied))
+        })
+}
+
+fn mod_tree_contains_denied_file() -> bool {
+    let Ok(dir) = crate::utils::mod_directory() else {
+        return false;
+    };
+    probe_with_ancestors(&dir)
+        .iter()
+        .filter_map(|(_, result)| result.as_ref().ok())
+        .any(report_contains_denied_file)
+}
+
+/// Wait through the host loader's startup window and return the fatal player-facing reason when a
+/// known-incompatible DLL is actually loaded.
+///
+/// Loaders call DLL entry points sequentially, so the provenance snapshot from our `DllMain` can
+/// run before a later DLL in the same list has appeared in the module table. In boblerrr's
+/// 2026-08-18 log that exact ordering listed `RandomizerHelper.dll` on disk while the early module
+/// snapshot did not contain it. This runs on our worker after leaving the loader lock and polls for
+/// one second before any AP core or overlay is built. A file merely sitting unused in matt's
+/// randomizer directory does NOT block; the module must really enter this process.
+pub fn wait_for_blocking_incompatibility() -> Option<&'static str> {
+    // Avoid adding a full second to normal startup. An already-loaded helper is caught by the
+    // first pass regardless of location; only the observed loader-order case (the file is in the
+    // active mod tree but has not loaded yet) needs polling.
+    let should_wait = mod_tree_contains_denied_file();
+    for attempt in 0..=20 {
+        if let Ok(paths) = crate::utils::loaded_modules() {
+            let modules = triage_modules(&paths, None);
+            if !modules.denied.is_empty() {
+                return Some(INCOMPATIBLE_MESSAGE);
+            }
+        }
+        if !should_wait {
+            return None;
+        }
+        if attempt < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    None
 }
 
 /// Whether the me3 VFS icon override can possibly be in effect this session.
@@ -830,7 +889,7 @@ mod tests {
         );
         assert_eq!(modules.denied.len(), 1);
         assert!(modules.denied[0].0.ends_with("RandomizerHelper.dll"));
-        assert!(modules.denied[0].1.contains("cannot grant items"));
+        assert!(modules.denied[0].1.contains("unable to receive items"));
     }
 
     /// Windows is case-insensitive; a launcher that writes the name differently is the same DLL.
@@ -838,6 +897,18 @@ mod tests {
     fn the_deny_match_is_case_insensitive() {
         let modules = triage_modules(&[PathBuf::from(r"C:\x\randomizerhelper.DLL")], None);
         assert_eq!(modules.denied.len(), 1);
+    }
+
+    #[test]
+    fn an_installed_denied_module_is_a_loader_order_candidate() {
+        let report = classify(&[Entry::file("RandomizerHelper.DLL")]);
+        assert!(report_contains_denied_file(&report));
+    }
+
+    #[test]
+    fn an_unrelated_randomizer_dll_is_not_a_loader_order_candidate() {
+        let report = classify(&[Entry::file("RandomizerCrashFix.dll")]);
+        assert!(!report_contains_denied_file(&report));
     }
 
     /// The filter that makes the line readable, and the count that stops it hiding anything.

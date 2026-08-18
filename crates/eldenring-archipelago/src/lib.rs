@@ -103,6 +103,15 @@ extern "system" fn DllMain(_hinst: HINSTANCE, call_reason: u32, _reserved: *mut 
     // Safety: called once, on the load thread, before any game input runs.
     unsafe { input::install() };
 
-    shared::initialize::<game::EldenRing>(input::EldenRingInputBlocker);
+    // HARD INCOMPATIBILITY GATE. RandomizerHelper hooks item granting too; allowing both clients
+    // to initialise produces the worst possible failure mode: AP connects normally while received
+    // items silently never reach the player. Run this off the loader lock and wait through the
+    // loader's sequential DLL startup, then build no AP core or overlay if the helper appears.
+    shared::initialize_checked::<game::EldenRing, _>(input::EldenRingInputBlocker, || {
+        match shared::mod_stack::wait_for_blocking_incompatibility() {
+            Some(message) => Err(message.to_string()),
+            None => Ok(()),
+        }
+    });
     true
 }
