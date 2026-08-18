@@ -258,6 +258,61 @@ fn inventory_has_goods(goods: i32) -> bool {
     storage_has_goods_row(pgd, want_row).unwrap_or(false)
 }
 
+/// Whether a protector FullID from an armour bundle is already in the bag or storage. Unlike
+/// consumables, armour is observable, so this is the reconnect/exactly-once key for bundle members.
+fn inventory_has_protector(full_id: i32) -> bool {
+    use eldenring::cs::{GameDataMan, ItemCategory};
+    use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
+
+    let gdm = match unsafe { GameDataMan::instance() } {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let pgd = gdm.main_player_game_data.as_ref();
+    let want_row = (full_id as u32 & 0x0FFF_FFFF) as i32;
+    let bag_has = pgd
+        .equipment
+        .equip_inventory_data
+        .items_data
+        .normal_entries()
+        .iter()
+        .chain(
+            pgd.equipment
+                .equip_inventory_data
+                .items_data
+                .key_entries()
+                .iter(),
+        )
+        .chain(
+            pgd.equipment
+                .equip_inventory_data
+                .items_data
+                .multiplay_key_entries()
+                .iter(),
+        )
+        .non_empty()
+        .any(|e| {
+            e.item_id.category() == ItemCategory::Protector
+                && e.item_id.param_id() as i32 == want_row
+        });
+    if bag_has {
+        return true;
+    }
+    let Some(storage) = pgd.storage.as_ref() else {
+        return false;
+    };
+    storage
+        .items_data
+        .normal_entries()
+        .iter()
+        .chain(storage.items_data.key_entries().iter())
+        .non_empty()
+        .any(|e| {
+            e.item_id.category() == ItemCategory::Protector
+                && e.item_id.param_id() as i32 == want_row
+        })
+}
+
 /// Whether the STORAGE BOX holds `want_row`. `None` means there is no box to read (`pgd.storage`
 /// is `None`), which is NOT the same answer as "read it, the row is not in there" (`Some(false)`).
 /// [`inventory_forensics`] prints the difference; [`inventory_has_goods`] treats both as "not
@@ -466,6 +521,19 @@ impl GameIo for LiveGame {
         for &f in companion_flags {
             let _ = crate::flags::try_set_event_flag(f, true);
         }
+        true
+    }
+
+    fn has_protector(&self, full_id: i32) -> bool {
+        inventory_has_protector(full_id)
+    }
+
+    fn grant_protector(&mut self, full_id: i32) -> bool {
+        if !crate::detour::grant_full_id(full_id, 1) {
+            return false;
+        }
+        // Queue the concrete member, never the synthetic wrapper. enqueue self-gates on auto_equip.
+        crate::auto_equip::enqueue(full_id, None);
         true
     }
 

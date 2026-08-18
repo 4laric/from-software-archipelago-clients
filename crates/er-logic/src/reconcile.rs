@@ -194,6 +194,9 @@ pub enum ItemSemantics {
         qty: i32,
         echo_skip: bool,
     },
+    /// A synthetic armour-set wrapper. Every protector is independently observable in inventory,
+    /// so reconnect can resume a partly delivered bundle without duplicating members that landed.
+    ArmorBundle(Vec<GoodsId>),
     /// A PROGRESSIVE item: the Nth received copy of this NAME lands tier N (that tier's unique
     /// goods plus its observable flags); every copy past the last tier yields ONE overflow consumable
     /// (`overflow_full_id`, e.g. a Lord's Rune). The desired state depends only on the COUNT of
@@ -297,6 +300,8 @@ pub struct DesiredState {
     pub flags: BTreeMap<FlagId, bool>,
     /// OBSERVABLE unique goods (key items, great runes): granted iff absent from the live inventory.
     pub unique_goods: BTreeMap<GoodsId, UniqueGood>,
+    /// Observable protector FullIDs owed by received armour-set wrappers.
+    pub unique_protectors: BTreeSet<GoodsId>,
     /// NON-observable consumables: desired == "server indices `>= watermark`, each applied once".
     pub ledgered: Vec<LedgeredGrant>,
     /// The clear-allowlist: only flags in here may ever be [`Action::ClearFlag`]'d. A vanilla-owned
@@ -416,6 +421,9 @@ impl DesiredState {
                         apply: !*echo_skip,
                     });
                 }
+                ItemSemantics::ArmorBundle(members) => {
+                    d.unique_protectors.extend(members.iter().copied());
+                }
                 ItemSemantics::GoalFlag(f) => {
                     d.flags.insert(*f, true);
                 }
@@ -516,6 +524,7 @@ impl DesiredState {
 pub struct ObservedState {
     pub flags: BTreeMap<FlagId, bool>,
     pub unique_goods: BTreeSet<GoodsId>,
+    pub unique_protectors: BTreeSet<GoodsId>,
     /// Contiguous "already applied" frontier for the consumable ledger (persisted per save). Grants
     /// with `index >= applied_watermark` are still owed.
     pub applied_watermark: ItemIndex,
@@ -530,6 +539,8 @@ pub enum Action {
     ClearFlag(FlagId),
     /// Grant a unique good and set its companion (obtained/restored) flags atomically.
     GrantUnique(GoodsId, Vec<FlagId>),
+    /// Grant one missing protector from an armour-set wrapper.
+    GrantUniqueProtector(GoodsId),
     /// Apply a ledgered consumable grant once, advancing the watermark past `index`.
     GrantLedgered {
         index: ItemIndex,
@@ -565,6 +576,11 @@ pub fn diff(desired: &DesiredState, observed: &ObservedState) -> Vec<Action> {
     for (&g, ug) in &desired.unique_goods {
         if !observed.unique_goods.contains(&g) {
             out.push(Action::GrantUnique(g, ug.companion_flags.clone()));
+        }
+    }
+    for &p in &desired.unique_protectors {
+        if !observed.unique_protectors.contains(&p) {
+            out.push(Action::GrantUniqueProtector(p));
         }
     }
 
@@ -666,6 +682,14 @@ pub trait GameIo {
     /// Grant a unique good and set its companion flags. Returns `false` if the inventory pointer
     /// isn't captured yet (retry next tick, nothing placed).
     fn grant_good(&mut self, goods: GoodsId, companion_flags: &[FlagId]) -> bool;
+    /// Is this protector FullID present in the bag or storage box?
+    fn has_protector(&self, _full_id: GoodsId) -> bool {
+        false
+    }
+    /// Grant one protector member of a synthetic armour-set wrapper.
+    fn grant_protector(&mut self, _full_id: GoodsId) -> bool {
+        false
+    }
     /// Apply a ledgered consumable grant. Returns `false` if the inventory pointer isn't ready.
     fn grant_ledgered(&mut self, full_id: GoodsId, qty: i32) -> bool;
 }
@@ -703,7 +727,7 @@ impl ApplyClasses {
     pub fn allows(&self, action: &Action) -> bool {
         match action {
             Action::SetFlag(_) | Action::ClearFlag(_) => self.flags,
-            Action::GrantUnique(..) => self.goods,
+            Action::GrantUnique(..) | Action::GrantUniqueProtector(..) => self.goods,
             Action::GrantLedgered { .. } | Action::SkipLedgered { .. } => self.ledger,
         }
     }
@@ -992,16 +1016,23 @@ impl Reconciler {
             flags.insert(f, io.get_flag(f));
         }
         let mut goods = BTreeSet::new();
+        let mut protectors = BTreeSet::new();
         if read_goods {
             for &g in self.desired.unique_goods.keys() {
                 if io.has_good(g) {
                     goods.insert(g);
                 }
             }
+            for &p in &self.desired.unique_protectors {
+                if io.has_protector(p) {
+                    protectors.insert(p);
+                }
+            }
         }
         ObservedState {
             flags,
             unique_goods: goods,
+            unique_protectors: protectors,
             applied_watermark: self.applied_watermark,
         }
     }
@@ -1109,6 +1140,10 @@ impl Reconciler {
             self.grant_attempts.remove(g);
             self.stalled_goods.remove(g);
         }
+        for p in &observed.unique_protectors {
+            self.grant_attempts.remove(p);
+            self.stalled_goods.remove(p);
+        }
         // A flag observed at its DESIRED value has landed: forget attempts and un-park it, so a
         // late-landing write (or a world edge that fixed whatever discarded it) restores service.
         for (&f, &have) in &observed.flags {
@@ -1124,6 +1159,9 @@ impl Reconciler {
         // spinning forever on actions it will never apply.
         actions
             .retain(|a| !matches!(a, Action::GrantUnique(g, _) if self.stalled_goods.contains(g)));
+        actions.retain(
+            |a| !matches!(a, Action::GrantUniqueProtector(p) if self.stalled_goods.contains(p)),
+        );
         actions.retain(|a| {
             !matches!(a, Action::SetFlag(f) | Action::ClearFlag(f) if self.stalled_flags.contains(f))
         });
@@ -1255,6 +1293,29 @@ impl Reconciler {
                         deferred = true; // inventory not ready -> retry next tick
                     }
                 }
+                Action::GrantUniqueProtector(p) => {
+                    if !grants_allowed || goods_used >= budget.goods {
+                        deferred = true;
+                        continue;
+                    }
+                    if io.grant_protector(*p) {
+                        goods_used += 1;
+                        granted_this_tick = true;
+                        applied.push(a.clone());
+                        if io.has_protector(*p) {
+                            self.grant_attempts.remove(p);
+                        } else {
+                            let n = self.grant_attempts.entry(*p).or_insert(0);
+                            *n += 1;
+                            if *n >= MAX_GRANT_ATTEMPTS {
+                                self.stalled_goods.insert(*p);
+                                newly_stalled.push(*p);
+                            }
+                        }
+                    } else {
+                        deferred = true;
+                    }
+                }
                 Action::GrantLedgered { .. } | Action::SkipLedgered { .. } => {} // pass 2 (contiguity)
             }
         }
@@ -1347,6 +1408,7 @@ impl Reconciler {
 pub struct MockGame {
     pub flags: BTreeMap<FlagId, bool>,
     pub goods: BTreeSet<GoodsId>,
+    pub protectors: BTreeSet<GoodsId>,
     /// Every consumable grant that LANDED: (full_id, qty). Length is the double-grant detector.
     pub ledger_log: Vec<(GoodsId, i32)>,
     /// Flag holder ready (false => set_flag returns false, caller retries).
@@ -1378,6 +1440,7 @@ impl Default for MockGame {
         MockGame {
             flags: BTreeMap::new(),
             goods: BTreeSet::new(),
+            protectors: BTreeSet::new(),
             ledger_log: Vec::new(),
             flag_ready: true,
             inventory_ready: true,
@@ -1523,6 +1586,17 @@ impl GameIo for MockGame {
         }
         true
     }
+    fn has_protector(&self, full_id: GoodsId) -> bool {
+        self.protectors.contains(&full_id)
+    }
+    fn grant_protector(&mut self, full_id: GoodsId) -> bool {
+        if !self.inventory_ready {
+            return false;
+        }
+        self.unique_grant_calls.push(full_id);
+        self.protectors.insert(full_id);
+        true
+    }
     fn grant_ledgered(&mut self, full_id: GoodsId, qty: i32) -> bool {
         if !self.inventory_ready {
             return false;
@@ -1551,6 +1625,40 @@ mod tests {
             name: name.into(),
             semantics: ItemSemantics::MapReveal(flags.to_vec()),
         }
+    }
+    fn armor_bundle(index: ItemIndex, members: &[GoodsId]) -> ReceivedItem {
+        ReceivedItem {
+            index,
+            name: "Carian Knight Set".into(),
+            semantics: ItemSemantics::ArmorBundle(members.to_vec()),
+        }
+    }
+
+    #[test]
+    fn armor_bundle_reconnect_resumes_only_missing_members() {
+        let members = [
+            0x100f_4240,
+            0x100f_42a4,
+            0x100f_4308,
+            0x100f_436c,
+            0x100f_4630,
+        ];
+        let input = inputs("A", vec![armor_bundle(7, &members)], vec![]);
+        let mut game = MockGame::stable();
+        // Model a crash/reconnect after the first two concrete protectors landed.
+        game.protectors.extend(members[..2].iter().copied());
+        let mut r = Reconciler::new(input);
+        r.run_to_fixpoint(&mut game, TickBudget::default(), 32);
+
+        assert_eq!(game.protectors, members.into_iter().collect());
+        assert_eq!(game.unique_grant_calls, members[2..]);
+        let calls = game.unique_grant_calls.len();
+        r.run_to_fixpoint(&mut game, TickBudget::default(), 8);
+        assert_eq!(
+            game.unique_grant_calls.len(),
+            calls,
+            "reconnect/fixpoint is exactly once"
+        );
     }
     fn great_rune(index: ItemIndex, name: &str, goods: GoodsId, restored: FlagId) -> ReceivedItem {
         ReceivedItem {
@@ -1960,6 +2068,7 @@ mod tests {
         let obs = ObservedState {
             flags: [(6901u32, true)].into_iter().collect(),
             unique_goods: [191i32].into_iter().collect(),
+            unique_protectors: Default::default(),
             applied_watermark: 0,
         };
         assert!(

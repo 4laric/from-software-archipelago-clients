@@ -58,6 +58,7 @@ use crate::region::RegionConfig;
 /// `core` and cannot be a static.
 pub struct ProbeCtx<'a> {
     pub region: Option<&'a RegionConfig>,
+    pub armor_bundles: bool,
 }
 
 /// A tag paired with the read-back that decides whether it is live.
@@ -115,6 +116,8 @@ pub const PROBES: &[(&str, Probe)] = &[
     // Read the same atomic that gates both outbound broadcasts and inbound queueing. The world
     // declares this tag only when the option is on, so `false` is a genuine dark feature.
     ("trap_link", |_| crate::traps::trap_link_enabled()),
+    // Parsed per connect into Core. Non-empty means wrapper receipt has concrete members to apply.
+    ("armor_bundles", |c| c.armor_bundles),
 ];
 
 /// Build the `(tag, live)` table this connect.
@@ -219,7 +222,10 @@ mod tests {
     /// VALUE logic is tested where it is deterministic: `client_features::reconcile` in er-logic.
     #[test]
     fn probes_are_host_safe() {
-        let ctx = ProbeCtx { region: None };
+        let ctx = ProbeCtx {
+            region: None,
+            armor_bundles: false,
+        };
         for (_tag, p) in PROBES {
             let _ = p(&ctx);
         }
@@ -235,11 +241,20 @@ mod tests {
             .find(|(t, _)| *t == "grace_attunement")
             .expect("covered by every_supported_tag_has_a_probe")
             .1;
-        assert!(!probe(&ProbeCtx { region: None }), "no config -> not armed");
+        assert!(
+            !probe(&ProbeCtx {
+                region: None,
+                armor_bundles: false
+            }),
+            "no config -> not armed"
+        );
 
         let mut cfg = RegionConfig::default();
         assert!(
-            !probe(&ProbeCtx { region: Some(&cfg) }),
+            !probe(&ProbeCtx {
+                region: Some(&cfg),
+                armor_bundles: false
+            }),
             "a seed that gates no region must not report the feature armed"
         );
         cfg.grace_attunement.insert(
@@ -247,7 +262,10 @@ mod tests {
             crate::region::GraceGate::default(),
         );
         assert!(
-            probe(&ProbeCtx { region: Some(&cfg) }),
+            probe(&ProbeCtx {
+                region: Some(&cfg),
+                armor_bundles: false
+            }),
             "one gated region is what the apworld declares the tag for"
         );
     }

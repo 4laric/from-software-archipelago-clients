@@ -91,6 +91,8 @@ pub const SUPPORTED: &[&str] = &[
     "blackout",
     // options.trap_link -> post-connect tag reconciliation plus exact-name Bounce delivery.
     "trap_link",
+    // armorBundles -> synthetic wrapper receipt reconciles every observable protector member.
+    "armor_bundles",
 ];
 
 /// Feature tags the seed requires that this build does not know.
