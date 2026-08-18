@@ -4034,10 +4034,17 @@ impl Core {
                 semantics: self.classify_received(name, *ap_id, *echo_skip),
             })
             .collect();
+        let received_names: HashSet<String> = received
+            .iter()
+            .map(|(_, name, _, _)| name.clone())
+            .collect();
         // Gap 1: fold slot-data bulk grants from the SAME tables the live handlers use.
         let sc = self.start.as_ref();
         let slot_data = SlotData {
-            seal_flags: Vec::new(),
+            // The physical Leyndell seal checks both 105 and 182. Derive them from the same
+            // cumulative receive stream used for ordinary deliveries and server `/send`; putting
+            // them in DesiredInputs lets the active flag reconciler self-heal the write.
+            seal_flags: crate::keyitems::leyndell_gate_flags(&received_names),
             start_graces: sc.map(|s| s.start_graces.clone()).unwrap_or_default(),
             always_map_flags: sc
                 .map(crate::startgrants::always_map_flags_for)

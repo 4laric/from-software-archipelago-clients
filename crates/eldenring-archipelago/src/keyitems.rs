@@ -84,6 +84,15 @@ fn received_great_rune_count(received: &HashSet<String>) -> usize {
         .count()
 }
 
+/// Non-location prerequisites owed to the physical Leyndell seal by the cumulative AP receive
+/// stream. This is shared by the active reconciler and the runtime-fallback handler so normal
+/// delivery, server `/send`, reconnect replay, and `RECONCILE_APPLY=none` cannot diverge.
+pub fn leyndell_gate_flags(received: &HashSet<String>) -> Vec<u32> {
+    (received_great_rune_count(received) >= 2)
+        .then(|| LEYNDELL_TWO_RUNES_FLAGS.to_vec())
+        .unwrap_or_default()
+}
+
 /// Every (item name, obtained flags) pair this module applies: the two local tables plus the
 /// whetblade affinity sets from `er_logic::whetblade` -- ONE source shared with the check repoint,
 /// so a whetblade's receive-set flags and its repointed check can never disagree by drift.
@@ -207,11 +216,9 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
     // would spend checks. Reconcile both non-location prerequisites once AP has delivered two runes.
     let rune_count = received_great_rune_count(received);
     let mut applied = Vec::new();
-    if rune_count >= 2 {
-        for &flag in LEYNDELL_TWO_RUNES_FLAGS {
-            if !flags::get_event_flag(flag) && flags::try_set_event_flag(flag, true) {
-                applied.push(flag);
-            }
+    for flag in leyndell_gate_flags(received) {
+        if !flags::get_event_flag(flag) && flags::try_set_event_flag(flag, true) {
+            applied.push(flag);
         }
     }
     if !applied.is_empty() {
@@ -268,7 +275,13 @@ mod tests {
 
     #[test]
     fn leyndell_gate_reconciles_both_non_location_prerequisites() {
-        assert_eq!(LEYNDELL_TWO_RUNES_FLAGS, &[105, 182]);
+        let one = HashSet::from(["Godrick's Great Rune".to_string()]);
+        let two = HashSet::from([
+            "Godrick's Great Rune".to_string(),
+            "Great Rune of the Unborn".to_string(),
+        ]);
+        assert!(leyndell_gate_flags(&one).is_empty());
+        assert_eq!(leyndell_gate_flags(&two), vec![105, 182]);
         assert!(
             LEYNDELL_TWO_RUNES_FLAGS
                 .iter()
