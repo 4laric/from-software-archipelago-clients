@@ -3334,6 +3334,12 @@ impl shared::Core for Core {
             // Keep this outside the reconciler ownership branch: DesiredInputs only contains
             // received items and therefore cannot represent the pre-receipt altar disarm.
             crate::keyitems::tick_seed_great_rune_altars();
+            // The physical Leyndell seal checks BOTH 105 and 182. Keep its tiny, safe prerequisite
+            // backstop outside the general reconciler ownership switch: the desired-state path owns
+            // the same idempotent flags, while this path independently reads back and retries writes
+            // that did not stick. Covers normal receive, server /send and reconnect replay because
+            // `received_all` is the cumulative stream.
+            crate::keyitems::tick_leyndell_gate_flags(&received_all);
         }
         if let Some(cfg) = self.region.as_ref() {
             if let Some(m) = crate::region::tick_random_start_warp(cfg) {

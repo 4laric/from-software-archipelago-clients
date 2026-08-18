@@ -15,7 +15,10 @@
 
 use crate::flags;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU32, Ordering},
+};
 
 /// Restore flags for Great Runes that exist in THIS seed's item map. These are armed at slot-data
 /// parse time, before receipt: event 90005110 does not check possession of the boss-drop rune before
@@ -77,6 +80,10 @@ const GREAT_RUNE_NAMES: &[&str] = &[
 // when AP supplies the runes and starts the player past that quest sequence.
 const LEYNDELL_TWO_RUNES_FLAGS: &[u32] = &[105, 182];
 
+/// One warning bit per Leyndell prerequisite. A rejected/lost write retries every stable tick, but
+/// says so once instead of flooding the log. The bit clears when readback eventually confirms.
+static LEYNDELL_GATE_WARNED: AtomicU32 = AtomicU32::new(0);
+
 fn received_great_rune_count(received: &HashSet<String>) -> usize {
     GREAT_RUNE_NAMES
         .iter()
@@ -92,6 +99,45 @@ pub fn leyndell_gate_flags(received: &HashSet<String>) -> Vec<u32> {
         LEYNDELL_TWO_RUNES_FLAGS.to_vec()
     } else {
         Vec::new()
+    }
+}
+
+/// Dedicated self-healing backstop for the physical Leyndell seal.
+///
+/// This deliberately runs even when the desired-state reconciler owns ordinary flag writes. Both
+/// paths derive the same two flags from [`leyndell_gate_flags`] and both are idempotent, while this
+/// path gives the seal an independent readback/retry boundary. Bobler's 2026-08-18 playtest reached
+/// four AP Great Runes under the active reconciler but still found the wall closed; coupling the
+/// only fallback to `!owns_flags()` left no recovery or named evidence for that state.
+pub fn tick_leyndell_gate_flags(received: &HashSet<String>) {
+    let rune_count = received_great_rune_count(received);
+    let mut applied = Vec::new();
+    for (index, flag) in leyndell_gate_flags(received).into_iter().enumerate() {
+        let bit = 1u32 << index;
+        if flags::get_event_flag(flag) {
+            LEYNDELL_GATE_WARNED.fetch_and(!bit, Ordering::Relaxed);
+            continue;
+        }
+        let accepted = flags::try_set_event_flag(flag, true);
+        if flags::get_event_flag(flag) {
+            LEYNDELL_GATE_WARNED.fetch_and(!bit, Ordering::Relaxed);
+            applied.push(flag);
+        } else if LEYNDELL_GATE_WARNED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            log::warn!(
+                "great runes: {rune_count} AP-received -- Leyndell prerequisite flag {flag} \
+                 did not stick (write accepted={accepted}); retrying every stable in-world tick"
+            );
+        }
+    }
+    if !applied.is_empty() {
+        let state: Vec<(u32, bool)> = LEYNDELL_TWO_RUNES_FLAGS
+            .iter()
+            .map(|&flag| (flag, flags::get_event_flag(flag)))
+            .collect();
+        log::info!(
+            "great runes: {rune_count} AP-received -- Leyndell gate prerequisite flag(s) \
+             {applied:?} applied; readback {state:?}"
+        );
     }
 }
 
@@ -134,6 +180,7 @@ pub fn configure_seed_great_runes(names: &[String]) {
 /// Clear seed-scoped configuration before parsing a different room.
 pub fn reset_seed_great_runes() {
     SEED_GREAT_RUNE_FLAGS.lock().unwrap().clear();
+    LEYNDELL_GATE_WARNED.store(0, Ordering::Relaxed);
 }
 
 /// Disarm vanilla's altar awards before the matching AP rune arrives. The event flag is the latch;
@@ -208,26 +255,6 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
                 "key item '{n}': obtained/restored flag(s) {fs:?} applied ({applied} newly set)"
             );
         }
-    }
-
-    // The physical seal is `EventFlag(182) && EventFlag(105)`. Common event 730 derives 182 from
-    // possession flags 171-177, but event 6905 populates those only once from vanilla boss flags,
-    // before late AP receipts. Flag 105 normally arrives through Roundtable/Finger Reader
-    // progression, which a random start can bypass. Do NOT set 171-177 here: 171-176 are the
-    // randomized Great Rune location flags and 177 belongs to the same vanilla family, so doing so
-    // would spend checks. Reconcile both non-location prerequisites once AP has delivered two runes.
-    let rune_count = received_great_rune_count(received);
-    let mut applied = Vec::new();
-    for flag in leyndell_gate_flags(received) {
-        if !flags::get_event_flag(flag) && flags::try_set_event_flag(flag, true) {
-            applied.push(flag);
-        }
-    }
-    if !applied.is_empty() {
-        log::info!(
-            "great runes: {rune_count} AP-received -- Leyndell gate prerequisite flag(s) \
-             {applied:?} applied"
-        );
     }
 }
 
