@@ -197,7 +197,7 @@ fn mod_tree_contains_denied_file() -> bool {
     let Ok(dir) = crate::utils::mod_directory() else {
         return false;
     };
-    probe_with_ancestors(&dir)
+    probe_with_ancestors(dir)
         .iter()
         .filter_map(|(_, result)| result.as_ref().ok())
         .any(report_contains_denied_file)
