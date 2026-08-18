@@ -44,7 +44,7 @@ const ASHEN: i32 = 11_050; // m11_05 bucket (also where the burn warp lands: reg
 const ROUNDTABLE: i32 = 11_100;
 const LIMGRAVE: i32 = 60_000;
 const ROYAL_GRACE: u32 = 11_001_950; // BonfireWarpParam row 110000
-const ASHEN_GRACE: u32 = 11_051_950; // row 110500
+const ASHEN_GRACE: u32 = 11_051_953; // row 110503: Leyndell, Capital of Ash (Ashen-only)
 const ROUNDTABLE_GRACE: u32 = 11_102_950; // Table of Lost Grace
 
 /// The game as the reconciler observes it: two flags + where the player is standing.

@@ -198,21 +198,23 @@ pub fn warp_target_bucket(target: u32) -> Option<i32> {
     Some((target / 10_000 * 10) as i32)
 }
 
+/// Grace entities that exist only in the post-burn capital state. The other five m11_05 graces
+/// have Royal counterparts with the same names, so selecting them should restore Royal rather
+/// than use the menu's currently visible map-variant row to force Ashen.
+const ASHEN_ONLY_WARP_TARGETS: &[u32] = &[
+    11_051_953, // Leyndell, Capital of Ash
+    19_001_950, // finale throne / Fractured Marika map
+];
+
 /// Warp-target intercept: what 9116 must be for the load that `target` is about to resolve.
-/// Ashen/Throne target -> `Some(true)`; ANY other resolvable target (including Royal m11_00,
-/// Roundtable, every overworld grace) -> `Some(false)` — every warp anywhere except the 7
-/// Ashen/Throne graces restores the Royal default. `None` only for an unresolvable target
-/// (0 / not a grace entity id): leave the flag alone rather than guess.
-pub fn capital_flag_state_for_warp_target(sets: &CapitalSets, target: u32) -> Option<bool> {
+/// Ashen-only target -> `Some(true)`; every shared Ashen/Royal grace chooses Royal, as do all
+/// other resolvable targets. `None` only for an unresolvable target (0): leave the flag alone
+/// rather than guess.
+pub fn capital_flag_state_for_warp_target(_sets: &CapitalSets, target: u32) -> Option<bool> {
     if target == 0 {
         return None;
     }
-    match warp_target_bucket(target) {
-        Some(b) if sets.ashen.contains(&b) => Some(true),
-        // Royal target, non-capital dungeon grace, or a 10-digit overworld tile id: all
-        // resolvable, none Ashen -> OFF.
-        _ => Some(false),
-    }
+    Some(ASHEN_ONLY_WARP_TARGETS.contains(&target))
 }
 
 /// Reconcile-don't-dispatch: the ONE flag write (if any) this observation demands.
@@ -289,20 +291,27 @@ mod tests {
     }
 
     #[test]
-    fn warping_to_ashen_or_throne_writes_on() {
+    fn only_ashen_exclusive_graces_write_on() {
         let s = sets();
-        // All 6 Ashen m11_05 graces (rows 110500-110505) + the Elden Throne grace.
-        for g in 11_051_950..=11_051_955u32 {
+        for g in [11_051_953, 19_001_950] {
             assert_eq!(
                 capital_flag_state_for_warp_target(&s, g),
                 Some(true),
                 "grace {g}"
             );
         }
-        assert_eq!(
-            capital_flag_state_for_warp_target(&s, 19_001_950),
-            Some(true)
-        );
+    }
+
+    #[test]
+    fn shared_ashen_graces_choose_the_royal_version() {
+        let s = sets();
+        for g in [11_051_950, 11_051_951, 11_051_952, 11_051_954, 11_051_955] {
+            assert_eq!(
+                capital_flag_state_for_warp_target(&s, g),
+                Some(false),
+                "shared Ashen grace {g} must restore Royal"
+            );
+        }
     }
 
     #[test]

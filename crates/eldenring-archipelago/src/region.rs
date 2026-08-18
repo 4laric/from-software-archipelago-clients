@@ -1200,9 +1200,8 @@ pub fn tick_capital() {
 }
 
 /// Warp-target intercept: decide 9116 from the TARGET before the load resolves, so the player
-/// always loads the correct capital version. Ashen/Throne grace -> ON; ANY other resolvable
-/// target (Royal graces, Roundtable, every overworld grace) -> OFF -- every warp anywhere
-/// except the 7 Ashen/Throne graces restores the Royal default. Called by
+/// always loads the intended capital version. Only Ashen-exclusive graces -> ON; shared
+/// Ashen/Royal graces and every other resolvable target -> OFF. Called by
 /// `warp::warp_to_grace` right after the warp request (the warp is asynchronous; the write
 /// lands before the load screen resolves). No-op while INERT or pre-burn.
 pub fn capital_warp_intercept(grace_entity_id: u32) {
