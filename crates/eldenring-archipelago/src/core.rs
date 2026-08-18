@@ -600,7 +600,8 @@ impl shared::Core for Core {
     /// latch is re-armed on a genuine seed change, so this correctly goes back to `None` while a
     /// new seed's options are being read.
     fn death_link_enabled(&self) -> Option<bool> {
-        self.slot_data_parsed.then(crate::deathlink::is_enabled)
+        self.base
+            .effective_death_link(self.slot_data_parsed.then(crate::deathlink::is_enabled))
     }
 
     /// Overlay menu-bar hook (SPEC-item-tracker.md): a "Tracker" item that toggles the window.
@@ -609,6 +610,31 @@ impl shared::Core for Core {
     /// only in this file: it was in no README, no guide and no menu label, so the one feature that
     /// answers "how do I get this off my screen" was undiscoverable by design.
     fn render_overlay_menu_items(&mut self, ui: &imgui::Ui) {
+        if self.slot_data_parsed {
+            let configured = crate::deathlink::is_enabled();
+            let effective = self.death_link_enabled().unwrap_or(configured);
+            let source = if self.base.death_link_override().is_some() {
+                "session override"
+            } else {
+                "seed"
+            };
+            let label = format!(
+                "DeathLink: {} ({source})",
+                if effective { "ON" } else { "off" }
+            );
+            if ui.menu_item(label) {
+                let next = !effective;
+                self.base.set_death_link_override(Some(next));
+                let line = format!(
+                    "DeathLink {} for this session (seed setting: {})",
+                    if next { "ENABLED" } else { "disabled" },
+                    if configured { "on" } else { "off" }
+                );
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(line.clone(), now);
+                self.log(ap::Print::message(line));
+            }
+        }
         if ui.menu_item("Tracker (F6)") {
             self.tracker_visible = !self.tracker_visible;
         }
@@ -634,6 +660,11 @@ impl shared::Core for Core {
     /// Overlay frame hook: hotkey toggle + hint accumulation every frame (cheap -- the watermark
     /// skips already-scanned log entries), then the tracker window itself when visible.
     fn render_overlay_windows(&mut self, ui: &imgui::Ui) {
+        if let Some(line) = self.base.take_death_link_tag_failure() {
+            let now = self.toast_clock.elapsed().as_millis() as u64;
+            self.toasts.push(line.clone(), now);
+            self.log(ap::Print::message(line));
+        }
         // F6 toggles the tracker (deliberately NOT a plain letter -- those fight the say input).
         if ui.is_key_pressed(imgui::Key::F6) {
             self.tracker_visible = !self.tracker_visible;
@@ -3558,7 +3589,7 @@ impl shared::Core for Core {
                 if foreign {
                     // R2 (SWEEP H2): honor the slot's death_link option on the INCOMING side too
                     // (the tag is advertised unconditionally; only the outgoing send was gated).
-                    if crate::deathlink::is_enabled() {
+                    if self.death_link_enabled() == Some(true) {
                         log::info!("DeathLink received from '{source}'");
                         crate::deathlink::latch_incoming_kill();
                         // SAY IT ON SCREEN. This kills the player, and until now the only record
@@ -3580,8 +3611,8 @@ impl shared::Core for Core {
                 }
             }
         }
-        crate::deathlink::drive_kill();
-        if crate::deathlink::is_enabled()
+        crate::deathlink::drive_kill(self.death_link_enabled() == Some(true));
+        if self.death_link_enabled() == Some(true)
             && crate::deathlink::poll_local_death()
             && let Some(client) = self.client_mut()
         {
@@ -4176,6 +4207,7 @@ impl Core {
     /// and install-once globals (detour_installed) are left intact.
     /// Recovered after commit 4bb3c95 accidentally dropped the body while leaving the call sites.
     fn reset_for_new_seed(&mut self) {
+        self.base.set_death_link_override(None);
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
         // flags the new seed never earned.
         self.sweep_flag_pending.clear();

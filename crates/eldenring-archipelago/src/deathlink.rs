@@ -56,7 +56,7 @@ pub fn latch_incoming_kill() {
 ///   first so the vanilla death banks an EMPTY bloodstain -- then arm the restore. The dedicated
 ///   flag is still set best-effort for bake-compat setups. Latch clears only on a successful kill,
 ///   so a kill latched on a menu/load screen retries.
-pub fn drive_kill() {
+pub fn drive_kill(effective_enabled: bool) {
     // --- KEEP-RUNES RESTORE leg (ungated: we may owe runes even if death_link was just disabled) ---
     if let Ok(mut keep) = KEEP_RUNES.lock()
         && let Some(runes) = keep.poll_restore(crate::flags::in_world(), read_local_hp())
@@ -72,7 +72,10 @@ pub fn drive_kill() {
 
     // R2 (SWEEP H2): belt-and-braces -- a stale latched kill must never fire once death_link is
     // known-disabled for this slot (the event handler gates too, but the latch can outlive it).
-    if !is_enabled() {
+    if !effective_enabled {
+        // Do not leave a pre-toggle kill waiting to surprise the player when they opt back in.
+        // The restore leg above still finishes any cleanup already owed by a kill that fired.
+        KILL_PENDING.store(false, Ordering::Relaxed);
         return;
     }
     // PURE-RUNTIME (2026-07-01): no baked common.emevd reactor exists on a vanilla game, so the
