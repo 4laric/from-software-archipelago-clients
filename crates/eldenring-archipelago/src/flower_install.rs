@@ -1,4 +1,4 @@
-//! In-client launcher for the locally generated AP flower atlas.
+//! In-client launcher for the locally generated AP flower atlas (issue #269).
 //!
 //! The client never patches or distributes FromSoft assets. It finds the installer shipped beside
 //! the DLL, chooses the mod root the active loader actually reads, and launches the installer in a
