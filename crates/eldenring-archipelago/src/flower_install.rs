@@ -55,9 +55,9 @@ fn find_installer(mod_dir: &Path) -> Option<PathBuf> {
 
 pub fn is_installed(loader: Loader, mod_dir: &Path) -> bool {
     let root = destination(loader, mod_dir);
-    (root.join(".er-ap-flower.json").is_file()
+    root.join(".er-ap-flower.json").is_file()
         || (root.join("menu/hi/01_common.tpf.dcx").is_file()
-            && root.join("menu/low/01_common.tpf.dcx").is_file()))
+            && root.join("menu/low/01_common.tpf.dcx").is_file())
 }
 
 /// Launches a visible PowerShell installer and immediately returns a player-facing status line.
