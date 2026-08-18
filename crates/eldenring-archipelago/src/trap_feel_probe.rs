@@ -28,10 +28,9 @@
 //! **F9 Nightfall** -- `WorldAreaTime::request_time(0,0,0)`. Instantaneous; time flows on from
 //! there and a grace rest resets it, so there is nothing to restore.
 //!
-//! **F10 Stamina Halved** -- a ceiling re-applied for 30s. `CSChrDataModule::stamina` is a plain
-//! `i32`; the game clamps and regenerates it for us, and the clamp DECLINES to write when the
-//! player is already below the ceiling (see `er_logic::trap_probe::stamina_clamp` -- rewriting it
-//! every frame is what would turn "half stamina" into "stamina that visibly never regenerates").
+//! **F10 Stamina Halved** -- halves `CSChrDataModule::max_stamina` for 30s. Current stamina is
+//! capped once when the effect lands and is never replenished by the probe; ordinary drain and
+//! regeneration continue inside the smaller maximum. The original maximum is restored afterward.
 //!
 //! **F11 Blackout** -- fades the screen out for 2.5s and back in.
 //! 🛑 `CSFade` carries NINE fade plates and nothing on record says which one composites over
@@ -52,7 +51,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use eldenring::cs::{WorldAreaTime, WorldChrMan};
 use er_logic::trap_probe::{
-    BLACKOUT_FADE_SECONDS, FeelEffect, NIGHTFALL_TIME, ProbeState, stamina_clamp,
+    BLACKOUT_FADE_SECONDS, FeelEffect, NIGHTFALL_TIME, ProbeState, initial_stamina_cap,
+    stamina_limit,
 };
 use fromsoftware_shared::FromStatic;
 
@@ -61,6 +61,16 @@ use fromsoftware_shared::FromStatic;
 /// A `Mutex` rather than atomics because [`ProbeState`] is two related deadlines and the frame hook
 /// is the only caller -- contention is impossible, and a poisoned lock simply skips the tick.
 static STATE: Mutex<ProbeState> = Mutex::new(ProbeState::new());
+
+#[derive(Clone, Copy)]
+struct ActiveStaminaLimit {
+    original_max: i32,
+    limited_max: i32,
+}
+
+/// Kept separately from the deadline because a restore that hits a death/load teardown must remain
+/// owed and retry on the next safe frame rather than being forgotten with the elapsed deadline.
+static STAMINA_LIMIT: Mutex<Option<ActiveStaminaLimit>> = Mutex::new(None);
 
 /// Is the probe on? ON unless somebody says no -- see the module note for the argument.
 pub fn enabled() -> bool {
@@ -134,15 +144,19 @@ pub fn tick() {
     let Ok(mut state) = STATE.lock() else {
         return;
     };
-    if state.idle() {
+    let restore_owed = STAMINA_LIMIT.lock().is_ok_and(|limit| limit.is_some());
+    if state.idle() && !restore_owed {
         return;
     }
     let now = now_ms();
 
     if state.stamina.holds(now) {
-        hold_stamina();
+        hold_stamina_max();
     } else if state.stamina.take_if_elapsed(now) {
-        log::info!("trap-feel stamina_halved: ceiling lifted, stamina back to normal");
+        log::info!("trap-feel stamina_halved: duration elapsed; restoring maximum stamina");
+    }
+    if !state.stamina.is_pending() && restore_owed && restore_stamina_max() {
+        log::info!("trap-feel stamina_halved: maximum stamina restored");
     }
 
     if state.blackout.take_if_elapsed(now) {
@@ -183,11 +197,11 @@ fn fire_nightfall() -> bool {
 fn fire_stamina_halved() -> bool {
     // The first application is the same write the sustain loop makes; if it cannot land now it will
     // not land this tick either, and the deadline is not armed.
-    if !hold_stamina() {
+    if !apply_stamina_limit() {
         log::info!("trap-feel stamina_halved: player unreachable -- skipped");
         return false;
     }
-    log::info!("trap-feel stamina_halved: ceiling applied for 30s");
+    log::info!("trap-feel stamina_halved: maximum halved for 30s");
     true
 }
 
@@ -209,25 +223,74 @@ fn fire_blackout() -> bool {
 /// All nine, because nothing on record says which one composites over ordinary play. Restoring all
 /// nine is what makes that guess safe: a plate we should not have faded is faded back by the same
 /// loop, and any load or grace rest re-drives them anyway.
-/// Re-apply the stamina ceiling. Returns whether the player was reachable at all -- NOT whether a
-/// write happened, because declining to write is the normal case (`stamina_clamp`).
-fn hold_stamina() -> bool {
+fn player_data_mut() -> Option<&'static mut eldenring::cs::CSChrDataModule> {
     // SAFETY: as `fire_nightfall`.
     let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
-        return false;
+        return None;
     };
     let Some(player) = wcm.main_player.as_mut() else {
-        return false;
+        return None;
     };
     let data = &mut player.chr_ins.modules.data;
     // The teardown guard. This module never walks `special_effect`, but `chr_ins` itself is torn
     // down at the death cam, and a ceiling is meaningless on a corpse -- the effect resumes on the
     // next tick with `hp > 0`, which is the documented degrade every caller of this guard takes.
     if er_logic::death_guard::lists_unsafe_to_touch(data.hp) {
+        return None;
+    }
+    Some(data)
+}
+
+/// Install the smaller maximum. Re-firing extends the deadline without halving an already-halved
+/// value again. Current stamina is touched only here, and only downward.
+fn apply_stamina_limit() -> bool {
+    let Some(data) = player_data_mut() else {
+        return false;
+    };
+    let Ok(mut active) = STAMINA_LIMIT.lock() else {
+        return false;
+    };
+    let limit = active.unwrap_or_else(|| ActiveStaminaLimit {
+        original_max: data.max_stamina,
+        limited_max: stamina_limit(data.max_stamina),
+    });
+    if limit.original_max <= 0 || limit.limited_max <= 0 {
         return false;
     }
-    if let Some(clamped) = stamina_clamp(data.stamina, data.max_stamina) {
+    data.max_stamina = limit.limited_max;
+    if let Some(clamped) = initial_stamina_cap(data.stamina, limit.limited_max) {
         data.stamina = clamped;
     }
+    *active = Some(limit);
+    true
+}
+
+/// Re-assert only the maximum; never write current stamina from the sustain loop.
+fn hold_stamina_max() -> bool {
+    let Some(data) = player_data_mut() else {
+        return false;
+    };
+    let Ok(active) = STAMINA_LIMIT.lock() else {
+        return false;
+    };
+    let Some(limit) = *active else {
+        return false;
+    };
+    data.max_stamina = limit.limited_max;
+    true
+}
+
+fn restore_stamina_max() -> bool {
+    let Some(data) = player_data_mut() else {
+        return false;
+    };
+    let Ok(mut active) = STAMINA_LIMIT.lock() else {
+        return false;
+    };
+    let Some(limit) = *active else {
+        return true;
+    };
+    data.max_stamina = limit.original_max;
+    *active = None;
     true
 }
