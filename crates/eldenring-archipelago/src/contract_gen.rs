@@ -210,3 +210,4 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // version number would.
 pub const CONTRACT_HASH: &str = "dc0dc687";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.4.8";
+
