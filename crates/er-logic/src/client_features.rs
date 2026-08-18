@@ -89,6 +89,8 @@ pub const SUPPORTED: &[&str] = &[
     "spawn_traps",
     // A seed that mints Blackout must refuse clients that would consume and ignore its fixed name.
     "blackout",
+    // options.trap_link -> post-connect tag reconciliation plus exact-name Bounce delivery.
+    "trap_link",
 ];
 
 /// Feature tags the seed requires that this build does not know.

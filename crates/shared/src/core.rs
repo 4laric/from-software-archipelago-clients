@@ -58,8 +58,10 @@ pub struct CoreBase<G: Game, S: DeserializeOwned + Send + 'static> {
     /// Whether the server currently believes this slot carries the `DeathLink` tag.
     ///
     /// We connect UNTAGGED, so this starts `false` on every new connection and only becomes `true`
-    /// after a successful [`Core::reconcile_death_link_tag`] send. See [`next_tag_advertisement`].
+    /// after a successful [`Core::reconcile_connection_tags`] send. See [`next_tag_advertisement`].
     advertised_death_link: bool,
+    /// Whether the server currently believes this socket carries the `TrapLink` tag.
+    advertised_trap_link: bool,
 
     /// Session-only player choice. `None` follows slot data; `Some` overrides it until reconnect.
     /// Kept beside the advertised latch so UI code cannot bypass protocol reconciliation.
@@ -94,6 +96,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
             load_time: None,
             error: None,
             advertised_death_link: false,
+            advertised_trap_link: false,
             death_link_override: None,
             death_link_tag_failure: None,
             death_link_tag_failure_reported: false,
@@ -128,7 +131,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         // It cannot be fixed here: the tag set is decided BEFORE the socket opens, and
         // `death_link` lives in SLOT DATA, which does not exist until after the server accepts the
         // connection. So we connect advertising nothing and add the tag afterwards, once the
-        // answer is actually known -- see [`Core::reconcile_death_link_tag`].
+        // answer is actually known -- see [`Core::reconcile_connection_tags`].
         //
         // Untagged is the FAIL-CLOSED direction. If the option is never resolved (slot data never
         // parses, the update send fails), a slot with DeathLink on quietly misses deaths, which is
@@ -176,6 +179,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
 
         self.connection = Self::new_connection(self.game, &self.config);
         self.advertised_death_link = false; // a fresh socket carries no tags
+        self.advertised_trap_link = false;
         self.death_link_override = None;
         self.death_link_tag_failure = None;
         self.death_link_tag_failure_reported = false;
@@ -214,6 +218,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.config.save()?;
         self.connection = Self::new_connection(self.game, &self.config);
         self.advertised_death_link = false; // a fresh socket carries no tags
+        self.advertised_trap_link = false;
         self.death_link_override = None;
         self.death_link_tag_failure = None;
         self.death_link_tag_failure_reported = false;
@@ -484,7 +489,7 @@ pub trait Core: Send + Sized {
 
     /// Whether this slot participates in DeathLink, or `None` while the answer is not yet known.
     ///
-    /// Drives the `DeathLink` connection tag (see [`Self::reconcile_death_link_tag`]). The tag is
+    /// Drives the `DeathLink` connection tag (see [`Self::reconcile_connection_tags`]). The tag is
     /// what makes the server route other players' deaths here, so this must be the SLOT's answer,
     /// not a guess: return `None` until slot data has actually been read. Returning `Some(false)`
     /// early is fine; returning `Some(true)` early is how deaths get delivered to a slot that
@@ -497,18 +502,35 @@ pub trait Core: Send + Sized {
         None
     }
 
-    /// Converges the server's idea of our tags onto [`Self::death_link_enabled`].
+    /// Whether this slot participates in TrapLink, or `None` until slot data has parsed.
+    fn trap_link_enabled(&self) -> Option<bool> {
+        None
+    }
+
+    /// Converges the server's idea of our link tags onto the slot's parsed settings.
     ///
     /// Runs every tick while connected and is a no-op once the two agree, so it costs one
     /// comparison in the steady state. A failed send deliberately does NOT move the latch, which
     /// makes the next tick retry it.
-    fn reconcile_death_link_tag(&mut self) {
-        let Some(want) =
-            next_tag_advertisement(self.death_link_enabled(), self.base().advertised_death_link)
-        else {
+    fn reconcile_connection_tags(&mut self) {
+        let death_want = self.death_link_enabled();
+        let trap_want = self.trap_link_enabled();
+        let death_changed =
+            next_tag_advertisement(death_want, self.base().advertised_death_link).is_some();
+        let trap_changed =
+            next_tag_advertisement(trap_want, self.base().advertised_trap_link).is_some();
+        if !death_changed && !trap_changed {
             return;
-        };
-        let tags: &[&str] = if want { &["DeathLink"] } else { &[] };
+        }
+        let death = death_want.unwrap_or(self.base().advertised_death_link);
+        let trap = trap_want.unwrap_or(self.base().advertised_trap_link);
+        let mut tags = Vec::with_capacity(2);
+        if death {
+            tags.push("DeathLink");
+        }
+        if trap {
+            tags.push("TrapLink");
+        }
         // Take the send's result before touching `base_mut` -- `client_mut` holds a mutable borrow
         // of `self` for as long as `client` is alive.
         let result = match self.client_mut() {
@@ -517,20 +539,17 @@ pub trait Core: Send + Sized {
         };
         match result {
             Ok(()) => {
-                self.base_mut().advertised_death_link = want;
+                self.base_mut().advertised_death_link = death;
+                self.base_mut().advertised_trap_link = trap;
                 self.base_mut().death_link_tag_failure_reported = false;
                 info!(
-                    "DeathLink tag {} the server",
-                    if want {
-                        "advertised to"
-                    } else {
-                        "retracted from"
-                    }
+                    "connection tags reconciled (DeathLink={}, TrapLink={})",
+                    death, trap,
                 );
             }
             Err(e) => {
                 let message =
-                    format!("DeathLink setting could not reach the server ({e}) -- retrying");
+                    format!("connection tags could not reach the server ({e}) -- retrying");
                 warn!("{message} next tick");
                 if !self.base().death_link_tag_failure_reported {
                     self.base_mut().death_link_tag_failure = Some(message);
@@ -590,7 +609,7 @@ pub trait Core: Send + Sized {
         // Tell the server whether we take DeathLink, now that slot data can answer it. Cheap and
         // idempotent; see the "NO TAGS AT CONNECT" note in `new_connection` for why it is here and
         // not there.
-        self.reconcile_death_link_tag();
+        self.reconcile_connection_tags();
 
         // CHAT-RELAY dispatch: run commands queued from server chat through the same
         // handle_command path as overlay say input. Before the load/grace gating so

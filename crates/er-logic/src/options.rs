@@ -30,6 +30,11 @@ pub fn parse_death_link(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "death_link")
 }
 
+/// `options.trap_link` (int-or-bool).
+pub fn parse_trap_link(slot_data: &Value) -> bool {
+    parse_bool_option(slot_data, "trap_link")
+}
+
 /// Weapon/spell requirement removal, under EITHER apworld's option name.
 ///
 /// Our apworld emits `options.no_weapon_requirements`; Bedrock's fswap apworld emits
@@ -116,6 +121,13 @@ mod tests {
         let sd = json!({ "options": { "enable_dlc": 0, "death_link": 1 } });
         assert!(!parse_dlc(&sd));
         assert!(parse_death_link(&sd));
+    }
+
+    #[test]
+    fn trap_link_parses_independently() {
+        let sd = json!({ "options": { "death_link": 0, "trap_link": true } });
+        assert!(!parse_death_link(&sd));
+        assert!(parse_trap_link(&sd));
     }
 
     #[test]
