@@ -72,6 +72,7 @@ pub mod receive_probe;
 pub mod receive_watermark_replay;
 pub mod reconcile;
 pub mod reconciler_replay;
+pub mod region_completion;
 pub mod region_lock;
 pub mod region_lock_replay;
 pub mod region_locks;

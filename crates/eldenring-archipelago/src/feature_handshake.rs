@@ -59,6 +59,7 @@ use crate::region::RegionConfig;
 pub struct ProbeCtx<'a> {
     pub region: Option<&'a RegionConfig>,
     pub armor_bundles: bool,
+    pub region_completion_goal_gate: bool,
 }
 
 /// A tag paired with the read-back that decides whether it is live.
@@ -118,6 +119,9 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("trap_link", |_| crate::traps::trap_link_enabled()),
     // Parsed per connect into Core. Non-empty means wrapper receipt has concrete members to apply.
     ("armor_bundles", |c| c.armor_bundles),
+    ("region_completion_goal_gate", |c| {
+        c.region_completion_goal_gate
+    }),
 ];
 
 /// Build the `(tag, live)` table this connect.
@@ -225,6 +229,7 @@ mod tests {
         let ctx = ProbeCtx {
             region: None,
             armor_bundles: false,
+            region_completion_goal_gate: false,
         };
         for (_tag, p) in PROBES {
             let _ = p(&ctx);
@@ -244,7 +249,8 @@ mod tests {
         assert!(
             !probe(&ProbeCtx {
                 region: None,
-                armor_bundles: false
+                armor_bundles: false,
+                region_completion_goal_gate: false,
             }),
             "no config -> not armed"
         );
@@ -253,7 +259,8 @@ mod tests {
         assert!(
             !probe(&ProbeCtx {
                 region: Some(&cfg),
-                armor_bundles: false
+                armor_bundles: false,
+                region_completion_goal_gate: false,
             }),
             "a seed that gates no region must not report the feature armed"
         );
@@ -264,7 +271,8 @@ mod tests {
         assert!(
             probe(&ProbeCtx {
                 region: Some(&cfg),
-                armor_bundles: false
+                armor_bundles: false,
+                region_completion_goal_gate: false,
             }),
             "one gated region is what the apworld declares the tag for"
         );

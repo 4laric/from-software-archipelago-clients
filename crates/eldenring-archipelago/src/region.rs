@@ -60,6 +60,30 @@ static GOAL_LOCK_ITEM: Mutex<String> = Mutex::new(String::new());
 static GOAL_GATE_OPENED: AtomicBool = AtomicBool::new(false);
 /// Rising-edge latch for the WITHHELD line, so "still shut, N outstanding" is not spammed.
 static GOAL_GATE_SAID_SHUT: AtomicBool = AtomicBool::new(false);
+static GOAL_GATE_BY_REGION_COMPLETION: AtomicBool = AtomicBool::new(false);
+static GOAL_GATE_COMPLETION_PRIMED: AtomicBool = AtomicBool::new(false);
+
+pub fn configure_goal_gate_policy(regions_completed: bool) {
+    GOAL_GATE_BY_REGION_COMPLETION.store(regions_completed, Ordering::Relaxed);
+    GOAL_GATE_COMPLETION_PRIMED.store(false, Ordering::Relaxed);
+    log::info!(
+        "goal-gate: unlock policy = {}",
+        if regions_completed {
+            "regions_completed"
+        } else {
+            "items_held"
+        }
+    );
+}
+
+pub fn goal_gate_uses_region_completion() -> bool {
+    GOAL_GATE_BY_REGION_COMPLETION.load(Ordering::Relaxed)
+}
+
+pub fn goal_region_name() -> Option<String> {
+    let lock = GOAL_LOCK_ITEM.lock().ok()?.clone();
+    lock.strip_suffix(" Lock").map(str::to_owned)
+}
 
 /// Re-arm at the in-world edge (`test_gf_client_resets_are_called`).
 ///
@@ -148,6 +172,7 @@ pub fn tick_goal_gate(
     rune_goals: &[String],
     runes_required: usize,
     has_item: &dyn Fn(&str) -> bool,
+    incomplete_regions: Option<&[String]>,
 ) -> Option<String> {
     if !flags::in_world() {
         return None; // writes at menu/load are silently discarded (SWEEP R3)
@@ -167,7 +192,25 @@ pub fn tick_goal_gate(
         runes_required,
         goal_lock_item: (!lock_item.is_empty()).then(|| lock_item.clone()),
     };
-    let decision = er_logic::goal_gate::decide(&gate, has_item);
+    let silent_reconnect_open = incomplete_regions.is_some()
+        && !GOAL_GATE_COMPLETION_PRIMED.swap(true, Ordering::Relaxed)
+        && incomplete_regions.is_some_and(<[String]>::is_empty);
+    let decision = if let Some(incomplete) = incomplete_regions {
+        let mut outstanding = incomplete.to_vec();
+        let held_runes = rune_goals.iter().filter(|name| has_item(name)).count();
+        if held_runes < runes_required {
+            outstanding.push(format!("Great Runes ({held_runes}/{runes_required})"));
+        }
+        outstanding.sort();
+        outstanding.dedup();
+        if outstanding.is_empty() {
+            er_logic::goal_gate::Decision::Open
+        } else {
+            er_logic::goal_gate::Decision::Withhold { outstanding }
+        }
+    } else {
+        er_logic::goal_gate::decide(&gate, has_item)
+    };
 
     if !decision.opens() {
         // Say the outstanding list ONCE, then stay quiet until something changes it.
@@ -230,7 +273,8 @@ pub fn tick_goal_gate(
         log::warn!("goal-gate: OPENED WITHOUT A GATE -- {why}");
     }
     // ASCII ONLY -- the game's font has no typographic quotes or dashes.
-    Some("Every goal item is held. The path to the ending is open.".to_string())
+    let region = lock_item.strip_suffix(" Lock").unwrap_or(&lock_item);
+    (!silent_reconnect_open).then(|| format!("Region unlocked: {region}"))
 }
 
 /// kick-watch diagnostic: last play_region_id seen by tick_kick (i32::MIN = none yet).

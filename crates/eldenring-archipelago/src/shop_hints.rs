@@ -70,6 +70,10 @@ static HINTED: Mutex<Option<HashSet<i64>>> = Mutex::new(None);
 
 /// One entry per shop open, drained by [`pump`]. Batched, never flattened -- see the module header.
 static QUEUE: Mutex<Vec<Vec<i64>>> = Mutex::new(Vec::new());
+/// Progression-surface shop locations visible on an opened shelf. Drained by `shop_views` on the
+/// socket thread and persisted independently of whether their rewards are foreign or own-world.
+static VIEWED_SURFACE_QUEUE: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+static COMPLETION_SURFACE: Mutex<Option<HashSet<i64>>> = Mutex::new(None);
 
 /// Set when the ESD detour could not be installed. The connect banner MUST render this: a feature
 /// that silently does nothing on an unsupported build is a silent regression.
@@ -102,6 +106,22 @@ pub fn configure(loc_flags: HashMap<i64, u32>) {
          released slots whose reward belongs to ANOTHER player (buy menu only -- Ash of War / \
          tailoring / upgrade / change-of-purpose open through commands whose ids are not known yet)"
     );
+}
+
+pub fn configure_completion_surface(surface: HashSet<i64>) {
+    if let Ok(mut g) = COMPLETION_SURFACE.lock() {
+        *g = Some(surface);
+    }
+    if let Ok(mut q) = VIEWED_SURFACE_QUEUE.lock() {
+        q.clear();
+    }
+}
+
+pub fn take_viewed_surface_locations() -> Vec<i64> {
+    VIEWED_SURFACE_QUEUE
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
 }
 
 /// Record that the ESD detour did not install, so the connect banner can say the feature is off.
@@ -142,17 +162,6 @@ pub fn on_shop_open(begin: i32, end: i32) {
     if flag_to_loc.is_empty() {
         return; // seed has no check flags at all: no shop checks to hint, and nothing to say.
     }
-    // 🛑 DEFER, do not skip. Planning now would classify the whole shelf as unclassified AND claim
-    // it, so this shelf would never hint again. Nothing is touched; the next open re-plans.
-    if !crate::scout_proof::cache_ready() {
-        log::info!(
-            "shop-hints: shop opened over rows {lo}..={hi} before the connect scout replied, so \
-             nothing can be classified as own or foreign yet -- DEFERRED, not skipped; re-open the \
-             shop once connected. (If this never stops, the scout failed -- grep 'AP item scout'.)"
-        );
-        return;
-    }
-
     // SAFETY: FD4 singleton, read-only, on the game thread. Same sanctioned access `shop_flags`
     // uses; no mutable borrow is taken, so this cannot alias the tick's `instance_mut()` passes.
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
@@ -171,6 +180,34 @@ pub fn on_shop_open(begin: i32, end: i32) {
                 release_flag: row.event_flag_for_release(),
             });
         }
+    }
+
+    // Viewing is a completion fact, not a hint classification. Credit every released AP surface
+    // row on the visible shelf even when its reward is ours and even before scouting finishes.
+    if let Ok(surface) = COMPLETION_SURFACE.lock()
+        && let Some(surface) = surface.as_ref()
+        && let Ok(mut q) = VIEWED_SURFACE_QUEUE.lock()
+    {
+        for row in &rows {
+            if row.release_flag != 0 && !crate::flags::get_event_flag(row.release_flag) {
+                continue;
+            }
+            if let Some(&loc) = flag_to_loc.get(&row.stock_flag)
+                && surface.contains(&loc)
+                && !q.contains(&loc)
+            {
+                q.push(loc);
+            }
+        }
+    }
+
+    // 🛑 DEFER hints, not view credit. Hint planning needs reward ownership from the scout.
+    if !crate::scout_proof::cache_ready() {
+        log::info!(
+            "shop-hints: shop opened over rows {lo}..={hi} before the connect scout replied, so \
+             hints are DEFERRED; region-completion view credit was still recorded"
+        );
+        return;
     }
 
     let Ok(mut hinted_guard) = HINTED.lock() else {
@@ -279,6 +316,9 @@ pub fn reset() {
         *h = Some(HashSet::new());
     }
     if let Ok(mut q) = QUEUE.lock() {
+        q.clear();
+    }
+    if let Ok(mut q) = VIEWED_SURFACE_QUEUE.lock() {
         q.clear();
     }
 }

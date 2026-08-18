@@ -93,6 +93,7 @@ pub const SUPPORTED: &[&str] = &[
     "trap_link",
     // armorBundles -> synthetic wrapper receipt reconciles every observable protector member.
     "armor_bundles",
+    "region_completion_goal_gate",
 ];
 
 /// Feature tags the seed requires that this build does not know.
