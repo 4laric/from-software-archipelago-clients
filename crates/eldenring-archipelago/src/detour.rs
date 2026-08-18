@@ -324,8 +324,8 @@ pub fn on_world_edge() -> u64 {
 /// consumes pots, so this boundary is also the one any future RETRY would run at. A quiet edge logs
 /// nothing -- which is what makes a line that does appear worth reading.
 ///
-/// 🛑 WARN, NOT INFO. Every item in this line is an AP delivery the watermark has already advanced
-/// past; it is the one place the loss is stated as a total rather than as a single example.
+/// 🛑 WARN, NOT INFO. Every item in this line is still pending behind capacity; the watermark has
+/// not advanced past it. The aggregate makes repeated deferrals visible without per-tick spam.
 fn flush_pot_cap_tally(epoch: u64) {
     let Ok(mut tally) = POT_CAP_TALLY.lock() else {
         return;
@@ -448,6 +448,9 @@ fn count_held_goods_row(row: i32) -> Option<i32> {
 /// explanation of the failure mode; repeating that paragraph twice a second would be the noise it
 /// was added to suppress. What it must no longer do is stand in for a COUNT -- see [`POT_CAP_TALLY`].
 static POT_CAP_ANNOUNCED: AtomicU32 = AtomicU32::new(0);
+/// Rows with at least one delivery currently deferred. Cleared only when a later call for that row
+/// fits and is allowed through, producing the positive half of the retry diagnostic.
+static POT_CAP_PENDING: AtomicU32 = AtomicU32::new(0);
 
 /// Every capped grant since the last world edge, per row (world#692).
 ///
@@ -471,10 +474,13 @@ fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
     let cap = POT_DELIVERY_CAPS[idx].1;
     match count_held_goods_row(full_id & 0x0FFF_FFFF) {
         Some(held) => {
-            let allowed = qty.min((cap - held).max(0));
-            // TELEMETRY (2026-07-30). Swallowing part of a grant and reporting success is precisely
-            // the "polite false" CONTRIBUTING forbids: `grant_full_id` returns true either way, so a
-            // pot the player never receives is indistinguishable from one they did. Eldakin's
+            // All-or-nothing is the idempotence boundary. If a stack of three only has room for
+            // one, placing that one and retrying the same AP entry would duplicate it. Defer the
+            // complete entry until it fits instead.
+            let allowed = er_logic::pot_cap_tally::deliverable_qty(held, cap, qty);
+            // TELEMETRY (2026-07-30). Swallowing a grant and reporting success was precisely the
+            // "polite false" CONTRIBUTING forbids. `grant_full_id` now returns false for this arm,
+            // so the caller retains the entry while this counter explains the backpressure. Eldakin's
             // 2026-07-29 log shows the consequence -- start-item backfill granting 10 Hefty Cracked
             // Pots that the cap then swallowed, with nothing anywhere saying why. (That backfill
             // burst is a one-shot early-scan race on a fresh character, not a permanent re-grant.)
@@ -487,11 +493,20 @@ fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
                     tally.record(full_id, qty, allowed);
                 }
                 let bit = 1u32 << idx;
+                POT_CAP_PENDING.fetch_or(bit, Ordering::Relaxed);
                 if (POT_CAP_ANNOUNCED.fetch_or(bit, Ordering::Relaxed) & bit) == 0 {
                     log::warn!(
-                        "pot-cap: goods {full_id:#x} grant of {qty} CAPPED to {allowed} (held {held}, cap {cap}) \
-                         -- the remainder is reported delivered but never enters the inventory. \
-                         Further caps on this row are silent."
+                        "pot-cap: goods {full_id:#x} grant of {qty} DEFERRED (held {held}, cap {cap}) \
+                         -- delivery watermark held; retrying when capacity is available. \
+                         Further deferrals on this row are counted and reported at a world edge."
+                    );
+                }
+            } else {
+                let bit = 1u32 << idx;
+                if (POT_CAP_PENDING.fetch_and(!bit, Ordering::Relaxed) & bit) != 0 {
+                    log::info!(
+                        "pot-cap: goods {full_id:#x} deferred delivery now fits (held {held}, cap {cap}) \
+                         -- retry released x{qty}"
                     );
                 }
             }
@@ -506,23 +521,17 @@ fn pot_capped_qty(full_id: i32, qty: i32) -> i32 {
 /// installed or no inventory pointer has been captured yet (no pickup this session) — caller retries.
 /// MUST run on the game thread (the FrameBegin tick / update_live).
 pub fn grant_full_id(full_id: i32, qty: i32) -> bool {
-    !matches!(
+    matches!(
         grant_full_id_outcome(full_id, qty),
-        er_logic::start_backfill::GrantOutcome::NotReady
+        er_logic::start_backfill::GrantOutcome::Placed
     )
 }
 
 /// The same grant, reporting WHAT ACTUALLY HAPPENED (#248, 2026-08-01).
 ///
-/// `grant_full_id`'s `bool` conflates two very different successes: the item entered the bag, and
-/// the item was capped to zero and delivered nowhere. That conflation is CORRECT for the ledger --
-/// a capped pot is as delivered as it will ever be, and the watermark must advance past it or the
-/// stream stalls forever -- and it is exactly what let the start-item backfill report `granted
-/// 22/32` for items it had not placed.
-///
-/// So the outcome is split at the source and `grant_full_id` becomes a thin wrapper preserving the
-/// old contract byte for byte (`Placed | Capped -> true`, `NotReady -> false`). Ledger callers keep
-/// the semantics they had; the VERIFIER gets the truth it needs.
+/// `Capped` means deferred, not delivered (#692): `grant_full_id` maps it to `false`, so both the
+/// receive path and reconciler hold their watermark and retry the same stream entry. The separate
+/// outcome remains useful to the start-item verifier for its diagnostics.
 pub fn grant_full_id_outcome(full_id: i32, qty: i32) -> er_logic::start_backfill::GrantOutcome {
     use er_logic::start_backfill::GrantOutcome;
     if HOOK.get().is_none() {
@@ -535,12 +544,11 @@ pub fn grant_full_id_outcome(full_id: i32, qty: i32) -> er_logic::start_backfill
         return GrantOutcome::NotReady; // deferred, not refused -- caller retries
     }
     // Pot-delivery cap: never let a pot grant push the held count to a mass-phantom-check threshold.
-    // At/over the cap we report success (the AP item is delivered as far as the watermark cares) but
-    // add no physical pot, so the count can't reach 20/10/10 and fire relief events 6902/6903/6904.
+    // A capped entry stays pending: callers receive false through `grant_full_id`, hold their
+    // watermark, and retry after the player frees capacity.
     let qty = pot_capped_qty(full_id, qty);
     if qty <= 0 {
-        // CAPPED: the call "succeeded" and no physical pot was added. Delivered for the watermark,
-        // NOT delivered for anyone verifying against the bag.
+        // CAPPED/DEFERRED: no physical pot was added and no delivery watermark may advance.
         return GrantOutcome::Capped;
     }
     // The id the CALLER asked for. auto_upgrade may re-map a weapon below, but the reconciler

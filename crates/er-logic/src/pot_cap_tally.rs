@@ -1,4 +1,4 @@
-//! `pot_cap_tally` — count what the pot cap eats, per row, flushed at the world edge (world#692).
+//! `pot_cap_tally` — defer and count deliveries held by the pot safety cap (world#692).
 //!
 //! # The line this replaces
 //!
@@ -15,11 +15,8 @@
 //! after it is dropped, so **the log's one line is a floor, not a count** — in that session and in
 //! every session this project has recorded.
 //!
-//! ⭐ THAT IS WHY THIS LANDS BEFORE THE POLICY QUESTION, not after. #692 asks whether a capped
-//! grant should be retried at the next world edge or dropped without an ack; both answers are
-//! arguments about a rate nobody has ever measured. A one-off at the start loadout and a steady
-//! drip across a 2h12m session want different fixes, and the current instrument cannot tell them
-//! apart. This module makes the next log answer that.
+//! The tally first landed as measurement. The 2026-08-17 ruling then settled policy: capped
+//! deliveries remain pending without an acknowledgement and retry when capacity becomes available.
 //!
 //! # Why the world edge is the flush point
 //!
@@ -29,17 +26,27 @@
 //! the noise the announce-bit was added to suppress; a per-session total would arrive only at
 //! shutdown, which is exactly when a crash loses it.
 //!
-//! # 🛑 What this deliberately does NOT change
-//!
-//! The ack. `grant_full_id_outcome` returns `Capped`, `grant_full_id` maps that to `true`, and the
-//! watermark advances. That conflation is documented in `detour.rs` as CORRECT for the ledger --
-//! "a capped pot is as delivered as it will ever be, and the watermark must advance past it or the
-//! stream stalls forever" -- and #692 proposes reversing it. Reversing a documented decision on an
-//! unmeasured rate is how the next postmortem gets written. Measure first.
+//! The tally is diagnostic only. Delivery ownership remains with the receive/reconcile watermark;
+//! draining this counter never acknowledges, drops, or independently requeues an item.
 
 /// Rows tracked at once. `POT_DELIVERY_CAPS` carries four; the slack is so a new cap row cannot
 /// silently fall off the end of the tally the way the announce-bit's 32 bits never could.
 pub const MAX_TRACKED_ROWS: usize = 8;
+
+/// Decide whether a capped delivery can be placed atomically.
+///
+/// Partial placement is deliberately refused: retrying the original AP stream entry after placing
+/// only part of it would duplicate that prefix. The whole quantity remains owed until it fits.
+pub fn deliverable_qty(held: i32, cap: i32, requested: i32) -> i32 {
+    if requested <= 0 {
+        return requested;
+    }
+    if held.saturating_add(requested) <= cap {
+        requested
+    } else {
+        0
+    }
+}
 
 /// One row's running loss since the last flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,9 +55,9 @@ pub struct RowTally {
     pub full_id: i32,
     /// How many grants were capped at all (the number the old announce-bit could only ever say 1).
     pub events: u32,
-    /// How many individual items never entered the bag. `i64` because it is a running sum of
+    /// How many individual items were deferred. `i64` because it is a running sum of
     /// `requested - allowed` and a seed handing out a large stack must not be able to wrap it.
-    pub lost: i64,
+    pub deferred: i64,
 }
 
 /// Per-row capped-grant counters, drained at the world edge.
@@ -78,7 +85,7 @@ impl PotCapTally {
             rows: [RowTally {
                 full_id: 0,
                 events: 0,
-                lost: 0,
+                deferred: 0,
             }; MAX_TRACKED_ROWS],
             used: 0,
             overflowed: 0,
@@ -92,11 +99,11 @@ impl PotCapTally {
         if allowed >= requested {
             return;
         }
-        let lost = (requested as i64) - (allowed.max(0) as i64);
+        let deferred = (requested as i64) - (allowed.max(0) as i64);
         for row in self.rows[..self.used].iter_mut() {
             if row.full_id == full_id {
                 row.events = row.events.saturating_add(1);
-                row.lost = row.lost.saturating_add(lost);
+                row.deferred = row.deferred.saturating_add(deferred);
                 return;
             }
         }
@@ -107,7 +114,7 @@ impl PotCapTally {
         self.rows[self.used] = RowTally {
             full_id,
             events: 1,
-            lost,
+            deferred,
         };
         self.used += 1;
     }
@@ -135,7 +142,7 @@ impl PotCapTally {
     /// The line [`Self::flush`] would emit, without resetting. Split out so the formatting is
     /// testable without the side effect.
     pub fn report(&self) -> String {
-        let total: i64 = self.rows().iter().map(|r| r.lost).sum();
+        let total: i64 = self.rows().iter().map(|r| r.deferred).sum();
         let mut per_row = String::new();
         for (i, r) in self.rows().iter().enumerate() {
             if i > 0 {
@@ -145,7 +152,7 @@ impl PotCapTally {
             // lines join on a grep.
             per_row.push_str(&format!(
                 "goods {:#x} x{} ({} item(s))",
-                r.full_id, r.events, r.lost
+                r.full_id, r.events, r.deferred
             ));
         }
         let tail = if self.overflowed > 0 {
@@ -157,9 +164,9 @@ impl PotCapTally {
             String::new()
         };
         format!(
-            "pot-cap tally (world edge): {total} item(s) reported delivered and never placed, \
-             across {} row(s): {per_row}{tail}. These are AP deliveries the watermark has already \
-             advanced past (world#692)",
+            "pot-cap tally (world edge): {total} item(s) deferred for capacity, \
+             across {} row(s): {per_row}{tail}. Their AP delivery watermark remains held and they \
+             will retry when capacity is available (world#692)",
             self.rows().len()
         )
     }
@@ -192,16 +199,16 @@ mod replay {
             5,
             "the announce-bit could only ever say 1; that is the whole bug"
         );
-        assert_eq!(t.rows()[0].lost, 5, "five items never entered the bag");
+        assert_eq!(t.rows()[0].deferred, 5, "five items remain pending");
     }
 
     /// A partial cap loses the remainder, not the whole grant. `grant of 3 CAPPED to 1` is two
     /// items lost -- getting this wrong would overstate the loss and argue for the wrong fix.
     #[test]
-    fn a_partial_cap_loses_only_the_remainder() {
+    fn a_tally_records_only_the_deferred_remainder() {
         let mut t = PotCapTally::new();
         t.record(CRACKED_POT, 3, 1);
-        assert_eq!(t.rows()[0].lost, 2);
+        assert_eq!(t.rows()[0].deferred, 2);
         assert_eq!(t.rows()[0].events, 1);
     }
 
@@ -228,7 +235,7 @@ mod replay {
         assert_eq!(t.rows()[0].full_id, RITUAL_POT);
         assert_eq!(t.rows()[0].events, 2);
         assert_eq!(t.rows()[1].full_id, CRACKED_POT);
-        assert_eq!(t.rows()[1].lost, 2);
+        assert_eq!(t.rows()[1].deferred, 2);
     }
 
     /// The flush is a drain: the next world edge starts from zero, so two edges never
@@ -254,9 +261,16 @@ mod replay {
         let line = t.report();
         assert!(line.contains("0x40002526 x2"), "{line}");
         assert!(line.contains("0x4000251d x1"), "{line}");
-        assert!(line.contains("4 item(s) reported delivered"), "{line}");
+        assert!(line.contains("4 item(s) deferred for capacity"), "{line}");
         assert!(line.contains("across 2 row(s)"), "{line}");
         assert!(line.contains("world#692"), "{line}");
+    }
+
+    #[test]
+    fn a_stack_is_all_or_nothing_so_retry_cannot_duplicate_a_prefix() {
+        assert_eq!(deliverable_qty(7, 9, 2), 2);
+        assert_eq!(deliverable_qty(8, 9, 2), 0);
+        assert_eq!(deliverable_qty(9, 9, 1), 0);
     }
 
     /// 🛑 AN OVERFLOW IS STATED, NEVER SWALLOWED. A tally that silently stopped counting past its
