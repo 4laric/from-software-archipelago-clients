@@ -653,21 +653,6 @@ impl shared::Core for Core {
         if ui.menu_item("Tracker (F6)") {
             self.tracker_visible = !self.tracker_visible;
         }
-        if let Ok(mod_dir) = shared::utils::mod_directory() {
-            let installed = crate::flower_install::is_installed(shared::utils::loader(), mod_dir);
-            let label = if installed {
-                "Reinstall AP Flower..."
-            } else {
-                "Install AP Flower..."
-            };
-            if ui.menu_item(label) {
-                let line = crate::flower_install::launch(shared::utils::loader(), mod_dir)
-                    .unwrap_or_else(|error| error);
-                let now = self.toast_clock.elapsed().as_millis() as u64;
-                self.toasts.push(line.clone(), now);
-                self.log(ap::Print::message(line));
-            }
-        }
         // ---- lock-hint balance, issue #412 (the discoverability half) -------------------------
         // The economy shipped entirely behind three closed doors at once: a tracker window that
         // defaults to HIDDEN, a hotkey (F6) that appeared in no guide, and a price printed only on
