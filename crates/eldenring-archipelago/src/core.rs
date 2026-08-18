@@ -4271,7 +4271,16 @@ impl Core {
         // Two-phase (collect, then insert): the log iterator immutably borrows self, so the
         // HintSet inserts have to wait until the scan ends.
         let mut new_hints: Vec<HintEntry> = Vec::new();
+        let mut explain_serpent_hunter = false;
         for (print, _) in self.base().logs().skip(start) {
+            if let ap::Print::Chat {
+                player, message, ..
+            } = print
+                && player.name() == our_name
+                && er_logic::hint_explain::is_serpent_hunter_hint(message)
+            {
+                explain_serpent_hunter = true;
+            }
             // ⭐ `found` HAS BEEN ON THE WIRE ALL ALONG (client#221). archipelago-rs parses it into
             // `Print::Hint` and this loop dropped it, so a collected hint was indistinguishable
             // from a live one and the panel header counted both -- bobler's screenshot read
@@ -4300,6 +4309,9 @@ impl Core {
         self.hint_log_watermark = log_len;
         for entry in new_hints {
             self.hints.insert(entry);
+        }
+        if explain_serpent_hunter && let Some(client) = self.client_mut() {
+            let _ = client.say(er_logic::hint_explain::SERPENT_HUNTER_REPLY.to_string());
         }
     }
 
