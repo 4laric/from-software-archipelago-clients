@@ -45,6 +45,7 @@ const ROUNDTABLE: i32 = 11_100;
 const LIMGRAVE: i32 = 60_000;
 const ROYAL_GRACE: u32 = 11_001_950; // BonfireWarpParam row 110000
 const ASHEN_GRACE: u32 = 11_051_953; // row 110503: Leyndell, Capital of Ash (Ashen-only)
+const ASHEN_BEDCHAMBER_MENU_TARGET: u32 = 11_051_954; // Bobler 2026-08-18
 const ROUNDTABLE_GRACE: u32 = 11_102_950; // Table of Lost Grace
 
 /// The game as the reconciler observes it: two flags + where the player is standing.
@@ -183,6 +184,32 @@ fn the_burn_round_trip_intercept_then_latch_then_royal_return() {
     s.flag_9116 = true; // interference again, this time in Royal
     s.tick(POLICY);
     assert!(!s.flag_9116, "latch re-asserts OFF in Royal");
+}
+
+/// Bobler's exact 2026-08-18 regression: from a burnt save, selecting the m11_05 Queen's
+/// Bedchamber target was classified Royal merely because the grace name is shared. Walking toward
+/// Godfrey then replayed the burn transition, returned him to Ashen, and one run crashed during
+/// the phase churn. The target's map version, not its display name, is the durable authority.
+#[test]
+fn ashen_queens_bedchamber_stays_ashen_for_the_godfrey_approach() {
+    let mut s = Sim::new();
+    s.burn();
+    let writes_before = s.client_writes.len();
+
+    s.warp(ASHEN_BEDCHAMBER_MENU_TARGET, POLICY);
+    assert_eq!(s.bucket, ASHEN);
+    assert!(s.flag_9116, "the m11_05 target must not be forced Royal");
+    s.tick(POLICY);
+
+    assert!(
+        s.flag_9116,
+        "the settled Ashen position holds the same phase"
+    );
+    assert_eq!(
+        s.client_writes.len(),
+        writes_before,
+        "an already-Ashen warp performs no phase write at all"
+    );
 }
 
 /// The arming gate: before the vanilla burn has completed once (118 unset), the reconciler

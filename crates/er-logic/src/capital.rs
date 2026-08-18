@@ -185,8 +185,8 @@ pub fn capital_flag_state(sets: &CapitalSets, play_region: i32) -> Option<bool> 
 }
 
 /// The capital bucket a warp target encodes, or `None` when the target is not an 8-digit
-/// dungeon-grace entity id. Warp targets are BONFIRE ENTITY ids (`BonfireWarpParam
-/// .bonfireEntityId`, the space `warp_to_grace` already speaks). Bucket rule
+/// dungeon-grace-shaped id. Menu warps expose BONFIRE ENTITY ids (`BonfireWarpParam
+/// .bonfireEntityId`); client warps call LuaWarp with that value minus 1000. Bucket rule
 /// `id / 10_000 * 10`, verified against EVERY capital BonfireWarpParam row (2026-07-14):
 /// Royal 11001950-11001959 -> 11000; Ashen 11051950-11051955 -> 11050; Throne 19001950 ->
 /// 19000; Roundtable 11102950 -> 11100 (never a capital). 10-digit overworld tile ids are
@@ -198,23 +198,22 @@ pub fn warp_target_bucket(target: u32) -> Option<i32> {
     Some((target / 10_000 * 10) as i32)
 }
 
-/// Grace entities that exist only in the post-burn capital state. The other five m11_05 graces
-/// have Royal counterparts with the same names, so selecting them should restore Royal rather
-/// than use the menu's currently visible map-variant row to force Ashen.
-const ASHEN_ONLY_WARP_TARGETS: &[u32] = &[
-    11_051_953, // Leyndell, Capital of Ash
-    19_001_950, // finale throne / Fractured Marika map
-];
-
 /// Warp-target intercept: what 9116 must be for the load that `target` is about to resolve.
-/// Ashen-only target -> `Some(true)`; every shared Ashen/Royal grace chooses Royal, as do all
-/// other resolvable targets. `None` only for an unresolvable target (0): leave the flag alone
-/// rather than guess.
-pub fn capital_flag_state_for_warp_target(_sets: &CapitalSets, target: u32) -> Option<bool> {
+/// The target's MAP VERSION is authoritative: any m11_05/m19 target selects Ashen, including an
+/// Ashen duplicate whose displayed name is shared with a Royal grace. A shared name is not shared
+/// state -- forcing Ashen Queen's Bedchamber to Royal makes the Godfrey approach replay the burn
+/// transition and return to Ashen instead of entering the fight.
+///
+/// LuaWarp exposes two target-shaped id spaces in practice: menu travel passes the bonfire entity
+/// id, while the client calls it with `entity - 1000`. The bucket rule deliberately accepts both;
+/// subtracting 1000 does not cross any capital map's 10,000 boundary. Every non-Ashen resolvable
+/// target restores the Royal default. `None` is reserved for zero, where there is no target to
+/// classify.
+pub fn capital_flag_state_for_warp_target(sets: &CapitalSets, target: u32) -> Option<bool> {
     if target == 0 {
         return None;
     }
-    Some(ASHEN_ONLY_WARP_TARGETS.contains(&target))
+    Some(warp_target_bucket(target).is_some_and(|bucket| sets.ashen.contains(&bucket)))
 }
 
 /// Reconcile-don't-dispatch: the ONE flag write (if any) this observation demands.
@@ -291,9 +290,11 @@ mod tests {
     }
 
     #[test]
-    fn only_ashen_exclusive_graces_write_on() {
+    fn every_ashen_grace_selects_the_ashen_version() {
         let s = sets();
-        for g in [11_051_953, 19_001_950] {
+        for g in [
+            11_051_950, 11_051_951, 11_051_952, 11_051_953, 11_051_954, 11_051_955, 19_001_950,
+        ] {
             assert_eq!(
                 capital_flag_state_for_warp_target(&s, g),
                 Some(true),
@@ -303,13 +304,22 @@ mod tests {
     }
 
     #[test]
-    fn shared_ashen_graces_choose_the_royal_version() {
+    fn lua_warp_argument_and_entity_spaces_choose_the_same_version() {
         let s = sets();
-        for g in [11_051_950, 11_051_951, 11_051_952, 11_051_954, 11_051_955] {
+        // Bobler's menu warp was logged as arg 11051954; the old hook added 1000 and handed the
+        // classifier 11052954. The client-initiated form is 11050954. All three are m11_05.
+        for g in [11_050_954, 11_051_954, 11_052_954] {
+            assert_eq!(
+                capital_flag_state_for_warp_target(&s, g),
+                Some(true),
+                "Ashen Queen's Bedchamber target {g} must remain Ashen"
+            );
+        }
+        for g in [11_000_954, 11_001_954, 11_002_954] {
             assert_eq!(
                 capital_flag_state_for_warp_target(&s, g),
                 Some(false),
-                "shared Ashen grace {g} must restore Royal"
+                "Royal Queen's Bedchamber target {g} must remain Royal"
             );
         }
     }
