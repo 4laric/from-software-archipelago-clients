@@ -87,6 +87,8 @@ pub const SUPPORTED: &[&str] = &[
     // failing quietly. `traps.rs` pins the format literal; the apworld pins the pair in
     // `test_gf_spawn_traps`.
     "spawn_traps",
+    // A seed that mints Blackout must refuse clients that would consume and ignore its fixed name.
+    "blackout",
 ];
 
 /// Feature tags the seed requires that this build does not know.

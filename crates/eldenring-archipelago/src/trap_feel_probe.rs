@@ -50,7 +50,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eldenring::cs::{CSFade, WorldAreaTime, WorldChrMan};
+use eldenring::cs::{WorldAreaTime, WorldChrMan};
 use er_logic::trap_probe::{
     BLACKOUT_FADE_SECONDS, FeelEffect, NIGHTFALL_TIME, ProbeState, stamina_clamp,
 };
@@ -146,7 +146,7 @@ pub fn tick() {
     }
 
     if state.blackout.take_if_elapsed(now) {
-        if fade(false) {
+        if crate::traps::fade_blackout(false) {
             log::info!("trap-feel blackout: faded back in");
         } else {
             // Worth a WARN rather than an info: the player is looking at a black screen.
@@ -192,7 +192,7 @@ fn fire_stamina_halved() -> bool {
 }
 
 fn fire_blackout() -> bool {
-    if fade(true) {
+    if crate::traps::fade_blackout(true) {
         log::info!(
             "trap-feel blackout: faded out over {BLACKOUT_FADE_SECONDS}s on all 9 plates -- if \
              nothing went dark, the plate is the finding"
@@ -209,21 +209,6 @@ fn fire_blackout() -> bool {
 /// All nine, because nothing on record says which one composites over ordinary play. Restoring all
 /// nine is what makes that guess safe: a plate we should not have faded is faded back by the same
 /// loop, and any load or grace rest re-drives them anyway.
-fn fade(out: bool) -> bool {
-    // SAFETY: as `fire_nightfall`.
-    let Ok(fade_ctl) = (unsafe { CSFade::instance_mut() }) else {
-        return false;
-    };
-    for plate in fade_ctl.fade_plates.iter_mut() {
-        if out {
-            plate.fade_out(BLACKOUT_FADE_SECONDS);
-        } else {
-            plate.fade_in(BLACKOUT_FADE_SECONDS);
-        }
-    }
-    true
-}
-
 /// Re-apply the stamina ceiling. Returns whether the player was reachable at all -- NOT whether a
 /// write happened, because declining to write is the normal case (`stamina_clamp`).
 fn hold_stamina() -> bool {

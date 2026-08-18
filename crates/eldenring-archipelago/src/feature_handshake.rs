@@ -106,6 +106,12 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("spawn_traps", |_| {
         er_logic::traps::SpawnSpec::from_item_name("Trap: Basilisk x3 (4150/41500060)").is_some()
     }),
+    // Exact parse is the read-back: this tag promises this fixed item is recognised, not that a
+    // process-wide option happened to be enabled.
+    ("blackout", |_| {
+        er_logic::traps::Trap::from_item_name("Trap: Blackout")
+            == Some(er_logic::traps::Trap::Blackout)
+    }),
 ];
 
 /// Build the `(tag, live)` table this connect.

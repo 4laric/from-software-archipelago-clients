@@ -44,6 +44,7 @@ use std::borrow::Cow;
 pub enum Trap {
     RuneThief,
     NoFlask,
+    Blackout,
     Runebear,
     /// Put `count` of a creature on the player's head. The ids come from the ITEM NAME.
     Spawn(SpawnSpec),
@@ -59,6 +60,7 @@ impl Trap {
         match self {
             Trap::RuneThief => Cow::Borrowed("rune_thief"),
             Trap::NoFlask => Cow::Borrowed("no_flask"),
+            Trap::Blackout => Cow::Borrowed("blackout"),
             Trap::Runebear => Cow::Borrowed("runebear"),
             // Carries DIGITS, unlike every key above it. The lower_snake pin in
             // `every_trap_line_is_ascii_and_names_itself` guards `ALL`, which is the yaml surface;
@@ -81,6 +83,7 @@ impl Trap {
             // `NO_FLASK_SECONDS`. Promising a blocked animation would be a lie the player finds out
             // about at the worst possible moment.
             Trap::NoFlask => Cow::Borrowed("TRAP: No Flask -- your flask heals nothing for 20s"),
+            Trap::Blackout => Cow::Borrowed("TRAP: Blackout -- the lights go out for 2s"),
             Trap::Runebear => {
                 Cow::Borrowed("TRAP: Runebear -- something large is standing where you are")
             }
@@ -143,6 +146,7 @@ impl Trap {
         match self {
             Trap::RuneThief => Cow::Borrowed("Trap: Rune Thief"),
             Trap::NoFlask => Cow::Borrowed("Trap: No Flask"),
+            Trap::Blackout => Cow::Borrowed("Trap: Blackout"),
             Trap::Runebear => Cow::Borrowed("Trap: Runebear"),
             Trap::Spawn(spec) => Cow::Owned(spec.item_name()),
         }
@@ -169,12 +173,17 @@ impl Trap {
 
 /// Every FIXED trap this build can fire. One place, so a new variant cannot be half-added.
 ///
-/// 🛑 [`Trap::Spawn`] is deliberately NOT here, and the length stays 3. `ALL` is the set of traps
+/// 🛑 [`Trap::Spawn`] is deliberately NOT here. `ALL` is the set of traps
 /// with a CONSTANT name -- it is what `from_item_name` exact-matches against, and what the
 /// round-trip and ASCII pins iterate. A spawn family is unbounded (any creature the world knows),
 /// so it has no enumerable membership to list; its equivalents are the round-trip and refusal
 /// tests below.
-pub const ALL: [Trap; 3] = [Trap::RuneThief, Trap::NoFlask, Trap::Runebear];
+pub const ALL: [Trap; 4] = [
+    Trap::RuneThief,
+    Trap::NoFlask,
+    Trap::Blackout,
+    Trap::Runebear,
+];
 
 // ---- spawn traps --------------------------------------------------------------------------------
 
@@ -984,7 +993,7 @@ mod tests {
         // true, and a NEW trap should force somebody to look at this file rather than sail past it.
         assert_eq!(
             ALL.len(),
-            3,
+            4,
             "a trap was added -- check its line and key here, then bump this"
         );
         for t in ALL {
@@ -1100,6 +1109,7 @@ mod tests {
     fn item_names_are_the_ones_the_world_mints() {
         assert_eq!(Trap::RuneThief.item_name(), "Trap: Rune Thief");
         assert_eq!(Trap::NoFlask.item_name(), "Trap: No Flask");
+        assert_eq!(Trap::Blackout.item_name(), "Trap: Blackout");
         // 🛑 THE PARAMETERISED SHAPE, pinned as a LITERAL rather than as a round trip, because a
         // round trip agrees with itself no matter which shape both halves moved to. This is the
         // byte-for-byte string `greenfield/eldenring/gen_data/spawn_traps.py` mints for all 390
@@ -1117,7 +1127,7 @@ mod tests {
 
     #[test]
     fn every_trap_round_trips_through_its_item_name() {
-        assert_eq!(ALL.len(), 3, "WITNESS: nothing was swept");
+        assert_eq!(ALL.len(), 4, "WITNESS: nothing was swept");
         for t in ALL {
             assert_eq!(Trap::from_item_name(&t.item_name()), Some(t));
             assert!(t.item_name().starts_with(ITEM_PREFIX), "{}", t.item_name());
@@ -1535,12 +1545,13 @@ mod tests {
     /// parameterised form must keep working against a client that shipped after it. Removing one
     /// would be a compat break, and the way it would show up is a trap that silently never fires.
     #[test]
-    fn the_legacy_three_names_still_resolve_to_their_fixed_variants() {
+    fn fixed_names_resolve_to_their_variants() {
         assert_eq!(
             Trap::from_item_name("Trap: Rune Thief"),
             Some(Trap::RuneThief)
         );
         assert_eq!(Trap::from_item_name("Trap: No Flask"), Some(Trap::NoFlask));
+        assert_eq!(Trap::from_item_name("Trap: Blackout"), Some(Trap::Blackout));
         // 🛑 NOT `Trap::Spawn(RUNEBEAR_SPAWN)`: the bare name has no payload to parse, and the
         // exact-match arm must win before the parser ever sees it.
         assert_eq!(Trap::from_item_name("Trap: Runebear"), Some(Trap::Runebear));
