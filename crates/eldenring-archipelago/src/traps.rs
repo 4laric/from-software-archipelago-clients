@@ -47,7 +47,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use eldenring::cs::{
-    ChrDebugSpawnRequest, ChrInsExt, SoloParamRepository, SpEffectParam, WorldChrMan,
+    CSFade, ChrDebugSpawnRequest, ChrInsExt, SoloParamRepository, SpEffectParam, WorldChrMan,
 };
 use er_logic::safe_speffect_rows::TRAP_NO_FLASK;
 use er_logic::traps::{
@@ -65,6 +65,11 @@ use fromsoftware_shared::FromStatic;
 static PENDING: Mutex<Option<er_logic::traps::TrapQueue>> = Mutex::new(None);
 /// One warn per overdue head, not one per tick.
 static WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Restore deadline for a real Blackout item. `poll_pending` drives it every overlay frame even
+/// when no trap remains queued, so consuming the item can never strand the screen dark.
+static BLACKOUT: Mutex<er_logic::trap_probe::Deadline> =
+    Mutex::new(er_logic::trap_probe::Deadline::new());
 
 /// Monotonic base for the burst's own timing (world#689).
 ///
@@ -149,6 +154,7 @@ pub fn enqueue_by_item_name(name: &str, now_ms: u64) {
 /// `fire` (death guard, param streamed) -- a trap that cannot land this tick goes back to waiting
 /// rather than being consumed, which is the whole point of the queue.
 pub fn poll_pending(now_ms: u64) -> Option<Cow<'static, str>> {
+    tick_blackout();
     // 🛑 THE BURST GOES FIRST, and it returns. A spawn that is still arriving owns this tick's
     // request slot; letting a queued trap fire underneath it would put a second write on the same
     // `init_data` before the creator drained the first -- which is the exact collapse #206 is
@@ -210,12 +216,61 @@ pub fn fire(trap: Trap) -> Option<Cow<'static, str>> {
     let ok = match trap {
         Trap::RuneThief => fire_rune_thief(),
         Trap::NoFlask => fire_no_flask(),
+        Trap::Blackout => fire_blackout(),
         // The legacy variant is a `SpawnSpec` in everything but its name, so it goes down the same
         // path -- one spawn implementation, not two that can drift.
         Trap::Runebear => fire_spawn(RUNEBEAR_SPAWN),
         Trap::Spawn(spec) => fire_spawn(spec),
     };
     ok.then(|| trap.toast())
+}
+
+fn fire_blackout() -> bool {
+    if !fade_blackout(true) {
+        log::info!("trap blackout: CSFade unavailable -- deferred");
+        return false;
+    }
+    if let Ok(mut deadline) = BLACKOUT.lock() {
+        deadline.arm(now_ms(), er_logic::trap_probe::BLACKOUT_MS);
+    }
+    log::info!(
+        "trap blackout: faded out over {}s on all 9 plates; restore armed",
+        er_logic::trap_probe::BLACKOUT_FADE_SECONDS
+    );
+    true
+}
+
+fn tick_blackout() {
+    let Ok(mut deadline) = BLACKOUT.lock() else {
+        return;
+    };
+    if deadline.take_if_elapsed(now_ms()) {
+        if fade_blackout(false) {
+            log::info!("trap blackout: faded back in");
+        } else {
+            log::warn!(
+                "trap blackout: could not reach CSFade to fade back in -- a load or grace rest \
+                 will clear it"
+            );
+        }
+    }
+}
+
+/// Fade all nine plates, matching the live-confirmed probe. Restoring the same complete set makes
+/// the broad write symmetric even if only one plate composites over ordinary play.
+pub(crate) fn fade_blackout(out: bool) -> bool {
+    // SAFETY: FD4 singleton, mutated only from the overlay frame hook.
+    let Ok(fade_ctl) = (unsafe { CSFade::instance_mut() }) else {
+        return false;
+    };
+    for plate in fade_ctl.fade_plates.iter_mut() {
+        if out {
+            plate.fade_out(er_logic::trap_probe::BLACKOUT_FADE_SECONDS);
+        } else {
+            plate.fade_in(er_logic::trap_probe::BLACKOUT_FADE_SECONDS);
+        }
+    }
+    true
 }
 
 fn fire_rune_thief() -> bool {
