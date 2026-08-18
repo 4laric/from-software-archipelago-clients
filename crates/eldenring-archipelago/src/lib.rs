@@ -22,6 +22,7 @@ mod feature_handshake;
 mod flagpoll;
 mod flags;
 mod flask;
+mod flower_install;
 mod fmg_inject;
 mod fogwall;
 mod game;
