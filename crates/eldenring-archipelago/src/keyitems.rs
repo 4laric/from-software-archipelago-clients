@@ -88,9 +88,11 @@ fn received_great_rune_count(received: &HashSet<String>) -> usize {
 /// stream. This is shared by the active reconciler and the runtime-fallback handler so normal
 /// delivery, server `/send`, reconnect replay, and `RECONCILE_APPLY=none` cannot diverge.
 pub fn leyndell_gate_flags(received: &HashSet<String>) -> Vec<u32> {
-    (received_great_rune_count(received) >= 2)
-        .then(|| LEYNDELL_TWO_RUNES_FLAGS.to_vec())
-        .unwrap_or_default()
+    if received_great_rune_count(received) >= 2 {
+        LEYNDELL_TWO_RUNES_FLAGS.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Every (item name, obtained flags) pair this module applies: the two local tables plus the
