@@ -1192,7 +1192,7 @@ pub fn tick_capital() {
     let play_region = flags::play_region_id();
     let position_desired =
         play_region.and_then(|pr| er_logic::capital::capital_flag_state(&cfg.sets, pr));
-    let desired = {
+    let (desired, explicit_warp_target) = {
         let mut pending = CAPITAL_PENDING_WARP.lock().unwrap();
         match *pending {
             Some((source, warp_desired)) => {
@@ -1205,13 +1205,33 @@ pub fn tick_capital() {
                 if !keep {
                     *pending = None;
                 }
-                desired
+                (desired, keep)
             }
-            None => position_desired,
+            None => (position_desired, false),
         }
     };
     let current = capital_state(cfg);
-    let writes = er_logic::capital::reconcile_state(armed, desired, current);
+    // A warp target is explicit player intent. A position is only an observation, and may be the
+    // wrong map version produced by stale flags. Do not let an unburnt-world contradiction turn
+    // itself into permanent Ashen save state (capital_guard/client#200).
+    let decision = if explicit_warp_target {
+        er_logic::capital_guard::decide(armed, desired, current.burn)
+    } else {
+        er_logic::capital_guard::decide_from_position(
+            armed,
+            desired,
+            current.burn,
+            current.world_burn,
+        )
+    };
+    let guarded_desired = match decision {
+        er_logic::capital_guard::Decision::Write(want)
+        | er_logic::capital_guard::Decision::Declined(
+            er_logic::capital_guard::Decline::AlreadyCorrect(want),
+        ) => Some(want),
+        er_logic::capital_guard::Decision::Declined(_) => None,
+    };
+    let writes = er_logic::capital::reconcile_state(armed, guarded_desired, current);
     if writes != er_logic::capital::CapitalWrites::default() {
         if let Ok(mut l) = CAPITAL_DECLINE.lock() {
             l.on_write();
@@ -1228,9 +1248,7 @@ pub fn tick_capital() {
                 "PENDING (a write was lost) -- re-applying next tick"
             }
         );
-    } else if let er_logic::capital_guard::Decision::Declined(d) =
-        er_logic::capital_guard::decide(armed, desired, current.burn)
-    {
+    } else if let er_logic::capital_guard::Decision::Declined(d) = decision {
         let admitted = CAPITAL_DECLINE.lock().ok().and_then(|mut l| l.admit(d));
         if let Some(d) = admitted {
             log::info!(
@@ -1244,15 +1262,15 @@ pub fn tick_capital() {
 }
 
 /// Warp-target intercept: decide 9116 from the TARGET before the load resolves, so the player
-/// always loads the intended capital version. Only Ashen-exclusive graces -> ON; shared
-/// Ashen/Royal graces and every other resolvable target -> OFF. Called by
+/// always loads the capital version encoded by the selected target. Ashen-map graces -> ON;
+/// Royal-map graces and every other resolvable target -> OFF. Called by
 /// `warp::warp_to_grace` right after the warp request (the warp is asynchronous; the write
 /// lands before the load screen resolves). No-op while INERT or pre-burn.
-pub fn capital_warp_intercept(grace_entity_id: u32) {
+pub fn capital_warp_intercept(warp_target: u32) {
     let guard = CAPITAL.lock().unwrap();
     let Some(cfg) = guard.as_ref() else { return };
     let armed = flags::get_event_flag(cfg.burn_done_flag);
-    let desired = er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, grace_entity_id);
+    let desired = er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, warp_target);
     let current = capital_state(cfg);
     if let Some(want) = desired {
         *CAPITAL_PENDING_WARP.lock().unwrap() = Some((flags::play_region_id(), want));
@@ -1263,7 +1281,7 @@ pub fn capital_warp_intercept(grace_entity_id: u32) {
     if writes != er_logic::capital::CapitalWrites::default() {
         let stuck = apply_capital_writes(cfg, writes);
         log::info!(
-            "capital warp intercept: target {grace_entity_id} -> writes {:?} (before {:?}); readback {}",
+            "capital warp intercept: target {warp_target} -> writes {:?} (before {:?}); readback {}",
             writes,
             current,
             if stuck {
@@ -1278,7 +1296,7 @@ pub fn capital_warp_intercept(grace_entity_id: u32) {
             // intercept line, because all 66 were `AlreadyCorrect` and nothing said so -- which was
             // indistinguishable from the reconciler being inert. 66 lines a session is nothing.
             er_logic::capital_guard::Decision::Declined(d) => log::info!(
-                "capital warp intercept: target {grace_entity_id} -> no write -- {}",
+                "capital warp intercept: target {warp_target} -> no write -- {}",
                 d.reason()
             ),
             er_logic::capital_guard::Decision::Write(_) => {

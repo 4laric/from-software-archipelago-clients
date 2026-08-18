@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use retour::GenericDetour;
 
-use crate::warp::{self, GRACE_TO_WARP_ARG_DELTA, LUA_WARP_FUNC_RVA, LuaWarpFn};
+use crate::warp::{self, LUA_WARP_FUNC_RVA, LuaWarpFn};
 
 static HOOK: OnceLock<GenericDetour<LuaWarpFn>> = OnceLock::new();
 /// One-shot attempt latch: `install` runs its body exactly once per session. Every failure mode
@@ -91,12 +91,9 @@ pub fn install() {
 /// The detour body. Runs INSIDE the game's warp call, on the game thread. Must never panic
 /// across the FFI boundary: the id arithmetic is wrapping and the intercept is caught.
 unsafe extern "C" fn lua_warp_detour(rcx: *mut c_void, rdx: *mut c_void, warp_arg: u32) -> u64 {
-    // Reconstruct the grace ENTITY id (the space capital_warp_intercept speaks): the CE call
-    // shape passes `entity_id - 1000` in r8d (see warp.rs module docs).
-    let entity = warp_arg.wrapping_add(GRACE_TO_WARP_ARG_DELTA);
     // THE PROBE SIGNAL — one line per warp, menu- or client-initiated (see module docs for how
     // the adjacent warp_to_grace line distinguishes the two).
-    log::info!("LuaWarp hook: warp arg {warp_arg} -> grace entity {entity} (menu or client)");
+    log::info!("LuaWarp hook: target {warp_arg} (menu or client)");
     // CTD guard (2026-07-24): a warp is a map teardown/rebuild. Re-arm the enemy-scaling settle
     // window NOW so its ChrIns sweep sits out the transition — the sweep's own region-change
     // guard misses the warp-OUT side (play_region only changes after the load). Infallible by
@@ -132,7 +129,10 @@ unsafe extern "C" fn lua_warp_detour(rcx: *mut c_void, rdx: *mut c_void, warp_ar
     // the double call is harmless (reconcile_write only writes on mismatch; note there).
     // catch_unwind: a poisoned CAPITAL mutex would panic in .lock().unwrap(); inside the game's
     // own call frame that must degrade to a logged miss, not an unwind across FFI.
-    if std::panic::catch_unwind(|| crate::region::capital_warp_intercept(entity)).is_err() {
+    // Pass LuaWarp's value without guessing which caller-specific id space produced it. Menu
+    // travel supplies the bonfire entity id; client travel supplies entity-1000. Capital's pure
+    // classifier intentionally accepts both by map bucket.
+    if std::panic::catch_unwind(|| crate::region::capital_warp_intercept(warp_arg)).is_err() {
         log::error!("LuaWarp hook: capital_warp_intercept panicked; suppressed (warp unaffected)");
     }
     ret
