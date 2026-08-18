@@ -2335,6 +2335,8 @@ impl shared::Core for Core {
         let mut dispatched = disp as i64;
         let mut pushed = self.received_through as i64;
         let mut unlocked: Vec<String> = Vec::new();
+        let trap_link_enabled = self.trap_link_enabled() == Some(true);
+        let mut trap_link_outbound: Vec<String> = Vec::new();
         if can_grant && !snapshot.is_empty() {
             let empty_map = HashMap::new();
             let item_map = self.item_map.as_ref().unwrap_or(&empty_map);
@@ -2439,24 +2441,11 @@ impl shared::Core for Core {
                                 &ri.name,
                                 self.toast_clock.elapsed().as_millis() as u64,
                             );
-                            if queued && self.trap_link_enabled() == Some(true) {
-                                let source = self
-                                    .my_name
-                                    .clone()
-                                    .unwrap_or_else(|| "Elden Ring".to_string());
-                                let data = serde_json::json!({
-                                    "time": std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map_or(0.0, |d| d.as_secs_f64()),
-                                    "source": source,
-                                    "trap_name": ri.name,
-                                });
-                                if let Some(client) = self.client_mut()
-                                    && let Err(e) = client
-                                        .bounce(data, ap::BounceOptions::new().tags(["TrapLink"]))
-                                {
-                                    log::warn!("TrapLink: broadcast failed: {e}");
-                                }
+                            if queued && trap_link_enabled {
+                                // `dispatch` owns mutable receive-state borrows for this whole
+                                // loop. Send after it drops; the name is the complete outbound
+                                // provenance and inbound TrapLink events never enter this path.
+                                trap_link_outbound.push(ri.name.clone());
                             }
                         } else if ri.name.starts_with("Boss Key: ") {
                             // Boss Keys (mode B) are SYNTHETIC gate tokens, intentionally absent from
@@ -2500,6 +2489,24 @@ impl shared::Core for Core {
                 }
             }
             unlocked = dispatch.unlocked;
+        }
+        for trap_name in trap_link_outbound {
+            let source = self
+                .my_name
+                .clone()
+                .unwrap_or_else(|| "Elden Ring".to_string());
+            let data = serde_json::json!({
+                "time": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                "source": source,
+                "trap_name": trap_name,
+            });
+            if let Some(client) = self.client_mut()
+                && let Err(e) = client.bounce(data, ap::BounceOptions::new().tags(["TrapLink"]))
+            {
+                log::warn!("TrapLink: broadcast failed: {e}");
+            }
         }
         self.dispatched_through = dispatched.max(0) as usize;
         self.received_through = pushed.max(0) as usize;
