@@ -61,6 +61,12 @@ pub struct CoreBase<G: Game, S: DeserializeOwned + Send + 'static> {
     /// after a successful [`Core::reconcile_death_link_tag`] send. See [`next_tag_advertisement`].
     advertised_death_link: bool,
 
+    /// Session-only player choice. `None` follows slot data; `Some` overrides it until reconnect.
+    /// Kept beside the advertised latch so UI code cannot bypass protocol reconciliation.
+    death_link_override: Option<bool>,
+    death_link_tag_failure: Option<String>,
+    death_link_tag_failure_reported: bool,
+
     /// CHAT-RELAY (2026-07-02): commands queued from server chat ("@<slot> <cmd> [args]"),
     /// dispatched through the game core's `handle_command` by [Core::update]. Exists because a
     /// game whose InputBlocker hasn't been RE'd (ER) can't take keyboard focus in the overlay
@@ -88,6 +94,9 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
             load_time: None,
             error: None,
             advertised_death_link: false,
+            death_link_override: None,
+            death_link_tag_failure: None,
+            death_link_tag_failure_reported: false,
             profiler: Default::default(),
             pending_chat_commands: vec![],
         })
@@ -167,6 +176,9 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
 
         self.connection = Self::new_connection(self.game, &self.config);
         self.advertised_death_link = false; // a fresh socket carries no tags
+        self.death_link_override = None;
+        self.death_link_tag_failure = None;
+        self.death_link_tag_failure_reported = false;
     }
 
     /// Updates the full set of connection info (server URL, slot, and optional
@@ -202,7 +214,28 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.config.save()?;
         self.connection = Self::new_connection(self.game, &self.config);
         self.advertised_death_link = false; // a fresh socket carries no tags
+        self.death_link_override = None;
+        self.death_link_tag_failure = None;
+        self.death_link_tag_failure_reported = false;
         Ok(())
+    }
+
+    /// Effective DeathLink state and its session override. `configured=None` remains unknown even
+    /// if no override exists; an explicit override may opt a parsed-off slot in at runtime.
+    pub fn effective_death_link(&self, configured: Option<bool>) -> Option<bool> {
+        effective_death_link(configured, self.death_link_override)
+    }
+
+    pub fn death_link_override(&self) -> Option<bool> {
+        self.death_link_override
+    }
+
+    pub fn set_death_link_override(&mut self, value: Option<bool>) {
+        self.death_link_override = value;
+    }
+
+    pub fn take_death_link_tag_failure(&mut self) -> Option<String> {
+        self.death_link_tag_failure.take()
     }
 
     /// Returns whether the config has the minimum info needed to connect (a
@@ -404,6 +437,10 @@ fn next_tag_advertisement(desired: Option<bool>, advertised: bool) -> Option<boo
     }
 }
 
+fn effective_death_link(configured: Option<bool>, session_override: Option<bool>) -> Option<bool> {
+    session_override.or(configured)
+}
+
 /// A trait for the core runners of FromSoftware game mods. This encapsulates
 /// the interface that the shared overlay logic needs to interact with these
 /// games.
@@ -481,6 +518,7 @@ pub trait Core: Send + Sized {
         match result {
             Ok(()) => {
                 self.base_mut().advertised_death_link = want;
+                self.base_mut().death_link_tag_failure_reported = false;
                 info!(
                     "DeathLink tag {} the server",
                     if want {
@@ -490,7 +528,15 @@ pub trait Core: Send + Sized {
                     }
                 );
             }
-            Err(e) => warn!("DeathLink tag: ConnectUpdate failed ({e}) -- retrying next tick"),
+            Err(e) => {
+                let message =
+                    format!("DeathLink setting could not reach the server ({e}) -- retrying");
+                warn!("{message} next tick");
+                if !self.base().death_link_tag_failure_reported {
+                    self.base_mut().death_link_tag_failure = Some(message);
+                    self.base_mut().death_link_tag_failure_reported = true;
+                }
+            }
         }
     }
 
@@ -587,7 +633,24 @@ pub trait Core: Send + Sized {
 
 #[cfg(test)]
 mod tests {
-    use super::next_tag_advertisement;
+    use super::{effective_death_link, next_tag_advertisement};
+
+    #[test]
+    fn session_override_wins_in_both_directions_and_none_follows_seed() {
+        assert_eq!(effective_death_link(Some(true), None), Some(true));
+        assert_eq!(effective_death_link(Some(false), None), Some(false));
+        assert_eq!(effective_death_link(Some(true), Some(false)), Some(false));
+        assert_eq!(effective_death_link(Some(false), Some(true)), Some(true));
+    }
+
+    #[test]
+    fn rapid_toggles_reconcile_only_the_latest_requested_state() {
+        let advertised = false;
+        assert_eq!(next_tag_advertisement(Some(true), advertised), Some(true));
+        // Before that send succeeds, the player toggles back off: the fresh socket already has the
+        // latest state, so no stale advertisement is emitted.
+        assert_eq!(next_tag_advertisement(Some(false), advertised), None);
+    }
 
     /// Slot data has not landed yet. Any guess is wrong, so say nothing.
     #[test]
