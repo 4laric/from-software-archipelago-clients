@@ -239,6 +239,12 @@ pub struct Core {
     /// which can be mid-load when the game refuses writes -- so a fire-and-forget write would leave
     /// those pickups dead in the world forever. See `er_logic::sweep_flush` (replay-tested).
     sweep_flag_pending: Vec<u32>,
+    /// AP checks observed in game but not yet accepted by the connection. Unlike the old
+    /// one-tick `to_check` vector, this debt survives a player death / load edge and is retried
+    /// without requiring another pickup to wake the reporting path (world#720).
+    check_report_pending: HashSet<i64>,
+    /// Suppress a per-frame wall while the socket is unavailable; a successful retry re-arms it.
+    check_report_error_logged: bool,
     /// On-screen notices for grants the GAME cannot announce (see `er_logic::toast`). A client-
     /// APPLIED grant -- flask rungs today -- changes state without an item entering the bag, so the
     /// native ticker never fires and the player cannot tell delivery from breakage.
@@ -570,6 +576,8 @@ impl shared::Core for Core {
             sweep_flag_state: HashMap::new(),
             sweep_watch: er_logic::sweep_watch::SweepWatch::new(),
             sweep_flag_pending: Vec::new(),
+            check_report_pending: HashSet::new(),
+            check_report_error_logged: false,
             toasts: er_logic::toast::Deck::new(4, 6000),
             toast_clock: std::time::Instant::now(),
             flask_seen: None,
@@ -804,14 +812,7 @@ impl shared::Core for Core {
 
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them. Gated on the minibake
         // refuse guard — a wrong-seed save must not report checks (see reconcile_io::is_refused).
-        let checks = crate::detour::take_pending_checks();
-        if !checks.is_empty()
-            && !crate::reconcile_io::is_refused()
-            && let Some(client) = self.client_mut()
-            && let Err(e) = client.mark_checked(checks.iter().copied())
-        {
-            log::warn!("mark_checked failed for {checks:?}: {e}");
-        }
+        self.stage_check_reports(crate::detour::take_pending_checks());
 
         // 2. Parse slot_data once -- but RE-PARSE on a genuine SEED CHANGE (reconnect to a
         //    DIFFERENT seed without reloading the ER save). `slot_data_parsed` is a one-shot latch,
@@ -2172,6 +2173,9 @@ impl shared::Core for Core {
         let can_grant = crate::detour::has_inventory()
             && crate::flags::in_world()
             && !crate::reconcile_io::is_refused();
+        // Seed-change detection/reset has completed above. Retry report debt only now, so debt from
+        // a prior room can never be offered to a newly-connected seed before reset_for_new_seed.
+        self.flush_check_reports();
         // Cumulative set of ALL received item names — natural-key triggers need the full history
         // (a clause may require an item received many ticks ago), not just this tick's new names.
         let mut received_all: HashSet<String> = HashSet::new();
@@ -2668,11 +2672,8 @@ impl shared::Core for Core {
                 }
                 if !to_check.is_empty() && !crate::reconcile_io::is_refused() {
                     log::info!("shop/offline discovery: {} new check(s)", to_check.len());
-                    if let Some(client) = self.client_mut()
-                        && let Err(e) = client.mark_checked(to_check.iter().copied())
-                    {
-                        log::warn!("shop mark_checked failed: {e}");
-                    }
+                    self.stage_check_reports(to_check);
+                    self.flush_check_reports();
                 }
             }
         }
@@ -3245,11 +3246,8 @@ impl shared::Core for Core {
                 to_check.sort_unstable();
                 to_check.dedup();
                 log::info!("flag-poll: {} new check(s)", to_check.len());
-                if let Some(client) = self.client_mut()
-                    && let Err(e) = client.mark_checked(to_check.iter().copied())
-                {
-                    log::warn!("flag-poll mark_checked failed: {e}");
-                }
+                self.stage_check_reports(to_check);
+                self.flush_check_reports();
             }
 
             // Boss-lock mode A (SPEC-boss-lock-tracker.md): emit the one-shot "Felled: <Boss>"
@@ -4109,6 +4107,58 @@ impl shared::Core for Core {
 }
 
 impl Core {
+    /// Remember checks before touching the socket. The old callers drained or discarded their
+    /// one-tick vectors before `mark_checked`; a death/load edge in that window left the check
+    /// waiting for some unrelated later pickup to rebuild the vector (world#720).
+    fn stage_check_reports(&mut self, checks: impl IntoIterator<Item = i64>) {
+        self.check_report_pending.extend(checks);
+    }
+
+    /// Reconcile staged checks with the AP client's accepted set. This runs every live update,
+    /// independently of flag polling and pickups. A socket refusal leaves the whole batch pending;
+    /// success retires exactly the ids `mark_checked` accepted into its local checked set.
+    fn flush_check_reports(&mut self) {
+        if self.check_report_pending.is_empty() || crate::reconcile_io::is_refused() {
+            return;
+        }
+
+        let mut pending = std::mem::take(&mut self.check_report_pending);
+        let batch = match self.client() {
+            Some(client) => er_logic::check_report::retry_batch(&mut pending, |loc| {
+                client.is_local_location_checked(loc)
+            }),
+            None => {
+                self.check_report_pending = pending;
+                return;
+            }
+        };
+        self.check_report_pending = pending;
+        if batch.is_empty() {
+            self.check_report_error_logged = false;
+            return;
+        }
+
+        let result = self
+            .client_mut()
+            .expect("client was present above")
+            .mark_checked(batch.iter().copied());
+        match result {
+            Ok(()) => {
+                er_logic::check_report::retire_accepted(&mut self.check_report_pending, &batch);
+                self.check_report_error_logged = false;
+            }
+            Err(e) => {
+                if !self.check_report_error_logged {
+                    log::warn!(
+                        "check report deferred: {e} ({} check(s) pending; retrying)",
+                        self.check_report_pending.len()
+                    );
+                    self.check_report_error_logged = true;
+                }
+            }
+        }
+    }
+
     // ---- RECONCILER DRY-RUN mapper (additive; only called under RECONCILE_DRYRUN) --------------
     //
     // build_desired_inputs folds the parsed slot_data tables + the server-delivered received-item
@@ -4292,6 +4342,8 @@ impl Core {
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
         // flags the new seed never earned.
         self.sweep_flag_pending.clear();
+        self.check_report_pending.clear();
+        self.check_report_error_logged = false;
         self.flask_seen = None;
         self.region_toast_primed = false;
         self.received_through = 0;
