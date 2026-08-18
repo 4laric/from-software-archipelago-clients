@@ -187,8 +187,24 @@ fn create_write_logger(dir: impl AsRef<Path>) -> Result<Box<WriteLogger<fs::File
 /// Initializes the basic hooks into the underlying rendering system for the
 /// current mod.
 pub fn initialize<G: Game>(blocker: G::InputBlocker) {
+    initialize_checked::<G, _>(blocker, || Ok(()));
+}
+
+/// Initialise after a worker-thread preflight. A rejection is shown to the player and leaves the
+/// game running without an Archipelago core or overlay.
+pub fn initialize_checked<G, F>(blocker: G::InputBlocker, preflight: F)
+where
+    G: Game,
+    F: FnOnce() -> std::result::Result<(), String> + Send + 'static,
+{
     std::thread::spawn(move || {
         info!("Worker thread initialized.");
+
+        if let Err(message) = preflight() {
+            error!("{message}");
+            message_box::<G>(message);
+            return;
+        }
 
         // This mutex isn't strictly necessary since in practice we're only
         // ever touching this on DS3's main thread. But Rust doesn't have
