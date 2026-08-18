@@ -228,9 +228,7 @@ fn player_data_mut() -> Option<&'static mut eldenring::cs::CSChrDataModule> {
     let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
         return None;
     };
-    let Some(player) = wcm.main_player.as_mut() else {
-        return None;
-    };
+    let player = wcm.main_player.as_mut()?;
     let data = &mut player.chr_ins.modules.data;
     // The teardown guard. This module never walks `special_effect`, but `chr_ins` itself is torn
     // down at the death cam, and a ceiling is meaningless on a corpse -- the effect resumes on the
