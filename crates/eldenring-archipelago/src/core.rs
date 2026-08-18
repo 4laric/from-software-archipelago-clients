@@ -604,6 +604,10 @@ impl shared::Core for Core {
             .effective_death_link(self.slot_data_parsed.then(crate::deathlink::is_enabled))
     }
 
+    fn trap_link_enabled(&self) -> Option<bool> {
+        self.slot_data_parsed.then(crate::traps::trap_link_enabled)
+    }
+
     /// Overlay menu-bar hook (SPEC-item-tracker.md): a "Tracker" item that toggles the window.
     ///
     /// The label carries its hotkey (as the shared overlay's "Hide (F5)" does) because F6 lived
@@ -980,6 +984,7 @@ impl shared::Core for Core {
                 // int-or-bool tolerant (er_logic::options): the apworld serializes options
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
+                crate::traps::set_trap_link_enabled(er_logic::options::parse_trap_link(sd));
                 // #548: a ROLL MODE, not a bool. `parse` is handed over whole so the feature can
                 // state an unrecognised value itself rather than have it collapse into "off" here.
                 crate::no_equip_load::set_mode(er_logic::equip_load::parse(sd));
@@ -2330,6 +2335,8 @@ impl shared::Core for Core {
         let mut dispatched = disp as i64;
         let mut pushed = self.received_through as i64;
         let mut unlocked: Vec<String> = Vec::new();
+        let trap_link_enabled = self.trap_link_enabled() == Some(true);
+        let mut trap_link_outbound: Vec<String> = Vec::new();
         if can_grant && !snapshot.is_empty() {
             let empty_map = HashMap::new();
             let item_map = self.item_map.as_ref().unwrap_or(&empty_map);
@@ -2430,10 +2437,16 @@ impl shared::Core for Core {
                             // the receive loop, which can land while the player is in a menu, and a
                             // trap dropped there is GONE (the item is already marked received and
                             // the server will never resend it). traps::poll_pending delivers it.
-                            crate::traps::enqueue_by_item_name(
+                            let queued = crate::traps::enqueue_by_item_name(
                                 &ri.name,
                                 self.toast_clock.elapsed().as_millis() as u64,
                             );
+                            if queued && trap_link_enabled {
+                                // `dispatch` owns mutable receive-state borrows for this whole
+                                // loop. Send after it drops; the name is the complete outbound
+                                // provenance and inbound TrapLink events never enter this path.
+                                trap_link_outbound.push(ri.name.clone());
+                            }
                         } else if ri.name.starts_with("Boss Key: ") {
                             // Boss Keys (mode B) are SYNTHETIC gate tokens, intentionally absent from
                             // apIdsToItemIds: they gate a felled boss's reward (boss_key_pending) and its
@@ -2476,6 +2489,24 @@ impl shared::Core for Core {
                 }
             }
             unlocked = dispatch.unlocked;
+        }
+        for trap_name in trap_link_outbound {
+            let source = self
+                .my_name
+                .clone()
+                .unwrap_or_else(|| "Elden Ring".to_string());
+            let data = serde_json::json!({
+                "time": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                "source": source,
+                "trap_name": trap_name,
+            });
+            if let Some(client) = self.client_mut()
+                && let Err(e) = client.bounce(data, ap::BounceOptions::new().tags(["TrapLink"]))
+            {
+                log::warn!("TrapLink: broadcast failed: {e}");
+            }
         }
         self.dispatched_through = dispatched.max(0) as usize;
         self.received_through = pushed.max(0) as usize;
@@ -3596,14 +3627,16 @@ impl shared::Core for Core {
             self.log(ap::Print::message(m));
         }
 
-        // 7. DeathLink.
+        // 7. Link events.
         let my_name = self.my_name.clone();
         for ev in self.take_events() {
-            if let ap::Event::DeathLink { source, .. } = ev {
-                let foreign = my_name.as_deref().map(|n| n != source).unwrap_or(true);
-                if foreign {
-                    // R2 (SWEEP H2): honor the slot's death_link option on the INCOMING side too
-                    // (the tag is advertised unconditionally; only the outgoing send was gated).
+            match ev {
+                ap::Event::DeathLink { source, .. } => {
+                    let foreign = my_name.as_deref().map(|n| n != source).unwrap_or(true);
+                    if !foreign {
+                        continue;
+                    }
+                    // R2 (SWEEP H2): honor the slot's death_link option on the incoming side too.
                     if self.death_link_enabled() == Some(true) {
                         log::info!("DeathLink received from '{source}'");
                         crate::deathlink::latch_incoming_kill();
@@ -3624,6 +3657,33 @@ impl shared::Core for Core {
                         );
                     }
                 }
+                ap::Event::Bounce { tags, data, .. }
+                    if self.trap_link_enabled() == Some(true)
+                        && tags.as_ref().is_some_and(|set| {
+                            set.iter().any(|tag| tag.as_str() == "TrapLink")
+                        }) =>
+                {
+                    let Some(data) = data else { continue };
+                    let Some(source) = data.get("source").and_then(|v| v.as_str()) else {
+                        log::warn!("TrapLink: inbound bounce has no string source -- ignored");
+                        continue;
+                    };
+                    if my_name.as_deref() == Some(source) {
+                        continue;
+                    }
+                    let Some(name) = data.get("trap_name").and_then(|v| v.as_str()) else {
+                        log::warn!(
+                            "TrapLink: inbound bounce from {source:?} has no trap_name -- ignored"
+                        );
+                        continue;
+                    };
+                    crate::traps::enqueue_by_link_name(
+                        name,
+                        source,
+                        self.toast_clock.elapsed().as_millis() as u64,
+                    );
+                }
+                _ => {}
             }
         }
         crate::deathlink::drive_kill(self.death_link_enabled() == Some(true));

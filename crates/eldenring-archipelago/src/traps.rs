@@ -65,6 +65,15 @@ use fromsoftware_shared::FromStatic;
 static PENDING: Mutex<Option<er_logic::traps::TrapQueue>> = Mutex::new(None);
 /// One warn per overdue head, not one per tick.
 static WARNED: AtomicBool = AtomicBool::new(false);
+static TRAP_LINK_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_trap_link_enabled(enabled: bool) {
+    TRAP_LINK_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn trap_link_enabled() -> bool {
+    TRAP_LINK_ENABLED.load(Ordering::Relaxed)
+}
 
 /// Restore deadline for a real Blackout item. `poll_pending` drives it every overlay frame even
 /// when no trap remains queued, so consuming the item can never strand the screen dark.
@@ -129,7 +138,7 @@ static SPAWN_BURST: Mutex<Option<er_logic::spawn_burst::SpawnBurst>> = Mutex::ne
 /// payload, from a world that had NOT taken the change this client had -- and that sentence sent
 /// the maintainer into the wrong repository. `classify_refusal` establishes the direction before
 /// naming one, and holds the sentence where it can be host-tested.
-pub fn enqueue_by_item_name(name: &str, now_ms: u64) {
+pub fn enqueue_by_item_name(name: &str, now_ms: u64) -> bool {
     let Some(trap) = Trap::from_item_name(name) else {
         // ONE line, and the diagnosis is a value rather than a literal: the client keeps no copy
         // of the words, so there is one place to fix when they are wrong again.
@@ -137,15 +146,36 @@ pub fn enqueue_by_item_name(name: &str, now_ms: u64) {
             "trap item {name:?} is not one this client can fire -- ignored. {}",
             classify_refusal(name).advice()
         );
-        return;
+        return false;
     };
     let Ok(mut guard) = PENDING.lock() else {
-        return;
+        return false;
     };
     guard
         .get_or_insert_with(er_logic::traps::TrapQueue::new)
         .push(trap, now_ms);
     log::info!("trap {} queued from item {name:?}", trap.key());
+    true
+}
+
+/// Queue an inbound TrapLink using the exact same public item-name vocabulary.
+/// Unknown foreign names fail closed and inbound provenance never reaches the outbound send path.
+pub fn enqueue_by_link_name(name: &str, source: &str, now_ms: u64) -> bool {
+    let Some(trap) = Trap::from_item_name(name) else {
+        log::warn!("TrapLink: unknown foreign trap {name:?} from {source:?} -- ignored");
+        return false;
+    };
+    let Ok(mut guard) = PENDING.lock() else {
+        return false;
+    };
+    guard
+        .get_or_insert_with(er_logic::traps::TrapQueue::new)
+        .push(trap, now_ms);
+    log::info!(
+        "TrapLink: {} queued from {source:?} as {name:?}",
+        trap.key()
+    );
+    true
 }
 
 /// Per-tick: deliver at most one queued trap, once the player can take it.

@@ -112,6 +112,9 @@ pub const PROBES: &[(&str, Probe)] = &[
         er_logic::traps::Trap::from_item_name("Trap: Blackout")
             == Some(er_logic::traps::Trap::Blackout)
     }),
+    // Read the same atomic that gates both outbound broadcasts and inbound queueing. The world
+    // declares this tag only when the option is on, so `false` is a genuine dark feature.
+    ("trap_link", |_| crate::traps::trap_link_enabled()),
 ];
 
 /// Build the `(tag, live)` table this connect.
