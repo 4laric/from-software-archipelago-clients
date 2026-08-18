@@ -71,11 +71,18 @@ pub fn start_logger() {
     // whole session -- making every OTHER runtime problem undetectable. No logger exists yet at
     // this point, so eprintln! is the only available channel; on failure, also try the current
     // directory as a fallback before giving up.
-    match utils::mod_directory() {
+    // The DLL is the one location every supported loader has in common. ME3's "mod directory"
+    // may be its profile/package root while Matt and ModEngine place this DLL several levels
+    // deeper; using that loader-specific root made logs move between installs and made bug-report
+    // instructions unreliable. Resolve our own loaded module instead and always put `log/` beside
+    // it. The working directory remains only the last-resort sink when Windows cannot resolve the
+    // module address or that directory is unwritable.
+    match utils::current_module_directory() {
         Ok(dir) => {
-            if let Err(err) = start_logger_for_dir(dir) {
+            if let Err(err) = start_logger_for_dir(&dir) {
                 eprintln!(
-                    "AP client: logger init FAILED for mod directory ({err}); trying current directory"
+                    "AP client: logger init FAILED beside client DLL at {} ({err}); trying current directory",
+                    dir.display()
                 );
                 if let Err(err2) = start_logger_for_dir(".") {
                     eprintln!(
@@ -84,22 +91,27 @@ pub fn start_logger() {
                     return;
                 }
             }
-            info!("Logger initialized.");
+            info!(
+                "Logger initialized beside client DLL: {}",
+                dir.join("log").display()
+            );
         }
         Err(dir_err) => {
             if let Err(err) = start_logger_for_dir(".") {
                 eprintln!(
-                    "AP client: no mod directory ({dir_err}) and logger init FAILED for current directory ({err}); file logging is OFF this session"
+                    "AP client: client DLL directory unavailable ({dir_err}) and logger init FAILED for current directory ({err}); file logging is OFF this session"
                 );
                 return;
             }
-            info!("Failed to determine mod directory, logging to current directory instead.");
+            info!(
+                "Failed to determine client DLL directory, logging to current directory instead."
+            );
         }
     }
 
     // Provenance, emitted only now because it CANNOT be emitted earlier: resolving the mod
-    // directory is what starts the logger, so `load_mod_directory`'s own println! lines land on
-    // stdout with no logger to catch them. Every path that reaches here has a live logger.
+    // directory used to start the logger, so early discovery lines land on stdout with no logger
+    // to catch them. Every path that reaches here has a live logger.
     mod_stack::log_provenance();
 }
 
