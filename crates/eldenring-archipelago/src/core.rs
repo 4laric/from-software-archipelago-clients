@@ -92,6 +92,8 @@ pub struct Core {
     recv_probe: er_logic::receive_probe::Probe,
     item_map: Option<HashMap<i64, i64>>,
     item_counts: HashMap<i64, i64>,
+    /// Synthetic AP armour-set id -> every protector FullID granted by that wrapper.
+    armor_bundles: HashMap<i64, Vec<i32>>,
     region: Option<crate::region::RegionConfig>,
     /// Region-lock fog-wall visuals (cosmetic; KICK still enforces).
     fogwall: Option<crate::fogwall::FogWallConfig>,
@@ -526,6 +528,7 @@ impl shared::Core for Core {
             recv_probe: er_logic::receive_probe::Probe::default(),
             item_map: None,
             item_counts: HashMap::new(),
+            armor_bundles: HashMap::new(),
             region: None,
             fogwall: None,
             progressive: ProgressiveState::new(HashMap::new()),
@@ -1069,6 +1072,7 @@ impl shared::Core for Core {
                 crate::shop_icon::set_real_goods(real_goods.clone());
                 crate::shop_preview::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
+                let armor_bundles = i64_to_i32_list_map(sd.get("armorBundles"));
                 let mut region = crate::region::parse(sd);
                 // Arm shop_preview to MARK region-lock rewards that land in a shop (a lock reward
                 // otherwise reads as its vanilla good, e.g. "Note: Sealed Spiritsprings", with no hint
@@ -1673,11 +1677,12 @@ impl shared::Core for Core {
                     .and_then(|item| region.region_open_flags.get(item).copied());
                 crate::region::configure_goal_arena(goal_arena_flag, goal_lock_item);
 
-                (map, counts, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features)
+                (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features)
             });
             if let Some((
                 map,
                 counts,
+                armor_bundles,
                 region,
                 fogwall,
                 prog_cfg,
@@ -1704,6 +1709,7 @@ impl shared::Core for Core {
                 );
                 self.item_map = Some(map);
                 self.item_counts = counts;
+                self.armor_bundles = armor_bundles;
                 self.region = Some(region);
                 self.fogwall = Some(fogwall);
                 self.progressive = ProgressiveState::new(prog_cfg);
@@ -1795,6 +1801,7 @@ impl shared::Core for Core {
                     &required_features,
                     &crate::feature_handshake::ProbeCtx {
                         region: self.region.as_ref(),
+                        armor_bundles: !self.armor_bundles.is_empty(),
                     },
                 );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A
@@ -2429,7 +2436,12 @@ impl shared::Core for Core {
                             .region
                             .map(|c| c.region_open_flags.contains_key(&ri.name))
                             .unwrap_or(false);
-                        if is_region_lock {
+                        if self.armor_bundles.contains_key(&ap_item_id) {
+                            log::debug!(
+                                "armour bundle '{}' (ap id {ap_item_id}) -> reconciler member grants",
+                                ri.name
+                            );
+                        } else if is_region_lock {
                             log::debug!(
                                 "region-lock '{}' (ap id {ap_item_id}) -> handled via open flag (not an ER item grant)",
                                 ri.name
@@ -4302,7 +4314,13 @@ impl Core {
             }
             return ItemSemantics::RegionFlags(flags);
         }
-        // 3. Key item / great rune: the base grant gives the (restored) goods, plus vanilla
+        // 3. Synthetic armour-set wrapper: every member is an independently observable protector.
+        // The reconciler therefore paces missing members and resumes a partial bundle on reconnect
+        // without relying on the wrapper's single received-stream index as a multi-grant ledger.
+        if let Some(members) = self.armor_bundles.get(&ap_id) {
+            return ItemSemantics::ArmorBundle(members.clone());
+        }
+        // 4. Key item / great rune: the base grant gives the (restored) goods, plus vanilla
         //    obtained/restored companion flags from the keyitems table. Both classes are a unique
         //    good + set-only companion flags, so both map to KeyItem.
         let full_id = self.item_map.as_ref().and_then(|m| m.get(&ap_id)).copied();
@@ -4315,7 +4333,7 @@ impl Core {
                 obtained_flags: acq,
             };
         }
-        // 4. Plain grant: mapped -> ledgered consumable; unmapped -> inert (region locks / boss keys
+        // 5. Plain grant: mapped -> ledgered consumable; unmapped -> inert (region locks / boss keys
         //    fell out at step 2 / are name-gated, so an unmapped id here is genuinely effect-less).
         match full_id {
             Some(fid) => {
@@ -4351,6 +4369,7 @@ impl Core {
         self.item_map = None;
         crate::keyitems::reset_seed_great_runes();
         self.item_counts.clear();
+        self.armor_bundles.clear();
         self.region = None;
         self.fogwall = None;
         self.progressive = ProgressiveState::new(HashMap::new());
@@ -5497,6 +5516,30 @@ fn i64_map(v: Option<&Value>) -> HashMap<i64, i64> {
         }
     }
     m
+}
+
+/// `{ "<AP item id>": [<protector FullID>, ...] }`, tolerantly skipping malformed entries.
+fn i64_to_i32_list_map(v: Option<&Value>) -> HashMap<i64, Vec<i32>> {
+    let mut out = HashMap::new();
+    if let Some(obj) = v.and_then(Value::as_object) {
+        for (key, value) in obj {
+            let Ok(ap_id) = key.parse::<i64>() else {
+                continue;
+            };
+            let Some(values) = value.as_array() else {
+                continue;
+            };
+            let members: Vec<i32> = values
+                .iter()
+                .filter_map(Value::as_i64)
+                .filter_map(|n| i32::try_from(n).ok())
+                .collect();
+            if !members.is_empty() {
+                out.insert(ap_id, members);
+            }
+        }
+    }
+    out
 }
 
 /// `{ "<i64>": <u32> }` slot_data object -> `i64 -> u32`. Tolerant: skips malformed entries. Used by

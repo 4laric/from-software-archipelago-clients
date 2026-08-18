@@ -32,6 +32,7 @@ pub struct ContractKey {
 
 pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "apIdsToItemIds", shape: Shape::ScalarIntMap, required: true, greenfield: true },
+    ContractKey { name: "armorBundles", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "locationFlags", shape: Shape::ScalarIntMap, required: true, greenfield: true },
     ContractKey { name: "regionOpenFlags", shape: Shape::ScalarIntMap, required: true, greenfield: true },
     ContractKey { name: "locationRegions", shape: Shape::ListvalIntMap, required: false, greenfield: true },
@@ -206,6 +207,6 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "5c2b9bf2";
+pub const CONTRACT_HASH: &str = "dc0dc687";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.4.7";
 
