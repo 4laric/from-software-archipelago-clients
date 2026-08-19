@@ -130,6 +130,7 @@ mod replay {
                 always_map_flags: vec![82005],
                 reveal_all_maps: true,
                 map_reveal_flags: vec![62010],
+                start_item_flags: Vec::new(),
                 start_items: vec![StartItem {
                     full_id: 3000,
                     qty: 1,

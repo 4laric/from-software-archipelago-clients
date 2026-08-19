@@ -164,6 +164,11 @@ pub fn apply_start_flags(cfg: &StartConfig) -> bool {
             }
         }
     }
+    for f in er_logic::whetblade::start_item_affinity_flags(&cfg.start_items) {
+        if !set_and_verify(f, "start-item obtained/affinity") {
+            return false;
+        }
+    }
     true
 }
 

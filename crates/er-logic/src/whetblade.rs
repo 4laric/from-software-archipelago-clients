@@ -53,6 +53,8 @@ use std::collections::HashMap;
 pub struct Whetblade {
     /// Received-item name, as the apworld ships it (keyitems.rs matches on this).
     pub name: &'static str,
+    /// Goods FullID used by slot_data `startItems` (category 0x40000000 | GoodsParam row).
+    pub full_id: i32,
     /// `ItemLotParam_map` row of the vanilla pickup (flag_lots.tsv).
     pub map_lot: u32,
     /// Vanilla `getItemFlagId` == the FIRST affinity's menu unlock (Hexinton CE table).
@@ -68,6 +70,7 @@ pub struct Whetblade {
 pub const WHETBLADES: [Whetblade; 5] = [
     Whetblade {
         name: "Iron Whetblade",
+        full_id: 0x40000000 | 8970,
         map_lot: 10000420,
         pickup_flag: 65610,
         check_flag: 65611,
@@ -75,6 +78,7 @@ pub const WHETBLADES: [Whetblade; 5] = [
     },
     Whetblade {
         name: "Red-Hot Whetblade",
+        full_id: 0x40000000 | 8971,
         map_lot: 1051360070,
         pickup_flag: 65640,
         check_flag: 65641,
@@ -82,6 +86,7 @@ pub const WHETBLADES: [Whetblade; 5] = [
     },
     Whetblade {
         name: "Sanctified Whetblade",
+        full_id: 0x40000000 | 8972,
         map_lot: 11001010,
         pickup_flag: 65660,
         check_flag: 65661,
@@ -89,6 +94,7 @@ pub const WHETBLADES: [Whetblade; 5] = [
     },
     Whetblade {
         name: "Glintstone Whetblade",
+        full_id: 0x40000000 | 8973,
         map_lot: 14000500,
         pickup_flag: 65680,
         check_flag: 65681,
@@ -96,12 +102,27 @@ pub const WHETBLADES: [Whetblade; 5] = [
     },
     Whetblade {
         name: "Black Whetblade",
+        full_id: 0x40000000 | 8974,
         map_lot: 12020010,
         pickup_flag: 65720,
         check_flag: 65721,
         affinity_flags: &[65720, 65700, 65710],
     },
 ];
+
+/// Affinity/obtained flags implied by slot-data start items.
+///
+/// Included whetblade checks are safe: [`repoint_poll_flags`] moves their lots and polling to the
+/// client-owned check flag before these vanilla affinity flags are applied. An excluded location is
+/// deliberately not repointed, so its vanilla lot still reads `pickup_flag` and despawns as already
+/// obtained instead of offering a duplicate max-held pickup.
+pub fn start_item_affinity_flags(start_items: &[i32]) -> Vec<u32> {
+    WHETBLADES
+        .iter()
+        .filter(|w| start_items.contains(&w.full_id))
+        .flat_map(|w| w.affinity_flags.iter().copied())
+        .collect()
+}
 
 /// Move every whetblade CHECK off its double-booked vanilla flag, in place.
 ///
@@ -174,6 +195,58 @@ mod tests {
                 "{}: check flag {} collides with an affinity flag",
                 w.name,
                 w.check_flag
+            );
+        }
+    }
+
+    #[test]
+    fn start_items_resolve_all_whetblade_affinity_flags_only() {
+        let mut start_items = WHETBLADES.iter().map(|w| w.full_id).collect::<Vec<_>>();
+        start_items.push(0x40000000 | 1000); // unrelated GoodsParam row
+
+        let actual: HashSet<u32> = start_item_affinity_flags(&start_items)
+            .into_iter()
+            .collect();
+        let expected: HashSet<u32> = WHETBLADES
+            .iter()
+            .flat_map(|w| w.affinity_flags.iter().copied())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn each_start_whetblade_resolves_only_its_own_flags() {
+        for w in &WHETBLADES {
+            assert_eq!(start_item_affinity_flags(&[w.full_id]), w.affinity_flags);
+        }
+        assert!(start_item_affinity_flags(&[0x40000000 | 1000]).is_empty());
+    }
+
+    /// Acceptance matrix for #867: every started blade keeps an included AP check collectible,
+    /// while the same blade's excluded vanilla pickup is despawned by its obtained flag.
+    #[test]
+    fn started_whetblade_included_and_excluded_location_matrix() {
+        for w in &WHETBLADES {
+            let flags: HashSet<u32> = start_item_affinity_flags(&[w.full_id])
+                .into_iter()
+                .collect();
+
+            let mut included_poll = HashMap::from([(1_i64, w.pickup_flag)]);
+            let rewrites = repoint_poll_flags(&mut included_poll);
+            assert_eq!(included_poll[&1], w.check_flag, "{} check poll", w.name);
+            assert_eq!(rewrites, vec![(w.map_lot, w.check_flag)], "{} lot", w.name);
+            assert!(
+                !flags.contains(&w.check_flag),
+                "{} included AP pickup must remain spawned and unreported",
+                w.name
+            );
+
+            let mut excluded_poll = HashMap::new();
+            assert!(repoint_poll_flags(&mut excluded_poll).is_empty());
+            assert!(
+                flags.contains(&w.pickup_flag),
+                "{} excluded vanilla pickup must be marked obtained",
+                w.name
             );
         }
     }
