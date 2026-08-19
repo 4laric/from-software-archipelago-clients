@@ -800,6 +800,104 @@ fn commit_fn(base: usize) -> Option<ChrAsmCommit> {
     Some(unsafe { std::mem::transmute::<usize, ChrAsmCommit>(addr) })
 }
 
+/// Normalize a genuinely fresh starting-class loadout to the challenge's one active left-hand
+/// slot (#441).
+///
+/// `Some(n)` means the live read-back settled and `n` reserve slots were unequipped. `None` means
+/// retry: the option/world/typed singleton/commit pin was unavailable, no live unarmed source
+/// existed, or the read-back disagreed. The caller persists success per seed so this never touches
+/// a returning player's manually curated loadout.
+pub fn normalize_starting_left_slots() -> Option<usize> {
+    if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
+        return None;
+    }
+    let commit = commit_fn(current_module_base()?)?;
+    // SAFETY: FD4 singleton, read/written on the single-threaded FrameBegin tick.
+    let gdm = unsafe { GameDataMan::instance_mut() }.ok()?;
+    let pgd = &mut *gdm.main_player_game_data;
+    let equipment = &mut pgd.equipment;
+    let worn: [i32; 6] = std::array::from_fn(|i| equipment.chr_asm.equipment_param_ids[i]);
+    let selected_left = equipment.chr_asm.equipment.selected_slots.left_weapon_slot;
+    let plan = match er_logic::auto_equip::starting_left_cleanup_plan(worn, selected_left) {
+        Ok(plan) => plan,
+        Err(er_logic::auto_equip::StartingLeftCleanupError::NoUnarmedSource) => {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "auto_equip starting loadout: Left2/3 need clearing but all six armament \
+                     slots are populated -- no live unarmed representation to copy; retrying"
+                );
+            }
+            return None;
+        }
+    };
+
+    if plan.clear_slots.is_empty() && !plan.reset_selector {
+        log::info!("auto_equip starting loadout: one-left-slot policy already settled");
+        return Some(0);
+    }
+
+    let entries = (&raw mut equipment.equipment_entries).cast::<u32>();
+    let indices = (equipment as *mut EquipGameData)
+        .cast::<u8>()
+        .wrapping_add(EQUIP_INDEX_OFF)
+        .cast::<u32>();
+    let unarmed = plan.unarmed_source.map(|source| {
+        let source = source as usize;
+        // SAFETY: source is one of WEAPON_SLOTS (0..=5), inside both arrays. The pure plan only
+        // returns it after its live param row read as UNARMED_WEAPON_PARAM_ID.
+        unsafe {
+            (
+                entries.add(source).read(),
+                indices.add(source).read_unaligned(),
+                equipment.chr_asm.gaitem_handles[source],
+            )
+        }
+    });
+
+    let live = &raw mut equipment.chr_asm;
+    // SAFETY: `live` is a valid initialized ChrAsm; the temporary is a bitwise source for the
+    // game's copy-assignment and has no Drop, matching the ordinary equip path below.
+    let mut src = unsafe { std::ptr::read(live) };
+    let mut unequipped = Vec::new();
+    if let Some((unarmed_full, unarmed_index, unarmed_handle)) = unarmed {
+        for &slot in &plan.clear_slots {
+            let idx = slot as usize;
+            // Record what was removed for the one-shot diagnostic before replacing each rep.
+            unequipped.push((slot, worn[idx]));
+            // SAFETY: target is Left2 or Left3, both inside the pinned arrays.
+            unsafe {
+                entries.add(idx).write(unarmed_full);
+                indices.add(idx).write_unaligned(unarmed_index);
+            }
+            src.gaitem_handles[idx] = unarmed_handle;
+            src.equipment_param_ids[idx] = er_logic::auto_equip::UNARMED_WEAPON_PARAM_ID;
+        }
+    }
+    if plan.reset_selector {
+        src.equipment.selected_slots.left_weapon_slot = 0;
+    }
+    // SAFETY: signature-verified game copy-assignment, same call contract as the ordinary equip
+    // path. It releases the outgoing handles and acquires the copied unarmed handle.
+    unsafe { commit(live, &raw const src) };
+
+    let settled = plan.clear_slots.iter().all(|&slot| {
+        equipment.chr_asm.equipment_param_ids[slot as usize]
+            == er_logic::auto_equip::UNARMED_WEAPON_PARAM_ID
+    }) && equipment.chr_asm.equipment.selected_slots.left_weapon_slot == 0;
+    if !settled {
+        log::warn!(
+            "auto_equip starting loadout: one-left-slot write did not read back -- retrying"
+        );
+        return None;
+    }
+    log::info!(
+        "auto_equip starting loadout: one-left-slot policy settled; unequipped {:?}, active Left1",
+        unequipped
+    );
+    Some(plan.clear_slots.len())
+}
+
 /// Per-tick until the pending queue drains. An item not yet in the bag stays queued for a later
 /// tick -- the grant and the receive are not ordered with respect to each other.
 pub fn tick() {

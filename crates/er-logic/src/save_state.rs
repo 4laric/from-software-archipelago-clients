@@ -17,6 +17,12 @@ pub struct SaveState {
     /// progressed flag state (which would exclude every prior pickup's check forever -- the
     /// check-eater bug). Empty on a save that has not captured one yet.
     pub flag_poll_baseline: BTreeSet<u32>,
+    /// Whether the fresh starting-class loadout has been normalized to the auto-equip challenge's
+    /// one active left-hand slot (#441).
+    pub starting_left_slots_normalized: bool,
+    /// A fresh-character verdict was observed and normalization is still owed. This survives a
+    /// restart after the save-embedded marker has changed from Fresh to Resume.
+    pub starting_left_slots_pending: bool,
     pub progressive_counter: BTreeMap<String, i32>,
     pub progressive_high_index: i64,
 }
@@ -35,6 +41,8 @@ impl SaveState {
             "last_received_index":    self.last_received_index,
             "notify_granted":         notify,
             "flag_poll_baseline":     flag_poll_baseline,
+            "starting_left_slots_normalized": self.starting_left_slots_normalized,
+            "starting_left_slots_pending": self.starting_left_slots_pending,
             "progressive_counter":    serde_json::Value::Object(counter),
             "progressive_high_index": self.progressive_high_index,
         })
@@ -79,6 +87,17 @@ impl SaveState {
                 .unwrap_or(0),
             notify_granted: notify,
             flag_poll_baseline,
+            // Legacy files belong to characters that may have manually curated their loadout.
+            // Treat an absent field as already normalized so an upgrade never unequips them.
+            // `Default` remains false: only an actually absent per-seed file is a fresh loadout.
+            starting_left_slots_normalized: v
+                .get("starting_left_slots_normalized")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
+            starting_left_slots_pending: v
+                .get("starting_left_slots_pending")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             progressive_counter: counter,
             progressive_high_index: v
                 .get("progressive_high_index")
@@ -95,6 +114,8 @@ impl Default for SaveState {
             last_received_index: 0,
             notify_granted: std::collections::BTreeSet::new(),
             flag_poll_baseline: std::collections::BTreeSet::new(),
+            starting_left_slots_normalized: false,
+            starting_left_slots_pending: false,
             progressive_counter: std::collections::BTreeMap::new(),
             progressive_high_index: -1,
         }
@@ -122,6 +143,8 @@ mod tests {
             last_received_index: 17,
             notify_granted: notify,
             flag_poll_baseline,
+            starting_left_slots_normalized: false,
+            starting_left_slots_pending: true,
             progressive_counter: counter,
             progressive_high_index: 16,
         };
@@ -144,6 +167,10 @@ mod tests {
             "absent flag_poll_baseline -> empty default"
         );
         assert!(s.progressive_counter.is_empty());
+        assert!(
+            s.starting_left_slots_normalized,
+            "legacy saves must not have their manually curated left slots cleared"
+        );
         assert_eq!(s.progressive_high_index, -1, "default high-index is -1");
     }
 
@@ -151,6 +178,13 @@ mod tests {
     fn malformed_json_loads_as_defaults_not_panic() {
         let s = SaveState::from_json("{ this is not json");
         assert_eq!(s.last_received_index, 0);
+        assert!(s.starting_left_slots_normalized);
+        assert!(!s.starting_left_slots_pending);
         assert_eq!(s.progressive_high_index, -1);
+    }
+
+    #[test]
+    fn a_genuinely_absent_save_still_requests_fresh_loadout_normalization() {
+        assert!(!SaveState::default().starting_left_slots_normalized);
     }
 }
