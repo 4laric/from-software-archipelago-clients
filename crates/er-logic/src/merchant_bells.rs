@@ -5,9 +5,10 @@
 //!
 //! boblerrr, Nexus, 2026-08-03: *"Add an option to receive bell bearings directly from merchants on
 //! first interaction -- Matt's Randomizer has a similar setting for this."* Taken literally that
-//! would put a vanilla Bell Bearing in the bag -- but every one of those bells is ALSO an
-//! Archipelago item in this seed's pool (`Nomadic Merchant's Bell Bearing [1]` is ap id 7001065),
-//! so granting one would hand the player a second copy of an item the multiworld is tracking.
+//! would put a vanilla Bell Bearing in the bag -- but a menu-opening bell is ALSO an Archipelago
+//! item whenever at least one of its merchant regions is present (`Nomadic Merchant's Bell Bearing
+//! [1]` is ap id 7001065), so granting one would hand the player a second copy of an item the
+//! multiworld is tracking.
 //!
 //! What the player wants from that item is the SHOP, so this option delivers the shop and nothing
 //! else: opening a merchant's buy menu sets the flag the Twin Maiden Husks would have set had you
@@ -51,7 +52,9 @@
 //! And the trigger is the regular buy menu only, so a vendor reached through Ash of War, tailoring,
 //! upgrading or change-of-purpose does not fire -- those commands' ids are still unobserved.
 
-use crate::merchant_bell_table::bell_for_range;
+use std::collections::HashSet;
+
+use crate::merchant_bell_table::{bell_for_range, MERCHANT_BELLS};
 
 /// What a shop open means for this feature. Every arm is logged by the caller: a feature that can
 /// decline silently is indistinguishable from one that is broken.
@@ -90,6 +93,37 @@ pub fn plan_hand_in(begin: i32, end: i32, enabled: bool, is_set: impl Fn(u32) ->
 /// for anything else (`merchant_bell_table` refuses a non-ASCII name at generation time).
 pub fn toast_text(name: &str) -> String {
     format!("{name} delivered to the Twin Maiden Husks")
+}
+
+/// Bells whose complete shop range contains no AP check row in this seed.
+///
+/// Several bells own two disjoint ranges under one hand-in flag (Gowry and Miriel), so this groups
+/// by flag and treats stock as randomized when ANY owned range contains an active row. The output
+/// is unique by flag and keeps the generated table's stable order.
+pub fn vanilla_only_bells(active_shop_rows: &HashSet<u32>) -> Vec<(u32, &'static str)> {
+    let mut out = Vec::new();
+    for &(_, _, flag, name) in &MERCHANT_BELLS {
+        if out.iter().any(|&(seen, _)| seen == flag) {
+            continue;
+        }
+        let has_ap_stock = MERCHANT_BELLS.iter().any(|&(lo, hi, candidate, _)| {
+            candidate == flag
+                && active_shop_rows
+                    .iter()
+                    .any(|&row| lo <= row as i32 && row as i32 <= hi)
+        });
+        if !has_ap_stock {
+            out.push((flag, name));
+        }
+    }
+    out
+}
+
+/// Explain a bell acquired outside the randomized pool (#555). The game can still award one by a
+/// vanilla path (most commonly killing a reachable merchant); opening a wholly vanilla menu must
+/// not look like a failed randomizer.
+pub fn vanilla_stock_toast(name: &str) -> String {
+    format!("{name}: stock is vanilla because its merchant region is not in this seed")
 }
 
 #[cfg(test)]
@@ -157,5 +191,42 @@ mod tests {
         let t = toast_text("Kale's Bell Bearing");
         assert!(t.is_ascii());
         assert!(t.contains("Kale's Bell Bearing"));
+    }
+
+    #[test]
+    fn a_bell_with_no_active_shop_row_is_vanilla_only() {
+        let bells = vanilla_only_bells(&HashSet::new());
+        assert!(bells.contains(&(KALE.2, "Kale's Bell Bearing")));
+        assert_eq!(
+            bells
+                .iter()
+                .filter(|&&(flag, _)| flag == 11_109_717)
+                .count(),
+            1,
+            "Miriel's two ranges are one bell and one hand-in flag"
+        );
+    }
+
+    #[test]
+    fn one_active_row_in_any_owned_range_randomizes_the_bell() {
+        let mut rows = HashSet::from([100_500]);
+        assert!(!vanilla_only_bells(&rows)
+            .iter()
+            .any(|&(flag, _)| flag == KALE.2));
+
+        // Miriel owns 100400..100424 and 100425..100474 under the same hand-in flag. A row in the
+        // second range protects the whole bell from the fallback classification.
+        rows = HashSet::from([100_450]);
+        assert!(!vanilla_only_bells(&rows)
+            .iter()
+            .any(|&(flag, _)| flag == 11_109_717));
+    }
+
+    #[test]
+    fn vanilla_stock_notice_is_ascii_and_explains_the_seed_boundary() {
+        let t = vanilla_stock_toast("Kale's Bell Bearing");
+        assert!(t.is_ascii());
+        assert!(t.contains("stock is vanilla"));
+        assert!(t.contains("merchant region is not in this seed"));
     }
 }
