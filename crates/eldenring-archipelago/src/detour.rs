@@ -578,6 +578,31 @@ unsafe extern "C" fn add_item_detour(
     itembuf: *mut c_void,
     r9: u64,
 ) -> u64 {
+    // This callback outlives individual world resources. In particular, the param repository
+    // singleton remains reachable for a few teardown frames after its holders have been emptied.
+    // `param_guard` makes that known case fallible; this boundary catch also guarantees that a
+    // poisoned diagnostic mutex or a future Rust panic cannot unwind into Elden Ring. Passing the
+    // pickup through is the least destructive fallback: crashing loses the session, while a rare
+    // unsuppressed item can at worst duplicate one vanilla/placeholding delivery.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        add_item_detour_inner(inventory, entry, itembuf, r9)
+    })) {
+        Ok(ret) => ret,
+        Err(_) => {
+            log::error!(
+                "add-item: Rust panic contained at detour boundary; passing the game's item through"
+            );
+            call_original(inventory, entry, itembuf, r9)
+        }
+    }
+}
+
+fn add_item_detour_inner(
+    inventory: *mut c_void,
+    entry: *mut c_void,
+    itembuf: *mut c_void,
+    r9: u64,
+) -> u64 {
     LAST_INVENTORY.store(inventory as usize, Ordering::Relaxed);
     LAST_INVENTORY_EPOCH.store(WORLD_EPOCH.load(Ordering::Relaxed), Ordering::Relaxed);
     REAL_PICKUP_SEEN.store(true, Ordering::Relaxed);

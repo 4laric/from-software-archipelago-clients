@@ -39,6 +39,7 @@ mod no_equip_load;
 mod no_fall_damage;
 mod no_weapon_reqs;
 mod notif_ticker;
+mod param_guard;
 mod params;
 mod physick_probe;
 mod reconcile_io;

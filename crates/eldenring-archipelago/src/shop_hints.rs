@@ -168,12 +168,17 @@ pub fn on_shop_open(begin: i32, end: i32) {
         log::warn!("shop-hints: param repository not up at shop open -- nothing hinted");
         return;
     };
+    if !crate::param_guard::is_available::<ShopLineupParam>(repo, "shop-open ESD callback") {
+        return;
+    }
     // Walk the OPENED RANGE, not the whole table: the range is the shelf, it is bounded by
     // `normalize_range`, and a full-table scan inside the game's dispatch frame is work we would be
     // doing every time a merchant is greeted.
     let mut rows: Vec<ShopRow> = Vec::new();
     for id in lo..=hi {
-        if let Some(row) = repo.get::<ShopLineupParam>(id) {
+        if let Some(row) =
+            crate::param_guard::get::<ShopLineupParam>(repo, id, "shop-open ESD callback")
+        {
             rows.push(ShopRow {
                 id,
                 stock_flag: row.event_flag_for_stock(),
