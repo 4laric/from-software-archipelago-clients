@@ -1019,12 +1019,19 @@ mod replay {
             // THE PREDICATE UNDER TEST, mirroring `reconcile_io::inventory_has_goods`: bag lists
             // UNION the great-rune equip slot UNION the storage box. Drop either out-of-bag term
             // (that is what `PossessionReads` is for) and the matching acceptance test below reds.
-            self.inner.has_good(g)
+            self.inner
+                .goods
+                .iter()
+                .any(|&row| crate::great_runes::possession_row_satisfies(g, row))
                 || (self.reads.equip_slot
                     && self
                         .equipped_great_rune
-                        .is_some_and(|row| crate::great_runes::equipped_row_satisfies(g, row)))
-                || (self.reads.storage && self.stored_goods.contains(&g))
+                        .is_some_and(|row| crate::great_runes::possession_row_satisfies(g, row)))
+                || (self.reads.storage
+                    && self
+                        .stored_goods
+                        .iter()
+                        .any(|&row| crate::great_runes::possession_row_satisfies(g, row)))
         }
         fn grant_good(&mut self, g: GoodsId, comp: &[FlagId]) -> bool {
             self.inner.grant_good(g, comp)
@@ -1038,15 +1045,19 @@ mod replay {
     /// `keyitems::acquire_flags`): boss-drop goods row 8150 plus restored flag 193. The flag makes
     /// the AP-received row usable and disarms the Divine-Tower award; there is no second goods grant.
     fn morgott_rune_inputs() -> DesiredInputs {
+        great_rune_inputs("Morgott's Great Rune", 8150, 193)
+    }
+
+    fn great_rune_inputs(name: &str, goods: GoodsId, restored_flag: FlagId) -> DesiredInputs {
         DesiredInputs {
             seed: SEED.into(),
             save: SaveIdentity("slot0".into()),
             received: vec![ReceivedItem {
                 index: 0,
-                name: "Morgott's Great Rune".into(),
+                name: name.into(),
                 semantics: ItemSemantics::KeyItem {
-                    goods: 8150,
-                    obtained_flags: vec![193],
+                    goods,
+                    obtained_flags: vec![restored_flag],
                 },
             }],
             slot_data: SlotData::default(),
@@ -1140,6 +1151,41 @@ mod replay {
                     "PRE-FIX: the backstop parks a rune the player is holding -- a bound, not a fix"
                 );
             }
+        }
+    }
+
+    /// Regression for client#313: a native shop sold Mohg's boss-drop row, AP suppressed the echo,
+    /// and the game exposed the restored row instead. The receive stream still names row 8152, so
+    /// exact-only bag/storage reads parked and retried the rune after every load.
+    #[test]
+    fn a_restored_great_rune_row_in_bag_or_storage_satisfies_the_received_row() {
+        const MOHG_RECEIVED: GoodsId = 8152;
+        const MOHG_RESTORED_ROW: GoodsId = 195;
+        const MOHG_RESTORED_FLAG: FlagId = 195;
+
+        for restored_in_storage in [false, true] {
+            let mut g = PossessionGame::new(PossessionReads {
+                equip_slot: true,
+                storage: true,
+            });
+            if restored_in_storage {
+                g.stored_goods.insert(MOHG_RESTORED_ROW);
+            } else {
+                g.inner.goods.insert(MOHG_RESTORED_ROW);
+            }
+            g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
+            let mut r = Reconciler::new(great_rune_inputs(
+                "Mohg's Great Rune",
+                MOHG_RECEIVED,
+                MOHG_RESTORED_FLAG,
+            ));
+
+            let out = r.tick(&mut g, TickBudget::default());
+
+            assert!(g.has_good(MOHG_RECEIVED));
+            assert!(g.inner.unique_grant_calls.is_empty());
+            assert!(r.stalled_goods().is_empty());
+            assert!(out.converged && out.applied.is_empty());
         }
     }
     /// The Rold Medallion exactly as the live mapper builds it (`core.rs` -> `KeyItem` via
