@@ -167,6 +167,12 @@ fn main() -> Result<()> {
             && let Some(client) = connection.client()
         {
             let seed_config = config.clone().apply_slot_data(client.slot_data())?;
+            match seed_config.verify_suppression_install()? {
+                Some(digest) => {
+                    eprintln!("Verified installed vanilla-suppression binder SHA-256 {digest}.")
+                }
+                None => eprintln!("Seed does not claim installed vanilla-award suppression."),
+            }
             let unsuppressed = seed_config
                 .locations
                 .iter()

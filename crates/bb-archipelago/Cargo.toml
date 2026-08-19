@@ -15,4 +15,5 @@ anyhow.workspace = true
 archipelago_rs.workspace = true
 json.workspace = true
 serde.workspace = true
+sha2.workspace = true
 windows.workspace = true
