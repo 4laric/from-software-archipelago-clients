@@ -1,0 +1,18 @@
+[package]
+name = "bb-archipelago"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "bb-ap-client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+archipelago_rs.workspace = true
+json.workspace = true
+serde.workspace = true
+windows.workspace = true
