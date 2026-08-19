@@ -22,11 +22,9 @@
 //!
 //! # Design constraints, and where each one comes from
 //!
-//! * **ON by default**, silenced with `ER_BOSSFIGHT_PROBE=0` or
-//!   `"probes": {"boss_fight": false}` -- the same shape as `ER_SCALING_SAMPLE`. See [`enabled`]
-//!   for why this reversed after shipping off-by-default: a measurement that can only be taken
-//!   during someone else's playtest, and that has already cost three triage cycles, must not be
-//!   able to no-op silently.
+//! * **OFF by default**, enabled with `ER_BOSSFIGHT_PROBE=1` or
+//!   `"probes": {"boss_fight": true}`. The probe has collected the evidence it was built for;
+//!   keeping it opt-in avoids adding a continuous fight trace to every player's log.
 //!
 //! * **Read-only.** No param writes, no game state, no flags. That is what exempts it from the
 //!   `in_world`-edge re-arm rule (`test_gf_client_resets_are_called`): there is nothing a map load
@@ -67,34 +65,19 @@ use er_logic::boss_fight_sample::{
 use er_logic::scaling::partition_carried_speffects;
 use fromsoftware_shared::FromStatic;
 
-/// **ON by default.** `ER_BOSSFIGHT_PROBE=0` or `"probes": {"boss_fight": false}` silences it.
+/// **OFF by default.** `ER_BOSSFIGHT_PROBE=1` or `"probes": {"boss_fight": true}` enables it.
 ///
-/// 🛑 THIS SHIPPED OFF BY DEFAULT AND THAT WAS WRONG. #553 says "probe-gated and OFF by default",
-/// and the argument for following it was that `shared::probes` reads `apconfig.json`, which sits
-/// beside the DLL, so the launcher problem `ER_SCALING_SAMPLE` defaults ON to dodge does not apply.
-///
-/// The record disagrees. On 2026-08-08 a session ran with `probes: none active` and the trap
-/// measurement simply did not happen -- a whole playtest round spent on a configuration nobody
-/// noticed was inert. `ER_SCALING_SAMPLE`'s own doc names the failure exactly: *"A probe that
-/// silently no-ops because a variable did not make that journey is worse than no probe: it looks
-/// like a clean result."*
-///
-/// ⭐ AND THE ASYMMETRY IS NOT CLOSE. This measurement can only be taken DURING a fight, in a
-/// playtest we do not run, on a machine we do not have; a missed session cannot be retaken, and the
-/// question it answers ("2 bosses in one fight wildly different") has already cost three separate
-/// triage cycles. The cost of being on is bounded and small: ~2 Hz, only while a healthbar is up,
-/// capped at [`er_logic::boss_fight_sample::MAX_SAMPLES_PER_FIGHT`] -- a 90-second fight is about
-/// 180 lines in a log that is already appended across sessions.
+/// The outcome instrument has collected the evidence requested by #553. It remains available for
+/// targeted diagnostics, but ordinary sessions should not pay for or retain a ~2 Hz boss-fight HP
+/// trace.
 fn enabled() -> bool {
-    shared::probes::enabled_by_default("ER_BOSSFIGHT_PROBE", "boss_fight")
+    shared::probes::enabled("ER_BOSSFIGHT_PROBE", "boss_fight")
 }
 
 /// Say which way the switch is set, once, on the first tick that reaches it.
 ///
-/// 🛑 A DEFAULT-ON PROBE CANNOT RIDE `probes::log_active`. That line lists probes it resolved as ON
-/// through [`shared::probes::enabled`] -- the default-OFF rule -- so it would report this one as off
-/// in exactly the case where it is on, which is worse than saying nothing. `ER_SCALING_SAMPLE` is
-/// absent from that list for the same reason. Saying it here keeps the answer in the log.
+/// This module-specific line states both the cadence and the opt-in switch. The aggregate
+/// `probes::log_active` line also names the probe when enabled.
 fn announce_once(on: bool) {
     static SAID: AtomicBool = AtomicBool::new(false);
     if SAID.swap(true, Ordering::Relaxed) {
@@ -102,12 +85,14 @@ fn announce_once(on: bool) {
     }
     if on {
         log::info!(
-            "boss-fight probe: ON (default). Samples player and boss HP ~2 Hz while a boss \
-             healthbar is up. Set ER_BOSSFIGHT_PROBE=0, or \"probes\": {{\"boss_fight\": false}} \
-             in apconfig.json, to silence it"
+            "boss-fight probe: ON (opt-in). Samples player and boss HP ~2 Hz while a boss \
+             healthbar is up"
         );
     } else {
-        log::info!("boss-fight probe: SILENCED by ER_BOSSFIGHT_PROBE=0 / probes.boss_fight=false");
+        log::info!(
+            "boss-fight probe: OFF (default). Set ER_BOSSFIGHT_PROBE=1 or \
+             probes.boss_fight=true to enable it"
+        );
     }
 }
 
