@@ -16,7 +16,7 @@ The first bridge contract supports received-item grants:
   a terminal success state and an absent command file.
 
 The current bridge contract is `BBGRANT1` with harness
-`bb-native-grant-v3`. Both tokens must appear in the harness state before the
+`bb-native-grant-v4`. Both tokens must appear in the harness state before the
 client publishes a command. A terminal harness failure blocks that AP item with
 a bounded diagnostic while location polling and the server connection continue.
 
@@ -25,19 +25,22 @@ The local rows are only a migration/test fallback. On connect, the apworld's
 `runtime_locations` and `runtime_items` slot-data tables replace them. Malformed
 present tables fail closed rather than mixing two seed contracts.
 
-The crate also contains pure policy for auto-equip and auto-upgrade. Equipment
+The crate also wires pure policy for auto-equip and auto-upgrade into the
+ordered receive loop behind mockable backend operations. Equipment
 slots are selected from AP receive-stream ordinals rather than the live loadout,
 so reconnect replay converges. Right- and left-hand weapons rotate over their
 two slots, Caryll Runes rotate over three slots after the Rune Workshop Tool has
 appeared in the feed, attire uses its fixed body slot, and Oath Runes use their
-dedicated slot. Upgrade targeting is raise-only and clamped to +10. Runtime
-inventory-instance and equipment writes remain Bloodborne-specific follow-up
-work.
+dedicated slot. Upgrade targeting is raise-only and clamped to +10. A durable
+pending plan records the selected level, target slot, and completed stages
+before the receive watermark advances, so a restart between grant and equip
+does not re-grant. The live backend still refuses weapon and equipment writes
+until their v0.18 memory contracts are validated.
 
 ## Standalone client
 
 `bb-ap-client` connects as game `Bloodborne`, requests a full item sync, polls
-configured location flags, sends new location checks, and grants received goods
+configured location flags when its safety context is valid, and grants received goods
 strictly by AP index. A seed-and-slot keyed JSON ledger is saved after each
 verified grant, so reconnects and process reloads skip acknowledged indices.
 
@@ -50,7 +53,11 @@ are placeholders to replace with IDs emitted by the APWorld. The test location
 binds the statically confirmed Pebble acquisition flag `52100000`. On Windows,
 live mode discovers shadPS4, reads the launch-specific eboot base from
 `shad_log`, verifies the Bloodborne 01.09 setter signature, and resolves flags
-through the manager's group tree. Run the client as administrator when shadPS4
+through the manager's group tree. The diagnostic reader is live, but automatic
+`LocationChecks` are fail-closed because the live backend cannot yet prove a
+loaded-save identity or a stable gameplay state. Mock mode supplies both,
+requires the configured identity, and debounces true reads before reporting.
+Run the client as administrator when shadPS4
 is elevated. `--mock` applies `mock_set_flags` and exercises the complete
 network, check, ordered-grant, acknowledgement, and persistence loop without
 game-memory access.

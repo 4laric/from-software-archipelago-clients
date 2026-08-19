@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::RUNTIME_BUILD;
+use crate::feed::{AttireSlot, EquipClass, FeedEffect};
 
 pub const TEST_PEBBLE_EVENT_FLAG: u32 = 52_100_000;
 
@@ -22,10 +23,54 @@ pub struct GoodsBinding {
     pub normalized_item_id: u32,
     #[serde(default = "one")]
     pub quantity: u32,
+    /// `Some(level)` marks an upgradeable weapon and records the level carried
+    /// by the received item. `None` keeps existing category-4 goods behavior.
+    #[serde(default)]
+    pub reinforcement_level: Option<u8>,
+    #[serde(default)]
+    pub feed_effect: FeedEffectBinding,
 }
 
 const fn one() -> u32 {
     1
+}
+
+const fn default_location_check_debounce() -> u8 {
+    3
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedEffectBinding {
+    RightHandWeapon,
+    LeftHandWeapon,
+    AttireHead,
+    AttireChest,
+    AttireHands,
+    AttireLegs,
+    CaryllRune,
+    OathRune,
+    RuneWorkshopTool,
+    #[default]
+    NotEquippable,
+}
+
+impl FeedEffectBinding {
+    pub fn effect(self) -> FeedEffect {
+        let class = match self {
+            Self::RightHandWeapon => EquipClass::RightHandWeapon,
+            Self::LeftHandWeapon => EquipClass::LeftHandWeapon,
+            Self::AttireHead => EquipClass::Attire(AttireSlot::Head),
+            Self::AttireChest => EquipClass::Attire(AttireSlot::Chest),
+            Self::AttireHands => EquipClass::Attire(AttireSlot::Hands),
+            Self::AttireLegs => EquipClass::Attire(AttireSlot::Legs),
+            Self::CaryllRune => EquipClass::CaryllRune,
+            Self::OathRune => EquipClass::OathRune,
+            Self::RuneWorkshopTool => return FeedEffect::RuneWorkshopTool,
+            Self::NotEquippable => EquipClass::NotEquippable,
+        };
+        FeedEffect::Item(class)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -38,6 +83,16 @@ pub struct RuntimeConfig {
     pub locations: Vec<LocationBinding>,
     #[serde(default)]
     pub items: HashMap<i64, GoodsBinding>,
+    #[serde(default)]
+    pub auto_upgrade: bool,
+    #[serde(default)]
+    pub auto_equip: bool,
+    /// Live location checks remain disarmed until the backend can prove that
+    /// it is reading the save the player explicitly bound to this config.
+    #[serde(default)]
+    pub expected_save_identity: Option<String>,
+    #[serde(default = "default_location_check_debounce")]
+    pub location_check_debounce: u8,
     #[serde(default)]
     pub mock_set_flags: Vec<u32>,
 }
@@ -100,6 +155,20 @@ impl RuntimeConfig {
             }
             self.items = items;
         }
+        if let Some(value) = slot_data.get("auto_upgrade") {
+            self.auto_upgrade = value
+                .as_bool()
+                .context("slot_data.auto_upgrade must be a boolean")?;
+        }
+        if let Some(value) = slot_data.get("auto_equip") {
+            self.auto_equip = value
+                .as_bool()
+                .context("slot_data.auto_equip must be a boolean")?;
+        }
+        anyhow::ensure!(
+            self.location_check_debounce >= 2,
+            "location_check_debounce must be at least 2"
+        );
         Ok(self)
     }
 }
@@ -126,6 +195,10 @@ mod tests {
                 vanilla_award_suppressed: false,
             }],
             items: HashMap::new(),
+            auto_upgrade: false,
+            auto_equip: false,
+            expected_save_identity: Some("mock-save".into()),
+            location_check_debounce: 3,
             mock_set_flags: vec![],
         }
     }
@@ -138,14 +211,28 @@ mod tests {
                     "12259363": {"event_flag": 52410800, "vanilla_award_suppressed": false}
                 },
                 "runtime_items": {
-                    "12255488": {"normalized_item_id": 1073742824, "quantity": 1}
-                }
+                    "12255488": {
+                        "normalized_item_id": 1073742824,
+                        "quantity": 1,
+                        "reinforcement_level": 0,
+                        "feed_effect": "right_hand_weapon"
+                    }
+                },
+                "auto_upgrade": true,
+                "auto_equip": true
             }))
             .unwrap();
         assert_eq!(config.locations.len(), 1);
         assert_eq!(config.locations[0].ap_location_id, 12_259_363);
         assert_eq!(config.locations[0].event_flag, 52_410_800);
         assert_eq!(config.items[&12_255_488].normalized_item_id, 0x4000_03E8);
+        assert_eq!(config.items[&12_255_488].reinforcement_level, Some(0));
+        assert_eq!(
+            config.items[&12_255_488].feed_effect,
+            FeedEffectBinding::RightHandWeapon
+        );
+        assert!(config.auto_upgrade);
+        assert!(config.auto_equip);
     }
 
     #[test]
@@ -173,5 +260,26 @@ mod tests {
             .apply_slot_data(&json!({"runtime_build": "bb-0.1.0-r2"}))
             .unwrap_err();
         assert!(format!("{error:#}").contains("seed runtime build mismatch"));
+    }
+
+    #[test]
+    fn slot_options_replace_local_policy_toggles() {
+        let config = local()
+            .apply_slot_data(&json!({"auto_upgrade": true, "auto_equip": true}))
+            .unwrap();
+        assert!(config.auto_upgrade);
+        assert!(config.auto_equip);
+    }
+
+    #[test]
+    fn feed_metadata_maps_to_the_pure_policy_types() {
+        assert_eq!(
+            FeedEffectBinding::AttireChest.effect(),
+            FeedEffect::Item(EquipClass::Attire(AttireSlot::Chest))
+        );
+        assert_eq!(
+            FeedEffectBinding::RuneWorkshopTool.effect(),
+            FeedEffect::RuneWorkshopTool
+        );
     }
 }

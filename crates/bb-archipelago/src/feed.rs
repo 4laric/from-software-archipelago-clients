@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum AttireSlot {
     Head,
     Chest,
@@ -15,7 +17,7 @@ pub enum AttireSlot {
     Legs,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum EquipClass {
     RightHandWeapon,
     LeftHandWeapon,
@@ -25,19 +27,19 @@ pub enum EquipClass {
     NotEquippable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FeedEffect {
     Item(EquipClass),
     RuneWorkshopTool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ReceivedFact {
     pub index: u64,
     pub effect: FeedEffect,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum EquipTarget {
     RightHand(usize),
     LeftHand(usize),
@@ -46,7 +48,7 @@ pub enum EquipTarget {
     OathRune,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EquipDecision {
     pub received_index: u64,
     pub ordinal: u64,

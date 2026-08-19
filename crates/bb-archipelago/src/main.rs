@@ -8,20 +8,28 @@ use anyhow::{Context, Result, bail};
 use archipelago_rs::{Connection, ConnectionOptions, Event, ItemHandling};
 use bb_archipelago::RUNTIME_BUILD;
 use bb_archipelago::backend::{
-    BloodborneBackend, FileBackend, GoodsGrant, GrantProgress, MockBackend,
+    BloodborneBackend, EquipRequest, FileBackend, ItemGrant, LocationContext, MockBackend,
+    OperationProgress,
 };
 use bb_archipelago::bridge::FileBridge;
-use bb_archipelago::client_loop::{ClientLoop, IncomingItem};
+use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::LiveEventFlags;
 use bb_archipelago::ledger::ReceiveLedger;
 
 enum Backend {
     Live(FileBackend),
-    Mock(MockBackend),
+    Mock(Box<MockBackend>),
 }
 
 impl BloodborneBackend for Backend {
+    fn location_context(&mut self) -> Result<Option<LocationContext>> {
+        match self {
+            Self::Live(backend) => backend.location_context(),
+            Self::Mock(backend) => backend.location_context(),
+        }
+    }
+
     fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>> {
         match self {
             Self::Live(backend) => backend.read_event_flag(event_flag),
@@ -29,10 +37,24 @@ impl BloodborneBackend for Backend {
         }
     }
 
-    fn grant_category4_goods(&mut self, grant: &GoodsGrant) -> Result<GrantProgress> {
+    fn target_weapon_level(&mut self) -> Result<Option<u8>> {
         match self {
-            Self::Live(backend) => backend.grant_category4_goods(grant),
-            Self::Mock(backend) => backend.grant_category4_goods(grant),
+            Self::Live(backend) => backend.target_weapon_level(),
+            Self::Mock(backend) => backend.target_weapon_level(),
+        }
+    }
+
+    fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
+        match self {
+            Self::Live(backend) => backend.grant_item(grant),
+            Self::Mock(backend) => backend.grant_item(grant),
+        }
+    }
+
+    fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress> {
+        match self {
+            Self::Live(backend) => backend.equip_item(request),
+            Self::Mock(backend) => backend.equip_item(request),
         }
     }
 }
@@ -82,7 +104,7 @@ fn main() -> Result<()> {
         backend
             .set_flags
             .extend(config.mock_set_flags.iter().copied());
-        Backend::Mock(backend)
+        Backend::Mock(Box::new(backend))
     } else {
         let shad_log = config
             .shad_log
@@ -150,11 +172,17 @@ fn main() -> Result<()> {
                 .iter()
                 .filter(|location| !location.vanilla_award_suppressed)
                 .count();
+            let location_mode = if args.mock {
+                "mock checks use bound save identity plus debounce"
+            } else {
+                "live check sends remain disarmed until gameplay/save identity is validated"
+            };
             eprintln!(
-                "Armed {} location flag(s) and {} item binding(s) from the seed contract; {} location(s) still award vanilla contents.",
+                "Loaded {} location flag(s) and {} item binding(s) from the seed contract; {} location(s) still award vanilla contents; {}.",
                 seed_config.locations.len(),
                 seed_config.items.len(),
-                unsuppressed
+                unsuppressed,
+                location_mode
             );
             runtime = Some(ClientLoop::new(
                 backend.take().context("backend was already initialized")?,
@@ -202,13 +230,21 @@ fn main() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             match runtime.poll_items(&received) {
-                Ok(true) => {
+                Ok(ItemPollResult::Completed(item)) => {
                     if last_item_error.take().is_some() {
                         eprintln!("Bloodborne item delivery recovered.");
                     }
-                    eprintln!("Acknowledged one received item.");
+                    eprintln!(
+                        "Acknowledged AP item index {} id {} | received level {:?} | target {:?} | delivered {:?} | equip {:?}.",
+                        item.index,
+                        item.ap_item_id,
+                        item.received_level,
+                        item.target_level,
+                        item.delivered_level,
+                        item.equip_target
+                    );
                 }
-                Ok(false) => {}
+                Ok(ItemPollResult::Idle | ItemPollResult::Pending) => {}
                 Err(error) => {
                     let message = format!("{error:#}");
                     let report = last_item_error.as_ref().is_none_or(|(previous, when)| {
