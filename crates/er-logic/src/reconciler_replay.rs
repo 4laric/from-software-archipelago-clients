@@ -990,7 +990,7 @@ mod replay {
         /// The player action at the Roundtable grace, 2026-07-29 ~01:36:10: equip the rune.
         fn equip_great_rune(&mut self, goods: GoodsId) {
             self.inner.drop_good(goods);
-            self.equipped_great_rune = crate::great_runes::restored_row_for_received(goods);
+            self.equipped_great_rune = crate::great_runes::canonical_restored_row(goods);
             self.inner.refuse_unique_adds = true;
         }
 
@@ -1042,11 +1042,12 @@ mod replay {
         }
     }
 
-    /// Morgott's Great Rune exactly as the live mapper builds it (`core.rs` -> `KeyItem` via
-    /// `keyitems::acquire_flags`): boss-drop goods row 8150 plus restored flag 193. The flag makes
-    /// the AP-received row usable and disarms the Divine-Tower award; there is no second goods grant.
+    /// Morgott's Great Rune exactly as the live mapper builds it (`core.rs` -> normalized item map
+    /// -> `KeyItem` via `keyitems::acquire_flags`): restored goods row 193 plus restored flag 193.
+    /// The seed still identifies the reward with boss-drop row 8150, but no delivery consumer sees
+    /// that unequippable row.
     fn morgott_rune_inputs() -> DesiredInputs {
-        great_rune_inputs("Morgott's Great Rune", 8150, 193)
+        great_rune_inputs("Morgott's Great Rune", 193, 193)
     }
 
     fn great_rune_inputs(name: &str, goods: GoodsId, restored_flag: FlagId) -> DesiredInputs {
@@ -1090,7 +1091,7 @@ mod replay {
     /// slot, the reconciler emits zero re-grants for an equipped rune.
     #[test]
     fn an_equipped_great_rune_reads_as_possessed_and_never_re_grants_replay() {
-        const MORGOTT: GoodsId = 8150;
+        const MORGOTT: GoodsId = 193;
         const TICKS_AFTER_EQUIP: usize = 400;
 
         for reads_equip_slot in [false, true] {
@@ -1155,38 +1156,40 @@ mod replay {
         }
     }
 
-    /// Regression for client#313: a native shop sold Mohg's boss-drop row, AP suppressed the echo,
-    /// and the game exposed the restored row instead. The receive stream still names row 8152, so
-    /// exact-only bag/storage reads parked and retried the rune after every load.
+    /// Regression for client#313 composed with #316: new deliveries desire Mohg's restored row,
+    /// while a legacy save (or native shop receipt from an older client) can still contain either
+    /// row. Both representations must suppress another grant in bag or storage.
     #[test]
-    fn a_restored_great_rune_row_in_bag_or_storage_satisfies_the_received_row() {
-        const MOHG_RECEIVED: GoodsId = 8152;
+    fn either_great_rune_row_in_bag_or_storage_satisfies_restored_delivery() {
+        const MOHG_BOSS_ROW: GoodsId = 8152;
         const MOHG_RESTORED_ROW: GoodsId = 195;
         const MOHG_RESTORED_FLAG: FlagId = 195;
 
-        for restored_in_storage in [false, true] {
-            let mut g = PossessionGame::new(PossessionReads {
-                equip_slot: true,
-                storage: true,
-            });
-            if restored_in_storage {
-                g.stored_goods.insert(MOHG_RESTORED_ROW);
-            } else {
-                g.inner.goods.insert(MOHG_RESTORED_ROW);
+        for observed in [MOHG_BOSS_ROW, MOHG_RESTORED_ROW] {
+            for in_storage in [false, true] {
+                let mut g = PossessionGame::new(PossessionReads {
+                    equip_slot: true,
+                    storage: true,
+                });
+                if in_storage {
+                    g.stored_goods.insert(observed);
+                } else {
+                    g.inner.goods.insert(observed);
+                }
+                g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
+                let mut r = Reconciler::new(great_rune_inputs(
+                    "Mohg's Great Rune",
+                    MOHG_RESTORED_ROW,
+                    MOHG_RESTORED_FLAG,
+                ));
+
+                let out = r.tick(&mut g, TickBudget::default());
+
+                assert!(g.has_good(MOHG_RESTORED_ROW));
+                assert!(g.inner.unique_grant_calls.is_empty());
+                assert!(r.stalled_goods().is_empty());
+                assert!(out.converged && out.applied.is_empty());
             }
-            g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
-            let mut r = Reconciler::new(great_rune_inputs(
-                "Mohg's Great Rune",
-                MOHG_RECEIVED,
-                MOHG_RESTORED_FLAG,
-            ));
-
-            let out = r.tick(&mut g, TickBudget::default());
-
-            assert!(g.has_good(MOHG_RECEIVED));
-            assert!(g.inner.unique_grant_calls.is_empty());
-            assert!(r.stalled_goods().is_empty());
-            assert!(out.converged && out.applied.is_empty());
         }
     }
     /// The Rold Medallion exactly as the live mapper builds it (`core.rs` -> `KeyItem` via
