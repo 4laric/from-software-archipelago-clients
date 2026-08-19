@@ -1137,13 +1137,10 @@ impl shared::Core for Core {
                 // resolve row -> eventFlag_forStock via shipped shoplineup_flags.json and fold into
                 // loc_flags so purchases self-detect through the same poller. Disjoint union.
                 let loc_flags = {
-                    fn shop_table_path() -> std::path::PathBuf {
-                        shared::utils::mod_directory()
-                            .map(|d| d.join("shoplineup_flags.json"))
-                            .unwrap_or_else(|_| std::path::PathBuf::from("shoplineup_flags.json"))
-                    }
                     let mut loc_flags = loc_flags;
-                    let shop_table = crate::key_resolver::load_shoplineup_flags(&shop_table_path());
+                    let shop_table_path = static_table_path("shoplineup_flags.json");
+                    let shop_table =
+                        crate::key_resolver::load_shoplineup_flags(&shop_table_path);
                     // Tolerance requires telemetry: an absent/empty table degrades every foreign
                     // shop check to "never fires", which is indistinguishable from "no shops in
                     // this seed" without this line. Announce armed/inert once, but only on the
@@ -1176,7 +1173,7 @@ impl shared::Core for Core {
                     } else if foreign_keys {
                         log::warn!(
                             "shoplineup_flags: INERT -- no usable table at {} (foreign shop checks will never fire)",
-                            shop_table_path().display()
+                            shop_table_path.display()
                         );
                     }
                     loc_flags
@@ -5530,22 +5527,56 @@ fn save_file_path(seed: &str, name: &str) -> Option<PathBuf> {
     Some(dir.join(format!("ap_save_{}_{}.json", safe(seed), safe(name))))
 }
 
-/// Parse slot_data `bossLockItems` (mode A/B, SPEC-boss-lock-tracker) into [`BossDef`] rows.
-/// `{ "<boss_flag>": {name, region, boss_ap_id, gate?, display_key?} }`. Tolerant: skips any
-/// entry whose key is not a u32 or whose value is not an object. Absent/empty => no boss tracking.
-/// Load the shipped `check_lots_table.json` from the DLL/mod directory (same place as
+/// Choose a shipped static table. The release contract puts both tables beside the AP DLL.
+/// Under me3, `mod_directory()` instead names the global me3 host installation, which can be a
+/// completely different directory from the profile's `[[natives]]` path. Prefer the DLL directory;
+/// retain the old loader-root lookup only as a compatibility fallback for existing dev installs.
+fn static_table_path(name: &str) -> std::path::PathBuf {
+    let dll_dir = shared::utils::current_module_directory().ok();
+    let loader_dir = shared::utils::mod_directory().ok();
+    let (path, source) = er_logic::sidecar::select_sidecar_path(
+        name,
+        dll_dir.as_deref(),
+        loader_dir,
+        std::path::Path::is_file,
+    );
+    match source {
+        er_logic::sidecar::SidecarSource::ClientDll => {
+            log::info!(
+                "static table: {name} <- {} (beside AP client DLL)",
+                path.display()
+            );
+        }
+        er_logic::sidecar::SidecarSource::LoaderFallback => {
+            log::warn!(
+                "static table: {name} <- {} (legacy me3/mod-directory fallback; not found beside AP client DLL)",
+                path.display()
+            );
+        }
+        er_logic::sidecar::SidecarSource::Missing => {
+            log::warn!(
+                "static table: {name} absent; looked first at {}",
+                path.display()
+            );
+        }
+    }
+    path
+}
+
+/// Load the shipped `check_lots_table.json` from the DLL directory (same place as
 /// `shoplineup_flags.json`). Absent/garbage -> empty, and suppression simply stays off, which is
 /// exactly today's behaviour -- never a panic mid-connect.
 fn load_static_lots() -> er_logic::static_lots::StaticLots {
-    let path = shared::utils::mod_directory()
-        .map(|d| d.join("check_lots_table.json"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("check_lots_table.json"));
+    let path = static_table_path("check_lots_table.json");
     match std::fs::read_to_string(&path) {
         Ok(t) => er_logic::static_lots::parse(&t),
         Err(_) => er_logic::static_lots::StaticLots::default(),
     }
 }
 
+/// Parse slot_data `bossLockItems` (mode A/B, SPEC-boss-lock-tracker) into [`BossDef`] rows.
+/// `{ "<boss_flag>": {name, region, boss_ap_id, gate?, display_key?} }`. Tolerant: skips any
+/// entry whose key is not a u32 or whose value is not an object. Absent/empty => no boss tracking.
 fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDef> {
     let mut out = Vec::new();
     let Some(obj) = v.and_then(|v| v.as_object()) else {
