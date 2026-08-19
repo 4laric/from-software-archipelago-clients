@@ -4,7 +4,8 @@
   "locations": [
     {
       "ap_location_id": 0,
-      "event_flag": 52100000
+      "event_flag": 52100000,
+      "vanilla_award_suppressed": false
     }
   ],
   "items": {

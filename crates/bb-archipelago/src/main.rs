@@ -134,9 +134,21 @@ fn main() -> Result<()> {
         if runtime.is_none()
             && let Some(client) = connection.client()
         {
+            let seed_config = config.clone().apply_slot_data(client.slot_data())?;
+            let unsuppressed = seed_config
+                .locations
+                .iter()
+                .filter(|location| !location.vanilla_award_suppressed)
+                .count();
+            eprintln!(
+                "Armed {} location flag(s) and {} item binding(s) from the seed contract; {} location(s) still award vanilla contents.",
+                seed_config.locations.len(),
+                seed_config.items.len(),
+                unsuppressed
+            );
             runtime = Some(ClientLoop::new(
                 backend.take().context("backend was already initialized")?,
-                config.clone(),
+                seed_config,
                 ledger.take().context("ledger was already initialized")?,
                 args.ledger.clone(),
                 client.seed_name(),

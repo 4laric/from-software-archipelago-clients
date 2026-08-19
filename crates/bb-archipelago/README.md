@@ -16,7 +16,9 @@ The first bridge contract supports received-item grants:
   a terminal success state and an absent command file.
 
 Item-ID mappings and location checks are deliberately not hard-coded here yet.
-They belong in Bloodborne slot data once the world package defines them.
+The local rows are only a migration/test fallback. On connect, the apworld's
+`runtime_locations` and `runtime_items` slot-data tables replace them. Malformed
+present tables fail closed rather than mixing two seed contracts.
 
 The crate also contains pure policy for auto-equip and auto-upgrade. Equipment
 slots are selected from AP receive-stream ordinals rather than the live loadout,

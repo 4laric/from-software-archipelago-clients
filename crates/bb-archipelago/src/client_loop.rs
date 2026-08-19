@@ -133,6 +133,7 @@ mod tests {
                 locations: vec![LocationBinding {
                     ap_location_id: 1000,
                     event_flag: TEST_PEBBLE_EVENT_FLAG,
+                    vanilla_award_suppressed: false,
                 }],
                 items: HashMap::from([(
                     2000,

@@ -11,6 +11,8 @@ pub const TEST_PEBBLE_EVENT_FLAG: u32 = 52_100_000;
 pub struct LocationBinding {
     pub ap_location_id: i64,
     pub event_flag: u32,
+    #[serde(default)]
+    pub vanilla_award_suppressed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -48,7 +50,108 @@ impl RuntimeConfig {
         self.locations.push(LocationBinding {
             ap_location_id,
             event_flag: TEST_PEBBLE_EVENT_FLAG,
+            vanilla_award_suppressed: false,
         });
         self
+    }
+
+    /// Replace seed-owned bindings with the tables emitted by the apworld.
+    ///
+    /// An older seed that has neither key keeps the local config as a migration
+    /// fallback. Once either key is present, malformed rows are fatal: silently
+    /// mixing two seed contracts is worse than refusing to arm.
+    pub fn apply_slot_data(mut self, slot_data: &json::Value) -> Result<Self> {
+        if let Some(value) = slot_data.get("runtime_locations") {
+            let rows: HashMap<String, SlotLocationBinding> =
+                json::from_value(value.clone()).context("parsing slot_data.runtime_locations")?;
+            let mut locations = Vec::with_capacity(rows.len());
+            for (raw_id, row) in rows {
+                locations.push(LocationBinding {
+                    ap_location_id: raw_id
+                        .parse()
+                        .with_context(|| format!("invalid AP location id {raw_id:?}"))?,
+                    event_flag: row.event_flag,
+                    vanilla_award_suppressed: row.vanilla_award_suppressed,
+                });
+            }
+            locations.sort_by_key(|row| row.ap_location_id);
+            self.locations = locations;
+        }
+        if let Some(value) = slot_data.get("runtime_items") {
+            let rows: HashMap<String, GoodsBinding> =
+                json::from_value(value.clone()).context("parsing slot_data.runtime_items")?;
+            let mut items = HashMap::with_capacity(rows.len());
+            for (raw_id, row) in rows {
+                items.insert(
+                    raw_id
+                        .parse()
+                        .with_context(|| format!("invalid AP item id {raw_id:?}"))?,
+                    row,
+                );
+            }
+            self.items = items;
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct SlotLocationBinding {
+    event_flag: u32,
+    #[serde(default)]
+    vanilla_award_suppressed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use json::json;
+
+    fn local() -> RuntimeConfig {
+        RuntimeConfig {
+            bridge_root: PathBuf::from("bridge"),
+            shad_log: None,
+            locations: vec![LocationBinding {
+                ap_location_id: 1,
+                event_flag: 2,
+                vanilla_award_suppressed: false,
+            }],
+            items: HashMap::new(),
+            mock_set_flags: vec![],
+        }
+    }
+
+    #[test]
+    fn slot_data_replaces_seed_owned_tables() {
+        let config = local()
+            .apply_slot_data(&json!({
+                "runtime_locations": {
+                    "12259363": {"event_flag": 52410800, "vanilla_award_suppressed": false}
+                },
+                "runtime_items": {
+                    "12255488": {"normalized_item_id": 1073742824, "quantity": 1}
+                }
+            }))
+            .unwrap();
+        assert_eq!(config.locations.len(), 1);
+        assert_eq!(config.locations[0].ap_location_id, 12_259_363);
+        assert_eq!(config.locations[0].event_flag, 52_410_800);
+        assert_eq!(config.items[&12_255_488].normalized_item_id, 0x4000_03E8);
+    }
+
+    #[test]
+    fn older_slot_data_keeps_the_local_migration_config() {
+        assert_eq!(
+            local(),
+            local().apply_slot_data(&json!({"version": 1})).unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_present_tables_fail_closed() {
+        let error = local()
+            .apply_slot_data(&json!({"runtime_locations": {"not-an-id": {"event_flag": 1}}}))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid AP location id"));
     }
 }
