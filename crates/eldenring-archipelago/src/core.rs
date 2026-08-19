@@ -4729,7 +4729,7 @@ impl Core {
         // bobler's sessions -- and it was invisible until it fired. Assembled here, outside the
         // closure, from tables that are all pure memory: `sweep_flag_state` was read on the tick.
         let checked_set: HashSet<u64> = checked.iter().copied().collect();
-        let mut sweep_rows: Vec<(String, String)> = Vec::new();
+        let mut sweep_rows: Vec<er_logic::sweep_view::RegionRows> = Vec::new();
         let mut sweep_header = String::new();
         // #171: groups whose region is known LOCKED are withheld and only counted -- see
         // `sweep_view`'s module note for why concealing the region NAME was not enough. There is
@@ -4970,8 +4970,14 @@ impl Core {
         if !sweep_rows.is_empty() || sweep_withheld > 0 {
             measured.push((sweep_header.clone(), false));
         }
-        for (label, state) in &sweep_rows {
-            measured.push((format!("  {label} -- {state}"), false));
+        for region in &sweep_rows {
+            measured.push((
+                format!("  {}", er_logic::sweep_view::region_header(region)),
+                false,
+            ));
+            for (label, state) in &region.rows {
+                measured.push((format!("    {label} -- {state}"), false));
+            }
         }
         if sweep_withheld > 0 {
             measured.push((
@@ -5093,10 +5099,19 @@ impl Core {
                         imgui::TreeNodeFlags::empty(),
                     )
                 {
-                    for (label, state) in &sweep_rows {
-                        ui.text(format!("  {label}"));
-                        ui.same_line();
-                        ui.text_disabled(format!("-- {state}"));
+                    for region in &sweep_rows {
+                        let region_id = region.region.as_deref().unwrap_or("unplaced");
+                        let header = er_logic::sweep_view::region_header(region);
+                        if ui.collapsing_header(
+                            format!("  {header}###trk-sweep-region-{region_id}"),
+                            imgui::TreeNodeFlags::empty(),
+                        ) {
+                            for (label, state) in &region.rows {
+                                ui.text(format!("    {label}"));
+                                ui.same_line();
+                                ui.text_disabled(format!("-- {state}"));
+                            }
+                        }
                     }
                     if sweep_withheld > 0 {
                         ui.text_disabled(format!(
