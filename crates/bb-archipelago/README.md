@@ -51,6 +51,12 @@ verified stage, so reconnects and process reloads skip acknowledged indices.
 Location reads and item mutation share the same gameplay/save gate; losing or
 changing that context cannot start or acknowledge a delivery.
 
+The seed also names one `goal_location`. After that location survives the same
+debounced flag read as every other check, the client sends Archipelago goal
+status before acknowledging the location. On reconnect it re-sends goal status
+when the server already records that location, so a dropped connection cannot
+strand a completed Father Gascoigne run.
+
 ```text
 bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock]
 ```

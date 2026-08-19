@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use archipelago_rs::{Connection, ConnectionOptions, Event, ItemHandling};
+use archipelago_rs::{ClientStatus, Connection, ConnectionOptions, Event, ItemHandling};
 use bb_archipelago::RUNTIME_BUILD;
 use bb_archipelago::backend::{
     BloodborneBackend, EquipRequest, FileBackend, ItemGrant, LocationContext, MockBackend,
@@ -143,6 +143,8 @@ fn main() -> Result<()> {
     let mut connection =
         Connection::<json::Value>::new(args.server, args.slot.clone(), Some("Bloodborne"), options);
     let mut runtime = None;
+    let mut goal_location = None;
+    let mut goal_reported = false;
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut last_item_error: Option<(String, Instant)> = None;
 
@@ -190,6 +192,7 @@ fn main() -> Result<()> {
                 unsuppressed,
                 location_mode
             );
+            goal_location = seed_config.goal_location;
             runtime = Some(ClientLoop::new(
                 backend.take().context("backend was already initialized")?,
                 seed_config,
@@ -205,12 +208,27 @@ fn main() -> Result<()> {
                 .checked_locations()
                 .map(|location| location.id())
                 .collect::<HashSet<_>>();
+            if !goal_reported && goal_location.is_some_and(|goal| checked.contains(&goal)) {
+                client.set_status(ClientStatus::Goal)?;
+                goal_reported = true;
+                eprintln!("Re-sent Bloodborne goal status from the server-checked goal location.");
+            }
             match runtime.poll_locations(&checked) {
                 Ok(newly_checked) => {
                     if last_location_error.take().is_some() {
                         eprintln!("Bloodborne location polling recovered.");
                     }
                     if !newly_checked.is_empty() {
+                        if !goal_reported
+                            && goal_location.is_some_and(|goal| newly_checked.contains(&goal))
+                        {
+                            // Send the irreversible goal status before retiring
+                            // the check locally. If this send fails, the next
+                            // poll sees the flag as new and retries both.
+                            client.set_status(ClientStatus::Goal)?;
+                            goal_reported = true;
+                            eprintln!("Father Gascoigne defeated; sent Bloodborne goal status.");
+                        }
                         client.mark_checked(newly_checked.iter().copied())?;
                         eprintln!("Sent location checks: {newly_checked:?}");
                     }

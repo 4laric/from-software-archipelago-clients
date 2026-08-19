@@ -202,6 +202,9 @@ pub struct RuntimeConfig {
     pub location_check_debounce: u8,
     #[serde(default)]
     pub mock_set_flags: Vec<u32>,
+    /// AP location whose debounced check completes this bounded world.
+    #[serde(default)]
+    pub goal_location: Option<i64>,
 }
 
 impl RuntimeConfig {
@@ -277,6 +280,21 @@ impl RuntimeConfig {
         if let Some(value) = slot_data.get("suppression") {
             self.suppression =
                 json::from_value(value.clone()).context("parsing slot_data.suppression")?;
+        }
+        if let Some(value) = slot_data.get("goal_location") {
+            self.goal_location = Some(
+                value
+                    .as_i64()
+                    .context("slot_data.goal_location must be a signed 64-bit integer")?,
+            );
+        }
+        if let Some(goal) = self.goal_location {
+            anyhow::ensure!(
+                self.locations
+                    .iter()
+                    .any(|location| location.ap_location_id == goal),
+                "goal location {goal} is absent from runtime_locations"
+            );
         }
         let claims_suppression = self
             .locations
@@ -436,6 +454,7 @@ mod tests {
             suppression: SuppressionRequirement::default(),
             location_check_debounce: 3,
             mock_set_flags: vec![],
+            goal_location: None,
         }
     }
 
@@ -458,7 +477,8 @@ mod tests {
                     }
                 },
                 "auto_upgrade": true,
-                "auto_equip": true
+                "auto_equip": true,
+                "goal_location": 12259363
             }))
             .unwrap();
         assert_eq!(config.locations.len(), 1);
@@ -473,6 +493,7 @@ mod tests {
         );
         assert!(config.auto_upgrade);
         assert!(config.auto_equip);
+        assert_eq!(config.goal_location, Some(12_259_363));
     }
 
     #[test]
@@ -553,6 +574,19 @@ mod tests {
             .unwrap();
         assert!(config.auto_upgrade);
         assert!(config.auto_equip);
+    }
+
+    #[test]
+    fn goal_location_must_be_one_of_the_seed_runtime_locations() {
+        let error = local()
+            .apply_slot_data(&json!({
+                "runtime_locations": {
+                    "10": {"event_flag": 12411800}
+                },
+                "goal_location": 11
+            }))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("absent from runtime_locations"));
     }
 
     #[test]

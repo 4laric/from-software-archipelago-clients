@@ -417,6 +417,7 @@ mod tests {
             suppression: crate::config::SuppressionRequirement::default(),
             location_check_debounce: 3,
             mock_set_flags: vec![],
+            goal_location: None,
         }
     }
 
