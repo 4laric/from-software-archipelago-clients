@@ -906,6 +906,26 @@ pub fn owns_ledger() -> bool {
     owner_state().owns(Class::Ledger)
 }
 
+/// May the possession-based start-item backfill run without racing this reconciler?
+///
+/// If the ledger class has no live owner, the backfill is the delivery path and must remain
+/// available (dry-run / `RECONCILE_APPLY=none` / never-armed fallback). If the reconciler owns the
+/// ledger, require its contiguous negative-band frontier to be fully drained. A poisoned or missing
+/// driver while ownership claims otherwise closes the gate: uncertainty must never create a second
+/// granter.
+pub fn start_item_backfill_ready() -> bool {
+    if !owns_ledger() {
+        return true;
+    }
+    let Some(driver) = DRIVER.get() else {
+        return false;
+    };
+    driver
+        .lock()
+        .map(|d| d.reconciler.start_item_ledger_drained())
+        .unwrap_or(false)
+}
+
 /// I3 (2026-08-01): is a `Driver` actually built for this session?
 ///
 /// `init` only builds one at the first STABLE IN-WORLD tick, which never arrives if the inventory

@@ -964,6 +964,19 @@ impl Reconciler {
         self.applied_watermark
     }
 
+    /// Has the contiguous ledger frontier advanced past every slot-data start item?
+    ///
+    /// This is intentionally narrower than [`TickOutcome::converged`]. Received-stream work and
+    /// self-healing flags may still be pending, but a possession-based start-item backfill only
+    /// needs proof that the reconciler can no longer grant another copy from the negative band.
+    /// The frontier is the proof: start items occupy the contiguous indices
+    /// `START_ITEM_INDEX_BASE..START_ITEM_INDEX_BASE + len` and the watermark only advances past a
+    /// ledger entry after that entry's grant was accepted.
+    pub fn start_item_ledger_drained(&self) -> bool {
+        self.applied_watermark
+            >= START_ITEM_INDEX_BASE + self.inputs.slot_data.start_items.len() as ItemIndex
+    }
+
     /// A read-only view of the current desired state (for the dry-run / logging path).
     pub fn desired(&self) -> &DesiredState {
         &self.desired
@@ -3056,6 +3069,59 @@ mod tests {
         r2.run_to_fixpoint(&mut g, TickBudget::default(), 32);
         assert_eq!(g.ledger_count(cracked_pot), 10, "no re-grant after reload");
         assert_eq!(g.ledger_count(ritual_pot), 4, "no re-grant after reload");
+    }
+
+    #[test]
+    fn backfill_waits_until_the_start_item_frontier_is_drained() {
+        // Cokeman5, 2026-08-16: the live budget granted two of forty start entries, reported
+        // `converged=false`, and the possession backfill ran in the SAME second. It then granted
+        // the still-absent copies while this ledger continued through the negative band, producing
+        // duplicate pots and false capped-delivery telemetry. The exact number is load-bearing:
+        // this test must cross more than one live-sized burst.
+        let pot = crate::progressive::GOODS_FULLID | 9500;
+        let start_items = (0..40)
+            .map(|_| StartItem {
+                full_id: pot,
+                qty: 1,
+            })
+            .collect();
+        let mut r = Reconciler::new(bulk_inputs(SlotData {
+            start_items,
+            ..Default::default()
+        }));
+        let mut g = MockGame::stable();
+        assert!(!r.start_item_ledger_drained());
+
+        let first = r.tick(
+            &mut g,
+            TickBudget {
+                goods: 2,
+                flags: 32,
+                min_grant_interval_ms: 0,
+            },
+        );
+        assert!(
+            !first.converged,
+            "thirty-eight start entries are still owed"
+        );
+        assert_eq!(g.ledger_count(pot), 2);
+        assert!(
+            !r.start_item_ledger_drained(),
+            "backfill must stay closed while the reconciler can still grant start items"
+        );
+
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 64);
+        assert_eq!(g.ledger_count(pot), 40);
+        assert!(
+            r.start_item_ledger_drained(),
+            "backfill may possession-scan only after the negative frontier is behind us"
+        );
+    }
+
+    #[test]
+    fn empty_start_item_band_is_already_drained() {
+        let r = Reconciler::new(bulk_inputs(SlotData::default()));
+        assert!(r.start_item_ledger_drained());
     }
 
     #[test]

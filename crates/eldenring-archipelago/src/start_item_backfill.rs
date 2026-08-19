@@ -5,10 +5,11 @@
 //! converged without placing it, and the old boolean-gated drain had already stood down. Logic +
 //! flask-family handling live in `er_logic::start_backfill`.
 //!
-//! Runs ONCE per client launch (in-memory latch), in-world, AFTER an in-world SETTLE (so the
-//! reconciler/drain have taken their pass first -> on a healthy save it finds nothing missing and
-//! never double-grants), snapshotting the inventory fresh each tick. Inventory verification is the
-//! anti-double-grant guarantee: anything a primary path placed reads as present and is skipped.
+//! Runs ONCE per client launch (in-memory latch), in-world, after BOTH an inventory settle and the
+//! active reconciler's contiguous watermark has advanced past the whole negative start-item band.
+//! The second gate is load-bearing: a settle proves the bag is safe to read; it does not prove the
+//! paced reconciler has finished writing start items. Once the frontier is drained, a healthy save
+//! finds nothing missing and never double-grants. The inventory is snapshotted fresh each tick.
 //!
 //! # DURABLE-ONLY INVARIANT (2026-08-01)
 //!
@@ -63,20 +64,19 @@ fn full_id_of(cat: ItemCategory, row: u32) -> u32 {
     nibble | (row & 0x0FFF_FFFF)
 }
 
-/// Per-tick until done. `settled` = the world has loaded + the primary start-item paths have had
-/// time to run (in-world settle, same signal `apply_start_flags`/the drain use). Once settled and
-/// in-world with the inventory populated, grant any `startItems` NOT in the bag.
+/// Per-tick until done. `ready` means the world/inventory has settled and either no reconciler owns
+/// the ledger or its start-item frontier is fully drained. Once ready and in-world with the
+/// inventory populated, grant any `startItems` NOT in the bag.
 ///
 /// GATE FIX (2026-07-18): originally gated on the persisted `start_items_granted` boolean, on the
 /// theory that a stale-TRUE boolean made the old drain skip. WRONG for the live case: start-item
 /// GOODS (the flask) are now owned by the RECONCILER (`apply=flags,goods,ledger`), the old drain
 /// stands down, so `start_items_granted` never latches TRUE -> the backfill never ran. Now gated on
-/// an in-world SETTLE instead, so it runs as a true backstop AFTER the reconciler converges,
-/// independent of whichever primary path (drain or reconciler) dropped the item. Inventory
-/// verification is what prevents a double-grant: anything the reconciler did place reads as present
-/// and is skipped; only genuinely-absent startItems are granted.
-pub fn tick(settled: bool) {
-    if DONE.load(Ordering::Relaxed) || !settled || !crate::flags::in_world() {
+/// a compound readiness gate instead. Inventory verification prevents a re-grant after the
+/// reconciler's frontier is drained; the frontier gate prevents both writers from acting while the
+/// reconciler still owns pending start-item entries.
+pub fn tick(ready: bool) {
+    if DONE.load(Ordering::Relaxed) || !ready || !crate::flags::in_world() {
         return;
     }
     let items = match START_ITEMS.lock() {
