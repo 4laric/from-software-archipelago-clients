@@ -43,7 +43,7 @@ static VANILLA_ONLY: Mutex<Vec<(u32, &'static str)>> = Mutex::new(Vec::new());
 
 /// Set flags already observed this connection. The first in-world pass is a silent baseline, so
 /// reconnecting never re-announces every bell handed in earlier in the save.
-static OBSERVED_HAND_INS: Mutex<HashSet<u32>> = Mutex::new(HashSet::new());
+static OBSERVED_HAND_INS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 static HAND_INS_PRIMED: AtomicBool = AtomicBool::new(false);
 
 /// Called at slot_data parse. Also clears any notice left over from a previous connection.
@@ -82,7 +82,7 @@ pub fn configure_shop_rows(rows: impl IntoIterator<Item = u32>) {
         active.len()
     );
     *VANILLA_ONLY.lock().unwrap() = vanilla;
-    OBSERVED_HAND_INS.lock().unwrap().clear();
+    *OBSERVED_HAND_INS.lock().unwrap() = Some(HashSet::new());
     HAND_INS_PRIMED.store(false, Ordering::Relaxed);
 }
 
@@ -129,7 +129,7 @@ pub fn on_shop_open(begin: i32, end: i32) {
                 // The poller below owns vanilla hand-ins. Mark this feature-path write observed so
                 // its next pass cannot announce the same flag a second time.
                 if let Ok(mut observed) = OBSERVED_HAND_INS.lock() {
-                    observed.insert(flag);
+                    observed.get_or_insert_with(HashSet::new).insert(flag);
                 }
                 if let Ok(mut q) = PENDING.lock() {
                     q.push(notice_for(flag, name));
@@ -164,9 +164,10 @@ pub fn poll_hand_ins() {
         .into_iter()
         .filter(|&(flag, _)| crate::flags::get_event_flag(flag))
         .collect();
-    let Ok(mut observed) = OBSERVED_HAND_INS.lock() else {
+    let Ok(mut observed_guard) = OBSERVED_HAND_INS.lock() else {
         return;
     };
+    let observed = observed_guard.get_or_insert_with(HashSet::new);
     if !HAND_INS_PRIMED.swap(true, Ordering::Relaxed) {
         observed.extend(set_now.iter().map(|&(flag, _)| flag));
         log::info!(
@@ -180,7 +181,7 @@ pub fn poll_hand_ins() {
         .into_iter()
         .filter_map(|(flag, name)| observed.insert(flag).then(|| vanilla_stock_toast(name)))
         .collect();
-    drop(observed);
+    drop(observed_guard);
     if let Ok(mut pending) = PENDING.lock() {
         pending.extend(notices);
     }
@@ -209,7 +210,7 @@ pub fn reset() {
         bells.clear();
     }
     if let Ok(mut observed) = OBSERVED_HAND_INS.lock() {
-        observed.clear();
+        *observed = None;
     }
     HAND_INS_PRIMED.store(false, Ordering::Relaxed);
 }
