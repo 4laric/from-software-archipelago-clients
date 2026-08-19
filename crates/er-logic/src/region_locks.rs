@@ -47,7 +47,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
     BakedRegionLock {
         region: "Ashen Capital",
         lock_item: "Ashen Capital Lock",
-        open_flag: Some(71122),
+        open_flag: Some(71123),
         play_regions: &[11050, 19000],
     },
     BakedRegionLock {
