@@ -50,18 +50,14 @@ pub fn canonical_restored_row(row: i32) -> Option<i32> {
 /// Whether an observed goods row satisfies the desired Great Rune row.
 ///
 /// Great Runes have two equivalent row families: boss-drop (`8148..=8153`) and restored/usable
-/// (`191..=196`). Delivery now targets the restored row, but legacy saves may contain either one;
-/// equivalence therefore has to work in both directions wherever possession is observed -- bag,
-/// storage, or the Great Rune equip slot. Non-rune goods retain exact-row identity.
+/// (`191..=196`). A restored row satisfies an older boss-row desire (client #313), but the inverse
+/// is deliberately false: delivery now desires the restored row, so a legacy save containing only
+/// the unequippable boss row receives one safe restored-row backfill (client #316). Once the
+/// restored row is present, bag/storage/equip-slot readback suppresses every later grant.
+/// Non-rune goods retain exact-row identity.
 pub fn possession_row_satisfies(desired_row: i32, observed_row: i32) -> bool {
     desired_row == observed_row
-        || matches!(
-            (
-                canonical_restored_row(desired_row),
-                canonical_restored_row(observed_row)
-            ),
-            (Some(desired), Some(observed)) if desired == observed
-        )
+        || restored_row_for_received(desired_row).is_some_and(|restored| restored == observed_row)
 }
 
 /// Backwards-compatible spelling for the first consumer of the row equivalence.
@@ -125,7 +121,10 @@ mod tests {
             let restored = RESTORED_FIRST + offset;
             assert!(possession_row_satisfies(boss_drop, boss_drop));
             assert!(possession_row_satisfies(boss_drop, restored));
-            assert!(possession_row_satisfies(restored, boss_drop));
+            assert!(
+                !possession_row_satisfies(restored, boss_drop),
+                "a boss-only legacy save still needs the equippable restored-row backfill"
+            );
             assert!(possession_row_satisfies(restored, restored));
         }
 

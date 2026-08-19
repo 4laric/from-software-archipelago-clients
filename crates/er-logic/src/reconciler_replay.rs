@@ -1156,40 +1156,73 @@ mod replay {
         }
     }
 
-    /// Regression for client#313 composed with #316: new deliveries desire Mohg's restored row,
-    /// while a legacy save (or native shop receipt from an older client) can still contain either
-    /// row. Both representations must suppress another grant in bag or storage.
+    /// Regression for client#313 composed with #316: a save already carrying the restored row must
+    /// suppress another grant whether that row is in the bag or storage.
     #[test]
-    fn either_great_rune_row_in_bag_or_storage_satisfies_restored_delivery() {
+    fn restored_great_rune_in_bag_or_storage_satisfies_restored_delivery() {
+        const MOHG_RESTORED_ROW: GoodsId = 195;
+        const MOHG_RESTORED_FLAG: FlagId = 195;
+
+        for in_storage in [false, true] {
+            let mut g = PossessionGame::new(PossessionReads {
+                equip_slot: true,
+                storage: true,
+            });
+            if in_storage {
+                g.stored_goods.insert(MOHG_RESTORED_ROW);
+            } else {
+                g.inner.goods.insert(MOHG_RESTORED_ROW);
+            }
+            g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
+            let mut r = Reconciler::new(great_rune_inputs(
+                "Mohg's Great Rune",
+                MOHG_RESTORED_ROW,
+                MOHG_RESTORED_FLAG,
+            ));
+
+            let out = r.tick(&mut g, TickBudget::default());
+
+            assert!(g.has_good(MOHG_RESTORED_ROW));
+            assert!(g.inner.unique_grant_calls.is_empty());
+            assert!(r.stalled_goods().is_empty());
+            assert!(out.converged && out.applied.is_empty());
+        }
+    }
+
+    /// The live #316 upgrade case: an older client left only Mohg's boss-drop row in the save.
+    /// Native removal is not safely bound, so the migration keeps that row and grants the restored
+    /// row once. A second tick/reconnect sees the restored row and emits nothing else.
+    #[test]
+    fn a_legacy_boss_row_gets_one_restored_row_backfill() {
         const MOHG_BOSS_ROW: GoodsId = 8152;
         const MOHG_RESTORED_ROW: GoodsId = 195;
         const MOHG_RESTORED_FLAG: FlagId = 195;
 
-        for observed in [MOHG_BOSS_ROW, MOHG_RESTORED_ROW] {
-            for in_storage in [false, true] {
-                let mut g = PossessionGame::new(PossessionReads {
-                    equip_slot: true,
-                    storage: true,
-                });
-                if in_storage {
-                    g.stored_goods.insert(observed);
-                } else {
-                    g.inner.goods.insert(observed);
-                }
-                g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
-                let mut r = Reconciler::new(great_rune_inputs(
-                    "Mohg's Great Rune",
-                    MOHG_RESTORED_ROW,
-                    MOHG_RESTORED_FLAG,
-                ));
-
-                let out = r.tick(&mut g, TickBudget::default());
-
-                assert!(g.has_good(MOHG_RESTORED_ROW));
-                assert!(g.inner.unique_grant_calls.is_empty());
-                assert!(r.stalled_goods().is_empty());
-                assert!(out.converged && out.applied.is_empty());
+        for boss_in_storage in [false, true] {
+            let mut g = PossessionGame::new(PossessionReads {
+                equip_slot: true,
+                storage: true,
+            });
+            if boss_in_storage {
+                g.stored_goods.insert(MOHG_BOSS_ROW);
+            } else {
+                g.inner.goods.insert(MOHG_BOSS_ROW);
             }
+            g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
+            let mut r = Reconciler::new(great_rune_inputs(
+                "Mohg's Great Rune",
+                MOHG_RESTORED_ROW,
+                MOHG_RESTORED_FLAG,
+            ));
+
+            r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+            assert_eq!(g.inner.unique_grant_calls, vec![MOHG_RESTORED_ROW]);
+            assert!(g.inner.goods.contains(&MOHG_RESTORED_ROW));
+
+            let before = g.inner.unique_grant_calls.len();
+            let out = r.tick(&mut g, TickBudget::default());
+            assert_eq!(g.inner.unique_grant_calls.len(), before);
+            assert!(out.converged && out.applied.is_empty());
         }
     }
     /// The Rold Medallion exactly as the live mapper builds it (`core.rs` -> `KeyItem` via
