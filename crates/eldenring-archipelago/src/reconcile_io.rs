@@ -257,7 +257,10 @@ fn inventory_has_goods(goods: i32) -> bool {
             continue;
         }
         // Current compare (assumes param_id() is the category-stripped row):
-        if entry.item_id.param_id() as i32 == want_row {
+        if er_logic::great_runes::possession_row_satisfies(
+            want_row,
+            entry.item_id.param_id() as i32,
+        ) {
             return true;
         }
         // NOTE(windows-verify) PROPOSED ALTERNATIVE if suspicion #1 above proves true (param_id()
@@ -270,7 +273,7 @@ fn inventory_has_goods(goods: i32) -> bool {
     //
     // 1. the great-rune equip slot, where an equipped rune may be the only place the row is visible.
     if great_rune_slot_row(pgd.equipment.equip_item_data.great_rune.gaitem_handle)
-        .is_some_and(|row| er_logic::great_runes::equipped_row_satisfies(want_row, row))
+        .is_some_and(|row| er_logic::great_runes::possession_row_satisfies(want_row, row))
     {
         return true;
     }
@@ -342,9 +345,10 @@ fn inventory_has_protector(full_id: i32) -> bool {
 ///
 /// THE SHARED STORAGE WALK. [`inventory_forensics`] had this walk first, as a diagnostic; as of
 /// 2026-08-02 [`inventory_has_goods`] needs the same answer, so both go through here rather than
-/// keeping two copies that could drift apart. Same masked compare as the bag walk above
-/// (`category() == Goods` plus `param_id() == want_row`) — keep it that way: a storage hit and a
-/// bag hit must mean the same thing or the forensics line stops describing the predicate.
+/// keeping two copies that could drift apart. Same row-identity predicate as the bag walk above:
+/// exact for ordinary goods, or boss-drop/restored aliases for Great Runes. Keep it that way: a
+/// storage hit and a bag hit must mean the same thing or the forensics line stops describing the
+/// predicate.
 ///
 /// `normal_entries()` + `key_entries()` only. The multiplay key list is the online pots/tears
 /// mirror of the HELD key list; it has no meaning for a storage box, and walking a third head on a
@@ -363,7 +367,10 @@ fn storage_has_goods_row(pgd: &eldenring::cs::PlayerGameData, want_row: i32) -> 
             .non_empty()
             .any(|e| {
                 e.item_id.category() == ItemCategory::Goods
-                    && e.item_id.param_id() as i32 == want_row
+                    && er_logic::great_runes::possession_row_satisfies(
+                        want_row,
+                        e.item_id.param_id() as i32,
+                    )
             }),
     )
 }

@@ -12,9 +12,19 @@ pub fn restored_row_for_received(received_row: i32) -> Option<i32> {
         .then_some(RESTORED_FIRST + offset)
 }
 
-/// Whether a goods row observed in the Great Rune equip slot satisfies a received-row readback.
+/// Whether an observed goods row satisfies the boss-drop row carried by the AP receive stream.
+///
+/// Great Runes have two equivalent row families: the boss-drop rows AP sends (8148-8153) and the
+/// restored/usable rows the game may expose after acquisition (191-196). The equivalence applies
+/// wherever possession is observed -- bag, storage, or the Great Rune equip slot. Non-rune goods
+/// retain exact-row identity.
+pub fn possession_row_satisfies(received_row: i32, observed_row: i32) -> bool {
+    observed_row == received_row || restored_row_for_received(received_row) == Some(observed_row)
+}
+
+/// Backwards-compatible spelling for the first consumer of the row equivalence.
 pub fn equipped_row_satisfies(received_row: i32, equipped_row: i32) -> bool {
-    equipped_row == received_row || restored_row_for_received(received_row) == Some(equipped_row)
+    possession_row_satisfies(received_row, equipped_row)
 }
 
 #[cfg(test)]
@@ -40,5 +50,18 @@ mod tests {
         }
         assert!(!equipped_row_satisfies(8150, 194));
         assert!(equipped_row_satisfies(8150, 193));
+    }
+
+    #[test]
+    fn restored_rows_satisfy_possession_in_every_store() {
+        for offset in 0..GREAT_RUNE_COUNT {
+            let received = BOSS_DROP_FIRST + offset;
+            let restored = RESTORED_FIRST + offset;
+            assert!(possession_row_satisfies(received, received));
+            assert!(possession_row_satisfies(received, restored));
+        }
+
+        assert!(possession_row_satisfies(9000, 9000));
+        assert!(!possession_row_satisfies(9000, 191));
     }
 }
