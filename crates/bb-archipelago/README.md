@@ -20,10 +20,13 @@ The current bridge contract is `BBGRANT1` with harness
 client publishes a command. A terminal harness failure blocks that AP item with
 a bounded diagnostic while location polling and the server connection continue.
 
-Item-ID mappings and location checks are deliberately not hard-coded here yet.
-The local rows are only a migration/test fallback. On connect, the apworld's
-`runtime_locations` and `runtime_items` slot-data tables replace them. Malformed
-present tables fail closed rather than mixing two seed contracts.
+Item-ID mappings and location checks are deliberately not hard-coded here. The
+local rows are only a migration/test fallback. On connect, the apworld's
+`runtime_locations` and `runtime_items` slot-data tables replace them. Every
+runtime item carries an explicit raw descriptor, normalized id, item category,
+descriptor-evidence class, quantity and receive policy. The client never derives
+an equipment descriptor from an ItemLot id. Malformed or unvalidated present
+tables fail closed before a bridge command can be published.
 
 The crate also wires pure policy for auto-equip and auto-upgrade into the
 ordered receive loop behind mockable backend operations. Equipment
@@ -34,8 +37,9 @@ appeared in the feed, attire uses its fixed body slot, and Oath Runes use their
 dedicated slot. Upgrade targeting is raise-only and clamped to +10. A durable
 pending plan records the selected level, target slot, and completed stages
 before the receive watermark advances, so a restart between grant and equip
-does not re-grant. The live backend still refuses weapon and equipment writes
-until their v0.18 memory contracts are validated.
+does not re-grant. The live bridge accepts allowlisted category-0 equipment such
+as the clean-save Saw Spear canary. Live auto-equip and reinforcement mutation
+remain disarmed until their separate v0.18 memory contracts are validated.
 
 ## Standalone client
 

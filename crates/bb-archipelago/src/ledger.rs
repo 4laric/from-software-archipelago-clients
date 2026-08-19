@@ -27,7 +27,11 @@ pub struct SlotLedger {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AcknowledgedItem {
     pub ap_item_id: i64,
+    #[serde(default)]
+    pub raw_descriptor: u32,
     pub normalized_item_id: u32,
+    #[serde(default = "legacy_goods_category")]
+    pub item_category: u8,
     pub quantity: u32,
     #[serde(default)]
     pub reinforcement_level: Option<u8>,
@@ -39,7 +43,11 @@ pub struct AcknowledgedItem {
 pub struct PendingItem {
     pub index: u64,
     pub ap_item_id: i64,
+    #[serde(default)]
+    pub raw_descriptor: u32,
     pub normalized_item_id: u32,
+    #[serde(default = "legacy_goods_category")]
+    pub item_category: u8,
     pub quantity: u32,
     #[serde(default)]
     pub upgrade_target_level: Option<u8>,
@@ -49,6 +57,10 @@ pub struct PendingItem {
     pub grant_complete: bool,
     #[serde(default)]
     pub equip_complete: bool,
+}
+
+const fn legacy_goods_category() -> u8 {
+    4
 }
 
 impl ReceiveLedger {
@@ -220,7 +232,9 @@ mod tests {
                 0,
                 AcknowledgedItem {
                     ap_item_id: 1,
+                    raw_descriptor: 0xB000_04CE,
                     normalized_item_id: 0x4000_04CE,
+                    item_category: 4,
                     quantity: 1,
                     reinforcement_level: None,
                     equip_target: None,
@@ -232,7 +246,9 @@ mod tests {
             .begin(PendingItem {
                 index: 0,
                 ap_item_id: 1,
+                raw_descriptor: 0xB000_04CE,
                 normalized_item_id: 0x4000_04CE,
+                item_category: 4,
                 quantity: 1,
                 reinforcement_level: None,
                 equip_target: None,
@@ -251,7 +267,9 @@ mod tests {
                 0,
                 AcknowledgedItem {
                     ap_item_id: 1,
+                    raw_descriptor: 0xB000_04CE,
                     normalized_item_id: 0x4000_04CE,
+                    item_category: 4,
                     quantity: 1,
                     reinforcement_level: None,
                     equip_target: None,
@@ -270,7 +288,9 @@ mod tests {
         let pending = PendingItem {
             index: 0,
             ap_item_id: 9,
+            raw_descriptor: 0x8010_0000,
             normalized_item_id: 0x1000,
+            item_category: 0,
             quantity: 1,
             reinforcement_level: Some(6),
             equip_target: Some(EquipTarget::RightHand(0)),

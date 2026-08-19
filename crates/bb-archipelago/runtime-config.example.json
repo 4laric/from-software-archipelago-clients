@@ -10,7 +10,10 @@
   ],
   "items": {
     "0": {
+      "raw_descriptor": 2952791246,
       "normalized_item_id": 1073743054,
+      "item_category": 4,
+      "descriptor_evidence": "goods_formula_observed",
       "quantity": 1,
       "reinforcement_level": null,
       "feed_effect": "not_equippable"

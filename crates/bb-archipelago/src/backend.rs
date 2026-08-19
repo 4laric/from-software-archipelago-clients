@@ -17,7 +17,9 @@ pub struct LocationContext {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemGrant {
+    pub raw_descriptor: u32,
     pub normalized_item_id: u32,
+    pub item_category: u8,
     pub quantity: u32,
     pub expected_before: u32,
     pub reinforcement_level: Option<u8>,
@@ -84,16 +86,28 @@ impl BloodborneBackend for FileBackend {
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
-        if grant.reinforcement_level.is_some() {
-            bail!(
-                "live weapon delivery is not armed; received item {} remains pending",
+        match grant.item_category {
+            4 => anyhow::ensure!(
+                grant.normalized_item_id & 0xF000_0000 == 0x4000_0000
+                    && grant.raw_descriptor & 0xF000_0000 == 0xB000_0000
+                    && (grant.normalized_item_id & 0x0FFF_FFFF)
+                        == (grant.raw_descriptor & 0x0FFF_FFFF),
+                "grant {} has an invalid category-4 raw/normalized descriptor pair",
                 grant.tag
-            );
+            ),
+            0 => anyhow::ensure!(
+                grant.normalized_item_id & 0xF000_0000 == 0
+                    && grant.raw_descriptor & 0xF000_0000 == 0x8000_0000
+                    && (grant.normalized_item_id & 0x0FFF_FFFF)
+                        == (grant.raw_descriptor & 0x0FFF_FFFF),
+                "grant {} has an invalid category-0 raw/normalized descriptor pair",
+                grant.tag
+            ),
+            category => bail!(
+                "grant {} uses unsupported Bloodborne item category {category}",
+                grant.tag
+            ),
         }
-        anyhow::ensure!(
-            grant.normalized_item_id & 0xF000_0000 == 0x4000_0000,
-            "live grant bridge currently supports category-4 goods only"
-        );
         let state = self.bridge.read_state()?;
         state.require_compatible()?;
         if state.concerns_tag(&grant.tag) {
@@ -118,10 +132,8 @@ impl BloodborneBackend for FileBackend {
             );
             return Ok(OperationProgress::Pending);
         }
-        // Observed category-4 goods use normalized 0x4....... and raw 0xB....... .
-        let raw_id = grant.normalized_item_id | 0x7000_0000;
         self.bridge.enqueue(&GrantCommand {
-            raw_id,
+            raw_id: grant.raw_descriptor,
             normalized_id: grant.normalized_item_id,
             quantity: grant.quantity,
             expected_before: None,
