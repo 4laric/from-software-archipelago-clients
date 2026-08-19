@@ -1188,12 +1188,20 @@ impl shared::Core for Core {
                     .map(|(l, g)| (l, g as i32))
                     .collect();
                 crate::scout_proof::configure_item_map(map.clone());
-                crate::shop_flags::configure(
+                let shop_row_flags: Vec<(u32, u32)> =
                     i64_to_u32_map(sd.get("shopRowFlags"))
                         .into_iter()
                         .map(|(r, f)| (r as u32, f))
-                        .collect(),
-                );
+                        .collect();
+                // #555: the same seed-accurate row set that arms AP shop checks also identifies
+                // bells whose entire Twin-Maiden menu remains vanilla. Keep this independent of
+                // merchant_bells_on_talk: a killed merchant's real bell follows the vanilla path.
+                if sd.get("shopRowFlags").is_some() {
+                    crate::merchant_bells::configure_shop_rows(
+                        shop_row_flags.iter().map(|&(row, _)| row),
+                    );
+                }
+                crate::shop_flags::configure(shop_row_flags);
                 crate::shop_flags::configure_check_flags(loc_flags.values().copied().collect());
 
                 // shopInfiniteStock: {"<row id>": [goodsId, equipType, price]} -- the per-seed reroll of
@@ -3841,6 +3849,7 @@ impl shared::Core for Core {
         // Every other notice in this function that a player is meant to keep already goes to both
         // (region unlocks, traps, boss keys); this one only ever toasted, which is why the feature
         // looked silent even when the flag write succeeded.
+        crate::merchant_bells::poll_hand_ins();
         while let Some(notice) = crate::merchant_bells::take_notice() {
             let now = self.toast_clock.elapsed().as_millis() as u64;
             self.log(ap::Print::message(notice.clone()));

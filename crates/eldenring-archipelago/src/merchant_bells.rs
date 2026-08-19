@@ -18,10 +18,13 @@
 //! So the decision leaves a string behind and `core`'s tick drains it -- the same take/put-back
 //! shape `shop_hints` uses for its hint batches.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use er_logic::merchant_bells::{Outcome, plan_hand_in, toast_text};
+use er_logic::merchant_bells::{
+    Outcome, plan_hand_in, toast_text, vanilla_only_bells, vanilla_stock_toast,
+};
 
 /// `options.merchant_bells_on_talk`. Off until slot_data says otherwise, so a seed that never
 /// declares the key -- including every foreign apworld -- behaves exactly as it does today.
@@ -33,6 +36,15 @@ static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// How many bells this session has handed in. Logged on reset so a playtest can say "I visited
 /// nine merchants and nine bells landed" without reading every line.
 static HANDED_IN: AtomicUsize = AtomicUsize::new(0);
+
+/// Hand-in flags whose complete shop blocks contain zero AP rows in this seed. Unlike ENABLED,
+/// this drives a fallback for vanilla hand-ins too, so it is configured for every greenfield seed.
+static VANILLA_ONLY: Mutex<Vec<(u32, &'static str)>> = Mutex::new(Vec::new());
+
+/// Set flags already observed this connection. The first in-world pass is a silent baseline, so
+/// reconnecting never re-announces every bell handed in earlier in the save.
+static OBSERVED_HAND_INS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+static HAND_INS_PRIMED: AtomicBool = AtomicBool::new(false);
 
 /// Called at slot_data parse. Also clears any notice left over from a previous connection.
 pub fn set_enabled(on: bool) {
@@ -55,6 +67,35 @@ pub fn set_enabled(on: bool) {
 /// `requiresClientFeatures` declaration, which is the only thing that would have caught #536.
 pub fn is_armed() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// Configure the active AP shop rows from this seed's `shopRowFlags` wire table.
+///
+/// A bell absent from all of those rows still opens its vanilla ShopLineupParam block when handed
+/// in. Polling its hand-in flag lets the client explain that unavoidable non-pool path (#555).
+pub fn configure_shop_rows(rows: impl IntoIterator<Item = u32>) {
+    let active: HashSet<u32> = rows.into_iter().collect();
+    let vanilla = vanilla_only_bells(&active);
+    log::info!(
+        "merchant bells: {} bell(s) have no AP stock in this seed ({} active shop row(s))",
+        vanilla.len(),
+        active.len()
+    );
+    *VANILLA_ONLY.lock().unwrap() = vanilla;
+    *OBSERVED_HAND_INS.lock().unwrap() = Some(HashSet::new());
+    HAND_INS_PRIMED.store(false, Ordering::Relaxed);
+}
+
+fn notice_for(flag: u32, name: &str) -> String {
+    if VANILLA_ONLY
+        .lock()
+        .map(|bells| bells.iter().any(|&(candidate, _)| candidate == flag))
+        .unwrap_or(false)
+    {
+        vanilla_stock_toast(name)
+    } else {
+        toast_text(name)
+    }
 }
 
 /// A merchant opened its buy menu over `ShopLineupParam` rows `[begin, end]`.
@@ -85,8 +126,13 @@ pub fn on_shop_open(begin: i32, end: i32) {
                     "merchant bells: {name} handed to the Twin Maiden Husks (flag {flag} set on \
                      shop {begin}..{end}); {n} this session"
                 );
+                // The poller below owns vanilla hand-ins. Mark this feature-path write observed so
+                // its next pass cannot announce the same flag a second time.
+                if let Ok(mut observed) = OBSERVED_HAND_INS.lock() {
+                    observed.get_or_insert_with(HashSet::new).insert(flag);
+                }
                 if let Ok(mut q) = PENDING.lock() {
-                    q.push(toast_text(name));
+                    q.push(notice_for(flag, name));
                 }
             } else {
                 log::warn!(
@@ -95,6 +141,51 @@ pub fn on_shop_open(begin: i32, end: i32) {
                 );
             }
         }
+    }
+}
+
+/// Detect vanilla Bell Bearing hand-ins and explain wholly vanilla stock.
+///
+/// Only bells already classified as having zero AP rows are read. The first pass silently records
+/// the save's existing flags; later clear->set edges enqueue one notice. This stays live even when
+/// `merchant_bells_on_talk` is off, because the player can kill a merchant and hand the item to the
+/// Twin Maidens through the base game's menu.
+pub fn poll_hand_ins() {
+    let bells = match VANILLA_ONLY.lock() {
+        Ok(bells) => bells.clone(),
+        Err(_) => return,
+    };
+    if bells.is_empty() {
+        HAND_INS_PRIMED.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    let set_now: Vec<(u32, &'static str)> = bells
+        .into_iter()
+        .filter(|&(flag, _)| crate::flags::get_event_flag(flag))
+        .collect();
+    let Ok(mut observed_guard) = OBSERVED_HAND_INS.lock() else {
+        return;
+    };
+    let observed = observed_guard.get_or_insert_with(HashSet::new);
+    if !HAND_INS_PRIMED.swap(true, Ordering::Relaxed) {
+        observed.extend(set_now.iter().map(|&(flag, _)| flag));
+        log::info!(
+            "merchant bells: vanilla-stock baseline primed with {} prior hand-in(s)",
+            set_now.len()
+        );
+        return;
+    }
+
+    let mut notices = Vec::new();
+    for (flag, name) in set_now {
+        if observed.insert(flag) {
+            notices.push(vanilla_stock_toast(name));
+        }
+    }
+    drop(observed_guard);
+    if let Ok(mut pending) = PENDING.lock() {
+        pending.extend(notices);
     }
 }
 
@@ -117,4 +208,11 @@ pub fn reset() {
     if let Ok(mut q) = PENDING.lock() {
         q.clear();
     }
+    if let Ok(mut bells) = VANILLA_ONLY.lock() {
+        bells.clear();
+    }
+    if let Ok(mut observed) = OBSERVED_HAND_INS.lock() {
+        *observed = None;
+    }
+    HAND_INS_PRIMED.store(false, Ordering::Relaxed);
 }
