@@ -33,6 +33,9 @@
 //!     via `GetModuleHandleExW(FROM_ADDRESS)`, and the module bases seen are listed so an
 //!     offset (RVA) stays comparable across ASLR'd sessions. A stack-overflow report skips the
 //!     walk (the handler itself runs on whatever stack is left) and keeps its path minimal.
+//!   * General-purpose registers come from that same fault `CONTEXT`. A fault address identifies
+//!     the bad access; register state preserves the pointer/index operands needed to identify the
+//!     object that led there (especially when an allocator detects corruption downstream).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -261,6 +264,78 @@ fn report(info: usize, phase: &str) {
     IN_HANDLER.store(false, Ordering::SeqCst);
 }
 
+/// General-purpose registers captured at the faulting instruction.
+///
+/// These are current-frame values, not necessarily the values a caller supplied at function
+/// entry (the Win64 argument registers are volatile). Keeping all of them is nevertheless
+/// load-bearing for allocator crashes: the faulting helper often preserves the pointer being
+/// classified in another register before reusing `rcx` for an index or page lookup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RegisterSnapshot {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+impl RegisterSnapshot {
+    fn from_context(ctx: &CONTEXT) -> Self {
+        Self {
+            rax: ctx.Rax,
+            rbx: ctx.Rbx,
+            rcx: ctx.Rcx,
+            rdx: ctx.Rdx,
+            rsi: ctx.Rsi,
+            rdi: ctx.Rdi,
+            rbp: ctx.Rbp,
+            r8: ctx.R8,
+            r9: ctx.R9,
+            r10: ctx.R10,
+            r11: ctx.R11,
+            r12: ctx.R12,
+            r13: ctx.R13,
+            r14: ctx.R14,
+            r15: ctx.R15,
+        }
+    }
+
+    fn render(self) -> String {
+        format!(
+            "registers at fault (current frame):\n  \
+             rax {:#018x}  rbx {:#018x}  rcx {:#018x}  rdx {:#018x}\n  \
+             rsi {:#018x}  rdi {:#018x}  rbp {:#018x}\n  \
+              r8 {:#018x}   r9 {:#018x}  r10 {:#018x}  r11 {:#018x}\n  \
+             r12 {:#018x}  r13 {:#018x}  r14 {:#018x}  r15 {:#018x}\n",
+            self.rax,
+            self.rbx,
+            self.rcx,
+            self.rdx,
+            self.rsi,
+            self.rdi,
+            self.rbp,
+            self.r8,
+            self.r9,
+            self.r10,
+            self.r11,
+            self.r12,
+            self.r13,
+            self.r14,
+            self.r15,
+        )
+    }
+}
+
 fn report_inner(info: usize, phase: &str) {
     let info = info as *const EXCEPTION_POINTERS;
     let mut code = 0u32;
@@ -271,6 +346,7 @@ fn report_inner(info: usize, phase: &str) {
     let mut av_target = 0usize;
     let mut rip = 0u64;
     let mut rsp = 0u64;
+    let mut registers = None;
     let mut ctx_ptr: *const CONTEXT = std::ptr::null();
     // SAFETY: pointers come straight from the OS dispatcher and are valid for the call; every
     // dereference is null-checked. Read-only.
@@ -295,6 +371,7 @@ fn report_inner(info: usize, phase: &str) {
             if let Some(ctx) = ctx_ptr.as_ref() {
                 rip = ctx.Rip;
                 rsp = ctx.Rsp;
+                registers = Some(RegisterSnapshot::from_context(ctx));
             }
         }
     }
@@ -318,6 +395,9 @@ fn report_inner(info: usize, phase: &str) {
     }
     if rsp != 0 {
         out.push_str(&format!("rsp {rsp:#x}\n"));
+    }
+    if let Some(registers) = registers {
+        out.push_str(&registers.render());
     }
     out.push_str(&format!("thread {:?}\n", std::thread::current().id()));
 
@@ -551,6 +631,35 @@ fn module_offset(addr: usize) -> Option<(String, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_report_names_every_general_purpose_register() {
+        let registers = RegisterSnapshot {
+            rax: 1,
+            rbx: 2,
+            rcx: 3,
+            rdx: 4,
+            rsi: 5,
+            rdi: 6,
+            rbp: 7,
+            r8: 8,
+            r9: 9,
+            r10: 10,
+            r11: 11,
+            r12: 12,
+            r13: 13,
+            r14: 14,
+            r15: 15,
+        };
+        let report = registers.render();
+        for name in [
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10", "r11", "r12",
+            "r13", "r14", "r15",
+        ] {
+            assert!(report.contains(name), "missing {name}: {report}");
+        }
+        assert!(report.contains("0x0000000000000004"), "rdx value missing");
+    }
 
     /// The 2026-07-31 case, by name and by number. Elden Ring's Alt-F4 teardown executes an
     /// `int3`; nothing handles it, so it reaches the unhandled filter. Reporting that as a CTD
