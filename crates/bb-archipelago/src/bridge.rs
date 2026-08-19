@@ -5,6 +5,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
+use crate::RUNTIME_BUILD;
+
 pub const BRIDGE_PROTOCOL: &str = "BBGRANT1";
 pub const HARNESS_VERSION: &str = "bb-native-grant-v3";
 
@@ -40,6 +42,7 @@ impl GrantCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeState {
+    pub build: Option<String>,
     pub protocol: Option<String>,
     pub harness: Option<String>,
     pub status: String,
@@ -54,6 +57,11 @@ impl BridgeState {
     }
 
     pub fn require_compatible(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.build.as_deref() == Some(RUNTIME_BUILD),
+            "Bloodborne runtime build mismatch: expected {RUNTIME_BUILD}, found {}",
+            self.build.as_deref().unwrap_or("missing")
+        );
         anyhow::ensure!(
             self.protocol.as_deref() == Some(BRIDGE_PROTOCOL),
             "grant bridge protocol mismatch: expected {BRIDGE_PROTOCOL}, found {}",
@@ -173,6 +181,7 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading bridge state {}", path.display()))?;
     let mut status = None;
+    let mut build = None;
     let mut protocol = None;
     let mut harness = None;
     let mut pid = None;
@@ -183,6 +192,7 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
             continue;
         };
         match key {
+            "build" => build = Some(value.to_owned()),
             "protocol" => protocol = Some(value.to_owned()),
             "harness" => harness = Some(value.to_owned()),
             "status" => status = Some(value.to_owned()),
@@ -195,6 +205,7 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
         }
     }
     Ok(BridgeState {
+        build,
         protocol,
         harness,
         status: status.context("bridge state has no status")?,
@@ -249,7 +260,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("native-grant-state.txt"),
-            "protocol=BBGRANT1\nharness=bb-native-grant-v3\nstatus=completed\npid=5040\ntag=received_17\ndetail=direct before=2 after=3\n",
+            "build=bb-0.1.0-r3\nprotocol=BBGRANT1\nharness=bb-native-grant-v3\nstatus=completed\npid=5040\ntag=received_17\ndetail=direct before=2 after=3\n",
         )
         .unwrap();
         let state = FileBridge::new(&root).read_state().unwrap();
@@ -263,6 +274,7 @@ mod tests {
     #[test]
     fn rejects_an_old_or_unversioned_harness() {
         let state = BridgeState {
+            build: None,
             protocol: None,
             harness: Some("bb-native-grant-v2".into()),
             status: "awaiting_inventory".into(),

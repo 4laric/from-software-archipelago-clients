@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::RUNTIME_BUILD;
+
 pub const TEST_PEBBLE_EVENT_FLAG: u32 = 52_100_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -61,6 +63,13 @@ impl RuntimeConfig {
     /// fallback. Once either key is present, malformed rows are fatal: silently
     /// mixing two seed contracts is worse than refusing to arm.
     pub fn apply_slot_data(mut self, slot_data: &json::Value) -> Result<Self> {
+        if let Some(build) = slot_data.get("runtime_build") {
+            anyhow::ensure!(
+                build.as_str() == Some(RUNTIME_BUILD),
+                "seed runtime build mismatch: client expects {RUNTIME_BUILD}, seed supplied {}",
+                build
+            );
+        }
         if let Some(value) = slot_data.get("runtime_locations") {
             let rows: HashMap<String, SlotLocationBinding> =
                 json::from_value(value.clone()).context("parsing slot_data.runtime_locations")?;
@@ -153,5 +162,16 @@ mod tests {
             .apply_slot_data(&json!({"runtime_locations": {"not-an-id": {"event_flag": 1}}}))
             .unwrap_err();
         assert!(format!("{error:#}").contains("invalid AP location id"));
+    }
+
+    #[test]
+    fn a_present_runtime_build_must_match_exactly() {
+        local()
+            .apply_slot_data(&json!({"runtime_build": RUNTIME_BUILD}))
+            .unwrap();
+        let error = local()
+            .apply_slot_data(&json!({"runtime_build": "bb-0.1.0-r2"}))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("seed runtime build mismatch"));
     }
 }

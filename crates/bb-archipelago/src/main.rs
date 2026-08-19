@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use archipelago_rs::{Connection, ConnectionOptions, Event, ItemHandling};
+use bb_archipelago::RUNTIME_BUILD;
 use bb_archipelago::backend::{
     BloodborneBackend, FileBackend, GoodsGrant, GrantProgress, MockBackend,
 };
@@ -74,6 +75,7 @@ fn arguments() -> Result<Arguments> {
 
 fn main() -> Result<()> {
     let args = arguments()?;
+    eprintln!("Bloodborne AP runtime build {RUNTIME_BUILD}");
     let config = RuntimeConfig::load(&args.config)?;
     let backend = if args.mock {
         let mut backend = MockBackend::default();
@@ -94,10 +96,17 @@ fn main() -> Result<()> {
             attachment.process_id,
             attachment.eboot_base
         );
-        Backend::Live(FileBackend::new(
-            FileBridge::new(&config.bridge_root),
-            event_flags,
-        ))
+        let bridge = FileBridge::new(&config.bridge_root);
+        match bridge.read_state() {
+            Ok(state) => eprintln!(
+                "Grant bridge reports build {} | protocol {} | harness {}",
+                state.build.as_deref().unwrap_or("missing"),
+                state.protocol.as_deref().unwrap_or("missing"),
+                state.harness.as_deref().unwrap_or("missing")
+            ),
+            Err(error) => eprintln!("Grant bridge state unavailable at startup: {error:#}"),
+        }
+        Backend::Live(FileBackend::new(bridge, event_flags))
     };
     let ledger = ReceiveLedger::load(&args.ledger)?;
     let mut backend = Some(backend);
