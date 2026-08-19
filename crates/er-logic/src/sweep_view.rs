@@ -29,9 +29,10 @@
 //! here".
 //!
 //! `section_rows` withholds those groups entirely and returns a COUNT instead, the same shape the
-//! region rollup already uses (`Locked region 0/??`). This supersedes "concealment is not silence"
-//! for the locked case only: a group whose region is unknown, or open, is unchanged, and the
-//! section header still totals every group so the seed-wide numbers do not silently shrink.
+//! region rollup already uses (`Locked region 0/??`). The remaining visible rows are grouped under
+//! their already-visible region, so the tracker can collapse a long run without publishing a
+//! per-region breakdown of anything withheld (#237). A group whose region is unknown remains
+//! visible under `Unplaced`; unknown must never silently become locked.
 
 /// One sweep group, as the tracker sees it. Borrowed rather than owned: the caller assembles these
 /// from live tables each frame and nothing outlives the render.
@@ -72,20 +73,11 @@ impl SweepGroupView<'_> {
 /// one. A row that degrades to the prettiest available label instead of the most identifying one is
 /// how a 49-check sweep became untraceable in bobler's log.
 ///
-/// The region rides ALONGSIDE the boss name rather than losing to it. bobler, 2026-08-10, reading
-/// nine rows: "i see many here that isnt cerulean region". Every one of them was in a region he
-/// kept -- but with only a boss name on the row he had no way to place any of them, so a seed-wide
-/// section read as a region-scoped one. Naming both is what makes that question answerable.
+/// The region is deliberately absent from this string: [`section_rows`] groups every rendered row
+/// under a region header now. Repeating it on each child was the wall of duplicate text that
+/// motivated #237.
 pub fn group_label(v: &SweepGroupView<'_>) -> String {
-    // A region known to be LOCKED is never named here -- see the module note.
-    let show_region = v.region_open != Some(false);
-    let who = match (v.boss, v.region) {
-        (Some(b), Some(r)) if show_region => format!("{b} ({r})"),
-        (Some(b), _) => b.to_string(),
-        (None, Some(r)) if show_region => r.to_string(),
-        (None, Some(_)) => "locked region".to_string(),
-        (None, None) => "unplaced".to_string(),
-    };
+    let who = v.boss.unwrap_or("unidentified boss");
     if v.fired {
         format!(
             "{who} -- {}/{} checks [flag {}]",
@@ -145,9 +137,32 @@ pub fn is_settled(v: &SweepGroupView<'_>) -> bool {
 
 /// What the tracker's Boss sweeps section actually draws.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SectionRows {
-    /// `(label, state)` for every group that renders, in the order given.
+pub struct RegionRows {
+    /// The already-visible region shared by these rows. `None` renders as `Unplaced`; it never
+    /// means locked.
+    pub region: Option<String>,
+    /// `(label, state)` for every visible group in this region, ordered by the caller.
     pub rows: Vec<(String, String)>,
+}
+
+/// Header for one collapsible region bucket.
+///
+/// Only the number of already-rendered child rows is shown. Pending member counts remain hidden by
+/// #160, and withheld groups never enter a bucket at all.
+pub fn region_header(region: &RegionRows) -> String {
+    format!(
+        "{} -- {} group(s)",
+        region.region.as_deref().unwrap_or("Unplaced"),
+        region.rows.len()
+    )
+}
+
+/// What the tracker's Boss sweeps section actually draws.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SectionRows {
+    /// Visible groups bucketed by their already-visible region. Named regions sort first;
+    /// `Unplaced` sorts last.
+    pub rows: Vec<RegionRows>,
     /// How many groups were withheld because their region is known locked.
     pub withheld: usize,
 }
@@ -168,8 +183,27 @@ pub fn section_rows(groups: &[SweepGroupView<'_>]) -> SectionRows {
             out.withheld += 1;
             continue;
         }
-        out.rows.push((group_label(v), group_state(v)));
+        let region = v.region.map(str::to_string);
+        let bucket = match out.rows.iter_mut().find(|bucket| bucket.region == region) {
+            Some(bucket) => bucket,
+            None => {
+                out.rows.push(RegionRows {
+                    region,
+                    rows: Vec::new(),
+                });
+                out.rows
+                    .last_mut()
+                    .expect("the region bucket was just pushed")
+            }
+        };
+        bucket.rows.push((group_label(v), group_state(v)));
     }
+    out.rows.sort_by(|a, b| match (&a.region, &b.region) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
     out
 }
 
@@ -227,28 +261,33 @@ mod tests {
     }
 
     #[test]
-    fn the_label_always_carries_the_flag_even_when_nothing_can_be_named() {
+    fn the_label_always_carries_the_flag_without_repeating_the_region() {
         // The seed shape that made bobler's 49-check sweep untraceable: `0 boss-lock def(s)`, so
         // `boss` is None for every group in the session. The flag is the only stable handle.
         let s = group_label(&v(20000800, Some("Shadow Keep"), 49, 0, false));
         assert!(s.contains("20000800"), "{s}");
         assert!(!s.contains("0/49"), "pending count leaked: {s}");
         assert!(s.contains("hidden until fired"), "{s}");
-        assert!(s.contains("Shadow Keep"), "{s}");
+        assert!(
+            !s.contains("Shadow Keep"),
+            "the header owns the region: {s}"
+        );
 
         let unplaced = group_label(&v(20000800, None, 49, 0, false));
         assert!(unplaced.contains("20000800"), "{unplaced}");
-        assert!(unplaced.contains("unplaced"), "{unplaced}");
+        assert!(unplaced.contains("unidentified boss"), "{unplaced}");
     }
 
     #[test]
-    fn a_named_boss_carries_its_region_too_and_the_flag_still_shows() {
-        // The boss used to REPLACE the region, which left nine rows unplaceable for bobler.
+    fn a_named_boss_carries_the_flag_but_the_region_lives_on_the_header() {
         let mut g = v(20000800, Some("Shadow Keep"), 49, 0, false);
         g.boss = Some("Messmer");
         let s = group_label(&g);
         assert!(s.contains("Messmer"), "{s}");
-        assert!(s.contains("Shadow Keep"), "the row must be placeable: {s}");
+        assert!(
+            !s.contains("Shadow Keep"),
+            "the header owns the region: {s}"
+        );
         assert!(
             s.contains("20000800"),
             "the flag survives a resolvable name: {s}"
@@ -292,7 +331,8 @@ mod tests {
         let mut g = v(1, Some("Belurat"), 10, 0, false);
         g.region_open = None;
         assert_eq!(group_state(&g), "waiting on the boss");
-        assert!(group_label(&g).contains("Belurat"));
+        let out = section_rows(&[g]);
+        assert_eq!(out.rows[0].region.as_deref(), Some("Belurat"));
     }
 
     #[test]
@@ -386,12 +426,64 @@ mod tests {
 
         let out = section_rows(&[rugalea, midra, open]);
         assert_eq!(out.withheld, 2);
-        assert_eq!(out.rows.len(), 1, "only the reachable group renders");
+        assert_eq!(out.rows.len(), 1, "only the reachable region renders");
+        assert_eq!(
+            out.rows[0].rows.len(),
+            1,
+            "only the reachable group renders"
+        );
         let rendered = format!("{:?}", out.rows);
         for leak in ["Rugalea", "Midra", "0/38", "0/7", "2044470800", "28000800"] {
             assert!(!rendered.contains(leak), "{leak} survived into {rendered}");
         }
         assert!(rendered.contains("Belurat"), "{rendered}");
+    }
+
+    #[test]
+    fn visible_rows_are_grouped_by_region_and_unplaced_sorts_last() {
+        // MOTIVATING CASE (#237): fourteen consecutive Altus rows repeated the same region text.
+        // The grouping is over rows that already survived the disclosure filters, and each child
+        // keeps its input order inside the bucket.
+        let altus_2 = v(2, Some("Altus"), 9, 0, false);
+        let unplaced = v(4, None, 5, 0, false);
+        let caelid = v(3, Some("Caelid"), 7, 0, false);
+        let altus_1 = v(1, Some("Altus"), 4, 0, false);
+        let out = section_rows(&[altus_2, unplaced, caelid, altus_1]);
+
+        assert_eq!(out.rows.len(), 3);
+        assert_eq!(out.rows[0].region.as_deref(), Some("Altus"));
+        assert_eq!(out.rows[0].rows.len(), 2);
+        assert!(out.rows[0].rows[0].0.contains("flag 2"));
+        assert!(out.rows[0].rows[1].0.contains("flag 1"));
+        assert_eq!(out.rows[1].region.as_deref(), Some("Caelid"));
+        assert_eq!(out.rows[2].region, None);
+        assert_eq!(region_header(&out.rows[2]), "Unplaced -- 1 group(s)");
+    }
+
+    #[test]
+    fn region_headers_do_not_reveal_pending_check_counts() {
+        // #160 hides exact member counts until a sweep fires. Grouping must not reconstruct the
+        // leak one level up by summing the children into a region header.
+        let out = section_rows(&[
+            v(1, Some("Altus"), 108, 17, false),
+            v(2, Some("Altus"), 41, 0, false),
+        ]);
+        let header = region_header(&out.rows[0]);
+        assert_eq!(header, "Altus -- 2 group(s)");
+        assert!(!header.contains("108"), "pending count leaked: {header}");
+        assert!(!header.contains("149"), "pending total leaked: {header}");
+    }
+
+    #[test]
+    fn withheld_groups_never_create_a_region_bucket() {
+        // Group the RENDERED rows, never the withheld ones. A per-region breakdown of locked
+        // groups is route information #171 explicitly declines to publish.
+        let mut locked = v(1, Some("Abyss"), 38, 0, false);
+        locked.region_open = Some(false);
+        let out = section_rows(&[locked]);
+        assert!(out.rows.is_empty());
+        assert_eq!(out.withheld, 1);
+        assert!(!format!("{out:?}").contains("Abyss"));
     }
 
     #[test]
@@ -428,6 +520,7 @@ mod tests {
         let out = section_rows(&[g]);
         assert_eq!(out.withheld, 0);
         assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].region.as_deref(), Some("Belurat"));
     }
 
     #[test]
@@ -440,6 +533,7 @@ mod tests {
         let groups = [locked, open];
         let out = section_rows(&groups);
         assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].rows.len(), 1);
         assert_eq!(out.withheld, 1);
         let h = section_header(&groups);
         assert!(h.contains("2 group(s)"), "{h}");
@@ -468,6 +562,10 @@ mod tests {
             group_label(&g),
             group_state(&g),
             section_header(&[g]),
+            region_header(&RegionRows {
+                region: Some("Shadow Keep".to_string()),
+                rows: vec![(group_label(&g), group_state(&g))],
+            }),
             withheld_line(20),
         ] {
             assert!(s.is_ascii(), "{s:?}");
