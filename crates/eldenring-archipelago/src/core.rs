@@ -4177,18 +4177,26 @@ impl shared::Core for Core {
             }
         }
 
-        // START-ITEM DELIVERY, reconciled against the BAG (#267). After the world has SETTLED (so
-        // the reconciler's ledger has had its pass), grant any startItems still absent and keep
-        // going until a fresh scan finds nothing missing. Possession is the dedup: it is
+        // START-ITEM DELIVERY, reconciled against the BAG (#267). After the world has SETTLED AND
+        // the reconciler has advanced past its whole negative start-item band, grant any
+        // startItems still absent and keep going until a fresh scan finds nothing missing.
+        // Possession is the dedup: it is
         // per-character for free, cannot be inherited by a new character on a used slot, and cannot
         // go stale the way the deleted `start_items_granted` boolean did.
         let start_backfill_settled = crate::detour::real_pickup_seen()
             || self
                 .in_world_since
                 .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(10));
+        // Cokeman5 RACE (2026-08-16): `real_pickup_seen || 10s` proved only that the BAG was safe to
+        // read. It did NOT prove the paced reconciler was done writing start items: it had applied
+        // 2/40 and reported `converged=false`, then this backfill granted the 38 absences while the
+        // same ledger kept advancing. Gate on the exact negative-band frontier, not a second timer
+        // or overall reconciler convergence (unrelated received/flag work may still be pending).
         // I3 FIX (a): a refused save is QUARANTINED -- the backstop must not write to it either.
         crate::start_item_backfill::tick(
-            start_backfill_settled && !crate::reconcile_io::is_refused(),
+            start_backfill_settled
+                && crate::reconcile_io::start_item_backfill_ready()
+                && !crate::reconcile_io::is_refused(),
         );
 
         Ok(())
