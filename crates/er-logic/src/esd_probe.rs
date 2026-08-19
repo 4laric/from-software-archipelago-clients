@@ -53,6 +53,13 @@ pub const OPEN_REGULAR_SHOP: i32 = 22;
 /// us the pair fires together, and because `shop_sell` already has a stake in the sell side.
 pub const OPEN_SELL_SHOP: i32 = 46;
 
+/// Whether enough monotonic time has elapsed since the last ESD talk dispatch for inventory reads
+/// and grants to be trusted. `last_activity_ms == 0` means the hook has not observed any talk yet.
+/// Kept pure so the live hook's clock policy is host-tested rather than sleep-tested.
+pub fn inventory_quiet(now_ms: u64, last_activity_ms: u64, quiet_ms: u64) -> bool {
+    last_activity_ms == 0 || now_ms.saturating_sub(last_activity_ms) >= quiet_ms
+}
+
 /// Commands that log on EVERY dispatch rather than once. Rare by nature; never suppressed, not
 /// even by [`DISTINCT_PAIR_CAP`].
 pub const WATCHED: [i32; 2] = [OPEN_REGULAR_SHOP, OPEN_SELL_SHOP];
@@ -221,5 +228,19 @@ mod tests {
         assert_eq!(ledger.distinct(), 0);
         assert_eq!(ledger.suppressed(), 0);
         assert!(!ledger.is_full());
+    }
+
+    #[test]
+    fn inventory_is_safe_before_any_talk_activity() {
+        assert!(inventory_quiet(50_000, 0, 2_000));
+    }
+
+    #[test]
+    fn talk_activity_holds_inventory_until_the_quiet_window_expires() {
+        assert!(!inventory_quiet(10_000, 9_999, 2_000));
+        assert!(!inventory_quiet(11_998, 9_999, 2_000));
+        assert!(inventory_quiet(11_999, 9_999, 2_000));
+        // A defensive saturating subtraction keeps a clock anomaly fail-closed.
+        assert!(!inventory_quiet(9_998, 9_999, 2_000));
     }
 }

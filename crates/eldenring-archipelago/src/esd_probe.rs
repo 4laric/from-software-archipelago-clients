@@ -75,7 +75,8 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use eldenring::cs::{
     BlockId, CSEzStateTalkEvent, FieldInsHandle, FieldInsSelector, FieldInsType, TalkScript,
@@ -105,6 +106,34 @@ static LEDGER: Mutex<Option<EsdProbeLedger>> = Mutex::new(None);
 /// Whether the phase-1 command-id enumeration is on. Read once at install, then on every dispatch
 /// -- so it must stay a plain relaxed atomic load, not a config or env read.
 static PROBE_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// NPC talk ESD can temporarily rebuild the key-item inventory while `in_world` and the player
+/// pointer both remain valid. The reconciler must not diff or grant against that transient view.
+static TALK_CLOCK: OnceLock<Instant> = OnceLock::new();
+static LAST_TALK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// ESD invokes many times a second while a conversation is active, so the window slides until the
+/// script is actually quiet rather than assuming a particular bell-bearing command id.
+const INVENTORY_QUIET_MS: u64 = 2_000;
+
+fn talk_clock_ms() -> u64 {
+    TALK_CLOCK
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+        + 1 // zero is the "no talk observed" sentinel
+}
+
+/// Whether received-item inventory work is safe this frame. Flags deliberately do not use this:
+/// they have no inventory pointer and remain self-healing while a conversation is open.
+pub fn inventory_grants_safe() -> bool {
+    er_logic::esd_probe::inventory_quiet(
+        talk_clock_ms(),
+        LAST_TALK_ACTIVITY_MS.load(Ordering::Relaxed),
+        INVENTORY_QUIET_MS,
+    )
+}
 
 /// Whether the phase-1 ENUMERATION was asked for. Read once, at install time. It no longer gates
 /// the detour itself -- shop auto-hints need the hook whatever this says.
@@ -222,6 +251,10 @@ unsafe extern "C" fn esd_invoke_detour(this: *mut c_void, event: *const EzStateE
         if this.is_null() || event.is_null() {
             return;
         }
+        // Record EVERY valid talk dispatch before interpreting it. This is the inventory-stability
+        // seam; it covers the Twin Maiden hand-in commands as well as the shop-open command whose
+        // id we understand.
+        LAST_TALK_ACTIVITY_MS.store(talk_clock_ms(), Ordering::Relaxed);
         // SAFETY: non-null checked; both pointers are the game's own live objects for this call,
         // read-only, and not retained past this frame.
         let (talk_id, event_ref) = unsafe {

@@ -519,6 +519,12 @@ impl GameIo for LiveGame {
         WorldStability {
             in_game: in_world,
             player_valid: crate::flags::play_region_id().is_some(),
+            // The Twin Maiden "Offer a bell bearing" flow temporarily mutates the key-item list
+            // without leaving the world. Two live captures (#357) showed an unrelated AP key item
+            // vanish during that window; treating the transient absence as authoritative emitted
+            // three duplicate floor drops. The always-installed ESD hook supplies a talk-quiet
+            // gate, while flags remain on their independent `flags_ready` tier.
+            inventory_safe: crate::esd_probe::inventory_grants_safe(),
             dwell_ms: self.dwell_ms(),
             // The generalized Torch-fix predicate: a real game-driven AddItem proves the bulk load
             // is done and the inventory is genuinely live.

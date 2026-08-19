@@ -625,6 +625,10 @@ pub fn diff(desired: &DesiredState, observed: &ObservedState) -> Vec<Action> {
 pub struct WorldStability {
     pub in_game: bool,
     pub player_valid: bool,
+    /// Whether the live inventory is safe to read and mutate this tick. NPC talk scripts can
+    /// temporarily remove/rebuild key-item entries while the player is still fully in-world; that
+    /// state must not be mistaken for a lost AP item.
+    pub inventory_safe: bool,
     /// Continuous in-world dwell time this session, in ms.
     pub dwell_ms: u64,
     /// A real game-driven `AddItem` has fired (bulk load done) — the inventory is genuinely live.
@@ -641,11 +645,13 @@ impl WorldStability {
     /// Fallback dwell before we trust the inventory when no real pickup has fired.
     pub const SETTLE_MS: u64 = 8_000;
 
-    /// Stable == in-game, player pointer valid, AND (a real pickup has fired OR we have dwelled long
-    /// enough that the bulk inventory load must be done).
+    /// Stable == in-game, player pointer valid, inventory not under an active talk-script mutation,
+    /// AND (a real pickup has fired OR we have dwelled long enough that the bulk inventory load must
+    /// be done).
     pub fn stable(&self) -> bool {
         self.in_game
             && self.player_valid
+            && self.inventory_safe
             && (self.real_pickup_seen || self.dwell_ms >= Self::SETTLE_MS)
     }
 
@@ -1471,6 +1477,7 @@ impl Default for MockGame {
             stability: WorldStability {
                 in_game: true,
                 player_valid: true,
+                inventory_safe: true,
                 dwell_ms: WorldStability::SETTLE_MS,
                 real_pickup_seen: true,
                 now_ms: 0,
@@ -1498,6 +1505,7 @@ impl MockGame {
             stability: WorldStability {
                 in_game: false,
                 player_valid: false,
+                inventory_safe: false,
                 dwell_ms: 0,
                 real_pickup_seen: false,
                 now_ms: 0,
@@ -1513,6 +1521,7 @@ impl MockGame {
             stability: WorldStability {
                 in_game: true,
                 player_valid: true,
+                inventory_safe: true,
                 dwell_ms: 0,
                 real_pickup_seen: false,
                 now_ms: 0,
@@ -1529,6 +1538,7 @@ impl MockGame {
             self.stability = WorldStability {
                 in_game: true,
                 player_valid: true,
+                inventory_safe: true,
                 dwell_ms: WorldStability::SETTLE_MS,
                 real_pickup_seen: true,
                 now_ms,
@@ -1538,6 +1548,7 @@ impl MockGame {
             self.stability = WorldStability {
                 in_game: false,
                 player_valid: false,
+                inventory_safe: false,
                 dwell_ms: 0,
                 real_pickup_seen: false,
                 now_ms,
@@ -2010,6 +2021,46 @@ mod tests {
             g.ledger_count(2008),
             1,
             "and the consumable grants exactly once"
+        );
+    }
+
+    /// LIVE REGRESSION (er-archipelago#357). Twice, the Twin Maiden "Offer a bell bearing" flow
+    /// temporarily removed an unrelated AP key item from the observable inventory while the player
+    /// remained in-world. The old stability predicate immediately emitted three replacement grants
+    /// onto the floor. Talk activity must hold every inventory class while preserving the early,
+    /// self-healing flag tier.
+    #[test]
+    fn talk_inventory_mutation_holds_goods_and_ledger_but_not_flags() {
+        let mut g = MockGame::stable();
+        g.stability.inventory_safe = false;
+        let mut r = Reconciler::new(inputs(
+            "A",
+            vec![
+                key_item(0, "Drawing-Room Key", 8134, &[400072]),
+                consumable(1, "Golden Rune", 290, 1),
+            ],
+            vec![],
+        ));
+
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(g.get_flag(400072), "flags remain safe during NPC talk");
+        assert!(
+            g.unique_grant_calls.is_empty(),
+            "the transiently absent key item must not be re-granted"
+        );
+        assert_eq!(
+            g.ledger_count(290),
+            0,
+            "ledgered grants must not mutate the same unstable inventory"
+        );
+
+        g.stability.inventory_safe = true;
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(g.has_good(8134), "the key item lands after talk goes quiet");
+        assert_eq!(
+            g.ledger_count(290),
+            1,
+            "the held ledger drains exactly once"
         );
     }
 
