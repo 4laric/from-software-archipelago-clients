@@ -1,0 +1,17 @@
+{
+  "bridge_root": "C:\\Users\\alari\\bb-archipelago\\work",
+  "shad_log": "C:\\Users\\alari\\AppData\\Roaming\\shadPS4\\log\\shad_log.txt",
+  "locations": [
+    {
+      "ap_location_id": 0,
+      "event_flag": 52100000
+    }
+  ],
+  "items": {
+    "0": {
+      "normalized_item_id": 1073743054,
+      "quantity": 1
+    }
+  },
+  "mock_set_flags": [52100000]
+}
