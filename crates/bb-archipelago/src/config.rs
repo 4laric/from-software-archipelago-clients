@@ -21,9 +21,19 @@ pub struct LocationBinding {
     pub vanilla_award_suppressed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DescriptorEvidence {
+    GoodsFormulaObserved,
+    LiveGrantInventoryUi,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GoodsBinding {
+pub struct RuntimeItemBinding {
+    pub raw_descriptor: u32,
     pub normalized_item_id: u32,
+    pub item_category: u8,
+    pub descriptor_evidence: DescriptorEvidence,
     #[serde(default = "one")]
     pub quantity: u32,
     /// `Some(level)` marks an upgradeable weapon and records the level carried
@@ -32,6 +42,73 @@ pub struct GoodsBinding {
     pub reinforcement_level: Option<u8>,
     #[serde(default)]
     pub feed_effect: FeedEffectBinding,
+}
+
+impl RuntimeItemBinding {
+    fn validate(&self, ap_item_id: i64) -> Result<()> {
+        anyhow::ensure!(
+            (1..=99).contains(&self.quantity),
+            "AP item {ap_item_id} has invalid grant quantity {}",
+            self.quantity
+        );
+        anyhow::ensure!(
+            self.reinforcement_level.is_none_or(|level| level <= 10),
+            "AP item {ap_item_id} has invalid reinforcement level {:?}",
+            self.reinforcement_level
+        );
+        match self.item_category {
+            4 => {
+                anyhow::ensure!(
+                    self.descriptor_evidence == DescriptorEvidence::GoodsFormulaObserved,
+                    "AP item {ap_item_id} category-4 descriptor lacks observed-goods evidence"
+                );
+                anyhow::ensure!(
+                    self.normalized_item_id & 0xF000_0000 == 0x4000_0000
+                        && self.raw_descriptor & 0xF000_0000 == 0xB000_0000
+                        && (self.normalized_item_id & 0x0FFF_FFFF)
+                            == (self.raw_descriptor & 0x0FFF_FFFF),
+                    "AP item {ap_item_id} has an incompatible category-4 raw/normalized descriptor pair"
+                );
+                anyhow::ensure!(
+                    self.reinforcement_level.is_none(),
+                    "AP item {ap_item_id} category-4 goods cannot carry a reinforcement level"
+                );
+            }
+            0 => {
+                anyhow::ensure!(
+                    self.descriptor_evidence == DescriptorEvidence::LiveGrantInventoryUi,
+                    "AP item {ap_item_id} category-0 descriptor is not live-validated"
+                );
+                anyhow::ensure!(
+                    self.normalized_item_id & 0xF000_0000 == 0
+                        && self.raw_descriptor & 0xF000_0000 == 0x8000_0000
+                        && (self.normalized_item_id & 0x0FFF_FFFF)
+                            == (self.raw_descriptor & 0x0FFF_FFFF),
+                    "AP item {ap_item_id} has an incompatible category-0 raw/normalized descriptor pair"
+                );
+                anyhow::ensure!(
+                    self.quantity == 1,
+                    "AP item {ap_item_id} category-0 equipment quantity must be one"
+                );
+                anyhow::ensure!(
+                    self.reinforcement_level.is_some(),
+                    "AP item {ap_item_id} category-0 weapon has no reinforcement level"
+                );
+                anyhow::ensure!(
+                    matches!(
+                        self.feed_effect,
+                        FeedEffectBinding::RightHandWeapon | FeedEffectBinding::LeftHandWeapon
+                    ),
+                    "AP item {ap_item_id} category-0 weapon has incompatible receive policy {:?}",
+                    self.feed_effect
+                );
+            }
+            category => anyhow::bail!(
+                "AP item {ap_item_id} uses unsupported Bloodborne item category {category}"
+            ),
+        }
+        Ok(())
+    }
 }
 
 const fn one() -> u32 {
@@ -103,7 +180,7 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub locations: Vec<LocationBinding>,
     #[serde(default)]
-    pub items: HashMap<i64, GoodsBinding>,
+    pub items: HashMap<i64, RuntimeItemBinding>,
     #[serde(default)]
     pub auto_upgrade: bool,
     #[serde(default)]
@@ -130,7 +207,10 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+        let config: Self =
+            json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+        config.validate_items()?;
+        Ok(config)
     }
 
     pub fn with_test_pebble_location(mut self, ap_location_id: i64) -> Self {
@@ -172,16 +252,15 @@ impl RuntimeConfig {
             self.locations = locations;
         }
         if let Some(value) = slot_data.get("runtime_items") {
-            let rows: HashMap<String, GoodsBinding> =
+            let rows: HashMap<String, RuntimeItemBinding> =
                 json::from_value(value.clone()).context("parsing slot_data.runtime_items")?;
             let mut items = HashMap::with_capacity(rows.len());
             for (raw_id, row) in rows {
-                items.insert(
-                    raw_id
-                        .parse()
-                        .with_context(|| format!("invalid AP item id {raw_id:?}"))?,
-                    row,
-                );
+                let ap_item_id = raw_id
+                    .parse()
+                    .with_context(|| format!("invalid AP item id {raw_id:?}"))?;
+                row.validate(ap_item_id)?;
+                items.insert(ap_item_id, row);
             }
             self.items = items;
         }
@@ -218,7 +297,15 @@ impl RuntimeConfig {
             self.location_check_debounce >= 2,
             "location_check_debounce must be at least 2"
         );
+        self.validate_items()?;
         Ok(self)
+    }
+
+    fn validate_items(&self) -> Result<()> {
+        for (&ap_item_id, binding) in &self.items {
+            binding.validate(ap_item_id)?;
+        }
+        Ok(())
     }
 
     /// Prove that the binder the seed requires is the binder on disk at the
@@ -361,7 +448,10 @@ mod tests {
                 },
                 "runtime_items": {
                     "12255488": {
-                        "normalized_item_id": 1073742824,
+                        "raw_descriptor": 2154583648_u32,
+                        "normalized_item_id": 7100000,
+                        "item_category": 0,
+                        "descriptor_evidence": "live_grant_inventory_ui",
                         "quantity": 1,
                         "reinforcement_level": 0,
                         "feed_effect": "right_hand_weapon"
@@ -374,7 +464,8 @@ mod tests {
         assert_eq!(config.locations.len(), 1);
         assert_eq!(config.locations[0].ap_location_id, 12_259_363);
         assert_eq!(config.locations[0].event_flag, 52_410_800);
-        assert_eq!(config.items[&12_255_488].normalized_item_id, 0x4000_03E8);
+        assert_eq!(config.items[&12_255_488].normalized_item_id, 0x006C_5660);
+        assert_eq!(config.items[&12_255_488].raw_descriptor, 0x806C_5660);
         assert_eq!(config.items[&12_255_488].reinforcement_level, Some(0));
         assert_eq!(
             config.items[&12_255_488].feed_effect,
@@ -398,6 +489,50 @@ mod tests {
             .apply_slot_data(&json!({"runtime_locations": {"not-an-id": {"event_flag": 1}}}))
             .unwrap_err();
         assert!(format!("{error:#}").contains("invalid AP location id"));
+    }
+
+    #[test]
+    fn equipment_requires_explicit_live_descriptor_evidence() {
+        let error = local()
+            .apply_slot_data(&json!({
+                "runtime_items": {
+                    "12255243": {
+                        "raw_descriptor": 0x8132B3A0_u32,
+                        "normalized_item_id": 0x0132B3A0_u32,
+                        "item_category": 0,
+                        "descriptor_evidence": "item_lot_inferred",
+                        "quantity": 1,
+                        "reinforcement_level": 0,
+                        "feed_effect": "right_hand_weapon"
+                    }
+                }
+            }))
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("slot_data.runtime_items"));
+        assert!(diagnostic.contains("item_lot_inferred"));
+    }
+
+    #[test]
+    fn equipment_requires_a_compatible_raw_descriptor() {
+        let error = local()
+            .apply_slot_data(&json!({
+                "runtime_items": {
+                    "12255243": {
+                        "raw_descriptor": 0x80989680_u32,
+                        "normalized_item_id": 0x006C5660,
+                        "item_category": 0,
+                        "descriptor_evidence": "live_grant_inventory_ui",
+                        "quantity": 1,
+                        "reinforcement_level": 0,
+                        "feed_effect": "right_hand_weapon"
+                    }
+                }
+            }))
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("AP item 12255243"));
+        assert!(diagnostic.contains("raw/normalized"));
     }
 
     #[test]

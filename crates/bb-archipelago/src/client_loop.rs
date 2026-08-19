@@ -232,7 +232,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(PendingItem {
             index: item.index,
             ap_item_id: item.ap_item_id,
+            raw_descriptor: binding.raw_descriptor,
             normalized_item_id: binding.normalized_item_id,
+            item_category: binding.item_category,
             quantity: binding.quantity,
             upgrade_target_level: target_level,
             reinforcement_level: delivered_level,
@@ -288,7 +290,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
 
         if !pending.grant_complete {
             let grant = ItemGrant {
+                raw_descriptor: pending.raw_descriptor,
                 normalized_item_id: pending.normalized_item_id,
+                item_category: pending.item_category,
                 quantity: pending.quantity,
                 expected_before: self.ledger.slot(&self.seed_name, &self.slot_name).map_or(
                     0,
@@ -337,7 +341,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 item.index,
                 AcknowledgedItem {
                     ap_item_id: item.ap_item_id,
+                    raw_descriptor: pending.raw_descriptor,
                     normalized_item_id: pending.normalized_item_id,
+                    item_category: pending.item_category,
                     quantity: pending.quantity,
                     reinforcement_level: pending.reinforcement_level,
                     equip_target: pending.equip_target,
@@ -364,7 +370,10 @@ impl<B: BloodborneBackend> ClientLoop<B> {
 mod tests {
     use super::*;
     use crate::backend::{LocationContext, MockBackend};
-    use crate::config::{FeedEffectBinding, GoodsBinding, LocationBinding, TEST_PEBBLE_EVENT_FLAG};
+    use crate::config::{
+        DescriptorEvidence, FeedEffectBinding, LocationBinding, RuntimeItemBinding,
+        TEST_PEBBLE_EVENT_FLAG,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn path() -> PathBuf {
@@ -378,9 +387,12 @@ mod tests {
         ))
     }
 
-    fn goods() -> GoodsBinding {
-        GoodsBinding {
+    fn goods() -> RuntimeItemBinding {
+        RuntimeItemBinding {
+            raw_descriptor: 0xB000_04CE,
             normalized_item_id: 0x4000_04CE,
+            item_category: 4,
+            descriptor_evidence: DescriptorEvidence::GoodsFormulaObserved,
             quantity: 1,
             reinforcement_level: None,
             feed_effect: FeedEffectBinding::NotEquippable,
@@ -622,6 +634,55 @@ mod tests {
     }
 
     #[test]
+    fn validated_saw_spear_grants_once_and_reloads_without_regrant() {
+        let ledger_path = path();
+        let mut runtime_config = config();
+        runtime_config.items.insert(
+            3000,
+            RuntimeItemBinding {
+                raw_descriptor: 0x806C_5660,
+                normalized_item_id: 0x006C_5660,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
+                quantity: 1,
+                reinforcement_level: Some(0),
+                feed_effect: FeedEffectBinding::RightHandWeapon,
+            },
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 3000,
+        }];
+        let mut first = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            runtime_config.clone(),
+        );
+        assert!(matches!(
+            first.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert_eq!(first.backend().grants.len(), 1);
+        assert_eq!(first.backend().grants[0].raw_descriptor, 0x806C_5660);
+        assert_eq!(first.backend().grants[0].item_category, 0);
+
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        let mut reloaded = loop_with(
+            MockBackend::default(),
+            persisted,
+            ledger_path.clone(),
+            runtime_config,
+        );
+        assert_eq!(
+            reloaded.poll_items(&received).unwrap(),
+            ItemPollResult::Idle
+        );
+        assert!(reloaded.backend().grants.is_empty());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
     fn grants_strictly_in_index_order() {
         let ledger_path = path();
         let mut client = loop_with(
@@ -661,8 +722,11 @@ mod tests {
         runtime_config.auto_equip = true;
         runtime_config.items.insert(
             3000,
-            GoodsBinding {
+            RuntimeItemBinding {
+                raw_descriptor: 0x8012_3400,
                 normalized_item_id: 0x0012_3400,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
                 quantity: 1,
                 reinforcement_level: Some(0),
                 feed_effect: FeedEffectBinding::RightHandWeapon,
@@ -712,8 +776,11 @@ mod tests {
             runtime_config.auto_upgrade = enabled;
             runtime_config.items.insert(
                 3000,
-                GoodsBinding {
+                RuntimeItemBinding {
+                    raw_descriptor: 0x8012_3400,
                     normalized_item_id: 0x0012_3400,
+                    item_category: 0,
+                    descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
                     quantity: 1,
                     reinforcement_level: Some(received_level),
                     feed_effect: FeedEffectBinding::RightHandWeapon,
@@ -752,8 +819,11 @@ mod tests {
         runtime_config.auto_upgrade = true;
         runtime_config.items.insert(
             3000,
-            GoodsBinding {
+            RuntimeItemBinding {
+                raw_descriptor: 0x8012_3400,
                 normalized_item_id: 0x0012_3400,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
                 quantity: 1,
                 reinforcement_level: Some(0),
                 feed_effect: FeedEffectBinding::RightHandWeapon,
@@ -802,8 +872,11 @@ mod tests {
         for (offset, (ap_item_id, feed_effect)) in rows.into_iter().enumerate() {
             runtime_config.items.insert(
                 ap_item_id,
-                GoodsBinding {
+                RuntimeItemBinding {
+                    raw_descriptor: 0xB000_1000 + offset as u32,
                     normalized_item_id: 0x4000_1000 + offset as u32,
+                    item_category: 4,
+                    descriptor_evidence: DescriptorEvidence::GoodsFormulaObserved,
                     quantity: 1,
                     reinforcement_level: None,
                     feed_effect,
@@ -856,8 +929,11 @@ mod tests {
         runtime_config.auto_equip = true;
         runtime_config.items.insert(
             3000,
-            GoodsBinding {
+            RuntimeItemBinding {
+                raw_descriptor: 0x8012_3400,
                 normalized_item_id: 0x0012_3400,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
                 quantity: 1,
                 reinforcement_level: Some(0),
                 feed_effect: FeedEffectBinding::RightHandWeapon,
