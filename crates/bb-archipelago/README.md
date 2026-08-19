@@ -16,7 +16,7 @@ The first bridge contract supports received-item grants:
   a terminal success state and an absent command file.
 
 The current bridge contract is `BBGRANT1` with harness
-`bb-native-grant-v4`. Both tokens must appear in the harness state before the
+`bb-native-grant-v5`. Both tokens must appear in the harness state before the
 client publishes a command. A terminal harness failure blocks that AP item with
 a bounded diagnostic while location polling and the server connection continue.
 
