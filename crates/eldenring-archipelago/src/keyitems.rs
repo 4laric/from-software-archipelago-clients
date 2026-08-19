@@ -8,10 +8,10 @@
 //! which under num_regions may sit in a sealed region. Leyndell's separate two-rune threshold is
 //! reconciled from AP receipts below. All idempotent: flags are save-persisted.
 //!
-//! The AP catalog maps each great rune to the boss-drop goods row (8148-8153). The restore flag makes
-//! that received row usable and, crucially, disarms the Divine-Tower award event. We therefore ONLY
-//! set the flag here -- granting the restored goods too would create the duplicate this module exists
-//! to prevent.
+//! The AP catalog maps each great rune to the boss-drop goods row (8148-8153), but slot-data parsing
+//! normalizes those FullIDs to the restored/equippable rows (191-196) before any delivery consumer
+//! sees them. This module supplies the matching restore flag and disarms the Divine-Tower award
+//! event; it does not issue a second goods grant.
 
 use crate::flags;
 use std::collections::HashSet;

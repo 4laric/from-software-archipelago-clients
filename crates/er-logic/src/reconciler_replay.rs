@@ -990,7 +990,7 @@ mod replay {
         /// The player action at the Roundtable grace, 2026-07-29 ~01:36:10: equip the rune.
         fn equip_great_rune(&mut self, goods: GoodsId) {
             self.inner.drop_good(goods);
-            self.equipped_great_rune = crate::great_runes::restored_row_for_received(goods);
+            self.equipped_great_rune = crate::great_runes::canonical_restored_row(goods);
             self.inner.refuse_unique_adds = true;
         }
 
@@ -1042,11 +1042,12 @@ mod replay {
         }
     }
 
-    /// Morgott's Great Rune exactly as the live mapper builds it (`core.rs` -> `KeyItem` via
-    /// `keyitems::acquire_flags`): boss-drop goods row 8150 plus restored flag 193. The flag makes
-    /// the AP-received row usable and disarms the Divine-Tower award; there is no second goods grant.
+    /// Morgott's Great Rune exactly as the live mapper builds it (`core.rs` -> normalized item map
+    /// -> `KeyItem` via `keyitems::acquire_flags`): restored goods row 193 plus restored flag 193.
+    /// The seed still identifies the reward with boss-drop row 8150, but no delivery consumer sees
+    /// that unequippable row.
     fn morgott_rune_inputs() -> DesiredInputs {
-        great_rune_inputs("Morgott's Great Rune", 8150, 193)
+        great_rune_inputs("Morgott's Great Rune", 193, 193)
     }
 
     fn great_rune_inputs(name: &str, goods: GoodsId, restored_flag: FlagId) -> DesiredInputs {
@@ -1090,7 +1091,7 @@ mod replay {
     /// slot, the reconciler emits zero re-grants for an equipped rune.
     #[test]
     fn an_equipped_great_rune_reads_as_possessed_and_never_re_grants_replay() {
-        const MORGOTT: GoodsId = 8150;
+        const MORGOTT: GoodsId = 193;
         const TICKS_AFTER_EQUIP: usize = 400;
 
         for reads_equip_slot in [false, true] {
@@ -1155,21 +1156,19 @@ mod replay {
         }
     }
 
-    /// Regression for client#313: a native shop sold Mohg's boss-drop row, AP suppressed the echo,
-    /// and the game exposed the restored row instead. The receive stream still names row 8152, so
-    /// exact-only bag/storage reads parked and retried the rune after every load.
+    /// Regression for client#313 composed with #316: a save already carrying the restored row must
+    /// suppress another grant whether that row is in the bag or storage.
     #[test]
-    fn a_restored_great_rune_row_in_bag_or_storage_satisfies_the_received_row() {
-        const MOHG_RECEIVED: GoodsId = 8152;
+    fn restored_great_rune_in_bag_or_storage_satisfies_restored_delivery() {
         const MOHG_RESTORED_ROW: GoodsId = 195;
         const MOHG_RESTORED_FLAG: FlagId = 195;
 
-        for restored_in_storage in [false, true] {
+        for in_storage in [false, true] {
             let mut g = PossessionGame::new(PossessionReads {
                 equip_slot: true,
                 storage: true,
             });
-            if restored_in_storage {
+            if in_storage {
                 g.stored_goods.insert(MOHG_RESTORED_ROW);
             } else {
                 g.inner.goods.insert(MOHG_RESTORED_ROW);
@@ -1177,15 +1176,52 @@ mod replay {
             g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
             let mut r = Reconciler::new(great_rune_inputs(
                 "Mohg's Great Rune",
-                MOHG_RECEIVED,
+                MOHG_RESTORED_ROW,
                 MOHG_RESTORED_FLAG,
             ));
 
             let out = r.tick(&mut g, TickBudget::default());
 
-            assert!(g.has_good(MOHG_RECEIVED));
+            assert!(g.has_good(MOHG_RESTORED_ROW));
             assert!(g.inner.unique_grant_calls.is_empty());
             assert!(r.stalled_goods().is_empty());
+            assert!(out.converged && out.applied.is_empty());
+        }
+    }
+
+    /// The live #316 upgrade case: an older client left only Mohg's boss-drop row in the save.
+    /// Native removal is not safely bound, so the migration keeps that row and grants the restored
+    /// row once. A second tick/reconnect sees the restored row and emits nothing else.
+    #[test]
+    fn a_legacy_boss_row_gets_one_restored_row_backfill() {
+        const MOHG_BOSS_ROW: GoodsId = 8152;
+        const MOHG_RESTORED_ROW: GoodsId = 195;
+        const MOHG_RESTORED_FLAG: FlagId = 195;
+
+        for boss_in_storage in [false, true] {
+            let mut g = PossessionGame::new(PossessionReads {
+                equip_slot: true,
+                storage: true,
+            });
+            if boss_in_storage {
+                g.stored_goods.insert(MOHG_BOSS_ROW);
+            } else {
+                g.inner.goods.insert(MOHG_BOSS_ROW);
+            }
+            g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
+            let mut r = Reconciler::new(great_rune_inputs(
+                "Mohg's Great Rune",
+                MOHG_RESTORED_ROW,
+                MOHG_RESTORED_FLAG,
+            ));
+
+            r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+            assert_eq!(g.inner.unique_grant_calls, vec![MOHG_RESTORED_ROW]);
+            assert!(g.inner.goods.contains(&MOHG_RESTORED_ROW));
+
+            let before = g.inner.unique_grant_calls.len();
+            let out = r.tick(&mut g, TickBudget::default());
+            assert_eq!(g.inner.unique_grant_calls.len(), before);
             assert!(out.converged && out.applied.is_empty());
         }
     }

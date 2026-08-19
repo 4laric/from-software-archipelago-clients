@@ -214,6 +214,39 @@ mod tests {
         assert_eq!(pushed, 2);
     }
 
+    /// Client #316: a restore flag does not convert a shardbearer's boss-drop inventory row. The
+    /// slot-data map is normalized before this receive loop sees it, so a fresh AP delivery must
+    /// enqueue Radahn's restored/equippable row rather than row 8149.
+    #[test]
+    fn great_rune_receipt_enqueues_the_restored_row() {
+        const AP_RADAHN: i64 = 7777;
+        const GOODS: i64 = 0x4000_0000;
+        let mut item_map = HashMap::from([(AP_RADAHN, GOODS | 8149)]);
+        crate::great_runes::normalize_delivery_item_map(&mut item_map);
+        let counts = HashMap::new();
+        let mut hook = MockHook::default();
+        let (mut dispatched, mut pushed) = (0, 0);
+
+        let action = process_received_item(
+            &item(0, AP_RADAHN, "Radahn's Great Rune"),
+            &mut dispatched,
+            &mut pushed,
+            &item_map,
+            &counts,
+            &mut hook,
+        );
+
+        assert_eq!(
+            action,
+            GrantAction::Enqueue {
+                full_id: (GOODS | 192) as i32,
+                qty: 1,
+                ap_index: 0,
+                name: "Radahn's Great Rune".into(),
+            }
+        );
+    }
+
     #[test]
     fn reconnect_replays_name_dispatch_but_grants_do_not_refire() {
         // THE watermark-split test. Reconnect after 2 items were granted:

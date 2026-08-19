@@ -1039,7 +1039,12 @@ impl shared::Core for Core {
                 // Our `flatten_regular_upgrades` (int cap) OR Bedrock/fswap's
                 // `reduce_non_somber_upgrade_cost` (bool toggle -> cap 1).
                 crate::upgrade_cost::set_flatten(er_logic::options::parse_flatten_cap(sd));
-                let map = i64_map(sd.get("apIdsToItemIds"));
+                let mut map = i64_map(sd.get("apIdsToItemIds"));
+                // Great Rune boss-drop rows are legitimate rewards but are not equippable. A
+                // restore FLAG does not perform vanilla event 90005110's inventory conversion.
+                // Normalise ONCE before any consumer sees the map, so direct receipts,
+                // reconciliation, and own-world shop repoints all deliver the restored row.
+                er_logic::great_runes::normalize_delivery_item_map(&mut map);
                 // Disarm each Divine-Tower vanilla award BEFORE its AP rune is received. Event
                 // 90005110 awards the restored rune without checking possession of the boss-drop
                 // row, so receipt-only flag reconciliation can lose this race (#731). Resolve the
@@ -2444,9 +2449,9 @@ impl shared::Core for Core {
                             && crate::reconcile_io::owns_ledger())
                         {
                             if dispatch.hook.grant_full_id(full_id, qty) {
-                                // Great-rune restore flag is set by keyitems::set_acquire_flags
-                                // (191-196); the AP item grants boss-drop row 8148-8153, so there is
-                                // no additive restored-goods grant here (that duplicates the rune).
+                                // Great Rune FullIDs were normalized to the restored/equippable row
+                                // when slot_data was parsed; keyitems::set_acquire_flags supplies
+                                // the matching restored flag without a second goods grant.
                             } else {
                                 // H3: the grant did NOT place — hold received_through at this item
                                 // and stop so the tail replays in order next tick (never advance the
@@ -2461,8 +2466,8 @@ impl shared::Core for Core {
                         }
                     }
                     GrantAction::SkipProgressive => {
-                        // Tier effects already applied in the dispatch (ReceiveDispatch). Great-rune
-                        // restore is handled by keyitems::set_acquire_flags (event flag), not a grant.
+                        // Tier effects already applied in the dispatch (ReceiveDispatch). Great
+                        // Runes are not progressive; their restored row + flag use the normal arm.
                     }
                     GrantAction::SkipUnmapped { ap_item_id } => {
                         // R5 (SWEEP): AP id absent from apIdsToItemIds and progressive didn't
