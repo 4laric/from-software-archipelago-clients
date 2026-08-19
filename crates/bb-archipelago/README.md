@@ -40,9 +40,12 @@ until their v0.18 memory contracts are validated.
 ## Standalone client
 
 `bb-ap-client` connects as game `Bloodborne`, requests a full item sync, polls
-configured location flags when its safety context is valid, and grants received goods
-strictly by AP index. A seed-and-slot keyed JSON ledger is saved after each
-verified grant, so reconnects and process reloads skip acknowledged indices.
+configured location flags when its safety context is valid, and grants received
+goods strictly by AP index. A seed-and-slot keyed JSON ledger durably binds the
+validated save identity before planning any grant and is saved after each
+verified stage, so reconnects and process reloads skip acknowledged indices.
+Location reads and item mutation share the same gameplay/save gate; losing or
+changing that context cannot start or acknowledge a delivery.
 
 ```text
 bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock]
@@ -80,6 +83,14 @@ The live backend automatically reattaches after a stale shad process handle. If
 shad is temporarily unavailable, location polling stays connected to AP, reports
 the failure at a bounded cadence, and announces recovery after the new process is
 readable.
+
+Seeds that claim any vanilla award is suppressed also carry the exact
+suppression-plan SHA-256 and manifest format. Configure `suppression_manifest`
+to the build manifest and `installed_gameparam` to the binder actually loaded by
+the game. The client requires the installation-relative `param/gameparam` path,
+independently hashes that installed file, and refuses the seed if it does not
+equal the manifest output; the separate build artifact is explicitly rejected
+as installation evidence.
 
 Runtime event flags, normalized item IDs, bridge paths, and future executable
 signatures stay in this client-side configuration/backend layer. They are never

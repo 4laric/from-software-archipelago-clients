@@ -72,45 +72,73 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         &mut self.backend
     }
 
-    pub fn poll_locations(&mut self, server_checked: &HashSet<i64>) -> Result<Vec<i64>> {
+    pub fn ledger(&self) -> &ReceiveLedger {
+        &self.ledger
+    }
+
+    /// Validate and durably bind the game context shared by every read or
+    /// mutation. `Ok(None)` is a normal non-gameplay transition; missing or
+    /// mismatched identity is an actionable refusal.
+    fn require_runtime_context(&mut self, operation: &str) -> Result<Option<String>> {
         let context = match self.backend.location_context() {
             Ok(Some(context)) => context,
             Ok(None) => {
+                anyhow::bail!("{operation} is disarmed: no validated gameplay/save identity");
+            }
+            Err(error) => return Err(error),
+        };
+        if !context.gameplay_ready {
+            return Ok(None);
+        }
+        let Some(expected) = self.config.expected_save_identity.as_deref() else {
+            anyhow::bail!("{operation} is disarmed: expected_save_identity is not configured");
+        };
+        if context.save_identity != expected {
+            anyhow::bail!(
+                "{operation} refused save identity {:?}; expected {:?}",
+                context.save_identity,
+                expected
+            );
+        }
+        let bound = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.bound_save_identity.as_deref());
+        if let Some(bound) = bound {
+            anyhow::ensure!(
+                bound == context.save_identity,
+                "{operation} refused save identity {:?}; AP slot is durably bound to {:?}",
+                context.save_identity,
+                bound
+            );
+        } else {
+            self.ledger
+                .slot_mut(&self.seed_name, &self.slot_name)
+                .bound_save_identity = Some(context.save_identity.clone());
+            self.ledger.save(&self.ledger_path)?;
+        }
+        Ok(Some(context.save_identity))
+    }
+
+    pub fn poll_locations(&mut self, server_checked: &HashSet<i64>) -> Result<Vec<i64>> {
+        let context_identity = match self.require_runtime_context("automatic location checks") {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
                 self.location_true_streaks.clear();
-                anyhow::bail!(
-                    "automatic location checks are disarmed: no validated gameplay/save identity"
-                );
+                return Ok(Vec::new());
             }
             Err(error) => {
                 self.location_true_streaks.clear();
                 return Err(error);
             }
         };
-        if !context.gameplay_ready {
-            self.location_true_streaks.clear();
-            return Ok(Vec::new());
-        }
-        let Some(expected) = self.config.expected_save_identity.as_deref() else {
-            self.location_true_streaks.clear();
-            anyhow::bail!(
-                "automatic location checks are disarmed: expected_save_identity is not configured"
-            );
-        };
-        if context.save_identity != expected {
-            self.location_true_streaks.clear();
-            anyhow::bail!(
-                "automatic location checks refused save identity {:?}; expected {:?}",
-                context.save_identity,
-                expected
-            );
-        }
         if self.config.location_check_debounce < 2 {
             self.location_true_streaks.clear();
             anyhow::bail!("location_check_debounce must be at least 2");
         }
-        if self.location_identity.as_deref() != Some(&context.save_identity) {
+        if self.location_identity.as_deref() != Some(&context_identity) {
             self.location_true_streaks.clear();
-            self.location_identity = Some(context.save_identity);
+            self.location_identity = Some(context_identity);
         }
 
         let mut newly_checked = Vec::new();
@@ -229,6 +257,12 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             index: next,
             ap_item_id,
         };
+        if self
+            .require_runtime_context("received-item delivery")?
+            .is_none()
+        {
+            return Ok(ItemPollResult::Pending);
+        }
 
         let mut pending = match self
             .ledger
@@ -366,6 +400,9 @@ mod tests {
             auto_upgrade: false,
             auto_equip: false,
             expected_save_identity: Some("mock-save".into()),
+            suppression_manifest: None,
+            installed_gameparam: None,
+            suppression: crate::config::SuppressionRequirement::default(),
             location_check_debounce: 3,
             mock_set_flags: vec![],
         }
@@ -385,7 +422,12 @@ mod tests {
         let ledger_path = path();
         let mut backend = MockBackend::default();
         backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
-        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path, config());
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
         assert!(client.poll_locations(&HashSet::new()).unwrap().is_empty());
         assert!(client.poll_locations(&HashSet::new()).unwrap().is_empty());
         assert_eq!(client.poll_locations(&HashSet::new()).unwrap(), vec![1000]);
@@ -396,6 +438,7 @@ mod tests {
         });
         let error = client.poll_locations(&HashSet::new()).unwrap_err();
         assert!(format!("{error:#}").contains("refused save identity"));
+        std::fs::remove_file(ledger_path).unwrap();
     }
 
     #[test]
@@ -414,7 +457,12 @@ mod tests {
         let ledger_path = path();
         let mut backend = MockBackend::default();
         backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
-        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path, config());
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
         assert!(client.poll_locations(&HashSet::new()).unwrap().is_empty());
         client.backend_mut().location_context = None;
         assert!(client.poll_locations(&HashSet::new()).is_err());
@@ -425,6 +473,117 @@ mod tests {
         assert!(client.poll_locations(&HashSet::new()).unwrap().is_empty());
         assert!(client.poll_locations(&HashSet::new()).unwrap().is_empty());
         assert_eq!(client.poll_locations(&HashSet::new()).unwrap(), vec![1000]);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn item_delivery_refuses_missing_or_mismatched_save_context_before_grant() {
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        for context in [
+            None,
+            Some(LocationContext {
+                save_identity: "wrong-save".into(),
+                gameplay_ready: true,
+            }),
+        ] {
+            let ledger_path = path();
+            let mut backend = MockBackend::default();
+            backend.location_context = context;
+            let mut client = loop_with(
+                backend,
+                ReceiveLedger::default(),
+                ledger_path.clone(),
+                config(),
+            );
+            assert!(client.poll_items(&received).is_err());
+            assert!(client.backend().grants.is_empty());
+            assert!(
+                client
+                    .ledger()
+                    .slot("seed", "slot")
+                    .is_none_or(|slot| slot.pending.is_none())
+            );
+            let _ = std::fs::remove_file(ledger_path);
+        }
+    }
+
+    #[test]
+    fn item_delivery_waits_without_mutation_outside_gameplay() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: false,
+        });
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path, config());
+        assert_eq!(
+            client
+                .poll_items(&[IncomingItem {
+                    index: 0,
+                    ap_item_id: 2000,
+                }])
+                .unwrap(),
+            ItemPollResult::Pending
+        );
+        assert!(client.backend().grants.is_empty());
+        assert!(client.ledger().slot("seed", "slot").is_none());
+    }
+
+    #[test]
+    fn durable_slot_binding_cannot_be_changed_by_config() {
+        let ledger_path = path();
+        let mut ledger = ReceiveLedger::default();
+        ledger.slot_mut("seed", "slot").bound_save_identity = Some("first-save".into());
+        let mut client = loop_with(MockBackend::default(), ledger, ledger_path, config());
+        let error = client
+            .poll_items(&[IncomingItem {
+                index: 0,
+                ap_item_id: 2000,
+            }])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("durably bound"));
+        assert!(client.backend().grants.is_empty());
+    }
+
+    #[test]
+    fn item_delivery_binds_save_identity_before_planning_or_granting() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .as_deref(),
+            Some("mock-save")
+        );
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        assert_eq!(
+            persisted
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .as_deref(),
+            Some("mock-save")
+        );
+        std::fs::remove_file(ledger_path).unwrap();
     }
 
     #[test]

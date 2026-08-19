@@ -19,6 +19,8 @@
   "auto_upgrade": false,
   "auto_equip": false,
   "expected_save_identity": "mock-save",
+  "suppression_manifest": null,
+  "installed_gameparam": null,
   "location_check_debounce": 3,
   "mock_set_flags": [52100000]
 }

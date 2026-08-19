@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::RUNTIME_BUILD;
 use crate::feed::{AttireSlot, EquipClass, FeedEffect};
@@ -37,6 +40,24 @@ const fn one() -> u32 {
 
 const fn default_location_check_debounce() -> u8 {
     3
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SuppressionRequirement {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub manifest_format: String,
+    #[serde(default)]
+    pub plan_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuppressionManifest {
+    format: String,
+    plan_sha256: String,
+    output_gameparam_sha256: String,
+    output_relative_path: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -87,10 +108,19 @@ pub struct RuntimeConfig {
     pub auto_upgrade: bool,
     #[serde(default)]
     pub auto_equip: bool,
-    /// Live location checks remain disarmed until the backend can prove that
-    /// it is reading the save the player explicitly bound to this config.
+    /// Both live checks and received-item mutation remain disarmed until the
+    /// backend proves that it is operating on this explicitly bound save.
     #[serde(default)]
     pub expected_save_identity: Option<String>,
+    /// Local build manifest produced by `build_vanilla_suppression.ps1`.
+    #[serde(default)]
+    pub suppression_manifest: Option<PathBuf>,
+    /// The binder actually loaded by the game, not the separate build output.
+    #[serde(default)]
+    pub installed_gameparam: Option<PathBuf>,
+    /// Seed-owned requirement. Local configuration cannot weaken this value.
+    #[serde(default)]
+    pub suppression: SuppressionRequirement,
     #[serde(default = "default_location_check_debounce")]
     pub location_check_debounce: u8,
     #[serde(default)]
@@ -165,12 +195,128 @@ impl RuntimeConfig {
                 .as_bool()
                 .context("slot_data.auto_equip must be a boolean")?;
         }
+        if let Some(value) = slot_data.get("suppression") {
+            self.suppression =
+                json::from_value(value.clone()).context("parsing slot_data.suppression")?;
+        }
+        let claims_suppression = self
+            .locations
+            .iter()
+            .any(|location| location.vanilla_award_suppressed);
+        anyhow::ensure!(
+            !claims_suppression || self.suppression.required,
+            "seed marks vanilla awards suppressed without requiring an installed binder witness"
+        );
+        if self.suppression.required {
+            anyhow::ensure!(
+                !self.suppression.manifest_format.is_empty(),
+                "required suppression manifest format is missing"
+            );
+            require_sha256("seed suppression plan", &self.suppression.plan_sha256)?;
+        }
         anyhow::ensure!(
             self.location_check_debounce >= 2,
             "location_check_debounce must be at least 2"
         );
         Ok(self)
     }
+
+    /// Prove that the binder the seed requires is the binder on disk at the
+    /// configured game path. The build manifest alone is not installation
+    /// evidence; the installed file is independently hashed here.
+    pub fn verify_suppression_install(&self) -> Result<Option<String>> {
+        if !self.suppression.required {
+            return Ok(None);
+        }
+        let manifest_path = self
+            .suppression_manifest
+            .as_deref()
+            .context("seed requires vanilla-award suppression; configure suppression_manifest")?;
+        let installed_path = self
+            .installed_gameparam
+            .as_deref()
+            .context("seed requires vanilla-award suppression; configure installed_gameparam")?;
+        let manifest_bytes = fs::read(manifest_path)
+            .with_context(|| format!("reading suppression manifest {}", manifest_path.display()))?;
+        let manifest: SuppressionManifest = json::from_slice(&manifest_bytes)
+            .with_context(|| format!("parsing suppression manifest {}", manifest_path.display()))?;
+        anyhow::ensure!(
+            manifest.format == self.suppression.manifest_format,
+            "suppression manifest format mismatch: expected {:?}, found {:?}",
+            self.suppression.manifest_format,
+            manifest.format
+        );
+        anyhow::ensure!(
+            manifest.plan_sha256 == self.suppression.plan_sha256,
+            "suppression plan mismatch: seed expects {}, manifest describes {}",
+            self.suppression.plan_sha256,
+            manifest.plan_sha256
+        );
+        anyhow::ensure!(
+            manifest.output_relative_path.replace('\\', "/")
+                == "param/gameparam/gameparam.parambnd.dcx",
+            "suppression manifest names unexpected output path {:?}",
+            manifest.output_relative_path
+        );
+        require_sha256(
+            "suppression manifest output",
+            &manifest.output_gameparam_sha256,
+        )?;
+        let installed_suffix = installed_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        anyhow::ensure!(
+            installed_suffix.ends_with("/param/gameparam/gameparam.parambnd.dcx"),
+            "installed_gameparam must name the game installation's param/gameparam/gameparam.parambnd.dcx"
+        );
+        if let Some(build_root) = manifest_path.parent() {
+            let build_output = build_root.join("gameparam.parambnd.dcx");
+            if build_output.exists() {
+                anyhow::ensure!(
+                    fs::canonicalize(&build_output)? != fs::canonicalize(installed_path)?,
+                    "installed_gameparam points to the separate build artifact, not the game installation"
+                );
+            }
+        }
+        let installed_hash = sha256_file(installed_path)?;
+        anyhow::ensure!(
+            installed_hash == manifest.output_gameparam_sha256,
+            "installed gameparam mismatch: expected {}, found {} at {}",
+            manifest.output_gameparam_sha256,
+            installed_hash,
+            installed_path.display()
+        );
+        Ok(Some(installed_hash))
+    }
+}
+
+fn require_sha256(label: &str, value: &str) -> Result<()> {
+    anyhow::ensure!(
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{label} SHA-256 must contain exactly 64 hexadecimal characters"
+    );
+    anyhow::ensure!(
+        value.bytes().all(|byte| !byte.is_ascii_uppercase()),
+        "{label} SHA-256 must use lowercase hexadecimal"
+    );
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -198,6 +344,9 @@ mod tests {
             auto_upgrade: false,
             auto_equip: false,
             expected_save_identity: Some("mock-save".into()),
+            suppression_manifest: None,
+            installed_gameparam: None,
+            suppression: SuppressionRequirement::default(),
             location_check_debounce: 3,
             mock_set_flags: vec![],
         }
@@ -269,6 +418,64 @@ mod tests {
             .unwrap();
         assert!(config.auto_upgrade);
         assert!(config.auto_equip);
+    }
+
+    #[test]
+    fn suppressed_location_requires_a_seed_owned_install_witness() {
+        let error = local()
+            .apply_slot_data(&json!({
+                "runtime_locations": {
+                    "1": {"event_flag": 2, "vanilla_award_suppressed": true}
+                }
+            }))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("without requiring"));
+    }
+
+    #[test]
+    fn installed_binder_must_match_the_seed_plan_and_manifest_output() {
+        let root =
+            std::env::temp_dir().join(format!("bb-suppression-witness-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let installed = root
+            .join("game-install")
+            .join("param")
+            .join("gameparam")
+            .join("gameparam.parambnd.dcx");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, b"verified suppressed binder").unwrap();
+        let output_hash = sha256_file(&installed).unwrap();
+        let plan_hash = "1".repeat(64);
+        let manifest = root.join("build-manifest.json");
+        fs::write(
+            &manifest,
+            json::to_vec_pretty(&json!({
+                "format": "bb-vanilla-suppression-build-v1",
+                "plan_sha256": plan_hash,
+                "output_gameparam_sha256": output_hash,
+                "output_relative_path": "param/gameparam/gameparam.parambnd.dcx",
+                "installed": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = local();
+        config.suppression_manifest = Some(manifest);
+        config.installed_gameparam = Some(installed.clone());
+        config.suppression = SuppressionRequirement {
+            required: true,
+            manifest_format: "bb-vanilla-suppression-build-v1".into(),
+            plan_sha256: "1".repeat(64),
+        };
+        assert_eq!(
+            config.verify_suppression_install().unwrap(),
+            Some(sha256_file(&installed).unwrap())
+        );
+        fs::write(&installed, b"not the built binder").unwrap();
+        let error = config.verify_suppression_install().unwrap_err();
+        assert!(format!("{error:#}").contains("installed gameparam mismatch"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

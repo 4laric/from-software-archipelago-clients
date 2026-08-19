@@ -14,6 +14,10 @@ pub struct ReceiveLedger {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SlotLedger {
+    /// Stable game-save identity bound to this AP seed/slot. Older ledgers bind
+    /// on their first validated runtime context before any game mutation.
+    #[serde(default)]
+    pub bound_save_identity: Option<String>,
     pub highest_processed_index: Option<u64>,
     pub acknowledged: BTreeMap<u64, AcknowledgedItem>,
     #[serde(default)]

@@ -39,9 +39,9 @@ pub enum OperationProgress {
 }
 
 pub trait BloodborneBackend {
-    /// Returns a validated live-play/save identity, or `None` when automatic
-    /// location reporting must abstain. A raw event-flag read is not enough to
-    /// prove that the process currently contains the intended character save.
+    /// Returns a validated live-play/save identity, or `None` when every game
+    /// read and mutation must abstain. A process handle or raw event-flag read
+    /// is not enough to prove that the intended character save is loaded.
     fn location_context(&mut self) -> Result<Option<LocationContext>>;
     /// `None` means the live accessor is not available, never "flag is false".
     fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>>;
