@@ -177,10 +177,12 @@ pub fn poll_hand_ins() {
         return;
     }
 
-    let notices: Vec<String> = set_now
-        .into_iter()
-        .filter_map(|(flag, name)| observed.insert(flag).then(|| vanilla_stock_toast(name)))
-        .collect();
+    let mut notices = Vec::new();
+    for (flag, name) in set_now {
+        if observed.insert(flag) {
+            notices.push(vanilla_stock_toast(name));
+        }
+    }
     drop(observed_guard);
     if let Ok(mut pending) = PENDING.lock() {
         pending.extend(notices);
