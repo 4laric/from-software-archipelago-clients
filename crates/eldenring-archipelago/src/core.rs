@@ -108,6 +108,13 @@ pub struct Core {
     my_name: Option<String>,
     save_path: Option<PathBuf>,
     save_loaded: bool,
+    /// Persisted per seed: a genuinely fresh starting class has had Left2/3 unequipped for the
+    /// auto-equip challenge's one-left-slot policy (#441). Legacy saves load this as true so an
+    /// upgrade never touches a returning player's curated loadout.
+    starting_left_slots_normalized: bool,
+    /// A fresh-character verdict was observed and the loadout normalization is still owed. Kept
+    /// separately so a restart after the in-save marker commits does not lose the work.
+    starting_left_slots_pending: bool,
     last_persisted_index: i64,
     valid_locations: HashSet<i64>,
     locations_loaded: bool,
@@ -537,6 +544,8 @@ impl shared::Core for Core {
             my_name: None,
             save_path: None,
             save_loaded: false,
+            starting_left_slots_normalized: false,
+            starting_left_slots_pending: false,
             last_persisted_index: -1,
             valid_locations: HashSet::new(),
             locations_loaded: false,
@@ -1885,6 +1894,8 @@ impl shared::Core for Core {
                 // er_logic::flagpoll_baseline_replay::effective_baseline (host-tested).
                 self.flag_poll_baseline = st.flag_poll_baseline.iter().copied().collect();
                 self.flag_poll_baseline_done = !self.flag_poll_baseline.is_empty();
+                self.starting_left_slots_normalized = st.starting_left_slots_normalized;
+                self.starting_left_slots_pending = st.starting_left_slots_pending;
                 self.last_persisted_index = st.last_received_index;
                 log::info!("save persistence armed at {}", path.display());
                 self.save_path = Some(path);
@@ -1962,6 +1973,38 @@ impl shared::Core for Core {
                 || self
                     .in_world_since
                     .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(8));
+            // #441: normalize ONLY a genuinely fresh character. A missing sidecar file is not
+            // enough evidence: the save-embedded marker/reconciler decides fresh vs returning.
+            // The pure action also preserves an explicit pending debt across a restart after that
+            // marker has changed from Fresh to Resume.
+            match er_logic::auto_equip::starting_left_init_action(
+                self.starting_left_slots_normalized,
+                self.starting_left_slots_pending,
+                crate::reconcile_io::fresh_character_verdict(),
+                crate::auto_equip::is_armed(),
+                has_inv && start_items_settled,
+            ) {
+                er_logic::auto_equip::StartingLeftInitAction::Wait => {}
+                er_logic::auto_equip::StartingLeftInitAction::Arm => {
+                    // Persist debt before the in-save marker can turn Fresh into Resume.
+                    self.starting_left_slots_pending = true;
+                    self.write_save();
+                }
+                er_logic::auto_equip::StartingLeftInitAction::Attempt => {
+                    // Copy the game's live unarmed representation and settle only after read-back.
+                    if crate::auto_equip::normalize_starting_left_slots().is_some() {
+                        self.starting_left_slots_pending = false;
+                        self.starting_left_slots_normalized = true;
+                        self.write_save();
+                    }
+                }
+                er_logic::auto_equip::StartingLeftInitAction::PreserveAndSettle => {
+                    // Returning character or option off: never touch manually curated equipment.
+                    self.starting_left_slots_pending = false;
+                    self.starting_left_slots_normalized = true;
+                    self.write_save();
+                }
+            }
             let mut did_flags = false;
             if let Some(sc) = self.start.as_ref() {
                 // Gate start FLAGS on a loaded world (has_inventory), not just CSEventFlagMan being
@@ -4403,6 +4446,9 @@ impl Core {
         self.slot_data_parsed = false;
         self.save_path = None;
         self.save_loaded = false;
+        self.starting_left_slots_normalized = false;
+        self.starting_left_slots_pending = false;
+        crate::reconcile_io::reset_fresh_character_verdict();
         self.last_persisted_index = -1;
         self.valid_locations.clear();
         self.locations_loaded = false;
@@ -5378,6 +5424,8 @@ impl Core {
             last_received_index: self.received_through as i64,
             flag_poll_baseline: self.flag_poll_baseline.iter().copied().collect(),
             notify_granted: Default::default(),
+            starting_left_slots_normalized: self.starting_left_slots_normalized,
+            starting_left_slots_pending: self.starting_left_slots_pending,
             progressive_counter: counter.into_iter().collect::<BTreeMap<_, _>>(),
             progressive_high_index: high,
         };

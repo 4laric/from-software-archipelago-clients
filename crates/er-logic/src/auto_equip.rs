@@ -38,6 +38,10 @@ const CATEGORY_ACCESSORY: u32 = 0x2000_0000;
 /// which is exactly why these are NOT `15 + n`.
 pub const SLOT_WEAPON_LEFT_1: u32 = 0;
 pub const SLOT_WEAPON_RIGHT_1: u32 = 1;
+pub const SLOT_WEAPON_LEFT_2: u32 = 2;
+pub const SLOT_WEAPON_RIGHT_2: u32 = 3;
+pub const SLOT_WEAPON_LEFT_3: u32 = 4;
+pub const SLOT_WEAPON_RIGHT_3: u32 = 5;
 pub const SLOT_PROTECTOR_HEAD: u32 = 12;
 pub const SLOT_PROTECTOR_CHEST: u32 = 13;
 pub const SLOT_PROTECTOR_HANDS: u32 = 14;
@@ -66,6 +70,118 @@ pub const ACCESSORY_SLOTS: [u32; 4] = [
     SLOT_ACCESSORY_3,
     SLOT_ACCESSORY_4,
 ];
+
+/// All six armament slots in `ChrAsmSlot` order.
+pub const WEAPON_SLOTS: [u32; 6] = [
+    SLOT_WEAPON_LEFT_1,
+    SLOT_WEAPON_RIGHT_1,
+    SLOT_WEAPON_LEFT_2,
+    SLOT_WEAPON_RIGHT_2,
+    SLOT_WEAPON_LEFT_3,
+    SLOT_WEAPON_RIGHT_3,
+];
+
+/// The two reserve left-hand slots the one-left-slot challenge policy clears at fresh-loadout
+/// initialization (#441).
+pub const LEFT_RESERVE_SLOTS: [u32; 2] = [SLOT_WEAPON_LEFT_2, SLOT_WEAPON_LEFT_3];
+
+/// Param row the live `ChrAsm` uses for an empty armament slot on 2.6.2.0.
+///
+/// This is observed game state, not an invented sentinel: the live dump cited above read 110000
+/// in every idle hand slot. The I/O caller still copies the complete representation from a live
+/// slot that carries this row; this constant is only the predicate that locates that source.
+pub const UNARMED_WEAPON_PARAM_ID: i32 = 110_000;
+
+/// Pure plan for normalizing a starting class to the challenge's one active left-hand slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartingLeftCleanupPlan {
+    /// Live slot whose complete unarmed representation should be copied to `clear_slots`.
+    /// `None` when no reserve slot needs clearing.
+    pub unarmed_source: Option<u32>,
+    /// Populated reserve left slots to unequip back to the inventory.
+    pub clear_slots: Vec<u32>,
+    /// Whether the active left-hand selector must be returned to Left1.
+    pub reset_selector: bool,
+}
+
+/// Why a fresh starting loadout could not be normalized this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartingLeftCleanupError {
+    /// At least one reserve left slot is populated, but none of the six live armament slots carries
+    /// the game's unarmed representation. Refuse rather than construct a handle from guessed bits.
+    NoUnarmedSource,
+}
+
+/// Per-seed control action for the fresh-loadout cleanup. Kept pure so a missing sidecar cannot be
+/// mistaken for a fresh character by the Windows glue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartingLeftInitAction {
+    /// No state change this tick.
+    Wait,
+    /// Persist cleanup debt before the save-embedded marker can turn Fresh into Resume.
+    Arm,
+    /// The inventory is settled; attempt the live normalization and settle only on read-back.
+    Attempt,
+    /// Mark complete without touching equipment (returning character, or option off).
+    PreserveAndSettle,
+}
+
+/// Decide the one-time fresh-loadout state transition.
+pub fn starting_left_init_action(
+    normalized: bool,
+    pending: bool,
+    fresh_character: Option<bool>,
+    auto_equip_on: bool,
+    inventory_settled: bool,
+) -> StartingLeftInitAction {
+    if normalized {
+        return StartingLeftInitAction::Wait;
+    }
+    if pending {
+        if !auto_equip_on {
+            return StartingLeftInitAction::PreserveAndSettle;
+        }
+        return if inventory_settled {
+            StartingLeftInitAction::Attempt
+        } else {
+            StartingLeftInitAction::Wait
+        };
+    }
+    match fresh_character {
+        None => StartingLeftInitAction::Wait,
+        Some(_) if !auto_equip_on => StartingLeftInitAction::PreserveAndSettle,
+        Some(true) => StartingLeftInitAction::Arm,
+        Some(false) => StartingLeftInitAction::PreserveAndSettle,
+    }
+}
+
+/// Decide how to enforce one active left-hand slot on a fresh starting loadout.
+///
+/// `worn` is slots 0..=5 in `ChrAsmSlot` order. Right-hand contents are only eligible to provide a
+/// known-good unarmed representation; they are never returned as clear targets and are unchanged.
+pub fn starting_left_cleanup_plan(
+    worn: [i32; 6],
+    selected_left_slot: u32,
+) -> Result<StartingLeftCleanupPlan, StartingLeftCleanupError> {
+    let clear_slots: Vec<u32> = LEFT_RESERVE_SLOTS
+        .into_iter()
+        .filter(|&slot| worn[slot as usize] != UNARMED_WEAPON_PARAM_ID)
+        .collect();
+    let unarmed_source = if clear_slots.is_empty() {
+        None
+    } else {
+        WEAPON_SLOTS
+            .into_iter()
+            .find(|&slot| worn[slot as usize] == UNARMED_WEAPON_PARAM_ID)
+            .ok_or(StartingLeftCleanupError::NoUnarmedSource)
+            .map(Some)?
+    };
+    Ok(StartingLeftCleanupPlan {
+        unarmed_source,
+        clear_slots,
+        reset_selector: selected_left_slot != 0,
+    })
+}
 
 /// Which primary hand a received weapon should occupy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,10 +339,10 @@ pub fn is_weapon(full_id: i32) -> bool {
 /// "you may equip the Sentinel Torch (left-hand slot 2) only to fight the Invisible Black Knife
 /// Assassin" -- which is a permission during a fight, not an auto-equip rule. Left where it was.
 ///
-/// ⚠️ ONE SLOT, LAST WRITER WINS. There is a single `SLOT_WEAPON_LEFT_1`, so a received staff
-/// clobbers a received shield. That is faithful to "no unequipping allowed" and is not a bug here.
-/// The ruleset's torch clause shows a left-hand slot 2 exists in their model, but its `ChrAsmSlot`
-/// index is NOT verified and this file will not guess one (same reason ammo returns `None`).
+/// ⭐ ONE SLOT, LAST WRITER WINS (#441 ruling, 2026-08-19). A received staff replaces a received
+/// shield in `SLOT_WEAPON_LEFT_1`; auto-equip never fills Left2/3. Their indices are now verified
+/// from the pinned `ChrAsmSlot` enum only so fresh starting-class loadouts can be normalized by
+/// [`starting_left_cleanup_plan`], not so received items can route there.
 ///
 /// (Datamine-confirmed is still not runtime-confirmed -- no live equip has been read back.)
 const LEFT_HAND_WEP_TYPES: &[u16] = &[50, 51, 53, 55, 56, 57, 61, 65, 67, 69];
@@ -629,6 +745,116 @@ mod tests {
     fn weapon_slots_follow_the_hand() {
         assert_eq!(slot_for_wep_type(67), Some(SLOT_WEAPON_LEFT_1));
         assert_eq!(slot_for_wep_type(1), Some(SLOT_WEAPON_RIGHT_1));
+    }
+
+    #[test]
+    fn starting_class_reserve_left_slots_are_cleared_but_right_slots_are_not() {
+        // #441 ruling: the challenge has one active left-hand slot. A starting class may populate
+        // Left2/3, but the corresponding right slots are outside the cleanup policy.
+        let worn = [
+            31_330_000,
+            20_000_000,
+            33_090_000,
+            21_000_000,
+            41_000_000,
+            UNARMED_WEAPON_PARAM_ID,
+        ];
+        let plan = starting_left_cleanup_plan(worn, 2).unwrap();
+        assert_eq!(
+            plan.clear_slots,
+            vec![SLOT_WEAPON_LEFT_2, SLOT_WEAPON_LEFT_3]
+        );
+        assert_eq!(plan.unarmed_source, Some(SLOT_WEAPON_RIGHT_3));
+        assert!(plan.reset_selector);
+        assert!(!plan.clear_slots.contains(&SLOT_WEAPON_RIGHT_2));
+        assert!(!plan.clear_slots.contains(&SLOT_WEAPON_RIGHT_3));
+    }
+
+    #[test]
+    fn an_already_single_left_loadout_is_a_noop() {
+        let worn = [
+            31_330_000,
+            20_000_000,
+            UNARMED_WEAPON_PARAM_ID,
+            21_000_000,
+            UNARMED_WEAPON_PARAM_ID,
+            22_000_000,
+        ];
+        let plan = starting_left_cleanup_plan(worn, 0).unwrap();
+        assert!(plan.clear_slots.is_empty());
+        assert_eq!(plan.unarmed_source, None);
+        assert!(!plan.reset_selector);
+    }
+
+    #[test]
+    fn a_non_primary_left_selector_is_normalized_even_when_reserves_are_empty() {
+        let worn = [
+            31_330_000,
+            20_000_000,
+            UNARMED_WEAPON_PARAM_ID,
+            21_000_000,
+            UNARMED_WEAPON_PARAM_ID,
+            22_000_000,
+        ];
+        let plan = starting_left_cleanup_plan(worn, 1).unwrap();
+        assert!(plan.clear_slots.is_empty());
+        assert_eq!(plan.unarmed_source, None);
+        assert!(plan.reset_selector);
+    }
+
+    #[test]
+    fn a_full_six_slot_loadout_is_refused_not_cleared_with_a_guessed_handle() {
+        let err = starting_left_cleanup_plan([1, 2, 3, 4, 5, 6], 0).unwrap_err();
+        assert_eq!(err, StartingLeftCleanupError::NoUnarmedSource);
+    }
+
+    #[test]
+    fn missing_sidecar_waits_for_the_save_embedded_fresh_verdict() {
+        assert_eq!(
+            starting_left_init_action(false, false, None, true, true),
+            StartingLeftInitAction::Wait
+        );
+        assert_eq!(
+            starting_left_init_action(false, false, Some(false), true, true),
+            StartingLeftInitAction::PreserveAndSettle,
+            "a returning character's manually curated Left2/3 must survive"
+        );
+    }
+
+    #[test]
+    fn fresh_cleanup_debt_survives_the_marker_changing_to_resume() {
+        assert_eq!(
+            starting_left_init_action(false, false, Some(true), true, false),
+            StartingLeftInitAction::Arm
+        );
+        assert_eq!(
+            starting_left_init_action(false, true, Some(false), true, false),
+            StartingLeftInitAction::Wait,
+            "the explicit pending bit, not the later marker verdict, owns the retry"
+        );
+        assert_eq!(
+            starting_left_init_action(false, true, Some(false), true, true),
+            StartingLeftInitAction::Attempt
+        );
+    }
+
+    #[test]
+    fn option_off_settles_without_touching_a_loadout() {
+        for fresh in [None, Some(false), Some(true)] {
+            let expected = if fresh.is_none() {
+                StartingLeftInitAction::Wait
+            } else {
+                StartingLeftInitAction::PreserveAndSettle
+            };
+            assert_eq!(
+                starting_left_init_action(false, false, fresh, false, true),
+                expected
+            );
+        }
+        assert_eq!(
+            starting_left_init_action(false, true, Some(false), false, true),
+            StartingLeftInitAction::PreserveAndSettle
+        );
     }
 
     /// The bug, by name: a bolt reached SLOT_WEAPON_RIGHT_1 in boblerrr's 2026-08-03 log because

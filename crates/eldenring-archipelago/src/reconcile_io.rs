@@ -84,6 +84,28 @@ use serde::{Deserialize, Serialize};
 /// inferring identity from `play_time`. Band verified in-game 2026-07-21 (the `!markerprobe` pass).
 const MARKER_BAND: FlagBand = FlagBand::PLACEHOLDER;
 
+// Session-init verdict exported for one-time fresh-loadout work (#441). 0 = not initialized or
+// refused, 1 = returning character, 2 = genuinely fresh character. Atomic because the consumer is
+// a later phase of the same game-thread tick; no lock or payload is needed.
+static FRESH_CHARACTER_VERDICT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether reconciler initialization proved this is a genuinely fresh character.
+///
+/// `None` means initialization has not settled or the save was refused. Callers must wait rather
+/// than guessing from a missing sidecar file.
+pub fn fresh_character_verdict() -> Option<bool> {
+    match FRESH_CHARACTER_VERDICT.load(Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// Clear the per-session verdict before a different seed is initialized.
+pub fn reset_fresh_character_verdict() {
+    FRESH_CHARACTER_VERDICT.store(0, Ordering::Relaxed);
+}
+
 /// SENTINEL flag id used for the folded-in goal-send (Gap 1). `core::build_desired_inputs` sets
 /// `SlotData.goal_flag = Some(GOAL_SENTINEL_FLAG)` and `goal_met` from the live goal predicate, so the
 /// PURE desired state carries the goal as a first-class target (proven in `er_logic::reconcile`).
@@ -1017,6 +1039,7 @@ fn apply_classes() -> ApplyClasses {
 /// INTEGRATION: call this from the reconstructed `core.rs` once per session, after the per-seed
 /// `DesiredInputs` are built AND the world is loaded (`has_inventory() && in_world()`).
 pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_through: i64) {
+    reset_fresh_character_verdict();
     log::info!("[reconcile] mode: {}", mode_desc());
     let b = paced_budget();
     log::info!(
@@ -1082,6 +1105,7 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
             )
         }
     };
+    FRESH_CHARACTER_VERDICT.store(if fresh_character { 2 } else { 1 }, Ordering::Relaxed);
     // [reattach] ONE-BLOCK STATE DUMP (2026-08-01). Every reattach incident so far has cost three
     // rounds of theory because the log carried the inputs to the decision but not the decision's
     // whole context. This is every fact that governs "what has already been delivered to THIS
