@@ -252,6 +252,10 @@ pub struct SlotData {
     /// owned). Ignored when it is off. The client pre-resolves the base (+DLC) list.
     pub reveal_all_maps: bool,
     pub map_reveal_flags: Vec<FlagId>,
+    /// Flags implied by slot-data start items (currently whetblade obtained/affinity flags).
+    /// Desired-SET, self-healing, and not owned. Included randomized checks have already moved to
+    /// client-owned flags; excluded vanilla lots intentionally despawn from these obtained flags.
+    pub start_item_flags: Vec<FlagId>,
     /// Slot-data START ITEMS: ledgered ONCE per save at the [`START_ITEM_INDEX_BASE`] negative band.
     pub start_items: Vec<StartItem>,
     /// GOAL-SEND: when `goal_met` is true this flag becomes desired-SET. The Windows glue maps the
@@ -336,6 +340,9 @@ impl DesiredState {
             for &f in &inputs.slot_data.map_reveal_flags {
                 d.flags.insert(f, true);
             }
+        }
+        for &f in &inputs.slot_data.start_item_flags {
+            d.flags.insert(f, true);
         }
         if inputs.slot_data.goal_met {
             if let Some(f) = inputs.slot_data.goal_flag {
@@ -3520,12 +3527,14 @@ mod tests {
 
     #[test]
     fn bulk_grants_reach_desired_end_to_end_and_only_start_items_are_goods() {
-        // One of every bulk class at once: graces + map flags + goal flag SET; start item LEDGERED.
+        // One of every bulk class at once: graces + map/start-item/goal flags SET; start item
+        // LEDGERED.
         let sd = SlotData {
             start_graces: vec![76900],
             always_map_flags: vec![82001],
             reveal_all_maps: true,
             map_reveal_flags: vec![62010],
+            start_item_flags: vec![65720],
             start_items: vec![StartItem {
                 full_id: 130,
                 qty: 1,
@@ -3537,7 +3546,7 @@ mod tests {
         let mut g = MockGame::stable();
         let mut r = Reconciler::new(bulk_inputs(sd));
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        for f in [76900u32, 82001, 62010, 9700] {
+        for f in [76900u32, 82001, 62010, 65720, 9700] {
             assert!(g.get_flag(f), "bulk flag {f} set");
         }
         assert!(

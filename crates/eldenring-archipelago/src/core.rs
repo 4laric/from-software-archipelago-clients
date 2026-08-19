@@ -4309,6 +4309,9 @@ impl Core {
             map_reveal_flags: sc
                 .map(crate::startgrants::reveal_flags_for)
                 .unwrap_or_default(),
+            start_item_flags: sc
+                .map(|s| er_logic::whetblade::start_item_affinity_flags(&s.start_items))
+                .unwrap_or_default(),
             start_items: sc
                 .map(|s| {
                     s.start_items
