@@ -145,6 +145,25 @@ impl FileBridge {
             >= timeout)
     }
 
+    /// Remove only the command acknowledged by a matching durable state. This
+    /// closes the crash window where the harness wrote `completed` but exited
+    /// before it could unlink the command file.
+    pub fn acknowledge_command(&self, tag: &str) -> Result<()> {
+        let path = self.command_path();
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        anyhow::ensure!(
+            text.split_whitespace().last() == Some(tag),
+            "refusing to acknowledge a grant command for a different tag"
+        );
+        fs::remove_file(&path).with_context(|| format!("removing acknowledged {}", path.display()))
+    }
+
     pub fn read_state(&self) -> Result<BridgeState> {
         parse_state_file(&self.state_path())
     }
@@ -261,6 +280,18 @@ mod tests {
         bridge.enqueue(&pebble()).unwrap();
         assert!(bridge.command_is_stale(Duration::ZERO).unwrap());
         assert!(!bridge.command_is_stale(Duration::from_secs(30)).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acknowledges_only_the_matching_command() {
+        let root = temp_root("ack");
+        let bridge = FileBridge::new(&root);
+        bridge.enqueue(&pebble()).unwrap();
+        assert!(bridge.acknowledge_command("received_18").is_err());
+        assert!(bridge.command_pending());
+        bridge.acknowledge_command("received_17").unwrap();
+        assert!(!bridge.command_pending());
         fs::remove_dir_all(root).unwrap();
     }
 }

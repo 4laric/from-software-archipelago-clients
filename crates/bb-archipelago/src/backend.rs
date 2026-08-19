@@ -52,6 +52,7 @@ impl BloodborneBackend for FileBackend {
         state.require_compatible()?;
         if state.concerns_tag(&grant.tag) {
             if state.is_success() {
+                self.bridge.acknowledge_command(&grant.tag)?;
                 return Ok(GrantProgress::Complete);
             }
             anyhow::ensure!(
