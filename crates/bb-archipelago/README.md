@@ -15,6 +15,11 @@ The first bridge contract supports received-item grants:
 - The client advances its durable received-item watermark only after observing
   a terminal success state and an absent command file.
 
+The current bridge contract is `BBGRANT1` with harness
+`bb-native-grant-v3`. Both tokens must appear in the harness state before the
+client publishes a command. A terminal harness failure blocks that AP item with
+a bounded diagnostic while location polling and the server connection continue.
+
 Item-ID mappings and location checks are deliberately not hard-coded here yet.
 The local rows are only a migration/test fallback. On connect, the apworld's
 `runtime_locations` and `runtime_items` slot-data tables replace them. Malformed

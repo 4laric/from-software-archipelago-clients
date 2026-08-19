@@ -48,11 +48,19 @@ impl BloodborneBackend for FileBackend {
         if self.bridge.command_pending() {
             return Ok(GrantProgress::Pending);
         }
-        if let Ok(state) = self.bridge.read_state()
-            && state.is_success()
-            && state.detail.contains(&format!("tag={}", grant.tag))
-        {
-            return Ok(GrantProgress::Complete);
+        let state = self.bridge.read_state()?;
+        state.require_compatible()?;
+        if state.concerns_tag(&grant.tag) {
+            if state.is_success() {
+                return Ok(GrantProgress::Complete);
+            }
+            anyhow::ensure!(
+                !state.is_terminal_failure(),
+                "grant {} failed in harness: {} ({})",
+                grant.tag,
+                state.status,
+                state.detail
+            );
         }
         // Observed category-4 goods use normalized 0x4....... and raw 0xB....... .
         let raw_id = grant.normalized_item_id | 0x7000_0000;

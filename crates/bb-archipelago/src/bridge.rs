@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+pub const BRIDGE_PROTOCOL: &str = "BBGRANT1";
+pub const HARNESS_VERSION: &str = "bb-native-grant-v3";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GrantCommand {
     pub raw_id: u32,
@@ -22,7 +25,7 @@ impl GrantCommand {
             bail!("grant tag must be one non-empty token");
         }
         Ok(format!(
-            "GRANT 0x{:08X} 0x{:08X} {} {} {}",
+            "{BRIDGE_PROTOCOL} GRANT 0x{:08X} 0x{:08X} {} {} {}",
             self.raw_id, self.normalized_id, self.quantity, self.expected_before, self.tag
         ))
     }
@@ -30,6 +33,8 @@ impl GrantCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeState {
+    pub protocol: Option<String>,
+    pub harness: Option<String>,
     pub status: String,
     pub pid: Option<u32>,
     pub detail: String,
@@ -38,6 +43,32 @@ pub struct BridgeState {
 impl BridgeState {
     pub fn is_success(&self) -> bool {
         matches!(self.status.as_str(), "completed" | "recovered_complete")
+    }
+
+    pub fn require_compatible(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.protocol.as_deref() == Some(BRIDGE_PROTOCOL),
+            "grant bridge protocol mismatch: expected {BRIDGE_PROTOCOL}, found {}",
+            self.protocol.as_deref().unwrap_or("missing")
+        );
+        anyhow::ensure!(
+            self.harness.as_deref() == Some(HARNESS_VERSION),
+            "grant harness mismatch: expected {HARNESS_VERSION}, found {}",
+            self.harness.as_deref().unwrap_or("missing")
+        );
+        Ok(())
+    }
+
+    pub fn concerns_tag(&self, tag: &str) -> bool {
+        let wanted = format!("tag={tag}");
+        self.detail.split_whitespace().any(|part| part == wanted)
+    }
+
+    pub fn is_terminal_failure(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "failed" | "command_rejected" | "quantity_mismatch" | "setup_error" | "write_error"
+        )
     }
 }
 
@@ -98,6 +129,8 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading bridge state {}", path.display()))?;
     let mut status = None;
+    let mut protocol = None;
+    let mut harness = None;
     let mut pid = None;
     let mut detail = String::new();
     for line in text.lines() {
@@ -105,6 +138,8 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
             continue;
         };
         match key {
+            "protocol" => protocol = Some(value.to_owned()),
+            "harness" => harness = Some(value.to_owned()),
             "status" => status = Some(value.to_owned()),
             "pid" if !value.is_empty() => {
                 pid = Some(value.parse().context("invalid bridge pid")?);
@@ -114,6 +149,8 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
         }
     }
     Ok(BridgeState {
+        protocol,
+        harness,
         status: status.context("bridge state has no status")?,
         pid,
         detail,
@@ -153,7 +190,7 @@ mod tests {
         bridge.enqueue(&pebble()).unwrap();
         assert_eq!(
             fs::read_to_string(bridge.command_path()).unwrap(),
-            "GRANT 0xB00004CE 0x400004CE 1 2 received_17"
+            "BBGRANT1 GRANT 0xB00004CE 0x400004CE 1 2 received_17"
         );
         assert!(bridge.enqueue(&pebble()).is_err());
         fs::remove_dir_all(root).unwrap();
@@ -165,12 +202,26 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("native-grant-state.txt"),
-            "status=completed\npid=5040\ndetail=tag=received_17 direct before=2 after=3\n",
+            "protocol=BBGRANT1\nharness=bb-native-grant-v3\nstatus=completed\npid=5040\ndetail=tag=received_17 direct before=2 after=3\n",
         )
         .unwrap();
         let state = FileBridge::new(&root).read_state().unwrap();
         assert!(state.is_success());
+        state.require_compatible().unwrap();
+        assert!(state.concerns_tag("received_17"));
         assert_eq!(state.pid, Some(5040));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_an_old_or_unversioned_harness() {
+        let state = BridgeState {
+            protocol: None,
+            harness: Some("bb-native-grant-v2".into()),
+            status: "awaiting_inventory".into(),
+            pid: Some(1),
+            detail: String::new(),
+        };
+        assert!(state.require_compatible().is_err());
     }
 }

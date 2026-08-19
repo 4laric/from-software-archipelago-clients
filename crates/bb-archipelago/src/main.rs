@@ -113,6 +113,7 @@ fn main() -> Result<()> {
         Connection::<json::Value>::new(args.server, args.slot.clone(), Some("Bloodborne"), options);
     let mut runtime = None;
     let mut last_location_error: Option<(String, Instant)> = None;
+    let mut last_item_error: Option<(String, Instant)> = None;
 
     loop {
         let mut connected_now = false;
@@ -191,8 +192,24 @@ fn main() -> Result<()> {
                     ap_item_id: item.item().id(),
                 })
                 .collect::<Vec<_>>();
-            if runtime.poll_items(&received)? {
-                eprintln!("Acknowledged one received item.");
+            match runtime.poll_items(&received) {
+                Ok(true) => {
+                    if last_item_error.take().is_some() {
+                        eprintln!("Bloodborne item delivery recovered.");
+                    }
+                    eprintln!("Acknowledged one received item.");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let report = last_item_error.as_ref().is_none_or(|(previous, when)| {
+                        previous != &message || when.elapsed() >= Duration::from_secs(10)
+                    });
+                    if report {
+                        eprintln!("Bloodborne item delivery blocked: {message}");
+                        last_item_error = Some((message, Instant::now()));
+                    }
+                }
             }
         }
 
