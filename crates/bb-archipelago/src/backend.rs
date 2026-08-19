@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::bridge::{FileBridge, GrantCommand};
 use crate::event_flags::LiveEventFlags;
+
+const GRANT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoodsGrant {
@@ -45,9 +48,6 @@ impl BloodborneBackend for FileBackend {
     }
 
     fn grant_category4_goods(&mut self, grant: &GoodsGrant) -> Result<GrantProgress> {
-        if self.bridge.command_pending() {
-            return Ok(GrantProgress::Pending);
-        }
         let state = self.bridge.read_state()?;
         state.require_compatible()?;
         if state.concerns_tag(&grant.tag) {
@@ -62,13 +62,22 @@ impl BloodborneBackend for FileBackend {
                 state.detail
             );
         }
+        if self.bridge.command_pending() {
+            anyhow::ensure!(
+                !self.bridge.command_is_stale(GRANT_COMMAND_TIMEOUT)?,
+                "grant {} timed out after {} seconds; command left in place for diagnosis",
+                grant.tag,
+                GRANT_COMMAND_TIMEOUT.as_secs()
+            );
+            return Ok(GrantProgress::Pending);
+        }
         // Observed category-4 goods use normalized 0x4....... and raw 0xB....... .
         let raw_id = grant.normalized_item_id | 0x7000_0000;
         self.bridge.enqueue(&GrantCommand {
             raw_id,
             normalized_id: grant.normalized_item_id,
             quantity: grant.quantity,
-            expected_before: grant.expected_before,
+            expected_before: None,
             tag: grant.tag.clone(),
         })?;
         Ok(GrantProgress::Pending)

@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
@@ -12,7 +13,10 @@ pub struct GrantCommand {
     pub raw_id: u32,
     pub normalized_id: u32,
     pub quantity: u32,
-    pub expected_before: u32,
+    /// `None` asks the harness to sample and durably record the live baseline
+    /// before executing. That baseline makes restart recovery decidable even
+    /// when vanilla inventory already contains the same consumable.
+    pub expected_before: Option<u32>,
     pub tag: String,
 }
 
@@ -24,9 +28,12 @@ impl GrantCommand {
         if self.tag.is_empty() || self.tag.chars().any(char::is_whitespace) {
             bail!("grant tag must be one non-empty token");
         }
+        let expected = self
+            .expected_before
+            .map_or_else(|| "AUTO".to_owned(), |value| value.to_string());
         Ok(format!(
             "{BRIDGE_PROTOCOL} GRANT 0x{:08X} 0x{:08X} {} {} {}",
-            self.raw_id, self.normalized_id, self.quantity, self.expected_before, self.tag
+            self.raw_id, self.normalized_id, self.quantity, expected, self.tag
         ))
     }
 }
@@ -37,6 +44,7 @@ pub struct BridgeState {
     pub harness: Option<String>,
     pub status: String,
     pub pid: Option<u32>,
+    pub tag: Option<String>,
     pub detail: String,
 }
 
@@ -60,8 +68,10 @@ impl BridgeState {
     }
 
     pub fn concerns_tag(&self, tag: &str) -> bool {
-        let wanted = format!("tag={tag}");
-        self.detail.split_whitespace().any(|part| part == wanted)
+        self.tag.as_deref() == Some(tag) || {
+            let wanted = format!("tag={tag}");
+            self.detail.split_whitespace().any(|part| part == wanted)
+        }
     }
 
     pub fn is_terminal_failure(&self) -> bool {
@@ -120,6 +130,21 @@ impl FileBridge {
         self.command_path().exists()
     }
 
+    pub fn command_is_stale(&self, timeout: Duration) -> Result<bool> {
+        let path = self.command_path();
+        let modified = match fs::metadata(&path) {
+            Ok(metadata) => metadata.modified(),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {} metadata", path.display()));
+            }
+        }?;
+        Ok(SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default()
+            >= timeout)
+    }
+
     pub fn read_state(&self) -> Result<BridgeState> {
         parse_state_file(&self.state_path())
     }
@@ -132,6 +157,7 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
     let mut protocol = None;
     let mut harness = None;
     let mut pid = None;
+    let mut tag = None;
     let mut detail = String::new();
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -144,6 +170,7 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
             "pid" if !value.is_empty() => {
                 pid = Some(value.parse().context("invalid bridge pid")?);
             }
+            "tag" if !value.is_empty() => tag = Some(value.to_owned()),
             "detail" => detail = value.to_owned(),
             _ => {}
         }
@@ -153,6 +180,7 @@ fn parse_state_file(path: &Path) -> Result<BridgeState> {
         harness,
         status: status.context("bridge state has no status")?,
         pid,
+        tag,
         detail,
     })
 }
@@ -178,7 +206,7 @@ mod tests {
             raw_id: 0xB000_04CE,
             normalized_id: 0x4000_04CE,
             quantity: 1,
-            expected_before: 2,
+            expected_before: None,
             tag: "received_17".into(),
         }
     }
@@ -190,7 +218,7 @@ mod tests {
         bridge.enqueue(&pebble()).unwrap();
         assert_eq!(
             fs::read_to_string(bridge.command_path()).unwrap(),
-            "BBGRANT1 GRANT 0xB00004CE 0x400004CE 1 2 received_17"
+            "BBGRANT1 GRANT 0xB00004CE 0x400004CE 1 AUTO received_17"
         );
         assert!(bridge.enqueue(&pebble()).is_err());
         fs::remove_dir_all(root).unwrap();
@@ -202,7 +230,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("native-grant-state.txt"),
-            "protocol=BBGRANT1\nharness=bb-native-grant-v3\nstatus=completed\npid=5040\ndetail=tag=received_17 direct before=2 after=3\n",
+            "protocol=BBGRANT1\nharness=bb-native-grant-v3\nstatus=completed\npid=5040\ntag=received_17\ndetail=direct before=2 after=3\n",
         )
         .unwrap();
         let state = FileBridge::new(&root).read_state().unwrap();
@@ -220,8 +248,19 @@ mod tests {
             harness: Some("bb-native-grant-v2".into()),
             status: "awaiting_inventory".into(),
             pid: Some(1),
+            tag: None,
             detail: String::new(),
         };
         assert!(state.require_compatible().is_err());
+    }
+
+    #[test]
+    fn detects_a_stale_pending_command() {
+        let root = temp_root("stale");
+        let bridge = FileBridge::new(&root);
+        bridge.enqueue(&pebble()).unwrap();
+        assert!(bridge.command_is_stale(Duration::ZERO).unwrap());
+        assert!(!bridge.command_is_stale(Duration::from_secs(30)).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 }
