@@ -788,6 +788,26 @@ unsafe fn build_validate_swap(base: usize, category: u32, r: &Rebuild<'_>) -> Op
 /// and revert a block on every world edge for the rest of the run.
 static INSERT_UNSAFE: AtomicBool = AtomicBool::new(false);
 
+/// Read-back for the `shop_preview_fmg_insert` feature tag (er-archipelago#937): the INSERT arm
+/// of [`extend_swap_overrides`] has not been caught wrong this session. The latch is the module's
+/// own live state -- the same atomic the write path consults before attempting an insert -- so
+/// this is a read-back, not a receipt.
+///
+/// Two deliberate limits, both the same reasoning:
+///
+///   * HOST-SAFE. The probe registry runs this on a CI runner with no Elden Ring in sight, where
+///     `GetModuleHandleW(None)` returns the TEST binary and `sig_ok(base + SEARCH_RVA)` would read
+///     unmapped memory -- an access violation, not a clean `false`. So the signature is not read
+///     here.
+///   * NO SIG CHECK AT CONNECT. A moved `SearchStringTable` signature is already handled where it
+///     actually bites: the write path fails closed and names the real cause ("signature mismatch,
+///     so a swap cannot be verified"). Firing it at connect would surface the handshake's
+///     #536-shaped "regenerate the seed" message for a failure whose fix is a CLIENT update --
+///     the message's "updating this client will NOT help" would be exactly backwards.
+pub fn insert_path_live() -> bool {
+    !INSERT_UNSAFE.load(Ordering::Relaxed)
+}
+
 /// Extend-swap OVERRIDES: give a set of ids in `base_array[0][category]` new AP strings, rebuilding
 /// from the LIVE block so any prior swap (e.g. this module's synthetic-goods appends) is preserved.
 /// Used by shop_preview / check_lots for names, info lines and captions that don't fit the packed

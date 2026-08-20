@@ -94,6 +94,13 @@ pub const SUPPORTED: &[&str] = &[
     // armorBundles -> synthetic wrapper receipt reconciles every observable protector member.
     "armor_bundles",
     "region_completion_goal_gate",
+    // Shop previews past the redirectable ceiling (2026-08-20, er-archipelago#937). The apworld's
+    // spare-goods pool gained a third tier: goods rows that have NO vanilla FMG entry, so naming
+    // them needs the extend-swap INSERT arm (`fmg_inject::extend_swap_overrides` CREATING records,
+    // not just redirecting existing slots). A seed declares this only when its preview demand
+    // exceeds the pool's redirectable rows; an old client would connect anyway and render the
+    // `?GoodsName?` tag on those slots -- which reads as a broken seed, not an ignored option.
+    "shop_preview_fmg_insert",
 ];
 
 /// Feature tags the seed requires that this build does not know.
@@ -361,6 +368,21 @@ mod tests {
         assert!(
             unsupported(&required_from_slot_data(&sd)).is_empty(),
             "this build implements merchant_bells_on_talk, so the tag must be in SUPPORTED"
+        );
+    }
+
+    /// THE CASE THIS TAG WAS ADDED FOR: a seed whose shop-preview demand exceeds the spare-goods
+    /// pool's redirectable rows declares the tag (er-archipelago#937), and this build carries the
+    /// behaviour -- `fmg_inject::extend_swap_overrides` can CREATE an FMG entry for an id no
+    /// vanilla group covers (the INSERT arm, fail-closed behind its post-swap read-back) -- so it
+    /// must connect. Without the tag an older build would connect and render the `?GoodsName?`
+    /// tag on every tier-3 preview slot, which reads as a broken seed, not as an old client.
+    #[test]
+    fn a_seed_requiring_shop_preview_fmg_insert_is_accepted() {
+        let sd = json!({ "requiresClientFeatures": ["shop_preview_fmg_insert"] });
+        assert!(
+            unsupported(&required_from_slot_data(&sd)).is_empty(),
+            "this build implements FMG entry insertion, so the tag must be in SUPPORTED"
         );
     }
 

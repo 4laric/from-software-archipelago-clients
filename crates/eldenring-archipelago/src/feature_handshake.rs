@@ -122,6 +122,16 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("region_completion_goal_gate", |c| {
         c.region_completion_goal_gate
     }),
+    // Read the same atomic the write path consults before attempting an insert
+    // (er-archipelago#937). The latch only flips when an insert has been CAUGHT wrong by the
+    // post-swap read-back, so on first connect this is a capability claim -- "this build HAS the
+    // INSERT arm" -- which is what the tag means; a reconnect after a failed insert reports the
+    // genuine darkness. The SearchStringTable signature is deliberately NOT read here: that check
+    // lives at the write path, where its failure names the real cause (see
+    // fmg_inject::insert_path_live).
+    ("shop_preview_fmg_insert", |_| {
+        crate::fmg_inject::insert_path_live()
+    }),
 ];
 
 /// Build the `(tag, live)` table this connect.
