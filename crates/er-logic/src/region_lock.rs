@@ -172,12 +172,9 @@ pub const VANILLA_GATED_REGIONS: &[VanillaGate] = &[
         note: "The Academy Glintstone Key opens the game's own seal here, not the region Lock.",
         opens: "the Academy Glintstone Key opens it",
     },
-    VanillaGate {
-        region: "Sewer",
-        key: "Great Runes",
-        note: "The Great Runes open the game's own seal here, not the region Lock.",
-        opens: "the Great Runes open it",
-    },
+    // The "Sewer" gate entry left 2026-08-20: the Shunning-Grounds merged into Leyndell
+    // (er-archipelago's audible on #917/#842), so the capital's own entry above covers the well
+    // and every m35 play region rides the Leyndell lock's kick geometry.
 ];
 
 /// The vanilla gate layered over `region`, if it has one. `region` is the bare region name
@@ -332,8 +329,8 @@ mod unlock_message_tests {
             "Region unlocked: Raya Lucaria Academy -- walk in, the Academy Glintstone Key opens it (no grace warp)"
         );
         assert_eq!(
-            region_unlocked_message("Sewer", true),
-            "Region unlocked: Sewer -- walk in, the Great Runes open it (no grace warp)"
+            region_unlocked_message("Leyndell", true),
+            "Region unlocked: Leyndell -- walk in, the Great Runes open it (no grace warp)"
         );
     }
 
