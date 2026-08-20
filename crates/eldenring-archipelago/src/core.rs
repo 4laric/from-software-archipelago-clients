@@ -1681,7 +1681,13 @@ impl shared::Core for Core {
                 let goal_lock_item = tracker_tables.goal_lock_item(&goal_ids);
                 let goal_arena_flag = goal_lock_item
                     .and_then(|item| region.region_open_flags.get(item).copied());
-                crate::region::configure_goal_arena(goal_arena_flag, goal_lock_item);
+                let goal_gate_expected = !goal_ids.is_empty()
+                    && !region.region_open_flags.is_empty();
+                crate::region::configure_goal_arena(
+                    goal_arena_flag,
+                    goal_lock_item,
+                    goal_gate_expected,
+                );
 
                 (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features)
             });
