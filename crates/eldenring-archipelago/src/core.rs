@@ -3494,7 +3494,12 @@ impl shared::Core for Core {
         //     the burn-done flag is set). Holds 9116 matched to the capital the player is
         //     standing in, so the Erdtree burn never permanently strands the Royal checks.
         crate::region::tick_capital();
-        // 6c. BOSS GRANTS (#413): hand the player the tool the BOSS assumes they arrived with.
+        // 6c. Radahn festival companion flags (#319): an enemy randomizer's replacement kill sets
+        //     the arena defeat flag, while vanilla's original-character death event never reaches
+        //     its 9130/9412 writes. Backfill those two only; common event 3040 still owns 9413 and
+        //     therefore preserves the Jerren-dialogue / out-of-area timing.
+        crate::radahn_festival::tick();
+        // 6d. BOSS GRANTS (#413): hand the player the tool the BOSS assumes they arrived with.
         //     Keyed on the CHARACTER, never the arena -- an enemy randomiser moves bosses between
         //     rooms, so a place key would arm the wrong fight (Alaric, 2026-08-06).
         //
