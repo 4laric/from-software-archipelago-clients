@@ -270,6 +270,11 @@ pub struct Core {
     toasts: er_logic::toast::Deck,
     /// Monotonic clock for the toast deck (ms since this Core was built).
     toast_clock: std::time::Instant,
+    /// The on-screen half of a contract VERSION MISMATCH: latched at slot-data parse, re-pushed
+    /// every tick beside the marker refusal (a mismatch never resolves mid-session, and the deck
+    /// refreshes identical text rather than stacking). `None` when the handshake was OK or the
+    /// seed predates it.
+    version_warn: Option<String>,
     /// Last OBSERVED flask-upgrade count. `None` until primed: the count is history-agnostic, so
     /// the first observation after a connect is a baseline, not news.
     flask_seen: Option<usize>,
@@ -663,6 +668,7 @@ impl shared::Core for Core {
             check_report_error_logged: false,
             toasts: er_logic::toast::Deck::new(4, 6000),
             toast_clock: std::time::Instant::now(),
+            version_warn: None,
             flask_seen: None,
             region_toast_primed: false,
             icon_override_warned: false,
@@ -992,6 +998,7 @@ impl shared::Core for Core {
                 // binary was compiled against and shout if they differ. Always log the whole string:
                 // every bug report should carry it, or it cannot be triaged.
                 let their_versions = sd.get("versions").and_then(|v| v.as_str()).unwrap_or("");
+                let mut version_warn: Option<String> = None;
                 if their_versions.is_empty() {
                     log::warn!(
                         "VERSION: apworld sent no `versions` -- it predates the version handshake. \
@@ -1014,6 +1021,16 @@ impl shared::Core for Core {
                              Update whichever is older; do not report bugs from this pairing -- the \
                              slot_data shapes this client expects are not the ones it is being sent.",
                             their_versions, crate::contract_gen::CONTRACT_HASH);
+                        // The on-screen half (2026-08-21): this error's only reader used to be
+                        // the log, and the one player guaranteed not to read the log is the one
+                        // mid-mismatch (Tommy played a whole session against it and reported
+                        // "locked out of my save"). Latched on `self` after the closure and
+                        // re-pushed every tick beside the marker refusal -- a mismatch never
+                        // resolves mid-session.
+                        version_warn = Some(er_logic::client_features::version_mismatch_toast(
+                            their_versions,
+                            crate::contract_gen::APWORLD_VERSION_EXPECTED,
+                        ));
                     }
                 }
 
@@ -1760,7 +1777,7 @@ impl shared::Core for Core {
                     goal_gate_expected,
                 );
 
-                (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features)
+                (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features, version_warn)
             });
             if let Some((
                 map,
@@ -1782,6 +1799,7 @@ impl shared::Core for Core {
                 tracker_tables,
                 feature_warn,
                 required_features,
+                version_warn,
             )) = parsed
             {
                 log::info!(
@@ -1905,6 +1923,9 @@ impl shared::Core for Core {
                         now,
                     );
                 }
+                // Latch the contract-mismatch banner; the re-push lives beside the marker
+                // refusal's (the same persists-until-the-player-acts contract).
+                self.version_warn = version_warn;
                 // The mirror case, and the one a player is far more likely to hit: the client is
                 // new enough and the feature still did not turn on. Same reasoning as above --
                 // without a toast the only symptom is an option that silently does nothing, which
@@ -4254,6 +4275,12 @@ impl shared::Core for Core {
             if let Some(refusal) = crate::reconcile_io::refusal_toast() {
                 let now = self.toast_clock.elapsed().as_millis() as u64;
                 self.toasts.push(refusal, now);
+            }
+            // Same re-push-every-tick contract for a version mismatch: the pairing stays wrong
+            // for the whole session, and the deck refreshes identical text rather than stacking.
+            if let Some(warn) = self.version_warn.clone() {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(warn, now);
             }
             // I4 (2026-08-01): the OTHER silent no-delivery state. A session configured to let the
             // reconciler grant, whose Driver never armed (the inventory pointer never captured --

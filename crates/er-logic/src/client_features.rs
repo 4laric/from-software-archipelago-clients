@@ -134,6 +134,27 @@ pub fn refusal_message(missing: &[String]) -> String {
     )
 }
 
+/// The on-screen half of the contract VERSION handshake (2026-08-21, Tommy's log: a v0.4.10
+/// client on a v0.4.2 seed logged VERSION MISMATCH at second five, then configured 3,873 shop
+/// rows against shapes it had just disclaimed -- and the player, seeing nothing in-game,
+/// reported "the new client locked me out of my save". The wrong-save marker and the
+/// client-too-old handshake both learned to say it ON SCREEN; this is the same lesson applied
+/// to the oldest gate. Both pairings error -- old dll on a new seed and new dll on an old seed
+/// -- so players who swap dlls conclude the mod is broken unless the banner names the MATCH as
+/// the invariant.)
+///
+/// Parses the `apworld/X.Y.Z` token out of the seed's `versions` string so the banner names the
+/// exact client to go and get. ASCII only (the in-game text rule).
+pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String {
+    let theirs = their_versions
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("apworld/"))
+        .unwrap_or("an unknown version");
+    format!(
+        "Archipelago: this seed was built for apworld {theirs}; this client is {our_apworld}.          Nothing from this pairing is safe to trust. Use the client that matches the seed, or          ask your host to regenerate the seed on {our_apworld}."
+    )
+}
+
 // ---------------------------------------------------------------------------------------------
 // DECLARED vs ARMED -- the half this handshake was missing until 2026-08-11
 // ---------------------------------------------------------------------------------------------
@@ -222,6 +243,34 @@ pub fn not_armed_message(tags: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn version_mismatch_toast_names_both_versions_and_an_action() {
+        let t = super::version_mismatch_toast(
+            "apworld/0.4.2 contract/5c2b9bf2 data/eb5adc59d3e28088",
+            "0.4.10",
+        );
+        // WITNESS both halves the player needs: the seed's version and this client's.
+        assert!(
+            t.contains("0.4.2"),
+            "must name the seed's apworld version: {t}"
+        );
+        assert!(t.contains("0.4.10"), "must name this client's version: {t}");
+        assert!(
+            t.contains("matches") || t.contains("regenerate"),
+            "must name an action the player can take: {t}"
+        );
+        assert!(t.is_ascii(), "in-game text is ASCII only: {t}");
+    }
+
+    #[test]
+    fn version_mismatch_toast_survives_a_versions_string_without_the_token() {
+        // A malformed or future `versions` string must still produce a usable banner.
+        let t = super::version_mismatch_toast("contract/deadbeef", "0.4.10");
+        assert!(t.contains("unknown version"), "{t}");
+        assert!(t.contains("0.4.10"), "{t}");
+        assert!(t.is_ascii(), "{t}");
+    }
+
     use super::*;
 
     /// 🛑 er-archipelago#595. The tag is only worth anything if it means "this build reads the
