@@ -96,7 +96,7 @@ impl Sim {
     /// is ON cannot reach m11_00; the player comes down in the Ashen version instead.
     fn warp(&mut self, target: u32, policy: Policy) {
         if policy == Policy::Reconciler {
-            let desired = capital_flag_state_for_warp_target(&self.sets, target);
+            let desired = capital_flag_state_for_warp_target(&self.sets, target, true);
             let w = reconcile_write(self.flag_118, desired, self.flag_9116);
             self.apply(w);
         }

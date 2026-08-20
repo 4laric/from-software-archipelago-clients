@@ -206,11 +206,15 @@ pub fn warp_target_bucket(target: u32) -> Option<i32> {
 ///
 /// LuaWarp exposes two target-shaped id spaces in practice: menu travel passes the bonfire entity
 /// id, while the client calls it with `entity - 1000`. The bucket rule deliberately accepts both;
-/// subtracting 1000 does not cross any capital map's 10,000 boundary. Every non-Ashen resolvable
-/// target restores the Royal default. `None` is reserved for zero, where there is no target to
-/// classify.
-pub fn capital_flag_state_for_warp_target(sets: &CapitalSets, target: u32) -> Option<bool> {
-    if target == 0 {
+/// subtracting 1000 does not cross any capital map's 10,000 boundary. `resolvable` must come from
+/// the live BonfireWarpParam table: numeric shape alone cannot prove a load will follow. Every
+/// non-Ashen resolvable target restores the Royal default.
+pub fn capital_flag_state_for_warp_target(
+    sets: &CapitalSets,
+    target: u32,
+    resolvable: bool,
+) -> Option<bool> {
+    if target == 0 || !resolvable {
         return None;
     }
     Some(warp_target_bucket(target).is_some_and(|bucket| sets.ashen.contains(&bucket)))
@@ -282,7 +286,7 @@ mod tests {
         // All 9 Royal m11_00 graces (rows 110000-110009).
         for g in 11_001_950..=11_001_959u32 {
             assert_eq!(
-                capital_flag_state_for_warp_target(&s, g),
+                capital_flag_state_for_warp_target(&s, g, true),
                 Some(false),
                 "grace {g}"
             );
@@ -296,7 +300,7 @@ mod tests {
             11_051_950, 11_051_951, 11_051_952, 11_051_953, 11_051_954, 11_051_955, 19_001_950,
         ] {
             assert_eq!(
-                capital_flag_state_for_warp_target(&s, g),
+                capital_flag_state_for_warp_target(&s, g, true),
                 Some(true),
                 "grace {g}"
             );
@@ -306,18 +310,18 @@ mod tests {
     #[test]
     fn lua_warp_argument_and_entity_spaces_choose_the_same_version() {
         let s = sets();
-        // Bobler's menu warp was logged as arg 11051954; the old hook added 1000 and handed the
-        // classifier 11052954. The client-initiated form is 11050954. All three are m11_05.
-        for g in [11_050_954, 11_051_954, 11_052_954] {
+        // Bobler's menu warp was logged as the full entity 11051954. The client-initiated form is
+        // 11050954 (entity - 1000). These are the two forms validated against BonfireWarpParam.
+        for g in [11_050_954, 11_051_954] {
             assert_eq!(
-                capital_flag_state_for_warp_target(&s, g),
+                capital_flag_state_for_warp_target(&s, g, true),
                 Some(true),
                 "Ashen Queen's Bedchamber target {g} must remain Ashen"
             );
         }
-        for g in [11_000_954, 11_001_954, 11_002_954] {
+        for g in [11_000_954, 11_001_954] {
             assert_eq!(
-                capital_flag_state_for_warp_target(&s, g),
+                capital_flag_state_for_warp_target(&s, g, true),
                 Some(false),
                 "Royal Queen's Bedchamber target {g} must remain Royal"
             );
@@ -328,19 +332,24 @@ mod tests {
     fn any_other_warp_restores_the_royal_default() {
         let s = sets();
         assert_eq!(
-            capital_flag_state_for_warp_target(&s, 11_102_950),
+            capital_flag_state_for_warp_target(&s, 11_102_950, true),
             Some(false),
             "Roundtable warp writes OFF -- every warp home restores Royal"
         );
         assert_eq!(
-            capital_flag_state_for_warp_target(&s, 1_046_360_950),
+            capital_flag_state_for_warp_target(&s, 1_046_360_950, true),
             Some(false),
             "10-digit overworld tile grace: never a capital -> OFF"
         );
         assert_eq!(
-            capital_flag_state_for_warp_target(&s, 0),
+            capital_flag_state_for_warp_target(&s, 0, false),
             None,
             "unresolvable target: leave the flag alone, never guess"
+        );
+        assert_eq!(
+            capital_flag_state_for_warp_target(&s, 75_227, false),
+            None,
+            "numeric junk absent from BonfireWarpParam leaves capital state alone"
         );
     }
 
