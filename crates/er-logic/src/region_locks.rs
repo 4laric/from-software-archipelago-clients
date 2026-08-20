@@ -120,7 +120,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Leyndell",
         lock_item: "Leyndell Lock",
         open_flag: Some(76980),
-        play_regions: &[11000],
+        play_regions: &[11000, 35000],
     },
     BakedRegionLock {
         region: "Limgrave",
@@ -169,12 +169,6 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         lock_item: "Scadu Altus Lock",
         open_flag: Some(76900),
         play_regions: &[40020, 41010, 42020, 69000, 69020, 69030],
-    },
-    BakedRegionLock {
-        region: "Sewer",
-        lock_item: "Sewer Lock",
-        open_flag: Some(76982),
-        play_regions: &[35000],
     },
     BakedRegionLock {
         region: "Shadow Keep",
