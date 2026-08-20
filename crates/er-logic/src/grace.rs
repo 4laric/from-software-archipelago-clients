@@ -5,6 +5,59 @@
 use crate::hook::GameHook;
 use std::collections::{HashSet, VecDeque};
 
+/// A named Site of Grace from the game's `BonfireWarpParam -> PlaceName` join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraceEntry {
+    pub unlock_flag: u32,
+    pub name: &'static str,
+}
+
+/// Complete named-grace table for the game version targeted by this client.
+///
+/// The TSV is generated in the world repository by `tools/datamine_grace_names.py`; `include_str!`
+/// embeds it in the DLL, so rescue lookup remains available even when slot data omits a grace.
+const GRACE_NAMES_TSV: &str = include_str!("grace_names.tsv");
+
+pub fn grace_catalog() -> impl Iterator<Item = GraceEntry> {
+    GRACE_NAMES_TSV.lines().filter_map(|line| {
+        let (flag, name) = line.split_once('\t')?;
+        Some(GraceEntry {
+            unlock_flag: flag.parse().ok()?,
+            name,
+        })
+    })
+}
+
+/// Case-insensitive substring search across every named grace, independent of AP slot data.
+pub fn find_graces(query: &str) -> Vec<GraceEntry> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    grace_catalog()
+        .filter(|entry| entry.name.to_lowercase().contains(&query))
+        .collect()
+}
+
+/// Resolve an explicit rescue target. A numeric input addresses the unlock flag directly; a name
+/// is accepted only when its substring has exactly one match, so broad commands cannot mutate many
+/// flags accidentally.
+pub fn resolve_grace_target(input: &str) -> Result<GraceEntry, Vec<GraceEntry>> {
+    let input = input.trim();
+    let matches = if let Ok(flag) = input.parse::<u32>() {
+        grace_catalog()
+            .filter(|entry| entry.unlock_flag == flag)
+            .collect()
+    } else {
+        find_graces(input)
+    };
+    if matches.len() == 1 {
+        Ok(matches[0])
+    } else {
+        Err(matches)
+    }
+}
+
 /// Drain pending grace flags: skip ones already set this session; set each via `try_set_event_flag`;
 /// flags whose holder isn't ready are retained for the next tick (never dropped).
 pub fn flush_grace_flags(
@@ -66,11 +119,11 @@ pub fn console_grace_line(
     entity_id: Option<u32>,
 ) -> String {
     match entity_id {
-        Some(entity) => {
-            format!("{label}: flag {unlock_flag} = {is_unlocked}; !warp {entity}")
-        }
+        Some(entity) => format!(
+            "{label}: flag {unlock_flag} = {is_unlocked}; !unlockgrace {unlock_flag}; !warp {entity}"
+        ),
         None => format!(
-            "{label}: flag {unlock_flag} = {is_unlocked}; warp unavailable (BonfireWarpParam not ready/no row)"
+            "{label}: flag {unlock_flag} = {is_unlocked}; !unlockgrace {unlock_flag}; warp unavailable (BonfireWarpParam not ready/no row)"
         ),
     }
 }
@@ -146,8 +199,41 @@ mod tests {
     fn grace_line_prints_a_command_that_can_be_pasted_straight_back() {
         assert_eq!(
             console_grace_line("Elden Throne", 71100, false, Some(11001950)),
-            "Elden Throne: flag 71100 = false; !warp 11001950"
+            "Elden Throne: flag 71100 = false; !unlockgrace 71100; !warp 11001950"
         );
         assert!(console_grace_line("Elden Throne", 71100, false, None).contains("warp unavailable"));
+    }
+
+    #[test]
+    fn full_catalog_finds_graces_absent_from_typical_slot_data() {
+        assert_eq!(
+            find_graces("AINSEL river MAIN"),
+            vec![GraceEntry {
+                unlock_flag: 71214,
+                name: "Ainsel River Main",
+            }]
+        );
+        assert_eq!(
+            resolve_grace_target("71214").unwrap().name,
+            "Ainsel River Main"
+        );
+    }
+
+    #[test]
+    fn generated_catalog_has_unique_flags_and_no_blank_names() {
+        let entries: Vec<_> = grace_catalog().collect();
+        let flags: HashSet<_> = entries.iter().map(|entry| entry.unlock_flag).collect();
+        assert_eq!(entries.len(), 419);
+        assert_eq!(flags.len(), entries.len());
+        assert!(entries.iter().all(|entry| !entry.name.trim().is_empty()));
+    }
+
+    #[test]
+    fn mutation_target_must_be_unambiguous() {
+        let matches = resolve_grace_target("church").unwrap_err();
+        assert!(matches.len() > 1);
+        assert!(resolve_grace_target("not a real grace")
+            .unwrap_err()
+            .is_empty());
     }
 }

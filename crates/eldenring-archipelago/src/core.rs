@@ -65,6 +65,7 @@ console_commands! {
     Region => "!region" => "!region",
     Warp => "!warp" => "!warp <grace entity id>",
     Grace => "!grace" => "!grace <name substring>",
+    UnlockGrace => "!unlockgrace" => "!unlockgrace <unique name substring|flag>",
     MarkerProbe => "!markerprobe" => "!markerprobe [set|verify|clear]",
     Give => "!give" => "!give <fullId> [qty]",
     Help => "!help" => "!help",
@@ -380,14 +381,26 @@ impl shared::Core for Core {
                     return true;
                 };
                 let mut lines: Vec<String> = Vec::new();
+                let mut seen_flags = HashSet::new();
+                for entry in er_logic::grace::find_graces(&q) {
+                    seen_flags.insert(entry.unlock_flag);
+                    lines.push(er_logic::grace::console_grace_line(
+                        entry.name,
+                        entry.unlock_flag,
+                        crate::flags::get_event_flag(entry.unlock_flag),
+                        crate::warp::grace_entity_for_unlock_flag(entry.unlock_flag),
+                    ));
+                }
                 if let Some(cfg) = self.region.as_ref() {
-                    for (name, &f) in &cfg.grace_items {
-                        if name.to_lowercase().contains(&q) {
+                    // Preserve old slot-data aliases (notably the AP region suffix in grace item
+                    // names) without printing a second row for catalog matches.
+                    for (name, &flag) in &cfg.grace_items {
+                        if name.to_lowercase().contains(&q) && seen_flags.insert(flag) {
                             lines.push(er_logic::grace::console_grace_line(
                                 name,
-                                f,
-                                crate::flags::get_event_flag(f),
-                                crate::warp::grace_entity_for_unlock_flag(f),
+                                flag,
+                                crate::flags::get_event_flag(flag),
+                                crate::warp::grace_entity_for_unlock_flag(flag),
                             ));
                         }
                     }
@@ -409,6 +422,51 @@ impl shared::Core for Core {
                 }
                 for l in lines {
                     self.log(ap::Print::message(l));
+                }
+                true
+            }
+            ConsoleCommand::UnlockGrace => {
+                let Some(target) = arg.map(str::trim).filter(|s| !s.is_empty()) else {
+                    self.log(ap::Print::message(
+                        "usage: !unlockgrace <unique name substring|flag>".to_string(),
+                    ));
+                    return true;
+                };
+                match er_logic::grace::resolve_grace_target(target) {
+                    Ok(entry) => {
+                        let wrote = crate::flags::try_set_event_flag(entry.unlock_flag, true);
+                        let read_back = crate::flags::get_event_flag(entry.unlock_flag);
+                        self.log(ap::Print::message(format!(
+                            "unlockgrace '{}' flag {}: write={}, readback={}{}",
+                            entry.name,
+                            entry.unlock_flag,
+                            if wrote { "OK" } else { "NOT READY" },
+                            read_back,
+                            crate::warp::grace_entity_for_unlock_flag(entry.unlock_flag)
+                                .map(|entity| format!("; !warp {entity}"))
+                                .unwrap_or_else(|| {
+                                    "; warp unavailable (BonfireWarpParam not ready/no row)"
+                                        .to_string()
+                                })
+                        )));
+                    }
+                    Err(matches) if matches.is_empty() => self.log(ap::Print::message(format!(
+                        "no grace matching '{target}' in the full game table"
+                    ))),
+                    Err(matches) => {
+                        self.log(ap::Print::message(format!(
+                            "ambiguous grace '{target}' ({} matches); use !unlockgrace <flag> from one result:",
+                            matches.len()
+                        )));
+                        for entry in matches {
+                            self.log(ap::Print::message(er_logic::grace::console_grace_line(
+                                entry.name,
+                                entry.unlock_flag,
+                                crate::flags::get_event_flag(entry.unlock_flag),
+                                crate::warp::grace_entity_for_unlock_flag(entry.unlock_flag),
+                            )));
+                        }
+                    }
                 }
                 true
             }
