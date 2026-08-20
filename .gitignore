@@ -1,3 +1,8 @@
 /target
 /log
 .fuse_hidden*
+
+# Locally supplied emulator/launcher runtimes and save backups. Never publish
+# game binaries, launcher state, or player saves from this source repository.
+/BBLauncher/
+/v.0.18.0/

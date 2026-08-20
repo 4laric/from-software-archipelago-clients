@@ -257,6 +257,51 @@ mod platform {
             Ok(value & mask != 0)
         }
 
+        /// Validate the minimum live event-flag-manager structure needed for
+        /// gameplay reads without interpreting any particular world flag.
+        ///
+        /// This is deliberately a readiness probe, not save identification.
+        /// The unsafe MVP mode uses several consecutive successful probes only
+        /// after the player has explicitly attested that the correct save is
+        /// loaded.
+        pub fn probe_manager(&self) -> Result<()> {
+            let manager: u64 = self.process.read(self.eboot_base + MANAGER_ROOT_RVA)?;
+            ensure!(
+                manager != 0,
+                "Bloodborne event-flag manager became unavailable"
+            );
+            let divisor: u32 = self.process.read(manager + GROUP_DIVISOR_OFFSET)?;
+            ensure!(divisor != 0, "Bloodborne event-flag group divisor is zero");
+            let packed_stride: u32 = self.process.read(manager + PACKED_STRIDE_OFFSET)?;
+            ensure!(
+                packed_stride != 0,
+                "Bloodborne event-flag packed stride is zero"
+            );
+            let sentinel: u64 = self.process.read(manager + GROUP_TREE_OFFSET)?;
+            ensure!(
+                sentinel != 0,
+                "Bloodborne event-flag group tree is unavailable"
+            );
+            let _: u8 = self.process.read(sentinel + NODE_NIL_OFFSET)?;
+            Ok(())
+        }
+
+        pub fn probe_manager_resilient(&mut self) -> Result<()> {
+            match self.probe_manager() {
+                Ok(()) => Ok(()),
+                Err(read_error) => {
+                    let replacement = Self::attach(&self.shad_log).with_context(|| {
+                        format!(
+                            "reattaching to shadPS4 after gameplay probe failed: {read_error:#}"
+                        )
+                    })?;
+                    *self = replacement;
+                    self.probe_manager()
+                        .context("probing event-flag manager after shadPS4 reattachment")
+                }
+            }
+        }
+
         pub fn read_resilient(&mut self, event_flag: u32) -> Result<bool> {
             match self.read(event_flag) {
                 Ok(value) => Ok(value),
@@ -295,6 +340,14 @@ mod platform {
         }
 
         pub fn read_resilient(&mut self, _event_flag: u32) -> Result<bool> {
+            bail!("live Bloodborne event-flag reads require Windows")
+        }
+
+        pub fn probe_manager(&self) -> Result<()> {
+            bail!("live Bloodborne event-flag reads require Windows")
+        }
+
+        pub fn probe_manager_resilient(&mut self) -> Result<()> {
             bail!("live Bloodborne event-flag reads require Windows")
         }
 
