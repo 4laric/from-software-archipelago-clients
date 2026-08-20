@@ -54,7 +54,7 @@
 //! world#200 was born from — the capital reconciler wrote once, trusted the latch, and left a
 //! player in a burnt world.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// What the caller should do this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +135,41 @@ pub fn decide(gate: &GoalGate, held: &dyn Fn(&str) -> bool) -> Decision {
     }
 }
 
+/// The exact event-flag convergence target for a goal-region unlock.
+///
+/// A resolved gate touches only its own open flag and bundle. An unresolved gate cannot identify
+/// which withheld Lock the world removed from the pool, so failing open means opening every region
+/// apparatus the seed advertised. That is deliberately broad: contract drift may spoil traversal,
+/// but it cannot strand the run or foreign players' items behind an impossible Lock.
+pub fn flags_to_open(
+    open_flag: Option<u32>,
+    lock_item: Option<&str>,
+    region_open_flags: &HashMap<String, u32>,
+    lock_reveal_flags: &HashMap<String, Vec<u32>>,
+    region_graces: &HashMap<String, Vec<u32>>,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Some(flag) = open_flag.filter(|flag| *flag != 0) {
+        out.push(flag);
+        if let Some(lock) = lock_item {
+            if let Some(flags) = lock_reveal_flags.get(lock) {
+                out.extend(flags.iter().copied());
+            }
+            if let Some(flags) = region_graces.get(lock) {
+                out.extend(flags.iter().copied());
+            }
+        }
+    } else {
+        out.extend(region_open_flags.values().copied());
+        out.extend(lock_reveal_flags.values().flatten().copied());
+        out.extend(region_graces.values().flatten().copied());
+    }
+    out.retain(|flag| *flag != 0);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The one-line status for the log. Callers latch on the transition, not on this string.
 pub fn status_line(d: &Decision, goal_region: &str) -> String {
     match d {
@@ -165,6 +200,51 @@ mod tests {
 
     fn holding<'a>(names: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
         move |n: &str| names.contains(&n)
+    }
+
+    fn flag_maps() -> (
+        HashMap<String, u32>,
+        HashMap<String, Vec<u32>>,
+        HashMap<String, Vec<u32>>,
+    ) {
+        (
+            HashMap::from([
+                ("Ashen Capital Lock".to_string(), 70),
+                ("Enir Ilim Lock".to_string(), 80),
+            ]),
+            HashMap::from([
+                ("Ashen Capital Lock".to_string(), vec![71]),
+                ("Enir Ilim Lock".to_string(), vec![81]),
+            ]),
+            HashMap::from([
+                ("Ashen Capital Lock".to_string(), vec![72, 73]),
+                ("Enir Ilim Lock".to_string(), vec![82]),
+            ]),
+        )
+    }
+
+    #[test]
+    fn a_resolved_gate_writes_only_its_own_apparatus() {
+        let (open, reveal, graces) = flag_maps();
+        assert_eq!(
+            flags_to_open(
+                Some(70),
+                Some("Ashen Capital Lock"),
+                &open,
+                &reveal,
+                &graces,
+            ),
+            vec![70, 71, 72, 73]
+        );
+    }
+
+    #[test]
+    fn an_unresolved_withheld_gate_fails_open_across_the_advertised_seed() {
+        let (open, reveal, graces) = flag_maps();
+        assert_eq!(
+            flags_to_open(None, None, &open, &reveal, &graces),
+            vec![70, 71, 72, 73, 80, 81, 82]
+        );
     }
 
     #[test]

@@ -43,6 +43,11 @@ static START_LATCHED: AtomicBool = AtomicBool::new(false);
 /// the notice is then simply absent: it warns, it does not gate, so don't-know costs nothing.
 static GOAL_ARENA_OPEN_FLAG: AtomicU32 = AtomicU32::new(0);
 
+/// Whether this seed advertises a goal plus region apparatus and therefore has a withheld gate to
+/// reconcile. This distinguishes a genuinely absent/foreign gate from a broken resolution: both
+/// store open flag 0, but only the latter must take the loud fail-open path (client#268).
+static GOAL_GATE_EXPECTED: AtomicBool = AtomicBool::new(false);
+
 /// Rising-edge latch for the goal-approach notice, so it says its line once per arrival rather
 /// than once per tick or once per reload.
 static GOAL_APPROACH: Mutex<er_logic::goal_approach::ApproachNotice> =
@@ -99,8 +104,9 @@ pub fn reset() {
 
 /// Install the goal region's open flag. Called at connect once the tracker tables and the region
 /// config both exist; `None` / unresolvable leaves it at 0 (notice absent).
-pub fn configure_goal_arena(open_flag: Option<u32>, lock_item: Option<&str>) {
+pub fn configure_goal_arena(open_flag: Option<u32>, lock_item: Option<&str>, gate_expected: bool) {
     GOAL_ARENA_OPEN_FLAG.store(open_flag.unwrap_or(0), Ordering::Relaxed);
+    GOAL_GATE_EXPECTED.store(gate_expected, Ordering::Relaxed);
     if let Ok(mut g) = GOAL_LOCK_ITEM.lock() {
         *g = lock_item.unwrap_or_default().to_string();
     }
@@ -109,9 +115,14 @@ pub fn configure_goal_arena(open_flag: Option<u32>, lock_item: Option<&str>) {
             "goal-approach: armed on the goal region's open flag {f} -- a player who reaches the \
              arena with Region Locks outstanding will be told once (world#694)"
         ),
+        None if gate_expected => log::error!(
+            "goal-gate: goal locations exist and region apparatus is advertised, but the withheld \
+             gate did not resolve -- FAIL-OPEN armed; once the goal requirements are met every \
+             advertised region/grace flag will be reconciled (client#268)"
+        ),
         None => log::info!(
-            "goal-approach: INERT -- the goal locations do not resolve to one lock-bearing region \
-             (foreign apworld, natural_progression, or goal locations spanning regions)"
+            "goal-approach: INERT -- no lock-bearing goal gate is advertised (foreign/legacy \
+             apworld or a seed with no region apparatus)"
         ),
     }
 }
@@ -178,8 +189,9 @@ pub fn tick_goal_gate(
         return None; // writes at menu/load are silently discarded (SWEEP R3)
     }
     let want = GOAL_ARENA_OPEN_FLAG.load(Ordering::Relaxed);
-    if want == 0 {
-        return None; // no goal region resolved -> nothing to gate, and nothing withheld either
+    let gate_expected = GOAL_GATE_EXPECTED.load(Ordering::Relaxed);
+    if want == 0 && !gate_expected {
+        return None; // genuinely no gate advertised; nothing was withheld
     }
     let lock_item = GOAL_LOCK_ITEM
         .lock()
@@ -228,17 +240,24 @@ pub fn tick_goal_gate(
         return None;
     }
 
-    // The exact flag set a Lock receipt would produce for this region.
-    let mut to_set = vec![want];
-    if !lock_item.is_empty()
-        && let Some(bundle) = cfg.lock_reveal_flags.get(&lock_item)
-    {
-        to_set.extend(bundle.iter().copied());
-    }
-    if !lock_item.is_empty()
-        && let Some(graces) = cfg.region_graces.get(&lock_item)
-    {
-        to_set.extend(graces.iter().copied());
+    // A resolved gate receives exactly its own Lock apparatus. If resolution failed despite an
+    // advertised goal gate, open every seed-advertised apparatus: broad but survivable, and unlike
+    // the old zero-sentinel early return it cannot strand a withheld goal Lock.
+    let to_set = er_logic::goal_gate::flags_to_open(
+        (want != 0).then_some(want),
+        (!lock_item.is_empty()).then_some(lock_item.as_str()),
+        &cfg.region_open_flags,
+        &cfg.lock_reveal_flags,
+        &cfg.region_graces,
+    );
+    if to_set.is_empty() {
+        if !GOAL_GATE_SAID_SHUT.swap(true, Ordering::Relaxed) {
+            log::error!(
+                "goal-gate: FAIL-OPEN could not find any advertised region/grace flags to write; \
+                 the seed contract is incomplete"
+            );
+        }
+        return None;
     }
 
     // WRITE, then READ BACK. Every flag has to agree before the latch is taken; anything short of
@@ -258,8 +277,13 @@ pub fn tick_goal_gate(
 
     GOAL_GATE_OPENED.store(true, Ordering::Relaxed);
     log::info!(
-        "goal-gate: CONVERGED -- {} flag(s) set and read back for {lock_item} ({} decision)",
+        "goal-gate: CONVERGED -- {} flag(s) set and read back for {} ({} decision)",
         to_set.len(),
+        if lock_item.is_empty() {
+            "all advertised regions (unresolved goal gate)"
+        } else {
+            lock_item.as_str()
+        },
         if matches!(
             decision,
             er_logic::goal_gate::Decision::OpenUnresolvable { .. }
@@ -273,7 +297,10 @@ pub fn tick_goal_gate(
         log::warn!("goal-gate: OPENED WITHOUT A GATE -- {why}");
     }
     // ASCII ONLY -- the game's font has no typographic quotes or dashes.
-    let region = lock_item.strip_suffix(" Lock").unwrap_or(&lock_item);
+    let region = lock_item
+        .strip_suffix(" Lock")
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Goal region");
     (!silent_reconnect_open).then(|| format!("Region unlocked: {region}"))
 }
 
