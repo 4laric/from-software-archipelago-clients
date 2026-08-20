@@ -189,6 +189,12 @@ pub fn status_line(d: &Decision, goal_region: &str) -> String {
 mod tests {
     use super::*;
 
+    type FlagMaps = (
+        HashMap<String, u32>,
+        HashMap<String, Vec<u32>>,
+        HashMap<String, Vec<u32>>,
+    );
+
     fn gate(items: &[&str], lock: Option<&str>) -> GoalGate {
         GoalGate {
             item_goals: items.iter().map(|s| s.to_string()).collect(),
@@ -202,11 +208,7 @@ mod tests {
         move |n: &str| names.contains(&n)
     }
 
-    fn flag_maps() -> (
-        HashMap<String, u32>,
-        HashMap<String, Vec<u32>>,
-        HashMap<String, Vec<u32>>,
-    ) {
+    fn flag_maps() -> FlagMaps {
         (
             HashMap::from([
                 ("Ashen Capital Lock".to_string(), 70),
