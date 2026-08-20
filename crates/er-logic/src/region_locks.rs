@@ -69,12 +69,6 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         play_regions: &[22000, 41020, 68300, 68400],
     },
     BakedRegionLock {
-        region: "Consecrated Snowfield",
-        lock_item: "Consecrated Snowfield Lock",
-        open_flag: Some(76550),
-        play_regions: &[30190, 30200, 31120, 32110, 65030],
-    },
-    BakedRegionLock {
         region: "Deeproot Depths",
         lock_item: "Deeproot Depths Lock",
         open_flag: Some(71231),
@@ -144,7 +138,7 @@ pub const REGION_LOCKS: &[BakedRegionLock] = &[
         region: "Mountaintops of the Giants",
         lock_item: "Mountaintops of the Giants Lock",
         open_flag: Some(73017),
-        play_regions: &[30170, 30180, 31220, 65000, 65010, 65020],
+        play_regions: &[30170, 30180, 30190, 30200, 31120, 31220, 32110, 65000, 65010, 65020, 65030],
     },
     BakedRegionLock {
         region: "Mt. Gelmir",
