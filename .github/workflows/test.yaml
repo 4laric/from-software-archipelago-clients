@@ -155,3 +155,13 @@ jobs:
         # Short on purpose: these are build outputs, not releases, and artifact storage is the same
         # quota the cache above just got evicted out of.
         retention-days: 14
+
+    # Bloodborne is a standalone companion client rather than an injected DLL.
+    # The workspace release build above already produces it; retain the executable
+    # beside the Elden Ring artifact so playtesters do not need a Rust toolchain.
+    - uses: actions/upload-artifact@v4
+      with:
+        name: bloodborne_ap_client-${{ github.sha }}
+        path: target/release/bb-ap-client.exe
+        if-no-files-found: error
+        retention-days: 14
