@@ -39,6 +39,24 @@ pub fn entity_for_unlock_flag(
         .find_map(|(flag, entity)| (flag == unlock_flag).then_some(entity))
 }
 
+/// Whether a LuaWarp target names a row in the live `BonfireWarpParam` table.
+///
+/// Menu travel supplies the full bonfire entity id; client-issued travel supplies that id minus
+/// `warp_arg_delta`. Accept exactly those two spaces. Shape alone is not enough: an arbitrary
+/// numeric `!warp` argument must not be allowed to drive state that is written before the load.
+pub fn warp_target_resolves(
+    entities: impl IntoIterator<Item = u32>,
+    target: u32,
+    warp_arg_delta: u32,
+) -> bool {
+    entities.into_iter().any(|entity| {
+        entity == target
+            || target
+                .checked_add(warp_arg_delta)
+                .is_some_and(|full| full == entity)
+    })
+}
+
 /// One `!grace` result line. A resolved row includes the literal command the player can paste
 /// back into the console; an unresolved row says why the rescue route cannot be aimed yet.
 pub fn console_grace_line(
@@ -112,6 +130,16 @@ mod tests {
         let rows = [(71000, 10001950), (71100, 11001950), (71101, 11011950)];
         assert_eq!(entity_for_unlock_flag(rows, 71100), Some(11001950));
         assert_eq!(entity_for_unlock_flag(rows, 79999), None);
+    }
+
+    #[test]
+    fn warp_target_must_match_a_live_entity_in_one_of_the_two_argument_spaces() {
+        let entities = [11_001_950, 11_051_954, 1_046_360_950];
+        assert!(warp_target_resolves(entities, 11_051_954, 1000));
+        assert!(warp_target_resolves(entities, 11_050_954, 1000));
+        assert!(warp_target_resolves(entities, 1_046_359_950, 1000));
+        assert!(!warp_target_resolves(entities, 75_227, 1000));
+        assert!(!warp_target_resolves(entities, u32::MAX, 1000));
     }
 
     #[test]

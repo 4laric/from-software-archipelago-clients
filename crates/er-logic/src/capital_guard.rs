@@ -45,10 +45,10 @@
 //! ## What it does NOT fix
 //!
 //! Why the game loaded m11_05 with 9116 OFF in the first place. That is upstream of everything
-//! here and still unidentified -- `capitalWorldBurnFlag` (300) and `capitalPreBurnFlag` (302) are
-//! emitted in slot_data and read nowhere near this decision. This module makes the contradiction
-//! *stated* rather than silently written down, and it makes the next log carry the value of 300 at
-//! the moment it happens, which is the datum nobody has.
+//! here and still unidentified. `capitalWorldBurnFlag` is now the corroborator that prevents a
+//! position-only ON write, while `capitalPreBurnFlag` participates in the full-state reconciler;
+//! neither explains the original contradictory load. This module states that contradiction and
+//! makes the log carry the world-burn value at the moment it happens.
 
 /// Why no write happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

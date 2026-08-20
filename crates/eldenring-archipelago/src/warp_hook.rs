@@ -125,13 +125,12 @@ unsafe extern "C" fn lua_warp_detour(rcx: *mut c_void, rdx: *mut c_void, warp_ar
         }
     };
     // Capital intercept AFTER the original returns; the warp is asynchronous, so this still
-    // lands before the load screen. Client-initiated warps ALSO intercept in warp_to_grace —
-    // the double call is harmless (reconcile_write only writes on mismatch; note there).
+    // lands before the load screen. This hook is the one intercept for menu and client warps.
     // catch_unwind: a poisoned CAPITAL mutex would panic in .lock().unwrap(); inside the game's
     // own call frame that must degrade to a logged miss, not an unwind across FFI.
     // Pass LuaWarp's value without guessing which caller-specific id space produced it. Menu
-    // travel supplies the bonfire entity id; client travel supplies entity-1000. Capital's pure
-    // classifier intentionally accepts both by map bucket.
+    // travel supplies the bonfire entity id; client travel supplies entity-1000. The intercept
+    // validates both forms against the live BonfireWarpParam table before changing capital state.
     if std::panic::catch_unwind(|| crate::region::capital_warp_intercept(warp_arg)).is_err() {
         log::error!("LuaWarp hook: capital_warp_intercept panicked; suppressed (warp unaffected)");
     }

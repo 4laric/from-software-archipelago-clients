@@ -60,6 +60,23 @@ pub(crate) fn grace_entity_for_unlock_flag(unlock_flag: u32) -> Option<u32> {
     )
 }
 
+/// Validate a LuaWarp target against the live grace table before it is allowed to drive capital
+/// state. A junk `!warp` id can still be handed to the game, but it must not flip Royal/Ashen state
+/// when no load will follow.
+pub(crate) fn grace_warp_target_resolves(target: u32) -> bool {
+    // SAFETY: read-only FD4 singleton access on the game thread (the LuaWarp hook runs inline on
+    // that thread). A pre-world/not-ready repository deliberately declines the state write.
+    let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+        return false;
+    };
+    er_logic::grace::warp_target_resolves(
+        repo.rows::<BonfireWarpParam>()
+            .map(|(_, row)| row.bonfire_entity_id()),
+        target,
+        GRACE_TO_WARP_ARG_DELTA,
+    )
+}
+
 pub(crate) fn current_module_base() -> Option<usize> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     let hmodule = unsafe { GetModuleHandleW(None) }.ok()?;

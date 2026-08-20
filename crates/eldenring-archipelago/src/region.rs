@@ -1263,14 +1263,16 @@ pub fn tick_capital() {
 
 /// Warp-target intercept: decide 9116 from the TARGET before the load resolves, so the player
 /// always loads the capital version encoded by the selected target. Ashen-map graces -> ON;
-/// Royal-map graces and every other resolvable target -> OFF. Called by
-/// `warp::warp_to_grace` right after the warp request (the warp is asynchronous; the write
-/// lands before the load screen resolves). No-op while INERT or pre-burn.
+/// Royal-map graces and every other resolvable target -> OFF. Called by the LuaWarp hook after the
+/// request returns (the warp is asynchronous; the write lands before the load screen resolves).
+/// No-op while INERT or pre-burn.
 pub fn capital_warp_intercept(warp_target: u32) {
     let guard = CAPITAL.lock().unwrap();
     let Some(cfg) = guard.as_ref() else { return };
     let armed = flags::get_event_flag(cfg.burn_done_flag);
-    let desired = er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, warp_target);
+    let resolvable = crate::warp::grace_warp_target_resolves(warp_target);
+    let desired =
+        er_logic::capital::capital_flag_state_for_warp_target(&cfg.sets, warp_target, resolvable);
     let current = capital_state(cfg);
     if let Some(want) = desired {
         *CAPITAL_PENDING_WARP.lock().unwrap() = Some((flags::play_region_id(), want));
