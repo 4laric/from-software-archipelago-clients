@@ -120,6 +120,19 @@ static CHECK_ITEM_FLAGS: Mutex<Option<HashMap<u32, Vec<u32>>>> = Mutex::new(None
 /// prior, separate event) PASSES. `None` until the first poll → suppress-by-default (never leaks).
 static KNOWN_COLLECTED_FLAGS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 
+/// #759 watchdog: every vanilla-suppressed pickup, watched until its flags collect/fire (the
+/// pickup was the check -- silently dropped) or a grace period passes with neither (the
+/// suppression ate something that never became a check: the Leave-drop signature, or a lot-less
+/// ware farmed early -- #321). Decision logic is `er_logic::vanilla_suppress::split_unresolved`,
+/// host-tested; this static is only the buffer between the detour and the flag-poll tick.
+static SUPPRESSED_WATCH: Mutex<Vec<er_logic::vanilla_suppress::SuppressedPickup>> =
+    Mutex::new(Vec::new());
+/// How long a suppressed pickup may sit unresolved before the watchdog names it. A genuine check
+/// pickup's flags collect within a poll tick or two; 20s is far outside that and far inside a
+/// play session, so an announcement is never about a working check (the er_logic doc states the
+/// direction of error: shared flags can MISS an eaten drop, never accuse a working one).
+const SUPPRESS_WATCH_GRACE_MS: u64 = 20_000;
+
 /// #321 -- is the FLAG-SET DISARM legal for THIS seed's `checkItemFlags`?
 ///
 /// Set at connect from the live table, never from the apworld version: a seed rolled before the
@@ -163,6 +176,36 @@ pub fn configure_check_item_flags(map: HashMap<u32, Vec<u32>>) {
 /// Replace the collected-flag set. Called by the flag-poll each tick with the acquisition flags of
 /// every location currently in the server checked-set (loc->flag via `locationFlags`).
 pub fn set_known_collected_flags(flags: HashSet<u32>) {
+    // #759 watchdog, on the same tick that delivers the fresh collected-set. An entry whose
+    // flags collected (or live-fired) resolves silently; one that outlives the grace with
+    // neither was a pickup the suppressor ate that never became a check -- most likely a weapon
+    // the player put down with Leave and picked back up (the matt's-rando habit), or a lot-less
+    // check ware farmed early (#321). WARN once per event, with the console rescue inline: the
+    // item is gone from the world, so `!give` is the only path back.
+    {
+        let watch = std::mem::take(&mut *recover_lock(&SUPPRESSED_WATCH));
+        if !watch.is_empty() {
+            let (keep, overdue) = er_logic::vanilla_suppress::split_unresolved(
+                watch,
+                &flags,
+                &|f| crate::flags::get_event_flag(f),
+                now_ms(),
+                SUPPRESS_WATCH_GRACE_MS,
+            );
+            for e in &overdue {
+                log::warn!(
+                    "vanilla-suppress: pickup {:#x} was suppressed {}s ago and its check never \
+                     collected or fired -- the suppressor likely ate an item the player placed \
+                     on the ground (Leave) or a farmed copy of a lot-less check ware (#759/#321). \
+                     Rescue: `!give {:#x} 1` in the client console.",
+                    e.raw_id,
+                    (now_ms().saturating_sub(e.at_ms)) / 1000,
+                    e.raw_id,
+                );
+            }
+            *recover_lock(&SUPPRESSED_WATCH) = keep;
+        }
+    }
     *recover_lock(&KNOWN_COLLECTED_FLAGS) = Some(flags);
 }
 
@@ -699,11 +742,39 @@ fn add_item_detour_inner(
                     "vanilla-suppress: pickup {raw_id:#x} suppressed (check not yet collected, \
                      and its acquisition flag has not fired)"
                 );
+                // #759: remember it. If these flags never collect/fire, this suppression ate a
+                // pickup that was not a check -- the watchdog in `set_known_collected_flags`
+                // announces it with a rescue instead of letting the item vanish silently.
+                recover_lock(&SUPPRESSED_WATCH).push(
+                    er_logic::vanilla_suppress::SuppressedPickup {
+                        raw_id,
+                        mapped_flags: flags.clone(),
+                        at_ms: now_ms(),
+                    },
+                );
                 return 0;
             }
             log::info!(
                 "vanilla-suppress: pickup {raw_id:#x} passed (check already collected — re-pickup)"
             );
+        }
+        // AUTO-UPGRADE ON PICKUP (#693, matt's-rando parity). The receipt path has always raised
+        // a granted weapon to your best held tier; this applies the SAME id transform to a weapon
+        // the game itself is adding -- a world pickup, a chest, or the drop-and-pick-it-back-up
+        // loop players learned from matt's auto_upgrade. `apply_auto_upgrade` is raise-only,
+        // cap-clamped, affinity-preserving (level rides row%100; base keeps the affinity block),
+        // and identity when the option is off -- so this line is inert unless auto_upgrade is on
+        // and the id is a weapon below your demonstrated tier. Writing the entry id BEFORE
+        // call_original means the game adds the upgraded weapon: no remove seam needed, no
+        // duplicate, and Beeno's retroactive ask (#693) gets a player-visible mechanic: put it
+        // down, pick it up.
+        let up = crate::upgrades::apply_auto_upgrade(raw_id as i32);
+        if up != raw_id as i32 {
+            log::info!(
+                "auto-upgrade: pickup {raw_id:#x} raised to {up:#x} on add (drop-and-pickup / \
+                 world pickup catch-up, #693)"
+            );
+            unsafe { write_i32(entry, ITEMBUF_ENTRY_ID_OFF, up) };
         }
         return call_original(inventory, entry, itembuf, r9);
     }
@@ -762,6 +833,14 @@ fn signature_matches(addr: usize) -> bool {
 }
 unsafe fn read_i32(base: *const c_void, off: usize) -> i32 {
     unsafe { ((base as *const u8).add(off) as *const i32).read_unaligned() }
+}
+
+/// Write into the game's own itembuf entry BEFORE `call_original` consumes it. The only writer is
+/// the auto-upgrade pickup transform; the buffer is the game's argument for THIS call, so writing
+/// the id field is exactly what `grant_full_id` does when it constructs its own itembuf -- same
+/// layout, same consumer, no lifetime beyond the call.
+unsafe fn write_i32(base: *mut c_void, off: usize, v: i32) {
+    unsafe { ((base as *mut u8).add(off) as *mut i32).write_unaligned(v) }
 }
 
 #[cfg(test)]
