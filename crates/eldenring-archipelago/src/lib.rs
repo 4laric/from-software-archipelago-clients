@@ -42,6 +42,7 @@ mod notif_ticker;
 mod param_guard;
 mod params;
 mod physick_probe;
+mod radahn_festival;
 mod reconcile_io;
 mod region;
 mod runes;
