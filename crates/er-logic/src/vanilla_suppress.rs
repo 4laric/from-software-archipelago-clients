@@ -92,9 +92,68 @@ where
     true
 }
 
+/// One suppressed vanilla bag-add, held for the #759 watchdog.
+///
+/// The suppressor is keyed on the item id alone and cannot see where a pickup came from, so a
+/// weapon the player put on the ground with **Leave** looks exactly like the check's own world
+/// placement and is eaten (er-archipelago#759). What DOES tell them apart is what happens next:
+/// a real check pickup is reported and its flags enter the collected-set (or its acquisition flag
+/// fires) within a poll tick or two; an eaten Leave-drop resolves NOTHING, ever. This record plus
+/// [`split_unresolved`] turns that difference into a log line and a rescue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuppressedPickup {
+    /// The suppressed full item id (`AddItemFunc` space).
+    pub raw_id: u32,
+    /// The id's `checkItemFlags` acquisition flags at suppression time.
+    pub mapped_flags: Vec<u32>,
+    /// Monotonic client-session ms at suppression time.
+    pub at_ms: u64,
+}
+
+/// Partition a suppression watch list into (still-watching, overdue).
+///
+/// An entry RESOLVES -- silently dropped -- once every mapped flag is collected or live-set: the
+/// suppressed pickup was (or has since become) the check itself, and nothing of the player's was
+/// eaten. An entry older than `grace_ms` whose flags have done NEITHER is overdue: the suppression
+/// consumed a pickup that never turned into a check, which is the #759 Leave-drop signature (or a
+/// lot-less check ware farmed early, #321 -- the caller's log line names both).
+///
+/// Direction of error, stated: under a SHARED flag another item's pickup can resolve an entry
+/// that really was an eaten Leave-drop -- a MISSED warning. The reverse cannot happen: a genuine
+/// check pickup's flags collect within a poll tick or two, far inside any sane `grace_ms`, so an
+/// overdue entry is never a false alarm about a working check. Choose the miss, never the lie.
+pub fn split_unresolved(
+    watch: Vec<SuppressedPickup>,
+    collected: &HashSet<u32>,
+    flag_live: &dyn Fn(u32) -> bool,
+    now_ms: u64,
+    grace_ms: u64,
+) -> (Vec<SuppressedPickup>, Vec<SuppressedPickup>) {
+    let mut keep = Vec::new();
+    let mut overdue = Vec::new();
+    for e in watch {
+        let resolved = e
+            .mapped_flags
+            .iter()
+            .all(|f| collected.contains(f) || flag_live(*f));
+        if resolved {
+            continue; // the pickup was the check (or the check is done) -- nothing was eaten
+        }
+        if now_ms.saturating_sub(e.at_ms) >= grace_ms {
+            overdue.push(e);
+        } else {
+            keep.push(e);
+        }
+    }
+    (keep, overdue)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{flags_are_unshared, should_suppress, should_suppress_with_flag_disarm};
+    use super::{
+        flags_are_unshared, should_suppress, should_suppress_with_flag_disarm, split_unresolved,
+        SuppressedPickup,
+    };
     use std::collections::HashSet;
 
     fn set(flags: &[u32]) -> HashSet<u32> {
@@ -252,5 +311,94 @@ mod tests {
         // A duplicated flag inside ONE id's list is still that one id's flag, not sharing.
         let dup: Vec<u32> = vec![220550, 220550];
         assert!(flags_are_unshared(vec![dup.as_slice()]));
+    }
+
+    fn sp(raw: u32, flags: &[u32], at: u64) -> SuppressedPickup {
+        SuppressedPickup {
+            raw_id: raw,
+            mapped_flags: flags.to_vec(),
+            at_ms: at,
+        }
+    }
+
+    #[test]
+    fn watchdog_resolves_a_collected_entry_silently() {
+        let collected = set(&[220550]);
+        let never = |_f: u32| false;
+        let (keep, overdue) = split_unresolved(
+            vec![sp(0x1000, &[220550], 0)],
+            &collected,
+            &never,
+            60_000,
+            20_000,
+        );
+        assert!(
+            keep.is_empty() && overdue.is_empty(),
+            "a resolved entry must vanish"
+        );
+    }
+
+    #[test]
+    fn watchdog_resolves_on_live_flag_too() {
+        let collected = set(&[]);
+        let fired = |f: u32| f == 220550;
+        let (keep, overdue) = split_unresolved(
+            vec![sp(0x1000, &[220550], 0)],
+            &collected,
+            &fired,
+            60_000,
+            20_000,
+        );
+        assert!(keep.is_empty() && overdue.is_empty());
+    }
+
+    #[test]
+    fn watchdog_reports_the_leave_drop_signature_after_grace() {
+        // WITNESS the positive case by name: nothing collected, nothing fired, grace elapsed.
+        let collected = set(&[]);
+        let never = |_f: u32| false;
+        let (keep, overdue) = split_unresolved(
+            vec![sp(0x6acfc0, &[220550], 0)],
+            &collected,
+            &never,
+            20_000,
+            20_000,
+        );
+        assert!(keep.is_empty());
+        assert_eq!(overdue.len(), 1, "the eaten pickup must surface");
+        assert_eq!(overdue[0].raw_id, 0x6acfc0);
+    }
+
+    #[test]
+    fn watchdog_waits_out_the_grace_window() {
+        // A genuine check pickup's flags need a poll tick to collect; inside grace it stays quiet.
+        let collected = set(&[]);
+        let never = |_f: u32| false;
+        let (keep, overdue) = split_unresolved(
+            vec![sp(0x1000, &[220550], 0)],
+            &collected,
+            &never,
+            19_999,
+            20_000,
+        );
+        assert_eq!(keep.len(), 1);
+        assert!(overdue.is_empty());
+    }
+
+    #[test]
+    fn watchdog_partial_resolution_is_not_resolution() {
+        // Multi-flag ware: one collected flag of two is still unresolved -- same rule as the
+        // suppressor itself (every mapped flag, not any).
+        let collected = set(&[100]);
+        let never = |_f: u32| false;
+        let (keep, overdue) = split_unresolved(
+            vec![sp(0x1000, &[100, 200], 0)],
+            &collected,
+            &never,
+            30_000,
+            20_000,
+        );
+        assert!(keep.is_empty());
+        assert_eq!(overdue.len(), 1);
     }
 }
