@@ -597,6 +597,14 @@ fn read_play_time_ms() -> Option<u32> {
     unsafe { GameDataMan::instance() }.ok().map(|g| g.play_time)
 }
 
+/// Stable-enough coordinates for character-scoped sidecar state. The numeric save slot separates
+/// simultaneously existing characters; the monotonically increasing play time detects a
+/// delete-and-recreate that reuses that slot. Kept in this module so every client ledger reads the
+/// exact same game fields and identity doctrine.
+pub fn live_character_coordinates() -> Option<(i32, u32)> {
+    Some((read_save_slot()?, read_play_time_ms()?))
+}
+
 /// On-disk mirror of `CharLedger` (er-logic has no serde dep; convert at the boundary).
 #[derive(Serialize, Deserialize, Clone, Copy)]
 struct StoredLedger {
