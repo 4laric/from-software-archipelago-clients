@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory)] [string] $Config,
     [Parameter(Mandatory)] [string] $Ledger,
     [string] $Password,
+    [switch] $AssumeCorrectSave,
     [ValidateRange(10, 3600)] [int] $WaitSeconds = 600
 )
 
@@ -38,6 +39,9 @@ if (-not (Test-Administrator)) {
     )
     if ($Password) {
         $arguments += @("-Password", (Quote-Argument $Password))
+    }
+    if ($AssumeCorrectSave) {
+        $arguments += "-AssumeCorrectSave"
     }
     Start-Process -FilePath $shell -ArgumentList ($arguments -join " ") -Verb RunAs
     exit
@@ -74,6 +78,9 @@ Write-Host ("shadPS4 PID {0} detected; starting Bloodborne AP client." -f $shad.
 $clientArguments = @($Server, $Slot, $Config, $Ledger)
 if ($Password) {
     $clientArguments += $Password
+}
+if ($AssumeCorrectSave) {
+    $clientArguments += "--assume-correct-save"
 }
 & (Resolve-Path -LiteralPath $ClientPath).Path @clientArguments
 exit $LASTEXITCODE

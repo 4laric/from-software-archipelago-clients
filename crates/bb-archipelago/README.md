@@ -58,7 +58,7 @@ when the server already records that location, so a dropped connection cannot
 strand a completed Father Gascoigne run.
 
 ```text
-bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock]
+bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save]
 ```
 
 Use `runtime-config.example.json` as the configuration shape. Its zero AP IDs
@@ -70,10 +70,23 @@ through the manager's group tree. The diagnostic reader is live, but automatic
 `LocationChecks` are fail-closed because the live backend cannot yet prove a
 loaded-save identity or a stable gameplay state. Mock mode supplies both,
 requires the configured identity, and debounces true reads before reporting.
+For the controlled vertical-slice MVP, `--assume-correct-save` explicitly makes
+the player responsible for loading the character belonging to the connected AP
+slot. That mode uses a synthetic identity, requires three consecutive healthy
+event-flag-manager probes, and then enables automatic location checks and item
+delivery. Any failed manager probe immediately disarms it and resets all
+location debounce streaks. Do not switch characters while it is connected;
+checks sent from the wrong character cannot be undone, and received items may be
+recorded against the wrong save.
 Run the client as administrator when shadPS4
 is elevated. `--mock` applies `mock_set_flags` and exercises the complete
 network, check, ordered-grant, acknowledgement, and persistence loop without
 game-memory access.
+
+Live startup retries for up to ten minutes while shadPS4, the eboot mapping,
+and the event-flag manager initialize. The BBLauncher companion may therefore
+start the client as soon as the emulator process appears without turning that
+normal initialization window into a terminal attach failure.
 
 The read-only diagnostic below prints whether a decimal event flag is set:
 

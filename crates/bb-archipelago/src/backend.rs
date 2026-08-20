@@ -8,6 +8,7 @@ use crate::event_flags::LiveEventFlags;
 use crate::feed::EquipTarget;
 
 const GRANT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const ASSUMED_CONTEXT_STABLE_READS: u8 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocationContext {
@@ -56,6 +57,34 @@ pub trait BloodborneBackend {
 pub struct FileBackend {
     bridge: FileBridge,
     event_flags: LiveEventFlags,
+    assumed_context: Option<AssumedContextGate>,
+}
+
+#[derive(Clone, Debug)]
+struct AssumedContextGate {
+    identity: String,
+    consecutive_ready: u8,
+}
+
+impl AssumedContextGate {
+    fn new(identity: String) -> Self {
+        Self {
+            identity,
+            consecutive_ready: 0,
+        }
+    }
+
+    fn observe(&mut self, ready: bool) -> LocationContext {
+        if ready {
+            self.consecutive_ready = self.consecutive_ready.saturating_add(1);
+        } else {
+            self.consecutive_ready = 0;
+        }
+        LocationContext {
+            save_identity: self.identity.clone(),
+            gameplay_ready: self.consecutive_ready >= ASSUMED_CONTEXT_STABLE_READS,
+        }
+    }
 }
 
 impl FileBackend {
@@ -63,17 +92,37 @@ impl FileBackend {
         Self {
             bridge,
             event_flags,
+            assumed_context: None,
+        }
+    }
+
+    /// Enable the explicitly unsafe vertical-slice mode. The supplied identity
+    /// is an operator attestation, not a value read from the game save.
+    pub fn assuming_correct_save(
+        bridge: FileBridge,
+        event_flags: LiveEventFlags,
+        assumed_identity: String,
+    ) -> Self {
+        Self {
+            bridge,
+            event_flags,
+            assumed_context: Some(AssumedContextGate::new(assumed_identity)),
         }
     }
 }
 
 impl BloodborneBackend for FileBackend {
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
-        // The direct reader validates the eboot build and re-resolves the flag
-        // manager on every read, but it cannot yet identify the loaded save or
-        // prove that gameplay is not transitioning. Fail closed until both are
-        // available from a version-gated live accessor.
-        Ok(None)
+        let Some(gate) = self.assumed_context.as_mut() else {
+            // The normal live mode remains fail-closed until a real save
+            // identity accessor is available.
+            return Ok(None);
+        };
+        if let Err(error) = self.event_flags.probe_manager_resilient() {
+            gate.observe(false);
+            return Err(error);
+        }
+        Ok(Some(gate.observe(true)))
     }
 
     fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>> {
@@ -256,5 +305,22 @@ impl BloodborneBackend for MockBackend {
         self.equips.push(request.clone());
         self.completed_equips.insert(request.tag.clone());
         Ok(OperationProgress::Complete)
+    }
+}
+
+#[cfg(test)]
+mod assumed_context_tests {
+    use super::*;
+
+    #[test]
+    fn assumed_context_arms_after_three_reads_and_disarms_immediately() {
+        let mut gate = AssumedContextGate::new("unsafe-test".into());
+        assert!(!gate.observe(true).gameplay_ready);
+        assert!(!gate.observe(true).gameplay_ready);
+        assert!(gate.observe(true).gameplay_ready);
+        assert!(!gate.observe(false).gameplay_ready);
+        assert!(!gate.observe(true).gameplay_ready);
+        assert!(!gate.observe(true).gameplay_ready);
+        assert!(gate.observe(true).gameplay_ready);
     }
 }

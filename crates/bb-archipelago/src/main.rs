@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -66,21 +66,54 @@ struct Arguments {
     ledger: PathBuf,
     password: Option<String>,
     mock: bool,
+    assume_correct_save: bool,
+}
+
+const LIVE_ATTACH_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn attach_live_event_flags(shad_log: &Path) -> Result<LiveEventFlags> {
+    let deadline = Instant::now() + LIVE_ATTACH_TIMEOUT;
+    let mut next_report = Instant::now();
+    loop {
+        match LiveEventFlags::attach(shad_log) {
+            Ok(flags) => return Ok(flags),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out after {} seconds waiting for live Bloodborne event flags; last error: {error:#}",
+                        LIVE_ATTACH_TIMEOUT.as_secs()
+                    );
+                }
+                if Instant::now() >= next_report {
+                    eprintln!(
+                        "Waiting for shadPS4 and Bloodborne gameplay initialization: {error:#}"
+                    );
+                    next_report = Instant::now() + Duration::from_secs(5);
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
 }
 
 fn arguments() -> Result<Arguments> {
     let mut args = env::args().skip(1);
     let Some(server) = args.next() else {
-        bail!("usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock]")
+        bail!(
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save]"
+        )
     };
     let slot = args.next().context("missing SLOT")?;
     let config = args.next().context("missing CONFIG")?.into();
     let ledger = args.next().context("missing LEDGER")?.into();
     let mut password = None;
     let mut mock = false;
+    let mut assume_correct_save = false;
     for argument in args {
         if argument == "--mock" {
             mock = true;
+        } else if argument == "--assume-correct-save" {
+            assume_correct_save = true;
         } else if password.replace(argument).is_some() {
             bail!("only one password may be supplied");
         }
@@ -92,13 +125,26 @@ fn arguments() -> Result<Arguments> {
         ledger,
         password,
         mock,
+        assume_correct_save,
     })
 }
 
 fn main() -> Result<()> {
     let args = arguments()?;
     eprintln!("Bloodborne AP runtime build {RUNTIME_BUILD}");
-    let config = RuntimeConfig::load(&args.config)?;
+    anyhow::ensure!(
+        !(args.mock && args.assume_correct_save),
+        "--mock and --assume-correct-save cannot be combined"
+    );
+    let mut config = RuntimeConfig::load(&args.config)?;
+    const ASSUMED_IDENTITY: &str = "unsafe-operator-attested-correct-save";
+    if args.assume_correct_save {
+        config.expected_save_identity = Some(ASSUMED_IDENTITY.into());
+        eprintln!(
+            "WARNING: UNSAFE MVP MODE ARMED. The client cannot identify the loaded character. You attest that the correct save for AP slot {:?} is loaded; do not switch characters while connected.",
+            args.slot
+        );
+    }
     let backend = if args.mock {
         let mut backend = MockBackend::default();
         backend
@@ -110,7 +156,7 @@ fn main() -> Result<()> {
             .shad_log
             .as_deref()
             .context("live mode requires shad_log in the runtime config")?;
-        let event_flags = LiveEventFlags::attach(shad_log)?;
+        let event_flags = attach_live_event_flags(shad_log)?;
         let attachment = event_flags.info();
         eprintln!(
             "Bloodborne AP client {} | CUSA03173 01.09 | shad PID {} | eboot 0x{:X} | direct flag backend ready",
@@ -128,7 +174,11 @@ fn main() -> Result<()> {
             ),
             Err(error) => eprintln!("Grant bridge state unavailable at startup: {error:#}"),
         }
-        Backend::Live(FileBackend::new(bridge, event_flags))
+        Backend::Live(if args.assume_correct_save {
+            FileBackend::assuming_correct_save(bridge, event_flags, ASSUMED_IDENTITY.into())
+        } else {
+            FileBackend::new(bridge, event_flags)
+        })
     };
     let ledger = ReceiveLedger::load(&args.ledger)?;
     let mut backend = Some(backend);
@@ -182,6 +232,8 @@ fn main() -> Result<()> {
                 .count();
             let location_mode = if args.mock {
                 "mock checks use bound save identity plus debounce"
+            } else if args.assume_correct_save {
+                "UNSAFE live checks use operator-attested save identity, a three-read gameplay gate, and per-location debounce"
             } else {
                 "live check sends remain disarmed until gameplay/save identity is validated"
             };
