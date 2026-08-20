@@ -1122,15 +1122,13 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
     // `fresh_character` governs the reconcile.json play_time re-stamp (reset for a new character,
     // monotonic for a resume). On the marker Resume path the marker is authoritative, so it's false.
     let (reconciler, fresh_character) = match decision {
-        marker::InitDecision::Refuse { stored, expected } => {
-            set_refused(marker::Refusal::WrongSaveAtConnect);
+        marker::InitDecision::Rebind { stored, expected } => {
             log::warn!(
-                "[reconcile] REFUSED: save marker identity {stored:#010x} != this session {expected:#010x} \
-                 -- this save belongs to a different seed/slot. NOT arming the reconciler; check \
-                 reporting is gated. Quit to the main menu, then load this room's save or start a \
-                 new character -- the menu edge releases this refusal (clear_refusal_if_rearmable)."
+                "[reconcile] REBINDING: save marker identity {stored:#010x} != this session \
+                 {expected:#010x}. The wrong-seed guard is disabled: starting this seed's receive \
+                 cursor fresh and replacing the marker. Existing inventory and game flags remain."
             );
-            return; // no Driver -> tick() no-ops; is_refused() gates check reporting in core
+            (Reconciler::new(inputs), true)
         }
         // Marker present + matches: resume from the save's OWN cursor. No play_time inference.
         marker::InitDecision::Resume { watermark } => {

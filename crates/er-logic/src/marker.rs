@@ -14,8 +14,9 @@
 //!
 //! Minibake removes the inference: the watermark and a seed/slot identity travel INSIDE the save
 //! itself, written alongside the grants. On reconnect the client reads the save's own record — no
-//! marker means "fresh", a matching identity means "resume from exactly here", a mismatched identity
-//! means "this save belongs to a different seed/slot". Because the record rewinds WITH the inventory
+//! marker means "fresh", a matching identity means "resume from exactly here", and a mismatched
+//! identity means "start the connected seed fresh and rebind the marker". Because the record rewinds
+//! WITH the inventory
 //! (both live in the save), a restored backup is coherent for free: the cursor moves back with it.
 //!
 //! # Why event flags, not a synthetic good
@@ -247,11 +248,12 @@ pub enum InitDecision {
         /// The persisted watermark to resume from.
         watermark: ItemIndex,
     },
-    /// Identity MISMATCH — this save belongs to a different seed/slot. REFUSE the session: the caller
-    /// must gate the WHOLE pipeline (flag poll, check detection, shop rewrites), not just grants —
-    /// otherwise seed-A's save flags get reported as seed-B checks, corrupting the multiworld. Do NOT
-    /// [`commit`] (never mutate a save we refused). Surface a reason to the player.
-    Refuse {
+    /// Identity MISMATCH — the save was last used with a different seed/slot. Start the connected
+    /// seed from a fresh receive cursor and replace the save marker on the next [`commit`].
+    ///
+    /// This is deliberately permissive: inventory and already-set game flags remain on the character.
+    /// The caller should log the transition so cross-seed character reuse stays diagnosable.
+    Rebind {
         /// The identity found in the save.
         stored: Identity,
         /// The identity this connection expected.
@@ -270,7 +272,7 @@ pub fn decide(marker: MarkerRead, expected: Identity) -> InitDecision {
             if identity == expected {
                 InitDecision::Resume { watermark }
             } else {
-                InitDecision::Refuse {
+                InitDecision::Rebind {
                     stored: identity,
                     expected,
                 }
@@ -288,14 +290,24 @@ pub fn decide(marker: MarkerRead, expected: Identity) -> InitDecision {
 /// * ESTABLISHED band (`PRESENT` set): if the ACTIVE cursor already equals `watermark`, no-op. Else
 ///   write the INACTIVE register in full, then flip `SEL` — the atomic cursor commit.
 ///
-/// The caller MUST NOT call this on an identity [`InitDecision::Refuse`]: committing would mutate a
-/// save we just refused to touch.
+/// If an established marker carries a different identity, the old marker is first made absent and
+/// then initialized with the new identity. `PRESENT` remains the final commit bit, so a torn rebind
+/// is read as [`MarkerRead::Absent`] and safely retried.
 pub fn commit(
     io: &mut dyn GameIo,
     band: FlagBand,
     identity: Identity,
     watermark: ItemIndex,
 ) -> bool {
+    let present = io.get_flag(band.present());
+    if present && read_u32(io, |b| band.ident(b)) != identity {
+        // REBIND: invalidate the old committed record before changing identity or cursor. A crash
+        // anywhere after this write leaves PRESENT clear, so the partial replacement is never read.
+        if !io.set_flag(band.present(), false) {
+            return false;
+        }
+    }
+
     if !io.get_flag(band.present()) {
         // FRESH: register A holds the first cursor; SEL points at A (false). PRESENT commits last.
         let mut ok = io.set_flag(band.sel(), false);
@@ -329,7 +341,8 @@ pub fn commit(
 ///
 /// 2026-07-30, boblerrr: exactly that. Room `58616176906260760086` -> `87077892385581357560` on a
 /// live reconnect; `229` of the old room's checks were reported into the new one before the next
-/// game restart finally let [`decide`] refuse. `reconcile_io.rs`'s own note calls this outcome
+/// game restart finally let [`decide`] detect the mismatch. `reconcile_io.rs`'s own note calls this
+/// outcome
 /// "strictly worse than a double-grant" -- and it is not recoverable, because the checks are already
 /// on someone else's server.
 ///
@@ -342,7 +355,8 @@ pub enum ArmedVerdict {
     /// The armed reconciler still belongs to this session -- keep applying.
     Keep,
     /// The armed reconciler belongs to a DIFFERENT (seed, slot). It must be disarmed and the whole
-    /// pipeline gated, exactly as [`InitDecision::Refuse`] does at init.
+    /// pipeline gated. Unlike an at-connect [`InitDecision::Rebind`], an armed driver cannot be
+    /// rebuilt because the live client stores it in a `OnceLock`.
     Disarm {
         /// The identity the armed reconciler was built for.
         armed: Identity,
@@ -369,7 +383,8 @@ pub fn armed_verdict(armed: Identity, room_seed: &str, ap_slot: &str) -> ArmedVe
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// At connect: the loaded save's marker belongs to a different (seed, slot). The player has the
-    /// wrong SAVE for this room. See [`InitDecision::Refuse`].
+    /// wrong SAVE for this room. Retained for release compatibility with a refusal already latched
+    /// by an older client; new connects use [`InitDecision::Rebind`].
     WrongSaveAtConnect,
     /// Mid-session: the ROOM changed under a live, already-armed reconciler. See [`ArmedVerdict`].
     RoomChangedMidSession,
@@ -414,7 +429,7 @@ pub enum RefusalRelease {
 /// [`refusal_toast`] tells a wrong-save player to "start a fresh character", and until this
 /// predicate existed that instruction could not work. The refusal is a process-lifetime latch
 /// (`reconcile_io::REFUSED`), and `core`'s `reconcile_inited` is set the moment `init` RETURNS --
-/// including the [`InitDecision::Refuse`] path, which returns before building anything. So the
+/// including the former wrong-save refusal path, which returned before building anything. So the
 /// player quit to the menu, rolled a brand-new character, and got a save that was gated, silent and
 /// permanently inert: no checks reported, no items granted, the same toast still on screen. The
 /// only recovery was restarting the game, and nothing on screen said so.
@@ -577,14 +592,31 @@ mod tests {
     }
 
     #[test]
-    fn mismatch_decides_refuse() {
+    fn mismatch_decides_rebind() {
         let mut g = MockGame::stable();
         let stored = identity_hash("seedA", "slot");
         assert!(commit(&mut g, B, stored, 5));
         let expected = identity_hash("seedB", "slot");
         assert_eq!(
             decide(read(&g, B), expected),
-            InitDecision::Refuse { stored, expected }
+            InitDecision::Rebind { stored, expected }
+        );
+    }
+
+    #[test]
+    fn commit_rebinds_an_established_marker_to_the_new_identity_and_cursor() {
+        let mut g = MockGame::stable();
+        let stored = identity_hash("seedA", "slot");
+        let expected = identity_hash("seedB", "slot");
+        assert!(commit(&mut g, B, stored, 5));
+
+        assert!(commit(&mut g, B, expected, 0));
+        assert_eq!(
+            read(&g, B),
+            MarkerRead::Present {
+                identity: expected,
+                watermark: 0,
+            }
         );
     }
 
@@ -645,10 +677,11 @@ mod tests {
         ));
     }
 
-    /// `armed_verdict` must agree with `decide` -- they are the same question asked at two moments,
-    /// and a client that disarmed mid-session but would Resume at init (or vice versa) would flap.
+    /// `armed_verdict` and `decide` must agree on whether identities match. Their mismatch actions are
+    /// intentionally different: init can build a fresh driver, while a live `OnceLock` driver can only
+    /// disarm until restart.
     #[test]
-    fn armed_verdict_agrees_with_the_init_decision() {
+    fn armed_verdict_and_init_decision_agree_on_identity_match() {
         let armed = identity_hash("A", "slot");
         for (room, slot) in [("A", "slot"), ("B", "slot"), ("A", "other")] {
             let live = identity_hash(room, slot);
@@ -666,7 +699,7 @@ mod tests {
                 ArmedVerdict::Disarm { armed: a, live: l } => {
                     assert_eq!(
                         init,
-                        InitDecision::Refuse {
+                        InitDecision::Rebind {
                             stored: a,
                             expected: l
                         },
