@@ -69,6 +69,7 @@ pub mod pot_cap_tally;
 pub mod progressive;
 pub mod radahn_festival;
 pub mod receive;
+pub mod receive_cursor;
 pub mod receive_probe;
 pub mod receive_watermark_replay;
 pub mod reconcile;

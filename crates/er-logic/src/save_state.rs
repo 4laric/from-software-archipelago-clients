@@ -6,10 +6,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::receive_cursor::CursorEntry;
+
 /// Everything persisted per save, round-tripped through `apconfig`-adjacent JSON.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveState {
+    /// Pre-character-keyed frontier, retained only until one positively returning character adopts
+    /// it. New writes use `received_cursors`; keeping this field makes migration explicit and
+    /// prevents a fresh character from consuming another character's cursor.
     pub last_received_index: i64,
+    /// Positive ReceivedItems frontiers keyed by Elden Ring save-slot index. The play-time stamp
+    /// distinguishes delete-and-recreate reuse of the same numeric slot.
+    pub received_cursors: BTreeMap<i32, CursorEntry>,
     pub notify_granted: BTreeSet<i32>,
     /// Fresh-save flag-poll baseline (gf-flagpoll-baseline-persist): the guarding acquisition
     /// flags that already read SET on the FIRST in-world poll of a genuinely fresh save. Persisted
@@ -37,8 +45,22 @@ impl SaveState {
             .iter()
             .map(|(k, &v)| (k.clone(), serde_json::Value::from(v)))
             .collect();
+        let received_cursors: serde_json::Map<String, serde_json::Value> = self
+            .received_cursors
+            .iter()
+            .map(|(slot, entry)| {
+                (
+                    slot.to_string(),
+                    serde_json::json!({
+                        "index": entry.index,
+                        "play_time_ms": entry.play_time_ms,
+                    }),
+                )
+            })
+            .collect();
         serde_json::json!({
             "last_received_index":    self.last_received_index,
+            "received_cursors":       serde_json::Value::Object(received_cursors),
             "notify_granted":         notify,
             "flag_poll_baseline":     flag_poll_baseline,
             "starting_left_slots_normalized": self.starting_left_slots_normalized,
@@ -80,11 +102,29 @@ impl SaveState {
                     .collect()
             })
             .unwrap_or_default();
+        let received_cursors = v
+            .get("received_cursors")
+            .and_then(|x| x.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(slot, value)| {
+                        Some((
+                            slot.parse::<i32>().ok()?,
+                            CursorEntry {
+                                index: value.get("index")?.as_i64()?.max(0),
+                                play_time_ms: value.get("play_time_ms")?.as_u64()? as u32,
+                            },
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         SaveState {
             last_received_index: v
                 .get("last_received_index")
                 .and_then(|x| x.as_i64())
                 .unwrap_or(0),
+            received_cursors,
             notify_granted: notify,
             flag_poll_baseline,
             // Legacy files belong to characters that may have manually curated their loadout.
@@ -112,6 +152,7 @@ impl Default for SaveState {
     fn default() -> Self {
         SaveState {
             last_received_index: 0,
+            received_cursors: std::collections::BTreeMap::new(),
             notify_granted: std::collections::BTreeSet::new(),
             flag_poll_baseline: std::collections::BTreeSet::new(),
             starting_left_slots_normalized: false,
@@ -141,6 +182,22 @@ mod tests {
 
         let before = SaveState {
             last_received_index: 17,
+            received_cursors: BTreeMap::from([
+                (
+                    0,
+                    CursorEntry {
+                        index: 17,
+                        play_time_ms: 90_000,
+                    },
+                ),
+                (
+                    6,
+                    CursorEntry {
+                        index: 3,
+                        play_time_ms: 1_200,
+                    },
+                ),
+            ]),
             notify_granted: notify,
             flag_poll_baseline,
             starting_left_slots_normalized: false,
@@ -161,6 +218,7 @@ mod tests {
         let legacy = r#"{"last_received_index": 5}"#;
         let s = SaveState::from_json(legacy);
         assert_eq!(s.last_received_index, 5);
+        assert!(s.received_cursors.is_empty());
         assert!(s.notify_granted.is_empty());
         assert!(
             s.flag_poll_baseline.is_empty(),

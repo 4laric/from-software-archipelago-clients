@@ -116,6 +116,15 @@ pub struct Core {
     /// separately so a restart after the in-save marker commits does not lose the work.
     starting_left_slots_pending: bool,
     last_persisted_index: i64,
+    /// Character-scoped positive ReceivedItems frontiers loaded from the room/slot save file.
+    receive_cursors: BTreeMap<i32, er_logic::receive_cursor::CursorEntry>,
+    /// Pre-#322 cursor waiting for one positively returning character to adopt it.
+    legacy_received_index: i64,
+    /// ER save slot whose cursor is active this in-world session. `None` holds receive mutations
+    /// until save-slot + play-time identity can be read without guessing.
+    receive_cursor_slot: Option<i32>,
+    /// Delays cursor-ahead repair until a shorter re-hosted stream has stopped growing.
+    receive_cursor_ahead: er_logic::receive_cursor::AheadGuard,
     valid_locations: HashSet<i64>,
     locations_loaded: bool,
     /// Bake-emitted location->flag map (apconfig) for detour-bypass checks (NPC gifts, death drops).
@@ -547,6 +556,10 @@ impl shared::Core for Core {
             starting_left_slots_normalized: false,
             starting_left_slots_pending: false,
             last_persisted_index: -1,
+            receive_cursors: BTreeMap::new(),
+            legacy_received_index: 0,
+            receive_cursor_slot: None,
+            receive_cursor_ahead: er_logic::receive_cursor::AheadGuard::default(),
             valid_locations: HashSet::new(),
             locations_loaded: false,
             flag_poll: None,
@@ -1890,7 +1903,14 @@ impl shared::Core for Core {
                     }
                     Err(_) => SaveState::default(), // absent = fresh save (normal first run)
                 };
-                self.received_through = st.last_received_index.max(0) as usize;
+                // #322: the legacy frontier was room/slot scoped and cannot be applied until a
+                // live ER character identity is known. Hold at zero; `bind_receive_cursor` selects
+                // this save slot's stamped entry (or safely migrates the legacy value) below.
+                self.received_through = 0;
+                self.receive_cursors = st.received_cursors;
+                self.legacy_received_index = st.last_received_index.max(0);
+                self.receive_cursor_slot = None;
+                self.receive_cursor_ahead.reset();
                 self.progressive.restore(
                     st.progressive_counter
                         .iter()
@@ -1910,12 +1930,13 @@ impl shared::Core for Core {
                 self.flag_poll_baseline_done = !self.flag_poll_baseline.is_empty();
                 self.starting_left_slots_normalized = st.starting_left_slots_normalized;
                 self.starting_left_slots_pending = st.starting_left_slots_pending;
-                self.last_persisted_index = st.last_received_index;
+                self.last_persisted_index = -1;
                 log::info!("save persistence armed at {}", path.display());
                 self.save_path = Some(path);
                 log::info!(
-                    "save loaded: resume at received index {}",
-                    self.received_through
+                    "save loaded: {} character cursor(s), legacy received index {}; awaiting live ER character identity",
+                    self.receive_cursors.len(),
+                    self.legacy_received_index
                 );
             }
             self.save_loaded = true;
@@ -2219,6 +2240,14 @@ impl shared::Core for Core {
             crate::reconcile_io::tick();
         }
 
+        // Bind the POSITIVE AP receive frontier only after live save-slot/play-time coordinates
+        // and the save-embedded fresh-character verdict are available. Until then receive grants
+        // are held rather than replayed from a guessed zero or skipped from a character-blind tail.
+        self.bind_receive_cursor();
+        if let Some(stream_len) = self.client().map(|c| c.received_items().len()) {
+            self.repair_cursor_ahead(stream_len);
+        }
+
         // 3. Snapshot the received-item stream in one client borrow (RecvItem mirrors for the
         //    seam, plus the cumulative name set the reconcile ticks need). Under own_world:true
         //    this stream ALSO carries the echoes of our own self-found checks.
@@ -2233,6 +2262,7 @@ impl shared::Core for Core {
         // and the whole stream replays.
         let can_grant = crate::detour::has_inventory()
             && crate::flags::in_world()
+            && self.receive_cursor_slot.is_some()
             && !crate::reconcile_io::is_refused();
         // Seed-change detection/reset has completed above. Retry report debt only now, so debt from
         // a prior room can never be offered to a newly-connected seed before reset_for_new_seed.
@@ -4097,8 +4127,23 @@ impl shared::Core for Core {
         // `clear_refusal_if_rearmable` decides via `er_logic::marker::release_verdict`, which holds
         // a mid-session room change forever (its `Driver` is armed for the old room and `DRIVER` is
         // a `OnceLock`) -- see the 229-check incident in `disarm_if_identity_moved`.
-        if !now_in_world && self.was_in_world && crate::reconcile_io::clear_refusal_if_rearmable() {
-            self.reconcile_inited = false;
+        if !now_in_world && self.was_in_world {
+            // Stamp the active character at the latest observed play time before its game state is
+            // torn down, then force the next character load to bind its own cursor. This also
+            // supports switching ER characters without disconnecting the AP room.
+            self.write_save();
+            self.receive_cursor_slot = None;
+            self.received_through = 0;
+            self.dispatched_through = 0;
+            self.last_persisted_index = -1;
+            self.receive_cursor_ahead.reset();
+            // A verdict belongs to the character that just left. The reconciler's Driver cannot
+            // be replaced in-process, so the next cursor binding falls back to its own save-slot +
+            // play-time evidence instead of inheriting a stale Fresh/Resume answer.
+            crate::reconcile_io::reset_fresh_character_verdict();
+            if crate::reconcile_io::clear_refusal_if_rearmable() {
+                self.reconcile_inited = false;
+            }
         }
         self.was_in_world = now_in_world;
         if crate::flags::in_world() {
@@ -4481,6 +4526,10 @@ impl Core {
         self.starting_left_slots_pending = false;
         crate::reconcile_io::reset_fresh_character_verdict();
         self.last_persisted_index = -1;
+        self.receive_cursors.clear();
+        self.legacy_received_index = 0;
+        self.receive_cursor_slot = None;
+        self.receive_cursor_ahead.reset();
         self.valid_locations.clear();
         self.locations_loaded = false;
         self.flag_poll = None;
@@ -5446,13 +5495,109 @@ impl Core {
         self.tracker_surface_only = surface_only;
     }
 
-    fn write_save(&self) {
+    /// Select the positive ReceivedItems frontier belonging to the live Elden Ring character.
+    ///
+    /// The save-slot number separates coexisting characters; the play-time stamp detects a
+    /// delete-and-recreate in the same slot; the save-embedded marker's Fresh verdict is the final
+    /// override for very young characters whose play times could otherwise overlap.
+    fn bind_receive_cursor(&mut self) {
+        if self.receive_cursor_slot.is_some() || !self.save_loaded {
+            return;
+        }
+        let Some((save_slot, play_time_ms)) = crate::reconcile_io::live_character_coordinates()
+        else {
+            return;
+        };
+        let entry = self.receive_cursors.get(&save_slot).copied();
+        let decision = er_logic::receive_cursor::bind(
+            entry,
+            self.legacy_received_index,
+            play_time_ms,
+            crate::reconcile_io::fresh_character_verdict(),
+        );
+        let (cursor, migrated, description) = match decision {
+            er_logic::receive_cursor::Binding::Wait => return,
+            er_logic::receive_cursor::Binding::Fresh => (0, false, "fresh character"),
+            er_logic::receive_cursor::Binding::Resume(index) => {
+                (index.max(0) as usize, false, "same character resume")
+            }
+            er_logic::receive_cursor::Binding::Migrate(index) => {
+                (index.max(0) as usize, true, "legacy cursor migration")
+            }
+        };
+        if migrated {
+            // Exactly one positively returning character may consume the character-blind legacy
+            // value. Fresh characters leave it parked for its real owner.
+            self.legacy_received_index = 0;
+        }
+        self.received_through = cursor;
+        self.dispatched_through = 0;
+        self.last_persisted_index = cursor as i64;
+        self.receive_cursor_slot = Some(save_slot);
+        self.receive_cursors.insert(
+            save_slot,
+            er_logic::receive_cursor::CursorEntry {
+                index: cursor as i64,
+                play_time_ms,
+            },
+        );
+        log::info!(
+            "receive cursor bound: ER save slot {save_slot}, play_time_ms={play_time_ms}, \
+             received_through={cursor} ({description})"
+        );
+        // Persist Fresh/Migrate identity immediately. A crash before the first received item must
+        // not leave the next boot facing the same ambiguous legacy frontier.
+        self.write_save();
+    }
+
+    /// Recover a same-character cursor that is ahead of a shorter re-hosted server stream. The
+    /// pure guard waits for five seconds of an unchanged length so an incremental connection sync
+    /// cannot cause a replay burst.
+    fn repair_cursor_ahead(&mut self, stream_len: usize) {
+        if self.receive_cursor_slot.is_none() {
+            return;
+        }
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        let Some(repaired) =
+            self.receive_cursor_ahead
+                .observe(self.received_through, stream_len, now)
+        else {
+            return;
+        };
+        let previous = self.received_through;
+        self.received_through = repaired;
+        self.last_persisted_index = -1;
+        self.write_save();
+        log::warn!(
+            "receive cursor repaired after shorter stream settled: {previous} -> {repaired} \
+             (received_items().len()={stream_len}); future items can advance normally"
+        );
+    }
+
+    fn write_save(&mut self) {
         let Some(path) = self.save_path.as_ref() else {
             return;
         };
+        if let Some(save_slot) = self.receive_cursor_slot {
+            let prior_stamp = self
+                .receive_cursors
+                .get(&save_slot)
+                .map_or(0, |entry| entry.play_time_ms);
+            let play_time_ms = crate::reconcile_io::live_character_coordinates()
+                .filter(|(live_slot, _)| *live_slot == save_slot)
+                .map_or(prior_stamp, |(_, live)| prior_stamp.max(live));
+            self.receive_cursors.insert(
+                save_slot,
+                er_logic::receive_cursor::CursorEntry {
+                    index: self.received_through as i64,
+                    play_time_ms,
+                },
+            );
+        }
         let (counter, high) = self.progressive.snapshot();
         let st = SaveState {
-            last_received_index: self.received_through as i64,
+            last_received_index: self.legacy_received_index,
+            received_cursors: self.receive_cursors.clone(),
             flag_poll_baseline: self.flag_poll_baseline.iter().copied().collect(),
             notify_granted: Default::default(),
             starting_left_slots_normalized: self.starting_left_slots_normalized,
