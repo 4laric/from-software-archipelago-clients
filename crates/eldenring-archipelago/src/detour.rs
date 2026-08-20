@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use eldenring::cs::GameDataMan;
@@ -46,6 +46,20 @@ static ADD_ITEM_PROBE: Mutex<Option<er_logic::add_item_probe::AddItemProbe>> = M
 /// World epoch the probe's records belong to; a bump clears them, so a post-load stall never
 /// quotes a pre-load return.
 static ADD_ITEM_PROBE_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Rust panics caught at the AddItem detour boundary during this client process. Keeping the count
+/// in the diagnostic turns a repeated fail-open into a visible escalating fault instead of an
+/// indistinguishable stream of one-off warnings.
+static ADD_ITEM_PANIC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Collection state used by the AddItem boundary must remain usable after a contained panic.
+/// `Mutex::lock().unwrap()` would make one panic poison the mutex and every later pickup panic in
+/// turn, silently reducing the detour to its vanilla pass-through fallback for the rest of the
+/// session. The protected values remain structurally valid, so recover their guards.
+fn recover_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Remember a DISPATCHED call's raw return. Never called for a grant that did not reach the game.
 fn record_add_item_return(full_id: i32, ret: u64) {
@@ -143,13 +157,13 @@ pub fn configure_check_item_flags(map: HashMap<u32, Vec<u32>>) {
              Collected-set only (the pre-#321 policy this seed was rolled for)."
         );
     }
-    *CHECK_ITEM_FLAGS.lock().unwrap() = Some(map);
+    *recover_lock(&CHECK_ITEM_FLAGS) = Some(map);
 }
 
 /// Replace the collected-flag set. Called by the flag-poll each tick with the acquisition flags of
 /// every location currently in the server checked-set (loc->flag via `locationFlags`).
 pub fn set_known_collected_flags(flags: HashSet<u32>) {
-    *KNOWN_COLLECTED_FLAGS.lock().unwrap() = Some(flags);
+    *recover_lock(&KNOWN_COLLECTED_FLAGS) = Some(flags);
 }
 
 fn check_item_flags_lookup(raw_id: u32) -> Option<Vec<u32>> {
@@ -214,7 +228,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn take_pending_checks() -> Vec<i64> {
-    std::mem::take(&mut *PENDING_CHECKS.lock().unwrap())
+    std::mem::take(&mut *recover_lock(&PENDING_CHECKS))
 }
 
 /// Whether the detour holds an inventory pointer that is USABLE NOW -- captured, plausible, and
@@ -589,8 +603,10 @@ unsafe extern "C" fn add_item_detour(
     })) {
         Ok(ret) => ret,
         Err(_) => {
+            let panic_count = ADD_ITEM_PANIC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             log::error!(
-                "add-item: Rust panic contained at detour boundary; passing the game's item through"
+                "add-item: Rust panic #{panic_count} this session contained at detour boundary; \
+                 passing the game's item through"
             );
             call_original(inventory, entry, itembuf, r9)
         }
@@ -664,7 +680,7 @@ fn add_item_detour_inner(
         // flag is collected. This fixes the shared-flag / early-flag-set leak where the game set the
         // acquisition flag at/before AddItem and the old live-flag test mis-read it as a re-pickup.
         if let Some(flags) = check_item_flags_lookup(raw_id) {
-            let guard = KNOWN_COLLECTED_FLAGS.lock().unwrap();
+            let guard = recover_lock(&KNOWN_COLLECTED_FLAGS);
             // No poll yet (None) -> treat as "nothing collected" -> suppress by default (never leaks).
             let suppress = match guard.as_ref() {
                 // #321: a mapped flag also counts as released once it is LIVE-SET, but only for a
@@ -699,7 +715,7 @@ fn add_item_detour_inner(
                 "AP check: synthetic {raw_id:#x} -> location {}",
                 item.ap_location_id
             );
-            PENDING_CHECKS.lock().unwrap().push(item.ap_location_id);
+            recover_lock(&PENDING_CHECKS).push(item.ap_location_id);
             // own_world:true: report the check + suppress; the server echoes the item back and the
             // received-item path grants it (running progressive / region-open / notify by name).
             0 // suppress the world pickup
@@ -746,4 +762,25 @@ fn signature_matches(addr: usize) -> bool {
 }
 unsafe fn read_i32(base: *const c_void, off: usize) -> i32 {
     unsafe { ((base as *const u8).add(off) as *const i32).read_unaligned() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recover_lock;
+    use std::sync::Mutex;
+
+    #[test]
+    fn collection_lock_recovers_after_contained_panic() {
+        let collection = Mutex::new(vec![1]);
+        let result = std::panic::catch_unwind(|| {
+            let mut guard = collection.lock().unwrap();
+            guard.push(2);
+            panic!("test poison");
+        });
+        assert!(result.is_err());
+        assert!(collection.is_poisoned());
+
+        recover_lock(&collection).push(3);
+        assert_eq!(&*recover_lock(&collection), &[1, 2, 3]);
+    }
 }
