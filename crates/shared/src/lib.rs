@@ -24,6 +24,7 @@ pub mod mod_stack;
 mod overlay;
 pub mod probes;
 mod section_profiler;
+pub mod seed_ids;
 pub mod utils;
 
 pub use core::*;

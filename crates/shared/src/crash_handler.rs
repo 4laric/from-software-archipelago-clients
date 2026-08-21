@@ -334,6 +334,29 @@ impl RegisterSnapshot {
             self.r15,
         )
     }
+
+    /// The same snapshot as `(name, value)` pairs, for the seed-ids scan (client#351): the
+    /// id-shaped half-pointer in crash-19968 sat in r13, not in the fault target, so the
+    /// registers get the same "shaped like an id we wrote" question the target gets.
+    fn named_values(self) -> [(&'static str, u64); 15] {
+        [
+            ("rax", self.rax),
+            ("rbx", self.rbx),
+            ("rcx", self.rcx),
+            ("rdx", self.rdx),
+            ("rsi", self.rsi),
+            ("rdi", self.rdi),
+            ("rbp", self.rbp),
+            ("r8", self.r8),
+            ("r9", self.r9),
+            ("r10", self.r10),
+            ("r11", self.r11),
+            ("r12", self.r12),
+            ("r13", self.r13),
+            ("r14", self.r14),
+            ("r15", self.r15),
+        ]
+    }
 }
 
 fn report_inner(info: usize, phase: &str) {
@@ -389,6 +412,11 @@ fn report_inner(info: usize, phase: &str) {
     // 14 identical reports could only suggest. See `foreign_blocks`.
     if av_target != 0 {
         out.push_str(&crate::foreign_blocks::annotate(av_target));
+        // client#351: is the fault TARGET's low half shaped like a FullID this seed's own
+        // tables carry? crash-19968 faulted at r13+0x10 where r13's low half was the FullID of
+        // a goods row THIS seed's enemyDropRoll wrote -- every crash of that class now names
+        // the table itself instead of needing the shape recognised by a human.
+        out.push_str(&crate::seed_ids::annotate_fault(av_target as u64));
     }
     if rip != 0 && rip as usize != fault_addr {
         out.push_str(&format!("rip {}\n", format_addr(rip as usize)));
@@ -398,6 +426,9 @@ fn report_inner(info: usize, phase: &str) {
     }
     if let Some(registers) = registers {
         out.push_str(&registers.render());
+        out.push_str(&crate::seed_ids::annotate_registers(
+            &registers.named_values(),
+        ));
     }
     out.push_str(&format!("thread {:?}\n", std::thread::current().id()));
 
