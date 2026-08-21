@@ -59,6 +59,12 @@ static GOAL_APPROACH: Mutex<er_logic::goal_approach::ApproachNotice> =
 /// lock from the requirement list, because that lock is the thing being GRANTED and requiring it
 /// would be requiring the output as an input. Empty string = unresolved.
 static GOAL_LOCK_ITEM: Mutex<String> = Mutex::new(String::new());
+/// The goal gate's latest human-readable state, for the TRACKER header (2026-08-21, 4laric's
+/// live test: he held every lock and believed the goal was met while the gate's (correct)
+/// "Great Runes (1/2)" ledger existed only in the log -- no on-screen surface showed the rune
+/// requirement, so "I have all my goals and no Ashen" read as a defect). Updated on every gate
+/// evaluation; empty until a gate exists.
+static GOAL_GATE_STATUS: Mutex<String> = Mutex::new(String::new());
 
 /// Latched once the gate has opened the goal region this world-load, so the convergence loop stops
 /// and the log line is said once rather than per tick.
@@ -88,6 +94,19 @@ pub fn goal_gate_uses_region_completion() -> bool {
 pub fn goal_region_name() -> Option<String> {
     let lock = GOAL_LOCK_ITEM.lock().ok()?.clone();
     lock.strip_suffix(" Lock").map(str::to_owned)
+}
+
+/// The tracker header's goal line ("2 outstanding -- Consecrated Snowfield Lock, Great Runes
+/// (1/2)" / "requirements met -- ..."). `None` until the gate has evaluated once this session.
+pub fn goal_gate_status() -> Option<String> {
+    let s = GOAL_GATE_STATUS.lock().ok()?.clone();
+    (!s.is_empty()).then_some(s)
+}
+
+fn set_goal_gate_status(s: String) {
+    if let Ok(mut g) = GOAL_GATE_STATUS.lock() {
+        *g = s;
+    }
 }
 
 /// Re-arm at the in-world edge (`test_gf_client_resets_are_called`).
@@ -224,6 +243,22 @@ pub fn tick_goal_gate(
         er_logic::goal_gate::decide(&gate, has_item)
     };
 
+    // The tracker header mirrors the gate on EVERY evaluation (the log line stays edge-latched
+    // below). ASCII by construction: region names and the rune counter are ASCII already.
+    match &decision {
+        er_logic::goal_gate::Decision::Withhold { outstanding } => set_goal_gate_status(format!(
+            "{} outstanding -- {}",
+            outstanding.len(),
+            outstanding.join(", ")
+        )),
+        _ => set_goal_gate_status(format!(
+            "requirements met -- {} opens",
+            lock_item
+                .strip_suffix(" Lock")
+                .filter(|n| !n.is_empty())
+                .unwrap_or("the goal region")
+        )),
+    }
     if !decision.opens() {
         // Say the outstanding list ONCE, then stay quiet until something changes it.
         if !GOAL_GATE_SAID_SHUT.swap(true, Ordering::Relaxed) {
