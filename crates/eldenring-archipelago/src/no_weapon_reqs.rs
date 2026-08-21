@@ -50,8 +50,15 @@ pub fn tick() {
     let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
         return;
     };
+    // #351: mid-restream holder -> panics upstream. Defer instead: APPLIED is not latched, so
+    // the pass re-runs next tick (the world-edge reset() re-arms it after a restream anyway).
+    let Some(rows) =
+        crate::param_guard::rows_mut::<EquipParamWeapon>(repo, "no_weapon_requirements")
+    else {
+        return;
+    };
     let mut weapons = 0u32;
-    for (_id, row) in repo.rows_mut::<EquipParamWeapon>() {
+    for (_id, row) in rows {
         row.set_proper_strength(0);
         row.set_proper_agility(0);
         row.set_proper_magic(0);
@@ -62,8 +69,11 @@ pub fn tick() {
     if weapons == 0 {
         return; // param file not populated yet -- retry next tick
     }
+    let Some(rows) = crate::param_guard::rows_mut::<Magic>(repo, "no_weapon_requirements") else {
+        return;
+    };
     let mut spells = 0u32;
-    for (_id, row) in repo.rows_mut::<Magic>() {
+    for (_id, row) in rows {
         row.set_requirement_intellect(0);
         row.set_requirement_faith(0);
         row.set_requirement_luck(0);

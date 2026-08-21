@@ -170,7 +170,9 @@ fn is_physick_tear(full_id: i32) -> bool {
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
         return false;
     };
-    crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip goods read")
+    // #351: param_guard -- a mid-restream holder panics upstream; false = "not a tear", and the
+    // tear path re-classifies on the next received item.
+    crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip tear check")
         .is_some_and(|g| er_logic::physick::is_tear(g.goods_type(), g.sort_id()))
 }
 
@@ -385,7 +387,9 @@ pub fn spell_class(full_id: i32) -> SpellClass {
     if er_logic::spell_equip::is_memory_stone(row) {
         return SpellClass::MemoryStone;
     }
-    let Some(g) = crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip goods gate")
+    // #351: param_guard -- a mid-restream holder panics upstream; Other is the safe
+    // classification, and the stream build re-runs on the next received item.
+    let Some(g) = crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip spell_class")
     else {
         return SpellClass::Other;
     };
@@ -404,7 +408,9 @@ pub fn spell_school(full_id: i32) -> Option<er_logic::spell_equip::School> {
     let row = er_logic::physick::goods_row(full_id)?;
     // SAFETY: FD4 singleton, read on the game thread like every other param read in this module.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
-    let g = crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip goods classify")?;
+    // #351: param_guard -- a mid-restream holder panics upstream; None = "could not read", which
+    // the caller treats as no-preference, never as "the player cannot cast it".
+    let g = crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip spell_school")?;
     er_logic::spell_equip::school_of(g.goods_type())
 }
 
@@ -421,11 +427,13 @@ pub fn held_catalysts() -> Option<er_logic::spell_equip::Catalysts> {
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
     // `/ 100 * 100` strips the upgrade level, exactly as the equip path does at its own wep_type
     // read -- a +9 staff is not a different weapon type.
+    // #351: param_guard -- a mid-restream holder panics upstream; a failed read maps to None,
+    // which from_wep_types already treats as don't-know.
     let types = worn.map(|id| {
         crate::param_guard::get::<EquipParamWeapon>(
             repo,
             ((id / 100) * 100) as u32,
-            "auto_equip weapon base",
+            "auto_equip catalysts",
         )
         .map(|w| w.wep_type())
     });
@@ -925,6 +933,15 @@ pub fn tick() {
     }) else {
         return;
     };
+    // #351: the drain loop reads three param holders per queued entry; a mid-restream holder
+    // would panic upstream, and gating here keeps one teardown event to one warn rather than one
+    // per item. The queue stays pending and re-drains next tick.
+    if !crate::param_guard::is_available::<EquipParamWeapon>(repo, "auto_equip drain")
+        || !crate::param_guard::is_available::<EquipParamAccessory>(repo, "auto_equip drain")
+        || !crate::param_guard::is_available::<EquipParamProtector>(repo, "auto_equip drain")
+    {
+        return;
+    }
 
     // SAFETY: FD4 singletons, read/written on the single-threaded FrameBegin tick (same contract as
     // inventory.rs / no_equip_load.rs).
@@ -1034,9 +1051,12 @@ pub fn tick() {
         let slot = match er_logic::auto_equip::equipable(fid) {
             Some(Equipable::Weapon) => {
                 // Weapon rows are upgradeable, so round to the base row the way the game does.
-                let wep_type = repo
-                    .get::<EquipParamWeapon>((param_id / 100) * 100)
-                    .map(|w| w.wep_type());
+                let wep_type = crate::param_guard::get::<EquipParamWeapon>(
+                    repo,
+                    (param_id / 100) * 100,
+                    "auto_equip drain",
+                )
+                .map(|w| w.wep_type());
                 match wep_type {
                     Some(t) => {
                         // None = it does not belong in a hand at all (AMMUNITION). Skipping is
@@ -1067,7 +1087,7 @@ pub fn tick() {
                 if crate::param_guard::get::<EquipParamAccessory>(
                     repo,
                     param_id,
-                    "auto_equip accessory check",
+                    "auto_equip drain",
                 )
                 .is_none()
                 {
@@ -1090,7 +1110,7 @@ pub fn tick() {
                         && crate::param_guard::get::<EquipParamAccessory>(
                             repo,
                             id as u32,
-                            "auto_equip accessory slot",
+                            "auto_equip drain",
                         )
                         .is_some())
                     .then_some(id)
@@ -1139,10 +1159,12 @@ pub fn tick() {
             }
             Some(Equipable::Protector) => {
                 // Protectors are not upgradeable -- no rounding.
-                let Some(cat) = repo
-                    .get::<EquipParamProtector>(param_id)
-                    .map(|p| p.protector_category())
-                else {
+                let Some(cat) = crate::param_guard::get::<EquipParamProtector>(
+                    repo,
+                    param_id,
+                    "auto_equip drain",
+                )
+                .map(|p| p.protector_category()) else {
                     log::debug!("auto_equip: protector {full:#010x} has no param row -- skipped");
                     continue;
                 };

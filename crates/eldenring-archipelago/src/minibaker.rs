@@ -42,7 +42,7 @@ fn row_base(row_id: u32) -> Option<usize> {
     // SAFETY: FD4 singleton; game thread, in-world (caller gates). Same access shop_flags.rs uses.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
     let row: &SHOP_LINEUP_PARAM =
-        crate::param_guard::get::<ShopLineupParam>(repo, row_id, "minibaker lineup read")?;
+        crate::param_guard::get::<ShopLineupParam>(repo, row_id, "minibaker reserved row")?;
     Some(row as *const SHOP_LINEUP_PARAM as usize)
 }
 

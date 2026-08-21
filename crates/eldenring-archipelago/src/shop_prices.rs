@@ -112,12 +112,19 @@ pub fn run() -> bool {
         Ok(r) => r,
         Err(_) => return false, // repo not up yet -- retry next tick
     };
+    // clients#351: defer the whole pass while the holder is mid-restream -- otherwise every row
+    // reads as "missing" and DONE latches on a pass that wrote nothing.
+    if !crate::param_guard::is_available::<ShopLineupParam>(repo, "shop-prices run") {
+        return false;
+    }
 
     // The write loop CONSUMES `prices`; the read-back below needs the same pairs.
     let verify: Vec<(u32, i32)> = prices.clone();
     let (mut n, mut missing) = (0usize, 0usize);
     for (row_id, price) in prices {
-        let Some(row) = repo.get_mut::<ShopLineupParam>(row_id) else {
+        let Some(row) =
+            crate::param_guard::get_mut::<ShopLineupParam>(repo, row_id, "shop-prices write")
+        else {
             // A configured row with no live ShopLineupParam entry is the interesting case: the world
             // thinks this check is a shop purchase and the game has no such row. Counted, not
             // swallowed -- a silently absent row is how a whole feature goes inert.
@@ -138,7 +145,8 @@ pub fn run() -> bool {
     let mut ok = 0u32;
     let mut wrong: Vec<String> = Vec::new();
     for (row_id, price) in &verify {
-        match repo.get_mut::<ShopLineupParam>(*row_id) {
+        match crate::param_guard::get_mut::<ShopLineupParam>(repo, *row_id, "shop-prices read-back")
+        {
             Some(row) => {
                 let got = row.value();
                 if got == *price {

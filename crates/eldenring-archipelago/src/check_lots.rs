@@ -100,12 +100,16 @@ pub fn dress_placeholder() -> bool {
     let tele_icon = match crate::param_guard::get::<EquipParamGoods>(
         repo,
         TELESCOPE_GOOD_ID,
-        "check_lots telescope icon",
+        "check-lots dress placeholder",
     ) {
         Some(row) => row.icon_id(),
         None => return false, // telescope row not up yet -- retry next tick
     };
-    if let Some(row) = repo.get_mut::<EquipParamGoods>(ph as u32) {
+    if let Some(row) = crate::param_guard::get_mut::<EquipParamGoods>(
+        repo,
+        ph as u32,
+        "check-lots dress placeholder",
+    ) {
         if row.icon_id() != tele_icon {
             row.set_icon_id(tele_icon);
         }
@@ -225,6 +229,18 @@ pub fn run() -> bool {
         Ok(r) => r,
         Err(_) => return false,
     };
+    // clients#351: a mid-restream ItemLotParam holder would make EVERY lot read as absent, land
+    // them all in `missed` ("stale gen data?"), and latch DONE on a pass that wrote nothing.
+    // Defer instead -- the world edge's reset() re-arms us and the next tick retries.
+    if !crate::param_guard::is_available::<eldenring::cs::ItemLotParam_map>(
+        repo,
+        "check-lots neutralise pass",
+    ) || !crate::param_guard::is_available::<eldenring::cs::ItemLotParam_enemy>(
+        repo,
+        "check-lots neutralise pass",
+    ) {
+        return false;
+    }
 
     let mut n = 0usize;
     let mut missed: Vec<u32> = Vec::new();
@@ -256,7 +272,11 @@ pub fn run() -> bool {
     let goods_write = er_logic::check_neutralise::slot_write(true, CAN_WRITE_SLOT_CATEGORY, ph);
     if let Some(w) = goods_write {
         for (lot, slots) in &blank_map {
-            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
+            if let Some(row) = crate::param_guard::get_mut::<eldenring::cs::ItemLotParam_map>(
+                repo,
+                *lot,
+                "check-lots neutralise pass",
+            ) {
                 for &sl in slots {
                     set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
@@ -266,7 +286,11 @@ pub fn run() -> bool {
             }
         }
         for (lot, slots) in &blank_enemy {
-            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
+            if let Some(row) = crate::param_guard::get_mut::<eldenring::cs::ItemLotParam_enemy>(
+                repo,
+                *lot,
+                "check-lots neutralise pass",
+            ) {
                 for &sl in slots {
                     set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
@@ -298,7 +322,11 @@ pub fn run() -> bool {
     let write = er_logic::check_neutralise::slot_write(false, CAN_WRITE_SLOT_CATEGORY, ph);
     if let Some(w) = write {
         for (lot, slots) in &non_goods_map {
-            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
+            if let Some(row) = crate::param_guard::get_mut::<eldenring::cs::ItemLotParam_map>(
+                repo,
+                *lot,
+                "check-lots neutralise pass",
+            ) {
                 for &sl in slots {
                     set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
@@ -308,7 +336,11 @@ pub fn run() -> bool {
             }
         }
         for (lot, slots) in &non_goods_enemy {
-            if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(*lot) {
+            if let Some(row) = crate::param_guard::get_mut::<eldenring::cs::ItemLotParam_enemy>(
+                repo,
+                *lot,
+                "check-lots neutralise pass",
+            ) {
                 for &sl in slots {
                     set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;

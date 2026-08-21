@@ -162,7 +162,13 @@ pub fn echo_skip(loc: i64) -> bool {
     // context run() writes rows from.
     let row_still_sells_reward = unsafe { SoloParamRepository::instance_mut() }
         .ok()
-        .and_then(|repo| repo.get_mut::<ShopLineupParam>(row_id))
+        .and_then(|repo| {
+            crate::param_guard::get_mut::<ShopLineupParam>(
+                repo,
+                row_id,
+                "shop-sell echo-skip live-row check",
+            )
+        })
         .map(|row| row.equip_id() == eid && row.equip_type() == etype)
         .unwrap_or(false);
     let skip = er_logic::shop_echo::echo_skip_decision(flag_set, row_still_sells_reward);
@@ -262,6 +268,15 @@ pub fn run() -> bool {
         Ok(r) => r,
         Err(_) => return false, // repo not up yet — retry next tick
     };
+    // clients#351: the singleton being up is not the holders being SETTLED -- a mid-restream
+    // ShopLineupParam holder would panic upstream's rows()/get_mut() ("exactly one res cap",
+    // Synergy 2026-08-20) or, guarded per-row, make every row read as missing and latch DONE on a
+    // pass that wrote nothing. Defer the pass instead; reset() on the world edge re-arms it.
+    if !crate::param_guard::is_available::<ShopLineupParam>(repo, "shop-sell run")
+        || !crate::param_guard::is_available::<EquipParamGoods>(repo, "shop-sell run")
+    {
+        return false;
+    }
     let (trace, trace_all) = trace_rows();
 
     // Scan immutably -> plan the rewrites, then apply (avoids holding a row borrow across get_mut).
@@ -294,11 +309,11 @@ pub fn run() -> bool {
     // (recipes / a different param), or the flag never came from a shop row at all.
     let mut matched_flags: HashSet<u32> = HashSet::new();
     let mut live_rows_with_flag = 0u32;
-    let Some(lineup_rows) = crate::param_guard::rows::<ShopLineupParam>(repo, "shop_sell scan")
+    let Some(scan_rows) = crate::param_guard::rows::<ShopLineupParam>(repo, "shop-sell scan")
     else {
-        return false; // holder mid-teardown -- retry next tick, same as an absent repo
+        return false; // holder went away between the gate and the walk -- retry next tick
     };
-    for (id, row) in lineup_rows {
+    for (id, row) in scan_rows {
         let f = row.event_flag_for_stock();
         // TRACE (pre-decision). Deliberately BEFORE both continues: "row 100016 is not a check row
         // at all" and "its stock flag is not in slot_data" are findings, and a tally can never say
@@ -457,7 +472,9 @@ pub fn run() -> bool {
     let n = plan.len();
     let mut overrides_cleared = 0u32;
     for (id, eid, etype) in &plan {
-        if let Some(row) = repo.get_mut::<ShopLineupParam>(*id) {
+        if let Some(row) =
+            crate::param_guard::get_mut::<ShopLineupParam>(repo, *id, "shop-sell apply")
+        {
             row.set_equip_id(*eid);
             row.set_equip_type(*etype);
             // CLEAR THE ROW'S OWN NAME OVERRIDE. `ShopLineupParam.nameMsgId` lets a shop row label
@@ -494,7 +511,7 @@ pub fn run() -> bool {
     let mut verified = 0u32;
     let mut mismatched: Vec<String> = Vec::new();
     for (id, eid, etype) in &plan {
-        match repo.get_mut::<ShopLineupParam>(*id) {
+        match crate::param_guard::get_mut::<ShopLineupParam>(repo, *id, "shop-sell read-back") {
             Some(row) => {
                 let got_eid = row.equip_id();
                 let got_etype = row.equip_type();
@@ -549,8 +566,11 @@ pub fn run() -> bool {
         if *etype != 3 {
             continue; // only GOODS live in EquipParamGoods
         }
-        match crate::param_guard::get::<EquipParamGoods>(repo, *eid as u32, "shop_sell goods read")
-        {
+        match crate::param_guard::get::<EquipParamGoods>(
+            repo,
+            *eid as u32,
+            "shop-sell ware sort trace",
+        ) {
             Some(g) => log::info!(
                 "shop-sell TRACE row {id}: WARE goods {eid} sortGroupId {} sortId {} sellValue {} \
                  iconId {}",

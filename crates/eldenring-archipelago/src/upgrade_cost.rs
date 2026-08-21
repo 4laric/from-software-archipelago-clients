@@ -86,7 +86,15 @@ pub fn maybe_apply() -> u32 {
     // clamp could not run, RETRY -- never latch DONE over it") and `spell_slot_length` guards it
     // with an explicit `rows == 0` return. This one did neither.
     let mut tally = er_logic::applied_tally::AppliedTally::new();
-    for (id, row) in repo.rows_mut::<EquipMtrlSetParam>() {
+    // #351: mid-restream holder -> upstream rows_mut panics. Defer instead: APPLIED is not
+    // latched, so the pass retries next tick (same "never latch DONE over a walk that could not
+    // run" rule as the client#139 audit above).
+    let Some(rows) =
+        crate::param_guard::rows_mut::<EquipMtrlSetParam>(repo, "flatten_regular_upgrades")
+    else {
+        return 0;
+    };
+    for (id, row) in rows {
         tally.walked += 1;
         let n = flatten_row(id, row, cap);
         if n > 0 {

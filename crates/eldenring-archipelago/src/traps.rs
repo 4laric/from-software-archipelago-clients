@@ -536,7 +536,9 @@ fn fire_no_flask() -> bool {
     let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
         return false;
     };
-    let Some(row) = repo.get_mut::<SpEffectParam>(TRAP_NO_FLASK as u32) else {
+    let Some(row) =
+        crate::param_guard::get_mut::<SpEffectParam>(repo, TRAP_NO_FLASK as u32, "trap no_flask")
+    else {
         // Not streamed in yet. Retry is a keypress away; a warn here would fire on every boot.
         log::info!("trap no_flask: SpEffect {TRAP_NO_FLASK} not loaded yet -- skipped");
         return false;

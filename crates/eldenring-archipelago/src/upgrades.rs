@@ -248,8 +248,16 @@ const ROW_ID_MASK: u32 = er_codec::ROW_ID_MASK;
 pub(crate) fn weapon_track_and_cap(base: i32) -> Option<(i32, bool)> {
     // SAFETY: FD4 singleton; on the game thread, gated in-world by the caller. Err until built.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
+    // #351: either holder mid-restream -> upstream get panics. Defer the whole classify instead
+    // (None = "can't resolve", and the caller leaves the weapon unchanged rather than guessing);
+    // the up-front gate keeps an empty ReinforceParamWeapon from logging once per rung below.
+    if !crate::param_guard::is_available::<EquipParamWeapon>(repo, "weapon_track_and_cap")
+        || !crate::param_guard::is_available::<ReinforceParamWeapon>(repo, "weapon_track_and_cap")
+    {
+        return None;
+    }
     let weapon =
-        crate::param_guard::get::<EquipParamWeapon>(repo, base as u32, "upgrades weapon read")?;
+        crate::param_guard::get::<EquipParamWeapon>(repo, base as u32, "weapon_track_and_cap")?;
     let rt = weapon.reinforce_type_id() as i32;
     // Reinforce-run length = the CAP. C++: `while (k<=25 && row(rt+k)) ++k; cap = k-1`. rt can be
     // negative for non-upgradeable junk; get() just returns None then.
@@ -258,7 +266,7 @@ pub(crate) fn weapon_track_and_cap(base: i32) -> Option<(i32, bool)> {
         && crate::param_guard::get::<ReinforceParamWeapon>(
             repo,
             (rt + k) as u32,
-            "upgrades cap walk",
+            "weapon_track_and_cap",
         )
         .is_some()
     {

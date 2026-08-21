@@ -200,7 +200,13 @@ pub fn tick() {
         let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
             return;
         };
-        match repo.get_mut::<SpEffectParam>(SP_EFFECT_ID as u32) {
+        // #351: param_guard, not raw get_mut -- a mid-restream holder (res-cap 0, e.g. the warp
+        // this module's own WARP GAP comment describes) panics upstream instead of None.
+        match crate::param_guard::get_mut::<SpEffectParam>(
+            repo,
+            SP_EFFECT_ID as u32,
+            "no_equip_load",
+        ) {
             Some(row) => {
                 // 🛑 ONE FIELD, and it is `equipWeightChangeRate`. See the module doc: the old
                 // `allItemWeightChangeRate = 0` write is inert because that field is never a

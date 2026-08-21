@@ -53,9 +53,11 @@ pub(crate) fn grace_entity_for_unlock_flag(unlock_flag: u32) -> Option<u32> {
     // SAFETY: read-only FD4 singleton access on the game thread (the console command runs from
     // FrameBegin). A pre-world/not-ready repository returns Err and therefore None.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
+    // #351: param_guard -- a mid-restream BonfireWarpParam holder panics upstream; None here
+    // already means "no mapping", which the console prints as a degradation.
+    let rows = crate::param_guard::rows::<BonfireWarpParam>(repo, "warp grace-flag lookup")?;
     er_logic::grace::entity_for_unlock_flag(
-        crate::param_guard::rows::<BonfireWarpParam>(repo, "warp grace table")?
-            .map(|(_, row)| (row.eventflag_id(), row.bonfire_entity_id())),
+        rows.map(|(_, row)| (row.eventflag_id(), row.bonfire_entity_id())),
         unlock_flag,
     )
 }
@@ -69,9 +71,10 @@ pub(crate) fn grace_warp_target_resolves(target: u32) -> bool {
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
         return false;
     };
-    let Some(rows) = crate::param_guard::rows::<BonfireWarpParam>(repo, "warp target resolve")
-    else {
-        return false; // holder mid-teardown: decline the state write, same as a not-ready repo
+    // #351: param_guard -- a mid-restream BonfireWarpParam holder panics upstream; false here
+    // deliberately declines the capital-state write, same as a not-ready repository.
+    let Some(rows) = crate::param_guard::rows::<BonfireWarpParam>(repo, "warp target check") else {
+        return false;
     };
     er_logic::grace::warp_target_resolves(
         rows.map(|(_, row)| row.bonfire_entity_id()),

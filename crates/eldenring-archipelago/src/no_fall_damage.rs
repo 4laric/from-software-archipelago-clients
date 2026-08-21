@@ -69,7 +69,13 @@ pub fn tick() {
         let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
             return;
         };
-        match repo.get_mut::<SpEffectParam>(SP_EFFECT_ID as u32) {
+        // #351: param_guard, not raw get_mut -- a mid-restream holder (res-cap 0) panics
+        // upstream instead of returning None.
+        match crate::param_guard::get_mut::<SpEffectParam>(
+            repo,
+            SP_EFFECT_ID as u32,
+            "no_fall_damage",
+        ) {
             Some(row) => {
                 row.set_fall_damage_rate(0.0);
                 PARAM_PATCHED.store(true, Ordering::Relaxed);

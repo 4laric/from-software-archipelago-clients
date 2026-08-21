@@ -70,6 +70,14 @@ pub fn run() -> bool {
         Ok(r) => r,
         Err(_) => return false, // repo not up yet -- retry
     };
+    // clients#351: defer while the holder is mid-restream -- otherwise every lot skips and DONE
+    // latches on "rerolled 0".
+    if !crate::param_guard::is_available::<eldenring::cs::ItemLotParam_enemy>(
+        repo,
+        "enemy-drops reroll",
+    ) {
+        return false;
+    }
 
     let mut n = 0usize;
     for (lot, slots) in roll {
@@ -78,7 +86,11 @@ pub fn run() -> bool {
         //   row struct : eldenring::param::ITEMLOT_PARAM_ST  (shared with ItemLotParam_map)
         //   setters    : set_lot_item_id01..08               (NO underscore before the digits)
         // lotItemBasePoint (the drop WEIGHT) is deliberately NOT written, so drop rates stay vanilla.
-        let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_enemy>(lot) else {
+        let Some(row) = crate::param_guard::get_mut::<eldenring::cs::ItemLotParam_enemy>(
+            repo,
+            lot,
+            "enemy-drops reroll",
+        ) else {
             continue;
         };
         for (slot, gid) in slots {

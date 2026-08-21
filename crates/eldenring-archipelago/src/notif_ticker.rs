@@ -69,27 +69,56 @@ pub fn tick() {
     let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
         return;
     };
+    // clients#351: the in_world gate above is NOT enough -- a holder can still be mid-restream on
+    // the first ticks after the flip, and upstream's rows_mut PANICS on it ("Expected param holder
+    // to have exactly one res cap", Synergy's 2026-08-20 log). param_guard makes that state
+    // fallible; deferring the whole pass is safe because APPLIED stays clear and the next tick
+    // retries.
     let mut n = 0u32;
-    for (_id, row) in repo.rows_mut::<EquipParamGoods>() {
+    let Some(rows) =
+        crate::param_guard::rows_mut::<EquipParamGoods>(repo, "notif-ticker goods pass")
+    else {
+        return;
+    };
+    for (_id, row) in rows {
         row.set_show_dialog_cond_type(DIALOG_NONE);
         n += 1;
     }
     if n == 0 {
         return; // param file not populated yet -- retry next tick
     }
-    for (_id, row) in repo.rows_mut::<EquipParamWeapon>() {
+    let Some(rows) =
+        crate::param_guard::rows_mut::<EquipParamWeapon>(repo, "notif-ticker weapon pass")
+    else {
+        return;
+    };
+    for (_id, row) in rows {
         row.set_show_dialog_cond_type(DIALOG_NONE);
         n += 1;
     }
-    for (_id, row) in repo.rows_mut::<EquipParamProtector>() {
+    let Some(rows) =
+        crate::param_guard::rows_mut::<EquipParamProtector>(repo, "notif-ticker protector pass")
+    else {
+        return;
+    };
+    for (_id, row) in rows {
         row.set_show_dialog_cond_type(DIALOG_NONE);
         n += 1;
     }
-    for (_id, row) in repo.rows_mut::<EquipParamAccessory>() {
+    let Some(rows) =
+        crate::param_guard::rows_mut::<EquipParamAccessory>(repo, "notif-ticker accessory pass")
+    else {
+        return;
+    };
+    for (_id, row) in rows {
         row.set_show_dialog_cond_type(DIALOG_NONE);
         n += 1;
     }
-    for (_id, row) in repo.rows_mut::<EquipParamGem>() {
+    let Some(rows) = crate::param_guard::rows_mut::<EquipParamGem>(repo, "notif-ticker gem pass")
+    else {
+        return;
+    };
+    for (_id, row) in rows {
         row.set_show_dialog_cond_type(DIALOG_NONE);
         n += 1;
     }

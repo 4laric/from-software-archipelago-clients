@@ -203,6 +203,11 @@ pub fn tick() {
     }) else {
         return;
     };
+    // #351: a mid-restream EquipParamGoods holder would panic per-row below; defer the whole
+    // scan tick instead (one warn per teardown event, not one per inventory slot).
+    if !crate::param_guard::is_available::<EquipParamGoods>(repo, "physick-probe scan") {
+        return;
+    }
 
     let mut guard = STATE.lock().unwrap();
     let state = guard.get_or_insert_with(|| State {
@@ -321,7 +326,7 @@ pub fn tick() {
             continue;
         };
         let Some(param) =
-            crate::param_guard::get::<EquipParamGoods>(repo, row, "physick_probe goods read")
+            crate::param_guard::get::<EquipParamGoods>(repo, row, "physick-probe scan")
         else {
             continue;
         };
