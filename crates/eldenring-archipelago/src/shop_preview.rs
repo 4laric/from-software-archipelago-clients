@@ -411,8 +411,9 @@ pub fn repaint_tick() {
         return;
     }
     let hi = hi.min(lo.saturating_add(REPAINT_MAX_ROWS));
+    let (lo_u, hi_u) = (lo.max(0) as u32, hi.max(0) as u32); // param ids are u32; a negative range is empty
     let mut claims: Vec<(u32, er_logic::name_override::ShopLabel)> = Vec::new();
-    for id in lo..=hi {
+    for id in lo_u..=hi_u {
         let Some(row) = crate::param_guard::get::<ShopLineupParam>(repo, id, "shop-open repaint")
         else {
             continue;
