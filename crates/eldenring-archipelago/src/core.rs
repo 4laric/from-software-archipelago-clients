@@ -955,6 +955,10 @@ impl shared::Core for Core {
         if !self.slot_data_parsed {
             let parsed = self.client().map(|client| {
                 let sd = client.slot_data();
+                // client#351: a fresh seed means the crash reporter's id registry must forget the
+                // LAST seed's tables before this seed's are recorded below (enemyDropRoll /
+                // shopPreviewGoods / shopInfiniteStock). Generation bump, O(1), crash-safe.
+                shared::seed_ids::clear();
                 // Full slot_data dump (playtest diagnostics): every top-level key + a truncated
                 // JSON value, so a client log alone answers "what did this seed emit?" -- e.g. is
                 // regionSphereTargetRanges present/non-empty, is the seed `versions`-stamped.
@@ -1304,6 +1308,12 @@ impl shared::Core for Core {
                     .into_iter()
                     .map(|(l, g)| (l, g as i32))
                     .collect();
+                // client#351: shopPreviewGoods already carries ER FullIDs (category nibble OR'd
+                // in by gen_data). Register each so the crash reporter can recognise one sitting
+                // inside a pointer-shaped value.
+                for &(_, g) in &preview {
+                    shared::seed_ids::record(g as u32, shared::seed_ids::SRC_SHOP);
+                }
                 crate::scout_proof::configure_item_map(map.clone());
                 let shop_row_flags: Vec<(u32, u32)> =
                     i64_to_u32_map(sd.get("shopRowFlags"))
@@ -1337,6 +1347,13 @@ impl shared::Core for Core {
                             let (Some(gid), Some(et), Some(pr)) =
                                 (a[0].as_i64(), a[1].as_i64(), a[2].as_i64()) else { continue };
                             roll.insert(row, (gid as i32, et as u8, pr as i32));
+                            // client#351: register the rerolled ware as the FullID the shop table
+                            // resolves it to, for the crash reporter's id-shaped-fault decode.
+                            if let Some(full) =
+                                er_codec::full_id_from_equip_type(et as u8, gid as i32)
+                            {
+                                shared::seed_ids::record(full as u32, shared::seed_ids::SRC_SHOP);
+                            }
                         }
                     }
                     if !roll.is_empty() {
@@ -1359,6 +1376,13 @@ impl shared::Core for Core {
                                 }
                                 let (Some(sl), Some(gid)) = (ch[0].as_i64(), ch[1].as_i64()) else { continue };
                                 pairs.push((sl as u8, gid as i32));
+                                // client#351: the reroll writes the bare row id into a GOODS slot
+                                // (lotItemCategory 1 -> nibble 4), so register the FULLID -- that
+                                // is the shape crash-19968 found inside r13's low half.
+                                shared::seed_ids::record(
+                                    er_codec::CATEGORY_GOODS | gid as u32,
+                                    shared::seed_ids::SRC_ENEMY_DROP_ROLL,
+                                );
                             }
                             if !pairs.is_empty() {
                                 roll.insert(lot, pairs);

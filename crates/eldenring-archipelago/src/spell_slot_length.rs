@@ -36,6 +36,13 @@
 //! normalised, so any other number means the param table is not vanilla -- which on a stacked
 //! install (matt's randomizer ships its own `regulation.bin`) is worth knowing and is otherwise
 //! invisible to us.
+//!
+//! ⚠ The oracle reads on the FIRST apply only. This module is re-armed on the `in_world` edge like
+//! every other param writer, and a re-pass over a table the load never reverted finds 0 rows to
+//! normalise -- the EXPECTED shape, not a modded table. crash-19968's session (client#351) carried
+//! `normalised 0 of 317 ... (param table may be modded)` from exactly such a re-pass, and the line
+//! was filed as evidence of a stale param read. `APPLIED_ONCE` splits the cases; the "may be
+//! modded" wording now only prints when the first-ever count disagrees with vanilla.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -51,6 +58,12 @@ const VANILLA_MULTI_SLOT_ROWS: u32 = 25;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static APPLIED: AtomicBool = AtomicBool::new(false);
+/// Whether ANY pass has ever applied this session. Distinguishes the first apply from a re-arm
+/// re-pass: on a re-pass, `normalised == 0` means the load did NOT revert the table (our write
+/// survived) -- the expected shape, not the "param table may be modded" anomaly. crash-19968's
+/// session (client#351) carried exactly that false alarm: `normalised 0 of 317 Magic rows
+/// (expected 25 ...)` printed by a re-pass, and it read as a stale/moved param table.
+static APPLIED_ONCE: AtomicBool = AtomicBool::new(false);
 
 /// Set from slot_data `options.auto_equip` at connect. Shares that option deliberately.
 pub fn set_enabled(on: bool) {
@@ -96,14 +109,28 @@ pub fn tick() {
         return; // param file not populated yet -- retry next tick
     }
     APPLIED.store(true, Ordering::Relaxed);
+    let first_apply = !APPLIED_ONCE.swap(true, Ordering::Relaxed);
     if normalised == VANILLA_MULTI_SLOT_ROWS {
         log::info!("spell_slot_length: normalised {normalised} of {rows} Magic rows to one slot");
-    } else {
+    } else if first_apply {
         // Not an error. A stacked data mod (e.g. a host randomizer's regulation.bin) legitimately
         // changes this count, and this is the only place we would ever see that.
         log::info!(
             "spell_slot_length: normalised {normalised} of {rows} Magic rows to one slot \
              (expected {VANILLA_MULTI_SLOT_ROWS} on a vanilla table -- param table may be modded)"
+        );
+    } else if normalised == 0 {
+        // Re-arm re-pass and the table still holds our write: the load did NOT re-stream Magic.
+        // Expected, and NOT the modded-table anomaly -- see APPLIED_ONCE.
+        log::info!(
+            "spell_slot_length: re-arm pass found 0 multi-slot rows of {rows} -- the load did \
+             not revert Magic (normalisation intact)"
+        );
+    } else {
+        // Re-arm re-pass that found rows to write: the load reverted the table and we re-applied.
+        log::info!(
+            "spell_slot_length: re-normalised {normalised} of {rows} Magic rows after the load \
+             reverted the table"
         );
     }
 }
