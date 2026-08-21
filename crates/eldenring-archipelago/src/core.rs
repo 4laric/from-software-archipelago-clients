@@ -4292,6 +4292,14 @@ impl shared::Core for Core {
             if crate::reconcile_io::clear_refusal_if_rearmable() {
                 self.reconcile_inited = false;
             }
+            // clients#353: retire the captured inventory pointer at the EXIT edge too, not just at
+            // warp request and arrival. Quit-to-menu frees the world that owns the object, yet the
+            // pointer kept its epoch -- so `has_inventory()` read TRUE through the whole menu sit
+            // (4+ minutes of `has_inv=true in_world=false` in the pre-crash log). Today's grant
+            // paths all AND `in_world()` and were safe; retiring at the source keeps the NEXT
+            // writer from having to remember that. Post-fix, a receive-probe line showing
+            // `has_inv=true in_world=false` is itself the alarm.
+            crate::detour::on_world_exit();
         }
         self.was_in_world = now_in_world;
         if crate::flags::in_world() {

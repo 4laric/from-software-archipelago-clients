@@ -409,6 +409,23 @@ pub fn on_warp_request() {
     );
 }
 
+/// Called on the in-world true->false edge (core.rs): quit-to-menu / character switch -- the
+/// exit a warp REQUEST never announces, so `on_warp_request` cannot cover it. Before this
+/// retirement the captured pointer kept its epoch through the whole out-of-world window and
+/// `has_inventory()` read TRUE for as long as the player sat at the menu (clients#353: 4+
+/// minutes of `has_inv=true in_world=false` in the pre-crash log). Every grant path ANDs
+/// `in_world()`, so nothing wrote through it -- but gate and pointer disagreeing for minutes at
+/// a time is exactly the leftover the next instance of the class grows from, and the 2026-07-24
+/// postmortem's rule is that a stale pointer is DEAD, not "probably fine". No primer holdoff is
+/// needed here: `prime_inventory_if_needed` is itself gated on `in_world()`, so the slot cannot
+/// re-seed until the next arrival, which bumps the epoch again and re-primes as today.
+pub fn on_world_exit() {
+    let e = WORLD_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    log::info!(
+        "inventory-ptr: retired at world exit (epoch {e}) -- menu-time ticks now read has_inventory=false"
+    );
+}
+
 /// Cracked Pot FullID (GOODS | goods 9500) — the item the Chapel pot-relief guard watches.
 const CRACKED_POT_FULL_ID: i32 = 0x4000_0000 | 9500;
 /// Vanilla latch flag of m10_01 event 10010792 ("shop lineup: empty-pot pre-consumption"): the
