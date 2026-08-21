@@ -67,6 +67,7 @@ mod start_item_backfill;
 mod startgrants;
 mod trap_feel_probe;
 mod traps;
+mod update_check;
 mod upgrade_cost;
 mod upgrades;
 mod warp;

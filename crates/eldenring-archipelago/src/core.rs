@@ -1955,6 +1955,10 @@ impl shared::Core for Core {
                 // Latch the contract-mismatch banner; the re-push lives beside the marker
                 // refusal's (the same persists-until-the-player-acts contract).
                 self.version_warn = version_warn;
+                // Phase 1 of the updater: one background fetch of /er/latest.json per session,
+                // fail-silent. Its toast (safe-mid-seed vs contract-moved) arrives via
+                // update_check::take_toast() in the tick below.
+                crate::update_check::spawn();
                 // The mirror case, and the one a player is far more likely to hit: the client is
                 // new enough and the feature still did not turn on. Same reasoning as above --
                 // without a toast the only symptom is an option that silently does nothing, which
@@ -4322,6 +4326,12 @@ impl shared::Core for Core {
             if let Some(warn) = self.version_warn.clone() {
                 let now = self.toast_clock.elapsed().as_millis() as u64;
                 self.toasts.push(warn, now);
+            }
+            // The update verdict: ONE toast per session, not re-pushed -- "an update exists" is
+            // news, not a condition the player must clear before playing.
+            if let Some(update) = crate::update_check::take_toast() {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(update, now);
             }
             // I4 (2026-08-01): the OTHER silent no-delivery state. A session configured to let the
             // reconciler grant, whose Driver never armed (the inventory pointer never captured --

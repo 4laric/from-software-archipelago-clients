@@ -110,6 +110,7 @@ pub mod tracker_tables;
 pub mod trap_probe;
 pub mod traps;
 pub mod unique_grants;
+pub mod update_check;
 pub mod upgrade_cost;
 pub mod upgrade_cost_replay;
 pub mod upgrades;
