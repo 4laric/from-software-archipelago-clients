@@ -90,6 +90,7 @@ pub mod seed_change;
 pub mod serpent_hunter;
 pub mod shop_echo;
 pub mod shop_hints;
+pub mod shop_repaint;
 pub mod shop_repoint;
 pub mod shop_repoint_replay;
 pub mod sidecar;

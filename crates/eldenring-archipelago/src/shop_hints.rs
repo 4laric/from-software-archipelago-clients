@@ -134,6 +134,14 @@ pub fn is_inactive() -> bool {
     INACTIVE.load(Ordering::Relaxed)
 }
 
+/// `stock flag -> AP location` for one flag -- the same inverted check table `on_shop_open` walks,
+/// exposed for shop_preview's #937 repaint (it walks the SAME opened range and needs the same
+/// join). `None` until `configure` ran, or for a flag that is no AP check.
+pub fn loc_of_flag(flag: u32) -> Option<i64> {
+    let g = FLAG_TO_LOC.lock().ok()?;
+    g.as_ref()?.get(&flag).copied()
+}
+
 /// A merchant opened its buy menu over `ShopLineupParam` rows `[begin, end]`.
 ///
 /// Runs on the game thread inside the ESD dispatch. Reads only; queues only. Never panics past its

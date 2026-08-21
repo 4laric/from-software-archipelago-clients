@@ -4344,6 +4344,10 @@ impl shared::Core for Core {
             // must not stall the rewrite.
             let _ = crate::check_lots::dress_placeholder();
             let _ = crate::shop_preview::run();
+            // #937 repaint: rewrite the just-opened shelf's rows to THIS shop's claimants. AFTER
+            // run() on purpose -- a re-armed baseline must publish its padded blocks in the same
+            // tick before the repaint writes into them.
+            crate::shop_preview::repaint_tick();
             // #937 hover probe: frame flush for the goods-lookup trace. A no-op unless the probe
             // gate is on AND a shop is open; both checks are atomic loads.
             crate::hover_probe::tick();
