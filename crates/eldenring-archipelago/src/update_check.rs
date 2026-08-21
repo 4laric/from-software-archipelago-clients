@@ -117,11 +117,10 @@ fn fetch() -> Option<String> {
     // Tolerate chunked encoding by stripping chunk-size lines if present: the body is one small
     // JSON object, so the crude filter (keep the braces line) is enough for this endpoint.
     let body = body.trim();
-    let json = if let Some(i) = body.find('{') {
+    let json = {
+        let i = body.find('{')?;
         let j = body.rfind('}')?;
         &body[i..=j]
-    } else {
-        return None;
     };
     Some(json.to_string())
 }
