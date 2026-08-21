@@ -294,7 +294,11 @@ pub fn run() -> bool {
     // (recipes / a different param), or the flag never came from a shop row at all.
     let mut matched_flags: HashSet<u32> = HashSet::new();
     let mut live_rows_with_flag = 0u32;
-    for (id, row) in repo.rows::<ShopLineupParam>() {
+    let Some(lineup_rows) = crate::param_guard::rows::<ShopLineupParam>(repo, "shop_sell scan")
+    else {
+        return false; // holder mid-teardown -- retry next tick, same as an absent repo
+    };
+    for (id, row) in lineup_rows {
         let f = row.event_flag_for_stock();
         // TRACE (pre-decision). Deliberately BEFORE both continues: "row 100016 is not a check row
         // at all" and "its stock flag is not in slot_data" are findings, and a tally can never say
@@ -545,7 +549,8 @@ pub fn run() -> bool {
         if *etype != 3 {
             continue; // only GOODS live in EquipParamGoods
         }
-        match repo.get::<EquipParamGoods>(*eid as u32) {
+        match crate::param_guard::get::<EquipParamGoods>(repo, *eid as u32, "shop_sell goods read")
+        {
             Some(g) => log::info!(
                 "shop-sell TRACE row {id}: WARE goods {eid} sortGroupId {} sortId {} sellValue {} \
                  iconId {}",

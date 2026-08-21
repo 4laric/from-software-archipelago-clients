@@ -170,7 +170,7 @@ fn is_physick_tear(full_id: i32) -> bool {
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
         return false;
     };
-    repo.get::<EquipParamGoods>(row)
+    crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip goods read")
         .is_some_and(|g| er_logic::physick::is_tear(g.goods_type(), g.sort_id()))
 }
 
@@ -385,7 +385,8 @@ pub fn spell_class(full_id: i32) -> SpellClass {
     if er_logic::spell_equip::is_memory_stone(row) {
         return SpellClass::MemoryStone;
     }
-    let Some(g) = repo.get::<EquipParamGoods>(row) else {
+    let Some(g) = crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip goods gate")
+    else {
         return SpellClass::Other;
     };
     if er_logic::spell_equip::is_spell(g.goods_type(), g.sort_id()) {
@@ -403,7 +404,7 @@ pub fn spell_school(full_id: i32) -> Option<er_logic::spell_equip::School> {
     let row = er_logic::physick::goods_row(full_id)?;
     // SAFETY: FD4 singleton, read on the game thread like every other param read in this module.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
-    let g = repo.get::<EquipParamGoods>(row)?;
+    let g = crate::param_guard::get::<EquipParamGoods>(repo, row, "auto_equip goods classify")?;
     er_logic::spell_equip::school_of(g.goods_type())
 }
 
@@ -421,8 +422,12 @@ pub fn held_catalysts() -> Option<er_logic::spell_equip::Catalysts> {
     // `/ 100 * 100` strips the upgrade level, exactly as the equip path does at its own wep_type
     // read -- a +9 staff is not a different weapon type.
     let types = worn.map(|id| {
-        repo.get::<EquipParamWeapon>(((id / 100) * 100) as u32)
-            .map(|w| w.wep_type())
+        crate::param_guard::get::<EquipParamWeapon>(
+            repo,
+            ((id / 100) * 100) as u32,
+            "auto_equip weapon base",
+        )
+        .map(|w| w.wep_type())
     });
     Some(er_logic::spell_equip::Catalysts::from_wep_types(types))
 }
@@ -1059,7 +1064,13 @@ pub fn tick() {
                 // protectors. A row the param table does not know is skipped rather than defaulted
                 // into a slot: unlike the weapon arm there is no "main hand" to fall back to, and
                 // an unknown accessory row is far more likely to be a bad id than a real talisman.
-                if repo.get::<EquipParamAccessory>(param_id).is_none() {
+                if crate::param_guard::get::<EquipParamAccessory>(
+                    repo,
+                    param_id,
+                    "auto_equip accessory check",
+                )
+                .is_none()
+                {
                     log::debug!(
                         "auto_equip: accessory {full:#010x} has no EquipParamAccessory row -- \
                          skipped"
@@ -1075,7 +1086,14 @@ pub fn tick() {
                 let worn = &pgd.equipment.chr_asm.equipment_param_ids;
                 let slots: [Option<i32>; 4] = std::array::from_fn(|i| {
                     let id = worn[er_logic::auto_equip::ACCESSORY_SLOTS[i] as usize];
-                    (id > 0 && repo.get::<EquipParamAccessory>(id as u32).is_some()).then_some(id)
+                    (id > 0
+                        && crate::param_guard::get::<EquipParamAccessory>(
+                            repo,
+                            id as u32,
+                            "auto_equip accessory slot",
+                        )
+                        .is_some())
+                    .then_some(id)
                 });
 
                 let pos = er_logic::auto_equip::TalismanPos { ordinal, pouches };

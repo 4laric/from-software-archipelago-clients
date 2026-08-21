@@ -114,7 +114,11 @@ pub fn run() -> bool {
         Ok(r) => r,
         Err(_) => return false, // repo not up yet — retry next tick
     };
-    let tele_icon = match repo.get::<EquipParamGoods>(TELESCOPE_GOOD_ID) {
+    let tele_icon = match crate::param_guard::get::<EquipParamGoods>(
+        repo,
+        TELESCOPE_GOOD_ID,
+        "shop_icon telescope icon",
+    ) {
         Some(row) => row.icon_id(),
         None => return false, // telescope row absent — retry
     };

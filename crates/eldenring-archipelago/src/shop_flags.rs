@@ -157,7 +157,8 @@ fn stock_flag_addr(row_id: u32) -> Option<usize> {
     // SAFETY: FD4 singleton; on the game thread (caller gates in-world). `get::<ShopLineupParam>`
     // mirrors `params.rs`'s `get::<EquipParamGoods>` — returns Option<&SHOP_LINEUP_PARAM>.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
-    let row: &SHOP_LINEUP_PARAM = repo.get::<ShopLineupParam>(row_id)?;
+    let row: &SHOP_LINEUP_PARAM =
+        crate::param_guard::get::<ShopLineupParam>(repo, row_id, "shop_flags lineup read")?;
     Some((row as *const SHOP_LINEUP_PARAM as usize) + STOCK_FLAG_OFF)
 }
 
@@ -400,7 +401,8 @@ pub fn configure_capital_release(rows: Vec<(u32, u32, u32)>) {
 fn release_flag_addr(row_id: u32) -> Option<usize> {
     // SAFETY: FD4 singleton; on the game thread (caller gates in-world).
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
-    let row: &SHOP_LINEUP_PARAM = repo.get::<ShopLineupParam>(row_id)?;
+    let row: &SHOP_LINEUP_PARAM =
+        crate::param_guard::get::<ShopLineupParam>(repo, row_id, "shop_flags lineup read")?;
     Some((row as *const SHOP_LINEUP_PARAM as usize) + RELEASE_FLAG_OFF)
 }
 

@@ -248,12 +248,20 @@ const ROW_ID_MASK: u32 = er_codec::ROW_ID_MASK;
 pub(crate) fn weapon_track_and_cap(base: i32) -> Option<(i32, bool)> {
     // SAFETY: FD4 singleton; on the game thread, gated in-world by the caller. Err until built.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
-    let weapon = repo.get::<EquipParamWeapon>(base as u32)?;
+    let weapon =
+        crate::param_guard::get::<EquipParamWeapon>(repo, base as u32, "upgrades weapon read")?;
     let rt = weapon.reinforce_type_id() as i32;
     // Reinforce-run length = the CAP. C++: `while (k<=25 && row(rt+k)) ++k; cap = k-1`. rt can be
     // negative for non-upgradeable junk; get() just returns None then.
     let mut k = 0;
-    while k <= NORMAL_CAP && repo.get::<ReinforceParamWeapon>((rt + k) as u32).is_some() {
+    while k <= NORMAL_CAP
+        && crate::param_guard::get::<ReinforceParamWeapon>(
+            repo,
+            (rt + k) as u32,
+            "upgrades cap walk",
+        )
+        .is_some()
+    {
         k += 1;
     }
     // TRACK from materialSetId, cap from the run above -- host-tested predicate (owns the somber
