@@ -2751,6 +2751,12 @@ impl shared::Core for Core {
         // "Region unlocked: Liurnia" is the thing that actually changed about their run. The
         // console line keeps its exact wording so there is ONE phrasing to learn, not two.
         //
+        // ONCE PER REAL OPEN, 2026-08-21: `unlocked` now carries only true 0->1 edges
+        // (open_on_received_name edge-detects), so the per-world-edge dispatch replays that used
+        // to re-announce every held lock -- five "Mt. Gelmir" lines around one kick, 4laric's
+        // report -- say nothing. The old "the console line can afford to repeat" ruling is
+        // superseded: what a player holds is the tracker's job (F6), not a scrollback echo.
+        //
         // ASCII only -- this goes through the FMG path (`every_toast_is_ascii`); region names are
         // already ASCII by construction, and an em-dash here drew as `?` in v0.2.18.
         let region_toast_live = self.region_toast_primed;

@@ -912,9 +912,22 @@ pub fn first_open_grants(cfg: &RegionConfig, name: &str) -> Vec<i32> {
 pub fn open_on_received_name(cfg: &RegionConfig, name: &str) -> bool {
     let mut opened = false;
     if let Some(&f) = cfg.region_open_flags.get(name) {
+        // EDGE-DETECT, 2026-08-21 (4laric's console: "Region unlocked: Mt. Gelmir" x5 around one
+        // kick). The receive stream re-dispatches on every world edge -- kick warps, deaths,
+        // loads, reconnects -- and this returned `opened = true` per RUN, not per CHANGE, so the
+        // console re-announced every held lock on every edge. `opened` is now the honest edge:
+        // the flag was CLEAR before and READS SET after. The read-back half also covers the
+        // not-ready flag holder (writes are silently discarded at menu/load; without it, each
+        // discarded write would re-print on the next pass and the spam would survive).
+        let already = flags::get_event_flag(f);
         flags::set_event_flag(f, true);
-        log::info!("RegionLock '{name}' received -> open flag {f}");
-        opened = true;
+        let stuck = flags::get_event_flag(f);
+        if already {
+            log::debug!("RegionLock '{name}' re-applied (open flag {f} already set)");
+        } else {
+            log::info!("RegionLock '{name}' received -> open flag {f} (stuck={stuck})");
+        }
+        opened = !already && stuck;
     }
     if let Some(fs) = cfg.lock_reveal_flags.get(name) {
         for &f in fs {
