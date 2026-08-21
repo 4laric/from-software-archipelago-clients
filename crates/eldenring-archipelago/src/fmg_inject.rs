@@ -116,6 +116,9 @@ fn current_module_base() -> Option<usize> {
     let h = unsafe { GetModuleHandleW(None) }.ok()?;
     Some(h.0 as usize)
 }
+unsafe fn read_u16(a: usize) -> u16 {
+    (a as *const u16).read_unaligned()
+}
 unsafe fn read_u32(a: usize) -> u32 {
     (a as *const u32).read_unaligned()
 }
@@ -631,6 +634,102 @@ pub fn read_goods_string(category: u32, id: u32) -> Option<String> {
     read_string(ptr)
 }
 
+/// Outcome of [`rewrite_in_place`], so the caller can tell "re-arm the baseline" (`StaleBlock`)
+/// from "this id was never written / the slot is not padded" (both bugs worth a log line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteOutcome {
+    Done,
+    /// The category no longer points at the caller's published block (a load reverted it, or a
+    /// sibling extend-swapped on top). The caller's padded slots are gone with it: re-run the
+    /// baseline extend-swap, then repaint against the NEW block address.
+    StaleBlock,
+    /// The block is ours but the id resolves to no string slot -- caller bug (an id it never wrote).
+    NoEntry,
+    /// The slot at the resolved address is not `cap`-padded (no terminator inside the reserved
+    /// span). Writing would run into a neighbour's string; refused.
+    NotPadded,
+}
+
+/// Rewrite ONE padded override string IN PLACE -- the zero-allocation repaint arm (er-archipelago
+/// #937). `expected_block` must be the address [`extend_swap_overrides_tracked`] returned to the
+/// SAME caller whose call also zero-padded `id`'s string to `cap` units (er_logic::shop_repaint::
+/// pad_units); override strings get private slots in the rebuilt block (only vanilla strings are
+/// deduped), so a padded slot is exclusively that caller's to rewrite. The block-identity check is
+/// what makes this safe against every sibling: `check_lots`' re-dress and any later extend-swap
+/// publish a DIFFERENT block, and this refuses to touch it.
+///
+/// Runs on the game thread (the tick), the same thread that renders the menu, so a reader never
+/// observes a torn string. Writes `text` (clamped to `cap`) then zero-fills through `cap` -- the
+/// builder's terminator slot at `cap` stays NUL by construction.
+pub fn rewrite_in_place(
+    category: u32,
+    expected_block: usize,
+    id: u32,
+    text: &[u16],
+    cap: usize,
+) -> RewriteOutcome {
+    let Some(base) = current_module_base() else {
+        return RewriteOutcome::StaleBlock; // no module base = nothing is ours right now
+    };
+    let md = match unsafe { category_msgdata(base, category) } {
+        Some(m) => m,
+        None => return RewriteOutcome::StaleBlock,
+    };
+    if md != expected_block {
+        return RewriteOutcome::StaleBlock;
+    }
+    let Some(addr) = (unsafe { entry_addr(md, id) }) else {
+        return RewriteOutcome::NoEntry;
+    };
+    unsafe {
+        // The padding proof: a NUL must exist within the reserved span. Our padded slot always has
+        // one (text is at most `cap` units in a `cap + 1`-unit slot); a vanilla or foreign slot
+        // this address could otherwise be is shorter, and running past its terminator into a
+        // neighbour is the failure this check exists to refuse.
+        let padded = (0..=cap).any(|i| read_u16(addr + i * 2) == 0);
+        if !padded {
+            return RewriteOutcome::NotPadded;
+        }
+        let n = text.len().min(cap);
+        for (i, &u) in text.iter().take(n).enumerate() {
+            write_u16(addr + i * 2, u);
+        }
+        for i in n..=cap {
+            write_u16(addr + i * 2, 0);
+        }
+    }
+    RewriteOutcome::Done
+}
+
+/// String-slot address of `id` in the block at `md` -- a lean, allocation-free walk of the group
+/// records (the [`parse`] helper copies the whole offset table; a per-shop-open repaint has no
+/// business allocating 80 KB to read one offset).
+unsafe fn entry_addr(md: usize, id: u32) -> Option<usize> {
+    let count = read_u32(md + MD_GROUPCOUNT) as usize;
+    if count == 0 || count > 0x10000 {
+        return None;
+    }
+    for i in 0..count {
+        let g = md + MD_GROUPS + i * 16;
+        let fi = read_u32(g + 4);
+        let li = read_u32(g + 8);
+        if id >= fi && id <= li {
+            let sib = read_u32(g);
+            let si = (id - fi + sib) as usize;
+            let offtab = read_usize(md + MD_OFFTABLE_PTR);
+            if !plausible(offtab) {
+                return None;
+            }
+            let off = read_u64(offtab + si * 8);
+            if off == 0 {
+                return None;
+            }
+            return Some(md + off as usize);
+        }
+    }
+    None
+}
+
 /// One rebuild of a category block: what goes in, and whether the result must be proved against the
 /// GAME's own lookup before we keep it. Bundled into a struct so `build_validate_swap` stays under
 /// clippy's argument limit and so no caller can silently transpose `injects` and `overrides`.
@@ -651,7 +750,11 @@ struct Rebuild<'a> {
 /// Build one category block, validate it in OUR memory, swap it in, and (optionally) prove the GAME
 /// reads it correctly. Returns how many entries landed, or `None` with the game left untouched
 /// (either never swapped, or swapped and reverted).
-unsafe fn build_validate_swap(base: usize, category: u32, r: &Rebuild<'_>) -> Option<usize> {
+unsafe fn build_validate_swap(
+    base: usize,
+    category: u32,
+    r: &Rebuild<'_>,
+) -> Option<(usize, usize)> {
     let block = match build_block(r.md, r.groups, r.offsets, r.injects, r.overrides) {
         Some(b) => b,
         None => {
@@ -704,8 +807,11 @@ unsafe fn build_validate_swap(base: usize, category: u32, r: &Rebuild<'_>) -> Op
         }
     }
     for (id, txt) in r.overrides.iter().chain(r.injects.iter()) {
+        // Trailing NULs are PADDING, not text (shop_repaint::pad_units reserves in-place rewrite
+        // capacity); `my_lookup` reads to the first NUL, so compare against the unpadded prefix.
         let want = String::from_utf16_lossy(txt);
-        if my_lookup(block, &g2, &o2, *id).as_deref() != Some(want.as_str()) {
+        let want = want.trim_end_matches('\0');
+        if my_lookup(block, &g2, &o2, *id).as_deref() != Some(want) {
             mismatch += 1;
         }
     }
@@ -726,7 +832,7 @@ unsafe fn build_validate_swap(base: usize, category: u32, r: &Rebuild<'_>) -> Op
         return None;
     }
     if !r.verify_live {
-        return Some(r.overrides.len() + r.injects.len());
+        return Some((r.overrides.len() + r.injects.len(), block));
     }
 
     // POST-SWAP READ-BACK THROUGH THE GAME'S OWN LOOKUP. Everything above is our parser agreeing
@@ -752,7 +858,8 @@ unsafe fn build_validate_swap(base: usize, category: u32, r: &Rebuild<'_>) -> Op
     let mut bad: Vec<u32> = Vec::new();
     for (id, txt) in r.injects.iter().chain(r.overrides.iter()) {
         let want = String::from_utf16_lossy(txt);
-        if read_string(search(repo, 0, category, *id) as usize).as_deref() != Some(want.as_str()) {
+        let want = want.trim_end_matches('\0'); // padding, not text -- see the in-memory check
+        if read_string(search(repo, 0, category, *id) as usize).as_deref() != Some(want) {
             bad.push(*id);
         }
     }
@@ -779,7 +886,7 @@ unsafe fn build_validate_swap(base: usize, category: u32, r: &Rebuild<'_>) -> Op
         swap_category(base, category, r.md);
         return None;
     }
-    Some(r.overrides.len() + r.injects.len())
+    Some((r.overrides.len() + r.injects.len(), block))
 }
 
 /// Insertion (CREATING an FMG entry for an id no vanilla group covers) is the one shape here whose
@@ -844,22 +951,35 @@ pub fn search_string_table_addr() -> Option<usize> {
 /// resolves), and when anything was INSERTED, re-read through the game's own `SearchStringTable`
 /// after it, reverting on any disagreement.
 pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> usize {
+    extend_swap_overrides_tracked(category, overrides).0
+}
+
+/// [`extend_swap_overrides`] that also returns the PUBLISHED BLOCK's address on a successful swap.
+/// The block identity is the safety token for [`rewrite_in_place`]: a caller that padded its
+/// override strings may rewrite them in place ONLY while the category still points at the exact
+/// block that call built -- any sibling's later extend-swap (or a load reverting the pointer)
+/// produces a different block whose copies of our strings are unpadded and possibly deduped, and
+/// writing into that is how a rewrite corrupts a neighbour. Callers compare, never assume.
+pub fn extend_swap_overrides_tracked(
+    category: u32,
+    overrides: &[(u32, Vec<u16>)],
+) -> (usize, Option<usize>) {
     if overrides.is_empty() {
-        return 0;
+        return (0, None);
     }
     let base = match current_module_base() {
         Some(b) => b,
-        None => return 0,
+        None => return (0, None),
     };
     let md = match unsafe { category_msgdata(base, category) } {
         Some(m) => m,
-        None => return 0, // repo/category not up yet — caller retries next tick
+        None => return (0, None), // repo/category not up yet — caller retries next tick
     };
     let (groups, offsets) = match unsafe { parse(md) } {
         Some(p) => p,
         None => {
             log::warn!("FMG extend-swap(cat {category}): parse failed");
-            return 0;
+            return (0, None);
         }
     };
     // REDIRECT vs INSERT, decided by the category's existing coverage (er-logic, host-tested against
@@ -904,7 +1024,7 @@ pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> us
         }
     }
     if resolvable.is_empty() && injects.is_empty() {
-        return 0;
+        return (0, None);
     }
 
     if !injects.is_empty() {
@@ -918,13 +1038,13 @@ pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> us
             overrides: &resolvable,
             verify_live: true,
         };
-        if let Some(n) = unsafe { build_validate_swap(base, category, &r) } {
+        if let Some((n, blk)) = unsafe { build_validate_swap(base, category, &r) } {
             log::info!(
                 "FMG extend-swap(cat {category}): swapped (+{redirected} redirected, \
                  +{inserted} NEW entries created for ids in no vanilla group; \
                  read-back through the game's own lookup OK)"
             );
-            return n;
+            return (n, Some(blk));
         }
         INSERT_UNSAFE.store(true, Ordering::Relaxed);
         log::warn!(
@@ -934,7 +1054,7 @@ pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> us
             overrides.len()
         );
         if resolvable.is_empty() {
-            return 0;
+            return (0, None);
         }
     }
 
@@ -947,11 +1067,11 @@ pub fn extend_swap_overrides(category: u32, overrides: &[(u32, Vec<u16>)]) -> us
         verify_live: false,
     };
     match unsafe { build_validate_swap(base, category, &r) } {
-        Some(n) => {
+        Some((n, blk)) => {
             log::info!("FMG extend-swap(cat {category}): swapped (+{n} overrides)");
-            n
+            (n, Some(blk))
         }
-        None => 0,
+        None => (0, None),
     }
 }
 

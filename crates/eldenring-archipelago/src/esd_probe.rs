@@ -289,6 +289,11 @@ unsafe extern "C" fn esd_invoke_detour(this: *mut c_void, event: *const EzStateE
                 // probe's ACTIVE atomic); placed after the features for the same reason they are
                 // ordered -- a diagnostic added later goes last.
                 crate::hover_probe::on_shop_open(lo, hi);
+                // #937 repaint: mark the opened range so shop_preview's next tick rewrites the
+                // visible rows' names to THIS shelf's claimants (the coloring reuses spare rows
+                // across menus). Mark-only here -- the FMG walk happens on the tick, not inside
+                // the game's dispatch frame.
+                crate::shop_preview::on_shop_open(lo, hi);
             }
         }
 

@@ -40,6 +40,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use eldenring::cs::{ShopLineupParam, SoloParamRepository};
+use fromsoftware_shared::FromStatic;
+
 const GOODS_NAME_CAT: u32 = 10;
 const GOODS_INFO_CAT: u32 = 20; // the "Item Effect" line the buy menu renders
 const GOODS_CAPTION_CAT: u32 = 24;
@@ -58,6 +61,25 @@ static DONE: AtomicBool = AtomicBool::new(false);
 /// second case spins an FMG parse every tick forever. ~10s at 60fps.
 static NAME_RETRIES: AtomicU32 = AtomicU32::new(0);
 const NAME_RETRY_LIMIT: u32 = 600;
+
+/// #937 repaint state. `PER_LOC` is what the baseline fold learned per slot -- AP location ->
+/// (goods row, this slot's OWN label) -- kept so a shop open can rewrite each visible row to the
+/// claimant actually on that shelf (the world's coloring reuses rows across menus; the baseline
+/// fold can only write ONE name per row seed-wide, so shared rows carry the honest shared label
+/// until the first open repaints them). `MY_BLOCKS` holds the block address each of the three
+/// category extend-swaps published: `fmg_inject::rewrite_in_place` refuses any other block, which
+/// is the whole safety story -- a load or a sibling's re-dress replaces the block, the repaint
+/// sees `StaleBlock`, clears `DONE`, and the baseline (padded) pass re-arms first.
+static PER_LOC: Mutex<Vec<(i64, u32, er_logic::name_override::ShopLabel)>> = Mutex::new(Vec::new());
+/// (name, info, caption) published-block addresses, in category-call order.
+static MY_BLOCKS: Mutex<[Option<usize>; 3]> = Mutex::new([None; 3]);
+/// The last `OpenRegularShop` range not yet repainted. One deep on purpose: menus do not stack.
+static PENDING_RANGE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// The range most recently repainted against the CURRENT blocks -- reopening the same shelf with
+/// nothing changed is a no-op, not a rewrite storm.
+static PAINTED: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// Rows the repaint walks at most, whatever the ESD claimed (mirrors shop_hints' own bound).
+const REPAINT_MAX_ROWS: i32 = 2048;
 
 pub fn set_real_goods(rows: HashSet<u32>) {
     log::info!(
@@ -134,6 +156,12 @@ pub fn configure_locks(names: HashSet<String>) {
 pub fn reset() {
     DONE.store(false, Ordering::Relaxed);
     NAME_RETRIES.store(0, Ordering::Relaxed);
+    // #937 repaint state: the load edge that armed this reset also reverted the category pointers,
+    // so the recorded blocks are history and any pending shelf belongs to a menu that cannot
+    // survive a load. (`PER_LOC` is seed-scoped and re-filled by the next run(); left alone.)
+    *MY_BLOCKS.lock().unwrap() = [None; 3];
+    PENDING_RANGE.lock().unwrap().take();
+    PAINTED.lock().unwrap().take();
 }
 
 pub fn run() -> bool {
@@ -162,6 +190,7 @@ pub fn run() -> bool {
     // maps (name 10, info 20, caption 24) deduped by good id (the FMG entry is global).
     // goods row -> every label the slots pointing at it produced. See the fold below for why this
     // is not a `HashMap<u32, Label>` with an insert.
+    PER_LOC.lock().unwrap().clear();
     let mut by_row: HashMap<u32, Vec<er_logic::name_override::ShopLabel>> = HashMap::new();
     let mut nmap: HashMap<u32, Vec<u16>> = HashMap::new();
     let mut imap: HashMap<u32, Vec<u16>> = HashMap::new();
@@ -217,6 +246,7 @@ pub fn run() -> bool {
         // last write silently spoke for all of them. Funnyfail, 2026-08-16: "all AP items from Kale
         // look like they are 'Arrows(10)'". That name was REAL and correctly scouted; it just
         // belonged to one of the three. Gather per row, decide after.
+        PER_LOC.lock().unwrap().push((*loc, gid, lbl.clone()));
         by_row.entry(gid).or_default().push(lbl);
     }
 
@@ -239,15 +269,22 @@ pub fn run() -> bool {
             lbls.pop()
                 .expect("entry() only exists because something was pushed")
         };
-        nmap.insert(gid, lbl.name.encode_utf16().collect());
-        let u: Vec<u16> = lbl.caption.encode_utf16().collect();
+        // PADDED to fixed capacity (er_logic::shop_repaint): every override gets a private slot
+        // in the rebuilt block, and the trailing NULs are the storage the #937 per-shop-open
+        // repaint rewrites in place -- no per-open block rebuild, no leak.
+        nmap.insert(
+            gid,
+            er_logic::shop_repaint::pad_units(&lbl.name, er_logic::shop_repaint::PAD_NAME),
+        );
+        let u: Vec<u16> =
+            er_logic::shop_repaint::pad_units(&lbl.caption, er_logic::shop_repaint::PAD_CAPTION);
         imap.insert(gid, u.clone());
         cmap.insert(gid, u);
     }
     let names: Vec<(u32, Vec<u16>)> = nmap.into_iter().collect();
     let infos: Vec<(u32, Vec<u16>)> = imap.into_iter().collect();
     let caps: Vec<(u32, Vec<u16>)> = cmap.into_iter().collect();
-    let n = crate::fmg_inject::extend_swap_overrides(GOODS_NAME_CAT, &names);
+    let (n, nblk) = crate::fmg_inject::extend_swap_overrides_tracked(GOODS_NAME_CAT, &names);
     // RETRY, do not latch, when the NAME write did not land. `extend_swap_overrides` returns 0 when
     // the MSG repo or the category is not up yet and explicitly asks the caller to retry next tick --
     // `check_lots::dress_placeholder` does exactly that, and this pass did not, so it latched DONE on
@@ -276,8 +313,10 @@ pub fn run() -> bool {
             names.len()
         );
     }
-    let i = crate::fmg_inject::extend_swap_overrides(GOODS_INFO_CAT, &infos);
-    let c = crate::fmg_inject::extend_swap_overrides(GOODS_CAPTION_CAT, &caps);
+    let (i, iblk) = crate::fmg_inject::extend_swap_overrides_tracked(GOODS_INFO_CAT, &infos);
+    let (c, cblk) = crate::fmg_inject::extend_swap_overrides_tracked(GOODS_CAPTION_CAT, &caps);
+    *MY_BLOCKS.lock().unwrap() = [nblk, iblk, cblk];
+    *PAINTED.lock().unwrap() = None; // fresh blocks carry baseline labels; any open shelf repaints
     log::info!(
         "shop-preview: {overridden} foreign/gem slot(s) + {locks} region-lock slot(s) marked ({} distinct, \
          {native} own-world via shop_sell, {protected} left vanilla to protect a real good's shared FMG entry, \
@@ -314,4 +353,136 @@ pub fn run() -> bool {
     }
     DONE.store(true, Ordering::Relaxed);
     true
+}
+
+// ---------------------------------------------------------------------------------------------
+// #937: per-shop-open repaint. The world colors the spare pool so no two slots visible in ONE
+// menu share a goods row, reusing rows across regular-shop menus -- legal precisely because the
+// two functions below rewrite each opened shelf's rows to that shelf's own claimants. The pure
+// halves (claim fold, padding) are er_logic::shop_repaint; the write arm is
+// fmg_inject::rewrite_in_place, gated on block identity.
+
+/// Called from esd_probe's command-22 detour, same frame as the open. MARK-ONLY: the FMG walk and
+/// the param walk happen on the tick ([`repaint_tick`]), never inside the game's dispatch frame.
+/// One deep -- menus do not stack, so a new open simply replaces an unpainted older one.
+pub fn on_shop_open(begin: i32, end: i32) {
+    if let Ok(mut g) = PENDING_RANGE.lock() {
+        *g = Some((begin, end));
+    }
+}
+
+/// The repaint arm -- runs every tick from core beside [`run`]. Idle unless a shop opened since
+/// the last paint. The hover probe measured the buy menu re-looking names up EVERY frame, so a
+/// rewrite that lands a tick after the open is what the player reads.
+pub fn repaint_tick() {
+    let Some((lo, hi)) = PENDING_RANGE.lock().ok().and_then(|g| *g) else {
+        return;
+    };
+    if !DONE.load(Ordering::Relaxed) {
+        return; // baseline (padded) pass not landed yet -- it runs first, we keep the range
+    }
+    if PAINTED
+        .lock()
+        .map(|g| *g == Some((lo, hi)))
+        .unwrap_or(false)
+    {
+        PENDING_RANGE.lock().unwrap().take();
+        return; // same shelf, same blocks: nothing to rewrite
+    }
+    let [Some(nb), Some(ib), Some(cb)] = *MY_BLOCKS.lock().unwrap() else {
+        // The baseline latched without publishing (MSG repo never came up / gave up after the
+        // retry budget). There are no padded slots to rewrite; dropping the range is honest.
+        PENDING_RANGE.lock().unwrap().take();
+        return;
+    };
+    let per_loc = PER_LOC.lock().unwrap().clone();
+    if per_loc.is_empty() {
+        PENDING_RANGE.lock().unwrap().take();
+        return; // no overridden slots this seed -- nothing a shelf could show
+    }
+    // Walk the OPENED RANGE, exactly like shop_hints: each row's stock flag joins to an AP
+    // location, and PER_LOC says which goods row + label the baseline gave that slot.
+    // SAFETY: FD4 singleton, read-only, on the game thread -- the same sanctioned access
+    // shop_flags/shop_hints use.
+    let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+        return; // repo not up (mid-load?) -- retry next tick, the range stays pending
+    };
+    if !crate::param_guard::is_available::<ShopLineupParam>(repo, "shop-open repaint") {
+        return;
+    }
+    let hi = hi.min(lo.saturating_add(REPAINT_MAX_ROWS));
+    let mut claims: Vec<(u32, er_logic::name_override::ShopLabel)> = Vec::new();
+    for id in lo..=hi {
+        let Some(row) = crate::param_guard::get::<ShopLineupParam>(repo, id, "shop-open repaint")
+        else {
+            continue;
+        };
+        let flag = row.event_flag_for_stock();
+        if flag == 0 {
+            continue;
+        }
+        let Some(loc) = crate::shop_hints::loc_of_flag(flag) else {
+            continue;
+        };
+        if let Some((_, gid, lbl)) = per_loc.iter().find(|(l, _, _)| *l == loc) {
+            claims.push((*gid, lbl.clone()));
+        }
+    }
+    if claims.is_empty() {
+        PENDING_RANGE.lock().unwrap().take();
+        *PAINTED.lock().unwrap() = Some((lo, hi));
+        return; // a shelf with no overridden AP slots (all own-world/vanilla)
+    }
+    let overrides = er_logic::shop_repaint::per_shop_overrides(&claims);
+    use crate::fmg_inject::{RewriteOutcome, rewrite_in_place};
+    let (mut wrote, mut skipped) = (0usize, 0usize);
+    for (gid, lbl) in &overrides {
+        let name_u: Vec<u16> = lbl.name.encode_utf16().collect();
+        let cap_u: Vec<u16> = lbl.caption.encode_utf16().collect();
+        let writes: [(u32, usize, &[u16], usize); 3] = [
+            (
+                GOODS_NAME_CAT,
+                nb,
+                &name_u,
+                er_logic::shop_repaint::PAD_NAME,
+            ),
+            (
+                GOODS_INFO_CAT,
+                ib,
+                &cap_u,
+                er_logic::shop_repaint::PAD_CAPTION,
+            ),
+            (
+                GOODS_CAPTION_CAT,
+                cb,
+                &cap_u,
+                er_logic::shop_repaint::PAD_CAPTION,
+            ),
+        ];
+        for (cat, blk, txt, cap) in writes {
+            match rewrite_in_place(cat, blk, *gid, txt, cap) {
+                RewriteOutcome::Done => wrote += 1,
+                RewriteOutcome::StaleBlock => {
+                    // A sibling re-published (or a load reverted the pointer) between our baseline
+                    // and this open: OUR padded slots are gone. Re-arm the baseline and keep the
+                    // range pending -- next tick paints against the fresh blocks.
+                    DONE.store(false, Ordering::Relaxed);
+                    NAME_RETRIES.store(0, Ordering::Relaxed);
+                    log::info!(
+                        "shop-preview: repaint of rows {lo}..={hi} found a STALE cat-{cat} block; \
+                         re-arming the padded baseline first (the shelf repaints right after)"
+                    );
+                    return;
+                }
+                RewriteOutcome::NoEntry | RewriteOutcome::NotPadded => skipped += 1,
+            }
+        }
+    }
+    PENDING_RANGE.lock().unwrap().take();
+    *PAINTED.lock().unwrap() = Some((lo, hi));
+    log::info!(
+        "shop-preview: shelf rows {lo}..={hi} repainted -- {} AP slot(s) named for THIS shop \
+         ({wrote} FMG rewrite(s) in place, {skipped} skipped)",
+        overrides.len()
+    );
 }
