@@ -396,6 +396,56 @@ pub fn refusal_toast(refusal: Refusal) -> String {
     }
 }
 
+/// Parse an `ap_save_<seed>_<slot>.json` file NAME into the `(seed, slot)` identity parts the
+/// client hashed when it armed that room's persistence.
+///
+/// The split is on the FIRST `_`: room seeds are numeric, so `safe()` left them underscore-free,
+/// while a slot name's own spaces/punctuation became `_` and stay part of the slot half. The
+/// legacy shared file `ap_save__<slot>.json` (pre-2026-07-02, empty seed) parses to an empty seed
+/// and is REJECTED: its true seed is unknowable, so it can never be named as the matching room.
+///
+/// 🛑 The parts are the `safe()`'d forms from the file name, not the originals -- for a slot
+/// name with non-alphanumerics the re-hash in [`wrong_save_room`] simply will not match, and the
+/// refusal falls back to the un-named wording. A silent miss is the designed failure mode; a
+/// WRONG room name is not (a false match needs a 32-bit FNV collision).
+pub fn save_file_identity_parts(file_name: &str) -> Option<(String, String)> {
+    let stem = file_name.strip_prefix("ap_save_")?.strip_suffix(".json")?;
+    let (seed, slot) = stem.split_once('_')?;
+    if seed.is_empty() || slot.is_empty() {
+        return None;
+    }
+    Some((seed.to_string(), slot.to_string()))
+}
+
+/// The room a refused save actually belongs to (clients#337): the sibling `(seed, slot)` whose
+/// [`identity_hash`] IS the save-embedded marker `stored`. `siblings` are the parsed identity
+/// parts of every other `ap_save_*.json` beside the save just armed.
+///
+/// The CURRENT room's own file cannot false-positive here: the refusal fired precisely because
+/// `stored != identity_hash(this_seed, this_slot)`.
+pub fn wrong_save_room(
+    stored: Identity,
+    siblings: &[(String, String)],
+) -> Option<(String, String)> {
+    siblings
+        .iter()
+        .find(|(seed, slot)| identity_hash(seed, slot) == stored)
+        .cloned()
+}
+
+/// [`refusal_toast`] with the clients#337 room routing when the sibling scan identified the room
+/// the save belongs to. A refusal the player cannot ACT on reads as a lockout (two players read
+/// it as "the new client is erroneously locking me out of my save", bobler 2026-08-20); naming
+/// the room makes it a routing instruction instead of a wall.
+pub fn refusal_toast_with_room(refusal: Refusal, room: Option<(&str, &str)>) -> String {
+    match (refusal, room) {
+        (Refusal::WrongSaveAtConnect, Some((seed, slot))) => format!(
+            "Archipelago: this save belongs to a DIFFERENT seed -- it was last played on seed {seed} (save file ap_save_{seed}_{slot}.json).              Nothing will send or arrive. Connect to THAT room to continue it, or quit to the main menu, then load this room's save or start a new character."
+        ),
+        _ => refusal_toast(refusal),
+    }
+}
+
 /// What may be done with a LATCHED refusal when the player leaves the world.
 ///
 /// See [`release_verdict`].
@@ -714,7 +764,89 @@ mod tests {
         for r in [Refusal::WrongSaveAtConnect, Refusal::RoomChangedMidSession] {
             let t = refusal_toast(r);
             assert!(t.is_ascii(), "{t}");
+            // The room-enriched variant (clients#337) obeys the same rule, hint or no hint.
+            let h = refusal_toast_with_room(r, Some(("88641793823048305365", "bobler")));
+            assert!(h.is_ascii(), "{h}");
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // clients#337 — the wrong-save refusal NAMES the room the save belongs to (2026-08-21)
+    // -----------------------------------------------------------------------------------------
+
+    /// THE MOTIVATING CASE, bobler 2026-08-20: the guard fired correctly -- stored marker
+    /// 0x56c299ee is exactly identity_hash("88641793823048305365", "bobler") -- but the refusal
+    /// named no room and read as a lockout. The sibling scan must recover that room.
+    #[test]
+    fn the_sibling_scan_names_the_room_the_save_belongs_to() {
+        let stored = 0x56c299ee;
+        let siblings: Vec<(String, String)> = [
+            "ap_save_88641793823048305365_bobler.json", // the room he played five hours earlier
+            "ap_save_77770000000000000001_bobler.json", // the NEW room he connected to
+            "ap_save_88641793823048305365_carla.json",  // same seed, another slot
+        ]
+        .iter()
+        .map(|n| save_file_identity_parts(n).unwrap())
+        .collect();
+        // Guard the motivating hash itself: if identity_hash ever drifts, THIS is the alarm.
+        assert_eq!(identity_hash("88641793823048305365", "bobler"), stored);
+        let room = wrong_save_room(stored, &siblings).expect("a sibling matches");
+        assert_eq!(
+            room,
+            ("88641793823048305365".to_string(), "bobler".to_string())
+        );
+        // ...and the enriched toast turns the refusal into a routing instruction.
+        let toast = refusal_toast_with_room(
+            Refusal::WrongSaveAtConnect,
+            Some((room.0.as_str(), room.1.as_str())),
+        );
+        assert!(toast.contains("seed 88641793823048305365"), "{toast}");
+        assert!(
+            toast.contains("ap_save_88641793823048305365_bobler.json"),
+            "{toast}"
+        );
+        assert!(toast.contains("Connect to THAT room"), "{toast}");
+        // The standing instructions survive the enrichment.
+        assert!(toast.contains("Nothing will send or arrive"), "{toast}");
+        assert!(toast.to_lowercase().contains("main menu"), "{toast}");
+    }
+
+    #[test]
+    fn no_matching_sibling_keeps_the_original_wording() {
+        let stored = identity_hash("no-such-seed", "no-such-slot");
+        let siblings: Vec<(String, String)> =
+            [save_file_identity_parts("ap_save_12345_bobler.json").unwrap()].into();
+        assert_eq!(wrong_save_room(stored, &siblings), None);
+        assert_eq!(
+            refusal_toast_with_room(Refusal::WrongSaveAtConnect, None),
+            refusal_toast(Refusal::WrongSaveAtConnect)
+        );
+    }
+
+    #[test]
+    fn save_file_name_parsing_splits_on_the_first_underscore_only() {
+        // Slot names with spaces were safe()'d to underscores and must survive the split whole.
+        assert_eq!(
+            save_file_identity_parts("ap_save_12345_My_Slot_Name.json"),
+            Some(("12345".to_string(), "My_Slot_Name".to_string()))
+        );
+        // The legacy shared file (pre-2026-07-02) has an empty seed: unknowable, never named.
+        assert_eq!(save_file_identity_parts("ap_save__bobler.json"), None);
+        // Not a save file at all.
+        assert_eq!(save_file_identity_parts("reconcile.json"), None);
+        assert_eq!(save_file_identity_parts("ap_save_12345.json"), None);
+    }
+
+    #[test]
+    fn a_room_changed_refusal_is_never_room_enriched() {
+        // The hint only exists for WrongSaveAtConnect; the mid-session wording must not change.
+        assert_eq!(
+            refusal_toast_with_room(
+                Refusal::RoomChangedMidSession,
+                Some(("88641793823048305365", "bobler"))
+            ),
+            refusal_toast(Refusal::RoomChangedMidSession)
+        );
     }
 
     // -----------------------------------------------------------------------------------------

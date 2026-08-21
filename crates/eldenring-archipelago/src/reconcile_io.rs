@@ -718,7 +718,12 @@ pub fn is_refused() -> bool {
 
 /// WHY the session was refused, so the player can be told what to DO about it. `REFUSED` stays an
 /// `AtomicBool` because `is_refused` is on the check-reporting hot path; this is read once a tick.
-static REFUSAL: Mutex<Option<marker::Refusal>> = Mutex::new(None);
+///
+/// The latched refusal state: the reason plus the clients#337 room hint -- the `(seed, slot)` of
+/// the sibling save file whose identity IS the save-embedded marker, when a wrong-save refusal
+/// could name one. Latched WITH the refusal so the toast and the log can never disagree about it.
+type RefusalState = (marker::Refusal, Option<(String, String)>);
+static REFUSAL: Mutex<Option<RefusalState>> = Mutex::new(None);
 
 /// The on-screen notice owed while this session is refused, or `None` when it is healthy.
 ///
@@ -730,16 +735,43 @@ pub fn refusal_toast() -> Option<String> {
     if !is_refused() {
         return None;
     }
-    let refusal = (*REFUSAL.lock().ok()?)?;
-    Some(marker::refusal_toast(refusal))
+    let (refusal, room) = REFUSAL.lock().ok()?.clone()?;
+    Some(marker::refusal_toast_with_room(
+        refusal,
+        room.as_ref().map(|(s, l)| (s.as_str(), l.as_str())),
+    ))
 }
 
 /// Latch the refusal + its reason together, so `is_refused` and `refusal_toast` can never disagree.
 fn set_refused(refusal: marker::Refusal) {
+    set_refused_with_room(refusal, None);
+}
+
+/// [`set_refused`] carrying the clients#337 room hint (wrong-save refusals only).
+fn set_refused_with_room(refusal: marker::Refusal, room: Option<(String, String)>) {
     if let Ok(mut r) = REFUSAL.lock() {
-        *r = Some(refusal);
+        *r = Some((refusal, room));
     }
     REFUSED.store(true, Ordering::Relaxed);
+}
+
+/// The room a refused save actually belongs to (clients#337): scan the persist directory's
+/// sibling `ap_save_*.json` files for the `(seed, slot)` whose identity IS the save-embedded
+/// marker `stored`. The decision itself is pure (`er_logic::marker::wrong_save_room`,
+/// host-tested); this owns only the one directory read, taken at refusal time. Every failure --
+/// no mod directory, unreadable entries, no match -- degrades to `None`, which keeps the
+/// original un-named refusal wording; a wrong GUESS is the outcome to avoid, not a missing hint.
+fn wrong_save_room_hint(stored: marker::Identity) -> Option<(String, String)> {
+    let dir = shared::utils::mod_directory().ok()?;
+    let mut siblings = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(parts) = marker::save_file_identity_parts(name) {
+            siblings.push(parts);
+        }
+    }
+    marker::wrong_save_room(stored, &siblings)
 }
 
 /// RELEASE a latched refusal, if this is one of the refusals that may be released. Returns `true`
@@ -773,9 +805,10 @@ pub fn clear_refusal_if_rearmable() -> bool {
     let Ok(mut guard) = REFUSAL.lock() else {
         return false; // poisoned: a refusal we cannot evaluate must stay latched (fail closed)
     };
-    let Some(refusal) = *guard else {
+    let Some((refusal, _room)) = guard.as_ref() else {
         return false;
     };
+    let refusal = *refusal;
     match marker::release_verdict(refusal, DRIVER.get().is_some()) {
         marker::RefusalRelease::Hold => false,
         marker::RefusalRelease::Rearm => {
@@ -1123,13 +1156,28 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
     // monotonic for a resume). On the marker Resume path the marker is authoritative, so it's false.
     let (reconciler, fresh_character) = match decision {
         marker::InitDecision::Refuse { stored, expected } => {
-            set_refused(marker::Refusal::WrongSaveAtConnect);
-            log::warn!(
-                "[reconcile] REFUSED: save marker identity {stored:#010x} != this session {expected:#010x} \
-                 -- this save belongs to a different seed/slot. NOT arming the reconciler; check \
-                 reporting is gated. Quit to the main menu, then load this room's save or start a \
-                 new character -- the menu edge releases this refusal (clear_refusal_if_rearmable)."
-            );
+            // clients#337: name the room the save belongs to, so the refusal is a routing
+            // instruction instead of a wall. Pure decision in er_logic::marker; the only I/O is
+            // listing the persist directory, once, at refusal time. A scan failure or no match
+            // falls back to the un-named wording (bobler had TEN characters to guess among).
+            let room = wrong_save_room_hint(stored);
+            set_refused_with_room(marker::Refusal::WrongSaveAtConnect, room.clone());
+            match &room {
+                Some((seed, slot)) => log::warn!(
+                    "[reconcile] REFUSED: save marker identity {stored:#010x} != this session {expected:#010x} \
+                     -- this save belongs to a different seed/slot. It was last played on seed \
+                     {seed} (save file ap_save_{seed}_{slot}.json): connect to THAT room to \
+                     continue it. NOT arming the reconciler; check reporting is gated. Or quit to \
+                     the main menu, then load this room's save or start a new character -- the \
+                     menu edge releases this refusal (clear_refusal_if_rearmable)."
+                ),
+                None => log::warn!(
+                    "[reconcile] REFUSED: save marker identity {stored:#010x} != this session {expected:#010x} \
+                     -- this save belongs to a different seed/slot. NOT arming the reconciler; check \
+                     reporting is gated. Quit to the main menu, then load this room's save or start a \
+                     new character -- the menu edge releases this refusal (clear_refusal_if_rearmable)."
+                ),
+            }
             return; // no Driver -> tick() no-ops; is_refused() gates check reporting in core
         }
         // Marker present + matches: resume from the save's OWN cursor. No play_time inference.
