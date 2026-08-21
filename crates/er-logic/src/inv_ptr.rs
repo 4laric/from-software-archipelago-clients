@@ -30,6 +30,13 @@
 //! save-load, warp arrival, respawn) bumps the epoch, and a pointer from an older epoch is dead —
 //! not "probably fine", dead. Re-priming is cheap and already implemented; using a stale pointer
 //! is a native crash we cannot catch.
+//!
+//! The epoch bumps three times over, once per hole found: at ARRIVAL (the 2026-07-24 crash above),
+//! at warp REQUEST (the warp-out teardown frames, 2026-07-30 — see `may_prime`), and at world EXIT
+//! (quit-to-menu / character switch, clients#353, 2026-08-21): a menu sit freed the world while the
+//! pointer kept its epoch, so `has_inventory()` read true through 4+ minutes of `in_world=false`.
+//! Nothing wrote through it — every grant path ANDs `in_world()` — but a gate that answers from a
+//! dead pointer is exactly the leftover the next instance of the class grows from.
 
 /// May a pointer captured in `captured_epoch` be used now, in `world_epoch`?
 ///
@@ -53,7 +60,8 @@ pub const PRIME_HOLDOFF_MS: u64 = 3000;
 ///
 /// ## The warp-OUT hole in the epoch rule (found 2026-07-30, generalizing the Rampart Gaol edge)
 ///
-/// The epoch scheme retires a pointer at every ARRIVAL edge (in-world false->true). But when
+/// The epoch scheme retires a pointer at every ARRIVAL edge (in-world false->true) and, since
+/// clients#353, at the EXIT edge too (quit-to-menu frees the world between the two). But when
 /// `LuaWarp` is called, the engine begins freeing the origin map while `in_world()` still reads
 /// true for the first teardown frames — the exact blindness that let the scaling sweep walk dying
 /// `ChrIns` sets until `warp_hook` re-armed its gate at the REQUEST. The grant path had the same
