@@ -91,6 +91,25 @@ impl IdSample {
             )
         }
     }
+
+    /// The WHOLE distinct population, sorted. No cap, no `+N more` -- the point is that nothing is
+    /// withheld, so a population question (clients#235's "which 258?") is answerable from the log
+    /// itself rather than from a guess at which twelve the cap happened to keep.
+    ///
+    /// Sorted rather than insertion-ordered so two runs of the same sweep diff cleanly and an id is
+    /// findable by eye in a long line. This is for the probe-gated full dump, not the per-sweep
+    /// census line: a line of ~340 ids is exactly what `render()`'s cap exists to keep out of the
+    /// default log.
+    pub fn render_full(&self) -> String {
+        let mut ids: Vec<i32> = self.seen.iter().copied().collect();
+        ids.sort_unstable();
+        let ids = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{ids}]")
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +183,54 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.render(), "[]");
         assert_eq!(s.withheld(), 0);
+    }
+
+    /// THE MOTIVATING CASE for the full dump (clients#235, item 2): the twelve ids the cap kept
+    /// could not answer "which 258 were left vanilla", and the population question is the one the
+    /// census exists for. The full render must name ALL of them, not the kept prefix.
+    #[test]
+    fn the_full_render_withholds_nothing() {
+        let mut s = IdSample::new(12);
+        for id in 0..258 {
+            s.note(id);
+        }
+        let out = s.render_full();
+        for id in 0..258 {
+            assert!(
+                out.contains(&id.to_string()),
+                "the full dump must contain id {id}, beyond the cap or not"
+            );
+        }
+        assert!(!out.contains("more"), "nothing is withheld: {out}");
+    }
+
+    /// Sorted so two runs of the same sweep diff cleanly, and so an id is findable in a long line
+    /// by eye rather than by grep alone.
+    #[test]
+    fn the_full_render_is_sorted_regardless_of_insertion_order() {
+        let mut s = IdSample::new(12);
+        for id in [41800010, 7, 44501020, 100] {
+            s.note(id);
+        }
+        assert_eq!(s.render_full(), "[7, 100, 41800010, 44501020]");
+    }
+
+    /// Repeats deduplicate in the full render exactly as in the capped one -- 258 events over 3
+    /// distinct ids is a 3-id dump, not a 258-id one.
+    #[test]
+    fn the_full_render_deduplicates() {
+        let mut s = IdSample::new(12);
+        for _ in 0..258 {
+            for id in [33, 11, 22] {
+                s.note(id);
+            }
+        }
+        assert_eq!(s.render_full(), "[11, 22, 33]");
+    }
+
+    #[test]
+    fn an_empty_full_render_is_an_empty_list() {
+        let s = IdSample::new(12);
+        assert_eq!(s.render_full(), "[]");
     }
 }
