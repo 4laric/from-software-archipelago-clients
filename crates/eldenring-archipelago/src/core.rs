@@ -3931,13 +3931,17 @@ impl shared::Core for Core {
         // once applied, re-armed on the in_world edge below for the same reason 8b is).
         crate::spell_slot_length::tick();
 
-        // 8b1. serpent_hunter: the wave SpEffect into the spear's resident slot (latched once
-        // applied, re-armed on the in_world edge below -- a map load restores the vanilla row).
-        crate::serpent_hunter::tick();
-        // 8b1b. ...and the same SpEffect on the PLAYER, every tick. The resident slot binds at
-        // EQUIP time (measured 2026-08-07 19:56:29), so the row write above is inert while the
-        // spear is already in hand -- which, across a map load, is the normal case.
-        crate::serpent_hunter::ensure_applied();
+        // 8b1. serpent_hunter (#345, fight-keyed): the STATIC row probe (read-only since the
+        // ruling reversal -- a non-vanilla resident triple now means another mod's hand), and
+        // the per-tick wave keeper: SpEffect 1908 ON the player while Rykard's healthbar is up
+        // and the spear is held, STRIPPED when the bar drops. The healthbar read is the same
+        // one the grant keys on (#594) -- recomputed here because the grant's copy lives in an
+        // inner scope, and the read is one param lookup.
+        crate::serpent_hunter::probe_row();
+        crate::serpent_hunter::ensure(er_logic::boss_grants::healthbar_shows(
+            er_logic::boss_grants::RYKARD_CHR_ID,
+            crate::flags::boss_healthbar_npc_param_id(),
+        ));
 
         // 8b2. no_equip_load: weightless-equipment SpEffect on the player (param edit + apply).
         crate::no_equip_load::tick();
@@ -4169,11 +4173,6 @@ impl shared::Core for Core {
             // restores the vanilla lengths, and auto_equip would then place spells by a
             // modulus that no longer matches what the game charges for them.
             crate::spell_slot_length::reset();
-            // EquipParamWeapon 17030000's resident SpEffect slot. Same revert-on-load shape as
-            // the line above, and the same reason it must re-arm: without this the spear's waves
-            // work until the player's first load and then stop, which reads as flaky rather than
-            // absent and is strictly harder to diagnose.
-            crate::serpent_hunter::reset();
             // The SpEffectParam pair, ruled on together as their docs ask: one row write each
             // (20012080 allItemWeightChangeRate, 20010827 fallDamageRate). The player keeps
             // carrying the row across a load, so a reverted row is a buff that is present and does

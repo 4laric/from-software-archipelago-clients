@@ -1,26 +1,24 @@
-//! The Serpent-Hunter's wave, forced on (#413 follow-up; boblerrr 2026-08-07 15:23 "it equipped
-//! but weapon dont work" -> Alaric "oh like it doesn't have the special effect?" -> "exactly").
+//! The Serpent-Hunter's wave moveset, gated to the Rykard FIGHT (#345; reverses the
+//! "everywhere, deliberately" ruling that shipped 2026-08-07).
 //!
 //! THE FACT THIS RESTS ON, AND ITS PROVENANCE. The spear's wind waves are NOT a property of the
-//! weapon in vanilla: `EquipParamWeapon` row 17030000 ships `-1` in all three of its RESIDENT
-//! SpEffect fields, and the game turns the moveset on from somewhere else during the Rykard fight.
-//! Writing SpEffect **1908** into one of those three fields is the community's standing fix --
-//! Digones, "Keep Serpent-Hunter Spear special moveset" (Nexus 642), whose install notes are
-//! verbatim: "change the ID of -1 to 1908 to one of three fields 'passive SpEffect'. That will
-//! make the weapon have the moveset used in the fight."
+//! weapon in vanilla: `EquipParamWeapon` row 17030000 ships `-1` in all three RESIDENT SpEffect
+//! fields, and the game turns the moveset on from somewhere else during the Rykard fight. Applying
+//! SpEffect **1908** to the wielder enables it -- Digones, "Keep Serpent-Hunter Spear special
+//! moveset" (Nexus 642). Measured 2026-08-07 19:56:29: the resident-slot param write binds at
+//! EQUIP time only, so the client applies 1908 to the PLAYER directly.
 //!
-//! 🛑🛑 WHAT IS *NOT* MEASURED, STATED UP FRONT BECAUSE THE PROBE EXISTS FOR IT. Nothing here has
-//! measured HOW VANILLA APPLIES 1908 -- whether the arena puts it on the player, or the wave is
-//! gated on the TARGET being the God-Devouring Serpent. The wikis say the effect does not fire
-//! against other serpents, which leans target-gated, and if it IS target-gated then a resident
-//! SpEffect on the wielder may not be sufficient on its own. That is exactly why the client half
-//! logs the player's whole active SpEffect list during the fight: if this write does not work,
-//! the log says what the game actually had, and the next step is a reading rather than a guess.
+//! ⭐ THE RULING, 2026-08-21 (#345, Alaric): the waves are ON only while the Rykard fight is
+//! ACTIVE. The first ruling made them global -- "'only in the vanilla arena' is not a behaviour
+//! worth preserving", because enemy rando can move Rykard into any arena (measured: a Rykard
+//! healthbar in play region 68410) and ARENA-keyed gating would miss him. That reasoning stands;
+//! the conclusion changed because the gate is FIGHT-keyed, not arena-keyed: `healthbar_shows`
+//! follows Rykard wherever the randomiser puts him (#594's lesson, reused from the grant). With
+//! the spear a randomized item any player can receive early, an always-on screen-wide wave attack
+//! is a balance hole everywhere except the one fight it exists for.
 //!
-//! ⚠️ The Nexus mod also ships `sfxbnd_commoneffects.ffxbnd`, which implies the wave's SFX is not
-//! resident outside Rykard's map. A pure-runtime client cannot ship that file. It should not
-//! matter for the case we care about -- the player is INSIDE the fight, where the SFX is already
-//! loaded -- but a seed that wants the waves everywhere is a different, larger job.
+//! This module is the PURE half: one total decision function the client crate obeys. The I/O
+//! (SpEffect application/removal, the row probe) lives in the game crate.
 
 /// The SpEffect that gives the spear its Rykard-fight moveset. See the module doc for provenance.
 pub const WAVE_SPEFFECT: i32 = 1908;
@@ -29,40 +27,45 @@ pub const WAVE_SPEFFECT: i32 = 1908;
 /// [`crate::boss_grants::SERPENT_HUNTER_BASE`] so this module reads standalone.
 pub const SERPENT_HUNTER_ROW: i32 = crate::boss_grants::SERPENT_HUNTER_BASE;
 
-/// The "no SpEffect" sentinel in an `EquipParamWeapon` resident slot.
-///
-/// 🛑 ONLY `-1`, never `0`. SpEffect row 0 is a REAL row in ER, so treating 0 as free would let
-/// this clobber a weapon that legitimately carries it. The mod's own notes say the vanilla
-/// Serpent-Hunter slots read `-1`, so the narrow sentinel loses us nothing on the row we target.
-pub const EMPTY_SLOT: i32 = -1;
-
-/// What to do with the three resident SpEffect slots of a weapon row.
+/// What the per-tick wave keeper should do to the player's SpEffect list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResidentWrite {
-    /// The SpEffect is already in a slot -- do nothing. Keeps the write idempotent across the
-    /// per-tick retry AND across a map load that restored the vanilla row and then got rewritten.
-    AlreadyPresent(usize),
-    /// Write it into this slot index (0-based over `resident_sp_effect_id{,1,2}`).
-    Slot(usize),
-    /// Every slot is occupied by something else. 🛑 We do NOT clobber: a resident SpEffect we did
-    /// not put there is a vanilla behaviour (or another mod's), and silently dropping it to force
-    /// a cosmetic-ish moveset is a worse bug than the one being fixed. The caller logs this loudly
-    /// -- on the vanilla row it cannot happen, so if it ever fires, something else edited the row
-    /// first and that is the news.
-    NoFreeSlot,
+pub enum WaveAction {
+    /// Put 1908 on the player.
+    Apply,
+    /// Take 1908 off the player.
+    Remove,
+    /// Touch nothing this tick.
+    Nothing,
 }
 
-/// Decide which resident slot takes `want`, given the row's current three.
+/// Decide the wave action. Total over every read outcome; the reads are the caller's.
 ///
-/// Total and order-stable: presence beats writing, and the lowest free index wins so a re-run
-/// after a param reload lands in the same slot and the log stays comparable across sessions.
-pub fn resident_write(resident: [i32; 3], want: i32) -> ResidentWrite {
-    if let Some(i) = resident.iter().position(|&v| v == want) {
-        return ResidentWrite::AlreadyPresent(i);
-    }
-    match resident.iter().position(|&v| v == EMPTY_SLOT) {
-        Some(i) => ResidentWrite::Slot(i),
-        None => ResidentWrite::NoFreeSlot,
+/// * `fight_on` -- `healthbar_shows(RYKARD_CHR_ID, ..)`: `None` is a FAILED READ and freezes the
+///   hand (never apply, never strip, off one blink -- the same discipline `probe_fight` keeps).
+/// * `holds` -- does the bag hold a Serpent-Hunter (`None` = bag unreadable).
+/// * `present` -- is 1908 on the player right now.
+///
+/// 🛑 NEVER strips mid-fight, even on an unreadable bag: taking the moveset away DURING the one
+/// fight it exists for is the harm case this feature must be incapable of. Outside the fight the
+/// effect has no business on the player regardless of what the bag says, so `Remove` ignores
+/// `holds` entirely.
+pub fn wave_action(fight_on: Option<bool>, holds: Option<bool>, present: bool) -> WaveAction {
+    match fight_on {
+        None => WaveAction::Nothing,
+        Some(true) => {
+            if holds == Some(true) && !present {
+                WaveAction::Apply
+            } else {
+                WaveAction::Nothing
+            }
+        }
+        Some(false) => {
+            if present {
+                WaveAction::Remove
+            } else {
+                WaveAction::Nothing
+            }
+        }
     }
 }
 
@@ -71,65 +74,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_vanilla_row_takes_slot_zero() {
-        // MOTIVATING CASE (rule 11). The mod's notes say the vanilla Serpent-Hunter carries -1 in
-        // all three, which is the shape this has to handle first.
+    fn in_the_fight_a_held_spear_gets_the_waves() {
+        // MOTIVATING CASE (rule 11), unchanged from the first ruling: boblerrr 2026-08-07 15:23,
+        // "it equipped but weapon dont work" -- in the fight, spear in hand, effect absent.
         assert_eq!(
-            resident_write([-1, -1, -1], WAVE_SPEFFECT),
-            ResidentWrite::Slot(0)
+            wave_action(Some(true), Some(true), false),
+            WaveAction::Apply
+        );
+        // ...and once present, the keeper is quiet.
+        assert_eq!(
+            wave_action(Some(true), Some(true), true),
+            WaveAction::Nothing
         );
     }
 
     #[test]
-    fn a_row_we_already_wrote_is_left_alone() {
-        // The client retries per tick until the params are up, and re-arms after every map load.
-        // Without this the same id would be written into all three slots over three ticks.
-        for i in 0..3 {
-            let mut r = [-1; 3];
-            r[i] = WAVE_SPEFFECT;
-            assert_eq!(
-                resident_write(r, WAVE_SPEFFECT),
-                ResidentWrite::AlreadyPresent(i)
-            );
-        }
-    }
-
-    #[test]
-    fn an_occupied_slot_is_never_clobbered() {
-        // 🛑 Vanilla content in a resident slot outranks our moveset write.
+    fn outside_the_fight_the_waves_come_off() {
+        // THE #345 CASE, the inversion of the one above: fight over, effect still on the player.
         assert_eq!(
-            resident_write([100, 200, 300], WAVE_SPEFFECT),
-            ResidentWrite::NoFreeSlot
+            wave_action(Some(false), Some(true), true),
+            WaveAction::Remove
         );
-        // ...and a partially-occupied row takes the first FREE index, not index 0.
+        // `holds` is irrelevant to removal -- the effect has no business there either way.
+        assert_eq!(wave_action(Some(false), None, true), WaveAction::Remove);
         assert_eq!(
-            resident_write([100, -1, -1], WAVE_SPEFFECT),
-            ResidentWrite::Slot(1)
+            wave_action(Some(false), Some(false), true),
+            WaveAction::Remove
         );
+        // Nothing to remove, nothing to do.
         assert_eq!(
-            resident_write([100, 200, -1], WAVE_SPEFFECT),
-            ResidentWrite::Slot(2)
+            wave_action(Some(false), Some(true), false),
+            WaveAction::Nothing
         );
     }
 
     #[test]
-    fn zero_is_a_real_speffect_row_and_not_a_free_slot() {
-        // 🛑 THE REGRESSION THIS EXISTS FOR. `0` is a valid SpEffect row id in ER; treating it as
-        // "empty" would delete it. A row of zeroes therefore has NO free slot.
+    fn a_failed_healthbar_read_freezes_the_hand() {
+        // 🛑 A blink mid-fight must not strip, and a blink outside must not apply.
+        assert_eq!(wave_action(None, Some(true), false), WaveAction::Nothing);
+        assert_eq!(wave_action(None, Some(true), true), WaveAction::Nothing);
+    }
+
+    #[test]
+    fn mid_fight_nothing_is_ever_stripped() {
+        // 🛑 The harm case this feature must be incapable of: bag unreadable (or the spear
+        // dropped mid-fight) while the bar is up -- the effect STAYS.
+        assert_eq!(wave_action(Some(true), None, true), WaveAction::Nothing);
         assert_eq!(
-            resident_write([0, 0, 0], WAVE_SPEFFECT),
-            ResidentWrite::NoFreeSlot
+            wave_action(Some(true), Some(false), true),
+            WaveAction::Nothing
         );
+    }
+
+    #[test]
+    fn an_empty_bag_in_the_fight_gets_nothing() {
+        // The grant path is what hands the spear over; the keeper never applies to a bare hand.
         assert_eq!(
-            resident_write([0, -1, 0], WAVE_SPEFFECT),
-            ResidentWrite::Slot(1)
+            wave_action(Some(true), Some(false), false),
+            WaveAction::Nothing
         );
+        assert_eq!(wave_action(Some(true), None, false), WaveAction::Nothing);
     }
 
     #[test]
     fn the_row_and_speffect_ids_are_the_published_ones() {
-        // Pinned in exact values: these two numbers ARE the fix, and a typo in either is a silent
-        // no-op in game with nothing in the log to say so.
+        // Pinned in exact values: these two numbers ARE the mechanism, and a typo in either is a
+        // silent no-op in game with nothing in the log to say so.
         assert_eq!(WAVE_SPEFFECT, 1908);
         assert_eq!(SERPENT_HUNTER_ROW, 17_030_000);
     }
