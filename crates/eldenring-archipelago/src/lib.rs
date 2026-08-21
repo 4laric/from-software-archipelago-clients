@@ -51,6 +51,7 @@ mod runes;
 mod scadu_blessing;
 mod scaling;
 mod scout_proof;
+mod seamless_probe;
 mod serpent_hunter;
 mod shop_flags;
 mod shop_hints;

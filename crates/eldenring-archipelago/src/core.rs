@@ -68,6 +68,7 @@ console_commands! {
     UnlockGrace => "!unlockgrace" => "!unlockgrace <unique name substring|flag>",
     MarkerProbe => "!markerprobe" => "!markerprobe [set|verify|clear]",
     Give => "!give" => "!give <fullId> [qty]",
+    SeamlessProbe => "!seamlessprobe" => "!seamlessprobe [start|stop]",
     Help => "!help" => "!help",
 }
 
@@ -584,6 +585,19 @@ impl shared::Core for Core {
                         "usage: !give <fullId> [qty]  -- fullId = category nibble | raw, so goods row R                          is 0x40000000|R -- PREFER HEX: goods 8853 = 0x40002295 (decimal 1073750677); hex needs no arithmetic"
                             .to_string(),
                     )),
+                }
+                true
+            }
+            ConsoleCommand::SeamlessProbe => {
+                let lines = match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
+                    None => crate::seamless_probe::report(self.detour_installed),
+                    Some("start") => crate::seamless_probe::start(),
+                    Some("stop") => crate::seamless_probe::stop(),
+                    Some(_) => vec!["usage: !seamlessprobe [start|stop]".to_string()],
+                };
+                for line in lines {
+                    log::info!("{line}");
+                    self.log(ap::Print::message(line));
                 }
                 true
             }
