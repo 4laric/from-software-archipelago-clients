@@ -890,6 +890,13 @@ impl shared::Core for Core {
         // move -- the observation the hover-rename design is waiting on.
         crate::hover_probe::install();
 
+        // Ability-lock probes (ability_probe.rs; SPEC-ability-lock-mode, er-archipelago#945):
+        // LOG-ONLY, gated on `ER_ABILITY_PROBE` / `"probes": {"ability": true}`. No hooks at
+        // all -- per-tick sampling of menu-state candidates and the player's debug flags +
+        // SpEffect list, so the mode's menu-context predicate and the Roundtable no-combat
+        // mechanism are MEASURED before anything is built on them.
+        crate::ability_probe::install();
+
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them. Gated on the minibake
         // refuse guard — a wrong-seed save must not report checks (see reconcile_io::is_refused).
         self.stage_check_reports(crate::detour::take_pending_checks());
@@ -4138,6 +4145,9 @@ impl shared::Core for Core {
             // enumerates every module that does. Clears the shop-open trace so a reconnect
             // starts a clean cursor log; the lookup hook itself stays installed for the process.
             crate::hover_probe::reset();
+            // ability_probe (#945): same shape as hover_probe -- log-only, defines reset() so the
+            // world gate can see it; clears the last-basket latch so a reconnect samples fresh.
+            crate::ability_probe::reset();
             // --- 2026-08-04: the rest of the latched game-state writers, ruled on together. ------
             // Alaric: "resets for everything should be handled in the same way". These seven sat in
             // the world gate's _UNRULED_WRITERS debt ledger -- each writes game state, latches, and
@@ -4260,6 +4270,9 @@ impl shared::Core for Core {
             // #937 hover probe: frame flush for the goods-lookup trace. A no-op unless the probe
             // gate is on AND a shop is open; both checks are atomic loads.
             crate::hover_probe::tick();
+            // #945 ability probe: the menu-context / Roundtable state sampler. A single atomic
+            // load when the gate is off; when on, one basket sample, logged on change only.
+            crate::ability_probe::tick();
             let _ = crate::shop_icon::run();
             // AFTER shop_sell has latched (it gates on shop_sell::is_done) and after the two display
             // overrides: writes the preview good onto the check row so those overrides are something
