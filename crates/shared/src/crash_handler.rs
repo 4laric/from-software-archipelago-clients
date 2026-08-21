@@ -430,6 +430,10 @@ fn report_inner(info: usize, phase: &str) {
             &registers.named_values(),
         ));
     }
+    // client#301: the session's scaling-write tallies, so the NEXT teardown crash itself answers
+    // the "had scaling just written to many UNLOADED chrs?" correlation instead of a human
+    // diffing the log around the crash. Empty string when scaling never wrote.
+    out.push_str(&crate::crash_tallies::annotate());
     out.push_str(&format!("thread {:?}\n", std::thread::current().id()));
 
     // STACK_OVERFLOW runs on the exhausted stack: skip the walk, keep the path minimal.
