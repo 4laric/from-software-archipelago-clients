@@ -808,6 +808,20 @@ pub fn insert_path_live() -> bool {
     !INSERT_UNSAFE.load(Ordering::Relaxed)
 }
 
+/// The verified runtime address of the game's `SearchStringTable`, or `None` when the module
+/// base or the signature check fails. The single source of truth for `SEARCH_RVA`/`SEARCH_SIG`
+/// beyond the read-back: `hover_probe` hooks this address (er-archipelago#937), and it must
+/// verify the same bytes the read-back trusts rather than carrying a second copy of the
+/// signature.
+pub fn search_string_table_addr() -> Option<usize> {
+    let base = current_module_base()?;
+    if sig_ok(base + SEARCH_RVA) {
+        Some(base + SEARCH_RVA)
+    } else {
+        None
+    }
+}
+
 /// Extend-swap OVERRIDES: give a set of ids in `base_array[0][category]` new AP strings, rebuilding
 /// from the LIVE block so any prior swap (e.g. this module's synthetic-goods appends) is preserved.
 /// Used by shop_preview / check_lots for names, info lines and captions that don't fit the packed

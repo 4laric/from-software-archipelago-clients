@@ -869,6 +869,7 @@ impl shared::Core for Core {
             ("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player"),
             ("ER_TRAP_PROBE", "traps"),
             ("ER_BOSSFIGHT_PROBE", "boss_fight"),
+            ("ER_HOVER_PROBE", "hover"),
             // ER_TRAP_FEEL_PROBE is absent for the same reason; trap_feel_probe::announce_once
             // says that one, and also prints its key map.
         ]);
@@ -881,6 +882,13 @@ impl shared::Core for Core {
         // LuaWarp hook above: an unsupported build degrades to one refusal line AND marks shop
         // hints inactive, which the connect banner then states outright.
         crate::esd_probe::install();
+
+        // Hover-signal probe (hover_probe.rs; er-archipelago#937 keystone 1): LOG-ONLY, gated on
+        // `ER_HOVER_PROBE` / `"probes": {"hover": true}`, so when it is off (the default) install
+        // is a no-op and the SearchStringTable hook is never built. When on, it watches goods
+        // lookups while a shop is open to learn whether the buy menu re-queries FMG per cursor
+        // move -- the observation the hover-rename design is waiting on.
+        crate::hover_probe::install();
 
         // 1. Report suppressed (world-pickup) synthetics. The echo grants them. Gated on the minibake
         // refuse guard — a wrong-seed save must not report checks (see reconcile_io::is_refused).
@@ -4126,6 +4134,10 @@ impl shared::Core for Core {
             // swaps across 51 edges vs 3 preview swaps across one. Must run AFTER shop_repoint,
             // same as shop_icon: repoint decides WHICH rows are ours, preview names them.
             crate::shop_preview::reset();
+            // hover_probe (world#937): log-only, but it defines reset() and the world gate
+            // enumerates every module that does. Clears the shop-open trace so a reconnect
+            // starts a clean cursor log; the lookup hook itself stays installed for the process.
+            crate::hover_probe::reset();
             // --- 2026-08-04: the rest of the latched game-state writers, ruled on together. ------
             // Alaric: "resets for everything should be handled in the same way". These seven sat in
             // the world gate's _UNRULED_WRITERS debt ledger -- each writes game state, latches, and
@@ -4245,6 +4257,9 @@ impl shared::Core for Core {
             // must not stall the rewrite.
             let _ = crate::check_lots::dress_placeholder();
             let _ = crate::shop_preview::run();
+            // #937 hover probe: frame flush for the goods-lookup trace. A no-op unless the probe
+            // gate is on AND a shop is open; both checks are atomic loads.
+            crate::hover_probe::tick();
             let _ = crate::shop_icon::run();
             // AFTER shop_sell has latched (it gates on shop_sell::is_done) and after the two display
             // overrides: writes the preview good onto the check row so those overrides are something
