@@ -1152,11 +1152,25 @@ pub fn tick() -> Option<String> {
                 .filter(|&(_, &n)| n > 0)
                 .map(|(i, &n)| (i, n))
                 .collect();
+            // client#251, ask 5: the HP-PENDING population, session-wide. The per-sweep tallies
+            // beside it say what THIS sweep did; these say what has never been CONFIRMED -- the
+            // "scaled in name, stale in fact" residue that vanishes from the log after its
+            // one-shot verdict line. `indefinite` is #188's transient-vs-permanent split
+            // (long_stale); `cap-dropped` keeps the watch's own doctrine ("forgetting is stated,
+            // never silent") true at the summary level, where a player actually looks.
+            let (hp_pending, hp_pending_dropped, hp_pending_indefinite) = RESCALE_WATCH
+                .lock()
+                .map(|w| {
+                    let (outstanding, dropped) = w.outstanding();
+                    (outstanding, dropped, w.long_stale(now_ms()).len())
+                })
+                .unwrap_or((0, 0, 0));
             log::info!(
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \
                  atk{}); (re)scaled {} enemy(ies) ({} of them UNLOADED, whose max_hp recompute \
-                 is deferred until they load; recompute CONFIRMED {}, FAILED-while-loaded {} {}); \
+                 is deferred until they load; recompute CONFIRMED {}, FAILED-while-loaded {} {}; \
+                 hp-pending {} session-wide, {} indefinite, {} cap-dropped); \
                  unrunged {} \
                  (up-scaled by native tier {}, left vanilla {} {}, npc_param_ids {}), \
                  down-scaled {} (settled {}, kept {}, cleared {}), \
@@ -1171,6 +1185,9 @@ pub fn tick() -> Option<String> {
                 tally.recomputed,
                 tally.recompute_failed_loaded,
                 tally.recompute_failed_ids.render(),
+                hp_pending,
+                hp_pending_indefinite,
+                hp_pending_dropped,
                 tally.unrunged,
                 tally.scaled_by_native,
                 tally.left_vanilla,
