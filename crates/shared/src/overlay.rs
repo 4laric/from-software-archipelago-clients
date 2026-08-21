@@ -64,8 +64,19 @@ pub struct Overlay<G: Game> {
     /// The history of messages sent to the say input.
     say_history: TextInputHistory,
 
-    /// Whether the log was previously scrolled all the way down.
-    log_was_scrolled_down: bool,
+    /// STICKY bottom-follow for the log window. `true` = keep pinning to the newest line;
+    /// cleared ONLY by the user deliberately scrolling UP (wheel or scrollbar), re-armed when
+    /// they return to the bottom. Sticky rather than measured-per-frame because a BURST of
+    /// lines (a boss sweep pays 26+ checks in one pass) grows `scroll_max_y` faster than the
+    /// old at-bottom check could observe: the check read false on the burst frame, the latch
+    /// died, and the console silently stopped following -- 4laric, 2026-08-21, "it stops being
+    /// at the bottom and new ones stop showing up", a long-standing report.
+    log_stick_to_bottom: bool,
+
+    /// Where the sticky pin last left the scroll (last frame's `scroll_max_y`). The unstick
+    /// test compares the CURRENT scroll against this: content growth never moves the view
+    /// above the previous pin, so `scroll_y < last_pin` can only mean the USER scrolled up.
+    log_last_pin: f32,
 
     /// The time of the most recent log we've seen. This is used to determine
     /// when new logs are emitted for [frames_since_new_logs].
@@ -216,7 +227,8 @@ impl<G: Game> Overlay<G> {
             open_connect_requested: false,
             say_input: Default::default(),
             say_history: Default::default(),
-            log_was_scrolled_down: false,
+            log_stick_to_bottom: true,
+            log_last_pin: 0.0,
             last_log_emitted: Instant::now(),
             frames_since_new_logs: 0,
             settings_window_visible: false,
@@ -742,14 +754,32 @@ impl<G: Game> Overlay<G> {
                     );
                 }
 
-                // Was the user already at the bottom? Measure BEFORE the forced
-                // set_scroll_y, and allow a 1px epsilon so sub-pixel rounding in
-                // scroll_max_y can't latch this to false and kill auto-scroll.
-                let at_bottom = ui.scroll_y() >= ui.scroll_max_y() - 1.0;
-                if self.log_was_scrolled_down && self.frames_since_new_logs < 10 {
-                    ui.set_scroll_y(ui.scroll_max_y());
+                // STICKY FOLLOW (2026-08-21). The old latch measured "am I at the bottom"
+                // AFTER rendering this frame's rows -- so the one frame a sweep dumps 26 lines,
+                // scroll_max_y has already jumped, the check reads false while the view still
+                // sits at the OLD bottom, and auto-scroll died exactly when the console most
+                // needed to follow. The latch is sticky now, and only the USER can clear it:
+                //   * content growth cannot -- growth never moves the view ABOVE last frame's
+                //     pin, so `scroll_y < last_pin` is a reliable "the user scrolled up",
+                //     whatever scroll_max_y did this frame (wheel and scrollbar drag both
+                //     land here; the 1px epsilon eats sub-pixel rounding);
+                //   * returning to the bottom re-arms it.
+                // The frames_since_new_logs window is gone from this condition on purpose: it
+                // existed to stop fighting the user, and the unstick test does that job
+                // precisely instead of by timeout.
+                let cur = ui.scroll_y();
+                let max = ui.scroll_max_y();
+                if self.log_stick_to_bottom {
+                    if cur + 1.0 < self.log_last_pin.min(max) {
+                        self.log_stick_to_bottom = false; // the user scrolled up: let them read
+                    }
+                } else if cur >= max - 1.0 {
+                    self.log_stick_to_bottom = true; // they came back: resume following
                 }
-                self.log_was_scrolled_down = at_bottom;
+                if self.log_stick_to_bottom {
+                    ui.set_scroll_y(max);
+                    self.log_last_pin = max;
+                }
             });
     }
 
