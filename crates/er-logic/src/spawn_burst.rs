@@ -81,6 +81,17 @@ use crate::traps::SpawnSpec;
 /// instrument ignorable.
 pub const SETTLE_MS: u64 = 2_000;
 
+/// Minimum wall-clock gap between successive spawn REQUESTS inside one burst.
+///
+/// One-request-per-tick (client#206) still drains at FRAME rate: eight copies land in ~130ms at
+/// 60fps, and back-to-back traps -- "a couple of runebears and a couple of basilisks" -- arrive
+/// effectively simultaneously and can overload `CSDebugChrCreator`. Frame pacing bounds the writes
+/// per frame but not per second; this bounds them per second, the same shape the item-grant path
+/// uses via `RECONCILE_GRANT_INTERVAL_MS`. `0` disables pacing (the RECONCILE convention: unpaced).
+///
+/// Env-overridable by the client through [`SpawnBurst::with_min_request_interval_ms`].
+pub const DEFAULT_MIN_REQUEST_INTERVAL_MS: u64 = 250;
+
 /// A `count > 1` spawn, played out one request per tick.
 ///
 /// 🛑 THE SPEC IS CARRIED, NOT THE REQUEST. `SpawnSpec` is `Copy` and the ids are all this needs;
@@ -96,8 +107,11 @@ pub struct SpawnBurst {
     /// 🛑 THE TRAP'S ROW IS NOT PRIVATE. Without this, a trap that spawned nothing in a room that
     /// already held three basilisks reports a clean `3 standing`.
     baseline: u32,
-    /// Wall clock of the last request, i.e. when the settle window starts.
+    /// Wall clock of the last request, i.e. when the settle window starts, and the anchor the
+    /// inter-request pacing gate measures from.
     last_issue_ms: u64,
+    /// Minimum wall-clock gap between successive requests. `0` = unpaced (issue every tick).
+    min_request_interval_ms: u64,
 }
 
 impl SpawnBurst {
@@ -110,7 +124,21 @@ impl SpawnBurst {
             issued: 0,
             baseline,
             last_issue_ms: now_ms,
+            min_request_interval_ms: DEFAULT_MIN_REQUEST_INTERVAL_MS,
         }
+    }
+
+    /// Override the inter-request spacing, in ms. `0` issues every tick (unpaced). The client wires
+    /// this from `ER_SPAWN_INTERVAL_MS` the same way `reconcile_io` wires the grant interval.
+    #[must_use]
+    pub fn with_min_request_interval_ms(mut self, ms: u64) -> Self {
+        self.min_request_interval_ms = ms;
+        self
+    }
+
+    /// The inter-request spacing this burst paces to, in ms (`0` = unpaced).
+    pub fn min_request_interval_ms(&self) -> u64 {
+        self.min_request_interval_ms
     }
 
     /// The row the witness counts on. Not the same id as [`Self::spec_chr_id`]: `chr_id` is the
@@ -167,6 +195,18 @@ impl SpawnBurst {
     /// next person to read it, which is the bug this module exists to remove.
     pub fn next_request(&mut self, now_ms: u64) -> Option<SpawnSpec> {
         if self.is_done() {
+            return None;
+        }
+        // Wall-clock pacing (issue #2 onward): hold until the interval has elapsed since the last
+        // request. Returning None here while NOT done is the "wait" signal the driver already
+        // understands -- `drive_spawn_burst` keeps the burst and owns the tick, so nothing writes
+        // the creator's slot underneath it, and `verify_due` stays false until the burst is spent.
+        // The first request (issued == 0) always goes immediately; a backwards clock saturates to 0
+        // and simply issues, never stalls.
+        if self.min_request_interval_ms > 0
+            && self.issued > 0
+            && now_ms.saturating_sub(self.last_issue_ms) < self.min_request_interval_ms
+        {
             return None;
         }
         self.issued += 1;
@@ -244,8 +284,8 @@ mod replay {
         assert_eq!(spec.count, 3, "the curated basilisk trap is three mists");
 
         let mut creator = SingleSlotCreator::default();
-        let mut burst = SpawnBurst::new(spec, 0, 0);
-        // One request per tick, each with a frame in between for the creator to drain it.
+        let mut burst = SpawnBurst::new(spec, 0, 0).with_min_request_interval_ms(0); // pacing tested separately
+                                                                                     // One request per tick, each with a frame in between for the creator to drain it.
         while let Some(one) = burst.next_request(0) {
             assert_eq!(one.count, 1, "each request describes exactly one creature");
             creator.request(one.chr_id);
@@ -305,7 +345,7 @@ mod replay {
     /// case -- so the staggered path is the ONLY spawn path and never grows a second one.
     #[test]
     fn a_burst_is_spent_exactly_once() {
-        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 0);
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 0).with_min_request_interval_ms(0);
         let mut issued = 0;
         while burst.next_request(0).is_some() {
             issued += 1;
@@ -343,7 +383,7 @@ mod replay {
     /// shape a one-line "just count them" fix would have shipped.
     #[test]
     fn a_room_that_already_had_basilisks_cannot_pass_for_a_successful_trap() {
-        let mut burst = SpawnBurst::new(basilisk_x3(), 3, 0);
+        let mut burst = SpawnBurst::new(basilisk_x3(), 3, 0).with_min_request_interval_ms(0);
         while burst.next_request(0).is_some() {}
 
         // The creator collapsed everything: the live count is still the three that were there.
@@ -362,7 +402,7 @@ mod replay {
     /// The happy path, in a room that already had some: baseline 2, five standing, three are ours.
     #[test]
     fn the_delta_is_what_the_trap_actually_added() {
-        let mut burst = SpawnBurst::new(basilisk_x3(), 2, 0);
+        let mut burst = SpawnBurst::new(basilisk_x3(), 2, 0).with_min_request_interval_ms(0);
         while burst.next_request(0).is_some() {}
         assert_eq!(burst.baseline(), 2);
         assert_eq!(burst.observed_delta(5), 3);
@@ -410,7 +450,7 @@ mod replay {
     /// `SampleGate` documents for its heartbeat.
     #[test]
     fn a_backwards_clock_does_not_strand_the_witness() {
-        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 10_000);
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 10_000).with_min_request_interval_ms(0);
         while burst.next_request(10_000).is_some() {}
         assert!(
             !burst.verify_due(5),
@@ -427,5 +467,81 @@ mod replay {
             let line = burst_report(4150, 3, 3, observed);
             assert!(line.is_ascii(), "non-ASCII in a spawn report: {line}");
         }
+    }
+
+    /// ⭐ THE FIX FOR #947: successive requests are spaced by WALL CLOCK, not one-per-frame. The
+    /// first goes immediately; each subsequent one is held until the interval elapses. This is what
+    /// keeps "a couple of runebears and a couple of basilisks" from landing in the same ~130ms.
+    #[test]
+    fn requests_are_spaced_by_wall_clock() {
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 0).with_min_request_interval_ms(250);
+        // First request is immediate (issued == 0).
+        assert!(
+            burst.next_request(0).is_some(),
+            "first request must go at once"
+        );
+        assert_eq!(burst.issued(), 1);
+        // Same tick / inside the interval: held, and holding does not spend the burst.
+        assert!(burst.next_request(0).is_none(), "second request must wait");
+        assert!(
+            burst.next_request(249).is_none(),
+            "still inside the interval"
+        );
+        assert!(!burst.is_done(), "a held burst is not a spent burst");
+        // Interval elapsed: the second request goes, and the clock re-anchors from it.
+        assert!(burst.next_request(250).is_some());
+        assert_eq!(burst.issued(), 2);
+        assert!(
+            burst.next_request(499).is_none(),
+            "measured from the last request, not the first"
+        );
+        assert!(burst.next_request(500).is_some());
+        assert!(burst.is_done(), "three requests, spaced, then spent");
+    }
+
+    /// The witness clock still runs from the LAST request even when the burst is paced -- pacing
+    /// only decides WHEN each request may go, never how the settle window is measured.
+    #[test]
+    fn a_paced_burst_settles_from_its_last_request() {
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 0).with_min_request_interval_ms(250);
+        assert!(burst.next_request(0).is_some());
+        assert!(burst.next_request(250).is_some());
+        assert!(burst.next_request(500).is_some());
+        assert!(burst.is_done());
+        assert!(
+            !burst.verify_due(500 + SETTLE_MS - 1),
+            "settle runs from the third request"
+        );
+        assert!(burst.verify_due(500 + SETTLE_MS));
+    }
+
+    /// `0` is unpaced, matching the RECONCILE convention: every call issues, so the pre-#947
+    /// frame-rate behaviour is still reachable (and is what the accounting tests above rely on).
+    #[test]
+    fn interval_zero_is_unpaced() {
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 0).with_min_request_interval_ms(0);
+        assert_eq!(burst.min_request_interval_ms(), 0);
+        let mut issued = 0;
+        while burst.next_request(0).is_some() {
+            issued += 1;
+            assert!(issued <= 8, "a burst must terminate even unpaced");
+        }
+        assert_eq!(issued, 3, "unpaced: all three drain at the same now");
+    }
+
+    /// A burst built with the plain constructor is paced by default (the fix is live without any
+    /// client wiring): a second same-tick request is held.
+    #[test]
+    fn the_default_burst_is_paced() {
+        let mut burst = SpawnBurst::new(basilisk_x3(), 0, 0);
+        assert_eq!(
+            burst.min_request_interval_ms(),
+            DEFAULT_MIN_REQUEST_INTERVAL_MS
+        );
+        assert!(burst.next_request(0).is_some());
+        assert!(
+            burst.next_request(0).is_none(),
+            "default pacing holds the second request"
+        );
     }
 }
