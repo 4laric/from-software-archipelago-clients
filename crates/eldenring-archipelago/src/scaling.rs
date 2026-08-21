@@ -1165,6 +1165,14 @@ pub fn tick() -> Option<String> {
                     (outstanding, dropped, w.long_stale(now_ms()).len())
                 })
                 .unwrap_or((0, 0, 0));
+            // client#301: fold this sweep's write tallies into the session counters the crash
+            // report appends, so the next teardown crash answers the "had scaling just written to
+            // many UNLOADED chrs?" correlation itself. Cheap atomics; see shared::crash_tallies.
+            shared::crash_tallies::record_scaling_sweep(
+                tally.scaled,
+                tally.scaled_unloaded,
+                tally.recompute_failed_loaded,
+            );
             log::info!(
                 "enemy-scaling: region {region} -> speffect {target} \
                  (tier {tier}/{}, sphere target {tgt}/{max_target}, {hp:.2}x HP / {attack:.2}x \

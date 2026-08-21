@@ -15,6 +15,7 @@ mod config;
 mod connect_error;
 mod core;
 mod crash_handler;
+pub mod crash_tallies;
 mod error_display;
 pub mod foreign_blocks;
 mod game;
