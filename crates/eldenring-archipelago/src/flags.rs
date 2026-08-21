@@ -34,6 +34,7 @@ pub fn try_set_event_flag(flag_id: u32, enabled: bool) -> bool {
     match unsafe { CSEventFlagMan::instance_mut() } {
         Ok(m) => {
             m.virtual_memory_flag.set_flag(flag_id, enabled);
+            crate::seamless_probe::record_ap_write(flag_id, enabled);
             true
         }
         Err(_) => false,
