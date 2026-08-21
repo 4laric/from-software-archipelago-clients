@@ -96,9 +96,14 @@ pub fn tick() {
     let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
         return;
     };
+    // #351: mid-restream holder -> upstream rows_mut panics. Defer: APPLIED is not latched, so
+    // the pass re-runs next tick; the in_world edge re-arm covers the restream case.
+    let Some(magic_rows) = crate::param_guard::rows_mut::<Magic>(repo, "spell_slot_length") else {
+        return;
+    };
     let mut rows = 0u32;
     let mut normalised = 0u32;
-    for (_id, row) in repo.rows_mut::<Magic>() {
+    for (_id, row) in magic_rows {
         rows += 1;
         if row.slot_length() != ONE_SLOT {
             row.set_slot_length(ONE_SLOT);

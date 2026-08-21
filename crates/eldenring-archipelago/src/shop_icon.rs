@@ -117,7 +117,7 @@ pub fn run() -> bool {
     let tele_icon = match crate::param_guard::get::<EquipParamGoods>(
         repo,
         TELESCOPE_GOOD_ID,
-        "shop_icon telescope icon",
+        "shop-icon flower pass",
     ) {
         Some(row) => row.icon_id(),
         None => return false, // telescope row absent — retry
@@ -164,7 +164,9 @@ pub fn run() -> bool {
             protected += 1;
             continue;
         }
-        if let Some(row) = repo.get_mut::<EquipParamGoods>(gid)
+        // clients#351: guarded -- a mid-restream goods holder must defer the write, not panic.
+        if let Some(row) =
+            crate::param_guard::get_mut::<EquipParamGoods>(repo, gid, "shop-icon flower pass")
             && row.icon_id() != tele_icon
         {
             row.set_icon_id(tele_icon);

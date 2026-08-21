@@ -158,7 +158,7 @@ fn stock_flag_addr(row_id: u32) -> Option<usize> {
     // mirrors `params.rs`'s `get::<EquipParamGoods>` — returns Option<&SHOP_LINEUP_PARAM>.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
     let row: &SHOP_LINEUP_PARAM =
-        crate::param_guard::get::<ShopLineupParam>(repo, row_id, "shop_flags lineup read")?;
+        crate::param_guard::get::<ShopLineupParam>(repo, row_id, "shop-flags stock-flag addr")?;
     Some((row as *const SHOP_LINEUP_PARAM as usize) + STOCK_FLAG_OFF)
 }
 
@@ -191,7 +191,11 @@ fn set_sell_quantity_one(row_id: u32) -> Option<i16> {
     // SAFETY: FD4 singleton; game thread, in-world (caller gates). instance_mut/get_mut are the crate's
     // sanctioned mutable param access on the live RW param table.
     let repo = unsafe { SoloParamRepository::instance_mut() }.ok()?;
-    let row: &mut SHOP_LINEUP_PARAM = repo.get_mut::<ShopLineupParam>(row_id)?;
+    let row: &mut SHOP_LINEUP_PARAM = crate::param_guard::get_mut::<ShopLineupParam>(
+        repo,
+        row_id,
+        "shop-flags sellQuantity clamp",
+    )?;
     let old = row.sell_quantity();
     if old != 1 {
         row.set_sell_quantity(1);
@@ -219,7 +223,14 @@ fn clamp_check_row_stock() -> bool {
         Err(_) => return false, // repo not up -- retry next tick
     };
     let mut clamped = 0u32;
-    for (id, row) in repo.rows_mut::<ShopLineupParam>() {
+    // clients#351: defer while the holder is mid-restream rather than panic or clamp nothing
+    // and report a clean-looking pass.
+    let Some(rows) =
+        crate::param_guard::rows_mut::<ShopLineupParam>(repo, "shop-flags stock clamp scan")
+    else {
+        return false;
+    };
+    for (id, row) in rows {
         let f = row.event_flag_for_stock();
         if f != 0 && flags.contains(&f) && row.sell_quantity() != 1 {
             let old = row.sell_quantity();
@@ -402,7 +413,7 @@ fn release_flag_addr(row_id: u32) -> Option<usize> {
     // SAFETY: FD4 singleton; on the game thread (caller gates in-world).
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
     let row: &SHOP_LINEUP_PARAM =
-        crate::param_guard::get::<ShopLineupParam>(repo, row_id, "shop_flags lineup read")?;
+        crate::param_guard::get::<ShopLineupParam>(repo, row_id, "shop-flags release-flag addr")?;
     Some((row as *const SHOP_LINEUP_PARAM as usize) + RELEASE_FLAG_OFF)
 }
 

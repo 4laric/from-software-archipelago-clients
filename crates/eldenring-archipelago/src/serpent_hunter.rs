@@ -57,7 +57,13 @@ pub fn probe_row() {
         return;
     };
     let row_id = SERPENT_HUNTER_ROW as u32;
-    for (id, row) in repo.rows_mut::<EquipParamWeapon>() {
+    // #351: the probe is read-only, but upstream rows_mut still panics on a mid-restream
+    // holder -- defer via param_guard (latch not set, re-runs next tick).
+    let Some(rows) = crate::param_guard::rows_mut::<EquipParamWeapon>(repo, "serpent-hunter probe")
+    else {
+        return;
+    };
+    for (id, row) in rows {
         if id != row_id {
             continue;
         }

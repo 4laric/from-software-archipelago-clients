@@ -53,10 +53,22 @@ pub fn run() -> bool {
         Ok(r) => r,
         Err(_) => return false,
     };
+    // clients#351: defer while the holder is mid-restream -- otherwise every lot lands in `missed`
+    // ("stale table?") and DONE latches on a pass that wrote nothing.
+    if !crate::param_guard::is_available::<eldenring::cs::ItemLotParam_map>(
+        repo,
+        "whetblade-lots repoint",
+    ) {
+        return false;
+    }
     let mut n = 0usize;
     let mut missed: Vec<u32> = Vec::new();
     for (lot, flag) in &rewrites {
-        if let Some(row) = repo.get_mut::<eldenring::cs::ItemLotParam_map>(*lot) {
+        if let Some(row) = crate::param_guard::get_mut::<eldenring::cs::ItemLotParam_map>(
+            repo,
+            *lot,
+            "whetblade-lots repoint",
+        ) {
             row.set_get_item_flag_id(*flag);
             n += 1;
         } else {

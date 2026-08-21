@@ -102,17 +102,22 @@ pub fn run() -> bool {
         Ok(r) => r,
         Err(_) => return false, // repo not up yet -- retry next tick
     };
+    // clients#351: defer while the holder is mid-restream -- this pass latches DONE, so it must
+    // never run against a half-loaded table.
+    if !crate::param_guard::is_available::<ShopLineupParam>(repo, "shop-repoint pass") {
+        return false;
+    }
 
     // Scan immutably -> plan, then apply (avoids holding a row borrow across get_mut), exactly as
     // shop_sell does.
     let mut plan: Vec<(u32, i32, u8)> = Vec::new();
     let (mut sold, mut no_preview, mut not_goods, mut already) = (0u32, 0u32, 0u32, 0u32);
     let mut check_rows = 0u32;
-    let Some(lineup_rows) = crate::param_guard::rows::<ShopLineupParam>(repo, "shop_repoint scan")
+    let Some(scan_rows) = crate::param_guard::rows::<ShopLineupParam>(repo, "shop-repoint scan")
     else {
-        return false; // holder mid-teardown -- retry next tick, same as an absent repo
+        return false;
     };
-    for (id, row) in lineup_rows {
+    for (id, row) in scan_rows {
         let f = row.event_flag_for_stock();
         if f == 0 {
             continue;
@@ -136,7 +141,9 @@ pub fn run() -> bool {
     }
     let n = plan.len();
     for (id, eid, etype) in &plan {
-        if let Some(row) = repo.get_mut::<ShopLineupParam>(*id) {
+        if let Some(row) =
+            crate::param_guard::get_mut::<ShopLineupParam>(repo, *id, "shop-repoint apply")
+        {
             row.set_equip_id(*eid);
             row.set_equip_type(*etype);
             // Same reason as shop_sell: a row-level nameMsgId override outlives the ware and the menu

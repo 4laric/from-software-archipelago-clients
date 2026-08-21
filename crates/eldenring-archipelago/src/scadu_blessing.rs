@@ -140,8 +140,9 @@ pub fn drive(level: i32) -> Option<String> {
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
         return None;
     };
-    // param file not populated yet -> retry next tick (same `?` reasoning as `player` below)
-    let cfg = crate::param_guard::get::<GameSystemCommonParam>(repo, 0, "scadu_blessing config")?;
+    // param file not populated yet -> retry next tick (same `?` reasoning as `player` below).
+    // #351: param_guard -- a mid-restream GameSystemCommonParam holder panics upstream.
+    let cfg = crate::param_guard::get::<GameSystemCommonParam>(repo, 0, "scadu_blessing")?;
     let base = cfg.base_scadu_blessing_sp_effect_id();
     if base <= 0 {
         return None; // nothing sane to index off
@@ -225,10 +226,12 @@ fn sync_clone_row(base: i32, target: i32, active_level: i32) -> bool {
         let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
             return false;
         };
+        // #351: param_guard -- a mid-restream SpEffectParam holder panics upstream; an
+        // unreadable source rung just means "try again next window" (caller treats false so).
         let Some(src) = crate::param_guard::get::<SpEffectParam>(
             repo,
             (base + target) as u32,
-            "scadu_blessing source",
+            "scadu_blessing sync",
         ) else {
             return false;
         };
@@ -236,7 +239,7 @@ fn sync_clone_row(base: i32, target: i32, active_level: i32) -> bool {
         let Some(act) = crate::param_guard::get::<SpEffectParam>(
             repo,
             (base + active_level) as u32,
-            "scadu_blessing active",
+            "scadu_blessing sync",
         ) else {
             return false;
         };
@@ -253,7 +256,12 @@ fn sync_clone_row(base: i32, target: i32, active_level: i32) -> bool {
     let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {
         return false;
     };
-    let row = repo.get_mut::<SpEffectParam>(SCADU_BLESSING as u32);
+    // #351: param_guard -- the clone-row write must not panic on a mid-restream holder.
+    let row = crate::param_guard::get_mut::<SpEffectParam>(
+        repo,
+        SCADU_BLESSING as u32,
+        "scadu_blessing sync",
+    );
     let rates = er_logic::upgrades::blessing_write_or_skip(a_target, a_active, row.is_some());
     let (Some(dst), Some((attack, cut))) = (row, rates) else {
         return false;

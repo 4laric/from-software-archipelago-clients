@@ -95,8 +95,14 @@ pub fn run() -> bool {
             Ok(r) => r,
             Err(_) => return false, // repo not up yet -- retry
         };
+        // clients#351: defer while the holder is mid-restream (else every row counts "missing").
+        if !crate::param_guard::is_available::<ShopLineupParam>(repo, "shop-stock reroll") {
+            return false;
+        }
         for (row_id, (gid, etype, price)) in roll {
-            let Some(row) = repo.get_mut::<ShopLineupParam>(row_id) else {
+            let Some(row) =
+                crate::param_guard::get_mut::<ShopLineupParam>(repo, row_id, "shop-stock reroll")
+            else {
                 missing += 1;
                 continue;
             };
