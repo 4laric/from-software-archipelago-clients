@@ -1224,6 +1224,32 @@ pub fn tick() -> Option<String> {
                 tally.area_moved_ids.render(),
                 tally.left_vanilla,
             );
+
+            // Full id-set dump (clients#235, item 2): the capped lists above answer "name one
+            // offender"; they cannot answer "which 258 were left vanilla", which is the question
+            // the census exists for. IdSample already holds the whole distinct population, so the
+            // dump is a render, not a new collection -- gated on a probe because a line of ~340
+            // ids per region is exactly what UNRUNGED_ID_CAP keeps out of the default log.
+            if shared::probes::enabled("ER_SCALING_IDS_PROBE", "scaling_ids") {
+                for (name, sample) in [
+                    ("unrunged", &tally.unrunged_ids),
+                    ("recompute-failed", &tally.recompute_failed_ids),
+                    ("left-vanilla", &tally.left_vanilla_ids),
+                    ("area-down", &tally.area_down_ids),
+                    ("area-moved", &tally.area_moved_ids),
+                    ("other-in-range", &tally.other_ids),
+                ] {
+                    // Nothing withheld, nothing to add: a `[]` line per empty sample per region
+                    // would bury the dumps that carry the answer.
+                    if sample.withheld() > 0 {
+                        log::info!(
+                            "enemy-scaling ids {name}: region {region} full set of {} distinct: {}",
+                            sample.distinct(),
+                            sample.render_full()
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -44,6 +44,7 @@ const PROBE_PAIRS: &[(&str, &str)] = &[
     ("ER_TRAP_PROBE", "traps"),
     ("ER_BOSSFIGHT_PROBE", "boss_fight"),
     ("ER_HOVER_PROBE", "hover"),
+    ("ER_SCALING_IDS_PROBE", "scaling_ids"),
 ];
 
 // ONE command registry owns dispatch recognition, the overlay hint and `!help` (#217). Adding a
