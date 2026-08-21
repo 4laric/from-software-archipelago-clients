@@ -113,6 +113,15 @@ impl<G: Game> Config<G> {
         &self.raw.probes
     }
 
+    /// Replaces the in-memory probe flags WITHOUT saving (client#166). The config watcher calls
+    /// this when the `probes` object changes ON DISK -- the disk is already right, so there is
+    /// nothing to write; this exists so a LATER `save()` (e.g. a connection change through
+    /// `update_connection_info`) serialises the live map instead of clobbering the player's edit
+    /// with the map as it was at startup.
+    pub fn set_probes(&mut self, probes: std::collections::BTreeMap<String, bool>) {
+        self.raw.probes = probes;
+    }
+
     /// Returns the Archipelago server URL defined in the config (empty if not set).
     pub fn url(&self) -> &str {
         self.raw.url.as_str()

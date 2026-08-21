@@ -37,24 +37,33 @@
 //! on, so "I set it and nothing happened" is answerable from the log the player already sends.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{RwLock, RwLockReadGuard};
 
 use log::info;
 
-/// Probe flags parsed from `apconfig.json`, installed once at startup.
+/// Probe flags parsed from `apconfig.json`. Installed at startup, and REPLACED when the file
+/// watcher sees the `probes` object change (client#166: a playtester turns a probe on mid-session
+/// by editing the line he already edits for the server url -- no restart, no overlay).
 ///
 /// A map rather than named fields because `shared` is game-agnostic: the probe names belong to the
 /// game crates, and `shared` has no business enumerating Elden Ring's diagnostics.
-static CONFIG_PROBES: OnceLock<BTreeMap<String, bool>> = OnceLock::new();
-
-/// Installs the config-file probe flags. Call once, at startup, after the config is loaded.
 ///
-/// Later calls are ignored: the flags are read on a hot path via [`enabled`], so this is a
-/// `OnceLock` rather than a lock, and a second install would mean two sources of truth for the same
-/// question.
+/// This was a `OnceLock` ("later calls are ignored") until #166, which would have made the
+/// watcher's re-install a SILENT NO-OP that tests green. It is now one map behind one lock:
+/// a single owner (the config watcher) replaces it atomically, and readers on the hot path pay a
+/// read lock -- already cheaper than the `std::env::var_os` every `enabled` call makes beside it.
+static CONFIG_PROBES: RwLock<Option<BTreeMap<String, bool>>> = RwLock::new(None);
+
+fn config_probes() -> RwLockReadGuard<'static, Option<BTreeMap<String, bool>>> {
+    CONFIG_PROBES.read().unwrap()
+}
+
+/// Installs the config-file probe flags, REPLACING whatever was there. Called at startup after
+/// the config is loaded, and again by the config watcher when the `probes` object changes on
+/// disk. One owner, one map: there is never a startup map and a live map that can disagree.
 pub fn install(probes: BTreeMap<String, bool>) {
-    let _ = CONFIG_PROBES.set(probes);
+    *CONFIG_PROBES.write().unwrap() = Some(probes);
 }
 
 /// The resolution rule, pure: environment first, then config, then off.
@@ -69,8 +78,8 @@ pub fn resolve(env_present: bool, config: Option<bool>) -> bool {
 
 /// Is this probe on? `env_var` is the legacy variable, `key` the `probes` object key.
 pub fn enabled(env_var: &str, key: &str) -> bool {
-    let config = CONFIG_PROBES
-        .get()
+    let config = config_probes()
+        .as_ref()
         .and_then(|probes| probes.get(key))
         .copied();
     resolve(std::env::var_os(env_var).is_some(), config)
@@ -101,7 +110,9 @@ pub fn enabled_by_default(env_var: &str, key: &str) -> bool {
         Err(_) => {}
     }
     CONFIG_PROBES
-        .get()
+        .read()
+        .unwrap()
+        .as_ref()
         .and_then(|probes| probes.get(key))
         .copied()
         .unwrap_or(true)
@@ -119,8 +130,8 @@ pub fn source(env_var: &str, key: &str) -> Option<String> {
     if std::env::var_os(env_var).is_some() {
         return Some(format!("env {env_var}"));
     }
-    let on = CONFIG_PROBES
-        .get()
+    let on = config_probes()
+        .as_ref()
         .and_then(|probes| probes.get(key))
         .copied()
         .unwrap_or(false);
@@ -143,6 +154,11 @@ static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 ///
 /// The latch lives HERE rather than at the call site on purpose: a caller that has to remember is
 /// a caller that will forget, and the next probe added to the list would reintroduce it.
+///
+/// RE-ARMED, not unlatched, for the live toggle (#166): a probe flipped mid-session from
+/// `apconfig.json` must announce exactly ONCE PER CHANGE -- "I turned it on and nothing happened"
+/// stays answerable -- without returning to once-per-tick. The config watcher calls
+/// [`rearm_announcement`] on an accepted change; the next `log_active` then speaks once.
 pub fn log_active(pairs: &[(&str, &str)]) {
     if ANNOUNCED.swap(true, Ordering::Relaxed) {
         return;
@@ -161,6 +177,13 @@ pub fn log_active(pairs: &[(&str, &str)]) {
             active.join(", ")
         );
     }
+}
+
+/// Let the next [`log_active`] announce again -- called by the config watcher after an ACCEPTED
+/// probe change (#166). The latch, not the call site, owns "once"; this only moves "once per
+/// process" to "once per change".
+pub fn rearm_announcement() {
+    ANNOUNCED.store(false, Ordering::Relaxed);
 }
 
 #[cfg(test)]

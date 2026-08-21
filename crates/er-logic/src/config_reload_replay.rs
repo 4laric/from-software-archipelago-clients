@@ -141,3 +141,108 @@ fn a_realistic_editing_session_reconnects_once_per_real_change() {
         "exactly one reconnect per REAL change -- no storm, no torn-read reconnect"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Live probe toggles (client#166) -- the same timeline discipline for the `probes` object
+// ---------------------------------------------------------------------------------------------
+
+use crate::config_reload::{probe_reload_action, ProbeAction, ProbeMap};
+
+fn probes(pairs: &[(&str, bool)]) -> ProbeMap {
+    pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+}
+
+/// What the client has installed, and how many times a probe set was (re)applied.
+struct ProbeSim {
+    applied: ProbeMap,
+    applies: Vec<ProbeMap>,
+}
+
+impl ProbeSim {
+    fn new(applied: ProbeMap) -> Self {
+        ProbeSim {
+            applied,
+            applies: vec![],
+        }
+    }
+
+    /// One watcher tick against the probes object currently on disk. Production folds the
+    /// applied map into the in-memory Config as part of Apply, so the client's own later
+    /// `save()` writes the SAME probes back -- which is exactly what makes the next tick a
+    /// no-op instead of a storm (the echo trap, probe edition).
+    fn tick(&mut self, on_disk: &ProbeMap) {
+        match probe_reload_action(&self.applied, on_disk) {
+            ProbeAction::Ignore => {}
+            ProbeAction::Apply(next) => {
+                self.applied = next.clone();
+                self.applies.push(next);
+            }
+        }
+    }
+}
+
+/// THE MOTIVATING CASE (#166): bobler edits one probe line mid-session, alt-tabs back, and the
+/// probe is on -- applied EXACTLY ONCE, with every later tick (including the echo of the save the
+/// apply itself caused) a no-op.
+#[test]
+fn editing_a_probe_applies_exactly_once() {
+    let mut s = ProbeSim::new(probes(&[]));
+    let on = probes(&[("trap_feel", true)]);
+
+    s.tick(&on); // the edit lands -> apply
+    s.tick(&on); // watcher ticks again (our own saved file)
+    s.tick(&on);
+    s.tick(&on);
+
+    assert_eq!(s.applies, vec![on], "one edit must produce ONE apply");
+}
+
+/// BOTH directions (#166's verification note): setting `false` on an installed probe is an apply
+/// too, or "turn it off again" would need the restart this feature exists to remove.
+#[test]
+fn turning_a_probe_back_off_applies() {
+    let mut s = ProbeSim::new(probes(&[("trap_feel", true)]));
+    let off = probes(&[("trap_feel", false)]);
+    s.tick(&off);
+    assert_eq!(s.applies, vec![off]);
+    assert_eq!(s.applied, probes(&[("trap_feel", false)]));
+}
+
+/// Deleting the whole `probes` object means "all off": an empty map is a meaningful edit, NOT a
+/// torn read (a torn write never parses, so it never reaches this predicate at all).
+#[test]
+fn deleting_the_probes_object_turns_everything_off() {
+    let mut s = ProbeSim::new(probes(&[("esd", true), ("hover", true)]));
+    s.tick(&probes(&[]));
+    assert_eq!(s.applies, vec![probes(&[])]);
+    assert!(s.applied.is_empty());
+}
+
+/// A playtester's UNKNOWN probe key (a typo, or a newer client's name) is data, and toggling it
+/// still applies -- the watcher compares maps, it does not know the probe roster. `log_active`
+/// is what makes the typo answerable, and the re-armed announcement covers this change too.
+#[test]
+fn an_unknown_key_change_still_applies() {
+    let mut s = ProbeSim::new(probes(&[]));
+    let typo = probes(&[("esd_probe", true)]); // the real key is "esd"
+    s.tick(&typo);
+    assert_eq!(s.applies, vec![typo]);
+}
+
+/// The echo trap, stated as a storm test: apply -> our save writes the same map -> the next
+/// hundred ticks must be silent. (The replay only models this correctly because Apply updates
+/// `applied`; production's twin is folding the map into the in-memory Config before any save.)
+#[test]
+fn our_own_save_after_an_apply_echoes_to_nothing() {
+    let mut s = ProbeSim::new(probes(&[]));
+    let on = probes(&[("esd", true)]);
+    s.tick(&on);
+    for _ in 0..100 {
+        s.tick(&on); // what our own save() wrote back
+    }
+    assert_eq!(
+        s.applies.len(),
+        1,
+        "the echo of our own save must not re-apply"
+    );
+}
