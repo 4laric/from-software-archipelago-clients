@@ -51,3 +51,32 @@ pub fn reload_action(applied: &ConnInfo, on_disk: &ConnInfo) -> ReloadAction {
     }
     ReloadAction::Reconnect(on_disk.clone())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Live probe toggles (client#166) -- the SAME watcher, a different key family
+// ---------------------------------------------------------------------------------------------
+
+/// The `probes` object of apconfig.json: probe name -> on/off. Kept as the plain map because
+/// `shared` is game-agnostic and does not enumerate a game's probe names.
+pub type ProbeMap = std::collections::BTreeMap<String, bool>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProbeAction {
+    /// Nothing to do -- unchanged, INCLUDING the echo of our own `save()` (which serialises the
+    /// probes map too: same storm trap as the connection half, same remedy).
+    Ignore,
+    /// The probes object on disk differs from what is installed: install it, re-arm the
+    /// active-probe announcement (so it says so ONCE PER CHANGE, not once per process), and fold
+    /// the map into the in-memory config so a later connection save cannot clobber the edit.
+    Apply(ProbeMap),
+}
+
+/// The probe-toggle twin of [`reload_action`]. No completeness gate: unlike a connection, an
+/// EMPTY probes object is a meaningful edit ("turn them all off"), and a torn write never reaches
+/// here at all -- `read_on_disk` rejects unparseable JSON before either predicate runs.
+pub fn probe_reload_action(applied: &ProbeMap, on_disk: &ProbeMap) -> ProbeAction {
+    if on_disk == applied {
+        return ProbeAction::Ignore;
+    }
+    ProbeAction::Apply(on_disk.clone())
+}

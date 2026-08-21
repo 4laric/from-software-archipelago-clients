@@ -199,6 +199,20 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         )
     }
 
+    /// The probes map as currently configured -- lets the ER config watcher seed its applied-probes
+    /// baseline with what startup actually installed (client#166 live probe toggles).
+    pub fn config_probes_snapshot(&self) -> std::collections::BTreeMap<String, bool> {
+        self.config.probes().clone()
+    }
+
+    /// Folds a watcher-accepted probes map into the in-memory config (client#166). The edit came
+    /// FROM the disk, so there is nothing to save here; this keeps a later `save()` (a connection
+    /// change) from clobbering the player's live edit with the startup map. See
+    /// [`Config::set_probes`](crate::config::Config::set_probes).
+    pub fn set_config_probes(&mut self, probes: std::collections::BTreeMap<String, bool>) {
+        self.config.set_probes(probes);
+    }
+
     /// Also used by the ER config hot-reload watcher (eldenring-archipelago::config_watch), so a
     /// tester can change server/slot by editing apconfig.json instead of fighting the game for input
     /// (ER has no InputBlocker, so the overlay cannot take focus cleanly).

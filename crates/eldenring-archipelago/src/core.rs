@@ -31,6 +31,21 @@ const SURFACE_ORANGE: [f32; 4] = [0.9882, 0.6863, 0.2431, 1.0];
 /// Dim gray for locked-region headers in the tracker window (mirrors imgui's TextDisabled).
 const LOCKED_GRAY: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
 
+/// (env var, apconfig `probes` key) for every probe whose activity we announce. ONE list feeds
+/// both the boot announcement and the config hot-reload's live re-announcement (client#166), so a
+/// probe added to one can never silently drift out of the other. Two probes stay out on purpose,
+/// both self-announcing: `ER_TRAP_FEEL_PROBE` (trap_feel_probe::announce_once also prints its key
+/// map) and `ER_ABILITY_PROBE` (ability_probe::install logs its own ACTIVE banner + protocol).
+const PROBE_PAIRS: &[(&str, &str)] = &[
+    ("ER_ESD_PROBE", "esd"),
+    ("ER_DOWNSTATE_PROBE", "downstate"),
+    ("ER_DOWNSTATE_PROBE_ARM", "downstate_arm"),
+    ("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player"),
+    ("ER_TRAP_PROBE", "traps"),
+    ("ER_BOSSFIGHT_PROBE", "boss_fight"),
+    ("ER_HOVER_PROBE", "hover"),
+];
+
 // ONE command registry owns dispatch recognition, the overlay hint and `!help` (#217). Adding a
 // row updates both visible lists; the exhaustive `match ConsoleCommand` in handle_command then
 // refuses to compile until the new command has a handler.
@@ -876,17 +891,7 @@ impl shared::Core for Core {
         // Which diagnostics are on, stated once. A probe turned on from `apconfig.json` is
         // invisible to us otherwise, so "I set it and nothing happened" would cost a conversation
         // instead of a grep -- and a silently-typo'd key would look exactly like a broken probe.
-        shared::probes::log_active(&[
-            ("ER_ESD_PROBE", "esd"),
-            ("ER_DOWNSTATE_PROBE", "downstate"),
-            ("ER_DOWNSTATE_PROBE_ARM", "downstate_arm"),
-            ("ER_DOWNSTATE_PROBE_PLAYER", "downstate_player"),
-            ("ER_TRAP_PROBE", "traps"),
-            ("ER_BOSSFIGHT_PROBE", "boss_fight"),
-            ("ER_HOVER_PROBE", "hover"),
-            // ER_TRAP_FEEL_PROBE is absent for the same reason; trap_feel_probe::announce_once
-            // says that one, and also prints its key map.
-        ]);
+        shared::probes::log_active(PROBE_PAIRS);
 
         // ESD talk-event hook (esd_probe.rs) -- the shop-open seam SHOP AUTO-HINTS ride on
         // (er-archipelago#455, phase 2). Installed unconditionally now that phase 1 witnessed
@@ -1755,6 +1760,9 @@ impl shared::Core for Core {
                 {
                     let cfg = self.base().config_snapshot();
                     crate::config_watch::prime(&cfg.0, &cfg.1, cfg.2);
+                    // Same seeding for the probe half: without it the first tick would "apply"
+                    // the boot file's probes object and re-announce what boot already said.
+                    crate::config_watch::prime_probes(self.base().config_probes_snapshot());
                 }
 
                 // THE PROGRESSION SURFACE = what the tracker stars. Computed HERE, inside the
@@ -4379,12 +4387,27 @@ impl shared::Core for Core {
             // strand the player (SELF-CALIBRATING field overwrite; see fast_travel.rs). Game-thread.
             crate::fast_travel::tick();
 
-            // Config hot-reload: a tester changes server/slot by editing apconfig.json and alt-tabbing
-            // back, instead of fighting the game for input in the overlay (ER has no InputBlocker, so
-            // clicking closes the ER menu and Escape closes the client's window). The decision is
-            // er_logic::config_reload::reload_action -- host-tested: one reconnect per REAL change, no
-            // storm from our own save, and a half-written file never drops a live session.
-            if let Some(next) = crate::config_watch::poll()
+            // Config hot-reload: a tester changes server/slot -- or toggles a probe LIVE
+            // (client#166) -- by editing apconfig.json and alt-tabbing back, instead of fighting
+            // the game for input in the overlay (ER has no InputBlocker, so clicking closes the ER
+            // menu and Escape closes the client's window). The decisions are er_logic::config_reload's
+            // two predicates -- host-tested: one apply per REAL change, no storm from our own save,
+            // and a half-written file never drops a live session.
+            let outcome = crate::config_watch::poll();
+            // Probes BEFORE the reconnect: update_connection_info SAVES the file, and the in-memory
+            // config must already hold the player's probe edit when it does, or the save clobbers
+            // that edit with the startup map (which the watcher would then see as a NEW change and
+            // apply back -- a two-state storm).
+            if let Some(map) = outcome.probes {
+                // set_config_probes: fold the edit into the in-memory config (no save -- the edit
+                // came FROM disk). install: the live gate every probe reads. rearm + log_active:
+                // the announcement is once-per-CHANGE, not once-per-process.
+                self.base_mut().set_config_probes(map.clone());
+                shared::probes::install(map);
+                shared::probes::rearm_announcement();
+                shared::probes::log_active(PROBE_PAIRS);
+            }
+            if let Some(next) = outcome.reconnect
                 && let Err(e) = self.base_mut().update_connection_info(
                     &next.url,
                     &next.slot,
