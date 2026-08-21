@@ -4882,10 +4882,13 @@ impl Core {
         // Both notices are gated on there BEING a lock to spend on. A seed with every region open
         // has nothing to advertise, and saying so anyway is noise.
         let open = self.open_coarse_regions();
-        let any_locked = self
-            .coarse_lock_items
-            .keys()
-            .any(|r| !r.is_empty() && !open.contains(r));
+        // The withheld GOAL lock is granted by the gate, never found -- it must not count as "a
+        // lock left to hint" (2026-08-21, 4laric: the affordability nudge fired after the last
+        // fill-placed lock arrived, with only Ashen Capital -- unhintable by design -- left).
+        let goal_region = crate::region::goal_region_name();
+        let any_locked = self.coarse_lock_items.keys().any(|r| {
+            !r.is_empty() && !open.contains(r) && goal_region.as_deref() != Some(r.as_str())
+        });
         if !any_locked {
             return;
         }
@@ -5173,7 +5176,16 @@ impl Core {
         hinted_locs.extend(self.lock_hints.bought().iter().copied());
         let ledger_ready = self.lock_hints.is_ready();
         let purchases_n = self.lock_hints.purchases();
-        let lock_item_of: HashMap<String, String> = self.coarse_lock_items.clone();
+        // The withheld goal lock leaves the frontier BEFORE the picker sees it: it is granted by
+        // the goal gate, never placed, so "next lock" must never name it. Left in, the picker
+        // scouted it, found nothing local, and rendered "next lock is in another world (Ashen
+        // Capital) -- use !hint" on a SOLO seed -- a hint the server could never answer
+        // (2026-08-21, 4laric's live test).
+        let goal_region_hint = crate::region::goal_region_name();
+        let mut lock_item_of: HashMap<String, String> = self.coarse_lock_items.clone();
+        if let Some(goal) = &goal_region_hint {
+            lock_item_of.remove(goal);
+        }
         // location id -> coarse region. NOT keyed by region name: `coarse_table` is
         // HashMap<u64, RegionId>. tracker.rs:117 states every location in a tracker region shares
         // one coarse region, so any of the region's location ids resolves it.
@@ -5260,6 +5272,10 @@ impl Core {
         if let Some((have, price)) = hud {
             measured.push((format!("lock hints: {have}/{price} surface checks"), true));
         }
+        let goal_status = crate::region::goal_gate_status();
+        if let Some(gs) = &goal_status {
+            measured.push((format!("goal: {gs}"), false));
+        }
         if let Some(line) = &scaling_here {
             measured.push((line.clone(), false));
         }
@@ -5324,6 +5340,14 @@ impl Core {
                 // without a locked region happening to be on screen.
                 if let Some((have, price)) = hud {
                     ui.text(format!("lock hints: {have}/{price} surface checks"));
+                    // The goal ledger, ON SCREEN (2026-08-21): the gate's held/outstanding
+                    // accounting lived only in the log, so a player holding every lock read
+                    // "no Ashen yet" as a defect while the (correct) answer -- Great Runes
+                    // (1/2) -- was never shown. Rendered beside the hint economy because this
+                    // is the same question: "what am I still looking for".
+                    if let Some(gs) = &goal_status {
+                        ui.text(format!("goal: {gs}"));
+                    }
                     if ui.is_item_hovered() {
                         ui.tooltip_text(
                             "You earn 1 per progression-surface check -- the * rows below.\nSpend them to publish a real Archipelago hint for a region lock.",
