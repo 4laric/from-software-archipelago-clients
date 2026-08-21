@@ -191,7 +191,8 @@ impl RescaleWatch {
     }
 
     /// Writes that have been waiting longer than [`STALE_VERDICT_MS`] -- the population that is
-    /// stale INDEFINITELY rather than for a tick, which is the distinction #188 asks for.
+    /// stale INDEFINITELY rather than for a tick, which is the distinction #188 asks for. Surfaced
+    /// in scaling.rs's per-region census summary as the session-wide hp-pending line (client#251).
     pub fn long_stale(&self, now_ms: u64) -> Vec<i32> {
         self.pending
             .iter()
