@@ -280,6 +280,9 @@ pub struct Core {
     check_report_pending: HashSet<i64>,
     /// Suppress a per-frame wall while the socket is unavailable; a successful retry re-arms it.
     check_report_error_logged: bool,
+    /// The multiworld-pickup cue's seen-set + cooldown (client#336). Decides WHEN a staged batch
+    /// sounds; seed-scoped because check ids are (`reset_for_new_seed` clears it).
+    collect_cue: er_logic::collect_cue::CollectCue,
     /// On-screen notices for grants the GAME cannot announce (see `er_logic::toast`). A client-
     /// APPLIED grant -- flask rungs today -- changes state without an item entering the bag, so the
     /// native ticker never fires and the player cannot tell delivery from breakage.
@@ -699,6 +702,7 @@ impl shared::Core for Core {
             sweep_flag_pending: Vec::new(),
             check_report_pending: HashSet::new(),
             check_report_error_logged: false,
+            collect_cue: er_logic::collect_cue::CollectCue::default(),
             toasts: er_logic::toast::Deck::new(4, 6000),
             toast_clock: std::time::Instant::now(),
             version_warn: None,
@@ -4481,6 +4485,30 @@ impl Core {
     /// one-tick vectors before `mark_checked`; a death/load edge in that window left the check
     /// waiting for some unrelated later pickup to rebuild the vector (world#720).
     fn stage_check_reports(&mut self, checks: impl IntoIterator<Item = i64>) {
+        let checks: Vec<i64> = checks.into_iter().collect();
+        // client#336: the pickup cue fires at STAGE time -- "accepted for sending", not "sent": a
+        // socket outage must not silence a pickup the player just made, and the flush's retry
+        // path can then never re-cue (the seen-set in er_logic::collect_cue is the belt to the
+        // stage sites' own dedup suspenders). One cue per sweep batch; cooldown-silenced pickups
+        // never replay stale. The sound itself is platform glue: crate::sound_cue.
+        if !checks.is_empty() && self.base().sound_cue_enabled() {
+            let now = self.toast_clock.elapsed().as_millis() as u64;
+            match self.collect_cue.cue_action(&checks, now) {
+                er_logic::collect_cue::CueAction::Play {
+                    suppressed_since_last,
+                } => {
+                    crate::sound_cue::play();
+                    if suppressed_since_last > 0 {
+                        log::info!(
+                            "collect-cue: {suppressed_since_last} pickup(s) silenced by the \
+                             {}ms cooldown since the last cue",
+                            er_logic::collect_cue::CUE_COOLDOWN_MS
+                        );
+                    }
+                }
+                er_logic::collect_cue::CueAction::Silent => {}
+            }
+        }
         self.check_report_pending.extend(checks);
     }
 
@@ -4723,6 +4751,9 @@ impl Core {
         self.sweep_flag_pending.clear();
         self.check_report_pending.clear();
         self.check_report_error_logged = false;
+        // The cue's seen-set is keyed by check id, and check ids are the OLD seed's: carrying it
+        // across would silence the new seed's pickups whose ids happen to collide.
+        self.collect_cue = Default::default();
         self.flask_seen = None;
         self.region_toast_primed = false;
         self.received_through = 0;

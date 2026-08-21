@@ -51,6 +51,9 @@ features = [
     "Win32_System_ProcessStatus",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    # Media_Audio: the multiworld-pickup audio cue (client#336) — PlaySoundW + SND_* flags live in
+    # Win32_Media_Audio (the bare Win32_Media feature does not include the Audio module).
+    "Win32_Media_Audio",
     "Win32_UI_WindowsAndMessaging",
 ]
 

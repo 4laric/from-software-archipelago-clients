@@ -213,6 +213,13 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.config.set_probes(probes);
     }
 
+    /// Whether the multiworld-pickup audio cue sounds (client#336). Read per batch rather than
+    /// latched on Core, so a future live-reload of this key (the config watcher already does it
+    /// for `probes`) needs no callsite change. Today the value is fixed at config load.
+    pub fn sound_cue_enabled(&self) -> bool {
+        self.config.sound_cue()
+    }
+
     /// Also used by the ER config hot-reload watcher (eldenring-archipelago::config_watch), so a
     /// tester can change server/slot by editing apconfig.json instead of fighting the game for input
     /// (ER has no InputBlocker, so the overlay cannot take focus cleanly).

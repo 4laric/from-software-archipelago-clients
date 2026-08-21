@@ -28,6 +28,11 @@ struct RawConfig {
     seed: String,
     client_version: Option<String>,
     password: Option<String>,
+    /// The multiworld-pickup audio cue (client#336). Three-state on purpose: absent means the
+    /// DEFAULT (on), so an existing config does not gain a key on its next save and a client older
+    /// than the feature simply never wrote one. Only an explicit `false` silences the cue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sound_cue: Option<bool>,
 }
 
 /// Parses `apconfig.json` text into a [RawConfig]. Empty or whitespace-only text is treated as an
@@ -164,6 +169,13 @@ impl<G: Game> Config<G> {
     pub fn password(&self) -> Option<&str> {
         self.raw.password.as_deref()
     }
+
+    /// Whether the multiworld-pickup audio cue sounds (client#336). DEFAULT ON: the issue asks for
+    /// the cue, so a config that never mentions it gets the new behaviour; `"sound_cue": false`
+    /// opts out.
+    pub fn sound_cue(&self) -> bool {
+        self.raw.sound_cue.unwrap_or(true)
+    }
 }
 
 /// Whether `url` is worth opening a socket to.
@@ -239,6 +251,21 @@ mod tests {
     fn an_empty_probe_map_is_not_written_out() {
         let raw = parse_config(r#"{"url":"u"}"#).expect("parses");
         assert!(!serialize_config(&raw).unwrap().contains("probes"));
+    }
+
+    /// client#336: the cue defaults ON (a config that never mentions it gets the new behaviour),
+    /// an explicit false silences it, and a round-trip neither invents the key nor loses an
+    /// explicit setting (the same save-clobber hazard as `a_probe_flag_survives_a_save_round_trip`).
+    #[test]
+    fn the_sound_cue_defaults_on_and_round_trips() {
+        let raw = parse_config(r#"{"url":"u"}"#).expect("parses");
+        assert!(raw.sound_cue.is_none());
+        assert!(!serialize_config(&raw).unwrap().contains("sound_cue"));
+
+        let off = parse_config(r#"{"url":"u","sound_cue":false}"#).expect("parses");
+        let reread = parse_config(&serialize_config(&off).unwrap()).expect("re-parses");
+        assert_eq!(reread.sound_cue, Some(false));
+        assert_eq!(reread, off);
     }
 
     /// THE MOTIVATING CASE (CONTRIBUTING rule 11): Alaric, 2026-08-12 -- "the default apconfig,

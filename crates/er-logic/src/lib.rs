@@ -28,6 +28,7 @@ pub mod capital_replay;
 pub mod check_neutralise;
 pub mod check_report;
 pub mod client_features;
+pub mod collect_cue;
 pub mod config_reload;
 pub mod config_reload_replay;
 pub mod death_guard;
