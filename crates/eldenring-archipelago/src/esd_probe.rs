@@ -285,6 +285,10 @@ unsafe extern "C" fn esd_invoke_detour(this: *mut c_void, event: *const EzStateE
                 // in changes nothing about THIS shelf (it adds a menu entry at the Twin Maidens),
                 // so the order is not load-bearing -- but a feature added later goes second.
                 crate::merchant_bells::on_shop_open(lo, hi);
+                // #937 hover probe: start the goods-lookup cursor trace. Cheap gate inside (the
+                // probe's ACTIVE atomic); placed after the features for the same reason they are
+                // ordered -- a diagnostic added later goes last.
+                crate::hover_probe::on_shop_open(lo, hi);
             }
         }
 
