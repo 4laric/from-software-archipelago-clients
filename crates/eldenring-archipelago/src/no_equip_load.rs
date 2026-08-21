@@ -187,6 +187,13 @@ pub fn tick() {
     }
     let multiplier = mode.multiplier();
 
+    // Did the row get (re)patched on THIS tick? Drives the cycle below: after a warp the row is
+    // vanilla again but the player's effect ENTRY survived, and a surviving entry only re-reads
+    // its row on the effect's own internal update interval -- the measured ~1 second of fat
+    // roll after every grace warp (4laric, 2026-08-21). Cycling the entry right after the
+    // repatch makes the fresh row take effect NOW.
+    let mut patched_this_tick = false;
+
     // One-time param edit: equipWeightChangeRate on our row (the mode is on, guaranteed here).
     if !PARAM_PATCHED.load(Ordering::Relaxed) {
         // SAFETY: FD4 singleton; only mutated on the single-threaded FrameBegin tick.
@@ -202,6 +209,7 @@ pub fn tick() {
                 // that ambiguity is the whole reason this took two reports to find.
                 row.set_equip_weight_change_rate(multiplier);
                 PARAM_PATCHED.store(true, Ordering::Relaxed);
+                patched_this_tick = true;
                 log::info!(
                     "no_equip_load: SpEffect {SP_EFFECT_ID} equipWeightChangeRate -> {multiplier} \
                      for mode {} (was 1; allItemWeightChangeRate is NOT written -- it is a \
@@ -231,6 +239,29 @@ pub fn tick() {
         .special_effect
         .entries()
         .any(|e| e.param_id == SP_EFFECT_ID);
+    // THE WARP GAP (4laric, 2026-08-21): a grace warp re-streams the params (row back to
+    // vanilla) while the player's effect ENTRY survives the load -- so `resident` holds, the
+    // repatch lands a tick later, and the surviving entry only notices on its own update
+    // interval: ~1s of fat roll after every warp. When the repatch and a resident entry meet
+    // on the same tick, CYCLE the entry so it re-reads the patched row immediately. Same two
+    // calls the apply/strip paths already make, behind the same death guard -- no new risk
+    // class ("not worth risking a crash" was the ruling; this adds no surface the CTD history
+    // lives in). If entries turn out NOT to survive some load shape, `resident` is false there
+    // and this branch simply never runs -- the fix degrades to the old behaviour, never worse.
+    if resident && patched_this_tick {
+        chr.remove_speffect(SP_EFFECT_ID);
+        // Sample between remove and apply: post-remove IS the pre-effect state the readback
+        // wants (the reading may lag the engine's per-frame recompute by one frame; it is
+        // diagnostics, not behaviour).
+        if let Some(load) = read_max_equip_load() {
+            LOAD_BEFORE_BITS.store(load.to_bits(), Ordering::Relaxed);
+        }
+        chr.apply_speffect(SP_EFFECT_ID, false);
+        log::info!(
+            "no_equip_load: row repatched after a load with the effect still resident -- cycled              the entry so the multiplier applies now instead of on the effect's next internal              update (the post-warp fat-roll gap)"
+        );
+        return; // VERIFIED re-runs next tick against the fresh sample
+    }
     if !resident {
         // Sample BEFORE applying -- once the effect is on, the pre-effect number is unrecoverable.
         if let Some(load) = read_max_equip_load() {
