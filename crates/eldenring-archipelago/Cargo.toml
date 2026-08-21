@@ -24,6 +24,10 @@ crate-type = ["cdylib"]
 name = "eldenring_archipelago"
 
 [dependencies]
+# update_check's HTTPS GET for /er/latest.json. SAME versions archipelago-rs already resolves
+# (its rustls feature), so this adds links, not a second copy in the tree.
+rustls = "0.23.36"
+webpki-roots = "1.0.6"
 anyhow.workspace = true
 archipelago_rs.workspace = true        # ensure the workspace is on 3.0.1 (try-ap-3x) so ER seeds connect
 # Track the SAME ref as `eldenring` below (NOT `.workspace`, which is the 0.13 default-branch source
