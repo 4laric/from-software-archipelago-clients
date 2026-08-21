@@ -97,7 +97,11 @@ pub fn dress_placeholder() -> bool {
         Ok(r) => r,
         Err(_) => return false,
     };
-    let tele_icon = match repo.get::<EquipParamGoods>(TELESCOPE_GOOD_ID) {
+    let tele_icon = match crate::param_guard::get::<EquipParamGoods>(
+        repo,
+        TELESCOPE_GOOD_ID,
+        "check_lots telescope icon",
+    ) {
         Some(row) => row.icon_id(),
         None => return false, // telescope row not up yet -- retry next tick
     };

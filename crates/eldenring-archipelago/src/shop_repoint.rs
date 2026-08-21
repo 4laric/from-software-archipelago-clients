@@ -108,7 +108,11 @@ pub fn run() -> bool {
     let mut plan: Vec<(u32, i32, u8)> = Vec::new();
     let (mut sold, mut no_preview, mut not_goods, mut already) = (0u32, 0u32, 0u32, 0u32);
     let mut check_rows = 0u32;
-    for (id, row) in repo.rows::<ShopLineupParam>() {
+    let Some(lineup_rows) = crate::param_guard::rows::<ShopLineupParam>(repo, "shop_repoint scan")
+    else {
+        return false; // holder mid-teardown -- retry next tick, same as an absent repo
+    };
+    for (id, row) in lineup_rows {
         let f = row.event_flag_for_stock();
         if f == 0 {
             continue;

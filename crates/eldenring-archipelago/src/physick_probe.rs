@@ -320,7 +320,9 @@ pub fn tick() {
         let Some(row) = er_logic::physick::goods_row(full as i32) else {
             continue;
         };
-        let Some(param) = repo.get::<EquipParamGoods>(row) else {
+        let Some(param) =
+            crate::param_guard::get::<EquipParamGoods>(repo, row, "physick_probe goods read")
+        else {
             continue;
         };
         if !er_logic::physick::is_tear(param.goods_type(), param.sort_id()) {

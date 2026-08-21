@@ -141,7 +141,7 @@ pub fn drive(level: i32) -> Option<String> {
         return None;
     };
     // param file not populated yet -> retry next tick (same `?` reasoning as `player` below)
-    let cfg = repo.get::<GameSystemCommonParam>(0)?;
+    let cfg = crate::param_guard::get::<GameSystemCommonParam>(repo, 0, "scadu_blessing config")?;
     let base = cfg.base_scadu_blessing_sp_effect_id();
     if base <= 0 {
         return None; // nothing sane to index off
@@ -225,11 +225,19 @@ fn sync_clone_row(base: i32, target: i32, active_level: i32) -> bool {
         let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
             return false;
         };
-        let Some(src) = repo.get::<SpEffectParam>((base + target) as u32) else {
+        let Some(src) = crate::param_guard::get::<SpEffectParam>(
+            repo,
+            (base + target) as u32,
+            "scadu_blessing source",
+        ) else {
             return false;
         };
         let a_target = src.atk_enemy_dmg_correct_rate_physics();
-        let Some(act) = repo.get::<SpEffectParam>((base + active_level) as u32) else {
+        let Some(act) = crate::param_guard::get::<SpEffectParam>(
+            repo,
+            (base + active_level) as u32,
+            "scadu_blessing active",
+        ) else {
             return false;
         };
         (a_target, act.atk_enemy_dmg_correct_rate_physics())

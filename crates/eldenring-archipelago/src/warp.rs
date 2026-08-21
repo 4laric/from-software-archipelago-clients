@@ -54,7 +54,7 @@ pub(crate) fn grace_entity_for_unlock_flag(unlock_flag: u32) -> Option<u32> {
     // FrameBegin). A pre-world/not-ready repository returns Err and therefore None.
     let repo = unsafe { SoloParamRepository::instance() }.ok()?;
     er_logic::grace::entity_for_unlock_flag(
-        repo.rows::<BonfireWarpParam>()
+        crate::param_guard::rows::<BonfireWarpParam>(repo, "warp grace table")?
             .map(|(_, row)| (row.eventflag_id(), row.bonfire_entity_id())),
         unlock_flag,
     )
@@ -69,9 +69,12 @@ pub(crate) fn grace_warp_target_resolves(target: u32) -> bool {
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
         return false;
     };
+    let Some(rows) = crate::param_guard::rows::<BonfireWarpParam>(repo, "warp target resolve")
+    else {
+        return false; // holder mid-teardown: decline the state write, same as a not-ready repo
+    };
     er_logic::grace::warp_target_resolves(
-        repo.rows::<BonfireWarpParam>()
-            .map(|(_, row)| row.bonfire_entity_id()),
+        rows.map(|(_, row)| row.bonfire_entity_id()),
         target,
         GRACE_TO_WARP_ARG_DELTA,
     )
