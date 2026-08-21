@@ -36,16 +36,29 @@
 //! no cap, no co-op blindness, no count-watching emevd — only flag reads, which a band audit covers),
 //! and already first-class in [`GameIo`] (`get_flag`/`set_flag`).
 //!
-//! # The flag band (PLACEHOLDER — pending a flag-space audit + a Windows verify)
+//! # The flag band (PLACEHOLDER — audit DONE 2026-08-21; pending only the Windows verify)
 //!
 //! [`FlagBand::PLACEHOLDER`] = `75000..75120`, inside the real, save-persisted legacy-bonfire flag
 //! group `[71000, 76000)` (bonfire-unlock flags ARE core save data). Vanilla legacy graces occupy
 //! `71000..=74351`; `75000..75999` is the unused tail, and it is disjoint from every flag this project
 //! authors or reads (grace warp-unlock, region-open/lock, check flags, map-reveal). The band constant
-//! is the ONLY thing that changes once (a) a flag-space audit confirms no non-grace vanilla EMEVD
-//! touches it and (b) a set -> quit-to-menu -> reload -> read Windows test confirms it persists. An
+//! is the ONLY thing that changes once (b) below lands. An
 //! INVENTED (group-less) flag id would silently no-op (`er-event-flag-validity`), which is exactly why
 //! the band must live inside an allocated, save-persisted group like `[71000, 76000)`.
+//!
+//! (a) **Flag-space audit — DONE, clean** (clients#338, 2026-08-21; reproducible via
+//! `tools/audit_marker_flag_band.py` against an `elden_ring_artifacts/` tree): 589 EMEVD scripts
+//! (incl. `common`/`common_func`), all 14 `*EventFlag*` verb shapes classified, 993 range/batch ops
+//! span-checked — ZERO script touches of `75000..=75119`. 203 ESD talk scripts — zero band literals.
+//! The only same-numeric-range literals anywhere are param cells, which cannot write event flags:
+//! AtkParam_Pc row ids `75000..75106` (referenced by the `refId1..4` of Magic rows 7500/7510) and a
+//! GameAreaParam `bonusSoul = 75000`. Still reasoning, not measurement, and named as such: the
+//! engine-hardcoded NG+ flag reset (expressed in no script) and the binary `.dcx` flag-allocation
+//! lists. An NG+ clear of the band degrades to marker-ABSENT (bounded replay), never a refusal.
+//!
+//! (b) **Windows persist verify — STILL OWED.** One set -> quit-to-menu -> reload -> read on a real
+//! save. If the band does not survive the reload, the marker always reads ABSENT and the guard is a
+//! no-op that looks armed — a quiet failure, not a lockout.
 //!
 //! # Layout (contiguous from `base`)
 //!
@@ -89,8 +102,9 @@ pub struct FlagBand {
 }
 
 impl FlagBand {
-    /// PLACEHOLDER band — `75000..75120`. Real/save-persisted (inside `[71000, 76000)`), vanilla-free,
-    /// disjoint from our own flag usage. PENDING flag-space audit + Windows persist verify.
+    /// PLACEHOLDER band — `75000..75120`. Real/save-persisted (inside `[71000, 76000)`), audited
+    /// vanilla-script-free on 2026-08-21 (see the module doc), disjoint from our own flag usage.
+    /// PENDING only the Windows persist verify.
     pub const PLACEHOLDER: FlagBand = FlagBand { base: 75_000 };
     /// Flags actually used by the layout.
     pub const WIDTH: u32 = 98;
