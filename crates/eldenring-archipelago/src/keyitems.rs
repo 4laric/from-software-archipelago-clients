@@ -42,13 +42,20 @@ static SEED_GREAT_RUNE_FLAGS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 /// entries below therefore come from er_logic::whetblade::WHETBLADES ([`entries`]), the same table
 /// that drives the repoint, so the two mechanisms cannot drift apart.
 ///
-/// Bell/Knife are DIFFERENT: 60110/60130 are set by ESD/EMEVD scripts and read directly by vanilla
-/// events -- there is no lot getItemFlagId to repoint -- so they must stay even though they are
-/// also check flags (locs 7770012/7770014); that residual false-collect is a known, separate issue
-/// (needs flagpoll-side suppression, not a lot rewrite).
+/// Bell/Knife/Kit are DIFFERENT: 60110/60130/60120 are set by ESD/EMEVD scripts and read directly
+/// by vanilla events -- there is no lot getItemFlagId to repoint -- so they must stay even though
+/// they are also check flags (locs 7770012/7770014/7770013); that residual false-collect is a
+/// known, separate issue (needs flagpoll-side suppression, not a lot rewrite).
+///
+/// The Kit's coupling is the vanilla grant itself: the extracted common event gives it as
+/// `DirectlyGivePlayerItem(ItemType.Goods, 8500, 60120, 1)`, and the Crafting menu reads 60120, not
+/// inventory -- a pool-granted kit without the flag leaves crafting disabled (client#335, playtest
+/// 2026-08-20: "found it ... although i cant use it even when out of combat"; workaround was
+/// `!setflag 60120 1`).
 const COMPANION_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Spirit Calling Bell", &[60110]),
     ("Whetstone Knife", &[60130]),
+    ("Crafting Kit", &[60120]),
 ];
 
 /// Vanilla key items whose progression gate reads an obtained event flag, not inventory -- plus the
@@ -371,5 +378,28 @@ mod tests {
     fn bell_and_knife_keep_their_vanilla_read_flags() {
         assert_eq!(acquire_flags("Spirit Calling Bell"), vec![60110]);
         assert_eq!(acquire_flags("Whetstone Knife"), vec![60130]);
+    }
+
+    /// The motivating case (rule 11), client#335: a pool-received Crafting Kit must set 60120 --
+    /// the vanilla grant is `DirectlyGivePlayerItem(Goods, 8500, 60120, 1)` and the Crafting menu
+    /// reads the FLAG, so a kit without it leaves crafting disabled out of combat. Same class as
+    /// Bell/Knife: EMEVD-set, vanilla-read, and a check flag (loc 7770013) with the same known
+    /// residual false-collect.
+    #[test]
+    fn crafting_kit_receive_sets_60120() {
+        assert_eq!(acquire_flags("Crafting Kit"), vec![60120]);
+    }
+
+    /// Acceptance (client#335): no duplicate check or item grant. 60120 keys TWO shop rows
+    /// (Kalé 100501, Twin Maiden Husks 101879), so once the client can set it, those checks must
+    /// be echo-dedup EXEMPT -- the exemption set is built from `all_acquire_flags()`, and this
+    /// pins that 60120 flows into it (else a native purchase's AP echo can be eaten, the
+    /// 2026-07-24 start-grant collision shape).
+    #[test]
+    fn crafting_kit_flag_is_echo_dedup_exempt_via_all_acquire_flags() {
+        assert!(
+            all_acquire_flags().any(|f| f == 60120),
+            "60120 must reach the shop_sell exemption set built from all_acquire_flags()"
+        );
     }
 }
