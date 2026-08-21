@@ -57,6 +57,13 @@ impl BloodborneBackend for Backend {
             Self::Mock(backend) => backend.equip_item(request),
         }
     }
+
+    fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
+        match self {
+            Self::Live(backend) => backend.withdraw_unwitnessed_grant(tag),
+            Self::Mock(backend) => backend.withdraw_unwitnessed_grant(tag),
+        }
+    }
 }
 
 struct Arguments {
@@ -245,14 +252,28 @@ fn main() -> Result<()> {
                 location_mode
             );
             goal_location = seed_config.goal_location;
-            runtime = Some(ClientLoop::new(
+            let mut new_runtime = ClientLoop::new(
                 backend.take().context("backend was already initialized")?,
                 seed_config,
                 ledger.take().context("ledger was already initialized")?,
                 args.ledger.clone(),
                 client.seed_name(),
                 args.slot.clone(),
-            ));
+            );
+            // clients#296: before any polling, withdraw a grant command left
+            // over by a previous process. It was published under a context this
+            // process has not witnessed, and the harness would execute it
+            // against whatever save is loaded now. The ledger keeps the plan;
+            // the first validated poll re-publishes.
+            match new_runtime.reconcile_pending_command() {
+                Ok(true) => eprintln!(
+                    "Withdrew an unwitnessed grant command left over from a previous session; \
+                     the durable plan re-publishes it once the save context validates."
+                ),
+                Ok(false) => {}
+                Err(error) => eprintln!("Pending-command reconciliation failed: {error:#}"),
+            }
+            runtime = Some(new_runtime);
         }
 
         if let (Some(runtime), Some(client)) = (runtime.as_mut(), connection.client_mut()) {
