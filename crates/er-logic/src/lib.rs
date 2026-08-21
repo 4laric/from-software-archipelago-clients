@@ -81,6 +81,7 @@ pub mod region_locks;
 pub mod rescale_watch;
 pub mod rune_log;
 pub mod safe_speffect_rows;
+pub mod save_backup;
 pub mod save_state;
 pub mod scadu_blessing_replay;
 pub mod scaling;

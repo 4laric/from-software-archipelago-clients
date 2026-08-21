@@ -48,6 +48,7 @@ mod radahn_festival;
 mod reconcile_io;
 mod region;
 mod runes;
+mod save_backup;
 mod scadu_blessing;
 mod scaling;
 mod scout_proof;
@@ -114,6 +115,12 @@ extern "system" fn DllMain(_hinst: HINSTANCE, call_reason: u32, _reserved: *mut 
     // items silently never reach the player. Run this off the loader lock and wait through the
     // loader's sequential DLL startup, then build no AP core or overlay if the helper appears.
     shared::initialize_checked::<game::EldenRing, _>(input::EldenRingInputBlocker, || {
+        // #287: back up the ACTIVE save before any Core exists -- every AP write to game state is
+        // a `Core::update` effect, so the worker preflight is the last moment "before the first
+        // AP-owned mutation" can mean anything. One copy, fully logged; a failure latched for the
+        // in-game warning, never a startup block. Runs before the deny gate on purpose: a session
+        // that is ABOUT to be refused is still a session the game save went into unprotected.
+        save_backup::run();
         match shared::mod_stack::wait_for_blocking_incompatibility() {
             Some(message) => Err(message.to_string()),
             None => Ok(()),

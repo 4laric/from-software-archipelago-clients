@@ -291,6 +291,10 @@ pub struct Core {
     /// latch that keeps it to ONE toast rather than one per map load. A log `warn!` alone was not
     /// enough: the failure mode is that nothing looks broken, so the player never opens the log.
     icon_override_warned: bool,
+    /// Has the "save backup failed" toast been shown this session? Same shape as
+    /// `icon_override_warned`: `save_backup::run()` latched the verdict in the worker preflight
+    /// (before any Core existed), and this latch keeps the in-game warning to ONE toast.
+    save_backup_warned: bool,
     /// ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker): per-region gate data
     /// {threshold, member_ap_ids, bloom_flags}. Empty => feature off. Parsed once per seed.
     region_attunement: HashMap<String, RegionAttunement>,
@@ -686,6 +690,7 @@ impl shared::Core for Core {
             flask_seen: None,
             region_toast_primed: false,
             icon_override_warned: false,
+            save_backup_warned: false,
             region_attunement: HashMap::new(),
             boss_payout_pending: HashMap::new(),
             attuned_regions: HashSet::new(),
@@ -4128,6 +4133,15 @@ impl shared::Core for Core {
                     "AP icon override not loaded: AP items wear a Telescope. Read the name.",
                     now,
                 );
+            }
+            // #287, same once-per-session shape: the backup ran in the worker preflight, before
+            // this Core existed; a Failed verdict there must not stay a log line nobody reads.
+            if !self.save_backup_warned
+                && let Some(line) = crate::save_backup::failure_toast()
+            {
+                self.save_backup_warned = true;
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(line, now);
             }
             // world#768: tick_goal_gate WRITES the goal region's open flag + grace bundle, and a
             // map load reverts flag writes -- so its convergence latch must drop here or it will
