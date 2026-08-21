@@ -98,6 +98,7 @@ pub mod start_backfill;
 pub mod startup_retry;
 pub mod static_lots;
 pub mod sweep_boss_names;
+pub mod sweep_clause;
 pub mod sweep_flush;
 pub mod sweep_gate;
 pub mod sweep_view;

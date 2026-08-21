@@ -5083,11 +5083,26 @@ impl Core {
             |n| received.contains(n),
         );
 
+        // #936 seed truth for the baked ", also granted by <boss>" sweep clause: the clause is
+        // corpus-wide (every check a sweep COULD pay); slot_data `dungeonSweepFlags` is already
+        // rung-filtered + surface-cut, so its member union is exactly what THIS seed grants.
+        // `None` while the flag-poll config is unknown -- er_logic::sweep_clause never strips on
+        // a guess. Both call sites (checks tree, hints) route through `display_loc`.
+        let sweep_members: Option<HashSet<u64>> = self.flag_poll.as_ref().map(|fp| {
+            fp.sweep_flags
+                .values()
+                .flatten()
+                .map(|&id| id as u64)
+                .collect()
+        });
+
         let display_loc = |id: u64| -> String {
-            loc_names
-                .get(&id)
-                .map(|n| n.as_str().to_string())
-                .unwrap_or_else(|| format!("(location {id})"))
+            match loc_names.get(&id) {
+                Some(n) => {
+                    er_logic::sweep_clause::seed_scoped_name(n.as_str(), id, sweep_members.as_ref())
+                }
+                None => format!("(location {id})"),
+            }
         };
 
         // ---- lock-hint economy snapshot (see er_logic::lock_hint_economy) --------------------
