@@ -168,8 +168,16 @@ mod platform {
 
     impl LiveEventFlags {
         pub fn attach(shad_log: &Path) -> Result<Self> {
-            let log = std::fs::read_to_string(shad_log)
-                .with_context(|| format!("reading {}", shad_log.display()))?;
+            // clients#369: name the setting and distinguish a missing log from
+            // an unreadable one; the OS error stays the source of the chain.
+            let log = std::fs::read_to_string(shad_log).map_err(|error| {
+                let action = if error.kind() == std::io::ErrorKind::NotFound {
+                    format!("shad_log does not exist: {}", shad_log.display())
+                } else {
+                    format!("shad_log cannot be read: {}", shad_log.display())
+                };
+                anyhow::Error::new(error).context(action)
+            })?;
             let eboot_base = parse_latest_eboot_base(&log)?;
             let (process_id, process) = open_shad()?;
             let mut signature = [0u8; SETTER_WRITE_SIGNATURE.len()];
