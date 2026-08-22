@@ -1175,12 +1175,14 @@ impl shared::Core for Core {
                 // Our `flatten_regular_upgrades` (int cap) OR Bedrock/fswap's
                 // `reduce_non_somber_upgrade_cost` (bool toggle -> cap 1).
                 crate::upgrade_cost::set_flatten(er_logic::options::parse_flatten_cap(sd));
-                let mut map = i64_map(sd.get("apIdsToItemIds"));
-                // Great Rune boss-drop rows are legitimate rewards but are not equippable. A
-                // restore FLAG does not perform vanilla event 90005110's inventory conversion.
-                // Normalise ONCE before any consumer sees the map, so direct receipts,
-                // reconciliation, and own-world shop repoints all deliver the restored row.
-                er_logic::great_runes::normalize_delivery_item_map(&mut map);
+                let map = i64_map(sd.get("apIdsToItemIds"));
+                // Great Rune deliveries keep the boss-drop rows (8148-8153) EXACTLY as the seed
+                // sends them (clients#392): the restored rows (191-196) cannot be granted --
+                // AddItem accepts them and materialises them nowhere (Corni probe 2026-08-22) --
+                // and a restore flag does not perform vanilla event 90005110's inventory
+                // conversion either. The boss-drop row plus the restore flag (keyitems.rs writes
+                // 191-196 on receive) is the empirically working end state. This map used to be
+                // normalised to the restored rows here; that rewrite was the bug.
                 // Disarm each Divine-Tower vanilla award BEFORE its AP rune is received. Event
                 // 90005110 awards the restored rune without checking possession of the boss-drop
                 // row, so receipt-only flag reconciliation can lose this race (#731). Resolve the
@@ -2645,8 +2647,8 @@ impl shared::Core for Core {
                             && crate::reconcile_io::owns_ledger())
                         {
                             if dispatch.hook.grant_full_id(full_id, qty) {
-                                // Great Rune FullIDs were normalized to the restored/equippable row
-                                // when slot_data was parsed; keyitems::set_acquire_flags supplies
+                                // Great Rune FullIDs stay the boss-drop rows exactly as the seed
+                                // sends them (clients#392); keyitems::set_acquire_flags supplies
                                 // the matching restored flag without a second goods grant.
                             } else {
                                 // H3: the grant did NOT place — hold received_through at this item
@@ -2663,7 +2665,7 @@ impl shared::Core for Core {
                     }
                     GrantAction::SkipProgressive => {
                         // Tier effects already applied in the dispatch (ReceiveDispatch). Great
-                        // Runes are not progressive; their restored row + flag use the normal arm.
+                        // Runes are not progressive; their boss-drop row + restored flag use the normal arm.
                     }
                     GrantAction::SkipUnmapped { ap_item_id } => {
                         // R5 (SWEEP): AP id absent from apIdsToItemIds and progressive didn't
@@ -4719,9 +4721,11 @@ impl Core {
         if let Some(members) = self.armor_bundles.get(&ap_id) {
             return ItemSemantics::ArmorBundle(members.clone());
         }
-        // 4. Key item / great rune: the base grant gives the (restored) goods, plus vanilla
-        //    obtained/restored companion flags from the keyitems table. Both classes are a unique
-        //    good + set-only companion flags, so both map to KeyItem.
+        // 4. Key item / great rune: the base grant gives the goods row exactly as the seed's map
+        //    sends it (for great runes: the boss-drop row 8148-8153 -- the restored rows 191-196
+        //    cannot be AddItem'd, clients#392), plus vanilla obtained/restored companion flags from
+        //    the keyitems table. Both classes are a unique good + set-only companion flags, so both
+        //    map to KeyItem.
         let full_id = self.item_map.as_ref().and_then(|m| m.get(&ap_id)).copied();
         let acq = crate::keyitems::acquire_flags(name);
         if !acq.is_empty()

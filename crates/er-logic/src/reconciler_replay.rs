@@ -1042,12 +1042,12 @@ mod replay {
         }
     }
 
-    /// Morgott's Great Rune exactly as the live mapper builds it (`core.rs` -> normalized item map
-    /// -> `KeyItem` via `keyitems::acquire_flags`): restored goods row 193 plus restored flag 193.
-    /// The seed still identifies the reward with boss-drop row 8150, but no delivery consumer sees
-    /// that unequippable row.
+    /// Morgott's Great Rune exactly as the live mapper builds it (`core.rs` -> item map
+    /// -> `KeyItem` via `keyitems::acquire_flags`): boss-drop goods row 8150 AS THE SEED SENDS IT,
+    /// plus restored flag 193. Delivery deliberately does NOT rewrite to the restored row
+    /// (clients#392 -- the restored row cannot be AddItem'd; the rewrite was the INERT-grant bug).
     fn morgott_rune_inputs() -> DesiredInputs {
-        great_rune_inputs("Morgott's Great Rune", 193, 193)
+        great_rune_inputs("Morgott's Great Rune", 8150, 193)
     }
 
     fn great_rune_inputs(name: &str, goods: GoodsId, restored_flag: FlagId) -> DesiredInputs {
@@ -1091,7 +1091,9 @@ mod replay {
     /// slot, the reconciler emits zero re-grants for an equipped rune.
     #[test]
     fn an_equipped_great_rune_reads_as_possessed_and_never_re_grants_replay() {
-        const MORGOTT: GoodsId = 193;
+        // Delivery desires the boss-drop row (clients#392); equipping moves it to the slot, whose
+        // canonical identity is the restored row (193) -- satisfied via the symmetric family rule.
+        const MORGOTT: GoodsId = 8150;
         const TICKS_AFTER_EQUIP: usize = 400;
 
         for reads_equip_slot in [false, true] {
@@ -1156,10 +1158,13 @@ mod replay {
         }
     }
 
-    /// Regression for client#313 composed with #316: a save already carrying the restored row must
-    /// suppress another grant whether that row is in the bag or storage.
+    /// Regression for client#313, re-based on #392: delivery now desires the BOSS-DROP row, and a
+    /// save already carrying the RESTORED row (a vanilla Divine-Tower visit on a hybrid save, or a
+    /// pre-AP save) must suppress the grant whether that row is in the bag or storage -- the two
+    /// families satisfy each other symmetrically.
     #[test]
-    fn restored_great_rune_in_bag_or_storage_satisfies_restored_delivery() {
+    fn restored_great_rune_in_bag_or_storage_satisfies_boss_row_delivery() {
+        const MOHG_BOSS_ROW: GoodsId = 8152;
         const MOHG_RESTORED_ROW: GoodsId = 195;
         const MOHG_RESTORED_FLAG: FlagId = 195;
 
@@ -1176,26 +1181,29 @@ mod replay {
             g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
             let mut r = Reconciler::new(great_rune_inputs(
                 "Mohg's Great Rune",
-                MOHG_RESTORED_ROW,
+                MOHG_BOSS_ROW,
                 MOHG_RESTORED_FLAG,
             ));
 
             let out = r.tick(&mut g, TickBudget::default());
 
-            assert!(g.has_good(MOHG_RESTORED_ROW));
+            assert!(
+                g.has_good(MOHG_BOSS_ROW),
+                "the restored row satisfies the boss-row desire"
+            );
             assert!(g.inner.unique_grant_calls.is_empty());
             assert!(r.stalled_goods().is_empty());
             assert!(out.converged && out.applied.is_empty());
         }
     }
 
-    /// The live #316 upgrade case: an older client left only Mohg's boss-drop row in the save.
-    /// Native removal is not safely bound, so the migration keeps that row and grants the restored
-    /// row once. A second tick/reconnect sees the restored row and emits nothing else.
+    /// The #316 backfill is DEAD (clients#392): it existed to migrate a legacy boss-row-only save
+    /// to the restored row delivery then desired. Delivery desires the boss row again, so a legacy
+    /// boss-row save satisfies it outright -- zero grants, nothing parked. (Granting the restored
+    /// row was never even effective: AddItem swallows it, which was Corni's INERT loop.)
     #[test]
-    fn a_legacy_boss_row_gets_one_restored_row_backfill() {
+    fn a_legacy_boss_row_satisfies_delivery_with_no_backfill() {
         const MOHG_BOSS_ROW: GoodsId = 8152;
-        const MOHG_RESTORED_ROW: GoodsId = 195;
         const MOHG_RESTORED_FLAG: FlagId = 195;
 
         for boss_in_storage in [false, true] {
@@ -1211,17 +1219,16 @@ mod replay {
             g.inner.flags.insert(MOHG_RESTORED_FLAG, true);
             let mut r = Reconciler::new(great_rune_inputs(
                 "Mohg's Great Rune",
-                MOHG_RESTORED_ROW,
+                MOHG_BOSS_ROW,
                 MOHG_RESTORED_FLAG,
             ));
 
-            r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-            assert_eq!(g.inner.unique_grant_calls, vec![MOHG_RESTORED_ROW]);
-            assert!(g.inner.goods.contains(&MOHG_RESTORED_ROW));
-
-            let before = g.inner.unique_grant_calls.len();
             let out = r.tick(&mut g, TickBudget::default());
-            assert_eq!(g.inner.unique_grant_calls.len(), before);
+            assert!(
+                g.inner.unique_grant_calls.is_empty(),
+                "the legacy boss row IS the desired row now -- no backfill, no grant at all"
+            );
+            assert!(r.stalled_goods().is_empty());
             assert!(out.converged && out.applied.is_empty());
         }
     }
