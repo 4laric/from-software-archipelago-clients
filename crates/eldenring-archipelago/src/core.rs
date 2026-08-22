@@ -5427,9 +5427,17 @@ impl Core {
         // reaches it, whereas a locked resize has no user-side escape at all.
         let floor_ceiling = (display[0] * 0.85).max(560.0);
         let floor_w = (widest + chrome).clamp(560.0, floor_ceiling);
+        // 🛑 THE FLOOR IS A DEFAULT, NOT A CONSTRAINT (rouqs, 2026-08-22, round two: the 85% cap
+        // gave back "like 10%" -- his words -- because that is exactly the band it created).
+        // bobler's #170 complaint was REACHABILITY, not width: he could not read clipped tails.
+        // Content-fitted width survives as the FirstUseEver default, so the window still opens
+        // readable; the every-frame minimum drops to the 560 constant; and the horizontal
+        // scrollbar below is what makes that safe -- a window narrower than its content SCROLLS
+        // now instead of clipping, so shrinking it to a corner sliver is finally allowed.
         ui.window("Item Tracker###ap-tracker")
             .size([floor_w, 560.0], imgui::Condition::FirstUseEver)
-            .size_constraints([floor_w, 240.0], [ceiling, display[1] * 0.95])
+            .size_constraints([560.0, 240.0], [ceiling, display[1] * 0.95])
+            .horizontal_scrollbar(true)
             .opened(&mut open)
             .build(|| {
                 ui.text(format!("checks: {}/{}", model.done, model.total));
