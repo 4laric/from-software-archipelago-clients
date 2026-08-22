@@ -1187,7 +1187,10 @@ mod replay {
 
             let out = r.tick(&mut g, TickBudget::default());
 
-            assert!(g.has_good(MOHG_BOSS_ROW), "the restored row satisfies the boss-row desire");
+            assert!(
+                g.has_good(MOHG_BOSS_ROW),
+                "the restored row satisfies the boss-row desire"
+            );
             assert!(g.inner.unique_grant_calls.is_empty());
             assert!(r.stalled_goods().is_empty());
             assert!(out.converged && out.applied.is_empty());
