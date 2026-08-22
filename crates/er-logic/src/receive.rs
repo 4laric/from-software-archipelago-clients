@@ -214,15 +214,16 @@ mod tests {
         assert_eq!(pushed, 2);
     }
 
-    /// Client #316: a restore flag does not convert a shardbearer's boss-drop inventory row. The
-    /// slot-data map is normalized before this receive loop sees it, so a fresh AP delivery must
-    /// enqueue Radahn's restored/equippable row rather than row 8149.
+    /// Client #392: the restored rows (191-196) cannot be granted -- AddItem accepts them and
+    /// materialises them nowhere (Corni probe 2026-08-22), so the reconciler re-emitted the grant
+    /// on every load. The delivery map is NOT normalized anymore: a fresh AP delivery must enqueue
+    /// Radahn's boss-drop row 8149 exactly as the seed sends it. (#316's normalize-to-restored was
+    /// the bug; the boss-drop row plus the restore flag keyitems.rs writes is the working state.)
     #[test]
-    fn great_rune_receipt_enqueues_the_restored_row() {
+    fn great_rune_receipt_enqueues_the_boss_drop_row_as_sent() {
         const AP_RADAHN: i64 = 7777;
         const GOODS: i64 = 0x4000_0000;
-        let mut item_map = HashMap::from([(AP_RADAHN, GOODS | 8149)]);
-        crate::great_runes::normalize_delivery_item_map(&mut item_map);
+        let item_map = HashMap::from([(AP_RADAHN, GOODS | 8149)]);
         let counts = HashMap::new();
         let mut hook = MockHook::default();
         let (mut dispatched, mut pushed) = (0, 0);
@@ -239,7 +240,7 @@ mod tests {
         assert_eq!(
             action,
             GrantAction::Enqueue {
-                full_id: (GOODS | 192) as i32,
+                full_id: (GOODS | 8149) as i32,
                 qty: 1,
                 ap_index: 0,
                 name: "Radahn's Great Rune".into(),
