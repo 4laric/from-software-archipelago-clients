@@ -5407,7 +5407,17 @@ impl Core {
         // The ceiling is raised to the old floor first, so `clamp` can never be handed a range
         // whose min exceeds its max on a very small viewport -- that would panic, in a render.
         let ceiling = (display[0] * 0.95).max(560.0);
-        let floor_w = (widest + chrome).clamp(560.0, ceiling);
+        // 🛑 THE FLOOR MUST STOP BELOW THE CEILING (rouqs, 2026-08-22: "can resize up/down but
+        // left right doesnt work anymore"). The measured content floor is re-applied every frame,
+        // and late-game sweep rows are enormous -- once `widest + chrome` reached the ceiling,
+        // min == max and imgui killed HORIZONTAL resize exactly (vertical kept its 240..95% band,
+        // which is why up/down still worked). Clip-freedom and resize-freedom trade off at the
+        // screen edge, and resize wins: cap the floor at 85% of the display so at least a tenth
+        // of the screen's width is always a live resize band. A row wider than 85% of the screen
+        // clips its tail -- that is the screen being too small, and horizontal scroll still
+        // reaches it, whereas a locked resize has no user-side escape at all.
+        let floor_ceiling = (display[0] * 0.85).max(560.0);
+        let floor_w = (widest + chrome).clamp(560.0, floor_ceiling);
         ui.window("Item Tracker###ap-tracker")
             .size([floor_w, 560.0], imgui::Condition::FirstUseEver)
             .size_constraints([floor_w, 240.0], [ceiling, display[1] * 0.95])
