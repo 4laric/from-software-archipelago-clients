@@ -1,12 +1,14 @@
-//! death_award_sweep.rs — the pure half of the missed corpse-award sweep (clients#385).
+//! death_award_sweep.rs — the pure half of the missed death-award sweep (clients#385, #395).
 //!
-//! An EMEVD death-award (common 90005300/90005301, `value == 0`) that misses its one chance —
-//! a death `CharacterRatioDead` never witnessed, or a corpse left unlooted across a reload —
-//! leaves its check permanently unpayable in-game, while the save carries the signature forever:
-//! death flag UP, check flag DOWN. The world ships the pair table beside the dll
-//! (`death_award_pairs.json`, game data like the check-lot table); the client arm reads the two
-//! flags per pair at connect and sets the check flag for every confirmed miss, which the normal
-//! check detection then pays. Retroactive by construction — no AP-save archaeology, no slot_data.
+//! An EMEVD death-award that misses its one chance — a death `CharacterRatioDead` never witnessed
+//! (common 90005300/90005301, `value == 0`), a corpse left unlooted across a reload, or a 1100/1200
+//! boss-award latch whose `WaitFor(trigger)` never paid (clients#395: trigger pre-dating the boot
+//! suppresses the award) — leaves its check permanently unpayable in-game, while the save carries
+//! the signature forever: trigger flag UP, check flag DOWN. The world ships the pair table beside
+//! the dll (`death_award_pairs.json`, game data like the check-lot table); the client arm reads
+//! the two flags per pair at connect and sets the check flag for every confirmed miss, which the
+//! normal check detection then pays. Retroactive by construction — no AP-save archaeology, no
+//! slot_data.
 
 use std::collections::HashSet;
 

@@ -1,16 +1,24 @@
-//! death_award_sweep.rs — fire checks whose EMEVD corpse-award the game missed (clients#385).
+//! death_award_sweep.rs — fire checks whose EMEVD death-driven award the game missed
+//! (clients#385, clients#395).
 //!
 //! The decision lives in er_logic::death_award_sweep (host-tested); this file is the arm. The
 //! shipped `death_award_pairs.json` (game data, beside the dll like the check-lot table) names
-//! every `value == 0` corpse-award as a (death flag, check flag) pair. Death UP with check DOWN
-//! in the live save means the award was missed and is unrecoverable in-game — the reload branch
-//! force-kills the corpse without re-offering the loot — so this pass SETS the check flag, and
-//! the ordinary check detection pays the location. Retroactive on any seed, because the death
-//! flag persists in the save and the server remembers what is unsent.
+//! every `value == 0` corpse-award as a (death flag, check flag) pair — and, since clients#395,
+//! every 1100/1200 boss-award latch as a (trigger flag, check flag) pair (Azeem's Elden Beast:
+//! 9123 up, 510230 never set, across 50 minutes and a full relaunch — the common `$Event(1100)`
+//! award is suppressed once the trigger pre-dates the boot). Trigger UP with check DOWN in the
+//! live save means the award was missed and is unrecoverable in-game — the corpse family's reload
+//! branch force-kills the corpse without re-offering the loot, and the boss family never re-offers
+//! at all — so this pass SETS the check flag, and the ordinary check detection pays the location.
+//! The boss-family condition is the game's own award condition (the event would fire on exactly
+//! trigger-up + latch-down), so the sweep pays nothing vanilla would not have. Retroactive on any
+//! seed, because the trigger flag persists in the save and the server remembers what is unsent.
 //!
 //! ONE pass per connect, latched: a death that happens mid-session gets its award the normal way
 //! (or becomes this pass's business on the NEXT connect, after the reload that makes the loss
-//! real). Sweeping continuously would race a live corpse the player is walking toward.
+//! real). Sweeping continuously would race a live corpse the player is walking toward — and for
+//! the boss family, a kill whose award is legitimately in flight (the WaitFor→award window is
+//! sub-second, but a connect cannot land inside it from a prior session).
 //!
 //! The table is OPTIONAL at runtime: absent or malformed degrades to no sweep, said once, loudly
 //! — a silent degrade here is an unpayable check nobody ever hears about.
