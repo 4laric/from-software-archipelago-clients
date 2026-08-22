@@ -170,11 +170,16 @@ impl<G: Game> Config<G> {
         self.raw.password.as_deref()
     }
 
-    /// Whether the multiworld-pickup audio cue sounds (client#336). DEFAULT ON: the issue asks for
-    /// the cue, so a config that never mentions it gets the new behaviour; `"sound_cue": false`
-    /// opts out.
+    /// Whether the multiworld-pickup audio cue sounds (client#336). OPT-IN: `"sound_cue": true`
+    /// turns it on; a config that never mentions it stays silent.
     pub fn sound_cue(&self) -> bool {
-        self.raw.sound_cue.unwrap_or(true)
+        // OPT-IN since 2026-08-22 (Alaric, on hearing it: "the windows ding every time you pick
+        // something up ... is unfortunately worse than doing nothing"). The cue's platform half
+        // is SystemAsterisk through the Windows mixer -- no game-volume coupling, no authored
+        // sound -- and a default-on system ding is a judgement call the client should not make
+        // for every player. `"sound_cue": true` in apconfig.json turns it on; the seam upgrades
+        // to an in-game SE if a sound-play RVA is ever verified (sound_cue.rs module doc).
+        self.raw.sound_cue.unwrap_or(false)
     }
 }
 
@@ -253,19 +258,23 @@ mod tests {
         assert!(!serialize_config(&raw).unwrap().contains("probes"));
     }
 
-    /// client#336: the cue defaults ON (a config that never mentions it gets the new behaviour),
-    /// an explicit false silences it, and a round-trip neither invents the key nor loses an
+    /// client#336, inverted 2026-08-22: the cue is OPT-IN (Alaric, on hearing the SystemAsterisk
+    /// ding per pickup: "worse than doing nothing"). A config that never mentions it stays
+    /// silent; an explicit true turns it on; a round-trip neither invents the key nor loses an
     /// explicit setting (the same save-clobber hazard as `a_probe_flag_survives_a_save_round_trip`).
     #[test]
-    fn the_sound_cue_defaults_on_and_round_trips() {
+    fn the_sound_cue_is_opt_in_and_round_trips() {
         let raw = parse_config(r#"{"url":"u"}"#).expect("parses");
+        // unmentioned = None, and Config::sound_cue() unwraps None to FALSE -- the 2026-08-22
+        // inversion lives in that unwrap_or; this pins the raw half it reads from.
         assert!(raw.sound_cue.is_none());
         assert!(!serialize_config(&raw).unwrap().contains("sound_cue"));
 
-        let off = parse_config(r#"{"url":"u","sound_cue":false}"#).expect("parses");
-        let reread = parse_config(&serialize_config(&off).unwrap()).expect("re-parses");
-        assert_eq!(reread.sound_cue, Some(false));
-        assert_eq!(reread, off);
+        let on = parse_config(r#"{"url":"u","sound_cue":true}"#).expect("parses");
+        assert_eq!(on.sound_cue, Some(true), "explicit true is the opt-in");
+        let reread = parse_config(&serialize_config(&on).unwrap()).expect("re-parses");
+        assert_eq!(reread.sound_cue, Some(true));
+        assert_eq!(reread, on);
     }
 
     /// THE MOTIVATING CASE (CONTRIBUTING rule 11): Alaric, 2026-08-12 -- "the default apconfig,
