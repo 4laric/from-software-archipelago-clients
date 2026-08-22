@@ -819,6 +819,11 @@ impl shared::Core for Core {
             self.log(ap::Print::message(line.to_string()));
         }
 
+        // Ability-lock TEST enforcement (#945): disable locked abilities at the game's logical
+        // action layer every frame. No-op unless ER_ABILITY_LOCK_TEST is set. Keybind-agnostic;
+        // menus are never affected (they do not flow through the character's action requests).
+        crate::ability_lock::enforce();
+
         // TRAP PROBE (traps.rs) -- off unless `probes: { "traps": true }`. Function keys for the
         // same reason F6 is one: a letter fights the say input, and a trap fired by a stray
         // keystroke while typing to the room would be indistinguishable from a bug.
