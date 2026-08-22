@@ -52,6 +52,14 @@ pub trait BloodborneBackend {
     fn target_weapon_level(&mut self) -> Result<Option<u8>>;
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress>;
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress>;
+    /// Retract a published-but-unexecuted grant command (clients#296). The
+    /// client calls this when the validated context the command was published
+    /// under is gone -- a save switch, a non-gameplay transition, or a process
+    /// restart that finds a leftover command. Returns `true` when a command
+    /// was actually withdrawn; `false` when there was nothing unwitnessed to
+    /// withdraw. See `FileBridge::withdraw_unwitnessed_command` for what
+    /// "unwitnessed" means and why witnessed commands are left alone.
+    fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool>;
 }
 
 pub struct FileBackend {
@@ -198,6 +206,10 @@ impl BloodborneBackend for FileBackend {
             request.tag
         )
     }
+
+    fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
+        self.bridge.withdraw_unwitnessed_command(tag)
+    }
 }
 
 pub struct MockBackend {
@@ -207,6 +219,11 @@ pub struct MockBackend {
     pub inventory: HashMap<(u32, Option<u8>), u32>,
     pub grants: Vec<ItemGrant>,
     pub equips: Vec<EquipRequest>,
+    /// Tags passed to `withdraw_unwitnessed_grant`, in call order. The loop only
+    /// calls withdraw when its ledger holds an ungranted pending plan, so the
+    /// mock answers `true`: from the loop's perspective an unwitnessed command
+    /// existed and is now withdrawn.
+    pub withdrawn: Vec<String>,
     grant_delays: HashMap<String, u8>,
     equip_delays: HashMap<String, u8>,
     completed_grants: HashSet<String>,
@@ -225,6 +242,7 @@ impl Default for MockBackend {
             inventory: HashMap::new(),
             grants: Vec::new(),
             equips: Vec::new(),
+            withdrawn: Vec::new(),
             grant_delays: HashMap::new(),
             equip_delays: HashMap::new(),
             completed_grants: HashSet::new(),
@@ -305,6 +323,11 @@ impl BloodborneBackend for MockBackend {
         self.equips.push(request.clone());
         self.completed_equips.insert(request.tag.clone());
         Ok(OperationProgress::Complete)
+    }
+
+    fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
+        self.withdrawn.push(tag.to_owned());
+        Ok(true)
     }
 }
 

@@ -172,6 +172,56 @@ impl FileBridge {
         fs::remove_file(&path).with_context(|| format!("removing acknowledged {}", path.display()))
     }
 
+    /// Withdraw a pending command the harness has NEVER reported touching
+    /// (clients#296). Returns `true` when a file was removed.
+    ///
+    /// The bridge is asynchronous: a published command can execute against
+    /// whatever save is loaded when the harness picks it up, not the save that
+    /// was validated at publication. Until the harness can witness save
+    /// identity at mutation time (bb-archipelago#56), the client-side half of
+    /// the guarantee is that a command is never left lying around for an
+    /// execution the client can no longer vouch for: on context loss, and at
+    /// startup for a leftover from a previous process, the client withdraws.
+    ///
+    /// "Unwitnessed" is the load-bearing word. If the durable state names this
+    /// tag AT ALL -- success, terminal failure, or an in-progress status --
+    /// the harness owns the command: success must stay for the
+    /// [`Self::acknowledge_command`] recovery path, failure stays for
+    /// diagnosis, and an in-progress execution cannot be stopped by deleting a
+    /// file it has already read. Withdrawing any of those changes nothing
+    /// about safety and breaks the recovery semantics, so they are left alone.
+    /// An unreadable/absent state means no witness exists, which is exactly
+    /// the case that must be withdrawn.
+    ///
+    /// The durable item plan lives in the receive ledger, so a withdrawn
+    /// command is not a lost item: the next poll under a validated context
+    /// re-publishes it, and the harness-side `expected_before` check plus the
+    /// state echo keep a race with an in-flight execution from double-granting.
+    pub fn withdraw_unwitnessed_command(&self, tag: &str) -> Result<bool> {
+        let path = self.command_path();
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        // Same ownership rule as acknowledge_command: never touch a command
+        // file whose tag is not the one the caller is responsible for.
+        anyhow::ensure!(
+            text.split_whitespace().last() == Some(tag),
+            "refusing to withdraw a grant command for a different tag"
+        );
+        if let Ok(state) = self.read_state()
+            && state.concerns_tag(tag)
+        {
+            return Ok(false); // witnessed: the harness owns this command now
+        }
+        fs::remove_file(&path)
+            .with_context(|| format!("withdrawing unwitnessed {}", path.display()))?;
+        Ok(true)
+    }
+
     pub fn read_state(&self) -> Result<BridgeState> {
         parse_state_file(&self.state_path())
     }
@@ -304,6 +354,66 @@ mod tests {
         assert!(bridge.command_pending());
         bridge.acknowledge_command("received_17").unwrap();
         assert!(!bridge.command_pending());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn withdraws_a_command_the_harness_never_witnessed() {
+        // No state file at all: the harness never saw this command (e.g. it
+        // was down at publication, or the client process died right after).
+        let root = temp_root("withdraw-unwitnessed");
+        let bridge = FileBridge::new(&root);
+        bridge.enqueue(&pebble()).unwrap();
+        assert!(bridge.withdraw_unwitnessed_command("received_17").unwrap());
+        assert!(!bridge.command_pending());
+        // A second withdrawal is a no-op, not an error.
+        assert!(!bridge.withdraw_unwitnessed_command("received_17").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_withdraw_a_witnessed_command() {
+        for status in ["completed", "failed", "awaiting_inventory"] {
+            let root = temp_root(&format!("withdraw-witnessed-{status}"));
+            let bridge = FileBridge::new(&root);
+            bridge.enqueue(&pebble()).unwrap();
+            fs::write(
+                bridge.state_path(),
+                format!(
+                    "build={RUNTIME_BUILD}\nprotocol={BRIDGE_PROTOCOL}\nharness={HARNESS_VERSION}\nstatus={status}\ntag=received_17\ndetail=\n"
+                ),
+            )
+            .unwrap();
+            assert!(!bridge.withdraw_unwitnessed_command("received_17").unwrap());
+            assert!(bridge.command_pending());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn withdraws_when_the_state_names_a_different_tag() {
+        let root = temp_root("withdraw-other-tag");
+        let bridge = FileBridge::new(&root);
+        bridge.enqueue(&pebble()).unwrap();
+        fs::write(
+            bridge.state_path(),
+            format!(
+                "build={RUNTIME_BUILD}\nprotocol={BRIDGE_PROTOCOL}\nharness={HARNESS_VERSION}\nstatus=completed\ntag=received_16\ndetail=\n"
+            ),
+        )
+        .unwrap();
+        assert!(bridge.withdraw_unwitnessed_command("received_17").unwrap());
+        assert!(!bridge.command_pending());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn never_withdraws_a_command_for_a_different_tag() {
+        let root = temp_root("withdraw-tag-guard");
+        let bridge = FileBridge::new(&root);
+        bridge.enqueue(&pebble()).unwrap();
+        assert!(bridge.withdraw_unwitnessed_command("received_18").is_err());
+        assert!(bridge.command_pending());
         fs::remove_dir_all(root).unwrap();
     }
 }

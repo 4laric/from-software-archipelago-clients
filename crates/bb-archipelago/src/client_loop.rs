@@ -15,6 +15,13 @@ pub struct IncomingItem {
     pub ap_item_id: i64,
 }
 
+/// The bridge tag of the grant command for an AP receive index. One helper so
+/// the publisher, the withdrawal path, and the startup reconciler can never
+/// disagree about which command a pending plan owns.
+fn grant_tag(index: u64) -> String {
+    format!("ap_{index}")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletedItem {
     pub index: u64,
@@ -244,6 +251,26 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         })
     }
 
+    /// Startup reconciliation (clients#296): withdraw a grant command left over
+    /// from a previous process BEFORE any context is validated. A leftover would
+    /// otherwise execute against whatever save is loaded when the harness picks
+    /// it up -- including a different character ("a full shad/CE/client restart
+    /// cannot redirect a retained command to another character"). The durable
+    /// pending plan is untouched: the next poll under a validated context
+    /// re-publishes the command. Returns `true` when a command was withdrawn.
+    pub fn reconcile_pending_command(&mut self) -> Result<bool> {
+        let Some(tag) = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.pending.as_ref())
+            .filter(|pending| !pending.grant_complete)
+            .map(|pending| grant_tag(pending.index))
+        else {
+            return Ok(false);
+        };
+        self.backend.withdraw_unwitnessed_grant(&tag)
+    }
+
     /// Processes at most one item, preserving AP index order and durable state
     /// across the grant -> optional upgrade -> optional equip sequence.
     pub fn poll_items(&mut self, received: &[IncomingItem]) -> Result<ItemPollResult> {
@@ -259,11 +286,42 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             index: next,
             ap_item_id,
         };
-        if self
-            .require_runtime_context("received-item delivery")?
-            .is_none()
-        {
-            return Ok(ItemPollResult::Pending);
+        // The in-flight grant's tag is read BEFORE the context check on
+        // purpose: context loss is exactly when a published-but-unexecuted
+        // command must be withdrawn (clients#296), and that duty does not
+        // wait for a valid context. The durable plan stays in the ledger, so
+        // a withdrawal is a held operation, never a lost item.
+        let in_flight_tag = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.pending.as_ref())
+            .filter(|pending| !pending.grant_complete)
+            .map(|pending| grant_tag(pending.index));
+        match self.require_runtime_context("received-item delivery") {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                // Not gameplay-ready (load transition, menu, character
+                // screen): a command published earlier must not execute
+                // against a game state we can no longer vouch for.
+                if let Some(tag) = in_flight_tag {
+                    self.backend.withdraw_unwitnessed_grant(&tag)?;
+                }
+                return Ok(ItemPollResult::Pending);
+            }
+            Err(error) => {
+                // Identity refused (a different save is loaded) or disarmed:
+                // same withdrawal duty, and the operator sees that it happened.
+                if let Some(tag) = in_flight_tag {
+                    return Err(match self.backend.withdraw_unwitnessed_grant(&tag) {
+                        Ok(true) => error.context("withdrew the unwitnessed pending grant command"),
+                        Ok(false) => error,
+                        Err(withdraw_error) => withdraw_error.context(format!(
+                            "withdrawing the pending grant command after: {error:#}"
+                        )),
+                    });
+                }
+                return Err(error);
+            }
         }
 
         let mut pending = match self
@@ -304,7 +362,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     },
                 ),
                 reinforcement_level: pending.reinforcement_level,
-                tag: format!("ap_{}", item.index),
+                tag: grant_tag(item.index),
             };
             if self.backend.grant_item(&grant)? == OperationProgress::Pending {
                 return Ok(ItemPollResult::Pending);
@@ -543,6 +601,165 @@ mod tests {
         );
         assert!(client.backend().grants.is_empty());
         assert!(client.ledger().slot("seed", "slot").is_none());
+    }
+
+    #[test]
+    fn save_switch_withdraws_an_unwitnessed_pending_grant() {
+        // clients#296: a command published under one validated save must not be
+        // left for the harness to execute after the player switches characters.
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.delay_grant("ap_0", 1);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert!(client.backend().withdrawn.is_empty());
+
+        // The save changes while the command is unexecuted: the poll refuses
+        // AND withdraws; the durable plan survives.
+        client.backend_mut().location_context = Some(LocationContext {
+            save_identity: "other-save".into(),
+            gameplay_ready: true,
+        });
+        let error = client.poll_items(&received).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("refused save identity"));
+        assert!(message.contains("withdrew the unwitnessed pending grant command"));
+        assert_eq!(client.backend().withdrawn, vec!["ap_0".to_string()]);
+        assert!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .is_some_and(|slot| slot.pending.is_some())
+        );
+
+        // Returning to the bound save permits one safe retry: the delay is
+        // spent, the grant completes exactly once, and nothing regrants.
+        client.backend_mut().location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert_eq!(client.backend().grants.len(), 1);
+        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Idle);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn a_non_gameplay_transition_holds_and_withdraws_a_pending_grant() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.delay_grant("ap_0", 1);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+
+        // A load transition (same save, not gameplay-ready) holds the item and
+        // withdraws the command; it never reports success for this window.
+        client.backend_mut().location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: false,
+        });
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert_eq!(client.backend().withdrawn, vec!["ap_0".to_string()]);
+
+        client.backend_mut().location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert_eq!(client.backend().grants.len(), 1);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn startup_reconcile_withdraws_a_previous_sessions_command() {
+        // Simulate a client that died with a grant in flight: the ledger holds
+        // the durable plan, and the bridge still holds the command file.
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.delay_grant("ap_0", 60);
+        let mut first = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert_eq!(
+            first.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        drop(first);
+
+        // The restarted client withdraws the leftover BEFORE any context is
+        // validated, then re-publishes under the validated context and
+        // completes exactly once.
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        let mut restarted = loop_with(
+            MockBackend::default(),
+            persisted,
+            ledger_path.clone(),
+            config(),
+        );
+        assert!(restarted.reconcile_pending_command().unwrap());
+        assert_eq!(restarted.backend().withdrawn, vec!["ap_0".to_string()]);
+        assert!(matches!(
+            restarted.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert_eq!(restarted.backend().grants.len(), 1);
+        assert_eq!(
+            restarted.poll_items(&received).unwrap(),
+            ItemPollResult::Idle
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+
+        // No pending plan -> reconciliation is a no-op.
+        let ledger_path = path();
+        let mut idle = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        assert!(!idle.reconcile_pending_command().unwrap());
+        assert!(idle.backend().withdrawn.is_empty());
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     #[test]
