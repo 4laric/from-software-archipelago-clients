@@ -10,6 +10,7 @@
 //!
 //! See SHARED-CONVERGENCE-PLAN.md.
 
+pub mod ability_lock;
 pub mod add_item_probe;
 pub mod applied_tally;
 pub mod area_tiers;
