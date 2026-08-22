@@ -85,6 +85,7 @@ console_commands! {
     MarkerProbe => "!markerprobe" => "!markerprobe [set|verify|clear]",
     Give => "!give" => "!give <fullId> [qty]",
     SeamlessProbe => "!seamlessprobe" => "!seamlessprobe [start|stop]",
+    Ability => "!ability" => "!ability [lock|unlock <name|all>]",
     Help => "!help" => "!help",
 }
 
@@ -624,6 +625,57 @@ impl shared::Core for Core {
                 }
                 true
             }
+            ConsoleCommand::Ability => {
+                // Playtest lever for #945: exercise the lock/unlock TRANSITION by hand -- the same
+                // seam a future find-to-unlock item drives. `!ability` alone reports state.
+                use er_logic::ability_lock::{Ability, set_names};
+                let parts: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+                let msg = match (parts.first().copied(), parts.get(1).copied()) {
+                    (None, _) => {
+                        let managed = crate::ability_lock::managed_set();
+                        let live = crate::ability_lock::live_set();
+                        if managed == 0 {
+                            "ability-lock: inactive (no locked set from slot_data or env)"
+                                .to_string()
+                        } else {
+                            format!(
+                                "ability-lock: locked [{}]; unlocked [{}]",
+                                set_names(live),
+                                set_names(managed & !live),
+                            )
+                        }
+                    }
+                    (Some("unlock"), Some("all")) => {
+                        crate::ability_lock::unlock_all();
+                        "ability-lock: unlocked all".to_string()
+                    }
+                    (Some("lock"), Some("all")) => {
+                        crate::ability_lock::lock_all();
+                        format!(
+                            "ability-lock: locked [{}]",
+                            set_names(crate::ability_lock::live_set())
+                        )
+                    }
+                    (Some(verb @ ("unlock" | "lock")), Some(name)) => {
+                        match Ability::from_name(name) {
+                            Some(a) if verb == "unlock" => {
+                                crate::ability_lock::unlock(a);
+                                format!("ability-lock: unlocked {}", a.name())
+                            }
+                            Some(a) => {
+                                crate::ability_lock::lock(a);
+                                format!("ability-lock: locked {}", a.name())
+                            }
+                            None => format!(
+                                "unknown ability {name:?} -- valid: jump, crouch, roll, r1, r2, l1, l2"
+                            ),
+                        }
+                    }
+                    _ => "usage: !ability [lock|unlock <name|all>]".to_string(),
+                };
+                self.log(ap::Print::message(msg));
+                true
+            }
             ConsoleCommand::Help => {
                 self.log(ap::Print::message(CONSOLE_COMMAND_USAGES.join(" | ")));
                 true
@@ -1127,6 +1179,9 @@ impl shared::Core for Core {
                 crate::no_equip_load::set_mode(er_logic::equip_load::parse(sd));
                 // no_fall_damage: the spirit-spring fallDamageRate=0 SpEffect, kept on the player.
                 crate::no_fall_damage::set_enabled(er_logic::options::parse_no_fall_damage(sd));
+                // ability-lock (#945): the locked set the seed asked for, installed at the game's
+                // logical-action layer. A zero mask leaves any ER_ABILITY_LOCK_TEST env set intact.
+                crate::ability_lock::set_locked_mask(er_logic::options::parse_ability_lock(sd));
                 // flask: history-agnostic reconciled LEVELED flask (charges + potency) driven by the
                 // count of received "Progressive Flask Upgrade" items vs the slot_data `flaskLadder`.
                 // Absent/empty ladder => feature OFF. No ledger; re-runs upward every tick.

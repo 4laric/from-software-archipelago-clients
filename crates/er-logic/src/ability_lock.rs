@@ -78,6 +78,13 @@ impl Ability {
         }
     }
 
+    /// The ability of this exact name (case-insensitive), or `None`. The single-name counterpart
+    /// of [`parse_set`], for the console lever's `!ability unlock <name>`.
+    pub fn from_name(s: &str) -> Option<Ability> {
+        let t = s.trim().to_ascii_lowercase();
+        Ability::ALL.into_iter().find(|a| a.name() == t)
+    }
+
     /// The `ChrActions` bit(s) this ability owns -- what gets disabled to lock it.
     ///
     /// Casting rides the attack buttons (a staff/seal casts through R1/L1/R2/L2), and at the
@@ -141,6 +148,12 @@ pub fn set_names(set: u8) -> String {
         .join(",")
 }
 
+/// The full locked set (every [`Ability`] bit) -- the domain a "lock everything" / "unlock
+/// everything" console action spans, and a convenient MANAGED seed.
+pub fn full_set() -> u8 {
+    Ability::ALL.into_iter().fold(0u8, |s, a| s | a.bit())
+}
+
 /// The `ChrActions` bitmask to disable for a locked set -- the union of each locked ability's
 /// own action bits. `0` when nothing is locked (the client then does nothing).
 pub fn chr_action_mask(locked: u8) -> u64 {
@@ -181,6 +194,15 @@ mod tests {
     }
 
     #[test]
+    fn from_name_and_full_set() {
+        assert_eq!(Ability::from_name("ROLL"), Some(Ability::Roll));
+        assert_eq!(Ability::from_name(" l2 "), Some(Ability::L2));
+        assert_eq!(Ability::from_name("nope"), None);
+        assert_eq!(full_set(), 0x7f);
+        assert_eq!(set_names(full_set()), "jump,crouch,roll,r1,r2,l1,l2");
+    }
+
+    #[test]
     fn nothing_locked_masks_nothing() {
         assert_eq!(chr_action_mask(0), 0);
         assert_eq!(requested_locked(0, u64::MAX), 0);
@@ -191,7 +213,11 @@ mod tests {
         // Locking R1 disables the light attack AND casting through it, or a caster ignores the mode.
         let m = chr_action_mask(Ability::R1.bit());
         assert_ne!(m & (1 << R1), 0);
-        assert_ne!(m & (1 << MAGIC_R), 0, "R1 lock must also disable magic_r (casting rides R1)");
+        assert_ne!(
+            m & (1 << MAGIC_R),
+            0,
+            "R1 lock must also disable magic_r (casting rides R1)"
+        );
         // L2 likewise pairs with the charged/left magic twin.
         let l2 = chr_action_mask(Ability::L2.bit());
         assert_ne!(l2 & (1 << L2), 0);
@@ -202,7 +228,11 @@ mod tests {
     fn roll_covers_both_the_roll_and_the_neutral_backstep() {
         let m = chr_action_mask(Ability::Roll.bit());
         assert_ne!(m & (1 << ROLLING), 0);
-        assert_ne!(m & (1 << BACKSTEP), 0, "a directionless B-tap is a backstep, still an evade");
+        assert_ne!(
+            m & (1 << BACKSTEP),
+            0,
+            "a directionless B-tap is a backstep, still an evade"
+        );
     }
 
     #[test]

@@ -97,6 +97,25 @@ pub fn parse_no_fall_damage(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "no_fall_damage")
 }
 
+/// `options.locked_abilities`: a JSON array of ability names (`["roll","r1"]`) -> the
+/// `er_logic::ability_lock` u8 locked set. Tolerant like the rest of this module -- a non-array,
+/// a non-string element, or an unknown name is skipped, never fatal, so a garbage option is simply
+/// inert rather than failing the connection. Absent/empty => 0 (the client then falls back to the
+/// `ER_ABILITY_LOCK_TEST` env var, or does nothing).
+pub fn parse_ability_lock(slot_data: &Value) -> u8 {
+    let Some(arr) = slot_data
+        .get("options")
+        .and_then(|o| o.get("locked_abilities"))
+        .and_then(|v| v.as_array())
+    else {
+        return 0;
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(crate::ability_lock::Ability::from_name)
+        .fold(0u8, |set, a| set | a.bit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +237,27 @@ mod tests {
             &json!({ "options": { "no_fall_damage": 0 } })
         ));
         assert!(!parse_no_fall_damage(&json!({ "options": {} })));
+    }
+
+    #[test]
+    fn ability_lock_folds_names_and_is_tolerant() {
+        use crate::ability_lock::Ability;
+        let sd = json!({ "options": { "locked_abilities": ["roll", "r1", "l2"] } });
+        assert_eq!(
+            parse_ability_lock(&sd),
+            Ability::Roll.bit() | Ability::R1.bit() | Ability::L2.bit()
+        );
+        // unknown names + non-strings are skipped, not fatal
+        let messy = json!({ "options": { "locked_abilities": ["roll", "nope", 7, "jump"] } });
+        assert_eq!(
+            parse_ability_lock(&messy),
+            Ability::Roll.bit() | Ability::Jump.bit()
+        );
+        // absent / wrong-typed => 0
+        assert_eq!(parse_ability_lock(&json!({ "options": {} })), 0);
+        assert_eq!(
+            parse_ability_lock(&json!({ "options": { "locked_abilities": "roll" } })),
+            0
+        );
     }
 }
