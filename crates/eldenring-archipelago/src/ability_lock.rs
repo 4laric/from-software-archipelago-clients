@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use eldenring::cs::WorldChrMan;
+use fromsoftware_shared::FromStatic;
 
 use er_logic::ability_lock::{Ability, chr_action_mask, parse_set, requested_locked, set_names};
 
