@@ -90,8 +90,9 @@ pub fn install() {
     }
     let Some(target) = crate::fmg_inject::search_string_table_addr() else {
         log::warn!(
-            "hover-probe: INACTIVE -- SearchStringTable did not verify (signature mismatch or no \
-             module base), so the lookup stream cannot be watched this session"
+            "hover-probe: INACTIVE -- SearchStringTable did not verify ({}), so the lookup \
+             stream cannot be watched this session",
+            crate::game_version_gate::measured_clause()
         );
         return;
     };

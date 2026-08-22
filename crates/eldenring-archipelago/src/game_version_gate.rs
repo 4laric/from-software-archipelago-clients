@@ -93,6 +93,31 @@ fn rejection_of(error: DetectError) -> Rejection {
     }
 }
 
+/// What the running executable's PE version resource says, rendered for log lines. Same read as
+/// [`check`], same `catch_unwind` armour, but NO refusal: the answer is data, not a verdict.
+/// clients#371: a sig-mismatch warn that cannot say which exe it measured forces a human to date
+/// the failure by hand, so every SearchStringTable reject carries this clause.
+pub fn measured_clause() -> String {
+    let detected = std::panic::catch_unwind(|| {
+        // Safety: identical to `check` -- the running executable's own base, mapped for the life
+        // of the process; `PeView::module` only reads that mapping.
+        let base = unsafe { GetModuleHandleA(PCSTR(std::ptr::null())) }
+            .map_err(|_| Rejection::Metadata { missing: "module" })?
+            .0 as *const u8;
+        let module = unsafe { PeView::module(base) };
+        Supported::detect(&module).map_err(rejection_of)
+    });
+    let result = match detected {
+        Ok(Ok(Supported::Ww262)) => Ok((game_version::REQUIRED_WW, LANG_ID_EN)),
+        Ok(Ok(Supported::Jp2621)) => Ok((game_version::REQUIRED_JP, LANG_ID_JP)),
+        Ok(Err(rejection)) => Err(rejection),
+        Err(_) => Err(Rejection::Metadata {
+            missing: "readable version resource",
+        }),
+    };
+    game_version::measured_clause(&result)
+}
+
 /// Put the message in front of the player. `shared::handle_panics` owns the only other message box
 /// in the client and its helper is private, so this is a deliberate second one rather than a
 /// duplicate: this text is NOT a panic and must not be dressed as one.

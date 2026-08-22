@@ -116,6 +116,35 @@ pub fn explain(rejection: &Rejection) -> String {
     }
 }
 
+/// One compact, log-safe clause rendering what the executable's PE version resource measured --
+/// for warnings that must SELF-DATE against a moved RVA instead of naming no version at all
+/// (clients#371: the SearchStringTable sig-mismatch warn could not say whether the exe had moved
+/// off 2.6.2, because nothing in the log recorded what it saw, so a human had to date the
+/// failure by hand).
+///
+/// `Ok((version, lang_id))` is a detection this build's RVA table ACCEPTED; the `Err` arm is the
+/// same [`Rejection`] the startup gate renders for the player. The gate does the PE read; the
+/// wording lives here, host-tested, like every other string in this module.
+pub fn measured_clause(result: &Result<(&str, u16), Rejection>) -> String {
+    match result {
+        Ok((version, lang_id)) => {
+            format!("measured exe {version} (lang {lang_id:#06x}, RVA-covered)")
+        }
+        Err(Rejection::Version { detected }) => {
+            format!("measured exe {detected} (NOT covered by this build's RVA table)")
+        }
+        Err(Rejection::Language { lang_id }) => {
+            format!("measured exe lang {lang_id:#06x} (unsupported localisation)")
+        }
+        Err(Rejection::Product { actual }) => {
+            format!("measured product {actual:?} (not recognised as Elden Ring)")
+        }
+        Err(Rejection::Metadata { missing }) => {
+            format!("exe version unreadable (no {missing} metadata)")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +272,49 @@ mod tests {
             assert!(
                 msg.contains("will start normally"),
                 "{rejection:?} never says the game still boots: {msg}"
+            );
+        }
+    }
+
+    /// clients#371: a sig-mismatch warn that cannot say which exe it measured is not
+    /// self-dating. The clause must name the detected version on a miss and the covered
+    /// version on a hit, and stay one ASCII line so it survives the log.
+    #[test]
+    fn the_measured_clause_self_dates_both_arms() {
+        let hit = measured_clause(&Ok((REQUIRED_WW, LANG_ID_EN)));
+        assert!(
+            hit.contains(REQUIRED_WW),
+            "hit must name the version: {hit}"
+        );
+        assert!(hit.contains("RVA-covered"), "{hit}");
+        let miss = measured_clause(&Err(Rejection::Version {
+            detected: "2.7.0.0".into(),
+        }));
+        assert!(
+            miss.contains("2.7.0.0"),
+            "miss must name the version: {miss}"
+        );
+        assert!(miss.contains("NOT covered"), "{miss}");
+    }
+
+    #[test]
+    fn the_measured_clause_is_one_ascii_line_for_every_outcome() {
+        let cases: [Result<(&str, u16), Rejection>; 5] = [
+            Ok((REQUIRED_WW, LANG_ID_EN)),
+            Err(Rejection::Version {
+                detected: "2.2.0.0".into(),
+            }),
+            Err(Rejection::Language { lang_id: 0x0007 }),
+            Err(Rejection::Product {
+                actual: "DARK SOULS III".into(),
+            }),
+            Err(Rejection::Metadata { missing: "version" }),
+        ];
+        for result in &cases {
+            let clause = measured_clause(result);
+            assert!(
+                clause.is_ascii() && !clause.contains('\n'),
+                "offender: {clause}"
             );
         }
     }
