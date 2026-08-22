@@ -167,9 +167,24 @@ pub fn run() -> bool {
         // clients#351: guarded -- a mid-restream goods holder must defer the write, not panic.
         if let Some(row) =
             crate::param_guard::get_mut::<EquipParamGoods>(repo, gid, "shop-icon flower pass")
-            && row.icon_id() != tele_icon
         {
-            row.set_icon_id(tele_icon);
+            if row.icon_id() != tele_icon {
+                row.set_icon_id(tele_icon);
+            }
+            // HOLD-CAP RAISE (rouqs, 2026-08-22, v0.4.11): 64 of the 79 spare pool rows are
+            // vanilla maxNum=1 goods. The purchase hands the player the spare as a receipt and
+            // nothing removes it, so ER itself then refuses EVERY other purchase on that row --
+            // "would exceed the maximum able to be held" -- which under #958's cross-shop row
+            // reuse (and the old draw's shared last row) padlocks whole shelves after one buy.
+            // These rows are already ours by the real-goods guard above; raise both caps so a
+            // spare can be held once per slot that pays it. Params revert on load; reset()
+            // re-arms this pass, same as the icon.
+            if row.max_num() < 600 {
+                row.set_max_num(999);
+            }
+            if row.max_repository_num() < 600 {
+                row.set_max_repository_num(600);
+            }
         }
         if is_lock {
             locks += 1;
