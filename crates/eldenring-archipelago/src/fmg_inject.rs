@@ -846,8 +846,9 @@ unsafe fn build_validate_swap(
         // to stand on "probably fine". Revert; the caller falls back to redirect-only.
         log::error!(
             "FMG extend-swap(cat {category}): swapped a block with {} inserted record(s) but the \
-             read-back is unavailable (SearchStringTable sig / repo pointer); REVERTING to {:#x}",
+             read-back is unavailable (SearchStringTable sig / repo pointer; {}); REVERTING to {:#x}",
             r.injects.len(),
+            crate::game_version_gate::measured_clause(),
             r.md
         );
         swap_category(base, category, r.md);
@@ -1015,9 +1016,12 @@ pub fn extend_swap_overrides_tracked(
                 injects.len(),
                 overrides.len(),
                 if latched {
-                    "disabled after a failed read-back earlier this session"
+                    "disabled after a failed read-back earlier this session".to_string()
                 } else {
-                    "SearchStringTable signature mismatch, so a swap cannot be verified"
+                    format!(
+                        "SearchStringTable signature mismatch ({}), so a swap cannot be verified",
+                        crate::game_version_gate::measured_clause()
+                    )
                 }
             );
             injects.clear();
@@ -1092,7 +1096,9 @@ pub fn run() -> bool {
         // R10 (SWEEP): latch DONE -- without it this warned EVERY tick for the whole session
         // (a game patch shifts the RVA; one warn then a permanent no-op is the right degrade).
         log::warn!(
-            "FMG-inject: SearchStringTable sig mismatch; abort (latched -- synthetic naming OFF this session)"
+            "FMG-inject: SearchStringTable sig mismatch ({}); abort (latched -- synthetic naming \
+             OFF this session)",
+            crate::game_version_gate::measured_clause()
         );
         DONE.store(true, Ordering::Relaxed);
         return true;
