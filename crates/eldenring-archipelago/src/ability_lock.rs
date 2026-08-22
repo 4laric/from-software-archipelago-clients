@@ -39,8 +39,9 @@
 //! locked action the player actually pressed (`new_action_presses`, rate-limited per ability) with
 //! a session tally: if the log never says "blocked", the mask is not proven to be doing anything.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
 use eldenring::cs::WorldChrMan;
@@ -69,6 +70,12 @@ static MANAGED: AtomicU8 = AtomicU8::new(0);
 static LIVE: AtomicU8 = AtomicU8::new(0);
 /// Whether the locked set has been sourced yet (env or slot_data). The env read is one-shot.
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Progressive mode (#980): AP item id -> the ability BIT its "Unlock: X" item grants. Parsed once
+/// per seed from slot_data (abilityUnlockItems) and read while folding the received stream. Non-empty
+/// only for a progressive seed; when empty the stream unlock path is inert and LIVE is left to
+/// set_locked_mask / the console lever.
+static UNLOCK_MAP: RwLock<Option<HashMap<i64, u8>>> = RwLock::new(None);
 
 fn now_ms() -> u64 {
     CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
@@ -142,6 +149,47 @@ pub fn unlock_all() {
 /// Re-lock every managed ability.
 pub fn lock_all() {
     LIVE.store(MANAGED.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// Authoritative stream-driven state: set LIVE to exactly "managed minus unlocked". `unlocked` is
+/// the set of abilities whose Unlock item the player has received (progressive mode), recomputed
+/// from the WHOLE received stream every connect -- so this is idempotent and reconnect-safe, and it
+/// is what makes a found unlock persist across a relaunch. Only the progressive receive path calls
+/// this (when abilityUnlockItems is non-empty); env/static seeds leave LIVE to the console lever.
+pub fn set_unlocked(unlocked: u8) {
+    let managed = MANAGED.load(Ordering::Relaxed);
+    LIVE.store(managed & !unlocked, Ordering::Relaxed);
+}
+
+/// Install the progressive id->ability-bit map from slot_data (empty = not a progressive seed).
+pub fn set_unlock_map(map: HashMap<i64, u8>) {
+    *UNLOCK_MAP.write().unwrap() = if map.is_empty() { None } else { Some(map) };
+}
+
+/// True on a progressive seed (a non-empty unlock map): the caller then drives [`set_unlocked`] from
+/// the received stream instead of leaving LIVE to the console lever.
+pub fn has_unlock_map() -> bool {
+    UNLOCK_MAP.read().unwrap().is_some()
+}
+
+/// The ability bit an AP item id unlocks, or 0 if the id is not an unlock item. Folded over the whole
+/// received stream each connect to recompute the unlocked set (reconnect-safe).
+pub fn unlock_bit_for(ap_id: i64) -> u8 {
+    UNLOCK_MAP
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&ap_id).copied())
+        .unwrap_or(0)
+}
+
+/// Seed change / disconnect: forget everything so the next seed re-arms from its own slot_data (or
+/// the env, on next enforce). Mirrors the other per-seed client tables cleared in reset_for_new_seed.
+pub fn reset() {
+    MANAGED.store(0, Ordering::Relaxed);
+    LIVE.store(0, Ordering::Relaxed);
+    INITIALIZED.store(false, Ordering::Release);
+    *UNLOCK_MAP.write().unwrap() = None;
 }
 
 /// Per-frame: make the player's `disabled_action_inputs` agree with (MANAGED, LIVE). Call from the

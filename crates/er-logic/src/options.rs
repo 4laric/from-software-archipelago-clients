@@ -116,6 +116,32 @@ pub fn parse_ability_lock(slot_data: &Value) -> u8 {
         .fold(0u8, |set, a| set | a.bit())
 }
 
+/// `abilityUnlockItems`: a JSON object {ap_item_id_string: ability_name} (progressive ability lock,
+/// er-archipelago#980) -> a map from AP item id to the `ability_lock` ability BIT. Receiving one of
+/// these ids unlocks that ability. Tolerant: a non-object, an unparseable id, or an unknown ability
+/// name is skipped, never fatal, so a garbage map is simply inert. Empty/absent => empty map (the
+/// client then never drives the stream unlock path and the abilities stay statically locked).
+pub fn parse_ability_unlock_items(slot_data: &Value) -> std::collections::HashMap<i64, u8> {
+    let mut out = std::collections::HashMap::new();
+    let Some(obj) = slot_data
+        .get("abilityUnlockItems")
+        .and_then(|v| v.as_object())
+    else {
+        return out;
+    };
+    for (id_str, name) in obj {
+        let (Ok(id), Some(a)) = (
+            id_str.parse::<i64>(),
+            name.as_str()
+                .and_then(crate::ability_lock::Ability::from_name),
+        ) else {
+            continue;
+        };
+        out.insert(id, a.bit());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +285,21 @@ mod tests {
             parse_ability_lock(&json!({ "options": { "locked_abilities": "roll" } })),
             0
         );
+    }
+
+    #[test]
+    fn ability_unlock_items_maps_ids_to_bits_and_is_tolerant() {
+        use crate::ability_lock::Ability;
+        let sd = json!({ "abilityUnlockItems": { "7900002": "roll", "7900003": "r1" } });
+        let m = parse_ability_unlock_items(&sd);
+        assert_eq!(m.get(&7900002).copied(), Some(Ability::Roll.bit()));
+        assert_eq!(m.get(&7900003).copied(), Some(Ability::R1.bit()));
+        // garbage id / unknown ability / wrong container -> skipped, never fatal
+        let messy = json!({ "abilityUnlockItems": { "nope": "roll", "7900004": "wat", "7900005": "jump" } });
+        let mm = parse_ability_unlock_items(&messy);
+        assert_eq!(mm.len(), 1);
+        assert_eq!(mm.get(&7900005).copied(), Some(Ability::Jump.bit()));
+        assert!(parse_ability_unlock_items(&json!({ "abilityUnlockItems": [] })).is_empty());
+        assert!(parse_ability_unlock_items(&json!({})).is_empty());
     }
 }

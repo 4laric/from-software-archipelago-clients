@@ -101,6 +101,10 @@ pub const SUPPORTED: &[&str] = &[
     // exceeds the pool's redirectable rows; an old client would connect anyway and render the
     // `?GoodsName?` tag on those slots -- which reads as a broken seed, not an ignored option.
     "shop_preview_fmg_insert",
+    // abilityUnlockItems -> a progressive ability-lock seed's synthetic "Unlock: X" items are
+    // resolved to ability unlocks by this build (er-archipelago#980). An older client would leave
+    // the abilities locked forever and treat the items as inert, so a progressive seed refuses it.
+    "ability_unlock",
 ];
 
 /// Feature tags the seed requires that this build does not know.

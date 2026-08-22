@@ -132,6 +132,11 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("shop_preview_fmg_insert", |_| {
         crate::fmg_inject::insert_path_live()
     }),
+    // Progressive ability-lock (er-archipelago#980). The apworld declares this tag only for a
+    // progressive seed, and the read-back that answers "did it arm?" is the parse itself: a
+    // non-empty unlock map means this build turned abilityUnlockItems into concrete id->ability
+    // bindings. Same shape as armor_bundles -- concrete members to apply, not a bare option flag.
+    ("ability_unlock", |_| crate::ability_lock::has_unlock_map()),
 ];
 
 /// Build the `(tag, live)` table this connect.

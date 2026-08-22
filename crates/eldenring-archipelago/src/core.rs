@@ -1270,6 +1270,12 @@ impl shared::Core for Core {
                 crate::shop_preview::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
                 let armor_bundles = i64_to_i32_list_map(sd.get("armorBundles"));
+                // Progressive ability-lock (#980): AP id -> ability bit. Stored in the ability_lock
+                // module (not threaded through the parse tuple) so the received-stream fold can read
+                // it without a Core field. Empty for a static/non-progressive seed.
+                crate::ability_lock::set_unlock_map(
+                    er_logic::options::parse_ability_unlock_items(sd),
+                );
                 let mut region = crate::region::parse(sd);
                 // Arm shop_preview to MARK region-lock rewards that land in a shop (a lock reward
                 // otherwise reads as its vanilla good, e.g. "Note: Sealed Spiritsprings", with no hint
@@ -2500,6 +2506,10 @@ impl shared::Core for Core {
         // name, so a foreign apworld (Bedrock/fswap) that calls its fragments something else still
         // counts — a name match would fail silently on exactly the seeds we cannot test.
         let mut scadu_fragment_units: i32 = 0;
+        // Progressive ability-lock (#980): OR of the ability bits whose Unlock item is anywhere in
+        // the received stream. Recomputed from the WHOLE stream every pass (like the fragment total
+        // above), so a found unlock survives a relaunch -- see ability_lock::set_unlocked.
+        let mut ability_unlock_bits: u8 = 0;
         // #342, and the SAME history-agnostic doctrine as `flask_upgrade_count` above: a talisman's
         // slot is decided by its position in the received stream and by how many Talisman Pouches
         // preceded it, both walked over the WHOLE stream rather than the watermarked tail.
@@ -2550,6 +2560,7 @@ impl shared::Core for Core {
                 if name == crate::flask::FLASK_UPGRADE_ITEM {
                     flask_upgrade_count += 1;
                 }
+                ability_unlock_bits |= crate::ability_lock::unlock_bit_for(ri.item().id());
                 if let Some(map) = self.item_map.as_ref() {
                     scadu_fragment_units += er_logic::upgrades::fragment_units_for(
                         ri.item().id(),
@@ -2619,6 +2630,12 @@ impl shared::Core for Core {
             // checks once crossed seeds). A reconnect replays the whole stream, so the first pass
             // after connecting recomputes the total from scratch.
             crate::upgrades::set_received_fragments(scadu_fragment_units);
+            // Progressive ability-lock: on a progressive seed, LIVE = locked set minus everything
+            // whose Unlock item has arrived. No-op for static/env seeds (empty map). Idempotent and
+            // reconnect-safe -- the whole stream was just folded, so this is authoritative each pass.
+            if crate::ability_lock::has_unlock_map() {
+                crate::ability_lock::set_unlocked(ability_unlock_bits);
+            }
         }
 
         // #549. Publish the below-watermark spells for `auto_equip::tick_spell_backfill`.
@@ -4832,6 +4849,7 @@ impl Core {
         crate::keyitems::reset_seed_great_runes();
         self.item_counts.clear();
         self.armor_bundles.clear();
+        crate::ability_lock::reset();
         self.region = None;
         self.fogwall = None;
         self.progressive = ProgressiveState::new(HashMap::new());
