@@ -1593,6 +1593,12 @@ impl shared::Core for Core {
                 // contract hash: shop_hints inverts it to turn a live row's eventFlag_forStock
                 // into the AP location a shop-open should announce (er_logic::shop_hints).
                 crate::shop_hints::configure(loc_flags.clone());
+                // clients#385: the missed corpse-award sweep -- same flag universe the shop
+                // modules receive; the table intersection keeps it to this seed's checks.
+                crate::death_award_sweep::configure(
+                    static_table_path("death_award_pairs.json"),
+                    loc_flags.values().copied().collect(),
+                );
                 // shopRunePrices: {ShopLineupParam row id (str) -> rolled rune price}.
                 crate::shop_prices::configure(
                     i64_to_u32_map(sd.get("shopRunePrices"))
@@ -4349,6 +4355,9 @@ impl shared::Core for Core {
             // must not stall the rewrite.
             let _ = crate::check_lots::dress_placeholder();
             let _ = crate::shop_preview::run();
+            // clients#385: one pass per connect -- pays any check whose corpse-award the game
+            // recorded a death for and never delivered (flags readable in this in-world block).
+            crate::death_award_sweep::run();
             // #937 repaint: rewrite the just-opened shelf's rows to THIS shop's claimants. AFTER
             // run() on purpose -- a re-armed baseline must publish its padded blocks in the same
             // tick before the repaint writes into them.
