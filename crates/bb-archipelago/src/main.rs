@@ -163,6 +163,11 @@ fn main() -> Result<()> {
             .shad_log
             .as_deref()
             .context("live mode requires shad_log in the runtime config")?;
+        // clients#369: fail fast on path misconfiguration (bridge_root) before
+        // arming. shad_log is deliberately not preflighted: the attach retry
+        // loop tolerates shadPS4 starting after the client, and its error now
+        // names the setting.
+        config.preflight_paths()?;
         let event_flags = attach_live_event_flags(shad_log)?;
         let attachment = event_flags.info();
         eprintln!(
@@ -187,7 +192,8 @@ fn main() -> Result<()> {
             FileBackend::new(bridge, event_flags)
         })
     };
-    let ledger = ReceiveLedger::load(&args.ledger)?;
+    let ledger = ReceiveLedger::load(&args.ledger)
+        .with_context(|| format!("loading receive ledger {}", args.ledger.display()))?;
     let mut backend = Some(backend);
     let mut ledger = Some(ledger);
     let mut options = ConnectionOptions::new().receive_items(ItemHandling::OtherWorlds {

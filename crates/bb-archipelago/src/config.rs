@@ -209,9 +209,9 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let config: Self =
-            json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+        let bytes = read_setting("runtime config", path)?;
+        let config: Self = json::from_slice(&bytes)
+            .with_context(|| format!("parsing runtime config {}", path.display()))?;
         config.validate_items()?;
         Ok(config)
     }
@@ -341,10 +341,9 @@ impl RuntimeConfig {
             .installed_gameparam
             .as_deref()
             .context("seed requires vanilla-award suppression; configure installed_gameparam")?;
-        let manifest_bytes = fs::read(manifest_path)
-            .with_context(|| format!("reading suppression manifest {}", manifest_path.display()))?;
+        let manifest_bytes = read_setting("suppression_manifest", manifest_path)?;
         let manifest: SuppressionManifest = json::from_slice(&manifest_bytes)
-            .with_context(|| format!("parsing suppression manifest {}", manifest_path.display()))?;
+            .with_context(|| format!("parsing suppression_manifest {}", manifest_path.display()))?;
         anyhow::ensure!(
             manifest.format == self.suppression.manifest_format,
             "suppression manifest format mismatch: expected {:?}, found {:?}",
@@ -378,13 +377,18 @@ impl RuntimeConfig {
         if let Some(build_root) = manifest_path.parent() {
             let build_output = build_root.join("gameparam.parambnd.dcx");
             if build_output.exists() {
+                let build_resolved = fs::canonicalize(&build_output).map_err(|error| {
+                    setting_error("suppression build output", &build_output, error)
+                })?;
+                let installed_resolved = fs::canonicalize(installed_path)
+                    .map_err(|error| setting_error("installed_gameparam", installed_path, error))?;
                 anyhow::ensure!(
-                    fs::canonicalize(&build_output)? != fs::canonicalize(installed_path)?,
+                    build_resolved != installed_resolved,
                     "installed_gameparam points to the separate build artifact, not the game installation"
                 );
             }
         }
-        let installed_hash = sha256_file(installed_path)?;
+        let installed_hash = sha256_file("installed_gameparam", installed_path)?;
         anyhow::ensure!(
             installed_hash == manifest.output_gameparam_sha256,
             "installed gameparam mismatch: expected {}, found {} at {}",
@@ -393,6 +397,19 @@ impl RuntimeConfig {
             installed_path.display()
         );
         Ok(Some(installed_hash))
+    }
+
+    /// clients#369: fail fast on path misconfiguration that would otherwise
+    /// surface deep in the polling loop as a bare OS error. `shad_log` is
+    /// intentionally NOT checked here: the attach retry loop tolerates
+    /// shadPS4 starting after the client, and its error now names the setting.
+    pub fn preflight_paths(&self) -> Result<()> {
+        fs::create_dir_all(&self.bridge_root).map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "bridge_root cannot be created: {}",
+                self.bridge_root.display()
+            ))
+        })
     }
 }
 
@@ -408,14 +425,30 @@ fn require_sha256(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+/// clients#369: every runtime-config filesystem failure names the setting and
+/// the resolved path, distinguishes a missing path from an unreadable one,
+/// and keeps the OS error as the final source of the chain.
+fn setting_error(setting: &str, path: &Path, error: std::io::Error) -> anyhow::Error {
+    let action = if error.kind() == std::io::ErrorKind::NotFound {
+        format!("{setting} does not exist: {}", path.display())
+    } else {
+        format!("{setting} cannot be read: {}", path.display())
+    };
+    anyhow::Error::new(error).context(action)
+}
+
+fn read_setting(setting: &str, path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|error| setting_error(setting, path, error))
+}
+
+fn sha256_file(setting: &str, path: &Path) -> Result<String> {
+    let mut file = File::open(path).map_err(|error| setting_error(setting, path, error))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
-            .with_context(|| format!("hashing {}", path.display()))?;
+            .map_err(|error| setting_error(setting, path, error))?;
         if read == 0 {
             break;
         }
@@ -614,7 +647,7 @@ mod tests {
             .join("gameparam.parambnd.dcx");
         fs::create_dir_all(installed.parent().unwrap()).unwrap();
         fs::write(&installed, b"verified suppressed binder").unwrap();
-        let output_hash = sha256_file(&installed).unwrap();
+        let output_hash = sha256_file("installed_gameparam", &installed).unwrap();
         let plan_hash = "1".repeat(64);
         let manifest = root.join("build-manifest.json");
         fs::write(
@@ -639,7 +672,7 @@ mod tests {
         };
         assert_eq!(
             config.verify_suppression_install().unwrap(),
-            Some(sha256_file(&installed).unwrap())
+            Some(sha256_file("installed_gameparam", &installed).unwrap())
         );
         fs::write(&installed, b"not the built binder").unwrap();
         let error = config.verify_suppression_install().unwrap_err();
@@ -657,5 +690,88 @@ mod tests {
             FeedEffectBinding::RuneWorkshopTool.effect(),
             FeedEffect::RuneWorkshopTool
         );
+    }
+
+    #[test]
+    fn missing_runtime_config_names_the_role_and_path() {
+        let path =
+            std::env::temp_dir().join(format!("bb-369-missing-config-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let error = RuntimeConfig::load(&path).unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("runtime config does not exist"));
+        assert!(diagnostic.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn missing_suppression_manifest_names_the_setting_and_path() {
+        let root = std::env::temp_dir().join(format!("bb-369-manifest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("absent-manifest.json");
+        let mut config = local();
+        config.suppression_manifest = Some(manifest.clone());
+        config.installed_gameparam = Some(root.join("unused"));
+        config.suppression = SuppressionRequirement {
+            required: true,
+            manifest_format: "bb-vanilla-suppression-build-v1".into(),
+            plan_sha256: "1".repeat(64),
+        };
+        let error = config.verify_suppression_install().unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("suppression_manifest does not exist"));
+        assert!(diagnostic.contains(&manifest.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_installed_gameparam_names_the_setting_and_path() {
+        let root = std::env::temp_dir().join(format!("bb-369-installed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("build-manifest.json");
+        fs::write(
+            &manifest,
+            json::to_vec_pretty(&json!({
+                "format": "bb-vanilla-suppression-build-v1",
+                "plan_sha256": "1".repeat(64),
+                "output_gameparam_sha256": "2".repeat(64),
+                "output_relative_path": "param/gameparam/gameparam.parambnd.dcx"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let installed = root
+            .join("game-install")
+            .join("param")
+            .join("gameparam")
+            .join("gameparam.parambnd.dcx");
+        let mut config = local();
+        config.suppression_manifest = Some(manifest);
+        config.installed_gameparam = Some(installed.clone());
+        config.suppression = SuppressionRequirement {
+            required: true,
+            manifest_format: "bb-vanilla-suppression-build-v1".into(),
+            plan_sha256: "1".repeat(64),
+        };
+        let error = config.verify_suppression_install().unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("installed_gameparam does not exist"));
+        assert!(diagnostic.contains(&installed.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preflight_reports_an_uncreatable_bridge_root() {
+        let root = std::env::temp_dir().join(format!("bb-369-bridge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("blocker");
+        fs::write(&blocker, b"not a directory").unwrap();
+        let mut config = local();
+        config.bridge_root = blocker.join("bridge");
+        let error = config.preflight_paths().unwrap_err();
+        assert!(format!("{error:#}").contains("bridge_root"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
