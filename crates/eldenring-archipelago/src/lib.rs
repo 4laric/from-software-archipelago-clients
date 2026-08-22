@@ -14,6 +14,7 @@ mod check_lots;
 mod config_watch;
 mod contract_gen;
 mod core;
+mod death_award_sweep;
 mod deathlink;
 mod detour;
 mod downstate_probe;
