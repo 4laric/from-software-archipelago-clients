@@ -15,7 +15,7 @@ use bb_archipelago::bridge::FileBridge;
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::LiveEventFlags;
-use bb_archipelago::ledger::ReceiveLedger;
+use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
 
 enum Backend {
     Live(FileBackend),
@@ -62,6 +62,22 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.withdraw_unwitnessed_grant(tag),
             Self::Mock(backend) => backend.withdraw_unwitnessed_grant(tag),
+        }
+    }
+
+    // Forward the watermark hooks rather than inheriting the attested-mode
+    // defaults, or mock mode could never exercise the watermark path.
+    fn read_save_watermark(&mut self) -> Result<Option<u64>> {
+        match self {
+            Self::Live(backend) => backend.read_save_watermark(),
+            Self::Mock(backend) => backend.read_save_watermark(),
+        }
+    }
+
+    fn write_save_watermark(&mut self, cursor: u64) -> Result<bool> {
+        match self {
+            Self::Live(backend) => backend.write_save_watermark(cursor),
+            Self::Mock(backend) => backend.write_save_watermark(cursor),
         }
     }
 }
@@ -283,6 +299,27 @@ fn main() -> Result<()> {
         }
 
         if let (Some(runtime), Some(client)) = (runtime.as_mut(), connection.client_mut()) {
+            while let Some(outcome) = runtime.take_watermark_notice() {
+                // docs/SAVE-RECONCILIATION.md §8: every non-resume comparison
+                // prints one line a player can act on, once per transition.
+                match outcome {
+                    WatermarkOutcome::Resume => eprintln!(
+                        "Save watermark readable again; delivery state verified, resuming."
+                    ),
+                    WatermarkOutcome::Reissue => eprintln!(
+                        "Restore detected: the save is behind the delivery ledger; \
+                         re-delivering the erased items in order."
+                    ),
+                    WatermarkOutcome::AdoptSaveCursor => eprintln!(
+                        "The delivery ledger is behind the save (ledger loss or rollback); \
+                         adopting the save cursor -- nothing is re-granted."
+                    ),
+                    WatermarkOutcome::Hold => eprintln!(
+                        "Held: delivery state could not be verified; no items granted, \
+                         no checks sent."
+                    ),
+                }
+            }
             let checked = client
                 .checked_locations()
                 .map(|location| location.id())
@@ -348,6 +385,9 @@ fn main() -> Result<()> {
                     );
                 }
                 Ok(ItemPollResult::Idle | ItemPollResult::Pending) => {}
+                // Held and Reconciled are surfaced through the watermark
+                // notice channel above, exactly once per transition.
+                Ok(ItemPollResult::Held | ItemPollResult::Reconciled(_)) => {}
                 Err(error) => {
                     let message = format!("{error:#}");
                     let report = last_item_error.as_ref().is_none_or(|(previous, when)| {

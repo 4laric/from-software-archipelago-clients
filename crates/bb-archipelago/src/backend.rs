@@ -60,6 +60,21 @@ pub trait BloodborneBackend {
     /// withdraw. See `FileBridge::withdraw_unwitnessed_command` for what
     /// "unwitnessed" means and why witnessed commands are left alone.
     fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool>;
+    /// Read the save-resident receive watermark (bb-archipelago#77). `None`
+    /// means no watermark is available: either the backend has no writable
+    /// save field yet (the attested-mode status quo) or a previously recorded
+    /// field is unreadable -- the client distinguishes the two from its own
+    /// ledger. The default keeps live builds in attested mode.
+    fn read_save_watermark(&mut self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    /// Persist the receive cursor into the save after acknowledgement.
+    /// Returns `true` only when the value was actually written; the default
+    /// declines, which keeps the slot in attested mode. A write failure is
+    /// non-fatal: the delivery is already acknowledged in the durable ledger.
+    fn write_save_watermark(&mut self, _cursor: u64) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub struct FileBackend {
@@ -212,6 +227,7 @@ impl BloodborneBackend for FileBackend {
     }
 }
 
+#[derive(Clone)]
 pub struct MockBackend {
     pub set_flags: HashSet<u32>,
     pub location_context: Option<LocationContext>,
@@ -224,6 +240,13 @@ pub struct MockBackend {
     /// mock answers `true`: from the loop's perspective an unwitnessed command
     /// existed and is now withdrawn.
     pub withdrawn: Vec<String>,
+    /// Whether this mock simulates a save with a writable receive watermark
+    /// (bb-archipelago#77). Off by default so the pre-watermark fixtures stay
+    /// in attested mode.
+    pub watermark_supported: bool,
+    /// The mock save's watermark field. `None` while `watermark_supported` is
+    /// on simulates a recorded field that has become unreadable.
+    pub watermark: Option<u64>,
     grant_delays: HashMap<String, u8>,
     equip_delays: HashMap<String, u8>,
     completed_grants: HashSet<String>,
@@ -243,6 +266,8 @@ impl Default for MockBackend {
             grants: Vec::new(),
             equips: Vec::new(),
             withdrawn: Vec::new(),
+            watermark_supported: false,
+            watermark: None,
             grant_delays: HashMap::new(),
             equip_delays: HashMap::new(),
             completed_grants: HashSet::new(),
@@ -258,6 +283,22 @@ impl MockBackend {
 
     pub fn delay_equip(&mut self, tag: impl Into<String>, polls: u8) {
         self.equip_delays.insert(tag.into(), polls);
+    }
+
+    /// Simulate a save restore (bb-archipelago#77): the game-side state rewinds
+    /// to the restored snapshot -- inventory contents, the watermark field, and
+    /// the memory of which bridge commands already executed -- while the
+    /// client's durable ledger is untouched. Detection of that rewind is the
+    /// watermark's job; this helper only arranges the game side.
+    pub fn restore_save(
+        &mut self,
+        watermark: Option<u64>,
+        inventory: HashMap<(u32, Option<u8>), u32>,
+    ) {
+        self.watermark = watermark;
+        self.inventory = inventory;
+        self.completed_grants.clear();
+        self.completed_equips.clear();
     }
 
     fn delayed(delays: &mut HashMap<String, u8>, tag: &str) -> bool {
@@ -327,6 +368,18 @@ impl BloodborneBackend for MockBackend {
 
     fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
         self.withdrawn.push(tag.to_owned());
+        Ok(true)
+    }
+
+    fn read_save_watermark(&mut self) -> Result<Option<u64>> {
+        Ok(self.watermark_supported.then_some(self.watermark).flatten())
+    }
+
+    fn write_save_watermark(&mut self, cursor: u64) -> Result<bool> {
+        if !self.watermark_supported {
+            return Ok(false);
+        }
+        self.watermark = Some(cursor);
         Ok(true)
     }
 }
