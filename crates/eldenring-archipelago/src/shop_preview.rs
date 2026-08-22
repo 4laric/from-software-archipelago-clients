@@ -157,10 +157,15 @@ pub fn reset() {
     DONE.store(false, Ordering::Relaxed);
     NAME_RETRIES.store(0, Ordering::Relaxed);
     // #937 repaint state: the load edge that armed this reset also reverted the category pointers,
-    // so the recorded blocks are history and any pending shelf belongs to a menu that cannot
-    // survive a load. (`PER_LOC` is seed-scoped and re-filled by the next run(); left alone.)
+    // so the recorded blocks are history and the painted-latch with them. PENDING_RANGE is
+    // deliberately KEPT: the edge detection can LAG the world, and a player who warps to a
+    // merchant and opens the menu fast marks the range BEFORE this reset fires -- clearing it
+    // here silently ate that open, and the shelf showed baseline labels until the next visit
+    // (rouqs, 2026-08-22 09:56: re-arm and shop open in the same second, no repaint line). A
+    // genuinely stale range is harmless: the repaint rewrites only our own padded rows, and the
+    // block-identity guard already refuses anything older than the re-published baseline.
+    // (`PER_LOC` is seed-scoped and re-filled by the next run(); left alone.)
     *MY_BLOCKS.lock().unwrap() = [None; 3];
-    PENDING_RANGE.lock().unwrap().take();
     PAINTED.lock().unwrap().take();
 }
 
@@ -432,7 +437,11 @@ pub fn repaint_tick() {
     if claims.is_empty() {
         PENDING_RANGE.lock().unwrap().take();
         *PAINTED.lock().unwrap() = Some((lo, hi));
-        return; // a shelf with no overridden AP slots (all own-world/vanilla)
+        // Say so: a silent early-out here is how the eaten-pending bug hid. One line, open-rate.
+        log::info!(
+            "shop-preview: shelf rows {lo}..={hi} has no overridden AP slots -- nothing to repaint"
+        );
+        return;
     }
     let overrides = er_logic::shop_repaint::per_shop_overrides(&claims);
     use crate::fmg_inject::{RewriteOutcome, rewrite_in_place};
