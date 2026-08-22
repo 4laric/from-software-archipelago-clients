@@ -31,6 +31,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+use fromsoftware_shared::FromStatic;
+
 use er_logic::ability_lock::{
     Ability, GamepadMask, gamepad_mask, parse_set, set_names, suppressed,
 };
