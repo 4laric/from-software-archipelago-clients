@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use crate::backend::{BloodborneBackend, EquipRequest, ItemGrant, OperationProgress};
 use crate::config::RuntimeConfig;
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
-use crate::ledger::{AcknowledgedItem, PendingItem, ReceiveLedger};
+use crate::ledger::{AcknowledgedItem, PendingItem, ReceiveLedger, WatermarkOutcome};
 use crate::upgrades::auto_upgrade_level;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +36,12 @@ pub struct CompletedItem {
 pub enum ItemPollResult {
     Idle,
     Pending,
+    /// A recorded save watermark is unreadable: no grants and no checks until
+    /// it recovers (docs/SAVE-RECONCILIATION.md §5, invariant I3).
+    Held,
+    /// The save and ledger disagreed and were reconciled this poll; the
+    /// outcome is reported and delivery resumes next poll.
+    Reconciled(WatermarkOutcome),
     Completed(CompletedItem),
 }
 
@@ -48,6 +54,8 @@ pub struct ClientLoop<B> {
     slot_name: String,
     location_identity: Option<String>,
     location_true_streaks: HashMap<i64, u8>,
+    last_watermark_outcome: WatermarkOutcome,
+    watermark_notice: Option<WatermarkOutcome>,
 }
 
 impl<B: BloodborneBackend> ClientLoop<B> {
@@ -68,7 +76,46 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             slot_name: slot_name.into(),
             location_identity: None,
             location_true_streaks: HashMap::new(),
+            last_watermark_outcome: WatermarkOutcome::Resume,
+            watermark_notice: None,
         }
+    }
+
+    /// Outcome transitions of the save-watermark comparison, for the operator
+    /// surface (docs/SAVE-RECONCILIATION.md §8). Each transition is reported
+    /// once; `main` drains this every loop.
+    pub fn take_watermark_notice(&mut self) -> Option<WatermarkOutcome> {
+        self.watermark_notice.take()
+    }
+
+    /// Compare the save-resident watermark with the durable ledger cursor and
+    /// apply the one defined outcome (bb-archipelago#77). Idempotent: the
+    /// location and item polls both call it each loop, and the second call
+    /// observes the reconciled state. Only valid under a validated context --
+    /// identity refusal must precede any watermark comparison (§5).
+    fn reconcile_watermark(&mut self) -> Result<WatermarkOutcome> {
+        let active = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .is_some_and(|slot| slot.save_watermark.is_some());
+        let observed = self.backend.read_save_watermark()?;
+        if !active && observed.is_none() {
+            // Attested mode: no watermark has ever been written or read for
+            // this slot. Zero behavior change.
+            return Ok(WatermarkOutcome::Resume);
+        }
+        let outcome = self
+            .ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .reconcile_save_watermark(observed);
+        if outcome != WatermarkOutcome::Resume {
+            self.ledger.save(&self.ledger_path)?;
+        }
+        if outcome != self.last_watermark_outcome {
+            self.last_watermark_outcome = outcome;
+            self.watermark_notice = Some(outcome);
+        }
+        Ok(outcome)
     }
 
     pub fn backend(&self) -> &B {
@@ -146,6 +193,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         if self.location_identity.as_deref() != Some(&context_identity) {
             self.location_true_streaks.clear();
             self.location_identity = Some(context_identity);
+        }
+        // A held watermark silences checks as well as grants (§5): a save
+        // whose delivery state cannot be verified is not read for checks
+        // either. Reissue/adopt outcomes leave flag polling alone -- a
+        // restored save simply reads false until the flags are earned again.
+        if self.reconcile_watermark()? == WatermarkOutcome::Hold {
+            self.location_true_streaks.clear();
+            return Ok(Vec::new());
         }
 
         let mut newly_checked = Vec::new();
@@ -280,6 +335,27 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .map_or(0, |slot| slot.next_index());
         let indexed = Self::indexed_received(received)?;
         let Some(&ap_item_id) = indexed.get(&next) else {
+            // Nothing to deliver -- but a restore can still have happened
+            // (every item delivered, then the save rolled back). Compare the
+            // watermark whenever one is active. This path never arms a
+            // binding and never refuses: a missing or mismatched context keeps
+            // idle delivery exactly as silent as before.
+            let watermark_active = self
+                .ledger
+                .slot(&self.seed_name, &self.slot_name)
+                .is_some_and(|slot| slot.save_watermark.is_some());
+            if watermark_active
+                && matches!(
+                    self.require_runtime_context("save-watermark reconciliation"),
+                    Ok(Some(_))
+                )
+            {
+                return Ok(match self.reconcile_watermark()? {
+                    WatermarkOutcome::Resume => ItemPollResult::Idle,
+                    WatermarkOutcome::Hold => ItemPollResult::Held,
+                    outcome => ItemPollResult::Reconciled(outcome),
+                });
+            }
             return Ok(ItemPollResult::Idle);
         };
         let item = IncomingItem {
@@ -322,6 +398,15 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 }
                 return Err(error);
             }
+        }
+
+        // Context validated (identity refusal never reaches here): compare the
+        // save watermark before any grant work. Hold abstains; reissue/adopt
+        // are reported once and replay starts next poll.
+        match self.reconcile_watermark()? {
+            WatermarkOutcome::Resume => {}
+            WatermarkOutcome::Hold => return Ok(ItemPollResult::Held),
+            outcome => return Ok(ItemPollResult::Reconciled(outcome)),
         }
 
         let mut pending = match self
@@ -407,6 +492,21 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     equip_target: pending.equip_target,
                 },
             )?;
+        // Record the receive cursor into the save when the backend supports
+        // it (bb-archipelago#77). Declined or failed writes leave the slot in
+        // attested mode; the delivery is already acknowledged, so a watermark
+        // failure must never fail the poll.
+        match self.backend.write_save_watermark(item.index) {
+            Ok(true) => {
+                self.ledger
+                    .slot_mut(&self.seed_name, &self.slot_name)
+                    .save_watermark = Some(item.index);
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "Save watermark write failed (the delivery stands; restore detection stays attested): {error:#}"
+            ),
+        }
         self.ledger.save(&self.ledger_path)?;
         let received_level = self
             .config
@@ -1203,6 +1303,398 @@ mod tests {
         assert!(restarted.backend().grants.is_empty());
         assert_eq!(restarted.backend().equips.len(), 1);
         assert_eq!(restarted.backend().equips[0].reinforcement_level, Some(4));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    // docs/SAVE-RECONCILIATION.md §9: the six save-restore shapes, exercised
+    // end-to-end against the mock save (bb-archipelago#77).
+
+    #[test]
+    fn restore_with_consumed_goods_replays_only_the_erased_tail() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.watermark_supported = true;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [
+            IncomingItem {
+                index: 0,
+                ap_item_id: 2000,
+            },
+            IncomingItem {
+                index: 1,
+                ap_item_id: 2000,
+            },
+        ];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert_eq!(client.backend().watermark, Some(1));
+        assert_eq!(client.backend().inventory[&(0x4000_04CE, None)], 2);
+
+        // The player consumes one pebble and restores a save from before index
+        // 1 was granted: game-side state rewinds, the client ledger does not.
+        client
+            .backend_mut()
+            .restore_save(Some(0), HashMap::from([((0x4000_04CE, None), 1)]));
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Reconciled(WatermarkOutcome::Reissue)
+        );
+        assert_eq!(
+            client.take_watermark_notice(),
+            Some(WatermarkOutcome::Reissue)
+        );
+
+        // The replay re-grants exactly the erased tail: expected_before comes
+        // from the rewound ledger (1), matching the restored save -- never
+        // from the pre-restore ledger (2), which the mock would reject, and
+        // never from scanning the inventory (§4).
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 1, .. })
+        ));
+        assert_eq!(client.backend().grants.len(), 3);
+        assert_eq!(client.backend().grants[2].expected_before, 1);
+        assert_eq!(client.backend().watermark, Some(1));
+        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Idle);
+        assert_eq!(
+            client.ledger().slot("seed", "slot").unwrap().next_index(),
+            2
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn restore_across_an_equipment_ack_replays_grant_and_equip() {
+        let ledger_path = path();
+        let mut runtime_config = config();
+        runtime_config.auto_upgrade = true;
+        runtime_config.auto_equip = true;
+        runtime_config.items.insert(
+            3000,
+            RuntimeItemBinding {
+                raw_descriptor: 0x8012_3400,
+                normalized_item_id: 0x0012_3400,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
+                quantity: 1,
+                reinforcement_level: Some(0),
+                feed_effect: FeedEffectBinding::RightHandWeapon,
+            },
+        );
+        let received = [
+            IncomingItem {
+                index: 0,
+                ap_item_id: 3000,
+            },
+            IncomingItem {
+                index: 1,
+                ap_item_id: 3000,
+            },
+        ];
+        let mut backend = MockBackend::default();
+        backend.watermark_supported = true;
+        backend.upgrade_target_level = Some(6);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            runtime_config,
+        );
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert_eq!(client.backend().grants.len(), 2);
+        assert_eq!(client.backend().equips.len(), 2);
+
+        // Restore to before index 1: the save keeps the first weapon (granted
+        // and auto-upgraded to +6) and forgets the second entirely.
+        client
+            .backend_mut()
+            .restore_save(Some(0), HashMap::from([((0x0012_3400, Some(6)), 1)]));
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Reconciled(WatermarkOutcome::Reissue)
+        );
+
+        // The replay re-executes BOTH halves of the erased acknowledgement:
+        // the grant against the restored inventory, then the equip of the
+        // re-planned target. Neither half consulted inventory contents to
+        // decide whether the item was missing.
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 1, .. })
+        ));
+        assert_eq!(client.backend().grants.len(), 3);
+        assert_eq!(client.backend().grants[2].expected_before, 1);
+        assert_eq!(client.backend().equips.len(), 3);
+        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Idle);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn ledger_loss_adopts_the_save_cursor_without_regranting() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.watermark_supported = true;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [
+            IncomingItem {
+                index: 0,
+                ap_item_id: 2000,
+            },
+            IncomingItem {
+                index: 1,
+                ap_item_id: 2000,
+            },
+        ];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        let backend_after_delivery = client.backend().clone();
+        assert_eq!(backend_after_delivery.grants.len(), 2);
+
+        // The durable ledger is lost (disk failure, fresh install): the save's
+        // watermark is the only surviving cursor.
+        std::fs::remove_file(&ledger_path).unwrap();
+        let mut restarted = loop_with(
+            backend_after_delivery,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        assert_eq!(
+            restarted.poll_items(&received).unwrap(),
+            ItemPollResult::Reconciled(WatermarkOutcome::AdoptSaveCursor)
+        );
+        assert_eq!(
+            restarted.take_watermark_notice(),
+            Some(WatermarkOutcome::AdoptSaveCursor)
+        );
+        // Nothing is re-granted (I1): the cursor jumps to the save's
+        // watermark and delivery of anything new resumes from there.
+        assert_eq!(
+            restarted.poll_items(&received).unwrap(),
+            ItemPollResult::Idle
+        );
+        assert_eq!(restarted.backend().grants.len(), 2);
+        assert_eq!(
+            restarted
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .next_index(),
+            2
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn identity_refusal_precedes_watermark_comparison() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.watermark_supported = true;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [
+            IncomingItem {
+                index: 0,
+                ap_item_id: 2000,
+            },
+            IncomingItem {
+                index: 1,
+                ap_item_id: 2000,
+            },
+            IncomingItem {
+                index: 2,
+                ap_item_id: 2000,
+            },
+        ];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+
+        // A different character is loaded, and its save field happens to read
+        // a lower watermark than this slot's ledger cursor: if the comparison
+        // ran first it would rewind the ledger on the strength of a foreign
+        // save. Identity refusal must precede any watermark comparison (§5).
+        client.backend_mut().location_context = Some(LocationContext {
+            save_identity: "other-save".into(),
+            gameplay_ready: true,
+        });
+        client.backend_mut().watermark = Some(0);
+        let error = client.poll_items(&received).unwrap_err();
+        assert!(format!("{error:#}").contains("refused save identity"));
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert_eq!(slot.next_index(), 2);
+        assert_eq!(slot.save_watermark, Some(1));
+        assert_eq!(slot.acknowledged.len(), 2);
+        assert_eq!(client.backend().grants.len(), 2);
+        assert!(client.take_watermark_notice().is_none());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn unreadable_watermark_holds_until_it_recovers() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.watermark_supported = true;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [
+            IncomingItem {
+                index: 0,
+                ap_item_id: 2000,
+            },
+            IncomingItem {
+                index: 1,
+                ap_item_id: 2000,
+            },
+        ];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+
+        // A watermark was recorded for this slot and is now unreadable: no
+        // grants and no location checks until it recovers (I3) -- a save whose
+        // delivery state cannot be verified is treated as unverifiable, not as
+        // restored.
+        client.backend_mut().watermark = None;
+        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Held);
+        assert_eq!(client.take_watermark_notice(), Some(WatermarkOutcome::Hold));
+        assert_eq!(client.backend().grants.len(), 1);
+        assert!(client.poll_locations(&HashSet::new()).unwrap().is_empty());
+
+        // The field reads again and matches the ledger: delivery resumes
+        // exactly where it stopped.
+        client.backend_mut().watermark = Some(0);
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 1, .. })
+        ));
+        assert_eq!(
+            client.take_watermark_notice(),
+            Some(WatermarkOutcome::Resume)
+        );
+        assert_eq!(client.backend().grants.len(), 2);
+        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Idle);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn attested_restore_replays_once_and_is_fixed_point_across_restart() {
+        // Attested mode is the MVP path (§5): no watermark support anywhere,
+        // and the operator attests the restore out of band (bb-restored).
+        let ledger_path = path();
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [
+            IncomingItem {
+                index: 0,
+                ap_item_id: 2000,
+            },
+            IncomingItem {
+                index: 1,
+                ap_item_id: 2000,
+            },
+        ];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        drop(client);
+
+        // Operator attestation (bb-restored): "the save was restored to before
+        // index 1". No watermark is recorded or observed anywhere.
+        let mut ledger = ReceiveLedger::load(&ledger_path).unwrap();
+        assert_eq!(ledger.slot_mut("seed", "slot").attest_restore(1), 1);
+        ledger.save(&ledger_path).unwrap();
+
+        // The restarted client replays exactly the attested tail against the
+        // restored inventory, and the watermark machinery stays out of the way
+        // (nothing recorded, nothing observed -> Resume, the status quo).
+        let mut restored_backend = MockBackend::default();
+        restored_backend.inventory.insert((0x4000_04CE, None), 1);
+        let mut replayed = loop_with(
+            restored_backend,
+            ReceiveLedger::load(&ledger_path).unwrap(),
+            ledger_path.clone(),
+            config(),
+        );
+        assert!(matches!(
+            replayed.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 1, .. })
+        ));
+        assert_eq!(replayed.backend().grants.len(), 1);
+        assert_eq!(
+            replayed.poll_items(&received).unwrap(),
+            ItemPollResult::Idle
+        );
+        assert!(
+            replayed
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .save_watermark
+                .is_none()
+        );
+
+        // A second restart is a fixed point: nothing replays again.
+        let mut settled = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::load(&ledger_path).unwrap(),
+            ledger_path.clone(),
+            config(),
+        );
+        assert_eq!(settled.poll_items(&received).unwrap(), ItemPollResult::Idle);
+        assert!(settled.backend().grants.is_empty());
         std::fs::remove_file(ledger_path).unwrap();
     }
 }

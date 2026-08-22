@@ -22,6 +22,30 @@ pub struct SlotLedger {
     pub acknowledged: BTreeMap<u64, AcknowledgedItem>,
     #[serde(default)]
     pub pending: Option<PendingItem>,
+    /// The last AP receive cursor confirmed written into the save itself
+    /// (docs/SAVE-RECONCILIATION.md §5/§7). `None` means the watermark was
+    /// never active for this slot -- the attested-mode status quo, not an
+    /// error -- so older ledgers load unchanged.
+    #[serde(default)]
+    pub save_watermark: Option<u64>,
+}
+
+/// The single defined outcome of comparing the save-resident receive
+/// watermark against the durable ledger cursor (docs/SAVE-RECONCILIATION.md
+/// §5, invariant I4: every restore/switch shape has exactly one outcome).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatermarkOutcome {
+    /// Save and ledger agree; nothing to do.
+    Resume,
+    /// The save regressed behind the ledger (a restore): the acknowledged
+    /// tail was rewound and will be re-issued in index order.
+    Reissue,
+    /// The ledger regressed behind the save (ledger loss/rollback): the save
+    /// cursor is adopted and nothing is re-granted (I1).
+    AdoptSaveCursor,
+    /// A watermark was recorded for this slot but could not be read now:
+    /// no grants, no checks, operator-visible (I3).
+    Hold,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -203,6 +227,66 @@ impl SlotLedger {
         self.pending = None;
         Ok(())
     }
+
+    /// Rewind the durable cursor so that `first_missing` is the next index to
+    /// process, dropping every acknowledged entry from that index on and any
+    /// pending plan (it re-plans identically from the seed contract on the
+    /// next poll). Returns how many acknowledged entries were rewound.
+    ///
+    /// This is only sound against a *proven* regression (a save restore, or an
+    /// operator attestation): never drive it from inventory absence
+    /// (docs/SAVE-RECONCILIATION.md §4).
+    pub fn rewind_to(&mut self, first_missing: u64) -> usize {
+        let before = self.acknowledged.len();
+        self.acknowledged.retain(|index, _| *index < first_missing);
+        self.highest_processed_index = first_missing.checked_sub(1);
+        self.pending = None;
+        before - self.acknowledged.len()
+    }
+
+    /// Operator-attested restore (docs/SAVE-RECONCILIATION.md §5 MVP): "I
+    /// restored the save to before index K". Rewinds so K is re-issued. The
+    /// save watermark is untouched -- attested mode has none -- and the ledger
+    /// stays loadable by builds that predate the watermark field.
+    pub fn attest_restore(&mut self, first_missing: u64) -> usize {
+        self.rewind_to(first_missing)
+    }
+
+    /// Compare the save-resident watermark with the durable cursor and apply
+    /// the one defined outcome (docs/SAVE-RECONCILIATION.md §5). Identity
+    /// mismatches never reach here: `require_runtime_context` refuses first.
+    pub fn reconcile_save_watermark(&mut self, observed: Option<u64>) -> WatermarkOutcome {
+        let recorded = self.save_watermark;
+        let Some(watermark) = observed else {
+            // No watermark support at all is the attested-mode status quo; a
+            // slot that HAS recorded a watermark and now cannot read it holds.
+            return if recorded.is_some() {
+                WatermarkOutcome::Hold
+            } else {
+                WatermarkOutcome::Resume
+            };
+        };
+        let cursor = self.highest_processed_index;
+        if cursor == Some(watermark) {
+            self.save_watermark = Some(watermark);
+            return WatermarkOutcome::Resume;
+        }
+        if cursor.is_none_or(|highest| watermark > highest) {
+            // The save is ahead of the ledger: ledger loss or rollback. Adopt
+            // the save cursor and re-grant nothing (I1) -- the acknowledged
+            // entries before the cursor may be gone, and that is accepted
+            // rather than reconstructed.
+            self.highest_processed_index = Some(watermark);
+            self.pending = None;
+            self.save_watermark = Some(watermark);
+            return WatermarkOutcome::AdoptSaveCursor;
+        }
+        // The save is behind the ledger: a proven restore. Rewind so the
+        // erased tail is re-issued in order.
+        self.rewind_to(watermark + 1);
+        self.save_watermark = Some(watermark);
+        WatermarkOutcome::Reissue
+    }
 }
 
 #[cfg(test)]
@@ -309,5 +393,122 @@ mod tests {
                 .unwrap(),
             Some(&pending)
         );
+    }
+
+    fn acknowledged(_index: u64) -> AcknowledgedItem {
+        AcknowledgedItem {
+            ap_item_id: 1,
+            raw_descriptor: 0xB000_04CE,
+            normalized_item_id: 0x4000_04CE,
+            item_category: 4,
+            quantity: 1,
+            reinforcement_level: None,
+            equip_target: None,
+        }
+    }
+
+    fn slot_with_acks(up_to_inclusive: u64) -> SlotLedger {
+        let mut slot = SlotLedger::default();
+        for index in 0..=up_to_inclusive {
+            slot.begin(PendingItem {
+                index,
+                ap_item_id: 1,
+                raw_descriptor: 0xB000_04CE,
+                normalized_item_id: 0x4000_04CE,
+                item_category: 4,
+                quantity: 1,
+                reinforcement_level: None,
+                equip_target: None,
+                upgrade_target_level: None,
+                grant_complete: false,
+                equip_complete: false,
+            })
+            .unwrap();
+            slot.mark_grant_complete().unwrap();
+            slot.acknowledge(index, acknowledged(index)).unwrap();
+        }
+        slot
+    }
+
+    #[test]
+    fn older_ledgers_without_a_watermark_load_unchanged() {
+        let mut slot = slot_with_acks(1);
+        let legacy = json::to_vec(&slot).unwrap();
+        // Simulate a pre-watermark receipt file by dropping the field.
+        let mut value: json::Value = json::from_slice(&legacy).unwrap();
+        value.as_object_mut().unwrap().remove("save_watermark");
+        let mut decoded: SlotLedger = json::from_slice(&json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.save_watermark, None);
+        assert_eq!(decoded.next_index(), 2);
+        // Attested mode: nothing observed, nothing recorded -> resume.
+        assert_eq!(
+            decoded.reconcile_save_watermark(None),
+            WatermarkOutcome::Resume
+        );
+        slot.save_watermark = None;
+        assert_eq!(decoded, slot);
+    }
+
+    #[test]
+    fn rewind_reissues_exactly_the_erased_tail() {
+        let mut slot = slot_with_acks(3);
+        assert_eq!(slot.rewind_to(2), 2);
+        assert_eq!(slot.highest_processed_index, Some(1));
+        assert_eq!(slot.next_index(), 2);
+        assert_eq!(slot.acknowledged.len(), 2);
+        assert!(slot.pending.is_none());
+        // The cursor can be rewound past zero.
+        assert_eq!(slot.rewind_to(0), 2);
+        assert_eq!(slot.highest_processed_index, None);
+        assert_eq!(slot.next_index(), 0);
+        assert!(slot.acknowledged.is_empty());
+    }
+
+    #[test]
+    fn watermark_reconciliation_assigns_exactly_one_outcome_per_shape() {
+        // Resume: save and ledger agree.
+        let mut slot = slot_with_acks(2);
+        slot.save_watermark = Some(2);
+        assert_eq!(
+            slot.reconcile_save_watermark(Some(2)),
+            WatermarkOutcome::Resume
+        );
+        assert_eq!(slot.next_index(), 3);
+
+        // Reissue: the save regressed (restore) -> rewind the erased tail.
+        let mut slot = slot_with_acks(3);
+        slot.save_watermark = Some(3);
+        assert_eq!(
+            slot.reconcile_save_watermark(Some(1)),
+            WatermarkOutcome::Reissue
+        );
+        assert_eq!(slot.next_index(), 2);
+        assert_eq!(slot.acknowledged.len(), 2);
+        assert_eq!(slot.save_watermark, Some(1));
+
+        // Adopt: the ledger regressed (loss/rollback) -> no re-grant.
+        let mut slot = slot_with_acks(1);
+        slot.save_watermark = Some(1);
+        assert_eq!(
+            slot.reconcile_save_watermark(Some(5)),
+            WatermarkOutcome::AdoptSaveCursor
+        );
+        assert_eq!(slot.next_index(), 6);
+        assert_eq!(slot.acknowledged.len(), 2);
+        assert_eq!(slot.save_watermark, Some(5));
+
+        // A fresh ledger against a played save is the same adopt shape.
+        let mut slot = SlotLedger::default();
+        assert_eq!(
+            slot.reconcile_save_watermark(Some(4)),
+            WatermarkOutcome::AdoptSaveCursor
+        );
+        assert_eq!(slot.next_index(), 5);
+
+        // Hold: a watermark was recorded but is now unreadable.
+        let mut slot = slot_with_acks(2);
+        slot.save_watermark = Some(2);
+        assert_eq!(slot.reconcile_save_watermark(None), WatermarkOutcome::Hold);
+        assert_eq!(slot.next_index(), 3);
     }
 }
