@@ -224,11 +224,13 @@ fn main() -> Result<()> {
     let mut runtime = None;
     let mut goal_location = None;
     let mut goal_reported = false;
+    let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut last_item_error: Option<(String, Instant)> = None;
 
     loop {
         let mut connected_now = false;
+        let mut ap_error_seen = false;
         for event in connection.update() {
             match event {
                 Event::Connected => {
@@ -236,9 +238,21 @@ fn main() -> Result<()> {
                     eprintln!("Connected to Archipelago.");
                 }
                 Event::Print(message) => eprintln!("{message}"),
-                Event::Error(error) => eprintln!("Archipelago error: {error}"),
+                Event::Error(error) => {
+                    ap_error_seen = true;
+                    eprintln!("Archipelago error: {error}");
+                }
                 _ => {}
             }
+        }
+        // Event::Error can be the placeholder variant; the stored
+        // Disconnected error carries the real connect failure.
+        if ap_error_seen
+            && !ap_detail_printed
+            && let archipelago_rs::ConnectionState::Disconnected(stored) = connection.state()
+        {
+            eprintln!("Archipelago connection failure detail: {stored}");
+            ap_detail_printed = true;
         }
         if connected_now && let Some(client) = connection.client_mut() {
             client.sync()?;
