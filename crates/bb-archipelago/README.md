@@ -94,6 +94,13 @@ The read-only diagnostic below prints whether a decimal event flag is set:
 bb-flag-probe SHAD_LOG EVENT_FLAG [OUTPUT]
 ```
 
+If a grant terminally fails in the harness, the client parks it (acknowledges
+it as blocked) and keeps delivering later items. `bb-blocked LEDGER SEED_NAME
+SLOT_NAME` lists parked entries with manual re-grant hints;
+`bb-blocked LEDGER SEED_NAME SLOT_NAME INDEX --confirm` clears one after you
+verify the item physically arrived. It never re-grants automatically —
+re-issuing an already-delivered item would duplicate it.
+
 ## BBLauncher companion startup
 
 `tools/start-bloodborne-ap.ps1` requests elevation once, starts BBLauncher,

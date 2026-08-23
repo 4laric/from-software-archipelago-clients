@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::backend::{BloodborneBackend, EquipRequest, ItemGrant, OperationProgress};
+use crate::backend::{
+    BloodborneBackend, EquipRequest, GrantTerminalFailure, ItemGrant, OperationProgress,
+};
 use crate::config::RuntimeConfig;
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
 use crate::ledger::{AcknowledgedItem, PendingItem, ReceiveLedger, WatermarkOutcome};
@@ -33,6 +35,14 @@ pub struct CompletedItem {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockedItem {
+    pub index: u64,
+    pub ap_item_id: i64,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ItemPollResult {
     Idle,
     Pending,
@@ -42,6 +52,11 @@ pub enum ItemPollResult {
     /// The save and ledger disagreed and were reconciled this poll; the
     /// outcome is reported and delivery resumes next poll.
     Reconciled(WatermarkOutcome),
+    /// The grant for this index terminally failed in the harness. The item is
+    /// acknowledged as blocked (never retried by the loop, never lost from the
+    /// ledger) and the stream moves on to the next index; recovery is the
+    /// operator-driven `bb-blocked` tool (clients#399).
+    Blocked(BlockedItem),
     Completed(CompletedItem),
 }
 
@@ -449,7 +464,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 reinforcement_level: pending.reinforcement_level,
                 tag: grant_tag(item.index),
             };
-            if self.backend.grant_item(&grant)? == OperationProgress::Pending {
+            let progress = match self.backend.grant_item(&grant) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    let failure = error.downcast::<GrantTerminalFailure>()?;
+                    return self.park_terminal_grant(item, &pending, failure);
+                }
+            };
+            if progress == OperationProgress::Pending {
                 return Ok(ItemPollResult::Pending);
             }
             self.ledger
@@ -490,6 +512,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     quantity: pending.quantity,
                     reinforcement_level: pending.reinforcement_level,
                     equip_target: pending.equip_target,
+                    blocked: None,
                 },
             )?;
         // Record the receive cursor into the save when the backend supports
@@ -520,6 +543,57 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             target_level: pending.upgrade_target_level,
             delivered_level: pending.reinforcement_level,
             equip_target: pending.equip_target,
+        }))
+    }
+
+    /// A terminally failed grant is parked: acknowledged in order with its
+    /// failure detail, skipping the grant/equip completion ensures. The
+    /// in-order acknowledge keeps every cursor and watermark invariant of the
+    /// normal path (the ER pot-cap `Capped` path is the precedent), so the
+    /// stream continues with the next index and the parked entry waits for
+    /// the operator's `bb-blocked` tool. Never retried automatically:
+    /// re-issuing an already-delivered item duplicates it (clients#399).
+    fn park_terminal_grant(
+        &mut self,
+        item: IncomingItem,
+        pending: &PendingItem,
+        failure: GrantTerminalFailure,
+    ) -> Result<ItemPollResult> {
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .acknowledge_blocked(
+                item.index,
+                AcknowledgedItem {
+                    ap_item_id: item.ap_item_id,
+                    raw_descriptor: pending.raw_descriptor,
+                    normalized_item_id: pending.normalized_item_id,
+                    item_category: pending.item_category,
+                    quantity: pending.quantity,
+                    reinforcement_level: pending.reinforcement_level,
+                    equip_target: pending.equip_target,
+                    blocked: Some(format!("{} ({})", failure.status, failure.detail)),
+                },
+            )?;
+        // Mirror the normal acknowledge path's watermark write: without it a
+        // future watermark-capable save would read the parked index as
+        // regressed and reissue the item.
+        match self.backend.write_save_watermark(item.index) {
+            Ok(true) => {
+                self.ledger
+                    .slot_mut(&self.seed_name, &self.slot_name)
+                    .save_watermark = Some(item.index);
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "Save watermark write failed for a parked grant (the parking stands): {error:#}"
+            ),
+        }
+        self.ledger.save(&self.ledger_path)?;
+        Ok(ItemPollResult::Blocked(BlockedItem {
+            index: item.index,
+            ap_item_id: item.ap_item_id,
+            status: failure.status,
+            detail: failure.detail,
         }))
     }
 }
@@ -586,6 +660,70 @@ mod tests {
         config: RuntimeConfig,
     ) -> ClientLoop<MockBackend> {
         ClientLoop::new(backend, config, ledger, ledger_path, "seed", "slot")
+    }
+
+    #[test]
+    fn terminal_harness_failure_parks_and_the_stream_continues() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.fail_grant_terminally("ap_0");
+        let mut cfg = config();
+        cfg.items.insert(
+            2001,
+            RuntimeItemBinding {
+                raw_descriptor: 0xB000_04D2,
+                normalized_item_id: 0x4000_04D2,
+                quantity: 3,
+                ..goods()
+            },
+        );
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        let received = [
+            IncomingItem {
+                index: 0,
+                ap_item_id: 2000,
+            },
+            IncomingItem {
+                index: 1,
+                ap_item_id: 2001,
+            },
+        ];
+
+        let first = client.poll_items(&received).unwrap();
+        let ItemPollResult::Blocked(blocked) = first else {
+            panic!("expected the terminal failure to park, got {first:?}");
+        };
+        assert_eq!(blocked.index, 0);
+        assert_eq!(blocked.ap_item_id, 2000);
+        assert_eq!(blocked.status, "failed");
+        // The failed grant never executed, and parking did not wedge the
+        // stream: the next poll delivers index 1 instead of retrying index 0.
+        assert!(client.backend.grants.is_empty());
+
+        let second = client.poll_items(&received).unwrap();
+        assert!(matches!(
+            second,
+            ItemPollResult::Completed(CompletedItem {
+                index: 1,
+                ap_item_id: 2001,
+                ..
+            })
+        ));
+        assert_eq!(client.backend.grants.len(), 1);
+        assert_eq!(client.backend.grants[0].tag, "ap_1");
+
+        let slot = client.ledger.slot("seed", "slot").unwrap();
+        assert_eq!(slot.next_index(), 2);
+        assert!(slot.pending.is_none());
+        assert!(
+            slot.acknowledged[&0]
+                .blocked
+                .as_deref()
+                .unwrap()
+                .contains("failed")
+        );
+        assert_eq!(slot.blocked_entries().count(), 1);
+        std::fs::remove_file(ledger_path).unwrap();
     }
 
     #[test]

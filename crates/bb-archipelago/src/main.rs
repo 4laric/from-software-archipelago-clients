@@ -398,6 +398,23 @@ fn main() -> Result<()> {
                         item.equip_target
                     );
                 }
+                Ok(ItemPollResult::Blocked(blocked)) => {
+                    if last_item_error.take().is_some() {
+                        eprintln!("Bloodborne item delivery recovered.");
+                    }
+                    eprintln!(
+                        "PARKED AP item index {} id {}: the grant terminally failed in the harness ({}: {}). \
+                         The item is recorded as blocked and later items keep delivering. \
+                         Inspect and resolve it with: bb-blocked {} \"{}\" \"{}\"",
+                        blocked.index,
+                        blocked.ap_item_id,
+                        blocked.status,
+                        blocked.detail,
+                        args.ledger.display(),
+                        client.seed_name(),
+                        args.slot,
+                    );
+                }
                 Ok(ItemPollResult::Idle | ItemPollResult::Pending) => {}
                 // Held and Reconciled are surfaced through the watermark
                 // notice channel above, exactly once per transition.
