@@ -11,7 +11,7 @@
 //! idempotent and re-scales correctly when the player changes region or an enemy reloads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
@@ -31,6 +31,21 @@ use serde_json::Value;
 
 static CONFIG: Mutex<Option<ScalingConfig>> = Mutex::new(None);
 static TICK: AtomicU32 = AtomicU32::new(0);
+
+/// #993 co-op difficulty: extra sphere tiers added per co-op partner. Set once at `configure` from
+/// `options.coop_difficulty`; `0` (the default) makes the whole feature inert. Read on every sweep.
+static COOP_DIFFICULTY: AtomicUsize = AtomicUsize::new(0);
+/// Last co-op headcount we logged, so an engaged bump announces itself once instead of every sweep.
+static LAST_COOP_EXTRA: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// 🛑 PROVISIONAL DISCRIMINATOR -- one observed sample, not a datamine. bobler's 2026-08-21
+/// seamless-co-op census printed the partner as `("summon", npc_id=8000, chr_type=5, team=10)`.
+/// Spirit Ash summons share `summon_buddy_chr_set`, so the apply-site count keys on this npc_id to
+/// exclude them -- but that 8000 is a HYPOTHESIS backed by a single row. A confirming census (a SOLO
+/// run with a Spirit Ash out) must show ashes do NOT also carry 8000 before anyone relies on the
+/// bump. Until then the feature ships off by default (`coop_difficulty = 0`), so a wrong guess here
+/// changes nothing for anyone who has not opted in. Cite this row, never "a census shows".
+const COOP_PARTNER_NPC_ID: i32 = 8000;
 
 /// Apply the region's tier SpEffect only a few times a second (enemy stats don't need per-frame).
 ///
@@ -458,6 +473,10 @@ pub fn ceiling_is_capped() -> bool {
 pub fn configure(sd: &Value) {
     let requested = er_logic::options::parse_bool_option(sd, "completion_scaling");
     let cfg = er_logic::scaling::parse_scaling_config(sd);
+    COOP_DIFFICULTY.store(
+        er_logic::options::parse_coop_difficulty(sd),
+        Ordering::Relaxed,
+    );
     match (&cfg, requested) {
         (Some(c), _) => {
             // THE BAND, NOT JUST ITS FLOOR. `completion_scaling_ceiling` reached the log only
@@ -890,6 +909,40 @@ pub fn tick() -> Option<String> {
             note_unmapped(region);
             return None;
         };
+        // #993 CO-OP DIFFICULTY. Seamless co-op raises enemy HP but leaves enemy DAMAGE at the
+        // host default, so a partner halves incoming threat without the enemies hitting harder.
+        // Bump the applied sphere tier by `coop_difficulty` rungs per partner in the world -- a
+        // higher rung carries both HP and attack, restoring the missing threat. Each client counts
+        // its own census and applies this identically (every player is on its own AP slot reading
+        // the same world), so no host arbitration is needed. Knob 0 (default) -> `coop_extra`
+        // irrelevant -> tier unchanged. The count discriminator is provisional (see
+        // the apply-site count / `COOP_PARTNER_NPC_ID`); the feature is inert until opted into.
+        let coop_knob = COOP_DIFFICULTY.load(Ordering::Relaxed);
+        // Count live co-op partners exactly the way the diagnostic census does (same set, same
+        // field), filtered to the co-op marker so Spirit Ashes -- which share this set -- do not
+        // inflate it. Walked only when the knob is on.
+        let coop_extra = if coop_knob > 0 {
+            sweepable_characters(&wcm.summon_buddy_chr_set)
+                .filter(|c| c.npc_id == COOP_PARTNER_NPC_ID)
+                .count()
+        } else {
+            0
+        };
+        let tier = er_logic::scaling::coop_tier_bump(tier, coop_extra, coop_knob, NUM_TIERS);
+        if coop_knob > 0 && LAST_COOP_EXTRA.swap(coop_extra, Ordering::Relaxed) != coop_extra {
+            if coop_extra > 0 {
+                log::info!(
+                    "enemy-scaling: co-op difficulty engaged -- {} partner(s) x +{} tier(s) each -> region tier bumped to {}",
+                    coop_extra,
+                    coop_knob,
+                    tier
+                );
+            } else {
+                log::info!(
+                    "enemy-scaling: co-op difficulty armed but no partners in world -- vanilla region tier this sweep"
+                );
+            }
+        }
         let rates = tier_rates(tier);
         let dbg = RegionScaleDbg {
             tier,

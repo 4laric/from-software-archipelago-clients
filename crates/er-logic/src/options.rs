@@ -91,6 +91,19 @@ pub fn parse_merchant_bells_on_talk(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "merchant_bells_on_talk")
 }
 
+/// `options.coop_difficulty`: extra sphere-scaling tiers added per player past the first, when a
+/// seamless-co-op session is live (#993). `0` (the default, and any absent/garbage value) disables
+/// it. Clamped to a small sane ceiling so a malformed slot can never push the ladder off its top
+/// rung on its own. The count of extra players is the CLIENT's job (its phantom census); this only
+/// reads the per-player knob.
+pub fn parse_coop_difficulty(slot_data: &Value) -> usize {
+    slot_data
+        .pointer("/options/coop_difficulty")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 9) as usize
+}
+
 /// `options.no_fall_damage` (int-or-bool). When on, the player never takes fall damage (the
 /// spirit-spring `fallDamageRate=0` trick, applied permanently -- see [`crate::no_fall_damage`]).
 pub fn parse_no_fall_damage(slot_data: &Value) -> bool {
@@ -301,5 +314,29 @@ mod tests {
         assert_eq!(mm.get(&7900005).copied(), Some(Ability::Jump.bit()));
         assert!(parse_ability_unlock_items(&json!({ "abilityUnlockItems": [] })).is_empty());
         assert!(parse_ability_unlock_items(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn coop_difficulty_reads_clamps_and_defaults_off() {
+        assert_eq!(
+            parse_coop_difficulty(&json!({ "options": { "coop_difficulty": 2 } })),
+            2
+        );
+        // absent / missing options => off
+        assert_eq!(parse_coop_difficulty(&json!({ "options": {} })), 0);
+        assert_eq!(parse_coop_difficulty(&json!({})), 0);
+        // negatives clamp to 0, oversized clamps to the 9 ceiling, garbage => 0
+        assert_eq!(
+            parse_coop_difficulty(&json!({ "options": { "coop_difficulty": -5 } })),
+            0
+        );
+        assert_eq!(
+            parse_coop_difficulty(&json!({ "options": { "coop_difficulty": 999 } })),
+            9
+        );
+        assert_eq!(
+            parse_coop_difficulty(&json!({ "options": { "coop_difficulty": "2" } })),
+            0
+        );
     }
 }
