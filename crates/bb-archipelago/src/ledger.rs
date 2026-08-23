@@ -61,6 +61,13 @@ pub struct AcknowledgedItem {
     pub reinforcement_level: Option<u8>,
     #[serde(default)]
     pub equip_target: Option<EquipTarget>,
+    /// The harness's terminal failure detail when this item was PARKED rather
+    /// than delivered (clients#399): the acknowledgement advanced the stream
+    /// without a physical grant, and the detail is the operator's evidence for
+    /// resolving it with bb-blocked. `None` is an ordinary delivery. Older
+    /// ledgers predate the field and load as `None`.
+    #[serde(default)]
+    pub blocked: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -204,6 +211,54 @@ impl SlotLedger {
         Ok(())
     }
 
+    /// Park an item whose grant the harness terminally failed (clients#399):
+    /// acknowledge it in order WITHOUT the grant/equip completion ensures, with
+    /// the failure detail recorded on the entry. The stream continues with the
+    /// next index and every cursor invariant still holds; the parked record is
+    /// the operator's evidence for bb-blocked. Never call this for a grant that
+    /// might still execute.
+    pub fn acknowledge_blocked(&mut self, index: u64, item: AcknowledgedItem) -> Result<()> {
+        anyhow::ensure!(
+            item.blocked.is_some(),
+            "a parked acknowledgement must carry the failure detail"
+        );
+        anyhow::ensure!(
+            index == self.next_index(),
+            "blocked acknowledgement is out of order"
+        );
+        let pending = self
+            .pending
+            .as_ref()
+            .context("cannot park an item without a durable pending plan")?;
+        anyhow::ensure!(pending.index == index, "pending item index changed");
+        self.acknowledged.insert(index, item);
+        self.highest_processed_index = Some(index);
+        self.pending = None;
+        Ok(())
+    }
+
+    /// The parked (blocked) entries, for bb-blocked's listing.
+    pub fn blocked_entries(&self) -> impl Iterator<Item = (u64, &AcknowledgedItem)> {
+        self.acknowledged
+            .iter()
+            .filter(|(_, item)| item.blocked.is_some())
+            .map(|(index, item)| (*index, item))
+    }
+
+    /// Operator-confirmed resolution of a parked entry (bb-blocked INDEX
+    /// --confirm): clears the blocked marker after the operator has verified
+    /// the item physically arrived. Returns the detail that was cleared.
+    /// Never re-grants -- re-issuing an already-delivered item duplicates it.
+    pub fn unblock(&mut self, index: u64) -> Result<String> {
+        let item = self
+            .acknowledged
+            .get_mut(&index)
+            .with_context(|| format!("no acknowledged entry at index {index}"))?;
+        item.blocked
+            .take()
+            .with_context(|| format!("entry at index {index} is not blocked"))
+    }
+
     pub fn acknowledge(&mut self, index: u64, item: AcknowledgedItem) -> Result<()> {
         anyhow::ensure!(
             index == self.next_index(),
@@ -322,6 +377,7 @@ mod tests {
                     quantity: 1,
                     reinforcement_level: None,
                     equip_target: None,
+                    blocked: None,
                 },
             )
             .unwrap_err();
@@ -357,6 +413,7 @@ mod tests {
                     quantity: 1,
                     reinforcement_level: None,
                     equip_target: None,
+                    blocked: None,
                 },
             )
             .unwrap();
@@ -404,6 +461,7 @@ mod tests {
             quantity: 1,
             reinforcement_level: None,
             equip_target: None,
+            blocked: None,
         }
     }
 
@@ -510,5 +568,89 @@ mod tests {
         slot.save_watermark = Some(2);
         assert_eq!(slot.reconcile_save_watermark(None), WatermarkOutcome::Hold);
         assert_eq!(slot.next_index(), 3);
+    }
+
+    #[test]
+    fn acknowledge_blocked_parks_in_order_without_grant_completion() {
+        let mut slot = SlotLedger::default();
+        slot.begin(PendingItem {
+            index: 0,
+            ap_item_id: 1,
+            raw_descriptor: 0xB000_04CE,
+            normalized_item_id: 0x4000_04CE,
+            item_category: 4,
+            quantity: 2,
+            reinforcement_level: None,
+            equip_target: None,
+            upgrade_target_level: None,
+            grant_complete: false,
+            equip_complete: false,
+        })
+        .unwrap();
+        // The grant never completed: the ordinary acknowledge refuses, the
+        // parking one does not, and the detail is the operator's evidence.
+        slot.acknowledge(0, acknowledged(0)).unwrap_err();
+        let mut parked = acknowledged(0);
+        parked.blocked = Some("failed (tag=ap_0 expected_after=2 actual=10)".to_string());
+        slot.acknowledge_blocked(0, parked.clone()).unwrap();
+        assert_eq!(slot.next_index(), 1);
+        assert!(slot.pending.is_none());
+        assert_eq!(slot.acknowledged[&0], parked);
+        assert_eq!(
+            slot.blocked_entries().collect::<Vec<_>>(),
+            vec![(0, &parked)]
+        );
+
+        // A parked entry must carry its detail, and the stream stays ordered.
+        slot.acknowledge_blocked(1, acknowledged(1)).unwrap_err();
+        slot.acknowledge_blocked(2, {
+            let mut item = acknowledged(2);
+            item.blocked = Some("failed".to_string());
+            item
+        })
+        .unwrap_err();
+    }
+
+    #[test]
+    fn blocked_entries_survive_serialization_and_predate_nothing() {
+        let mut ledger = ReceiveLedger::default();
+        let slot = ledger.slot_mut("seed", "slot");
+        slot.begin(PendingItem {
+            index: 0,
+            ap_item_id: 1,
+            raw_descriptor: 0xB000_04CE,
+            normalized_item_id: 0x4000_04CE,
+            item_category: 4,
+            quantity: 2,
+            reinforcement_level: None,
+            equip_target: None,
+            upgrade_target_level: None,
+            grant_complete: false,
+            equip_complete: false,
+        })
+        .unwrap();
+        let mut parked = acknowledged(0);
+        parked.blocked = Some("failed (detail)".to_string());
+        slot.acknowledge_blocked(0, parked).unwrap();
+        let decoded: ReceiveLedger = json::from_slice(&json::to_vec(&ledger).unwrap()).unwrap();
+        assert_eq!(decoded, ledger);
+
+        // A ledger written before the field existed loads with blocked=None.
+        let legacy = json::to_vec(&ledger).unwrap();
+        let mut value: json::Value = json::from_slice(&legacy).unwrap();
+        for slot in value["slots"].as_object_mut().unwrap().values_mut() {
+            for item in slot["acknowledged"].as_object_mut().unwrap().values_mut() {
+                item.as_object_mut().unwrap().remove("blocked");
+            }
+        }
+        let decoded: ReceiveLedger = json::from_slice(&json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            decoded
+                .slot("seed", "slot")
+                .unwrap()
+                .blocked_entries()
+                .next()
+                .is_none()
+        );
     }
 }

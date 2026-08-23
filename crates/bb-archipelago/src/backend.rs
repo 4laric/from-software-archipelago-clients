@@ -41,6 +41,31 @@ pub enum OperationProgress {
     Complete,
 }
 
+/// The grant harness latched a terminal failure for this tag (clients#399).
+/// Distinct from every other grant error so the delivery loop can park this
+/// one item and keep delivering later ones, instead of the whole stream
+/// wedging behind one verdict -- including a false one, which the harness's
+/// whole-inventory verify could produce before bb-archipelago#106.
+#[derive(Clone, Debug)]
+pub struct GrantTerminalFailure {
+    pub tag: String,
+    pub status: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for GrantTerminalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The same wording the ensure! produced, so log watches still match.
+        write!(
+            f,
+            "grant {} failed in harness: {} ({})",
+            self.tag, self.status, self.detail
+        )
+    }
+}
+
+impl std::error::Error for GrantTerminalFailure {}
+
 pub trait BloodborneBackend {
     /// Returns a validated live-play/save identity, or `None` when every game
     /// read and mutation must abstain. A process handle or raw event-flag read
@@ -187,13 +212,14 @@ impl BloodborneBackend for FileBackend {
                 self.bridge.acknowledge_command(&grant.tag)?;
                 return Ok(OperationProgress::Complete);
             }
-            anyhow::ensure!(
-                !state.is_terminal_failure(),
-                "grant {} failed in harness: {} ({})",
-                grant.tag,
-                state.status,
-                state.detail
-            );
+            if state.is_terminal_failure() {
+                return Err(GrantTerminalFailure {
+                    tag: grant.tag.clone(),
+                    status: state.status.clone(),
+                    detail: state.detail.clone(),
+                }
+                .into());
+            }
         }
         if self.bridge.command_pending() {
             anyhow::ensure!(
@@ -251,6 +277,7 @@ pub struct MockBackend {
     equip_delays: HashMap<String, u8>,
     completed_grants: HashSet<String>,
     completed_equips: HashSet<String>,
+    terminal_failures: HashSet<String>,
 }
 
 impl Default for MockBackend {
@@ -272,6 +299,7 @@ impl Default for MockBackend {
             equip_delays: HashMap::new(),
             completed_grants: HashSet::new(),
             completed_equips: HashSet::new(),
+            terminal_failures: HashSet::new(),
         }
     }
 }
@@ -279,6 +307,11 @@ impl Default for MockBackend {
 impl MockBackend {
     pub fn delay_grant(&mut self, tag: impl Into<String>, polls: u8) {
         self.grant_delays.insert(tag.into(), polls);
+    }
+
+    /// Simulate the harness latching a terminal failure for a tag (clients#399).
+    pub fn fail_grant_terminally(&mut self, tag: impl Into<String>) {
+        self.terminal_failures.insert(tag.into());
     }
 
     pub fn delay_equip(&mut self, tag: impl Into<String>, polls: u8) {
@@ -328,6 +361,14 @@ impl BloodborneBackend for MockBackend {
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
+        if self.terminal_failures.contains(&grant.tag) {
+            return Err(GrantTerminalFailure {
+                tag: grant.tag.clone(),
+                status: "failed".into(),
+                detail: "mock terminal harness failure".into(),
+            }
+            .into());
+        }
         if self.completed_grants.contains(&grant.tag) {
             return Ok(OperationProgress::Complete);
         }
