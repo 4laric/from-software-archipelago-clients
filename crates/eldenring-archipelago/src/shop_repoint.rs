@@ -112,6 +112,10 @@ pub fn run() -> bool {
     // shop_sell does.
     let mut plan: Vec<(u32, i32, u8)> = Vec::new();
     let (mut sold, mut no_preview, mut not_goods, mut already) = (0u32, 0u32, 0u32, 0u32);
+    // clients#402: NAME the no-preview rows, not just their count. A check slot with no preview
+    // good keeps its VANILLA ware while still firing the check -- the "bought bolts, check sent,
+    // bolts in bag" report -- and a bare count leaves that invisible in the one artifact we get.
+    let mut no_preview_rows: Vec<(u32, i64)> = Vec::new();
     let mut check_rows = 0u32;
     let Some(scan_rows) = crate::param_guard::rows::<ShopLineupParam>(repo, "shop-repoint scan")
     else {
@@ -134,7 +138,10 @@ pub fn run() -> bool {
         ) {
             Repoint::Write(eid, etype) => plan.push((id, eid, etype)),
             Repoint::Skip(SkipReason::SoldNatively) => sold += 1,
-            Repoint::Skip(SkipReason::NoPreview) => no_preview += 1,
+            Repoint::Skip(SkipReason::NoPreview) => {
+                no_preview += 1;
+                no_preview_rows.push((id, loc));
+            }
             Repoint::Skip(SkipReason::NotGoods) => not_goods += 1,
             Repoint::Skip(SkipReason::AlreadyPointed) => already += 1,
         }
@@ -167,6 +174,26 @@ pub fn run() -> bool {
          ({check_rows} check row(s) seen, {sold} owned by shop_sell, {already} already pointed, \
          {no_preview} no preview entry, {not_goods} preview not a GOODS row)"
     );
+    if !no_preview_rows.is_empty() {
+        // Cap the list: a broken preview could make this every check row, and the point is to NAME
+        // the slots, not to flood the log. 20 covers every real report to date (255 had 2).
+        let shown: Vec<String> = no_preview_rows
+            .iter()
+            .take(20)
+            .map(|(row, loc)| format!("row {row} (loc {loc})"))
+            .collect();
+        let more = no_preview_rows.len() - shown.len();
+        log::info!(
+            "shop-repoint: no-preview check row(s): {}{} -- these slots keep their VANILLA ware \
+             while still firing the check (clients#402)",
+            shown.join(", "),
+            if more > 0 {
+                format!(" +{more} more")
+            } else {
+                String::new()
+            },
+        );
+    }
     if n == 0 && check_rows > 0 && already == 0 {
         log::warn!(
             "shop-repoint: INERT -- {check_rows} check row(s) matched and none was repointed. \
