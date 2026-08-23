@@ -29,8 +29,8 @@
 //!
 //! Bit positions are `ChrActions`' own (eldenring crate, `chr_ins::module::action_request`).
 
-/// One bit per lockable ability. `Heal` is absent: its mechanism is the flask-charge clamp
-/// (spec 4.1), not an action mask.
+/// One bit per lockable ability. Seven are `ChrActions` masks; `Heal` is the odd one out -- it
+/// owns no action bit and is enforced by the flask-charge lockout (No Flask SpEffect) instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ability {
     Jump,
@@ -40,10 +40,14 @@ pub enum Ability {
     R2,
     L1,
     L2,
+    /// NOT an action mask: `heal` owns no `ChrActions` bit. It is enforced by the flask-charge
+    /// lockout (the No Flask SpEffect), applied by the client while it is locked. `chr_action_mask`
+    /// returns 0 for it so the ChrActions path ignores it; the client checks [`heal_locked`].
+    Heal,
 }
 
 impl Ability {
-    pub const ALL: [Ability; 7] = [
+    pub const ALL: [Ability; 8] = [
         Ability::Jump,
         Ability::Crouch,
         Ability::Roll,
@@ -51,6 +55,7 @@ impl Ability {
         Ability::R2,
         Ability::L1,
         Ability::L2,
+        Ability::Heal,
     ];
 
     /// This module's own one-hot bit, for the `u8` locked-set (NOT a ChrActions bit).
@@ -63,6 +68,7 @@ impl Ability {
             Ability::R2 => 1 << 4,
             Ability::L1 => 1 << 5,
             Ability::L2 => 1 << 6,
+            Ability::Heal => 1 << 7,
         }
     }
 
@@ -75,6 +81,7 @@ impl Ability {
             Ability::R2 => "r2",
             Ability::L1 => "l1",
             Ability::L2 => "l2",
+            Ability::Heal => "heal",
         }
     }
 
@@ -103,6 +110,8 @@ impl Ability {
             Ability::R2 => (1 << R2) | (1 << MAGIC_R2),
             Ability::L1 => (1 << L1) | (1 << MAGIC_L),
             Ability::L2 => (1 << L2) | (1 << MAGIC_L2),
+            // heal is not an action -- the client enforces it via the flask lockout, not this mask.
+            Ability::Heal => 0,
         }
     }
 }
@@ -132,7 +141,9 @@ pub fn parse_set(s: &str) -> Result<u8, String> {
             .into_iter()
             .find(|a| a.name() == t)
             .ok_or_else(|| {
-                format!("unknown ability {tok:?} -- valid: jump, crouch, roll, r1, r2, l1, l2")
+                format!(
+                    "unknown ability {tok:?} -- valid: jump, crouch, roll, r1, r2, l1, l2, heal"
+                )
             })?;
         set |= a.bit();
     }
@@ -152,6 +163,12 @@ pub fn set_names(set: u8) -> String {
 /// everything" console action spans, and a convenient MANAGED seed.
 pub fn full_set() -> u8 {
     Ability::ALL.into_iter().fold(0u8, |s, a| s | a.bit())
+}
+
+/// Whether `heal` is in the locked set. `heal` owns no `ChrActions` bit (so `chr_action_mask`
+/// ignores it); the client reads this to drive the flask-charge lockout instead.
+pub fn heal_locked(set: u8) -> bool {
+    set & Ability::Heal.bit() != 0
 }
 
 /// The `ChrActions` bitmask to disable for a locked set -- the union of each locked ability's
@@ -198,8 +215,8 @@ mod tests {
         assert_eq!(Ability::from_name("ROLL"), Some(Ability::Roll));
         assert_eq!(Ability::from_name(" l2 "), Some(Ability::L2));
         assert_eq!(Ability::from_name("nope"), None);
-        assert_eq!(full_set(), 0x7f);
-        assert_eq!(set_names(full_set()), "jump,crouch,roll,r1,r2,l1,l2");
+        assert_eq!(full_set(), 0xff);
+        assert_eq!(set_names(full_set()), "jump,crouch,roll,r1,r2,l1,l2,heal");
     }
 
     #[test]
@@ -242,6 +259,17 @@ mod tests {
         assert_eq!(m, (1u64 << JUMP) | (1 << ROLLING) | (1 << BACKSTEP));
         // an unlocked ability's bits are absent
         assert_eq!(m & (1 << R1), 0);
+    }
+
+    #[test]
+    fn heal_is_not_an_action_mask_but_is_in_the_set() {
+        let locked = parse_set("heal,roll").unwrap();
+        assert!(heal_locked(locked));
+        // heal contributes NOTHING to the ChrActions mask (it is flask-enforced) ...
+        assert_eq!(chr_action_mask(Ability::Heal.bit()), 0);
+        // ... but roll's bits are still there, so a mixed set masks only the real actions.
+        assert_eq!(chr_action_mask(locked), (1u64 << ROLLING) | (1 << BACKSTEP));
+        assert!(!heal_locked(parse_set("roll").unwrap()));
     }
 
     #[test]

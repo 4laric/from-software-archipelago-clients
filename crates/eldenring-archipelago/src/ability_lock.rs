@@ -47,11 +47,14 @@ use std::time::Instant;
 use eldenring::cs::WorldChrMan;
 use fromsoftware_shared::FromStatic;
 
-use er_logic::ability_lock::{Ability, chr_action_mask, parse_set, requested_locked, set_names};
+use er_logic::ability_lock::{
+    Ability, chr_action_mask, heal_locked, parse_set, requested_locked, set_names,
+};
 
 static CLOCK: OnceLock<Instant> = OnceLock::new();
 /// Per-ability last-log timestamp (ms), indexed by this module's bit position; 0 = never.
-static LAST_LOG_MS: [AtomicU64; 7] = [
+static LAST_LOG_MS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -62,6 +65,13 @@ static LAST_LOG_MS: [AtomicU64; 7] = [
 ];
 static BLOCKED_TOTAL: AtomicU32 = AtomicU32::new(0);
 const LOG_SPACING_MS: u64 = 1500;
+
+/// Last time the No Flask SpEffect was (re)applied for a heal lock; 0 = never. The trap effect is
+/// deliberately FINITE (`NO_FLASK_SECONDS` = 20s) -- its safety property -- so a persistent heal
+/// lock re-applies it before it lapses. On unlock we simply stop, and the flask returns within 20s.
+static LAST_HEAL_APPLY_MS: AtomicU64 = AtomicU64::new(0);
+/// Re-apply cadence, comfortably under the 20s effect so heal never flickers back on while locked.
+const HEAL_REAPPLY_MS: u64 = 15_000;
 
 /// The feature's domain: every ability it has governed this session. Only these bits are ever
 /// cleared from the game's disable field, so a disable the GAME set is never disturbed.
@@ -189,6 +199,7 @@ pub fn reset() {
     MANAGED.store(0, Ordering::Relaxed);
     LIVE.store(0, Ordering::Relaxed);
     INITIALIZED.store(false, Ordering::Release);
+    LAST_HEAL_APPLY_MS.store(0, Ordering::Relaxed);
     *UNLOCK_MAP.write().unwrap() = None;
 }
 
@@ -201,38 +212,54 @@ pub fn enforce() {
         return; // feature never armed -- touch nothing
     }
     let live = LIVE.load(Ordering::Relaxed);
-    let mask_live = chr_action_mask(live);
+
+    // ---- ChrActions abilities (everything except heal) -------------------------------------
+    // Scoped so the WorldChrMan borrow is dropped before the heal path re-acquires the singleton.
     let mask_managed = chr_action_mask(managed);
-    // Managed bits that are currently UNLOCKED -- to be restored (cleared from the disable field).
-    let restore = mask_managed & !mask_live;
+    if mask_managed != 0 {
+        let mask_live = chr_action_mask(live);
+        // Managed bits currently UNLOCKED -> restore (clear from the disable field).
+        let restore = mask_managed & !mask_live;
 
-    // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract every
-    // other player write in this crate (scaling, traps) relies on.
-    let Ok(wcm) = (unsafe { WorldChrMan::instance_mut() }) else {
-        return;
-    };
-    let Some(player) = wcm.main_player.as_mut() else {
-        return;
-    };
-    let module = &mut *player.chr_ins.modules.action_request;
+        // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract
+        // every other player write in this crate (scaling, traps) relies on.
+        if let Ok(wcm) = unsafe { WorldChrMan::instance_mut() } {
+            if let Some(player) = wcm.main_player.as_mut() {
+                let module = &mut *player.chr_ins.modules.action_request;
+                // ChrActions is a u64-backed bitfield (private tuple); reinterpret as the u64.
+                let disabled = &mut module.disabled_action_inputs as *mut _ as *mut u64;
+                let requests = &mut module.action_requests as *mut _ as *mut u64;
+                let presses = &mut module.new_action_presses as *mut _ as *mut u64;
 
-    // ChrActions is a u64-backed bitfield (private tuple); reinterpret as the u64 it is.
-    let disabled = &mut module.disabled_action_inputs as *mut _ as *mut u64;
-    let requests = &mut module.action_requests as *mut _ as *mut u64;
-    let presses = &mut module.new_action_presses as *mut _ as *mut u64;
-
-    // Read-back BEFORE clearing: which locked actions were newly pressed this frame.
-    let hit = requested_locked(live, unsafe { *presses });
-
-    unsafe {
-        *disabled |= mask_live; //   lock:   set the disable bit
-        *disabled &= !restore; //    unlock: restore the managed-but-unlocked bit
-        *requests &= !mask_live; //  belt-and-suspenders: drop this frame's locked requests
-        *presses &= !mask_live;
+                // Read-back BEFORE clearing: which locked actions were newly pressed this frame.
+                let hit = requested_locked(live, unsafe { *presses });
+                unsafe {
+                    *disabled |= mask_live; //  lock:   set the disable bit
+                    *disabled &= !restore; //   unlock: restore the managed-but-unlocked bit
+                    *requests &= !mask_live; // belt-and-suspenders: drop this frame's requests
+                    *presses &= !mask_live;
+                }
+                if hit != 0 {
+                    report(hit);
+                }
+            }
+        }
     }
 
-    if hit != 0 {
-        report(hit);
+    // ---- heal (no action bit) -- enforced via the flask lockout, re-applied on a timer --------
+    if heal_locked(live) {
+        let now = now_ms();
+        let last = LAST_HEAL_APPLY_MS.load(Ordering::Relaxed);
+        if last == 0 || now.saturating_sub(last) >= HEAL_REAPPLY_MS {
+            // fire_no_flask acquires WorldChrMan itself (after the borrow above dropped) and is
+            // death-guarded; it returns false until the param streams in, so retry next tick.
+            if crate::traps::fire_no_flask() {
+                LAST_HEAL_APPLY_MS.store(now, Ordering::Relaxed);
+            }
+        }
+    } else {
+        // Unlocked (or never locked): forget the timer so a later re-lock applies immediately.
+        LAST_HEAL_APPLY_MS.store(0, Ordering::Relaxed);
     }
 }
 
