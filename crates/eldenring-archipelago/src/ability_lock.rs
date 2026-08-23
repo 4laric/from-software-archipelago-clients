@@ -223,25 +223,25 @@ pub fn enforce() {
 
         // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract
         // every other player write in this crate (scaling, traps) relies on.
-        if let Ok(wcm) = unsafe { WorldChrMan::instance_mut() } {
-            if let Some(player) = wcm.main_player.as_mut() {
-                let module = &mut *player.chr_ins.modules.action_request;
-                // ChrActions is a u64-backed bitfield (private tuple); reinterpret as the u64.
-                let disabled = &mut module.disabled_action_inputs as *mut _ as *mut u64;
-                let requests = &mut module.action_requests as *mut _ as *mut u64;
-                let presses = &mut module.new_action_presses as *mut _ as *mut u64;
+        if let Ok(wcm) = unsafe { WorldChrMan::instance_mut() }
+            && let Some(player) = wcm.main_player.as_mut()
+        {
+            let module = &mut *player.chr_ins.modules.action_request;
+            // ChrActions is a u64-backed bitfield (private tuple); reinterpret as the u64.
+            let disabled = &mut module.disabled_action_inputs as *mut _ as *mut u64;
+            let requests = &mut module.action_requests as *mut _ as *mut u64;
+            let presses = &mut module.new_action_presses as *mut _ as *mut u64;
 
-                // Read-back BEFORE clearing: which locked actions were newly pressed this frame.
-                let hit = requested_locked(live, unsafe { *presses });
-                unsafe {
-                    *disabled |= mask_live; //  lock:   set the disable bit
-                    *disabled &= !restore; //   unlock: restore the managed-but-unlocked bit
-                    *requests &= !mask_live; // belt-and-suspenders: drop this frame's requests
-                    *presses &= !mask_live;
-                }
-                if hit != 0 {
-                    report(hit);
-                }
+            // Read-back BEFORE clearing: which locked actions were newly pressed this frame.
+            let hit = requested_locked(live, unsafe { *presses });
+            unsafe {
+                *disabled |= mask_live; //  lock:   set the disable bit
+                *disabled &= !restore; //   unlock: restore the managed-but-unlocked bit
+                *requests &= !mask_live; // belt-and-suspenders: drop this frame's requests
+                *presses &= !mask_live;
+            }
+            if hit != 0 {
+                report(hit);
             }
         }
     }
@@ -250,12 +250,12 @@ pub fn enforce() {
     if heal_locked(live) {
         let now = now_ms();
         let last = LAST_HEAL_APPLY_MS.load(Ordering::Relaxed);
-        if last == 0 || now.saturating_sub(last) >= HEAL_REAPPLY_MS {
-            // fire_no_flask acquires WorldChrMan itself (after the borrow above dropped) and is
-            // death-guarded; it returns false until the param streams in, so retry next tick.
-            if crate::traps::fire_no_flask() {
-                LAST_HEAL_APPLY_MS.store(now, Ordering::Relaxed);
-            }
+        // fire_no_flask acquires WorldChrMan itself (after the borrow above dropped) and is
+        // death-guarded; it returns false until the param streams in, so retry next tick.
+        if (last == 0 || now.saturating_sub(last) >= HEAL_REAPPLY_MS)
+            && crate::traps::fire_no_flask()
+        {
+            LAST_HEAL_APPLY_MS.store(now, Ordering::Relaxed);
         }
     } else {
         // Unlocked (or never locked): forget the timer so a later re-lock applies immediately.
