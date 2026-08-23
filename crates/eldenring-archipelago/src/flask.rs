@@ -26,7 +26,7 @@
 //! + the gen derives the tear schedule from it).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use eldenring::cs::GameDataMan;
 use fromsoftware_shared::FromStatic;
@@ -41,6 +41,9 @@ pub const FLASK_UPGRADE_ITEM: &str = "Progressive Flask Upgrade";
 /// Last rung whose "absorbed, nothing to add" explanation was logged (0 = none). Keeps the
 /// explanation to one line per rung instead of one per frame.
 static ABSORBED_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+/// One-shot: whether we've said "you received flask upgrades but this seed has no ladder" (#988).
+static RECEIVED_OFF_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The parsed `flaskLadder` from slot_data. `None`/empty => feature OFF (tick is a hard no-op).
 /// `Mutex<Option<..>>` because `Vec::new()` is not const and this is a `static` (a bare
@@ -74,7 +77,18 @@ pub fn tick(received_count: usize) -> Option<(u32, u32)> {
     // Desired rung from the received count. `None` => ladder absent/empty or count 0 => no-op.
     let target = {
         let guard = LADDER.lock().unwrap();
-        let ladder = guard.as_ref()?;
+        let Some(ladder) = guard.as_ref() else {
+            // #988: a Progressive Flask Upgrade landed but this seed set no flaskLadder
+            // (progressive_flasks is off), so it grants nothing. Say so ONCE -- a received item that
+            // silently does nothing reads as broken (CONTRIBUTING: tolerance requires telemetry).
+            if received_count > 0 && !RECEIVED_OFF_LOGGED.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "flask: received {received_count} Progressive Flask Upgrade(s), but this seed \
+                     has no flask ladder (progressive_flasks is off) -- they grant nothing."
+                );
+            }
+            return None;
+        };
         flask_reconcile::desired(ladder, received_count)?
     };
 

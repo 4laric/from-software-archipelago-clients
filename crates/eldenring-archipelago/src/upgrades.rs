@@ -91,10 +91,18 @@ fn dlc_blessing_floor_here() -> i32 {
 /// net.rs: `set_auto_upgrade(sd.pointer("/options/auto_upgrade").and_then(|v| v.as_i64()).unwrap_or(0) as i32)`.
 pub fn set_auto_upgrade(level_or_flag: i32) {
     AUTO_UPGRADE.store(level_or_flag, Ordering::Relaxed);
-    log::info!(
-        "auto_upgrade: {}",
-        if level_or_flag != 0 { "ENABLED" } else { "off" }
-    );
+    if level_or_flag != 0 {
+        // #989: the normal and somber smithing tracks are SEPARATE (normal +25 / somber +10), and
+        // auto_upgrade raises each weapon on its OWN track only -- a level never carries across.
+        // Stated here so "I upgraded a smithing weapon and my somber one didn't change" reads as
+        // intended, not as a bug.
+        log::info!(
+            "auto_upgrade: ENABLED -- raises each received weapon to your highest held level on ITS \
+             OWN smithing track (normal +25 / somber +10 are separate; a level does not cross)."
+        );
+    } else {
+        log::info!("auto_upgrade: off");
+    }
 }
 
 /// net.rs: `set_global_scadu_blessing(sd.pointer("/options/global_scadutree_blessing").and_then(|v| v.as_i64()).unwrap_or(0) as i32)`.

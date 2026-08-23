@@ -70,8 +70,14 @@ const LOG_SPACING_MS: u64 = 1500;
 /// deliberately FINITE (`NO_FLASK_SECONDS` = 20s) -- its safety property -- so a persistent heal
 /// lock re-applies it before it lapses. On unlock we simply stop, and the flask returns within 20s.
 static LAST_HEAL_APPLY_MS: AtomicU64 = AtomicU64::new(0);
+/// Last time we *attempted* the No Flask apply (success or not). Caps retries while the SpEffect
+/// param streams in -- fire_no_flask logs a "not loaded yet" line each call, so without this the
+/// pre-in-world frames spam it (~71 lines were seen in a heal test).
+static LAST_HEAL_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
 /// Re-apply cadence, comfortably under the 20s effect so heal never flickers back on while locked.
 const HEAL_REAPPLY_MS: u64 = 15_000;
+/// Retry cadence while the param is not loaded yet -- at most one attempt (and one log) per this.
+const HEAL_RETRY_MS: u64 = 2_000;
 
 /// The feature's domain: every ability it has governed this session. Only these bits are ever
 /// cleared from the game's disable field, so a disable the GAME set is never disturbed.
@@ -200,6 +206,7 @@ pub fn reset() {
     LIVE.store(0, Ordering::Relaxed);
     INITIALIZED.store(false, Ordering::Release);
     LAST_HEAL_APPLY_MS.store(0, Ordering::Relaxed);
+    LAST_HEAL_ATTEMPT_MS.store(0, Ordering::Relaxed);
     *UNLOCK_MAP.write().unwrap() = None;
 }
 
@@ -249,17 +256,22 @@ pub fn enforce() {
     // ---- heal (no action bit) -- enforced via the flask lockout, re-applied on a timer --------
     if heal_locked(live) {
         let now = now_ms();
-        let last = LAST_HEAL_APPLY_MS.load(Ordering::Relaxed);
-        // fire_no_flask acquires WorldChrMan itself (after the borrow above dropped) and is
-        // death-guarded; it returns false until the param streams in, so retry next tick.
-        if (last == 0 || now.saturating_sub(last) >= HEAL_REAPPLY_MS)
-            && crate::traps::fire_no_flask()
-        {
-            LAST_HEAL_APPLY_MS.store(now, Ordering::Relaxed);
+        let last_apply = LAST_HEAL_APPLY_MS.load(Ordering::Relaxed);
+        let due = last_apply == 0 || now.saturating_sub(last_apply) >= HEAL_REAPPLY_MS;
+        // fire_no_flask acquires WorldChrMan itself (after the borrow above dropped), is
+        // death-guarded, and returns false until the SpEffect param streams in. Cap the retry so a
+        // waiting heal-lock does not log "not loaded yet" every frame.
+        let last_try = LAST_HEAL_ATTEMPT_MS.load(Ordering::Relaxed);
+        if due && (last_try == 0 || now.saturating_sub(last_try) >= HEAL_RETRY_MS) {
+            LAST_HEAL_ATTEMPT_MS.store(now, Ordering::Relaxed);
+            if crate::traps::fire_no_flask() {
+                LAST_HEAL_APPLY_MS.store(now, Ordering::Relaxed);
+            }
         }
     } else {
-        // Unlocked (or never locked): forget the timer so a later re-lock applies immediately.
+        // Unlocked (or never locked): forget the timers so a later re-lock applies immediately.
         LAST_HEAL_APPLY_MS.store(0, Ordering::Relaxed);
+        LAST_HEAL_ATTEMPT_MS.store(0, Ordering::Relaxed);
     }
 }
 
