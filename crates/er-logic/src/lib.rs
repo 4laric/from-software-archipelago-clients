@@ -37,6 +37,7 @@ pub mod death_guard;
 pub mod deathlink;
 pub mod deathlink_gate_replay;
 pub mod downstate_watch;
+pub mod enemy_drop_watch;
 pub mod equip_load;
 pub mod esd_probe;
 pub mod fast_travel;
