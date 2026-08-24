@@ -81,6 +81,7 @@ console_commands! {
     Region => "!region" => "!region",
     Warp => "!warp" => "!warp <grace entity id>",
     Grace => "!grace" => "!grace <name substring>",
+    Check => "!check" => "!check <name substring>",
     UnlockGrace => "!unlockgrace" => "!unlockgrace <unique name substring|flag>",
     MarkerProbe => "!markerprobe" => "!markerprobe [set|verify|clear]",
     Give => "!give" => "!give <fullId> [qty]",
@@ -457,6 +458,53 @@ impl shared::Core for Core {
                 }
                 for l in lines {
                     self.log(ap::Print::message(l));
+                }
+                true
+            }
+            ConsoleCommand::Check => {
+                let Some(q) = arg.map(|s| s.to_lowercase()) else {
+                    self.log(ap::Print::message(
+                        "usage: !check <name substring>".to_string(),
+                    ));
+                    return true;
+                };
+                // Only FLAG-POLL checks carry a settable acquisition flag (enemy/boss/NPC death
+                // drops, offline pickups) -- the exact "a bunch that didn't fire" category #1008 is
+                // for. Regular world pickups fire on the game's own event and are not listed.
+                let entries: Vec<(i64, u32)> = self
+                    .flag_poll
+                    .as_ref()
+                    .map(|fp| fp.location_flags.iter().map(|(&l, &f)| (l, f)).collect())
+                    .unwrap_or_default();
+                let mut named: Vec<(String, u32, bool)> = Vec::new();
+                if let Some(client) = self.client() {
+                    let game = client.game(client.this_player().game());
+                    for (loc, flag) in entries {
+                        if let Some(name) = game
+                            .as_ref()
+                            .and_then(|g| g.location(loc).map(|l| l.name().to_string()))
+                        {
+                            named.push((name, flag, crate::flags::get_event_flag(flag)));
+                        }
+                    }
+                }
+                let (lines, dropped) = er_logic::console_check::matched_lines(named, &q, 25);
+                if lines.is_empty() {
+                    self.log(ap::Print::message(format!(
+                        "!check: no flag-poll check matches '{q}' (only enemy/boss/NPC-drop checks carry a settable flag)"
+                    )));
+                } else {
+                    for l in &lines {
+                        self.log(ap::Print::message(l.clone()));
+                    }
+                    if dropped > 0 {
+                        self.log(ap::Print::message(format!(
+                            "...{dropped} more match(es); narrow the search"
+                        )));
+                    }
+                    self.log(ap::Print::message(
+                        er_logic::console_check::CHECK_CAVEAT.to_string(),
+                    ));
                 }
                 true
             }
