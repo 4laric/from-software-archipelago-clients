@@ -29,48 +29,89 @@ use std::collections::HashSet;
 /// complete vanilla MSB set fills the remaining ~106 flagged enemy-drop checks (147 shipped total).
 /// The table is a FALLBACK universe; the client watches only the subset whose AP location is in the
 /// seed (see [`build_watch`]).
-pub const ENEMY_DROP_ENTITIES: [(u32, i64); 41] = [
-    (10000520, 7774017), // Raw Meat Dumpling
-    (11000405, 7771124), // Gravel Stone Seal
-    (11000469, 7771126), // 1890000
-    (11000480, 7771121), // Somber Smithing Stone [4]
-    (12010245, 7771237), // Larval Tear
-    (12010247, 7771239), // Larval Tear
-    (12010256, 7771241), // Larval Tear
-    (12020392, 7771345), // 301000
-    (14000600, 7774035), // Raw Meat Dumpling
-    (14000680, 7771654), // Gravity Well
-    (16000500, 7771821), // Great Omenkiller Cleaver
-    (16000520, 7771823), // Bloodhound Claws
-    (18000330, 7774042), // Dragon Communion Seal
-    (20000272, 7771912), // Golden Horn Tender
-    (21020270, 7774062), // Raw Meat Dumpling
-    (22000450, 7772111), // Congealed Putrescence
-    (28000390, 7772123), // Revered Spirit Ash
-    (30130400, 7774074), // Raw Meat Dumpling
-    (30130402, 7774075), // Raw Meat Dumpling
-    (30130407, 7774073), // Raw Meat Dumpling
-    (30130408, 7774072), // Raw Meat Dumpling
-    (30180326, 7774083), // Raw Meat Dumpling
-    (30180350, 7774084), // Raw Meat Dumpling
-    (30180351, 7774081), // Raw Meat Dumpling
-    (30180352, 7774082), // Raw Meat Dumpling
-    (30180355, 7774080), // Raw Meat Dumpling
-    (31040300, 7772233), // Golden Rune [6]
-    (31110300, 7772272), // Ghost Glovewort [4]
-    (35000258, 7772522), // Ghost Glovewort [6]
-    (35000369, 7772520), // Omen Bairn
-    (35000416, 7772521), // Somber Smithing Stone [7]
-    (35000418, 7774101), // Raw Meat Dumpling
-    (39200350, 7774121), // Golden Rune [6]
-    (39200352, 7774120), // Golden Rune [6]
-    (39200353, 7774119), // Golden Rune [6]
-    (40020290, 7774158), // Great Ghost Glovewort
-    (41000353, 7774171), // Raw Meat Dumpling
-    (41000359, 7774169), // Raw Meat Dumpling
-    (41000360, 7774168), // Raw Meat Dumpling
-    (41010331, 7774179), // Raw Meat Dumpling
-    (41010337, 7774177), // Raw Meat Dumpling
+pub const ENEMY_DROP_ENTITIES: [(u32, i64); 82] = [
+    (10000520, 7774017),   // Raw Meat Dumpling
+    (11000405, 7771124),   // Gravel Stone Seal
+    (11000469, 7771126),   // 1890000
+    (11000480, 7771121),   // Somber Smithing Stone [4]
+    (12010245, 7771237),   // Larval Tear
+    (12010247, 7771239),   // Larval Tear
+    (12010256, 7771241),   // Larval Tear
+    (12020392, 7771345),   // 301000
+    (14000600, 7774035),   // Raw Meat Dumpling
+    (14000680, 7771654),   // Gravity Well
+    (16000500, 7771821),   // Great Omenkiller Cleaver
+    (16000520, 7771823),   // Bloodhound Claws
+    (18000330, 7774042),   // Dragon Communion Seal
+    (20000272, 7771912),   // Golden Horn Tender
+    (21020270, 7774062),   // Raw Meat Dumpling
+    (22000450, 7772111),   // Congealed Putrescence
+    (28000390, 7772123),   // Revered Spirit Ash
+    (30130400, 7774074),   // Raw Meat Dumpling
+    (30130402, 7774075),   // Raw Meat Dumpling
+    (30130407, 7774073),   // Raw Meat Dumpling
+    (30130408, 7774072),   // Raw Meat Dumpling
+    (30180326, 7774083),   // Raw Meat Dumpling
+    (30180350, 7774084),   // Raw Meat Dumpling
+    (30180351, 7774081),   // Raw Meat Dumpling
+    (30180352, 7774082),   // Raw Meat Dumpling
+    (30180355, 7774080),   // Raw Meat Dumpling
+    (31040300, 7772233),   // Golden Rune [6]
+    (31110300, 7772272),   // Ghost Glovewort [4]
+    (35000258, 7772522),   // Ghost Glovewort [6]
+    (35000369, 7772520),   // Omen Bairn
+    (35000416, 7772521),   // Somber Smithing Stone [7]
+    (35000418, 7774101),   // Raw Meat Dumpling
+    (39200350, 7774121),   // Golden Rune [6]
+    (39200352, 7774120),   // Golden Rune [6]
+    (39200353, 7774119),   // Golden Rune [6]
+    (40020290, 7774158),   // Great Ghost Glovewort
+    (41000353, 7774171),   // Raw Meat Dumpling
+    (41000359, 7774169),   // Raw Meat Dumpling
+    (41000360, 7774168),   // Raw Meat Dumpling
+    (41010331, 7774179),   // Raw Meat Dumpling
+    (41010337, 7774177),   // Raw Meat Dumpling
+    (1035410340, 7774229), // Ghost Glovewort [2]
+    (1035410350, 7774230), // Ghost Glovewort [2]
+    (1035440210, 7774243), // Fire Blossom
+    (1035500290, 7774273), // Raw Meat Dumpling
+    (1035500291, 7774271), // Raw Meat Dumpling
+    (1035500292, 7774272), // Raw Meat Dumpling
+    (1035500350, 7774274), // Somber Smithing Stone [2]
+    (1035500351, 7774281), // Somber Smithing Stone [2]
+    (1035500353, 7774289), // Somber Smithing Stone [2]
+    (1035500354, 7774288), // Somber Smithing Stone [2]
+    (1035500355, 7774280), // Somber Smithing Stone [2]
+    (1035500356, 7774282), // Somber Smithing Stone [2]
+    (1035500360, 7774279), // Somber Smithing Stone [2]
+    (1035500361, 7774283), // Somber Smithing Stone [2]
+    (1035500363, 7774287), // Somber Smithing Stone [2]
+    (1035500365, 7774277), // Somber Smithing Stone [2]
+    (1035500367, 7774276), // Somber Smithing Stone [2]
+    (1035530400, 7774293), // Fire Blossom
+    (1035540275, 7774296), // Somber Smithing Stone [4]
+    (1035540300, 7774315), // Somber Smithing Stone [4]
+    (1035540400, 7774297), // Fire Blossom
+    (1036510310, 7900235), // 1890300
+    (1037420200, 7774319), // Ghost Glovewort [2]
+    (1039440730, 7774353), // Raw Meat Dumpling
+    (1039440731, 7774354), // Raw Meat Dumpling
+    (1039540301, 7774385), // Ghost Glovewort [4]
+    (1039540303, 7774384), // Ghost Glovewort [4]
+    (1042520350, 7774433), // Golden Rune [9]
+    (1043350280, 7774451), // 20900
+    (1043390280, 7774458), // 60300
+    (1051390204, 7774611), // Golden Rune [9]
+    (1051530283, 7774622), // Somber Smithing Stone [7]
+    (1051530284, 7774621), // Somber Smithing Stone [7]
+    (2047390300, 7773473), // Starlight Shards
+    (2047410301, 7774658), // Silver Horn Tender
+    (2047470200, 7773555), // Sacred Bloody Flesh
+    (2049430320, 7773646), // Blessed Bone Shard
+    (2049430321, 7773648), // Iris of Occultation
+    (2049430322, 7773647), // Blessed Bone Shard
+    (2049430330, 7773644), // Shadow Realm Rune [3]
+    (2049430331, 7773645), // Shadow Realm Rune [4]
 ];
 
 /// AP location a placement EntityID drops, if it is a known flagged enemy-drop check.
