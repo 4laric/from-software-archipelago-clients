@@ -276,6 +276,11 @@ pub struct Core {
     /// which can be mid-load when the game refuses writes -- so a fire-and-forget write would leave
     /// those pickups dead in the world forever. See `er_logic::sweep_flush` (replay-tested).
     sweep_flag_pending: Vec<u32>,
+    /// #1006 sweep-burst telemetry (measure-before-staggering): when a sweep stages owed flags
+    /// while none were pending, we start a burst = (started, peak_owed, ticks). Each flush tick
+    /// updates it; when `sweep_flag_pending` drains we log ms-to-drain (an SC shared-flag
+    /// propagation proxy) + peak size, then reset. Pure diagnostics -- no behaviour change.
+    sweep_flush_burst: Option<(std::time::Instant, usize, u32)>,
     /// AP checks observed in game but not yet accepted by the connection. Unlike the old
     /// one-tick `to_check` vector, this debt survives a player death / load edge and is retried
     /// without requiring another pickup to wake the reporting path (world#720).
@@ -753,6 +758,7 @@ impl shared::Core for Core {
             sweep_flag_state: HashMap::new(),
             sweep_watch: er_logic::sweep_watch::SweepWatch::new(),
             sweep_flag_pending: Vec::new(),
+            sweep_flush_burst: None,
             check_report_pending: HashSet::new(),
             check_report_error_logged: false,
             collect_cue: er_logic::collect_cue::CollectCue::default(),
@@ -3321,20 +3327,44 @@ impl shared::Core for Core {
                         self.sweep_flag_pending.push(f);
                     }
                 }
+                // #1006: a fresh burst begins the first tick flags are owed with none in flight.
+                if self.sweep_flush_burst.is_none() && !self.sweep_flag_pending.is_empty() {
+                    self.sweep_flush_burst =
+                        Some((std::time::Instant::now(), self.sweep_flag_pending.len(), 0));
+                }
             }
             if !self.sweep_flag_pending.is_empty() && crate::flags::in_world() {
                 let owed_before = self.sweep_flag_pending.len();
+                // #1006: time the shared-flag WRITE loop -- under seamless co-op each try_set
+                // propagates to every player, so a big burst is exactly what we'd stagger.
+                let write_t0 = std::time::Instant::now();
                 for &f in &self.sweep_flag_pending {
                     let _ = crate::flags::try_set_event_flag(f, true);
                 }
                 er_logic::sweep_flush::retire(&mut self.sweep_flag_pending, |f| {
                     crate::flags::get_event_flag(f)
                 });
+                let write_us = write_t0.elapsed().as_micros();
                 let landed = owed_before - self.sweep_flag_pending.len();
+                if let Some((_, peak, ticks)) = self.sweep_flush_burst.as_mut() {
+                    *ticks += 1;
+                    *peak = (*peak).max(owed_before);
+                }
                 if landed > 0 {
                     log::info!(
-                        "sweep-flush: {landed} swept member flag(s) confirmed set ({} still owed)",
+                        "sweep-flush: {landed} swept member flag(s) confirmed set ({} still owed) [wrote {owed_before} flag(s) in {write_us}us]",
                         self.sweep_flag_pending.len()
+                    );
+                }
+                // Burst drained: report ms-to-confirm + peak size. A large ms-to-drain under co-op
+                // is the signal that a write staggerer would help (issue #1006); a small one means
+                // it would not, and we leave the one-shot flush alone.
+                if self.sweep_flag_pending.is_empty()
+                    && let Some((start, peak, ticks)) = self.sweep_flush_burst.take()
+                {
+                    log::info!(
+                        "sweep-flush burst: drained {peak} flag(s) in {}ms across {ticks} tick(s) -- #1006 staggerer is warranted only if this is large under co-op",
+                        start.elapsed().as_millis()
                     );
                 }
             }
