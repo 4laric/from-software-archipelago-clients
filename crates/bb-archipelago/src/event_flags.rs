@@ -11,6 +11,42 @@ pub struct AttachmentInfo {
     pub eboot_base: u64,
 }
 
+/// The event-flag manager pointer is still null (clients#420).
+///
+/// This is a **startup-ordering** state, not a bad build: the manager is a
+/// guest global the game only populates further into boot -- plausibly only
+/// once a character save is loaded. Every live validation so far attached to an
+/// already-in-gameplay process, which is why it was never seen before.
+///
+/// It is a distinct error type so callers can tell it apart from a real refusal
+/// (signature mismatch, unknown build) and wait instead of exiting. In
+/// particular `main::native_attach_failure` must never wrap this class in the
+/// unrecognised-build / Cheat Engine bridge guidance: the bridge lane does not
+/// provide flag reads either, so that advice cannot help (clients#416).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventFlagManagerNotInitialized;
+
+impl std::fmt::Display for EventFlagManagerNotInitialized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ASCII only: this reaches the console notice surface.
+        f.write_str(
+            "Bloodborne event-flag manager is not initialized yet (the game has not finished loading a character)",
+        )
+    }
+}
+
+impl std::error::Error for EventFlagManagerNotInitialized {}
+
+/// True when `error` is the clients#420 startup-ordering state anywhere in its
+/// cause chain.
+pub fn is_manager_not_initialized(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<EventFlagManagerNotInitialized>()
+            .is_some()
+    })
+}
+
 /// CUSA03173 01.09: pointer slot for the event-flag manager.
 const MANAGER_ROOT_RVA: u64 = 0x0553_B100;
 /// CUSA03173 01.09: one of the inlined MSB-first flag writes.
@@ -54,9 +90,10 @@ mod platform {
     };
 
     use super::{
-        AttachmentInfo, GROUP_DIVISOR_OFFSET, GROUP_TREE_OFFSET, MANAGER_ROOT_RVA, NODE_KEY_OFFSET,
-        NODE_NIL_OFFSET, NODE_STORAGE_OFFSET, NODE_STORAGE_TYPE_OFFSET, PACKED_BASE_OFFSET,
-        PACKED_STRIDE_OFFSET, SETTER_WRITE_RVA, SETTER_WRITE_SIGNATURE, parse_latest_eboot_base,
+        AttachmentInfo, EventFlagManagerNotInitialized, GROUP_DIVISOR_OFFSET, GROUP_TREE_OFFSET,
+        MANAGER_ROOT_RVA, NODE_KEY_OFFSET, NODE_NIL_OFFSET, NODE_STORAGE_OFFSET,
+        NODE_STORAGE_TYPE_OFFSET, PACKED_BASE_OFFSET, PACKED_STRIDE_OFFSET, SETTER_WRITE_RVA,
+        SETTER_WRITE_SIGNATURE, parse_latest_eboot_base,
     };
 
     struct ProcessHandle(HANDLE);
@@ -203,10 +240,11 @@ mod platform {
                 signature
             );
             let manager: u64 = process.read(eboot_base + MANAGER_ROOT_RVA)?;
-            ensure!(
-                manager != 0,
-                "Bloodborne event-flag manager is not initialized"
-            );
+            if manager == 0 {
+                // clients#420: startup ordering, not a bad build. A distinct
+                // error type so the caller can wait instead of exiting.
+                return Err(anyhow::Error::new(EventFlagManagerNotInitialized));
+            }
             Ok(Self {
                 process_id,
                 process,

@@ -2,6 +2,28 @@
 
 ### Fixed
 
+* **A game that has not loaded a character no longer stops the client, and
+  never gets told its build is unrecognised (clients#420).** Immediately after
+  clients#418 landed, attach got past the base wait and image validation and
+  then died on `Bloodborne event-flag manager is not initialized` -- wrapped in
+  the unrecognised-build guidance, which points at a Cheat Engine lane that
+  provides no flag reads either. The manager is a guest global that stays null
+  until the game is further into boot (plausibly only once a save is loaded),
+  so this was a third startup-ordering race, not a bad build. The flag half now
+  arms **lazily**: attach succeeds with native item delivery armed and the flag
+  gate pending, and the client loop -- which already polls every tick -- arms it
+  the moment the manager appears. While pending, `read_event_flag` answers
+  "no accessor" (never "the flag is false") and the context reports
+  not-gameplay-ready, which is the *existing* send-gate shape
+  (`require_runtime_context` -> no checks, no sends); no parallel gate was
+  invented, and no check can be missed by waiting, because checks cannot fire
+  before gameplay anyway. Exactly two lines are printed, ever: one when the wait
+  begins and one when checks arm. A signature mismatch or a vanished process is
+  still terminal. And the routing now fails safe from both ends: the
+  not-initialized state is a distinct error type, exempted from the
+  unrecognised-build/ce-bridge guidance by the same mechanism as the
+  clients#418 stale-log case (clients#416).
+
 * **Native attach now waits for the game instead of racing it (clients#418).**
   The launcher starts shadPS4 and the client at the same moment, and the shad
   log is appended across runs, so reading it once at startup handed attach the

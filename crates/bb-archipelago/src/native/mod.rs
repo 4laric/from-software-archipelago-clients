@@ -29,6 +29,7 @@ pub mod contract;
 pub mod delivery;
 pub mod descriptor;
 pub mod engine;
+pub mod flag_gate;
 pub mod guest;
 pub mod install;
 pub mod mem;

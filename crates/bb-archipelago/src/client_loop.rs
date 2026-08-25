@@ -662,6 +662,61 @@ mod tests {
         ClientLoop::new(backend, config, ledger, ledger_path, "seed", "slot")
     }
 
+    /// clients#420: while the native flag gate is pending (the game has not
+    /// finished loading a character), location checks must simply abstain --
+    /// no checks, and no error either. Once the gate arms, the same loop starts
+    /// checking with no other intervention. The gating shape is the existing
+    /// one: a not-gameplay-ready context, plus `read_event_flag` answering
+    /// `None` rather than `false`.
+    #[test]
+    fn location_checks_abstain_while_the_flag_gate_is_pending_then_arm() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = false;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: false,
+        });
+        backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let none = HashSet::new();
+
+        for _ in 0..5 {
+            assert_eq!(
+                client
+                    .poll_locations(&none)
+                    .expect("waiting is not an error"),
+                Vec::<i64>::new()
+            );
+        }
+        // Nothing was bound while waiting: no identity is claimed off a
+        // not-ready context.
+        assert!(
+            client
+                .ledger
+                .slot("seed", "slot")
+                .and_then(|slot| slot.bound_save_identity.clone())
+                .is_none()
+        );
+
+        // The character finishes loading: the gate arms and the accessor works.
+        client.backend.event_flags_armed = true;
+        client.backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        // debounce is 3.
+        assert!(client.poll_locations(&none).unwrap().is_empty());
+        assert!(client.poll_locations(&none).unwrap().is_empty());
+        assert_eq!(client.poll_locations(&none).unwrap(), vec![1000]);
+        let _ = std::fs::remove_file(&ledger_path);
+    }
+
     #[test]
     fn terminal_harness_failure_parks_and_the_stream_continues() {
         let ledger_path = path();
