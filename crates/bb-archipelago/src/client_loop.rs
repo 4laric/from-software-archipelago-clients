@@ -141,6 +141,13 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         &mut self.backend
     }
 
+    /// The AP seed this runtime (and every ledger row it touches) is bound to.
+    /// clients#423 compares it against a reconnect's slot data: landing on a
+    /// regenerated seed must refuse, not continue on stale bindings.
+    pub fn seed_name(&self) -> &str {
+        &self.seed_name
+    }
+
     pub fn ledger(&self) -> &ReceiveLedger {
         &self.ledger
     }
@@ -714,6 +721,61 @@ mod tests {
         assert!(client.poll_locations(&none).unwrap().is_empty());
         assert!(client.poll_locations(&none).unwrap().is_empty());
         assert_eq!(client.poll_locations(&none).unwrap(), vec![1000]);
+        let _ = std::fs::remove_file(&ledger_path);
+    }
+
+    /// clients#423 (point 4): a check found while the client is offline must be
+    /// re-sent after reconnecting. `newly_checked` is derived from the
+    /// *server-checked* set handed in each tick -- which the loop rebuilds from
+    /// the fresh client after `sync()` -- and never from a local "already sent"
+    /// cache, so as long as the server does not yet know about a location whose
+    /// flag reads true, the poll keeps reporting it. This test is the witness:
+    /// the location is reported, and reported again on the next tick while the
+    /// server-checked set stays empty; once the server acknowledges it, the poll
+    /// goes quiet.
+    #[test]
+    fn a_check_the_server_does_not_know_about_is_reported_again() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let none = HashSet::new();
+
+        // debounce is 3.
+        assert!(client.poll_locations(&none).unwrap().is_empty());
+        assert!(client.poll_locations(&none).unwrap().is_empty());
+        assert_eq!(client.poll_locations(&none).unwrap(), vec![1000]);
+        // The send did not land (we were offline / the socket dropped): the
+        // server-checked set is still empty, so the very next poll re-reports.
+        assert_eq!(client.poll_locations(&none).unwrap(), vec![1000]);
+
+        // The reconnect's fresh client now reports it as checked: quiet.
+        let acknowledged = HashSet::from([1000]);
+        assert!(client.poll_locations(&acknowledged).unwrap().is_empty());
+        let _ = std::fs::remove_file(&ledger_path);
+    }
+
+    /// clients#423: the seed a runtime is bound to is readable, so a reconnect
+    /// can compare it against the slot data it just received.
+    #[test]
+    fn the_runtime_reports_the_seed_it_is_bound_to() {
+        let ledger_path = path();
+        let client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        assert_eq!(client.seed_name(), "seed");
         let _ = std::fs::remove_file(&ledger_path);
     }
 
