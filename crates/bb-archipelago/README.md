@@ -2,8 +2,10 @@
 
 This crate is the standalone Bloodborne client path. Unlike the native Dark
 Souls III and Sekiro DLLs, it reads Bloodborne location flags directly from
-shadPS4 process memory and uses a shadPS4/Cheat Engine file bridge for item
-delivery while the emulator integration is being developed.
+shadPS4 process memory. Item delivery now defaults to the in-process **native**
+backend (see below), with the shadPS4/Cheat Engine file bridge kept as an
+explicit escape (`--delivery=ce-bridge`) and as the remedy the default points
+you to when native cannot validate the running image.
 
 The first bridge contract supports received-item grants:
 
@@ -126,22 +128,45 @@ Runtime event flags, normalized item IDs, bridge paths, and future executable
 signatures stay in this client-side configuration/backend layer. They are never
 read from Bloodborne world-design data.
 
-## Native delivery (stage 2, experimental, off by default)
+## Native delivery (stage 2, now the default)
 
 Stage 2 replaces the Cheat Engine file bridge with an in-process native
 delivery backend that reads and writes shadPS4 memory directly, installs the
 `bb-native-grant-v5` grant payload, and drives the grant state machine the CE
-table paid for live. It is selected with a flag and is **not** the default:
+table paid for live. It is **now the default** — the client uses native when no
+`--delivery` flag is passed:
 
 ```
+bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD]                 # native (default)
 bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] --delivery=native
+bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] --delivery=ce-bridge
 ```
 
-`--delivery=ce-bridge` (the default when the flag is absent) keeps the Cheat
-Engine bridge described above. When `--delivery=native` is chosen but the
-running image does not verify against the contract, the client **fails closed**
-with a clear error — it never silently falls back in a way that would hide a
-broken native path.
+Defaulting to native is safe because native **fails closed** on any image it
+cannot validate: `require_validated_image` refuses CUSA00900 and every other
+serial/build, so a recognised-and-validated image gets native and nothing else
+is ever patched. On the **default** path (no `--delivery`), an image native
+cannot validate makes the client **stop with a clear, actionable error** — it
+does **not** silently fall back to the Cheat Engine bridge. The message is:
+
+> This game build was not recognized, so native item delivery cannot run
+> safely. To play now, load the Cheat Engine table and re-run with
+> `--delivery=ce-bridge`. Otherwise this build is not yet supported.
+
+A silent fallback would be unsafe: with native as the default the Cheat Engine
+table is not loaded, so the bridge's `GRANT` command files would sit unconsumed
+and delivered items would silently vanish. `--delivery=ce-bridge` forces the
+bridge directly and is exactly the remedy the error points to; use it once the
+CE table is loaded.
+
+An **explicit** `--delivery=native` also keeps the strict behaviour: it **fails
+closed** with a clear error, because the user asked for native specifically.
+Neither path falls back to the bridge; the fail-closed image check,
+no-double-grant, install atomicity and image-mismatch guards are unchanged.
+
+A safe, *detected* fallback — a liveness handshake that confirms a loaded CE
+table before offering the bridge — is the planned successor, tracked in
+clients#413.
 
 The native code lives in `src/native/`:
 
@@ -177,4 +202,9 @@ instead of granting twice.
 > machine, the inventory walk) is host-tested against fakes. The live Windows
 > attach/install/thread seams (`#[cfg(windows)]`) are compiled and linted by CI
 > only and **must be owner-validated against a running process** before the
-> native path is trusted. Until then, keep `--delivery=ce-bridge` (the default).
+> native path is fully trusted. Defaulting to native is bounded by its
+> fail-closed image check: an unrecognised build hard-fails with instructions
+> rather than being delivered, so nothing is patched on an image native cannot
+> validate. Owner-checklist item 3 (the CUSA00900 wrong-image refusal) is still
+> untested against a dump. If you want to avoid native entirely, load the Cheat
+> Engine table and pass `--delivery=ce-bridge`.

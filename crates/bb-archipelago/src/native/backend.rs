@@ -1,11 +1,17 @@
 //! `NativeBackend`: a [`BloodborneBackend`] that grants items in-process via the
 //! native `bb-native-grant-v5` payload, replacing the Cheat Engine file bridge.
 //!
-//! Selection is behind a flag and the CE bridge stays the default (see
-//! `main.rs`). When native delivery is chosen but the running image does not
-//! verify against the contract, [`NativeBackend::attach`] fails closed with a
-//! clear error -- it never silently falls back in a way that would hide a broken
-//! native path.
+//! Native is now the default delivery backend (see `main.rs`). Regardless of how
+//! it is selected, [`NativeBackend::attach`] itself always fails closed: when the
+//! running image does not verify against the contract it returns a clear error
+//! and patches nothing -- this layer never silently falls back. `main.rs` never
+//! turns that failure into a CE-bridge fallback: on the *default* path (no
+//! explicit `--delivery`) a failed attach hard-fails with guidance telling the
+//! player to load the Cheat Engine table and re-run with `--delivery=ce-bridge`,
+//! and an explicit `--delivery=native` propagates the raw error. A silent
+//! fallback would arm a bridge the player has no CE table loaded for, so grants
+//! would vanish; clients#413 tracks the liveness handshake that will let the
+//! client detect a loaded table and offer the bridge safely.
 //!
 //! The live attach/install path is `#[cfg(windows)]` and CI/owner-validated; the
 //! grant, flag and context logic it drives is host-tested through `engine.rs`,

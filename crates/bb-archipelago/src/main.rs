@@ -94,12 +94,18 @@ impl BloodborneBackend for Backend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeliveryMode {
-    /// The default: grant via the Cheat Engine file bridge.
+    /// Grant via the Cheat Engine file bridge. Not the default; selected
+    /// explicitly with `--delivery=ce-bridge`, and the remedy the default native
+    /// path points the player to when it cannot validate the running image.
     CeBridge,
-    /// Grant in-process via the native `bb-native-grant-v5` payload (stage 2).
+    /// The default: grant in-process via the native `bb-native-grant-v5` payload
+    /// (stage 2). Fails closed on any image it cannot validate; on the default
+    /// path (no explicit `--delivery`) an unrecognised image hard-fails with
+    /// guidance rather than silently falling back to the bridge (clients#413).
     Native,
 }
 
+#[derive(Debug)]
 struct Arguments {
     server: String,
     slot: String,
@@ -109,6 +115,40 @@ struct Arguments {
     mock: bool,
     assume_correct_save: bool,
     delivery: DeliveryMode,
+    /// True only when the user passed `--delivery=...` explicitly. Shapes the
+    /// native attach-failure message: the default path hard-fails with guidance
+    /// to load the Cheat Engine table and re-run with `--delivery=ce-bridge`,
+    /// while an explicit `--delivery=native` propagates the raw error.
+    delivery_explicit: bool,
+}
+
+/// The explicitly unsafe assumed-correct-save identity token. Set by
+/// `--assume-correct-save`; consulted by both the native and Cheat Engine paths.
+const ASSUMED_IDENTITY: &str = "unsafe-operator-attested-correct-save";
+
+/// Actionable guidance shown when the *default* native path cannot attach to and
+/// validate the running image. The default deliberately does NOT silently fall
+/// back to the Cheat Engine bridge: with native as the default the CE table will
+/// not be loaded, so a file-drop grant would sit unconsumed and delivered items
+/// would silently vanish. clients#413 tracks the liveness handshake that will
+/// let the client detect a loaded table before offering the bridge; until then
+/// an unrecognised build hard-fails and tells the player exactly how to play now.
+const UNRECOGNIZED_BUILD_GUIDANCE: &str = "This game build was not recognized, so native item delivery cannot run safely. To play now, load the Cheat Engine table and re-run with --delivery=ce-bridge. Otherwise this build is not yet supported.";
+
+/// Map a native attach/validate failure onto the error the client exits with.
+///
+/// Both paths hard-fail -- native fails closed, so nothing was patched or
+/// written. The default path (no explicit `--delivery`) wraps the failure with
+/// [`UNRECOGNIZED_BUILD_GUIDANCE`] so an unrecognised build tells the player how
+/// to play now; an explicit `--delivery=native` propagates the raw error,
+/// because the user asked for native specifically. Neither path silently falls
+/// back to the Cheat Engine bridge (clients#413).
+fn native_attach_failure(error: anyhow::Error, delivery_explicit: bool) -> anyhow::Error {
+    if delivery_explicit {
+        error
+    } else {
+        error.context(UNRECOGNIZED_BUILD_GUIDANCE)
+    }
 }
 
 const LIVE_ATTACH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -185,11 +225,57 @@ fn attach_native_backend(
     bail!("native Bloodborne delivery requires Windows")
 }
 
+/// Attach the Cheat Engine file-bridge backend (the `ce-bridge` delivery path).
+///
+/// Selected explicitly with `--delivery=ce-bridge`; it is the remedy the default
+/// native path points the player to when it cannot validate the running image.
+/// Factored out so the explicit selection here has one home. Note the default
+/// native path does NOT call this on failure -- it hard-fails with guidance
+/// rather than silently arming a bridge the player has no CE table loaded for
+/// (clients#413).
+fn attach_live_backend(config: &RuntimeConfig, assume_correct_save: bool) -> Result<Backend> {
+    let shad_log = config
+        .shad_log
+        .as_deref()
+        .context("live mode requires shad_log in the runtime config")?;
+    // clients#369: fail fast on path misconfiguration (bridge_root) before
+    // arming. shad_log is deliberately not preflighted: the attach retry loop
+    // tolerates shadPS4 starting after the client, and its error now names the
+    // setting.
+    config.preflight_paths()?;
+    let event_flags = attach_live_event_flags(shad_log)?;
+    let attachment = event_flags.info();
+    eprintln!(
+        "Bloodborne AP client {} | CUSA03173 01.09 | shad PID {} | eboot 0x{:X} | direct flag backend ready",
+        env!("CARGO_PKG_VERSION"),
+        attachment.process_id,
+        attachment.eboot_base
+    );
+    let bridge = FileBridge::new(&config.bridge_root);
+    match bridge.read_state() {
+        Ok(state) => eprintln!(
+            "Grant bridge reports build {} | protocol {} | harness {}",
+            state.build.as_deref().unwrap_or("missing"),
+            state.protocol.as_deref().unwrap_or("missing"),
+            state.harness.as_deref().unwrap_or("missing")
+        ),
+        Err(error) => eprintln!("Grant bridge state unavailable at startup: {error:#}"),
+    }
+    Ok(Backend::Live(if assume_correct_save {
+        FileBackend::assuming_correct_save(bridge, event_flags, ASSUMED_IDENTITY.into())
+    } else {
+        FileBackend::new(bridge, event_flags)
+    }))
+}
+
 fn arguments() -> Result<Arguments> {
-    let mut args = env::args().skip(1);
+    parse_args(env::args().skip(1))
+}
+
+fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let Some(server) = args.next() else {
         bail!(
-            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=ce-bridge|native]"
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native|ce-bridge] (native is the default; on an image it cannot validate the default hard-fails and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge)"
         )
     };
     let slot = args.next().context("missing SLOT")?;
@@ -198,7 +284,11 @@ fn arguments() -> Result<Arguments> {
     let mut password = None;
     let mut mock = false;
     let mut assume_correct_save = false;
-    let mut delivery = DeliveryMode::CeBridge;
+    // Native is the default delivery backend. It fails closed on any image it
+    // cannot validate; on the default path an unrecognised image hard-fails with
+    // guidance -- it does NOT fall back to the bridge (see `main`, clients#413).
+    let mut delivery = DeliveryMode::Native;
+    let mut delivery_explicit = false;
     for argument in args {
         if argument == "--mock" {
             mock = true;
@@ -208,8 +298,9 @@ fn arguments() -> Result<Arguments> {
             delivery = match mode {
                 "ce-bridge" => DeliveryMode::CeBridge,
                 "native" => DeliveryMode::Native,
-                other => bail!("unknown --delivery mode {other:?}; expected ce-bridge or native"),
+                other => bail!("unknown --delivery mode {other:?}; expected native or ce-bridge"),
             };
+            delivery_explicit = true;
         } else if password.replace(argument).is_some() {
             bail!("only one password may be supplied");
         }
@@ -223,6 +314,7 @@ fn arguments() -> Result<Arguments> {
         mock,
         assume_correct_save,
         delivery,
+        delivery_explicit,
     })
 }
 
@@ -234,7 +326,6 @@ fn main() -> Result<()> {
         "--mock and --assume-correct-save cannot be combined"
     );
     let mut config = RuntimeConfig::load(&args.config)?;
-    const ASSUMED_IDENTITY: &str = "unsafe-operator-attested-correct-save";
     if args.assume_correct_save {
         config.expected_save_identity = Some(ASSUMED_IDENTITY.into());
         eprintln!(
@@ -254,52 +345,40 @@ fn main() -> Result<()> {
             .as_deref()
             .context("native delivery requires shad_log in the runtime config")?;
         config.preflight_paths()?;
-        eprintln!(
-            "Native delivery selected (stage 2). This path is UNTESTED against a live game and              fails closed on any image mismatch; the Cheat Engine bridge remains the default."
-        );
+        if args.delivery_explicit {
+            eprintln!(
+                "Native delivery selected explicitly (--delivery=native). It fails closed on any image mismatch and will NOT fall back: a build it cannot validate is refused, not delivered through the bridge."
+            );
+        } else {
+            eprintln!(
+                "Native delivery is the default. It fails closed on any image mismatch: a build it cannot validate is refused, not delivered. If this build is not recognized the client stops and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge (it does NOT silently fall back to the bridge)."
+            );
+        }
         let assumed_identity = args
             .assume_correct_save
             .then(|| ASSUMED_IDENTITY.to_string());
-        let backend = attach_native_backend(shad_log, assumed_identity)?;
-        eprintln!(
-            "Bloodborne AP client {} | CUSA03173 01.09 | native payload installed | eboot 0x{:X} | native delivery armed",
-            env!("CARGO_PKG_VERSION"),
-            backend.base()
-        );
-        Backend::Native(Box::new(backend))
-    } else {
-        let shad_log = config
-            .shad_log
-            .as_deref()
-            .context("live mode requires shad_log in the runtime config")?;
-        // clients#369: fail fast on path misconfiguration (bridge_root) before
-        // arming. shad_log is deliberately not preflighted: the attach retry
-        // loop tolerates shadPS4 starting after the client, and its error now
-        // names the setting.
-        config.preflight_paths()?;
-        let event_flags = attach_live_event_flags(shad_log)?;
-        let attachment = event_flags.info();
-        eprintln!(
-            "Bloodborne AP client {} | CUSA03173 01.09 | shad PID {} | eboot 0x{:X} | direct flag backend ready",
-            env!("CARGO_PKG_VERSION"),
-            attachment.process_id,
-            attachment.eboot_base
-        );
-        let bridge = FileBridge::new(&config.bridge_root);
-        match bridge.read_state() {
-            Ok(state) => eprintln!(
-                "Grant bridge reports build {} | protocol {} | harness {}",
-                state.build.as_deref().unwrap_or("missing"),
-                state.protocol.as_deref().unwrap_or("missing"),
-                state.harness.as_deref().unwrap_or("missing")
-            ),
-            Err(error) => eprintln!("Grant bridge state unavailable at startup: {error:#}"),
+        match attach_native_backend(shad_log, assumed_identity) {
+            Ok(backend) => {
+                eprintln!(
+                    "Bloodborne AP client {} | CUSA03173 01.09 | native payload installed | eboot 0x{:X} | native delivery armed",
+                    env!("CARGO_PKG_VERSION"),
+                    backend.base()
+                );
+                Backend::Native(Box::new(backend))
+            }
+            // Native could not attach and validate this image -- an unknown
+            // serial/build, a failed image assert, or another refusal. Native
+            // fails closed by design, so nothing was patched or written. We do
+            // NOT silently fall back to the Cheat Engine bridge: with native as
+            // the default the CE table will not be loaded, so a file-drop grant
+            // would sit unconsumed and delivered items would vanish (clients#413
+            // tracks the liveness handshake that will make a safe fallback
+            // possible). The default path hard-fails with actionable guidance;
+            // an explicit --delivery=native propagates the raw error.
+            Err(error) => return Err(native_attach_failure(error, args.delivery_explicit)),
         }
-        Backend::Live(if args.assume_correct_save {
-            FileBackend::assuming_correct_save(bridge, event_flags, ASSUMED_IDENTITY.into())
-        } else {
-            FileBackend::new(bridge, event_flags)
-        })
+    } else {
+        attach_live_backend(&config, args.assume_correct_save)?
     };
     let ledger = ReceiveLedger::load(&args.ledger)
         .with_context(|| format!("loading receive ledger {}", args.ledger.display()))?;
@@ -526,5 +605,73 @@ fn main() -> Result<()> {
         }
 
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args(extra: &[&str]) -> Vec<String> {
+        let mut v = vec![
+            "server".to_string(),
+            "slot".to_string(),
+            "config.json".to_string(),
+            "ledger.json".to_string(),
+        ];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn default_delivery_is_native_and_not_explicit() {
+        let args = parse_args(base_args(&[]).into_iter()).expect("parse");
+        assert_eq!(args.delivery, DeliveryMode::Native);
+        assert!(!args.delivery_explicit);
+    }
+
+    #[test]
+    fn explicit_ce_bridge_selects_bridge_and_is_explicit() {
+        let args = parse_args(base_args(&["--delivery=ce-bridge"]).into_iter()).expect("parse");
+        assert_eq!(args.delivery, DeliveryMode::CeBridge);
+        assert!(args.delivery_explicit);
+    }
+
+    #[test]
+    fn explicit_native_selects_native_and_is_explicit() {
+        let args = parse_args(base_args(&["--delivery=native"]).into_iter()).expect("parse");
+        assert_eq!(args.delivery, DeliveryMode::Native);
+        assert!(args.delivery_explicit);
+    }
+
+    #[test]
+    fn unknown_delivery_mode_is_rejected() {
+        let error = parse_args(base_args(&["--delivery=bogus"]).into_iter()).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown --delivery mode"));
+    }
+
+    // The backend-construction step (native attach / Live bridge) needs a live
+    // shadPS4 process and, for native, `#[cfg(windows)]` seams, so "default on a
+    // recognized image -> native" and "explicit ce-bridge -> Live backend"
+    // cannot be exercised host-side. What IS host-testable is the decision that
+    // governs Direction A: given a native attach/validate failure, the default
+    // path must hard-fail with guidance (never a Live-backend fallback), while
+    // an explicit --delivery=native propagates the raw error.
+    #[test]
+    fn default_native_failure_hard_fails_with_guidance_not_fallback() {
+        let error = native_attach_failure(anyhow::anyhow!("image assert: unknown build"), false);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("was not recognized"), "{rendered}");
+        assert!(rendered.contains("--delivery=ce-bridge"), "{rendered}");
+        // The underlying failure is preserved in the error chain.
+        assert!(rendered.contains("image assert"), "{rendered}");
+    }
+
+    #[test]
+    fn explicit_native_failure_propagates_raw_error() {
+        let error = native_attach_failure(anyhow::anyhow!("image assert: unknown build"), true);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("image assert"), "{rendered}");
+        assert!(!rendered.contains("was not recognized"), "{rendered}");
     }
 }
