@@ -263,6 +263,17 @@ pub struct SlotData {
     /// Report-side, so it is never owned (never cleared).
     pub goal_flag: Option<FlagId>,
     pub goal_met: bool,
+    /// Non-location PREREQUISITE flags owed to the game by the cumulative receive stream (today:
+    /// the Leyndell physical-seal pair 105/182 once two Great Runes are received -- `m60_45_52`
+    /// event 1045522500 reads `EventFlag(182) && EventFlag(105)`). Desired-SET, self-healing, and
+    /// NEVER owned: these are vanilla quest-state flags, and clearing one is not ours to do.
+    ///
+    /// 🛑 NOT `seal_flags`. That field means "hold FALSE, owned, re-sealable" -- routing these
+    /// through it made the reconciler emit ClearFlag(105)/ClearFlag(182) on every stable tick
+    /// while the keyitems backstop re-set them: a 60Hz standoff that kept the capital fog wall
+    /// shut and flooded the log (Otakuu, 2026-08-24: "applied 2 action(s)" + the backstop's
+    /// "[105, 182] applied; readback true" thousands of times per minute).
+    pub prereq_set_flags: Vec<FlagId>,
 }
 
 /// Everything server-authoritative the reconciler derives desired state from.
@@ -331,6 +342,12 @@ impl DesiredState {
         //     owned (never cleared). These previously rode the scattered startgrants / goal handlers;
         //     folding them here makes the reconciler the single source of the whole desired state.
         for &f in &inputs.slot_data.start_graces {
+            d.flags.insert(f, true);
+        }
+        // Receive-stream prerequisites (the Leyndell seal pair): desired-SET, never owned. Plain
+        // insert -- nothing else legitimately wants these flags false, and running after the seal
+        // fold means a mis-listed id would surface as a test-visible override, not a silent clear.
+        for &f in &inputs.slot_data.prereq_set_flags {
             d.flags.insert(f, true);
         }
         for &f in &inputs.slot_data.always_map_flags {
@@ -1897,6 +1914,60 @@ mod tests {
             Some(&true),
             "the Lock opens the region"
         );
+    }
+
+    /// THE MOTIVATING CASE (Otakuu, 2026-08-24). The Leyndell prerequisite pair 105/182 was routed
+    /// through `seal_flags`, whose semantics are "hold FALSE, owned": the reconciler emitted
+    /// ClearFlag(105)/ClearFlag(182) on every stable tick while the keyitems backstop re-set them
+    /// -- a 60Hz standoff that held the capital fog wall shut with two Great Runes received and
+    /// flooded the log ("applied 2 action(s) this tick (converged=true)", forever). Through
+    /// `prereq_set_flags` the same pair is desired-SET and never owned: it lands once, self-heals
+    /// if lost, and no tick may ever clear it.
+    #[test]
+    fn leyndell_prereq_flags_are_set_once_and_never_cleared() {
+        let mut g = MockGame::stable();
+        let mut r = Reconciler::new(DesiredInputs {
+            seed: "A".into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![],
+            slot_data: SlotData {
+                prereq_set_flags: vec![105, 182],
+                ..Default::default()
+            },
+        });
+
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        assert!(
+            g.get_flag(105) && g.get_flag(182),
+            "both prerequisites land"
+        );
+        assert!(
+            !r.desired().owned_flags.contains(&105) && !r.desired().owned_flags.contains(&182),
+            "vanilla quest-state flags are NEVER owned (never clearable)"
+        );
+
+        // The standoff detector: 200 further ticks may neither clear nor re-set either flag.
+        let writes_before = g.flag_set_calls.len();
+        for _ in 0..200 {
+            let out = r.tick(&mut g, TickBudget::default());
+            assert!(out.converged && out.applied.is_empty(), "sits converged");
+        }
+        assert_eq!(
+            g.flag_set_calls.len(),
+            writes_before,
+            "zero flag writes across 200 converged ticks -- the 60Hz reapply/clear loop is dead"
+        );
+        assert!(
+            !g.flag_set_calls
+                .iter()
+                .any(|&(f, on)| (f == 105 || f == 182) && !on),
+            "no tick ever wrote 105/182 OFF"
+        );
+
+        // Self-heal: a load clobbers one flag; the next tick restores it -- and only it.
+        g.flags.insert(182, false);
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 4);
+        assert!(g.get_flag(182), "a lost prerequisite is re-set");
     }
 
     // ---- diff semantics ------------------------------------------------------------------

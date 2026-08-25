@@ -137,6 +137,9 @@ mod replay {
                 }],
                 goal_flag: Some(9700),
                 goal_met: true,
+                // A receive-stream prerequisite pair (the Leyndell seal shape): desired-SET,
+                // never owned, proven invariant alongside everything above.
+                prereq_set_flags: vec![105, 182],
             },
         }
     }
@@ -311,6 +314,9 @@ mod replay {
             76971u32, 76972, 62060, 82001, 6901, 400001, 9600,
             // slot-data bulk flags (start grace, always+reveal map flags, met goal)
             76900, 82005, 62010, 9700,
+            // receive-stream prerequisite pair (the Leyndell seal shape): desired-SET, never
+            // owned -- these must land exactly once and never be re-cleared by the seal fold
+            105, 182,
         ]
         .into_iter()
         .collect();

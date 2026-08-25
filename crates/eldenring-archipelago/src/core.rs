@@ -4613,10 +4613,19 @@ impl Core {
         // Gap 1: fold slot-data bulk grants from the SAME tables the live handlers use.
         let sc = self.start.as_ref();
         let slot_data = SlotData {
-            // The physical Leyndell seal checks both 105 and 182. Derive them from the same
-            // cumulative receive stream used for ordinary deliveries and server `/send`; putting
-            // them in DesiredInputs lets the active flag reconciler self-heal the write.
-            seal_flags: crate::keyitems::leyndell_gate_flags(&received_names),
+            // `seal_flags` stays EMPTY, exactly as this function's header documents: it means
+            // "hold FALSE, owned" and seeding it proposes bogus ClearFlag actions. The Leyndell
+            // prerequisites 105/182 go through `prereq_set_flags` (desired-SET, never owned)
+            // instead -- routing them through seal_flags put the reconciler in a per-tick
+            // ClearFlag standoff against the keyitems backstop, which held the capital fog wall
+            // shut with two Great Runes received (Otakuu log, 2026-08-24).
+            seal_flags: Vec::new(),
+            // The physical Leyndell seal checks both 105 and 182 (m60_45_52 event 1045522500).
+            // Derive them from the same cumulative receive stream used for ordinary deliveries
+            // and server `/send`; the reconciler self-heals the write, and the keyitems backstop
+            // stays as the independent readback/retry boundary -- with both now pulling the same
+            // direction.
+            prereq_set_flags: crate::keyitems::leyndell_gate_flags(&received_names),
             start_graces: sc.map(|s| s.start_graces.clone()).unwrap_or_default(),
             always_map_flags: sc
                 .map(crate::startgrants::always_map_flags_for)
