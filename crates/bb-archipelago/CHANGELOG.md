@@ -1,5 +1,27 @@
 ## Unreleased
 
+### Fixed
+
+* **Native attach now waits for the game instead of racing it (clients#418).**
+  The launcher starts shadPS4 and the client at the same moment, and the shad
+  log is appended across runs, so reading it once at startup handed attach the
+  **previous** run's eboot base: verification read an unmapped page and the
+  client exited immediately -- blaming the player's game build for what was
+  purely an ordering problem. Attach now records the log length at start, tries
+  the base already in the log (live verification, not the file, decides whether
+  it is current), and if that base cannot be confirmed it waits on a 1s poll
+  with a 90s budget, accepting only a base line written **past** the recorded
+  offset -- a stale line can never satisfy the wait. One `Waiting for shadPS4 to
+  load the game...` line is printed when the wait begins, not per poll. The
+  terminal messages are now distinct: no fresh base line ever appeared names the
+  configured `shad_log` path and says what to compare it against (portable
+  `user\log\shad_log.txt` beside the exe vs the `%APPDATA%` one) **without**
+  mentioning the Cheat Engine bridge, while a confirmed base whose image fails
+  validation keeps the existing unrecognised-build guidance. The live event-flag
+  attach is handed the confirmed base instead of re-reading the log, so it
+  cannot re-run the same race. Fail-closed behaviour is unchanged: nothing is
+  written until a base is both confirmed and validated.
+
 ### Features
 
 * **Native delivery is now the default backend.** With no `--delivery` flag the

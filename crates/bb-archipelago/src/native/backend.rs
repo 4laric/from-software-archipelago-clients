@@ -88,9 +88,23 @@ impl NativeBackend {
     ///
     /// `assumed_identity` arms the explicitly unsafe assumed-correct-save mode.
     pub fn attach(shad_log: &std::path::Path, assumed_identity: Option<String>) -> Result<Self> {
+        Self::attach_with_policy(
+            shad_log,
+            assumed_identity,
+            super::attach_wait::WaitPolicy::default(),
+        )
+    }
+
+    /// [`NativeBackend::attach`] with an explicit fresh-base wait policy.
+    pub fn attach_with_policy(
+        shad_log: &std::path::Path,
+        assumed_identity: Option<String>,
+        policy: super::attach_wait::WaitPolicy,
+    ) -> Result<Self> {
+        use super::attach_wait::{BaseCheck, SystemAttachClock, wait_for_verified_base};
         use super::contract::contract;
         use super::install::{self, InstallConfig};
-        use super::mem::{logged_eboot_base, require_validated_image, verify_base};
+        use super::mem::{require_validated_image, verify_base};
         use super::threads::WindowsThreadController;
 
         let contract = contract();
@@ -100,16 +114,33 @@ impl NativeBackend {
         let log = std::fs::read_to_string(shad_log).map_err(|error| {
             anyhow::Error::new(error).context(format!("reading shad_log {}", shad_log.display()))
         })?;
-        let base = logged_eboot_base(&log)
-            .ok_or_else(|| anyhow::anyhow!("shad_log has no eboot base_virtual_addr"))?;
-        anyhow::ensure!(
-            verify_base(&memory, base, contract)?,
-            "the logged eboot base 0x{base:X} failed hook-original verification; refusing to patch a base we cannot confirm"
-        );
 
-        // Fail closed on any image mismatch -- CUSA00900 and every other build
-        // land here and are refused.
-        require_validated_image(&memory, base, contract)?;
+        // clients#418: the shad log is appended across runs, so the base already
+        // in it may belong to the PREVIOUS run. Verify it live, and if it cannot
+        // be confirmed, wait -- bounded -- for a base line written after this
+        // point in the file. Fails closed either way: nothing is written until a
+        // base is both confirmed and validated.
+        let mut clock = SystemAttachClock::default();
+        let base = wait_for_verified_base(
+            &shad_log.display().to_string(),
+            &log,
+            || std::fs::read_to_string(shad_log).ok(),
+            |candidate| match verify_base(&memory, candidate, contract) {
+                // Not the running image's base yet: a stale line, or a page the
+                // loader has not mapped. Keep waiting.
+                Ok(false) | Err(_) => BaseCheck::Unverified,
+                // Confirmed base: CUSA00900 and every other build are refused
+                // here, and waiting longer cannot change a build.
+                Ok(true) => match require_validated_image(&memory, candidate, contract) {
+                    Ok(()) => BaseCheck::Attached,
+                    Err(error) => BaseCheck::ImageRejected(format!("{error:#}")),
+                },
+            },
+            |line| eprintln!("{line}"),
+            &mut clock,
+            policy,
+        )
+        .map_err(anyhow::Error::new)?;
 
         let mut threads = WindowsThreadController::new(process_id);
         install::install(
@@ -121,7 +152,9 @@ impl NativeBackend {
             std::thread::sleep,
         )?;
 
-        let event_flags = LiveEventFlags::attach(shad_log)?;
+        // clients#418: hand over the base this attach already confirmed rather
+        // than letting the event-flag attach re-read the log and re-run the race.
+        let event_flags = LiveEventFlags::attach_at_base(shad_log, base)?;
         let guest = GuestRuntime::new(memory, base)?;
         let delivery = NativeDelivery::new(guest, contract.descriptor, contract.policy);
         Ok(Self {

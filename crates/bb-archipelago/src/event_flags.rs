@@ -179,6 +179,20 @@ mod platform {
                 anyhow::Error::new(error).context(action)
             })?;
             let eboot_base = parse_latest_eboot_base(&log)?;
+            Self::attach_at_base(shad_log, eboot_base)
+        }
+
+        /// Attach at a base the caller has *already* confirmed against live
+        /// memory.
+        ///
+        /// clients#418: reading the appended shad log once yields the previous
+        /// run's base when the game is still loading. `NativeBackend::attach`
+        /// resolves that race properly (bounded wait, freshness floor,
+        /// `verify_base`); this entry point lets it hand the answer over instead
+        /// of re-reading the log and re-running the same race. The signature and
+        /// manager checks below still gate the attach, so a wrong base is
+        /// refused here as before.
+        pub fn attach_at_base(shad_log: &Path, eboot_base: u64) -> Result<Self> {
             let (process_id, process) = open_shad()?;
             let mut signature = [0u8; SETTER_WRITE_SIGNATURE.len()];
             process.read_bytes(eboot_base + SETTER_WRITE_RVA, &mut signature)?;
@@ -340,6 +354,10 @@ mod platform {
 
     impl LiveEventFlags {
         pub fn attach(_shad_log: &Path) -> Result<Self> {
+            bail!("live Bloodborne event-flag reads require Windows")
+        }
+
+        pub fn attach_at_base(_shad_log: &Path, _eboot_base: u64) -> Result<Self> {
             bail!("live Bloodborne event-flag reads require Windows")
         }
 

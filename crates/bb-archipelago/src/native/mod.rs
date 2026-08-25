@@ -23,6 +23,7 @@
 //! Behaviour is ported from `tools/bb_native_delivery/` in the
 //! `4laric/bb-archipelago` repo; the semantics are not reinvented.
 
+pub mod attach_wait;
 pub mod backend;
 pub mod contract;
 pub mod delivery;
