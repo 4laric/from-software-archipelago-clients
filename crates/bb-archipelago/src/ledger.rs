@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -28,6 +28,14 @@ pub struct SlotLedger {
     /// error -- so older ledgers load unchanged.
     #[serde(default)]
     pub save_watermark: Option<u64>,
+    /// Indices below the cursor that must be delivered again (clients#427):
+    /// entries that were parked with `quantity_mismatch` under the old
+    /// ledger-sum precondition and are safe to retry now that the precondition
+    /// is the observed live quantity. `next_index` prefers the lowest of these,
+    /// so every ordering ensure in this file keeps holding unchanged. Older
+    /// ledgers have no such field and load with it empty.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub redeliver: BTreeSet<u64>,
 }
 
 /// The single defined outcome of comparing the save-resident receive
@@ -88,6 +96,15 @@ pub struct PendingItem {
     pub grant_complete: bool,
     #[serde(default)]
     pub equip_complete: bool,
+    /// The live stack quantity observed at the moment this grant was first
+    /// submitted (clients#427). It is the delivery precondition, and it is
+    /// durable so that a restart mid-grant compares against the SAME baseline
+    /// the interrupted command used -- which is what lets the delivery machine
+    /// answer `recovered_complete` instead of granting twice. `None` means the
+    /// baseline has not been sampled yet: the next poll observes and records
+    /// it. Older ledgers load as `None` and simply sample on their next poll.
+    #[serde(default)]
+    pub observed_before: Option<u32>,
 }
 
 const fn legacy_goods_category() -> u8 {
@@ -143,8 +160,14 @@ impl ReceiveLedger {
 }
 
 impl SlotLedger {
+    /// The next AP index to deliver: a requeued index first (clients#427),
+    /// otherwise one past the cursor.
     pub fn next_index(&self) -> u64 {
-        self.highest_processed_index.map_or(0, |index| index + 1)
+        self.redeliver
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or_else(|| self.highest_processed_index.map_or(0, |index| index + 1))
     }
 
     pub fn delivered_quantity(
@@ -168,8 +191,12 @@ impl SlotLedger {
             "pending item is out of order"
         );
         if let Some(existing) = &self.pending {
+            // The observed baseline is sampled state, not part of the plan: a
+            // re-plan of the same item legitimately arrives without one.
+            let mut candidate = pending;
+            candidate.observed_before = existing.observed_before;
             anyhow::ensure!(
-                existing == &pending,
+                existing == &candidate,
                 "pending item plan changed before acknowledgement"
             );
             return Ok(());
@@ -187,6 +214,29 @@ impl SlotLedger {
             "received item does not match the durable pending plan"
         );
         Ok(Some(pending))
+    }
+
+    /// Record the live baseline this grant was submitted against (clients#427).
+    /// Written durably BEFORE the grant can execute, so a restart replays the
+    /// interrupted command against the same number.
+    pub fn record_observed_before(&mut self, observed: u32) -> Result<()> {
+        let pending = self
+            .pending
+            .as_mut()
+            .context("no pending item to record an observed baseline for")?;
+        pending.observed_before = Some(observed);
+        Ok(())
+    }
+
+    /// Forget the recorded baseline because the command it belonged to was
+    /// proven unexecuted and withdrawn (clients#296 + clients#427). The next
+    /// publication samples the live stack again, so a player who spends between
+    /// the withdrawal and the retry is not parked on a stale number.
+    pub fn clear_observed_before(&mut self) -> bool {
+        match self.pending.as_mut() {
+            Some(pending) => pending.observed_before.take().is_some(),
+            None => false,
+        }
     }
 
     pub fn mark_grant_complete(&mut self) -> Result<()> {
@@ -232,9 +282,49 @@ impl SlotLedger {
             .context("cannot park an item without a durable pending plan")?;
         anyhow::ensure!(pending.index == index, "pending item index changed");
         self.acknowledged.insert(index, item);
-        self.highest_processed_index = Some(index);
+        self.advance_cursor(index);
         self.pending = None;
         Ok(())
+    }
+
+    /// Retire a delivered index: it leaves the requeue set, and the cursor only
+    /// ever moves forward (a requeued index is BELOW it).
+    fn advance_cursor(&mut self, index: u64) {
+        self.redeliver.remove(&index);
+        self.highest_processed_index = Some(
+            self.highest_processed_index
+                .map_or(index, |highest| highest.max(index)),
+        );
+    }
+
+    /// The park reason recorded on a blocked entry: the harness status token,
+    /// which `client_loop` writes as `"{status} ({detail})"`.
+    fn park_status(item: &AcknowledgedItem) -> Option<&str> {
+        let blocked = item.blocked.as_deref()?;
+        Some(blocked.split(' ').next().unwrap_or(blocked))
+    }
+
+    /// Requeue every entry parked with `quantity_mismatch` (clients#427).
+    ///
+    /// Those parks were caused by the fresh-grant precondition comparing the
+    /// stack against the ledger's lifetime delivered sum, which any spent
+    /// consumable falsifies; the precondition is now the observed live
+    /// quantity, so re-delivering them either lands the item or fails for a
+    /// real reason. Only that reason auto-unparks: `failed`, `write_error` and
+    /// `command_rejected` parks stay put for `bb-blocked`, because their cause
+    /// is not known to be fixed. Returns the requeued indices in order.
+    pub fn requeue_quantity_mismatch_parks(&mut self) -> Vec<u64> {
+        let indices: Vec<u64> = self
+            .acknowledged
+            .iter()
+            .filter(|(_, item)| Self::park_status(item) == Some("quantity_mismatch"))
+            .map(|(index, _)| *index)
+            .collect();
+        for index in &indices {
+            self.acknowledged.remove(index);
+            self.redeliver.insert(*index);
+        }
+        indices
     }
 
     /// The parked (blocked) entries, for bb-blocked's listing.
@@ -278,7 +368,7 @@ impl SlotLedger {
             "cannot acknowledge before equip completion"
         );
         self.acknowledged.insert(index, item);
-        self.highest_processed_index = Some(index);
+        self.advance_cursor(index);
         self.pending = None;
         Ok(())
     }
@@ -294,6 +384,7 @@ impl SlotLedger {
     pub fn rewind_to(&mut self, first_missing: u64) -> usize {
         let before = self.acknowledged.len();
         self.acknowledged.retain(|index, _| *index < first_missing);
+        self.redeliver.retain(|index| *index < first_missing);
         self.highest_processed_index = first_missing.checked_sub(1);
         self.pending = None;
         before - self.acknowledged.len()
@@ -362,6 +453,124 @@ mod tests {
         );
     }
 
+    fn park(slot: &mut SlotLedger, index: u64, status: &str) {
+        slot.begin(PendingItem {
+            index,
+            ap_item_id: 1,
+            raw_descriptor: 0xB000_04CE,
+            normalized_item_id: 0x4000_04CE,
+            item_category: 4,
+            quantity: 1,
+            upgrade_target_level: None,
+            reinforcement_level: None,
+            equip_target: None,
+            grant_complete: false,
+            equip_complete: false,
+            observed_before: None,
+        })
+        .unwrap();
+        slot.acknowledge_blocked(
+            index,
+            AcknowledgedItem {
+                ap_item_id: 1,
+                raw_descriptor: 0xB000_04CE,
+                normalized_item_id: 0x4000_04CE,
+                item_category: 4,
+                quantity: 1,
+                reinforcement_level: None,
+                equip_target: None,
+                blocked: Some(format!("{status} (mock detail)")),
+            },
+        )
+        .unwrap();
+    }
+
+    /// clients#427: only the park reason this issue fixed re-enters the queue,
+    /// it is delivered before anything new, and retiring it never regresses the
+    /// cursor or re-delivers a neighbour.
+    #[test]
+    fn requeued_parks_are_delivered_before_the_cursor_without_regressing_it() {
+        let mut slot = SlotLedger::default();
+        park(&mut slot, 0, "quantity_mismatch");
+        park(&mut slot, 1, "write_error");
+        park(&mut slot, 2, "quantity_mismatch");
+        assert_eq!(slot.next_index(), 3);
+
+        assert_eq!(slot.requeue_quantity_mismatch_parks(), vec![0, 2]);
+        assert_eq!(slot.blocked_entries().count(), 1);
+        assert_eq!(slot.next_index(), 0);
+
+        for index in [0, 2] {
+            slot.begin(PendingItem {
+                index,
+                ap_item_id: 1,
+                raw_descriptor: 0xB000_04CE,
+                normalized_item_id: 0x4000_04CE,
+                item_category: 4,
+                quantity: 1,
+                upgrade_target_level: None,
+                reinforcement_level: None,
+                equip_target: None,
+                grant_complete: true,
+                equip_complete: false,
+                observed_before: Some(0),
+            })
+            .unwrap();
+            slot.acknowledge(
+                index,
+                AcknowledgedItem {
+                    ap_item_id: 1,
+                    raw_descriptor: 0xB000_04CE,
+                    normalized_item_id: 0x4000_04CE,
+                    item_category: 4,
+                    quantity: 1,
+                    reinforcement_level: None,
+                    equip_target: None,
+                    blocked: None,
+                },
+            )
+            .unwrap();
+            // The cursor only ever moves forward.
+            assert_eq!(slot.highest_processed_index, Some(2));
+        }
+        assert_eq!(slot.next_index(), 3);
+        assert!(slot.redeliver.is_empty());
+        // A second startup finds nothing left to requeue.
+        assert!(slot.requeue_quantity_mismatch_parks().is_empty());
+        assert_eq!(slot.blocked_entries().count(), 1);
+    }
+
+    /// clients#427: the observed baseline is sampled state, not part of the
+    /// plan -- a re-plan of the same item must not read as a changed plan.
+    #[test]
+    fn a_recorded_baseline_does_not_make_a_replan_look_changed() {
+        let mut slot = SlotLedger::default();
+        let plan = PendingItem {
+            index: 0,
+            ap_item_id: 1,
+            raw_descriptor: 0xB000_04CE,
+            normalized_item_id: 0x4000_04CE,
+            item_category: 4,
+            quantity: 1,
+            upgrade_target_level: None,
+            reinforcement_level: None,
+            equip_target: None,
+            grant_complete: false,
+            equip_complete: false,
+            observed_before: None,
+        };
+        slot.begin(plan.clone()).unwrap();
+        slot.record_observed_before(7).unwrap();
+        slot.begin(plan.clone()).unwrap();
+        assert_eq!(slot.pending.as_ref().unwrap().observed_before, Some(7));
+        assert!(slot.clear_observed_before());
+        assert!(!slot.clear_observed_before());
+
+        let mut changed = plan;
+        changed.quantity = 2;
+        slot.begin(changed).unwrap_err();
+    }
+
     #[test]
     fn ledgers_are_isolated_by_seed_and_slot() {
         let mut ledger = ReceiveLedger::default();
@@ -395,6 +604,7 @@ mod tests {
                 upgrade_target_level: None,
                 grant_complete: false,
                 equip_complete: false,
+                observed_before: None,
             })
             .unwrap();
         ledger
@@ -438,6 +648,7 @@ mod tests {
             upgrade_target_level: Some(6),
             grant_complete: false,
             equip_complete: false,
+            observed_before: None,
         };
         slot.begin(pending.clone()).unwrap();
         let bytes = json::to_vec(&ledger).unwrap();
@@ -480,6 +691,7 @@ mod tests {
                 upgrade_target_level: None,
                 grant_complete: false,
                 equip_complete: false,
+                observed_before: None,
             })
             .unwrap();
             slot.mark_grant_complete().unwrap();
@@ -585,6 +797,7 @@ mod tests {
             upgrade_target_level: None,
             grant_complete: false,
             equip_complete: false,
+            observed_before: None,
         })
         .unwrap();
         // The grant never completed: the ordinary acknowledge refuses, the
@@ -627,6 +840,7 @@ mod tests {
             upgrade_target_level: None,
             grant_complete: false,
             equip_complete: false,
+            observed_before: None,
         })
         .unwrap();
         let mut parked = acknowledged(0);

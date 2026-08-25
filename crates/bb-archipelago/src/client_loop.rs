@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 
 use crate::backend::{
     BloodborneBackend, EquipRequest, GrantTerminalFailure, ItemGrant, OperationProgress,
+    StackObservation,
 };
 use crate::client_eprintln;
 use crate::config::RuntimeConfig;
@@ -326,6 +327,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             equip_target: self.equip_target(indexed, item.index)?,
             grant_complete: false,
             equip_complete: false,
+            observed_before: None,
         })
     }
 
@@ -347,6 +349,37 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             return Ok(false);
         };
         self.backend.withdraw_unwitnessed_grant(&tag)
+    }
+
+    /// Drop the recorded observed baseline of the in-flight grant and persist
+    /// that (clients#427). Only called when the backend proved the command was
+    /// withdrawn unexecuted.
+    fn forget_observed_baseline(&mut self) -> Result<()> {
+        if self
+            .ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .clear_observed_before()
+        {
+            self.ledger.save(&self.ledger_path)?;
+        }
+        Ok(())
+    }
+
+    /// Startup unpark (clients#427): every entry parked with
+    /// `quantity_mismatch` re-enters the delivery queue, because the
+    /// precondition that produced those parks -- the ledger's lifetime
+    /// delivered sum standing in for current inventory -- is gone. They now
+    /// deliver, or fail for a real reason. Parks with any other status stay
+    /// parked for `bb-blocked`. Returns the requeued indices.
+    pub fn requeue_quantity_mismatch_parks(&mut self) -> Result<Vec<u64>> {
+        let indices = self
+            .ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .requeue_quantity_mismatch_parks();
+        if !indices.is_empty() {
+            self.ledger.save(&self.ledger_path)?;
+        }
+        Ok(indices)
     }
 
     /// Processes at most one item, preserving AP index order and durable state
@@ -402,8 +435,15 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 // Not gameplay-ready (load transition, menu, character
                 // screen): a command published earlier must not execute
                 // against a game state we can no longer vouch for.
-                if let Some(tag) = in_flight_tag {
-                    self.backend.withdraw_unwitnessed_grant(&tag)?;
+                if let Some(tag) = in_flight_tag
+                    && self.backend.withdraw_unwitnessed_grant(&tag)?
+                {
+                    // The command is proven unexecuted, so the baseline it was
+                    // sampled against is no longer binding: forget it, and the
+                    // next publication observes the stack again (clients#427).
+                    // A witnessed command keeps its baseline -- that is the
+                    // replay-recovery number.
+                    self.forget_observed_baseline()?;
                 }
                 return Ok(ItemPollResult::Pending);
             }
@@ -455,20 +495,56 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         };
 
         if !pending.grant_complete {
+            // clients#427: the delivery precondition.
+            //
+            //  * REPLAY -- this pending plan already carries the baseline its
+            //    in-flight command was submitted against, so a restart compares
+            //    against the same number and an already-applied stack is
+            //    recognised (`recovered_complete`) instead of granted twice.
+            //  * FRESH -- no baseline yet: observe the live stack, record it
+            //    durably BEFORE the grant can execute, and use that. The
+            //    ledger's lifetime delivered sum is NOT the current inventory
+            //    of anything the player can spend, which is why every grant of
+            //    a consumable parked once one was used.
+            //
+            // Double-delivery protection is unchanged and still lives in the
+            // ledger's index cursor: an index is delivered at most once.
+            let expected_before = match pending.observed_before {
+                Some(recorded) => recorded,
+                None => match self.backend.observe_stack_quantity(
+                    pending.normalized_item_id,
+                    pending.reinforcement_level,
+                )? {
+                    StackObservation::Quantity(observed) => {
+                        self.ledger
+                            .slot_mut(&self.seed_name, &self.slot_name)
+                            .record_observed_before(observed)?;
+                        self.ledger.save(&self.ledger_path)?;
+                        pending.observed_before = Some(observed);
+                        observed
+                    }
+                    // No trustworthy reading yet: nothing is published.
+                    StackObservation::NotReady => return Ok(ItemPollResult::Pending),
+                    // A backend that cannot read inventory (the CE file bridge,
+                    // whose harness ignores the field anyway) keeps the
+                    // pre-clients#427 ledger-derived baseline.
+                    StackObservation::Unsupported => self
+                        .ledger
+                        .slot(&self.seed_name, &self.slot_name)
+                        .map_or(0, |slot| {
+                            slot.delivered_quantity(
+                                pending.normalized_item_id,
+                                pending.reinforcement_level,
+                            )
+                        }),
+                },
+            };
             let grant = ItemGrant {
                 raw_descriptor: pending.raw_descriptor,
                 normalized_item_id: pending.normalized_item_id,
                 item_category: pending.item_category,
                 quantity: pending.quantity,
-                expected_before: self.ledger.slot(&self.seed_name, &self.slot_name).map_or(
-                    0,
-                    |slot| {
-                        slot.delivered_quantity(
-                            pending.normalized_item_id,
-                            pending.reinforcement_level,
-                        )
-                    },
-                ),
+                expected_before,
                 reinforcement_level: pending.reinforcement_level,
                 tag: grant_tag(item.index),
             };
@@ -841,6 +917,366 @@ mod tests {
                 .contains("failed")
         );
         assert_eq!(slot.blocked_entries().count(), 1);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427, the motivating case: deliver a consumable, let the player
+    /// SPEND it, deliver another. Before the fix the precondition was the
+    /// ledger's lifetime delivered sum (2), the live stack was 0, and the grant
+    /// parked `quantity_mismatch` -- forever, for every later grant of that
+    /// item. The precondition is now the observed stack.
+    #[test]
+    fn a_spent_consumable_still_delivers_against_the_observed_stack() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received: Vec<IncomingItem> = (0..3)
+            .map(|index| IncomingItem {
+                index,
+                ap_item_id: 2000,
+            })
+            .collect();
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 1, .. })
+        ));
+        assert_eq!(client.backend().inventory[&(0x4000_04CE, None)], 2);
+
+        // The player uses both. The ledger still says two were delivered.
+        client
+            .backend_mut()
+            .inventory
+            .insert((0x4000_04CE, None), 0);
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .delivered_quantity(0x4000_04CE, None),
+            2
+        );
+
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 2, .. })
+        ));
+        // Observed, not predicted.
+        assert_eq!(client.backend().grants[2].expected_before, 0);
+        assert_eq!(client.backend().inventory[&(0x4000_04CE, None)], 1);
+        assert_eq!(
+            client.ledger().slot("seed", "slot").unwrap().next_index(),
+            3
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427: the fresh path samples, the replay path does NOT re-sample.
+    /// The baseline is recorded durably before the grant can execute, and the
+    /// in-flight command that survives a restart is compared against that same
+    /// number -- which is exactly what lets the delivery machine answer
+    /// `recovered_complete` for an already-applied stack instead of granting
+    /// twice. The mock has no recovery model, so the witness here is the number
+    /// the replayed grant carries: the recorded 1, never a fresh sample.
+    #[test]
+    fn a_fresh_grant_records_its_baseline_and_the_replay_reuses_it() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.delay_grant("ap_1", 1);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received: Vec<IncomingItem> = (0..2)
+            .map(|index| IncomingItem {
+                index,
+                ap_item_id: 2000,
+            })
+            .collect();
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        let pending = persisted
+            .slot("seed", "slot")
+            .unwrap()
+            .pending
+            .clone()
+            .unwrap();
+        assert_eq!(pending.index, 1);
+        assert!(!pending.grant_complete);
+        assert_eq!(pending.observed_before, Some(1));
+
+        // Restart. The player spent the first item while the client was down;
+        // a fresh sample would say 0, and re-granting on that baseline is the
+        // double-delivery this recorded number exists to prevent.
+        let mut reloaded = loop_with(
+            MockBackend::default(),
+            persisted,
+            ledger_path.clone(),
+            config(),
+        );
+        let error = reloaded.poll_items(&received).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("expected 1, found 0"),
+            "replay must use the recorded baseline, got: {error:#}"
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427: a proven-withdrawn command releases its baseline, so a
+    /// player who spends during the load screen that withdrew it is not parked
+    /// on a stale number when it re-publishes.
+    #[test]
+    fn a_withdrawn_command_releases_its_recorded_baseline() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.delay_grant("ap_0", 1);
+        backend.inventory.insert((0x4000_04CE, None), 4);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .observed_before,
+            Some(4)
+        );
+
+        // A load transition: the context can no longer be vouched for, the
+        // command is withdrawn unexecuted, and the player spends one.
+        client.backend_mut().location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: false,
+        });
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert_eq!(client.backend().withdrawn, vec!["ap_0".to_string()]);
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .observed_before,
+            None
+        );
+
+        client.backend_mut().location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        client
+            .backend_mut()
+            .inventory
+            .insert((0x4000_04CE, None), 3);
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        assert_eq!(client.backend().grants[0].expected_before, 3);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427: no grant is published off an unhydrated inventory -- a
+    /// baseline of "not readable yet" is never recorded as zero.
+    #[test]
+    fn an_unreadable_stack_publishes_no_grant_and_records_no_baseline() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.stack_observation_ready = false;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert!(client.backend().grants.is_empty());
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .observed_before,
+            None
+        );
+
+        client.backend_mut().stack_observation_ready = true;
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427: a backend that cannot read inventory (the CE file bridge)
+    /// keeps the ledger-derived baseline it always used -- the two-way witness
+    /// is the same fixture answering 4 when it can observe and 0 when it
+    /// cannot.
+    #[test]
+    fn a_backend_that_cannot_observe_keeps_the_ledger_baseline() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_04CE, None), 4);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        assert_eq!(client.backend().grants[0].expected_before, 4);
+        std::fs::remove_file(&ledger_path).unwrap();
+
+        let unobserving_path = path();
+        let mut backend = MockBackend::default();
+        backend.stack_observation_supported = false;
+        backend.inventory.insert((0x4000_04CE, None), 4);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            unobserving_path.clone(),
+            config(),
+        );
+        let error = client.poll_items(&received).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("expected 0, found 4"),
+            "the ledger-sum fallback must be unchanged, got: {error:#}"
+        );
+        std::fs::remove_file(unobserving_path).unwrap();
+    }
+
+    /// clients#427: the 21 parked items. A `quantity_mismatch` park was caused
+    /// by the precondition this issue removed, so it re-enters the queue on
+    /// startup and delivers. Every other park reason stays parked for
+    /// bb-blocked -- its cause is not known to be fixed.
+    #[test]
+    fn quantity_mismatch_parks_requeue_on_startup_and_other_parks_stay() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.fail_grant_terminally_with("ap_0", "quantity_mismatch");
+        backend.fail_grant_terminally_with("ap_1", "write_error");
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received: Vec<IncomingItem> = (0..3)
+            .map(|index| IncomingItem {
+                index,
+                ap_item_id: 2000,
+            })
+            .collect();
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Blocked(BlockedItem { index: 0, .. })
+        ));
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Blocked(BlockedItem { index: 1, .. })
+        ));
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 2, .. })
+        ));
+
+        // Restart with the fix in place: the harness no longer mismatches.
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        assert_eq!(
+            persisted
+                .slot("seed", "slot")
+                .unwrap()
+                .blocked_entries()
+                .count(),
+            2
+        );
+        let mut reloaded = loop_with(
+            MockBackend::default(),
+            persisted,
+            ledger_path.clone(),
+            config(),
+        );
+        assert_eq!(reloaded.requeue_quantity_mismatch_parks().unwrap(), vec![0]);
+
+        assert!(matches!(
+            reloaded.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        assert_eq!(reloaded.backend().grants[0].tag, "ap_0");
+        assert_eq!(reloaded.backend().inventory[&(0x4000_04CE, None)], 1);
+
+        let slot = reloaded.ledger().slot("seed", "slot").unwrap();
+        // The write_error park is untouched, the cursor never regressed, and
+        // nothing already delivered is delivered again.
+        assert_eq!(slot.blocked_entries().count(), 1);
+        assert!(
+            slot.acknowledged[&1]
+                .blocked
+                .as_deref()
+                .unwrap()
+                .contains("write_error")
+        );
+        assert_eq!(slot.highest_processed_index, Some(2));
+        assert_eq!(slot.next_index(), 3);
+        assert_eq!(
+            reloaded.poll_items(&received).unwrap(),
+            ItemPollResult::Idle
+        );
+        assert_eq!(reloaded.backend().grants.len(), 1);
         std::fs::remove_file(ledger_path).unwrap();
     }
 

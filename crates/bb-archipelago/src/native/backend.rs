@@ -18,16 +18,18 @@
 //! `delivery.rs` and the `event_flags` resilient reads.
 //!
 //! Replay recovery is coordinated with the receive ledger, not a parallel store:
-//! `grant_item` feeds the ledger-derived `expected_before` straight into the
+//! `grant_item` feeds the ledger's durable `expected_before` straight into the
 //! delivery machine, so a restart mid-grant recognises an already-applied stack
-//! (`recovered_complete`) instead of granting twice -- the same durable baseline
-//! `client_loop.rs` already computes from `SlotLedger::delivered_quantity`.
+//! (`recovered_complete`) instead of granting twice. Since clients#427 that
+//! baseline is the quantity `observe_stack_quantity` read at submit time and the
+//! ledger recorded, not the lifetime delivered sum -- a sum that is simply not
+//! the current inventory of anything the player can spend.
 
 use anyhow::{Result, bail};
 
 use crate::backend::{
     BloodborneBackend, EquipRequest, GrantTerminalFailure, ItemGrant, LocationContext,
-    OperationProgress,
+    OperationProgress, StackObservation,
 };
 use crate::client_eprintln;
 use crate::event_flags::LiveEventFlags;
@@ -80,6 +82,13 @@ pub struct NativeBackend {
     shad_log: std::path::PathBuf,
     assumed_context: Option<AssumedContextGate>,
     base: u64,
+    /// clients#427: consecutive polls a stack has read as absent, per
+    /// normalized id. An absent reading right after a load can be the
+    /// inventory not having hydrated yet, so the same `min_absent_polls`
+    /// grace the delivery machine applies before declaring a stack absent
+    /// gates the observed baseline too -- otherwise a hydration lie would be
+    /// recorded durably as a baseline of zero.
+    absent_observations: std::collections::HashMap<u32, u32>,
 }
 
 impl NativeBackend {
@@ -206,6 +215,7 @@ impl NativeBackend {
             shad_log: shad_log.to_owned(),
             assumed_context: assumed_identity.map(AssumedContextGate::new),
             base,
+            absent_observations: std::collections::HashMap::new(),
         })
     }
 }
@@ -259,6 +269,30 @@ impl BloodborneBackend for NativeBackend {
         Ok(None)
     }
 
+    fn observe_stack_quantity(
+        &mut self,
+        normalized_item_id: u32,
+        _reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation> {
+        let min_absent_polls = super::contract::contract().policy.min_absent_polls;
+        let Some(stack) = self.delivery.observe_stack(normalized_item_id) else {
+            return Ok(StackObservation::NotReady);
+        };
+        if stack.exists {
+            self.absent_observations.remove(&normalized_item_id);
+            return Ok(StackObservation::Quantity(stack.quantity));
+        }
+        let seen = self
+            .absent_observations
+            .entry(normalized_item_id)
+            .or_insert(0);
+        *seen = seen.saturating_add(1);
+        if *seen < min_absent_polls {
+            return Ok(StackObservation::NotReady);
+        }
+        Ok(StackObservation::Quantity(stack.quantity))
+    }
+
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
         let request = NativeGrantRequest {
             tag: grant.tag.clone(),
@@ -266,7 +300,8 @@ impl BloodborneBackend for NativeBackend {
             normalized_item_id: grant.normalized_item_id,
             item_category: grant.item_category,
             quantity: grant.quantity,
-            // The ledger-derived durable baseline: this is what makes a restart
+            // The ledger's durable baseline -- the quantity observed when this
+            // command was first submitted. This is what makes a restart
             // mid-grant recover instead of double-granting.
             expected_before: Some(grant.expected_before),
         };
