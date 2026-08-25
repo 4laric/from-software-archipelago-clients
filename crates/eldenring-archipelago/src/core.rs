@@ -5640,8 +5640,21 @@ impl Core {
                             }
                         }
                         Next::Insufficient { price, have } => {
+                            // DISABLED WITH THE COST, never hidden -- and as a BUTTON, not body
+                            // text (world#1014, colombius07 on v0.4.13: "i don't have the hint
+                            // next location button"). `text_disabled` is indistinguishable from
+                            // the rows around it, so the control read as ABSENT for the whole
+                            // early game -- exactly the discoverability failure #412's top-of-
+                            // window placement exists to kill, and the exact opposite of the
+                            // ruling on LockHintOffer::Insufficient. The label keeps the price
+                            // and the progress toward it; the widget id matches the Buyable arm
+                            // so imgui state carries across the afford edge.
                             ui.same_line();
-                            ui.text_disabled(format!("Hint next lock ({price} -- have {have})"));
+                            ui.disabled(true, || {
+                                ui.small_button(format!(
+                                    "Hint next lock ({price} -- have {have})###trk-buy-next"
+                                ));
+                            });
                         }
                         Next::AllFrontierHinted => {
                             ui.same_line();
@@ -5823,9 +5836,16 @@ impl Core {
                             Offer::Insufficient { price, have, .. } => {
                                 // DISABLED WITH THE COST, never hidden: a player who cannot see
                                 // the price, or that they are making progress toward it, learns
-                                // nothing from the mechanic.
+                                // nothing from the mechanic. AS A BUTTON (world#1014) --
+                                // `text_disabled` read as "no such control", so the per-region
+                                // button was reported missing too. The id matches the Buyable arm.
                                 ui.same_line();
-                                ui.text_disabled(format!("hint lock ({price} -- have {have})"));
+                                ui.disabled(true, || {
+                                    ui.small_button(format!(
+                                        "hint lock ({price} -- have {have})###trk-buy-{}",
+                                        region.region
+                                    ));
+                                });
                             }
                             Offer::AlreadyHinted { .. } => {
                                 ui.same_line();
