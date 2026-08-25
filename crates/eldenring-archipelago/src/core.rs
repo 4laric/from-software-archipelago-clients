@@ -850,6 +850,13 @@ impl shared::Core for Core {
         self.slot_data_parsed.then(crate::traps::trap_link_enabled)
     }
 
+    /// Region Sync (#1005). Same `slot_data_parsed` gate and same reason as the two above: before
+    /// the parse, "off" and "not read yet" are indistinguishable, and the tag reconciler needs to
+    /// tell them apart so it does not advertise a link this slot never opted into.
+    fn region_sync_enabled(&self) -> Option<bool> {
+        self.slot_data_parsed.then(crate::region_sync::is_enabled)
+    }
+
     /// Overlay menu-bar hook (SPEC-item-tracker.md): a "Tracker" item that toggles the window.
     ///
     /// The label carries its hotkey (as the shared overlay's "Hide (F5)" does) because F6 lived
@@ -1228,6 +1235,10 @@ impl shared::Core for Core {
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
                 crate::traps::set_trap_link_enabled(er_logic::options::parse_trap_link(sd));
+                // Region Sync (#1005): seamless-co-op region sharing. Same tolerant int-or-bool
+                // parse; absent (any seed rolled before this option) reads false, so the link is
+                // dark and nothing about an existing seed changes.
+                crate::region_sync::set_enabled(er_logic::options::parse_region_sync(sd));
                 // #548: a ROLL MODE, not a bool. `parse` is handed over whole so the feature can
                 // state an unrecognised value itself rather than have it collapse into "off" here.
                 crate::no_equip_load::set_mode(er_logic::equip_load::parse(sd));
@@ -2917,6 +2928,15 @@ impl shared::Core for Core {
         // ASCII only -- this goes through the FMG path (`every_toast_is_ascii`); region names are
         // already ASCII by construction, and an em-dash here drew as `?` in v0.2.18.
         let region_toast_live = self.region_toast_primed;
+        // REGION SYNC (#1005): the regions to tell the link group about, decided BEFORE the loop
+        // below consumes `unlocked`. Both anti-loop rules -- do not rebroadcast an open the link
+        // handed us, and do not rebroadcast a reconnect's replayed Locks -- live in `outbound`,
+        // which is host-tested; this line only supplies the inputs.
+        let region_sync_outbound = er_logic::region_sync::outbound(
+            self.region_sync_enabled() == Some(true),
+            &unlocked,
+            &crate::region_sync::applied_snapshot(),
+        );
         for region in unlocked {
             // A GATED CHILD's Lock lights no graces -- the world withholds the bundle while the
             // wall is armed and emits `regionGraces["<region> Lock"] = []` DELIBERATELY (its own
@@ -2945,6 +2965,27 @@ impl shared::Core for Core {
         // the only pass where a real arrival is indistinguishable from a replayed one, and silence
         // there is better than six false toasts on every reconnect.
         self.region_toast_primed = true;
+        // REGION SYNC broadcast (#1005). Its own tag, so only opted-in ER slots in this session
+        // receive it; the server echoes a tagged Bounce back to the sender too, which
+        // `region_sync::parse_open` drops by source name.
+        for region in region_sync_outbound {
+            let source = self
+                .my_name
+                .clone()
+                .unwrap_or_else(|| "Elden Ring".to_string());
+            let time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64());
+            let data = er_logic::region_sync::encode_open(&source, &region, time);
+            if let Some(client) = self.client_mut()
+                && let Err(e) = client.bounce(
+                    data,
+                    ap::BounceOptions::new().tags([er_logic::region_sync::TAG]),
+                )
+            {
+                log::warn!("RegionSync: broadcast failed: {e}");
+            }
+        }
         // BOSS_LOCKS_PATCH: overlay line on boss-lock receipt -- the lock item is otherwise
         // invisible in the console (no region apparatus, so "Region unlocked" never fires for
         // it). Mirrors that line's semantics, including the reconnect replay (name-dispatch
@@ -3792,6 +3833,12 @@ impl shared::Core for Core {
             // aren't clobbered by the save load — same reason the start graces are gated.
             if can_grant {
                 crate::region::tick_natural_key_triggers(cfg, &received_all);
+                // REGION SYNC (#1005): apply opens handed to us by the link. Same gate as the
+                // rest of this block (a loaded world), because the same discarded-write hazard
+                // applies. Idempotent: an entry survives until its open flag reads back set.
+                if crate::region_sync::is_enabled() {
+                    region_msgs.extend(crate::region_sync::apply_pending(cfg));
+                }
                 // STRANGLER (flags): the reconciler owns region-open/grace-bundle flags (RegionFlags)
                 // and key-item/great-rune obtained flags (KeyItem) and self-heals them every stable
                 // tick, so skip these two OLD re-appliers when it owns `flags`. `RECONCILE_APPLY=none`
@@ -4137,6 +4184,27 @@ impl shared::Core for Core {
                         source,
                         self.toast_clock.elapsed().as_millis() as u64,
                     );
+                }
+                // REGION SYNC (#1005). Queued rather than applied here: flag writes are silently
+                // discarded at menu/load, and this handler runs wherever the packet lands. The
+                // settled/in-world tick drains the queue and only drops an entry once the open
+                // flag reads back set.
+                ap::Event::Bounce { tags, data, .. }
+                    if self.region_sync_enabled() == Some(true)
+                        && tags.as_ref().is_some_and(|set| {
+                            set.iter()
+                                .any(|tag| tag.as_str() == er_logic::region_sync::TAG)
+                        }) =>
+                {
+                    let Some(data) = data else { continue };
+                    match er_logic::region_sync::parse_open(&data, my_name.as_deref()) {
+                        Some(inbound) => crate::region_sync::enqueue(inbound),
+                        // `None` is ALSO our own echo, which is the common case and must stay
+                        // quiet -- so this logs at debug, not warn.
+                        None => log::debug!(
+                            "RegionSync: inbound bounce not applicable (own echo or malformed)"
+                        ),
+                    }
                 }
                 _ => {}
             }
@@ -4941,6 +5009,10 @@ impl Core {
         self.item_counts.clear();
         self.armor_bundles.clear();
         crate::ability_lock::reset();
+        // Region Sync (#1005): both the inbound queue and the anti-echo set are keyed by the OLD
+        // seed's region names. A stale anti-echo entry would silence a genuine open on the new
+        // seed, which is the failure that is invisible in game.
+        crate::region_sync::reset();
         self.region = None;
         self.fogwall = None;
         self.progressive = ProgressiveState::new(HashMap::new());

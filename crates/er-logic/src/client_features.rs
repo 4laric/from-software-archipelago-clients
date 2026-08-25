@@ -91,6 +91,16 @@ pub const SUPPORTED: &[&str] = &[
     "blackout",
     // options.trap_link -> post-connect tag reconciliation plus exact-name Bounce delivery.
     "trap_link",
+    // options.region_sync -> post-connect tag reconciliation, plus RegionSync Bounce broadcast of
+    // this slot's region-opens and application of everyone else's (2026-08-25,
+    // er-archipelago#1005).
+    //
+    // 🛑 SILENTLY IGNORING THIS ONE BREAKS THE CO-OP IT EXISTS FOR. The whole point is that the
+    // party stays in one physical world; a build that connects and never applies an inbound open
+    // leaves that player region-kicked out from under the others, which reads as the seed being
+    // broken rather than the client being old. So the seed declares the tag and an older build
+    // refuses loudly -- the same call `trap_link` makes, for the same reason.
+    "region_sync",
     // armorBundles -> synthetic wrapper receipt reconciles every observable protector member.
     "armor_bundles",
     "region_completion_goal_gate",

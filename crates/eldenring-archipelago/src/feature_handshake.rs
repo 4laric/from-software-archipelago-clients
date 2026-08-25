@@ -117,6 +117,11 @@ pub const PROBES: &[(&str, Probe)] = &[
     // Read the same atomic that gates both outbound broadcasts and inbound queueing. The world
     // declares this tag only when the option is on, so `false` is a genuine dark feature.
     ("trap_link", |_| crate::traps::trap_link_enabled()),
+    // Region Sync (er-archipelago#1005). Same shape as `trap_link`: read the ONE atomic that
+    // gates both the outbound broadcast and the inbound apply, so ARMED means the link is really
+    // live rather than merely compiled in. The world declares this tag only when the option is on,
+    // so `false` here is a genuine dark feature and not a seed that never asked.
+    ("region_sync", |_| crate::region_sync::is_enabled()),
     // Parsed per connect into Core. Non-empty means wrapper receipt has concrete members to apply.
     ("armor_bundles", |c| c.armor_bundles),
     ("region_completion_goal_gate", |c| {
