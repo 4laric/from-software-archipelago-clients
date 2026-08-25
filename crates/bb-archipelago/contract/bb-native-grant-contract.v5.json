@@ -1,0 +1,308 @@
+{
+  "format": "bb-native-grant-contract-v5",
+  "harness": "bb-native-grant-v5",
+  "build": "bb-0.1.0-r5",
+  "bridge_protocol": "BBGRANT1",
+  "target": {
+    "serial": "CUSA03173",
+    "app_ver": "01.09",
+    "eboot_sha256": "d65f0b4f01d59166aed16f8604196d8b7dd805abbf0758b356e8f1354c9429f9",
+    "emulator": "shadPS4 0.18.x",
+    "provenance": "validated",
+    "note": "CUSA00900 01.09 reproduced the six published hook-site byte sequences read-only, but no grant path has ever been installed there. Every other serial and app version must fail closed."
+  },
+  "base_resolution": {
+    "strategy": [
+      "read the last eboot base_virtual_addr from shad_log.txt",
+      "verify it against both hook originals",
+      "otherwise AOB-scan the consume-return signature and require exactly one candidate"
+    ],
+    "consume_signature": "44 89 E0 48 83 C4 28 5B 41 5C 41 5D 41 5E 41 5F",
+    "provenance": "validated",
+    "note": "shadPS4 0.18 maps the eboot below 4 GiB at a launch-dependent address; v0.17 absolutes such as 0x8014DA0A0 are not a portable binding."
+  },
+  "hook_sites": [
+    {
+      "name": "consume_return",
+      "rva": 21861749,
+      "original_bytes": "44 89 E0 48 83 C4 28",
+      "return_rva": 21861756,
+      "provenance": "validated",
+      "note": "the accepted game-thread context for the native grant"
+    },
+    {
+      "name": "idle_heartbeat",
+      "rva": 29354114,
+      "original_bytes": "48 81 C4 E8 07 00 00",
+      "return_rva": 29354121,
+      "provenance": "validated",
+      "note": "runs every frame; drives a zero-delta update on the Bullet stack so the consume hook fires without player input. Its patch window is the atomicity hazard."
+    }
+  ],
+  "native_routines": [
+    {
+      "name": "ItemGrant",
+      "rva": 21864608,
+      "provenance": "validated",
+      "signature": "(rdi=inventory, rsi=descriptor, edx=quantity) -> slot|-1"
+    },
+    {
+      "name": "quantity_delta",
+      "rva": 21861536,
+      "provenance": "validated",
+      "signature": "(rdi=inventory, esi=slot, edx=delta, rcx=overflow, r8=metadata, r9=0)"
+    },
+    {
+      "name": "find_slot_by_descriptor",
+      "rva": 21865152,
+      "provenance": "validated",
+      "signature": "(rdi=inventory, rsi=descriptor) -> slot|-1"
+    }
+  ],
+  "descriptor": {
+    "size": 24,
+    "staged_size": 32,
+    "fields": [
+      {
+        "offset": 0,
+        "width": 4,
+        "name": "raw_id"
+      },
+      {
+        "offset": 8,
+        "width": 8,
+        "name": "internal_pointer",
+        "note": "game-filled; staged zero"
+      },
+      {
+        "offset": 16,
+        "width": 4,
+        "name": "normalized_id"
+      }
+    ],
+    "goods_formula": {
+      "raw": "0xB0000000 | goods_id",
+      "normalized": "0x40000000 | goods_id",
+      "provenance": "inferred",
+      "note": "holds for the validated category-4 canaries (Pebble 0x4CE, Bullets 0x384, Vials 0x3E8). It is NOT a general runtime-descriptor formula: Torch and Rifle Spear ItemLot ids produced invisible records."
+    },
+    "source_selection": {
+      "test": "raw_id & 0xF0000000 == 0x80000000",
+      "true": "persistent descriptor cell (category 0, equipment)",
+      "false": "24 bytes materialized in the consume frame (category 4, goods)",
+      "provenance": "validated"
+    }
+  },
+  "state_cells": {
+    "region_rva": 84786688,
+    "region_size": 112,
+    "cells": [
+      {
+        "name": "request",
+        "rva": 84786688,
+        "width": 4,
+        "values": {
+          "0": "idle",
+          "1": "native insert",
+          "2": "existing-stack delta"
+        }
+      },
+      {
+        "name": "quantity",
+        "rva": 84786692,
+        "width": 4
+      },
+      {
+        "name": "result",
+        "rva": 84786696,
+        "width": 4,
+        "note": "native slot, or 0xFFFFFFFF"
+      },
+      {
+        "name": "done",
+        "rva": 84786700,
+        "width": 4
+      },
+      {
+        "name": "inventory",
+        "rva": 84786704,
+        "width": 8,
+        "note": "cached by the consume hook from r13; zero until one consumable is used"
+      },
+      {
+        "name": "overflow",
+        "rva": 84786736,
+        "width": 4
+      },
+      {
+        "name": "slot_index",
+        "rva": 84786740,
+        "width": 4
+      },
+      {
+        "name": "item_quantity_pointer",
+        "rva": 84786744,
+        "width": 8
+      },
+      {
+        "name": "heartbeat_descriptor",
+        "rva": 84786752,
+        "width": 12,
+        "note": "Bullets: raw B0000384, normalized 40000384, delta arg at +0xC"
+      },
+      {
+        "name": "manual_trigger",
+        "rva": 84786768,
+        "width": 4
+      },
+      {
+        "name": "descriptor",
+        "rva": 84786784,
+        "width": 32
+      }
+    ],
+    "provenance": "validated"
+  },
+  "inventory_geometry": {
+    "split": 36,
+    "last": 136,
+    "primary_array": 88,
+    "secondary_array": 72,
+    "record_stride": 16,
+    "record_id": 4,
+    "record_quantity": 8,
+    "provenance": "observed"
+  },
+  "asserts": [
+    {
+      "name": "consume_hook",
+      "rva": 21861749,
+      "bytes": "44 89 E0 48 83 C4 28",
+      "provenance": "validated",
+      "note": "hook originals are validated; zeroed cave regions are an unused-space claim"
+    },
+    {
+      "name": "heartbeat_hook",
+      "rva": 29354114,
+      "bytes": "48 81 C4 E8 07 00 00",
+      "provenance": "validated",
+      "note": "hook originals are validated; zeroed cave regions are an unused-space claim"
+    },
+    {
+      "name": "consume_cave",
+      "rva": 84785664,
+      "bytes": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "provenance": "observed",
+      "note": "hook originals are validated; zeroed cave regions are an unused-space claim"
+    },
+    {
+      "name": "heartbeat_cave",
+      "rva": 84786176,
+      "bytes": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "provenance": "observed",
+      "note": "hook originals are validated; zeroed cave regions are an unused-space claim"
+    },
+    {
+      "name": "state_region",
+      "rva": 84786688,
+      "bytes": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "provenance": "observed",
+      "note": "hook originals are validated; zeroed cave regions are an unused-space claim"
+    },
+    {
+      "name": "descriptor",
+      "rva": 84786784,
+      "bytes": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "provenance": "observed",
+      "note": "hook originals are validated; zeroed cave regions are an unused-space claim"
+    }
+  ],
+  "payload": {
+    "assembled_at_base": 0,
+    "source": "tools/bb_native_delivery/payload.py",
+    "source_of_truth": "tables/Bloodborne-native-item-grant-auto-v2.CT autoAssemble template",
+    "provenance": "validated",
+    "note": "VALIDATED 2026-08-24 against a live shadPS4 process. The CE table was loaded and armed, both caves read back with tools/compare_ce_payload.py, and the only differences were MR-form vs RM-form encodings of three reg-to-reg movs (mov rdi,r13 x2; mov rsi,rsp; mov esi,eax) -- semantically identical instructions. The assembler was switched to CE's RM-form encoding, so the shipped blob is now byte-identical to what CE emits. Owner checklist item 1 is complete.",
+    "blobs": [
+      {
+        "name": "state_region",
+        "rva": 84786688,
+        "size": 112,
+        "bytes": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000FFFFFFFF0000000000000000840300B08403004000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "relocations": [],
+        "provenance": "validated",
+        "note": "initial request/state block"
+      },
+      {
+        "name": "consume_cave",
+        "rva": 84785664,
+        "size": 219,
+        "bytes": "4C892D09040000833DF2030000000F84BB000000833DE5030000020F8468000000C705D5030000000000008B052F04000089042448C7442408000000008B052D04000089442410C744241400000000498BFD488BF48B050504000025000000F03D000000800F8507000000488D35EE0300008B158C03000048B8A0A04D0100000000FFD0E936000000C7056D03000000000000498BFD8B35980300008B1562030000488D0D870300004C8B05880300004531C948B8A0944D0100000000FFD0890543030000C7053D030000010000004489E04883C428E9A1DA3FFC",
+        "relocations": [
+          {
+            "offset": 122,
+            "width": 8,
+            "target_rva": 21864608
+          },
+          {
+            "offset": 181,
+            "width": 8,
+            "target_rva": 21861536
+          }
+        ],
+        "provenance": "validated",
+        "note": "consume-return detour cave"
+      },
+      {
+        "name": "heartbeat_cave",
+        "rva": 84786176,
+        "size": 117,
+        "bytes": "833D49020000000F855C000000833DEC010000000F844F00000048833DEE010000000F8441000000488B3DE1010000488D350A02000048B8C0A24D0100000000FFD083F8FF0F841E000000488B3DBE0100008BF031D2488D0DEF01000048B8A0944D0100000000FFD04881C4E8070000E9142CB2FC",
+        "relocations": [
+          {
+            "offset": 56,
+            "width": 8,
+            "target_rva": 21865152
+          },
+          {
+            "offset": 95,
+            "width": 8,
+            "target_rva": 21861536
+          }
+        ],
+        "provenance": "validated",
+        "note": "idle-heartbeat detour cave"
+      },
+      {
+        "name": "consume_detour",
+        "rva": 21861749,
+        "size": 7,
+        "bytes": "E98624C0039090",
+        "relocations": [],
+        "provenance": "validated",
+        "note": "E9 rel32 + NOP pad over the original"
+      },
+      {
+        "name": "heartbeat_detour",
+        "rva": 29354114,
+        "size": 7,
+        "bytes": "E979D34D039090",
+        "relocations": [],
+        "provenance": "validated",
+        "note": "E9 rel32 + NOP pad over the original"
+      }
+    ]
+  },
+  "policy": {
+    "absent_blood_vial": "refused",
+    "absent_blood_vial_reason": "live reproduction created raw 0xF00003E8 '?ItemInfo?' instead of 0xB00003E8",
+    "equipment": "allowlist only; Saw Spear raw 0x806C5660 is the sole validated row",
+    "excluded": [
+      "Torch (ItemLot 20100000)",
+      "Rifle Spear (ItemLot 10000000)"
+    ],
+    "verify_polls": 20,
+    "hydration_verify_polls": 240,
+    "min_absent_polls": 40
+  }
+}

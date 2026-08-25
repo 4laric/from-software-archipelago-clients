@@ -1,0 +1,344 @@
+//! The single-in-flight native delivery engine.
+//!
+//! Wraps one [`GrantSession`] and exposes a poll-per-call `grant` interface that
+//! maps cleanly onto `BloodborneBackend::grant_item`: the client loop calls it
+//! once per iteration, and it returns [`GrantStep::Pending`] until the delivery
+//! reaches a terminal status. Only one grant is ever in flight -- the same
+//! invariant the file bridge and the receive ledger's single `PendingItem`
+//! already enforce.
+//!
+//! Category branch (contract `source_selection`): category-4 goods use the
+//! in-frame descriptor and, when a stack already exists, a direct quantity
+//! write; category-0 equipment uses the persistent descriptor and the native
+//! `ItemGrant`. Both routes are chosen inside [`GrantSession`] by whether the
+//! stack exists and whether the raw id takes the persistent-source branch. The
+//! raw/normalized descriptor pairing is validated here before anything is
+//! queued, matching `FileBackend::grant_item` and `config.rs`.
+
+use std::collections::HashMap;
+
+use anyhow::{Result, bail};
+
+use super::contract::{DescriptorFormula, Policy};
+use super::delivery::{DurableState, GrantCommand, GrantSession, Runtime};
+use super::descriptor::{CATEGORY_EQUIPMENT, CATEGORY_GOODS};
+
+/// The outcome of one `grant` poll.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GrantStep {
+    /// Not done yet; call again next iteration.
+    Pending,
+    /// The item is in the inventory (granted or recovered as already present).
+    Complete,
+    /// A terminal failure the caller should park (never retry blindly).
+    Failed { status: String, detail: String },
+}
+
+/// A validated grant request from the client, before it becomes a
+/// [`GrantCommand`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeGrantRequest {
+    pub tag: String,
+    pub raw_descriptor: u32,
+    pub normalized_item_id: u32,
+    pub item_category: u8,
+    pub quantity: u32,
+    /// Durable baseline from the client's ledger for replay recovery, or `None`
+    /// to sample the live baseline.
+    pub expected_before: Option<u32>,
+}
+
+impl NativeGrantRequest {
+    /// Fail closed on any descriptor pairing the contract has not validated --
+    /// the same category-4 / category-0 checks `FileBackend::grant_item` runs.
+    fn into_command(self, formula: &DescriptorFormula) -> Result<GrantCommand> {
+        match self.item_category {
+            CATEGORY_GOODS => anyhow::ensure!(
+                self.normalized_item_id & 0xF000_0000 == formula.goods_normalized_prefix
+                    && self.raw_descriptor & 0xF000_0000 == formula.goods_raw_prefix
+                    && (self.normalized_item_id & 0x0FFF_FFFF)
+                        == (self.raw_descriptor & 0x0FFF_FFFF),
+                "grant {} has an invalid category-4 raw/normalized descriptor pair",
+                self.tag
+            ),
+            CATEGORY_EQUIPMENT => anyhow::ensure!(
+                self.normalized_item_id & 0xF000_0000 == 0
+                    && self.raw_descriptor & 0xF000_0000 == formula.persistent_source_marker
+                    && (self.normalized_item_id & 0x0FFF_FFFF)
+                        == (self.raw_descriptor & 0x0FFF_FFFF),
+                "grant {} has an invalid category-0 raw/normalized descriptor pair",
+                self.tag
+            ),
+            category => bail!(
+                "grant {} uses unsupported Bloodborne item category {category}",
+                self.tag
+            ),
+        }
+        Ok(GrantCommand {
+            raw_id: self.raw_descriptor,
+            normalized_id: self.normalized_item_id,
+            quantity: self.quantity,
+            tag: self.tag,
+            expected_before: self.expected_before,
+        })
+    }
+}
+
+pub struct NativeDelivery<R: Runtime> {
+    session: GrantSession<R>,
+    formula: DescriptorFormula,
+    current_tag: Option<String>,
+    finished: HashMap<String, GrantStep>,
+    manual_trigger: bool,
+}
+
+impl<R: Runtime> NativeDelivery<R> {
+    pub fn new(runtime: R, formula: DescriptorFormula, policy: Policy) -> Self {
+        Self {
+            session: GrantSession::new(runtime, formula, policy),
+            formula,
+            current_tag: None,
+            finished: HashMap::new(),
+            manual_trigger: false,
+        }
+    }
+
+    /// Resume with a durable prior for the given tag, so a restart mid-grant can
+    /// decide "already applied" (replay recovery). The caller is responsible for
+    /// only supplying a prior that its ledger vouches for.
+    pub fn with_prior(
+        runtime: R,
+        formula: DescriptorFormula,
+        policy: Policy,
+        prior: DurableState,
+    ) -> Self {
+        Self {
+            session: GrantSession::with_prior(runtime, formula, policy, prior),
+            formula,
+            current_tag: None,
+            finished: HashMap::new(),
+            manual_trigger: false,
+        }
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut R {
+        self.session.runtime_mut()
+    }
+
+    /// The live durable state of the current grant, for the client to persist.
+    pub fn state(&self) -> &DurableState {
+        self.session.state()
+    }
+
+    /// Advance the delivery of one request by one poll.
+    pub fn grant(&mut self, request: NativeGrantRequest) -> Result<GrantStep> {
+        let tag = request.tag.clone();
+        if let Some(step) = self.finished.get(&tag) {
+            return Ok(step.clone());
+        }
+        if self.current_tag.as_deref() != Some(tag.as_str()) {
+            anyhow::ensure!(
+                self.current_tag.is_none(),
+                "native delivery is busy with {:?}; refusing to start {:?}",
+                self.current_tag,
+                tag
+            );
+            let command = request.into_command(&self.formula)?;
+            self.session.submit(command, self.manual_trigger)?;
+            self.current_tag = Some(tag.clone());
+        }
+        let status = self.session.poll();
+        let step = classify(&status, self.session.state());
+        if !matches!(step, GrantStep::Pending) {
+            self.finished.insert(tag, step.clone());
+            self.current_tag = None;
+        }
+        Ok(step)
+    }
+
+    /// Best-effort withdrawal of an in-flight request the client can no longer
+    /// vouch for: clear the request cell if the native call has not completed.
+    /// Returns `true` when an unexecuted request was actually cleared.
+    ///
+    /// A witnessed (`done`) native call is left alone -- deleting the arm signal
+    /// cannot stop a call the cave already ran, and the completion is needed for
+    /// the recovery path -- mirroring the file bridge's "unwitnessed" rule.
+    pub fn withdraw_stale(&mut self) -> bool {
+        let runtime = self.session.runtime_mut();
+        let pending = runtime.request_pending();
+        let done = runtime.native_done();
+        self.current_tag = None;
+        if pending && !done {
+            runtime.clear_request();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn classify(status: &str, state: &DurableState) -> GrantStep {
+    match status {
+        "completed" | "recovered_complete" => GrantStep::Complete,
+        "failed" | "quantity_mismatch" | "command_rejected" | "write_error" => GrantStep::Failed {
+            status: status.to_string(),
+            detail: state.detail.clone(),
+        },
+        _ => GrantStep::Pending,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::contract::contract;
+    use super::super::delivery::{Runtime, SlotRecord, StackView};
+    use super::super::descriptor::ItemGrantDescriptor;
+    use super::*;
+    use std::collections::HashMap;
+
+    // A minimal cave-modelling runtime (a trimmed copy of delivery's fake): a
+    // direct-write path over an existing stack.
+    #[derive(Default)]
+    struct FakeRuntime {
+        ready: bool,
+        stacks: HashMap<u32, StackView>,
+    }
+
+    impl Runtime for FakeRuntime {
+        fn inventory_ready(&mut self) -> bool {
+            self.ready
+        }
+        fn find_stack(&mut self, normalized_id: u32) -> Option<StackView> {
+            if !self.ready {
+                return None;
+            }
+            Some(
+                self.stacks
+                    .get(&normalized_id)
+                    .copied()
+                    .unwrap_or(StackView {
+                        quantity: 0,
+                        exists: false,
+                        slot: None,
+                        quantity_address: None,
+                    }),
+            )
+        }
+        fn read_slot_record(&mut self, _slot: u32) -> SlotRecord {
+            SlotRecord::default()
+        }
+        fn write_quantity(&mut self, address: u64, value: u32) -> bool {
+            for stack in self.stacks.values_mut() {
+                if stack.quantity_address == Some(address) {
+                    stack.quantity = value;
+                }
+            }
+            true
+        }
+        fn request_pending(&mut self) -> bool {
+            false
+        }
+        fn queue_native(
+            &mut self,
+            _d: &ItemGrantDescriptor,
+            _q: u32,
+            _s: Option<u32>,
+            _a: Option<u64>,
+            _m: bool,
+        ) {
+        }
+        fn native_done(&mut self) -> bool {
+            true
+        }
+        fn native_result(&mut self) -> u32 {
+            0
+        }
+        fn clear_request(&mut self) {}
+    }
+
+    fn goods_request(goods: u32, qty: u32, tag: &str, before: Option<u32>) -> NativeGrantRequest {
+        let d = ItemGrantDescriptor::for_goods(&contract().descriptor, goods).unwrap();
+        NativeGrantRequest {
+            tag: tag.into(),
+            raw_descriptor: d.raw_id,
+            normalized_item_id: d.normalized_id,
+            item_category: 4,
+            quantity: qty,
+            expected_before: before,
+        }
+    }
+
+    #[test]
+    fn a_direct_write_grant_completes_and_is_idempotent() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime {
+            ready: true,
+            ..Default::default()
+        };
+        runtime.stacks.insert(
+            normalized,
+            StackView {
+                quantity: 3,
+                exists: true,
+                slot: Some(1),
+                quantity_address: Some(0x2000),
+            },
+        );
+        let mut engine = NativeDelivery::new(runtime, contract().descriptor, contract().policy);
+        let step = engine
+            .grant(goods_request(0x384, 2, "recv_9", Some(3)))
+            .unwrap();
+        assert_eq!(step, GrantStep::Complete);
+        // Asking again returns the cached terminal step without re-driving.
+        assert_eq!(
+            engine
+                .grant(goods_request(0x384, 2, "recv_9", Some(3)))
+                .unwrap(),
+            GrantStep::Complete
+        );
+    }
+
+    #[test]
+    fn a_bad_descriptor_pairing_is_refused() {
+        let mut engine = NativeDelivery::new(
+            FakeRuntime {
+                ready: true,
+                ..Default::default()
+            },
+            contract().descriptor,
+            contract().policy,
+        );
+        let bad = NativeGrantRequest {
+            tag: "recv_bad".into(),
+            raw_descriptor: 0x1234_5678, // wrong high nibble for category 4
+            normalized_item_id: 0x4000_0384,
+            item_category: 4,
+            quantity: 1,
+            expected_before: Some(0),
+        };
+        assert!(engine.grant(bad).is_err());
+    }
+
+    #[test]
+    fn a_quantity_mismatch_is_a_failed_step() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime {
+            ready: true,
+            ..Default::default()
+        };
+        runtime.stacks.insert(
+            normalized,
+            StackView {
+                quantity: 20,
+                exists: true,
+                slot: Some(1),
+                quantity_address: Some(0x2000),
+            },
+        );
+        let mut engine = NativeDelivery::new(runtime, contract().descriptor, contract().policy);
+        let step = engine
+            .grant(goods_request(0x384, 2, "recv_m", Some(5)))
+            .unwrap();
+        assert!(matches!(step, GrantStep::Failed { status, .. } if status == "quantity_mismatch"));
+    }
+}

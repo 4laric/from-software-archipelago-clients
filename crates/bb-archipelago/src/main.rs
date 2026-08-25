@@ -16,10 +16,12 @@ use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::LiveEventFlags;
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
+use bb_archipelago::native::backend::NativeBackend;
 
 enum Backend {
     Live(FileBackend),
     Mock(Box<MockBackend>),
+    Native(Box<NativeBackend>),
 }
 
 impl BloodborneBackend for Backend {
@@ -27,6 +29,7 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.location_context(),
             Self::Mock(backend) => backend.location_context(),
+            Self::Native(backend) => backend.location_context(),
         }
     }
 
@@ -34,6 +37,7 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.read_event_flag(event_flag),
             Self::Mock(backend) => backend.read_event_flag(event_flag),
+            Self::Native(backend) => backend.read_event_flag(event_flag),
         }
     }
 
@@ -41,6 +45,7 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.target_weapon_level(),
             Self::Mock(backend) => backend.target_weapon_level(),
+            Self::Native(backend) => backend.target_weapon_level(),
         }
     }
 
@@ -48,6 +53,7 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.grant_item(grant),
             Self::Mock(backend) => backend.grant_item(grant),
+            Self::Native(backend) => backend.grant_item(grant),
         }
     }
 
@@ -55,6 +61,7 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.equip_item(request),
             Self::Mock(backend) => backend.equip_item(request),
+            Self::Native(backend) => backend.equip_item(request),
         }
     }
 
@@ -62,6 +69,7 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.withdraw_unwitnessed_grant(tag),
             Self::Mock(backend) => backend.withdraw_unwitnessed_grant(tag),
+            Self::Native(backend) => backend.withdraw_unwitnessed_grant(tag),
         }
     }
 
@@ -71,6 +79,7 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.read_save_watermark(),
             Self::Mock(backend) => backend.read_save_watermark(),
+            Self::Native(backend) => backend.read_save_watermark(),
         }
     }
 
@@ -78,8 +87,17 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Live(backend) => backend.write_save_watermark(cursor),
             Self::Mock(backend) => backend.write_save_watermark(cursor),
+            Self::Native(backend) => backend.write_save_watermark(cursor),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryMode {
+    /// The default: grant via the Cheat Engine file bridge.
+    CeBridge,
+    /// Grant in-process via the native `bb-native-grant-v5` payload (stage 2).
+    Native,
 }
 
 struct Arguments {
@@ -90,6 +108,7 @@ struct Arguments {
     password: Option<String>,
     mock: bool,
     assume_correct_save: bool,
+    delivery: DeliveryMode,
 }
 
 const LIVE_ATTACH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -119,11 +138,58 @@ fn attach_live_event_flags(shad_log: &Path) -> Result<LiveEventFlags> {
     }
 }
 
+/// Attach the native (stage 2) backend, tolerating shadPS4 starting after the
+/// client the same way the CE path does: retry only while the process is not
+/// yet open, but fail fast on an image mismatch or any other refusal so a wrong
+/// build never spins silently.
+#[cfg(windows)]
+fn attach_native_backend(
+    shad_log: &Path,
+    assumed_identity: Option<String>,
+) -> Result<NativeBackend> {
+    let deadline = Instant::now() + LIVE_ATTACH_TIMEOUT;
+    let mut next_report = Instant::now();
+    loop {
+        match NativeBackend::attach(shad_log, assumed_identity.clone()) {
+            Ok(backend) => return Ok(backend),
+            Err(error) => {
+                let waiting_for_process = format!("{error:#}").contains("is not running");
+                if !waiting_for_process {
+                    // Image mismatch, base verification failure, uncleared detour
+                    // window: fail closed, do not retry.
+                    return Err(error);
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out after {} seconds waiting for shadPS4 to start; last error: {error:#}",
+                        LIVE_ATTACH_TIMEOUT.as_secs()
+                    );
+                }
+                if Instant::now() >= next_report {
+                    eprintln!(
+                        "Waiting for shadPS4 to start before arming native delivery: {error:#}"
+                    );
+                    next_report = Instant::now() + Duration::from_secs(5);
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_native_backend(
+    _shad_log: &Path,
+    _assumed_identity: Option<String>,
+) -> Result<NativeBackend> {
+    bail!("native Bloodborne delivery requires Windows")
+}
+
 fn arguments() -> Result<Arguments> {
     let mut args = env::args().skip(1);
     let Some(server) = args.next() else {
         bail!(
-            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save]"
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=ce-bridge|native]"
         )
     };
     let slot = args.next().context("missing SLOT")?;
@@ -132,11 +198,18 @@ fn arguments() -> Result<Arguments> {
     let mut password = None;
     let mut mock = false;
     let mut assume_correct_save = false;
+    let mut delivery = DeliveryMode::CeBridge;
     for argument in args {
         if argument == "--mock" {
             mock = true;
         } else if argument == "--assume-correct-save" {
             assume_correct_save = true;
+        } else if let Some(mode) = argument.strip_prefix("--delivery=") {
+            delivery = match mode {
+                "ce-bridge" => DeliveryMode::CeBridge,
+                "native" => DeliveryMode::Native,
+                other => bail!("unknown --delivery mode {other:?}; expected ce-bridge or native"),
+            };
         } else if password.replace(argument).is_some() {
             bail!("only one password may be supplied");
         }
@@ -149,6 +222,7 @@ fn arguments() -> Result<Arguments> {
         password,
         mock,
         assume_correct_save,
+        delivery,
     })
 }
 
@@ -174,6 +248,25 @@ fn main() -> Result<()> {
             .set_flags
             .extend(config.mock_set_flags.iter().copied());
         Backend::Mock(Box::new(backend))
+    } else if args.delivery == DeliveryMode::Native {
+        let shad_log = config
+            .shad_log
+            .as_deref()
+            .context("native delivery requires shad_log in the runtime config")?;
+        config.preflight_paths()?;
+        eprintln!(
+            "Native delivery selected (stage 2). This path is UNTESTED against a live game and              fails closed on any image mismatch; the Cheat Engine bridge remains the default."
+        );
+        let assumed_identity = args
+            .assume_correct_save
+            .then(|| ASSUMED_IDENTITY.to_string());
+        let backend = attach_native_backend(shad_log, assumed_identity)?;
+        eprintln!(
+            "Bloodborne AP client {} | CUSA03173 01.09 | native payload installed | eboot 0x{:X} | native delivery armed",
+            env!("CARGO_PKG_VERSION"),
+            backend.base()
+        );
+        Backend::Native(Box::new(backend))
     } else {
         let shad_log = config
             .shad_log

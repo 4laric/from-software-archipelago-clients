@@ -1,0 +1,857 @@
+//! The native-grant delivery state machine.
+//!
+//! A faithful port of `tools/bb_native_delivery/delivery.py` in the world repo,
+//! which is itself the control flow of the Cheat Engine harness's `poll()`.
+//! Every guest-memory access is behind the [`Runtime`] trait so the transitions
+//! are host-testable with a fake. The semantics the CE table paid for live, and
+//! that this port preserves exactly:
+//!
+//! * **hydration grace** -- a stack that merely *looks* absent right after a
+//!   load gets `min_absent_polls` polls before the native-insert path is
+//!   allowed, or an early declaration inserts a duplicate stack next to an
+//!   invisible one;
+//! * **bounded verify** -- `verify_polls` normally, `hydration_verify_polls`
+//!   when the evidence shape is "not hydrated yet" rather than "contradicted";
+//! * **verify against the reported slot**, not only a whole-inventory scan,
+//!   which returns the first matching stack and is the wrong witness when the
+//!   game merged into a stack that was invisible at queue time;
+//! * **replay recovery** -- a durable `expected_before` from a previous process
+//!   lets a restart decide "already applied" instead of granting twice;
+//! * **fail closed** -- absent Blood Vial insertion is refused outright after
+//!   the live `?ItemInfo?` (`0xF00003E8`) reproduction.
+//!
+//! Statuses are kept as the exact strings the `BBGRANT1` durable state uses
+//! (`native-grant-state.txt`), both so this port can be compared line-for-line
+//! with the Python reference and so a native backend and the file bridge speak
+//! one status vocabulary.
+
+use super::contract::{DescriptorFormula, Policy};
+use super::descriptor::ItemGrantDescriptor;
+
+/// `0xFFFFFFFF`: the empty/none slot sentinel the cave and cells use.
+pub const EMPTY_SLOT: u32 = 0xFFFF_FFFF;
+/// Goods id of the Blood Vial; the absent-insert of this id is refused.
+pub const BLOOD_VIAL_GOODS_ID: u32 = 0x3E8;
+
+/// A grant the machine is asked to deliver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantCommand {
+    pub raw_id: u32,
+    pub normalized_id: u32,
+    pub quantity: u32,
+    pub tag: String,
+    /// `None` means "sample the live baseline and record it durably".
+    pub expected_before: Option<u32>,
+}
+
+impl GrantCommand {
+    pub fn validate(&self) -> Result<(), DeliveryError> {
+        if !(1..=99).contains(&self.quantity) {
+            return Err(DeliveryError(
+                "grant quantity must be between 1 and 99".into(),
+            ));
+        }
+        if self.tag.is_empty() || self.tag.chars().any(char::is_whitespace) {
+            return Err(DeliveryError(
+                "grant tag must be one non-empty token".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What an inventory scan found for one normalized id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StackView {
+    pub quantity: u32,
+    pub exists: bool,
+    pub slot: Option<u32>,
+    pub quantity_address: Option<u64>,
+}
+
+/// A single inventory record read back by slot index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct SlotRecord {
+    pub normalized_id: Option<u32>,
+    pub quantity: Option<u32>,
+    pub address: Option<u64>,
+}
+
+/// Everything the machine needs from the guest process. `None` from a scan
+/// means "geometry unavailable", never "absent".
+pub trait Runtime {
+    fn inventory_ready(&mut self) -> bool;
+    fn find_stack(&mut self, normalized_id: u32) -> Option<StackView>;
+    fn read_slot_record(&mut self, slot: u32) -> SlotRecord;
+    fn write_quantity(&mut self, address: u64, value: u32) -> bool;
+    fn request_pending(&mut self) -> bool;
+    fn queue_native(
+        &mut self,
+        descriptor: &ItemGrantDescriptor,
+        quantity: u32,
+        slot: Option<u32>,
+        quantity_address: Option<u64>,
+        manual_trigger: bool,
+    );
+    fn native_done(&mut self) -> bool;
+    fn native_result(&mut self) -> u32;
+    fn clear_request(&mut self);
+}
+
+/// The rows the durable state carries so a crash between grant and
+/// acknowledgement is decidable on the next launch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableState {
+    pub status: String,
+    pub tag: String,
+    pub expected_before: Option<u32>,
+    pub expected_after: Option<u32>,
+    pub detail: String,
+}
+
+impl Default for DurableState {
+    fn default() -> Self {
+        Self {
+            status: "awaiting_inventory".into(),
+            tag: String::new(),
+            expected_before: None,
+            expected_after: None,
+            detail: String::new(),
+        }
+    }
+}
+
+impl DurableState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "completed"
+                | "recovered_complete"
+                | "failed"
+                | "quantity_mismatch"
+                | "command_rejected"
+                | "write_error"
+        )
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "recovered_complete")
+    }
+}
+
+fn is_recoverable_prior(status: &str) -> bool {
+    matches!(
+        status,
+        "executing"
+            | "queued"
+            | "verify_pending"
+            | "recovery_pending"
+            | "completed"
+            | "recovered_complete"
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryError(pub String);
+
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeliveryError {}
+
+/// One grant's lifecycle over a [`Runtime`].
+pub struct GrantSession<R: Runtime> {
+    runtime: R,
+    formula: DescriptorFormula,
+    policy: Policy,
+    prior: DurableState,
+    state: DurableState,
+    command: Option<GrantCommand>,
+    absent_polls: u32,
+    absent_tag: String,
+    verify_polls: u32,
+    expected_before: Option<u32>,
+    active: bool,
+    manual: bool,
+}
+
+impl<R: Runtime> GrantSession<R> {
+    pub fn new(runtime: R, formula: DescriptorFormula, policy: Policy) -> Self {
+        Self::with_prior(runtime, formula, policy, DurableState::default())
+    }
+
+    /// Resume with a durable state recovered from a previous process. That
+    /// prior is what makes a restart decide "already applied" instead of
+    /// granting twice.
+    pub fn with_prior(
+        runtime: R,
+        formula: DescriptorFormula,
+        policy: Policy,
+        prior: DurableState,
+    ) -> Self {
+        Self {
+            runtime,
+            formula,
+            policy,
+            prior,
+            state: DurableState::default(),
+            command: None,
+            absent_polls: 0,
+            absent_tag: String::new(),
+            verify_polls: 0,
+            expected_before: None,
+            active: false,
+            manual: false,
+        }
+    }
+
+    pub fn state(&self) -> &DurableState {
+        &self.state
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut R {
+        &mut self.runtime
+    }
+
+    fn blood_vial_normalized(&self) -> u32 {
+        self.formula.goods_normalized_prefix | BLOOD_VIAL_GOODS_ID
+    }
+
+    fn set(&mut self, status: &str, detail: String) -> String {
+        let tag = self
+            .command
+            .as_ref()
+            .map(|c| c.tag.clone())
+            .unwrap_or_else(|| self.state.tag.clone());
+        let expected_after = match (self.expected_before, self.command.as_ref()) {
+            (Some(before), Some(command)) => Some(before.saturating_add(command.quantity)),
+            _ => None,
+        };
+        self.state = DurableState {
+            status: status.to_string(),
+            tag,
+            expected_before: self.expected_before,
+            expected_after,
+            detail,
+        };
+        status.to_string()
+    }
+
+    fn finish(&mut self, status: &str, detail: String) -> String {
+        let result = self.set(status, detail);
+        self.active = false;
+        result
+    }
+
+    /// Queue one command. Refuses a second in-flight grant.
+    pub fn submit(
+        &mut self,
+        command: GrantCommand,
+        manual_trigger: bool,
+    ) -> Result<(), DeliveryError> {
+        command.validate()?;
+        if self.active {
+            return Err(DeliveryError("a grant is already in flight".into()));
+        }
+        if self.absent_tag != command.tag {
+            self.absent_polls = 0;
+        }
+        self.absent_tag = command.tag.clone();
+        self.verify_polls = 0;
+        self.expected_before = command.expected_before;
+        let detail = format!("tag={}", command.tag);
+        self.command = Some(command);
+        self.manual = manual_trigger;
+        self.set("queued", detail);
+        Ok(())
+    }
+
+    /// Advance the machine one poll and return the new status.
+    pub fn poll(&mut self) -> String {
+        if self.active {
+            return self.poll_active();
+        }
+        if self.command.is_none() {
+            return self.state.status.clone();
+        }
+        if self.state.is_terminal() {
+            return self.state.status.clone();
+        }
+        self.poll_pending()
+    }
+
+    fn poll_active(&mut self) -> String {
+        let command = self.command.clone().expect("active implies a command");
+        if !self.runtime.native_done() {
+            return self.set(
+                "executing",
+                format!("tag={} awaiting native completion", command.tag),
+            );
+        }
+        let native_result = self.runtime.native_result();
+        let stack = self.runtime.find_stack(command.normalized_id);
+        let actual = stack.map(|s| s.quantity);
+        let wanted = self
+            .expected_before
+            .expect("expected_before set before active")
+            .saturating_add(command.quantity);
+        let record = self.runtime.read_slot_record(native_result);
+        let slot_verified = record.normalized_id == Some(command.normalized_id)
+            && record.quantity.is_some_and(|q| q >= command.quantity);
+        if !slot_verified && actual != Some(wanted) {
+            self.verify_polls += 1;
+            let hydrating = matches!(record.normalized_id, None | Some(EMPTY_SLOT))
+                && !actual.is_some_and(|a| a != 0);
+            let budget = if hydrating {
+                self.policy.hydration_verify_polls
+            } else {
+                self.policy.verify_polls
+            };
+            if self.verify_polls < budget {
+                return self.set(
+                    "verify_pending",
+                    format!(
+                        "tag={} expected_after={wanted} actual={actual:?} attempt={}/{budget}",
+                        command.tag, self.verify_polls
+                    ),
+                );
+            }
+            return self.finish(
+                "failed",
+                format!(
+                    "tag={} expected_after={wanted} actual={actual:?} native_result={native_result} retry_budget={budget}",
+                    command.tag
+                ),
+            );
+        }
+        self.finish(
+            "completed",
+            format!("tag={} native_result={native_result}", command.tag),
+        )
+    }
+
+    fn poll_pending(&mut self) -> String {
+        let command = self.command.clone().expect("command present in pending");
+        if !self.runtime.inventory_ready() {
+            return self.set(
+                "awaiting_inventory",
+                "Command retained; use one bullet once".into(),
+            );
+        }
+        let Some(stack) = self.runtime.find_stack(command.normalized_id) else {
+            return self.set(
+                "awaiting_inventory",
+                "Command retained; inventory geometry is not hydrated yet".into(),
+            );
+        };
+        if !stack.exists {
+            self.absent_polls += 1;
+            if self.absent_polls < self.policy.min_absent_polls {
+                return self.set(
+                    "awaiting_inventory",
+                    format!(
+                        "tag={} waiting for inventory hydration before declaring the stack absent ({}/{})",
+                        command.tag, self.absent_polls, self.policy.min_absent_polls
+                    ),
+                );
+            }
+        } else {
+            self.absent_polls = 0;
+        }
+
+        self.expected_before = Some(match command.expected_before {
+            Some(before) => before,
+            None => self.recovered_baseline(&command, stack.quantity),
+        });
+        let expected_before = self.expected_before.unwrap();
+        let wanted = expected_before.saturating_add(command.quantity);
+
+        if stack.quantity == wanted {
+            return self.finish(
+                "recovered_complete",
+                format!("tag={} quantity={}", command.tag, stack.quantity),
+            );
+        }
+        if stack.quantity != expected_before {
+            return self.finish(
+                "quantity_mismatch",
+                format!(
+                    "tag={} expected_before={expected_before} actual={}",
+                    command.tag, stack.quantity
+                ),
+            );
+        }
+
+        if stack.exists {
+            return self.direct_write(&command, wanted);
+        }
+
+        if command.normalized_id == self.blood_vial_normalized()
+            && !self.policy.absent_blood_vial_allowed
+        {
+            return self.finish(
+                "failed",
+                format!(
+                    "tag={} absent Blood Vial insertion is disabled after the live invalid-record reproduction; acquire one Vial before delivery",
+                    command.tag
+                ),
+            );
+        }
+        if self.runtime.request_pending() {
+            return self.set("busy", "Native request already pending".into());
+        }
+
+        let descriptor = ItemGrantDescriptor::new(command.raw_id, command.normalized_id);
+        self.runtime.queue_native(
+            &descriptor,
+            command.quantity,
+            stack.slot,
+            stack.quantity_address,
+            self.manual,
+        );
+        self.active = true;
+        self.verify_polls = 0;
+        let source = if descriptor.uses_persistent_source(&self.formula) {
+            "persistent"
+        } else {
+            "in_frame"
+        };
+        self.set(
+            "executing",
+            format!("tag={} native source={source}", command.tag),
+        )
+    }
+
+    fn direct_write(&mut self, command: &GrantCommand, wanted: u32) -> String {
+        let stack = self.runtime.find_stack(command.normalized_id);
+        let address = stack.and_then(|s| s.quantity_address);
+        let Some(address) = address else {
+            return self.finish(
+                "write_error",
+                format!("tag={} quantity pointer missing", command.tag),
+            );
+        };
+        self.set(
+            "executing",
+            format!("tag={} direct expected_after={wanted}", command.tag),
+        );
+        if !self.runtime.write_quantity(address, wanted) {
+            return self.finish(
+                "write_error",
+                format!("tag={} quantity write failed", command.tag),
+            );
+        }
+        let after = self.runtime.find_stack(command.normalized_id);
+        if after.is_none_or(|a| a.quantity != wanted) {
+            return self.finish(
+                "failed",
+                format!(
+                    "tag={} direct expected_after={wanted} actual={:?}",
+                    command.tag,
+                    after.map(|a| a.quantity)
+                ),
+            );
+        }
+        self.finish(
+            "completed",
+            format!("tag={} direct after={wanted}", command.tag),
+        )
+    }
+
+    /// A durable prior for the same tag whose recorded delta matches this
+    /// command lets the baseline come from the prior, not the (already-applied)
+    /// live quantity -- the whole of replay recovery.
+    fn recovered_baseline(&self, command: &GrantCommand, live_quantity: u32) -> u32 {
+        let prior = &self.prior;
+        let recoverable = prior.tag == command.tag
+            && prior.expected_before.is_some()
+            && prior.expected_after
+                == prior
+                    .expected_before
+                    .map(|b| b.saturating_add(command.quantity))
+            && is_recoverable_prior(&prior.status);
+        if recoverable {
+            prior.expected_before.unwrap()
+        } else {
+            live_quantity
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::contract::contract;
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A scripted [`Runtime`] fake: an inventory keyed by normalized id, plus a
+    /// native-call model that applies the queued grant on the next poll.
+    #[derive(Default)]
+    struct FakeRuntime {
+        ready: bool,
+        stacks: HashMap<u32, StackView>,
+        // slot -> record
+        slots: HashMap<u32, SlotRecord>,
+        request: bool,
+        done: bool,
+        result: u32,
+        // A queued native grant that the next `native_done()` will "apply".
+        queued: Option<(ItemGrantDescriptor, u32, Option<u32>)>,
+        writes: Vec<(u64, u32)>,
+        // When true, a queued native grant reports done but never actually
+        // lands in the inventory, so the bounded verify starves and fails.
+        complete_without_applying: bool,
+    }
+
+    impl FakeRuntime {
+        fn with_stack(mut self, normalized: u32, view: StackView) -> Self {
+            self.ready = true;
+            self.stacks.insert(normalized, view);
+            self
+        }
+    }
+
+    impl Runtime for FakeRuntime {
+        fn inventory_ready(&mut self) -> bool {
+            self.ready
+        }
+        fn find_stack(&mut self, normalized_id: u32) -> Option<StackView> {
+            if !self.ready {
+                return None;
+            }
+            Some(
+                self.stacks
+                    .get(&normalized_id)
+                    .copied()
+                    .unwrap_or(StackView {
+                        quantity: 0,
+                        exists: false,
+                        slot: None,
+                        quantity_address: None,
+                    }),
+            )
+        }
+        fn read_slot_record(&mut self, slot: u32) -> SlotRecord {
+            self.slots.get(&slot).copied().unwrap_or_default()
+        }
+        fn write_quantity(&mut self, address: u64, value: u32) -> bool {
+            self.writes.push((address, value));
+            // Reflect the write into the stack backing that address.
+            for stack in self.stacks.values_mut() {
+                if stack.quantity_address == Some(address) {
+                    stack.quantity = value;
+                }
+            }
+            true
+        }
+        fn request_pending(&mut self) -> bool {
+            self.request
+        }
+        fn queue_native(
+            &mut self,
+            descriptor: &ItemGrantDescriptor,
+            quantity: u32,
+            slot: Option<u32>,
+            _quantity_address: Option<u64>,
+            _manual_trigger: bool,
+        ) {
+            self.request = true;
+            self.done = false;
+            self.queued = Some((*descriptor, quantity, slot));
+        }
+        fn native_done(&mut self) -> bool {
+            if self.complete_without_applying {
+                // Reports completion, writes a bogus result slot, and never
+                // updates the real stack: the verify can never be satisfied.
+                if self.queued.take().is_some() {
+                    self.result = 7;
+                    self.slots.insert(
+                        7,
+                        SlotRecord {
+                            normalized_id: Some(0x0BAD_0BAD),
+                            quantity: Some(0),
+                            address: Some(0),
+                        },
+                    );
+                    self.request = false;
+                    self.done = true;
+                }
+                return self.done;
+            }
+            // Model the cave applying the grant exactly once.
+            if let Some((descriptor, quantity, _slot)) = self.queued.take() {
+                let new_slot = 7u32;
+                self.result = new_slot;
+                self.slots.insert(
+                    new_slot,
+                    SlotRecord {
+                        normalized_id: Some(descriptor.normalized_id),
+                        quantity: Some(quantity),
+                        address: Some(0xDEAD_0000),
+                    },
+                );
+                self.stacks.insert(
+                    descriptor.normalized_id,
+                    StackView {
+                        quantity,
+                        exists: true,
+                        slot: Some(new_slot),
+                        quantity_address: Some(0xDEAD_0000),
+                    },
+                );
+                self.request = false;
+                self.done = true;
+            }
+            self.done
+        }
+        fn native_result(&mut self) -> u32 {
+            self.result
+        }
+        fn clear_request(&mut self) {
+            self.request = false;
+        }
+    }
+
+    fn session(runtime: FakeRuntime) -> GrantSession<FakeRuntime> {
+        GrantSession::new(runtime, contract().descriptor, contract().policy)
+    }
+
+    fn goods_command(goods: u32, qty: u32, tag: &str, before: Option<u32>) -> GrantCommand {
+        let d = ItemGrantDescriptor::for_goods(&contract().descriptor, goods).unwrap();
+        GrantCommand {
+            raw_id: d.raw_id,
+            normalized_id: d.normalized_id,
+            quantity: qty,
+            tag: tag.into(),
+            expected_before: before,
+        }
+    }
+
+    #[test]
+    fn direct_write_bumps_an_existing_stack() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "recv_1", Some(5)), false)
+            .unwrap();
+        let status = session.poll();
+        assert_eq!(status, "completed", "state: {:?}", session.state());
+        assert_eq!(session.runtime_mut().writes, vec![(0x1000, 7)]);
+    }
+
+    #[test]
+    fn absent_stack_waits_out_the_hydration_grace_then_inserts() {
+        // Pebble (0x4CE) is absent from the fake's empty inventory.
+        let mut session = session(FakeRuntime {
+            ready: true,
+            ..Default::default()
+        });
+        session
+            .submit(goods_command(0x4CE, 1, "recv_2", Some(0)), false)
+            .unwrap();
+        let min = contract().policy.min_absent_polls;
+        // The first `min-1` polls refuse to declare the stack absent.
+        for _ in 0..(min - 1) {
+            assert_eq!(session.poll(), "awaiting_inventory");
+        }
+        // The grace elapses: the machine queues the native insert and then
+        // completes on the following poll (the fake applies it).
+        assert_eq!(session.poll(), "executing");
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+    }
+
+    #[test]
+    fn absent_blood_vial_insertion_is_refused() {
+        let mut session = session(FakeRuntime {
+            ready: true,
+            ..Default::default()
+        });
+        session
+            .submit(
+                goods_command(BLOOD_VIAL_GOODS_ID, 1, "recv_vial", Some(0)),
+                false,
+            )
+            .unwrap();
+        let min = contract().policy.min_absent_polls;
+        for _ in 0..(min - 1) {
+            assert_eq!(session.poll(), "awaiting_inventory");
+        }
+        let status = session.poll();
+        assert_eq!(status, "failed");
+        assert!(session.state().detail.contains("Blood Vial"));
+    }
+
+    #[test]
+    fn already_applied_stack_is_recovered_not_regranted() {
+        // expected_before given: the stack is already at before+quantity.
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 7,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "recv_1", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "recovered_complete");
+        assert!(session.runtime_mut().writes.is_empty());
+    }
+
+    #[test]
+    fn replay_recovery_uses_the_prior_baseline_across_a_restart() {
+        // A previous process durably recorded before=5 after=7 for recv_1 and
+        // then applied it (the live stack now reads 7). A fresh session with
+        // NO expected_before (auto) must recognise this as already applied via
+        // the prior, not sample 7 as the baseline and grant again.
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 7,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let prior = DurableState {
+            status: "completed".into(),
+            tag: "recv_1".into(),
+            expected_before: Some(5),
+            expected_after: Some(7),
+            detail: String::new(),
+        };
+        let mut session =
+            GrantSession::with_prior(runtime, contract().descriptor, contract().policy, prior);
+        session
+            .submit(goods_command(0x384, 2, "recv_1", None), false)
+            .unwrap();
+        assert_eq!(
+            session.poll(),
+            "recovered_complete",
+            "state: {:?}",
+            session.state()
+        );
+        assert!(session.runtime_mut().writes.is_empty());
+    }
+
+    #[test]
+    fn auto_baseline_without_a_matching_prior_grants_from_the_live_quantity() {
+        // No prior: auto baseline samples the live quantity (5) and the direct
+        // write bumps to 7.
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "recv_1", None), false)
+            .unwrap();
+        assert_eq!(session.poll(), "completed");
+        assert_eq!(session.runtime_mut().writes, vec![(0x1000, 7)]);
+    }
+
+    #[test]
+    fn quantity_mismatch_when_the_stack_is_off_baseline() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 9,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "recv_1", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "quantity_mismatch");
+    }
+
+    #[test]
+    fn native_insert_that_never_verifies_fails_after_the_budget() {
+        let runtime = FakeRuntime {
+            ready: true,
+            complete_without_applying: true,
+            ..Default::default()
+        };
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x4CE, 1, "recv_x", Some(0)), false)
+            .unwrap();
+        let min = contract().policy.min_absent_polls;
+        for _ in 0..(min - 1) {
+            assert_eq!(session.poll(), "awaiting_inventory");
+        }
+        assert_eq!(session.poll(), "executing"); // queues the native insert
+        // native reports done but the stack never reflects it, and the reported
+        // slot holds a contradicting record -> the short verify budget applies.
+        let budget = contract().policy.verify_polls;
+        let mut last = String::new();
+        for _ in 0..budget {
+            last = session.poll();
+        }
+        assert_eq!(last, "failed", "state: {:?}", session.state());
+        // The verify budget, not the long hydration one, was used.
+        assert!(session.state().detail.contains("retry_budget=20"));
+    }
+
+    #[test]
+    fn submit_refuses_a_second_in_flight_grant() {
+        let mut session = session(FakeRuntime {
+            ready: true,
+            complete_without_applying: true,
+            ..Default::default()
+        });
+        session
+            .submit(goods_command(0x4CE, 1, "recv_a", Some(0)), false)
+            .unwrap();
+        // Drive up to the queue so a native call is in flight (active).
+        let min = contract().policy.min_absent_polls;
+        for _ in 0..min {
+            session.poll();
+        }
+        // Now active; a second submit is refused.
+        let err = session
+            .submit(goods_command(0x4CE, 1, "recv_b", Some(0)), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("already in flight"));
+    }
+
+    #[test]
+    fn invalid_command_is_rejected_at_submit() {
+        let mut session = session(FakeRuntime::default());
+        let bad = GrantCommand {
+            raw_id: 0,
+            normalized_id: 0,
+            quantity: 0,
+            tag: "x".into(),
+            expected_before: None,
+        };
+        assert!(session.submit(bad, false).is_err());
+    }
+}
