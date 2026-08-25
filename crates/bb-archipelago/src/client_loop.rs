@@ -970,7 +970,10 @@ mod tests {
         // Observed, not predicted.
         assert_eq!(client.backend().grants[2].expected_before, 0);
         assert_eq!(client.backend().inventory[&(0x4000_04CE, None)], 1);
-        assert_eq!(client.ledger().slot("seed", "slot").unwrap().next_index(), 3);
+        assert_eq!(
+            client.ledger().slot("seed", "slot").unwrap().next_index(),
+            3
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 
@@ -1002,7 +1005,10 @@ mod tests {
             client.poll_items(&received).unwrap(),
             ItemPollResult::Completed(CompletedItem { index: 0, .. })
         ));
-        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Pending);
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
 
         let persisted = ReceiveLedger::load(&ledger_path).unwrap();
         let pending = persisted
@@ -1051,7 +1057,10 @@ mod tests {
             index: 0,
             ap_item_id: 2000,
         }];
-        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Pending);
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
         assert_eq!(
             client
                 .ledger()
@@ -1070,7 +1079,10 @@ mod tests {
             save_identity: "mock-save".into(),
             gameplay_ready: false,
         });
-        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Pending);
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
         assert_eq!(client.backend().withdrawn, vec!["ap_0".to_string()]);
         assert_eq!(
             client
@@ -1117,7 +1129,10 @@ mod tests {
             index: 0,
             ap_item_id: 2000,
         }];
-        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Pending);
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
         assert!(client.backend().grants.is_empty());
         assert_eq!(
             client
@@ -1256,7 +1271,10 @@ mod tests {
         );
         assert_eq!(slot.highest_processed_index, Some(2));
         assert_eq!(slot.next_index(), 3);
-        assert_eq!(reloaded.poll_items(&received).unwrap(), ItemPollResult::Idle);
+        assert_eq!(
+            reloaded.poll_items(&received).unwrap(),
+            ItemPollResult::Idle
+        );
         assert_eq!(reloaded.backend().grants.len(), 1);
         std::fs::remove_file(ledger_path).unwrap();
     }
