@@ -2,6 +2,34 @@
 
 ### Added
 
+* **The client tees its own output: console AND `--log-file` (clients#425).**
+  New optional argument `--log-file <path>` (the joined `--log-file=<path>` form
+  works too). Given one, the client opens it for append as the first thing after
+  argument parsing -- before any other output -- stamps
+  `\n=== SESSION START YYYY-MM-DD HH:MM:SS UTC ===\n`, and from then on every
+  line it prints goes to *both* the real console and that file, flushed per line
+  so a crash cannot lose the tail. Without the flag nothing changes: no file is
+  opened, no path is touched, and the console output is byte-identical to
+  before.
+  This puts the split where it belongs. bb-archipelago#171/#172 captured the
+  client's output by redirecting its handles into `<session>/client.log`, which
+  blanked the console window players watch to see what arrived;
+  bb-archipelago#179 bought the console back by teeing in the *launcher*, with a
+  pipe and a pump thread. Teeing here means the client keeps a real inherited
+  console, no cross-process relay sits in its output path, and a client started
+  by hand outside the launcher still writes a log. The header shape is pinned to
+  what bb-archipelago's `read_session_log_tail` slices on, so the launcher's
+  early-exit dialog keeps showing exactly this session.
+  Mechanically: a `logging` module owning a process-wide tee sink, and a
+  `client_eprintln!` macro that replaces `eprintln!` at all 40 of this client's
+  printing sites. No unsafe, no file-descriptor games.
+  Residual, accepted and deliberate: a failure *during* argument parsing happens
+  before the log path is known, so it can only reach the console.
+  Pairs with bb-archipelago#181, which makes the generated plan pass
+  `--log-file {client_log}` and stops the launcher redirecting that entry. The
+  two merge independently: the plan pins the client by SHA-256, so plan and exe
+  always travel together.
+
 * **The client reconnects to Archipelago by itself (clients#423).** An
   archipelago.gg room closes its port while it sits idle, so a session that
   paused for lunch came back to a client that had silently stopped talking to

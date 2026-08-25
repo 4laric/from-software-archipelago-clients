@@ -29,6 +29,7 @@ use crate::backend::{
     BloodborneBackend, EquipRequest, GrantTerminalFailure, ItemGrant, LocationContext,
     OperationProgress,
 };
+use crate::client_eprintln;
 use crate::event_flags::LiveEventFlags;
 
 use super::engine::{GrantStep, NativeDelivery, NativeGrantRequest};
@@ -103,7 +104,7 @@ impl NativeBackend {
         let base = self.base;
         self.event_flags.poll(
             || LiveEventFlags::attach_at_base(&shad_log, base),
-            &mut |line: &str| eprintln!("{line}"),
+            &mut |line: &str| client_eprintln!("{line}"),
         )
     }
 }
@@ -164,7 +165,7 @@ impl NativeBackend {
                     Err(error) => BaseCheck::ImageRejected(format!("{error:#}")),
                 },
             },
-            |line| eprintln!("{line}"),
+            |line| client_eprintln!("{line}"),
             &mut clock,
             policy,
         )
@@ -193,7 +194,7 @@ impl NativeBackend {
         let event_flags = match LiveEventFlags::attach_at_base(shad_log, base) {
             Ok(flags) => FlagGate::armed(flags),
             Err(error) if crate::event_flags::is_manager_not_initialized(&error) => {
-                FlagGate::pending(&mut |line: &str| eprintln!("{line}"))
+                FlagGate::pending(&mut |line: &str| client_eprintln!("{line}"))
             }
             Err(error) => return Err(error),
         };

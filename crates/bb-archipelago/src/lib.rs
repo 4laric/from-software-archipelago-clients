@@ -11,5 +11,6 @@ pub mod config;
 pub mod event_flags;
 pub mod feed;
 pub mod ledger;
+pub mod logging;
 pub mod native;
 pub mod upgrades;

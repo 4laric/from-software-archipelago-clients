@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use crate::backend::{
     BloodborneBackend, EquipRequest, GrantTerminalFailure, ItemGrant, OperationProgress,
 };
+use crate::client_eprintln;
 use crate::config::RuntimeConfig;
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
 use crate::ledger::{AcknowledgedItem, PendingItem, ReceiveLedger, WatermarkOutcome};
@@ -533,7 +534,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     .save_watermark = Some(item.index);
             }
             Ok(false) => {}
-            Err(error) => eprintln!(
+            Err(error) => client_eprintln!(
                 "Save watermark write failed (the delivery stands; restore detection stays attested): {error:#}"
             ),
         }
@@ -591,7 +592,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     .save_watermark = Some(item.index);
             }
             Ok(false) => {}
-            Err(error) => eprintln!(
+            Err(error) => client_eprintln!(
                 "Save watermark write failed for a parked grant (the parking stands): {error:#}"
             ),
         }

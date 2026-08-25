@@ -12,10 +12,12 @@ use bb_archipelago::backend::{
     OperationProgress,
 };
 use bb_archipelago::bridge::{FileBridge, missing_bridge_state};
+use bb_archipelago::client_eprintln;
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::{LiveEventFlags, is_manager_not_initialized};
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
+use bb_archipelago::logging;
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
 
@@ -363,6 +365,11 @@ struct Arguments {
     /// to load the Cheat Engine table and re-run with `--delivery=ce-bridge`,
     /// while an explicit `--delivery=native` propagates the raw error.
     delivery_explicit: bool,
+    /// `--log-file <path>`: tee everything this client prints into that file as
+    /// well as the console (clients#425). Absent means console only, exactly as
+    /// before -- the launcher's generated plan supplies it, a hand-started
+    /// client need not.
+    log_file: Option<PathBuf>,
 }
 
 /// The explicitly unsafe assumed-correct-save identity token. Set by
@@ -430,7 +437,7 @@ fn attach_live_event_flags(shad_log: &Path) -> Result<LiveEventFlags> {
                     );
                 }
                 if Instant::now() >= next_report {
-                    eprintln!(
+                    client_eprintln!(
                         "Waiting for shadPS4 and Bloodborne gameplay initialization: {error:#}"
                     );
                     next_report = Instant::now() + Duration::from_secs(5);
@@ -469,7 +476,7 @@ fn attach_native_backend(
                     );
                 }
                 if Instant::now() >= next_report {
-                    eprintln!(
+                    client_eprintln!(
                         "Waiting for shadPS4 to start before arming native delivery: {error:#}"
                     );
                     next_report = Instant::now() + Duration::from_secs(5);
@@ -508,7 +515,7 @@ fn attach_live_backend(config: &RuntimeConfig, assume_correct_save: bool) -> Res
     config.preflight_paths()?;
     let event_flags = attach_live_event_flags(shad_log)?;
     let attachment = event_flags.info();
-    eprintln!(
+    client_eprintln!(
         "Bloodborne AP client {} | CUSA03173 01.09 | shad PID {} | eboot 0x{:X} | direct flag backend ready",
         env!("CARGO_PKG_VERSION"),
         attachment.process_id,
@@ -516,13 +523,13 @@ fn attach_live_backend(config: &RuntimeConfig, assume_correct_save: bool) -> Res
     );
     let bridge = FileBridge::new(&config.bridge_root);
     match bridge.read_state() {
-        Ok(state) => eprintln!(
+        Ok(state) => client_eprintln!(
             "Grant bridge reports build {} | protocol {} | harness {}",
             state.build.as_deref().unwrap_or("missing"),
             state.protocol.as_deref().unwrap_or("missing"),
             state.harness.as_deref().unwrap_or("missing")
         ),
-        Err(error) => eprintln!("Grant bridge state unavailable at startup: {error:#}"),
+        Err(error) => client_eprintln!("Grant bridge state unavailable at startup: {error:#}"),
     }
     Ok(Backend::Live(if assume_correct_save {
         FileBackend::assuming_correct_save(bridge, event_flags, ASSUMED_IDENTITY.into())
@@ -538,7 +545,7 @@ fn arguments() -> Result<Arguments> {
 fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let Some(server) = args.next() else {
         bail!(
-            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native|ce-bridge] (native is the default; on an image it cannot validate the default hard-fails and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge)"
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native|ce-bridge] [--log-file PATH] (native is the default; on an image it cannot validate the default hard-fails and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge)"
         )
     };
     let slot = args.next().context("missing SLOT")?;
@@ -552,7 +559,8 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     // guidance -- it does NOT fall back to the bridge (see `main`, clients#413).
     let mut delivery = DeliveryMode::Native;
     let mut delivery_explicit = false;
-    for argument in args {
+    let mut log_file = None;
+    while let Some(argument) = args.next() {
         if argument == "--mock" {
             mock = true;
         } else if argument == "--assume-correct-save" {
@@ -564,6 +572,15 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
                 other => bail!("unknown --delivery mode {other:?}; expected native or ce-bridge"),
             };
             delivery_explicit = true;
+        } else if argument == "--log-file" {
+            // Two-token form: what the launcher's generated plan emits
+            // ("--log-file", "{client_log}"). A bare flag is refused rather
+            // than swallowed as the optional PASSWORD positional, which would
+            // send a path to the server as a password.
+            let path = args.next().context("--log-file requires a path argument")?;
+            log_file = Some(PathBuf::from(path));
+        } else if let Some(path) = argument.strip_prefix("--log-file=") {
+            log_file = Some(PathBuf::from(path));
         } else if password.replace(argument).is_some() {
             bail!("only one password may be supplied");
         }
@@ -578,12 +595,22 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
         assume_correct_save,
         delivery,
         delivery_explicit,
+        log_file,
     })
 }
 
 fn main() -> Result<()> {
     let args = arguments()?;
-    eprintln!("Bloodborne AP runtime build {RUNTIME_BUILD}");
+    // The tee is armed before ANY other output (clients#425), so the session log
+    // carries the whole run rather than its tail. Everything below prints through
+    // `client_eprintln!`, which reaches both the console the player is watching
+    // and this file. Residual, accepted: a failure inside `arguments()` above
+    // happens before the path is known and can only reach the console.
+    if let Some(path) = args.log_file.as_deref() {
+        logging::install_log_file(path)
+            .with_context(|| format!("could not open the client log {}", path.display()))?;
+    }
+    client_eprintln!("Bloodborne AP runtime build {RUNTIME_BUILD}");
     // Console-legibility banner (clients#404 companion): a normal, working
     // launch otherwise prints only build/attach diagnostics interleaved with
     // long silent waits, so a healthy client looked identical to a frozen or
@@ -592,13 +619,18 @@ fn main() -> Result<()> {
     // launch, before any attach/connect work and NOT gated behind any error
     // path. The delivery label is derived from the *resolved* mode, so it stays
     // correct whichever default is in effect. This client streams all of its
-    // diagnostics to this console (there is no separate log file), which is the
-    // answer to "is it working / where do I look".
-    eprintln!(
-        "bb-ap-client running - delivery: {} - server: {} - slot: {} - diagnostics stream to this console",
+    // diagnostics to this console, which is the answer to "is it working /
+    // where do I look"; with `--log-file` the same lines are also teed to that
+    // file, and the banner names it so the player knows what to send back.
+    client_eprintln!(
+        "bb-ap-client running - delivery: {} - server: {} - slot: {} - diagnostics stream to this console{}",
         args.delivery.label(),
         args.server,
-        args.slot
+        args.slot,
+        match args.log_file.as_deref() {
+            Some(path) => format!(" and to {}", path.display()),
+            None => String::new(),
+        }
     );
     anyhow::ensure!(
         !(args.mock && args.assume_correct_save),
@@ -607,7 +639,7 @@ fn main() -> Result<()> {
     let mut config = RuntimeConfig::load(&args.config)?;
     if args.assume_correct_save {
         config.expected_save_identity = Some(ASSUMED_IDENTITY.into());
-        eprintln!(
+        client_eprintln!(
             "WARNING: UNSAFE MVP MODE ARMED. The client cannot identify the loaded character. You attest that the correct save for AP slot {:?} is loaded; do not switch characters while connected.",
             args.slot
         );
@@ -625,11 +657,11 @@ fn main() -> Result<()> {
             .context("native delivery requires shad_log in the runtime config")?;
         config.preflight_paths()?;
         if args.delivery_explicit {
-            eprintln!(
+            client_eprintln!(
                 "Native delivery selected explicitly (--delivery=native). It fails closed on any image mismatch and will NOT fall back: a build it cannot validate is refused, not delivered through the bridge."
             );
         } else {
-            eprintln!(
+            client_eprintln!(
                 "Native delivery is the default. It fails closed on any image mismatch: a build it cannot validate is refused, not delivered. If this build is not recognized the client stops and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge (it does NOT silently fall back to the bridge)."
             );
         }
@@ -638,7 +670,7 @@ fn main() -> Result<()> {
             .then(|| ASSUMED_IDENTITY.to_string());
         match attach_native_backend(shad_log, assumed_identity) {
             Ok(backend) => {
-                eprintln!(
+                client_eprintln!(
                     "Bloodborne AP client {} | CUSA03173 01.09 | native payload installed | eboot 0x{:X} | native delivery armed",
                     env!("CARGO_PKG_VERSION"),
                     backend.base()
@@ -702,12 +734,12 @@ fn main() -> Result<()> {
                     // The one recovery line, for the first connect and every
                     // reconnect alike (clients#423): `ReconnectPolicy` prints
                     // none of its own, so this is never doubled.
-                    eprintln!("{CONNECTED_LINE}");
+                    client_eprintln!("{CONNECTED_LINE}");
                 }
-                Event::Print(message) => eprintln!("{message}"),
+                Event::Print(message) => client_eprintln!("{message}"),
                 Event::Error(error) => {
                     ap_error_seen = true;
-                    eprintln!("Archipelago error: {error}");
+                    client_eprintln!("Archipelago error: {error}");
                 }
                 _ => {}
             }
@@ -718,7 +750,7 @@ fn main() -> Result<()> {
             && !ap_detail_printed
             && let archipelago_rs::ConnectionState::Disconnected(stored) = connection.state()
         {
-            eprintln!("Archipelago connection failure detail: {stored}");
+            client_eprintln!("Archipelago connection failure detail: {stored}");
             ap_detail_printed = true;
         }
         if connected_now {
@@ -748,7 +780,7 @@ fn main() -> Result<()> {
             }
             let now = Instant::now();
             if let Some(line) = reconnect.notice(now, &args.server) {
-                eprintln!("{line}");
+                client_eprintln!("{line}");
             }
             if reconnect.attempt_due(now) {
                 connection = Connection::<json::Value>::new(
@@ -766,9 +798,13 @@ fn main() -> Result<()> {
             let seed_config = config.clone().apply_slot_data(client.slot_data())?;
             match seed_config.verify_suppression_install()? {
                 Some(digest) => {
-                    eprintln!("Verified installed vanilla-suppression binder SHA-256 {digest}.")
+                    client_eprintln!(
+                        "Verified installed vanilla-suppression binder SHA-256 {digest}."
+                    )
                 }
-                None => eprintln!("Seed does not claim installed vanilla-award suppression."),
+                None => {
+                    client_eprintln!("Seed does not claim installed vanilla-award suppression.")
+                }
             }
             let unsuppressed = seed_config
                 .locations
@@ -782,7 +818,7 @@ fn main() -> Result<()> {
             } else {
                 "live check sends remain disarmed until gameplay/save identity is validated"
             };
-            eprintln!(
+            client_eprintln!(
                 "Loaded {} location flag(s) and {} item binding(s) from the seed contract; {} location(s) still award vanilla contents; {}.",
                 seed_config.locations.len(),
                 seed_config.items.len(),
@@ -804,12 +840,12 @@ fn main() -> Result<()> {
             // against whatever save is loaded now. The ledger keeps the plan;
             // the first validated poll re-publishes.
             match new_runtime.reconcile_pending_command() {
-                Ok(true) => eprintln!(
+                Ok(true) => client_eprintln!(
                     "Withdrew an unwitnessed grant command left over from a previous session; \
                      the durable plan re-publishes it once the save context validates."
                 ),
                 Ok(false) => {}
-                Err(error) => eprintln!("Pending-command reconciliation failed: {error:#}"),
+                Err(error) => client_eprintln!("Pending-command reconciliation failed: {error:#}"),
             }
             runtime = Some(new_runtime);
         }
@@ -819,18 +855,18 @@ fn main() -> Result<()> {
                 // docs/SAVE-RECONCILIATION.md §8: every non-resume comparison
                 // prints one line a player can act on, once per transition.
                 match outcome {
-                    WatermarkOutcome::Resume => eprintln!(
+                    WatermarkOutcome::Resume => client_eprintln!(
                         "Save watermark readable again; delivery state verified, resuming."
                     ),
-                    WatermarkOutcome::Reissue => eprintln!(
+                    WatermarkOutcome::Reissue => client_eprintln!(
                         "Restore detected: the save is behind the delivery ledger; \
                          re-delivering the erased items in order."
                     ),
-                    WatermarkOutcome::AdoptSaveCursor => eprintln!(
+                    WatermarkOutcome::AdoptSaveCursor => client_eprintln!(
                         "The delivery ledger is behind the save (ledger loss or rollback); \
                          adopting the save cursor -- nothing is re-granted."
                     ),
-                    WatermarkOutcome::Hold => eprintln!(
+                    WatermarkOutcome::Hold => client_eprintln!(
                         "Held: delivery state could not be verified; no items granted, \
                          no checks sent."
                     ),
@@ -843,12 +879,14 @@ fn main() -> Result<()> {
             if !goal_reported && goal_location.is_some_and(|goal| checked.contains(&goal)) {
                 client.set_status(ClientStatus::Goal)?;
                 goal_reported = true;
-                eprintln!("Re-sent Bloodborne goal status from the server-checked goal location.");
+                client_eprintln!(
+                    "Re-sent Bloodborne goal status from the server-checked goal location."
+                );
             }
             match runtime.poll_locations(&checked) {
                 Ok(newly_checked) => {
                     if last_location_error.take().is_some() {
-                        eprintln!("Bloodborne location polling recovered.");
+                        client_eprintln!("Bloodborne location polling recovered.");
                     }
                     if !newly_checked.is_empty() {
                         if !goal_reported
@@ -859,10 +897,12 @@ fn main() -> Result<()> {
                             // poll sees the flag as new and retries both.
                             client.set_status(ClientStatus::Goal)?;
                             goal_reported = true;
-                            eprintln!("Father Gascoigne defeated; sent Bloodborne goal status.");
+                            client_eprintln!(
+                                "Father Gascoigne defeated; sent Bloodborne goal status."
+                            );
                         }
                         client.mark_checked(newly_checked.iter().copied())?;
-                        eprintln!("Sent location checks: {newly_checked:?}");
+                        client_eprintln!("Sent location checks: {newly_checked:?}");
                     }
                 }
                 Err(error) => {
@@ -871,7 +911,7 @@ fn main() -> Result<()> {
                         previous != &message || when.elapsed() >= Duration::from_secs(10)
                     });
                     if report {
-                        eprintln!("Bloodborne location polling unavailable: {message}");
+                        client_eprintln!("Bloodborne location polling unavailable: {message}");
                         last_location_error = Some((message, Instant::now()));
                     }
                 }
@@ -888,9 +928,9 @@ fn main() -> Result<()> {
             match runtime.poll_items(&received) {
                 Ok(ItemPollResult::Completed(item)) => {
                     if let Some(line) = item_errors.recovered() {
-                        eprintln!("{line}");
+                        client_eprintln!("{line}");
                     }
-                    eprintln!(
+                    client_eprintln!(
                         "Acknowledged AP item index {} id {} | received level {:?} | target {:?} | delivered {:?} | equip {:?}.",
                         item.index,
                         item.ap_item_id,
@@ -902,9 +942,9 @@ fn main() -> Result<()> {
                 }
                 Ok(ItemPollResult::Blocked(blocked)) => {
                     if let Some(line) = item_errors.recovered() {
-                        eprintln!("{line}");
+                        client_eprintln!("{line}");
                     }
-                    eprintln!(
+                    client_eprintln!(
                         "PARKED AP item index {} id {}: the grant terminally failed in the harness ({}: {}). \
                          The item is recorded as blocked and later items keep delivering. \
                          Inspect and resolve it with: bb-blocked {} \"{}\" \"{}\"",
@@ -923,7 +963,7 @@ fn main() -> Result<()> {
                 Ok(ItemPollResult::Held | ItemPollResult::Reconciled(_)) => {}
                 Err(error) => {
                     if let Some(line) = item_errors.report(&error, Instant::now()) {
-                        eprintln!("{line}");
+                        client_eprintln!("{line}");
                     }
                 }
             }
@@ -1056,6 +1096,55 @@ mod tests {
         let args = parse_args(base_args(&["--delivery=native"]).into_iter()).expect("parse");
         assert_eq!(args.delivery, DeliveryMode::Native);
         assert!(args.delivery_explicit);
+    }
+
+    /// The two-token form the launcher's generated plan emits
+    /// ("--log-file", "{client_log}").
+    #[test]
+    fn log_file_is_taken_from_the_following_argument() {
+        let args = parse_args(base_args(&["--log-file", "sessions/abc/client.log"]).into_iter())
+            .expect("parse");
+        assert_eq!(
+            args.log_file.as_deref(),
+            Some(Path::new("sessions/abc/client.log"))
+        );
+        // The path must not have been mistaken for the optional PASSWORD.
+        assert!(args.password.is_none(), "{:?}", args.password);
+    }
+
+    #[test]
+    fn log_file_also_accepts_the_joined_form() {
+        let args = parse_args(base_args(&["--log-file=client.log"]).into_iter()).expect("parse");
+        assert_eq!(args.log_file.as_deref(), Some(Path::new("client.log")));
+    }
+
+    /// Without the flag nothing about logging changes: no path, and therefore
+    /// no file is ever opened.
+    #[test]
+    fn no_log_file_by_default() {
+        let args = parse_args(base_args(&[]).into_iter()).expect("parse");
+        assert!(args.log_file.is_none());
+    }
+
+    /// A bare trailing `--log-file` must fail loudly rather than silently
+    /// leaving the client unlogged.
+    #[test]
+    fn a_bare_log_file_flag_is_refused() {
+        let error = parse_args(base_args(&["--log-file"]).into_iter()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--log-file requires a path"),
+            "{error:#}"
+        );
+    }
+
+    /// The usage line advertises the flag: a player reading the refusal has to
+    /// be able to find it.
+    #[test]
+    fn usage_names_the_log_file_flag() {
+        let error = parse_args(Vec::<String>::new().into_iter()).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("--log-file"), "{rendered}");
+        assert!(rendered.is_ascii(), "{rendered}");
     }
 
     #[test]
