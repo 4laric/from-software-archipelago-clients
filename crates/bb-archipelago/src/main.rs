@@ -11,12 +11,77 @@ use bb_archipelago::backend::{
     BloodborneBackend, EquipRequest, FileBackend, ItemGrant, LocationContext, MockBackend,
     OperationProgress,
 };
-use bb_archipelago::bridge::FileBridge;
+use bb_archipelago::bridge::{FileBridge, missing_bridge_state};
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::LiveEventFlags;
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
 use bb_archipelago::native::backend::NativeBackend;
+
+/// Console reporting policy for item-delivery failures (clients#404).
+///
+/// Two regimes share one dedup slot:
+///
+/// * A *missing grant bridge* is a standing condition with a remedy, not a
+///   stream of incidents. It prints one actionable sentence the first time it
+///   is seen and then stays silent for as long as it persists -- no matter how
+///   much time passes -- because reprinting the same raw `os error 2` every
+///   ten seconds is the wall of spam the issue is about.
+/// * Every other error keeps the original behaviour: reprint when the message
+///   changes, or when [`ITEM_ERROR_DEDUP`] has elapsed.
+///
+/// Either way a delivery success clears the slot, and clearing a non-empty
+/// slot is what prints the recovery line.
+#[derive(Debug, Default)]
+struct ItemErrorReporter {
+    last: Option<(String, Instant)>,
+    bridge_missing: bool,
+}
+
+const ITEM_ERROR_DEDUP: Duration = Duration::from_secs(10);
+const ITEM_DELIVERY_RECOVERED: &str = "Bloodborne item delivery recovered.";
+
+impl ItemErrorReporter {
+    /// Returns the line to print for `error`, or `None` to stay quiet.
+    fn report(&mut self, error: &anyhow::Error, now: Instant) -> Option<String> {
+        let message = format!("{error:#}");
+        if let Some(missing) = missing_bridge_state(error) {
+            let already_said = self.bridge_missing
+                && self
+                    .last
+                    .as_ref()
+                    .is_some_and(|(previous, _)| previous == &message);
+            self.bridge_missing = true;
+            self.last = Some((message, now));
+            if already_said {
+                return None;
+            }
+            return Some(format!(
+                "Item grants are paused: no grant bridge state at {}. \
+                 The Cheat Engine grant table is not running -- start it from the launcher, \
+                 or re-run the client without --delivery=ce-bridge to use native delivery. \
+                 Nothing is lost: queued items deliver once the bridge appears, \
+                 and this line stays quiet until then.",
+                missing.path.display()
+            ));
+        }
+        self.bridge_missing = false;
+        let report = self.last.as_ref().is_none_or(|(previous, when)| {
+            previous != &message || now.duration_since(*when) >= ITEM_ERROR_DEDUP
+        });
+        if !report {
+            return None;
+        }
+        self.last = Some((message.clone(), now));
+        Some(format!("Bloodborne item delivery blocked: {message}"))
+    }
+
+    /// Returns the recovery line when a failure regime was in effect.
+    fn recovered(&mut self) -> Option<&'static str> {
+        self.bridge_missing = false;
+        self.last.take().map(|_| ITEM_DELIVERY_RECOVERED)
+    }
+}
 
 enum Backend {
     Live(FileBackend),
@@ -398,7 +463,7 @@ fn main() -> Result<()> {
     let mut goal_reported = false;
     let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
-    let mut last_item_error: Option<(String, Instant)> = None;
+    let mut item_errors = ItemErrorReporter::default();
 
     loop {
         let mut connected_now = false;
@@ -557,8 +622,8 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>();
             match runtime.poll_items(&received) {
                 Ok(ItemPollResult::Completed(item)) => {
-                    if last_item_error.take().is_some() {
-                        eprintln!("Bloodborne item delivery recovered.");
+                    if let Some(line) = item_errors.recovered() {
+                        eprintln!("{line}");
                     }
                     eprintln!(
                         "Acknowledged AP item index {} id {} | received level {:?} | target {:?} | delivered {:?} | equip {:?}.",
@@ -571,8 +636,8 @@ fn main() -> Result<()> {
                     );
                 }
                 Ok(ItemPollResult::Blocked(blocked)) => {
-                    if last_item_error.take().is_some() {
-                        eprintln!("Bloodborne item delivery recovered.");
+                    if let Some(line) = item_errors.recovered() {
+                        eprintln!("{line}");
                     }
                     eprintln!(
                         "PARKED AP item index {} id {}: the grant terminally failed in the harness ({}: {}). \
@@ -592,13 +657,8 @@ fn main() -> Result<()> {
                 // notice channel above, exactly once per transition.
                 Ok(ItemPollResult::Held | ItemPollResult::Reconciled(_)) => {}
                 Err(error) => {
-                    let message = format!("{error:#}");
-                    let report = last_item_error.as_ref().is_none_or(|(previous, when)| {
-                        previous != &message || when.elapsed() >= Duration::from_secs(10)
-                    });
-                    if report {
-                        eprintln!("Bloodborne item delivery blocked: {message}");
-                        last_item_error = Some((message, Instant::now()));
+                    if let Some(line) = item_errors.report(&error, Instant::now()) {
+                        eprintln!("{line}");
                     }
                 }
             }
@@ -611,6 +671,95 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bb_archipelago::bridge::BridgeStateMissing;
+
+    fn missing_bridge_error() -> anyhow::Error {
+        // The condition reaches the console wrapped in grant context, exactly
+        // as it does in the live poll loop.
+        anyhow::Error::new(BridgeStateMissing {
+            path: PathBuf::from("C:\\bridge\\native-grant-state.txt"),
+        })
+        .context("granting ap_7")
+    }
+
+    /// clients#404 motivating case, end to end: one actionable sentence, then
+    /// silence for as long as the bridge stays missing, then the recovery line
+    /// on the first successful delivery.
+    #[test]
+    fn missing_bridge_says_something_actionable_once_then_goes_quiet_then_recovers() {
+        let mut reporter = ItemErrorReporter::default();
+        let start = Instant::now();
+
+        let first = reporter
+            .report(&missing_bridge_error(), start)
+            .expect("the first missing-bridge failure must say something");
+        assert!(first.contains("Item grants are paused"), "{first}");
+        assert!(first.contains("native-grant-state.txt"), "{first}");
+        assert!(first.contains("Cheat Engine grant table"), "{first}");
+        assert!(first.contains("--delivery=ce-bridge"), "{first}");
+        assert!(first.is_ascii(), "in-console strings stay ASCII: {first}");
+
+        // Quiet, and quiet even far past the generic dedup window: this is a
+        // standing condition, not a stream of incidents.
+        for elapsed in [1, 10, 11, 600] {
+            let later = start + Duration::from_secs(elapsed);
+            assert_eq!(reporter.report(&missing_bridge_error(), later), None);
+        }
+
+        assert_eq!(reporter.recovered(), Some(ITEM_DELIVERY_RECOVERED));
+        // ...and only once: a second success is silent.
+        assert_eq!(reporter.recovered(), None);
+    }
+
+    #[test]
+    fn missing_bridge_speaks_again_after_a_recovery() {
+        let mut reporter = ItemErrorReporter::default();
+        let start = Instant::now();
+        assert!(reporter.report(&missing_bridge_error(), start).is_some());
+        assert_eq!(reporter.recovered(), Some(ITEM_DELIVERY_RECOVERED));
+        let after = reporter.report(&missing_bridge_error(), start + Duration::from_secs(1));
+        assert!(
+            after.is_some(),
+            "a fresh outage is a new incident and must be announced again"
+        );
+    }
+
+    #[test]
+    fn other_errors_keep_the_ten_second_dedup() {
+        let mut reporter = ItemErrorReporter::default();
+        let start = Instant::now();
+        let error = || anyhow::anyhow!("grant ap_7 timed out after 30 seconds");
+
+        let first = reporter.report(&error(), start).expect("first report");
+        assert!(
+            first.starts_with("Bloodborne item delivery blocked:"),
+            "{first}"
+        );
+        assert_eq!(
+            reporter.report(&error(), start + Duration::from_secs(9)),
+            None
+        );
+        let reprinted = reporter.report(&error(), start + Duration::from_secs(10));
+        assert!(
+            reprinted.is_some(),
+            "the generic path still reprints once the window elapses"
+        );
+    }
+
+    #[test]
+    fn a_different_error_after_the_missing_bridge_is_reported() {
+        let mut reporter = ItemErrorReporter::default();
+        let start = Instant::now();
+        assert!(reporter.report(&missing_bridge_error(), start).is_some());
+        let other = anyhow::anyhow!("grant bridge protocol mismatch");
+        let line = reporter
+            .report(&other, start + Duration::from_secs(1))
+            .expect("an unrelated failure is not silenced by the paused bridge");
+        assert!(line.contains("protocol mismatch"), "{line}");
+        // Back to missing: that is a new announcement, not a continuation.
+        let again = reporter.report(&missing_bridge_error(), start + Duration::from_secs(2));
+        assert!(again.is_some());
+    }
 
     fn base_args(extra: &[&str]) -> Vec<String> {
         let mut v = vec![
