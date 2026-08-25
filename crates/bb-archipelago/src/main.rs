@@ -47,7 +47,10 @@ impl ItemErrorReporter {
         let message = format!("{error:#}");
         if let Some(missing) = missing_bridge_state(error) {
             let already_said = self.bridge_missing
-                && self.last.as_ref().is_some_and(|(previous, _)| previous == &message);
+                && self
+                    .last
+                    .as_ref()
+                    .is_some_and(|(previous, _)| previous == &message);
             self.bridge_missing = true;
             self.last = Some((message, now));
             if already_said {
@@ -728,8 +731,14 @@ mod tests {
         let error = || anyhow::anyhow!("grant ap_7 timed out after 30 seconds");
 
         let first = reporter.report(&error(), start).expect("first report");
-        assert!(first.starts_with("Bloodborne item delivery blocked:"), "{first}");
-        assert_eq!(reporter.report(&error(), start + Duration::from_secs(9)), None);
+        assert!(
+            first.starts_with("Bloodborne item delivery blocked:"),
+            "{first}"
+        );
+        assert_eq!(
+            reporter.report(&error(), start + Duration::from_secs(9)),
+            None
+        );
         let reprinted = reporter.report(&error(), start + Duration::from_secs(10));
         assert!(
             reprinted.is_some(),

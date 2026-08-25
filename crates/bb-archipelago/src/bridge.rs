@@ -241,7 +241,11 @@ pub struct BridgeStateMissing {
 
 impl std::fmt::Display for BridgeStateMissing {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "no grant bridge state at {}", self.path.display())
+        write!(
+            formatter,
+            "no grant bridge state at {}",
+            self.path.display()
+        )
     }
 }
 
