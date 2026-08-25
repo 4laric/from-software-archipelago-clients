@@ -683,7 +683,9 @@ fn main() -> Result<()> {
         connection_options(),
     );
     let mut reconnect = ReconnectPolicy::default();
-    let mut runtime = None;
+    // Annotated because the clients#423 seed guard reads `runtime` above the
+    // point where `ClientLoop::new` would otherwise infer it.
+    let mut runtime: Option<ClientLoop<Backend>> = None;
     let mut goal_location = None;
     let mut goal_reported = false;
     let mut ap_detail_printed = false;
