@@ -4,8 +4,8 @@ This crate is the standalone Bloodborne client path. Unlike the native Dark
 Souls III and Sekiro DLLs, it reads Bloodborne location flags directly from
 shadPS4 process memory. Item delivery now defaults to the in-process **native**
 backend (see below), with the shadPS4/Cheat Engine file bridge kept as an
-explicit escape and as the automatic fallback the default drops to on any image
-native cannot validate.
+explicit escape (`--delivery=ce-bridge`) and as the remedy the default points
+you to when native cannot validate the running image.
 
 The first bridge contract supports received-item grants:
 
@@ -146,15 +146,27 @@ Defaulting to native is safe because native **fails closed** on any image it
 cannot validate: `require_validated_image` refuses CUSA00900 and every other
 serial/build, so a recognised-and-validated image gets native and nothing else
 is ever patched. On the **default** path (no `--delivery`), an image native
-cannot validate does not strand the player — the client logs why, loudly, and
-**falls back automatically to the Cheat Engine bridge**. `--delivery=ce-bridge`
-still forces the bridge directly for anyone who wants it.
+cannot validate makes the client **stop with a clear, actionable error** — it
+does **not** silently fall back to the Cheat Engine bridge. The message is:
 
-An **explicit** `--delivery=native` keeps the strict behaviour: it **fails
-closed** with a clear error and does **not** fall back, because the user asked
-for native specifically. Only the default path auto-falls-back; the fail-closed
-image check, no-double-grant, install atomicity and image-mismatch guards are
-unchanged.
+> This game build was not recognized, so native item delivery cannot run
+> safely. To play now, load the Cheat Engine table and re-run with
+> `--delivery=ce-bridge`. Otherwise this build is not yet supported.
+
+A silent fallback would be unsafe: with native as the default the Cheat Engine
+table is not loaded, so the bridge's `GRANT` command files would sit unconsumed
+and delivered items would silently vanish. `--delivery=ce-bridge` forces the
+bridge directly and is exactly the remedy the error points to; use it once the
+CE table is loaded.
+
+An **explicit** `--delivery=native` also keeps the strict behaviour: it **fails
+closed** with a clear error, because the user asked for native specifically.
+Neither path falls back to the bridge; the fail-closed image check,
+no-double-grant, install atomicity and image-mismatch guards are unchanged.
+
+A safe, *detected* fallback — a liveness handshake that confirms a loaded CE
+table before offering the bridge — is the planned successor, tracked in
+clients#413.
 
 The native code lives in `src/native/`:
 
@@ -191,7 +203,8 @@ instead of granting twice.
 > attach/install/thread seams (`#[cfg(windows)]`) are compiled and linted by CI
 > only and **must be owner-validated against a running process** before the
 > native path is fully trusted. Defaulting to native is bounded by its
-> fail-closed image check plus the automatic CE-bridge fallback on the default
-> path; owner-checklist item 3 (the CUSA00900 wrong-image refusal) is still
-> untested against a dump. If you want to avoid native entirely, pass
-> `--delivery=ce-bridge`.
+> fail-closed image check: an unrecognised build hard-fails with instructions
+> rather than being delivered, so nothing is patched on an image native cannot
+> validate. Owner-checklist item 3 (the CUSA00900 wrong-image refusal) is still
+> untested against a dump. If you want to avoid native entirely, load the Cheat
+> Engine table and pass `--delivery=ce-bridge`.

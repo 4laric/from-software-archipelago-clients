@@ -4,11 +4,14 @@
 //! Native is now the default delivery backend (see `main.rs`). Regardless of how
 //! it is selected, [`NativeBackend::attach`] itself always fails closed: when the
 //! running image does not verify against the contract it returns a clear error
-//! and patches nothing -- this layer never silently falls back. The fallback is
-//! an orchestration decision in `main.rs`: on the *default* path (no explicit
-//! `--delivery`) a failed attach drops, loudly, to the CE bridge so the player is
-//! never stranded, while an explicit `--delivery=native` propagates the error and
-//! hard-fails.
+//! and patches nothing -- this layer never silently falls back. `main.rs` never
+//! turns that failure into a CE-bridge fallback: on the *default* path (no
+//! explicit `--delivery`) a failed attach hard-fails with guidance telling the
+//! player to load the Cheat Engine table and re-run with `--delivery=ce-bridge`,
+//! and an explicit `--delivery=native` propagates the raw error. A silent
+//! fallback would arm a bridge the player has no CE table loaded for, so grants
+//! would vanish; clients#413 tracks the liveness handshake that will let the
+//! client detect a loaded table and offer the bridge safely.
 //!
 //! The live attach/install path is `#[cfg(windows)]` and CI/owner-validated; the
 //! grant, flag and context logic it drives is host-tested through `engine.rs`,

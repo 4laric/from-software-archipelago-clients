@@ -10,15 +10,20 @@
   native is bounded by its fail-closed image check: `require_validated_image`
   refuses CUSA00900 and every other serial/build, so only a
   recognised-and-validated image is ever patched.
-* **Automatic CE-bridge fallback on the default path.** When native is the
-  default (no explicit `--delivery`) and it cannot attach and validate the image,
-  the client logs why, loudly, and falls back to the Cheat Engine file bridge
-  instead of hard-failing the player. An **explicit** `--delivery=native` keeps
-  the strict behaviour and fails closed with a clear error -- it does not fall
-  back, because the user asked for native. `--delivery=ce-bridge` still forces
-  the bridge directly. The fail-closed image check, no-double-grant, install
-  atomicity and image-mismatch guards are unchanged; only which backend is
-  default, plus the safe default-path fallback, changed.
+* **An unrecognised build hard-fails with instructions -- no silent fallback.**
+  When native is the default (no explicit `--delivery`) and it cannot attach and
+  validate the image, the client **stops with a clear, actionable error**: it
+  tells the player the build was not recognised and to load the Cheat Engine
+  table and re-run with `--delivery=ce-bridge`. It does **not** silently fall
+  back to the bridge: with native as the default the CE table will not be
+  loaded, so a file-drop grant would sit unconsumed and delivered items would
+  vanish. An **explicit** `--delivery=native` also fails closed with a clear
+  error, unchanged. `--delivery=ce-bridge` still forces the bridge directly and
+  is the remedy the hard-fail points to. The fail-closed image check,
+  no-double-grant, install atomicity and image-mismatch guards are unchanged;
+  only which backend is default changed. A safe, detected fallback (a liveness
+  handshake that confirms a loaded CE table before offering the bridge) is
+  tracked as the successor in clients#413.
 
   The runtime contract is consumed from a vendored copy of the world repo's
   `bb-native-grant-contract.v5.json` (`src/native/contract.rs`), so no hook-site

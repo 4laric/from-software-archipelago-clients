@@ -94,14 +94,14 @@ impl BloodborneBackend for Backend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeliveryMode {
-    /// Grant via the Cheat Engine file bridge. No longer the default; kept as an
-    /// explicit escape (`--delivery=ce-bridge`) and as the automatic fallback
-    /// the default native path drops to when it cannot validate the image.
+    /// Grant via the Cheat Engine file bridge. Not the default; selected
+    /// explicitly with `--delivery=ce-bridge`, and the remedy the default native
+    /// path points the player to when it cannot validate the running image.
     CeBridge,
     /// The default: grant in-process via the native `bb-native-grant-v5` payload
-    /// (stage 2). Fails closed on any image mismatch; on the default path (no
-    /// explicit `--delivery`) an image it cannot validate falls back to the
-    /// Cheat Engine bridge instead of hard-failing the player.
+    /// (stage 2). Fails closed on any image it cannot validate; on the default
+    /// path (no explicit `--delivery`) an unrecognised image hard-fails with
+    /// guidance rather than silently falling back to the bridge (clients#413).
     Native,
 }
 
@@ -114,16 +114,41 @@ struct Arguments {
     mock: bool,
     assume_correct_save: bool,
     delivery: DeliveryMode,
-    /// True only when the user passed `--delivery=...` explicitly. The default
-    /// native path falls back to the Cheat Engine bridge on an image it cannot
-    /// validate; an explicit `--delivery=native` hard-fails instead, because the
-    /// user asked for native specifically.
+    /// True only when the user passed `--delivery=...` explicitly. Shapes the
+    /// native attach-failure message: the default path hard-fails with guidance
+    /// to load the Cheat Engine table and re-run with `--delivery=ce-bridge`,
+    /// while an explicit `--delivery=native` propagates the raw error.
     delivery_explicit: bool,
 }
 
 /// The explicitly unsafe assumed-correct-save identity token. Set by
 /// `--assume-correct-save`; consulted by both the native and Cheat Engine paths.
 const ASSUMED_IDENTITY: &str = "unsafe-operator-attested-correct-save";
+
+/// Actionable guidance shown when the *default* native path cannot attach to and
+/// validate the running image. The default deliberately does NOT silently fall
+/// back to the Cheat Engine bridge: with native as the default the CE table will
+/// not be loaded, so a file-drop grant would sit unconsumed and delivered items
+/// would silently vanish. clients#413 tracks the liveness handshake that will
+/// let the client detect a loaded table before offering the bridge; until then
+/// an unrecognised build hard-fails and tells the player exactly how to play now.
+const UNRECOGNIZED_BUILD_GUIDANCE: &str = "This game build was not recognized, so native item delivery cannot run safely. To play now, load the Cheat Engine table and re-run with --delivery=ce-bridge. Otherwise this build is not yet supported.";
+
+/// Map a native attach/validate failure onto the error the client exits with.
+///
+/// Both paths hard-fail -- native fails closed, so nothing was patched or
+/// written. The default path (no explicit `--delivery`) wraps the failure with
+/// [`UNRECOGNIZED_BUILD_GUIDANCE`] so an unrecognised build tells the player how
+/// to play now; an explicit `--delivery=native` propagates the raw error,
+/// because the user asked for native specifically. Neither path silently falls
+/// back to the Cheat Engine bridge (clients#413).
+fn native_attach_failure(error: anyhow::Error, delivery_explicit: bool) -> anyhow::Error {
+    if delivery_explicit {
+        error
+    } else {
+        error.context(UNRECOGNIZED_BUILD_GUIDANCE)
+    }
+}
 
 const LIVE_ATTACH_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -201,10 +226,12 @@ fn attach_native_backend(
 
 /// Attach the Cheat Engine file-bridge backend (the `ce-bridge` delivery path).
 ///
-/// Used both when the bridge is selected directly (`--delivery=ce-bridge`) and
-/// as the automatic fallback the default native path drops to when it cannot
-/// validate the running image. Keeping it in one function means the fallback and
-/// the explicit selection arm the identical guarded backend.
+/// Selected explicitly with `--delivery=ce-bridge`; it is the remedy the default
+/// native path points the player to when it cannot validate the running image.
+/// Factored out so the explicit selection here has one home. Note the default
+/// native path does NOT call this on failure -- it hard-fails with guidance
+/// rather than silently arming a bridge the player has no CE table loaded for
+/// (clients#413).
 fn attach_live_backend(config: &RuntimeConfig, assume_correct_save: bool) -> Result<Backend> {
     let shad_log = config
         .shad_log
@@ -241,10 +268,13 @@ fn attach_live_backend(config: &RuntimeConfig, assume_correct_save: bool) -> Res
 }
 
 fn arguments() -> Result<Arguments> {
-    let mut args = env::args().skip(1);
+    parse_args(env::args().skip(1))
+}
+
+fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let Some(server) = args.next() else {
         bail!(
-            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native|ce-bridge] (native is the default; on an image it cannot validate the default falls back to ce-bridge)"
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native|ce-bridge] (native is the default; on an image it cannot validate the default hard-fails and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge)"
         )
     };
     let slot = args.next().context("missing SLOT")?;
@@ -254,8 +284,8 @@ fn arguments() -> Result<Arguments> {
     let mut mock = false;
     let mut assume_correct_save = false;
     // Native is the default delivery backend. It fails closed on any image it
-    // cannot validate; the default path then falls back to the Cheat Engine
-    // bridge (see `main`), so this default never strands the player.
+    // cannot validate; on the default path an unrecognised image hard-fails with
+    // guidance -- it does NOT fall back to the bridge (see `main`, clients#413).
     let mut delivery = DeliveryMode::Native;
     let mut delivery_explicit = false;
     for argument in args {
@@ -320,7 +350,7 @@ fn main() -> Result<()> {
             );
         } else {
             eprintln!(
-                "Native delivery is the default. It fails closed on any image mismatch; if this image cannot be validated the client falls back to the Cheat Engine bridge automatically (pass --delivery=native to force native and fail closed, or --delivery=ce-bridge to select the bridge directly)."
+                "Native delivery is the default. It fails closed on any image mismatch: a build it cannot validate is refused, not delivered. If this build is not recognized the client stops and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge (it does NOT silently fall back to the bridge)."
             );
         }
         let assumed_identity = args
@@ -335,23 +365,16 @@ fn main() -> Result<()> {
                 );
                 Backend::Native(Box::new(backend))
             }
-            Err(error) if !args.delivery_explicit => {
-                // Default path only. Native could not attach and validate this
-                // image -- an unknown serial/build, a failed image assert, or
-                // another refusal. Native fails closed by design, so nothing was
-                // patched or written; rather than strand the player on the
-                // default we drop, loudly, to the guarded Cheat Engine bridge.
-                // An explicit --delivery=native never reaches this arm: the user
-                // asked for native specifically, so that path hard-fails below.
-                eprintln!(
-                    "Native delivery could not validate this image, so it will NOT be used: {error:#}"
-                );
-                eprintln!(
-                    "Falling back to the Cheat Engine bridge (default auto-fallback). Pass --delivery=native to force native and fail closed instead, or --delivery=ce-bridge to select the bridge directly."
-                );
-                attach_live_backend(&config, args.assume_correct_save)?
-            }
-            Err(error) => return Err(error),
+            // Native could not attach and validate this image -- an unknown
+            // serial/build, a failed image assert, or another refusal. Native
+            // fails closed by design, so nothing was patched or written. We do
+            // NOT silently fall back to the Cheat Engine bridge: with native as
+            // the default the CE table will not be loaded, so a file-drop grant
+            // would sit unconsumed and delivered items would vanish (clients#413
+            // tracks the liveness handshake that will make a safe fallback
+            // possible). The default path hard-fails with actionable guidance;
+            // an explicit --delivery=native propagates the raw error.
+            Err(error) => return Err(native_attach_failure(error, args.delivery_explicit)),
         }
     } else {
         attach_live_backend(&config, args.assume_correct_save)?
@@ -581,5 +604,73 @@ fn main() -> Result<()> {
         }
 
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args(extra: &[&str]) -> Vec<String> {
+        let mut v = vec![
+            "server".to_string(),
+            "slot".to_string(),
+            "config.json".to_string(),
+            "ledger.json".to_string(),
+        ];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn default_delivery_is_native_and_not_explicit() {
+        let args = parse_args(base_args(&[]).into_iter()).expect("parse");
+        assert_eq!(args.delivery, DeliveryMode::Native);
+        assert!(!args.delivery_explicit);
+    }
+
+    #[test]
+    fn explicit_ce_bridge_selects_bridge_and_is_explicit() {
+        let args = parse_args(base_args(&["--delivery=ce-bridge"]).into_iter()).expect("parse");
+        assert_eq!(args.delivery, DeliveryMode::CeBridge);
+        assert!(args.delivery_explicit);
+    }
+
+    #[test]
+    fn explicit_native_selects_native_and_is_explicit() {
+        let args = parse_args(base_args(&["--delivery=native"]).into_iter()).expect("parse");
+        assert_eq!(args.delivery, DeliveryMode::Native);
+        assert!(args.delivery_explicit);
+    }
+
+    #[test]
+    fn unknown_delivery_mode_is_rejected() {
+        let error = parse_args(base_args(&["--delivery=bogus"]).into_iter()).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown --delivery mode"));
+    }
+
+    // The backend-construction step (native attach / Live bridge) needs a live
+    // shadPS4 process and, for native, `#[cfg(windows)]` seams, so "default on a
+    // recognized image -> native" and "explicit ce-bridge -> Live backend"
+    // cannot be exercised host-side. What IS host-testable is the decision that
+    // governs Direction A: given a native attach/validate failure, the default
+    // path must hard-fail with guidance (never a Live-backend fallback), while
+    // an explicit --delivery=native propagates the raw error.
+    #[test]
+    fn default_native_failure_hard_fails_with_guidance_not_fallback() {
+        let error = native_attach_failure(anyhow::anyhow!("image assert: unknown build"), false);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("was not recognized"), "{rendered}");
+        assert!(rendered.contains("--delivery=ce-bridge"), "{rendered}");
+        // The underlying failure is preserved in the error chain.
+        assert!(rendered.contains("image assert"), "{rendered}");
+    }
+
+    #[test]
+    fn explicit_native_failure_propagates_raw_error() {
+        let error = native_attach_failure(anyhow::anyhow!("image assert: unknown build"), true);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("image assert"), "{rendered}");
+        assert!(!rendered.contains("was not recognized"), "{rendered}");
     }
 }
