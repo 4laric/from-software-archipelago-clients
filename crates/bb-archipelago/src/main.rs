@@ -12,12 +12,12 @@ use bb_archipelago::backend::{
     OperationProgress,
 };
 use bb_archipelago::bridge::{FileBridge, missing_bridge_state};
+use bb_archipelago::client_eprintln;
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::{LiveEventFlags, is_manager_not_initialized};
-use bb_archipelago::client_eprintln;
-use bb_archipelago::logging;
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
+use bb_archipelago::logging;
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
 
@@ -577,9 +577,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
             // ("--log-file", "{client_log}"). A bare flag is refused rather
             // than swallowed as the optional PASSWORD positional, which would
             // send a path to the server as a password.
-            let path = args
-                .next()
-                .context("--log-file requires a path argument")?;
+            let path = args.next().context("--log-file requires a path argument")?;
             log_file = Some(PathBuf::from(path));
         } else if let Some(path) = argument.strip_prefix("--log-file=") {
             log_file = Some(PathBuf::from(path));
@@ -800,9 +798,13 @@ fn main() -> Result<()> {
             let seed_config = config.clone().apply_slot_data(client.slot_data())?;
             match seed_config.verify_suppression_install()? {
                 Some(digest) => {
-                    client_eprintln!("Verified installed vanilla-suppression binder SHA-256 {digest}.")
+                    client_eprintln!(
+                        "Verified installed vanilla-suppression binder SHA-256 {digest}."
+                    )
                 }
-                None => client_eprintln!("Seed does not claim installed vanilla-award suppression."),
+                None => {
+                    client_eprintln!("Seed does not claim installed vanilla-award suppression.")
+                }
             }
             let unsuppressed = seed_config
                 .locations
@@ -877,7 +879,9 @@ fn main() -> Result<()> {
             if !goal_reported && goal_location.is_some_and(|goal| checked.contains(&goal)) {
                 client.set_status(ClientStatus::Goal)?;
                 goal_reported = true;
-                client_eprintln!("Re-sent Bloodborne goal status from the server-checked goal location.");
+                client_eprintln!(
+                    "Re-sent Bloodborne goal status from the server-checked goal location."
+                );
             }
             match runtime.poll_locations(&checked) {
                 Ok(newly_checked) => {
@@ -893,7 +897,9 @@ fn main() -> Result<()> {
                             // poll sees the flag as new and retries both.
                             client.set_status(ClientStatus::Goal)?;
                             goal_reported = true;
-                            client_eprintln!("Father Gascoigne defeated; sent Bloodborne goal status.");
+                            client_eprintln!(
+                                "Father Gascoigne defeated; sent Bloodborne goal status."
+                            );
                         }
                         client.mark_checked(newly_checked.iter().copied())?;
                         client_eprintln!("Sent location checks: {newly_checked:?}");
@@ -1108,8 +1114,7 @@ mod tests {
 
     #[test]
     fn log_file_also_accepts_the_joined_form() {
-        let args =
-            parse_args(base_args(&["--log-file=client.log"]).into_iter()).expect("parse");
+        let args = parse_args(base_args(&["--log-file=client.log"]).into_iter()).expect("parse");
         assert_eq!(args.log_file.as_deref(), Some(Path::new("client.log")));
     }
 
