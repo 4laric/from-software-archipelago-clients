@@ -105,6 +105,7 @@ enum DeliveryMode {
     Native,
 }
 
+#[derive(Debug)]
 struct Arguments {
     server: String,
     slot: String,
