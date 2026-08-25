@@ -135,6 +135,7 @@ pub const OPTIONS_SUBKEYS: &[ContractKey] = &[
     ContractKey { name: "flatten_regular_upgrades", shape: Shape::Int, required: true, greenfield: true },
     ContractKey { name: "locked_abilities", shape: Shape::StrList, required: false, greenfield: true },
     ContractKey { name: "coop_difficulty", shape: Shape::Int, required: false, greenfield: true },
+    ContractKey { name: "region_sync", shape: Shape::BoolOrInt, required: false, greenfield: true },
 ];
 
 fn is_int(v: &Value) -> bool { v.is_i64() || v.is_u64() }

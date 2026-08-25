@@ -49,6 +49,7 @@ mod physick_probe;
 mod radahn_festival;
 mod reconcile_io;
 mod region;
+mod region_sync;
 mod runes;
 mod save_backup;
 mod scadu_blessing;

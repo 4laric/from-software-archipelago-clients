@@ -62,6 +62,9 @@ pub struct CoreBase<G: Game, S: DeserializeOwned + Send + 'static> {
     advertised_death_link: bool,
     /// Whether the server currently believes this socket carries the `TrapLink` tag.
     advertised_trap_link: bool,
+    /// Whether the server currently believes this socket carries the `RegionSync` tag
+    /// (er-archipelago#1005).
+    advertised_region_sync: bool,
 
     /// Session-only player choice. `None` follows slot data; `Some` overrides it until reconnect.
     /// Kept beside the advertised latch so UI code cannot bypass protocol reconciliation.
@@ -97,6 +100,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
             error: None,
             advertised_death_link: false,
             advertised_trap_link: false,
+            advertised_region_sync: false,
             death_link_override: None,
             death_link_tag_failure: None,
             death_link_tag_failure_reported: false,
@@ -180,6 +184,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.connection = Self::new_connection(self.game, &self.config);
         self.advertised_death_link = false; // a fresh socket carries no tags
         self.advertised_trap_link = false;
+        self.advertised_region_sync = false;
         self.death_link_override = None;
         self.death_link_tag_failure = None;
         self.death_link_tag_failure_reported = false;
@@ -240,6 +245,7 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.connection = Self::new_connection(self.game, &self.config);
         self.advertised_death_link = false; // a fresh socket carries no tags
         self.advertised_trap_link = false;
+        self.advertised_region_sync = false;
         self.death_link_override = None;
         self.death_link_tag_failure = None;
         self.death_link_tag_failure_reported = false;
@@ -528,6 +534,13 @@ pub trait Core: Send + Sized {
         None
     }
 
+    /// Whether this slot participates in Region Sync (er-archipelago#1005), or `None` until slot
+    /// data has parsed. Its own link group, like the two above: only opted-in slots see the
+    /// packets, so a session can mix synced and unsynced players without either noticing.
+    fn region_sync_enabled(&self) -> Option<bool> {
+        None
+    }
+
     /// Converges the server's idea of our link tags onto the slot's parsed settings.
     ///
     /// Runs every tick while connected and is a no-op once the two agree, so it costs one
@@ -536,21 +549,30 @@ pub trait Core: Send + Sized {
     fn reconcile_connection_tags(&mut self) {
         let death_want = self.death_link_enabled();
         let trap_want = self.trap_link_enabled();
+        let sync_want = self.region_sync_enabled();
         let death_changed =
             next_tag_advertisement(death_want, self.base().advertised_death_link).is_some();
         let trap_changed =
             next_tag_advertisement(trap_want, self.base().advertised_trap_link).is_some();
-        if !death_changed && !trap_changed {
+        let sync_changed =
+            next_tag_advertisement(sync_want, self.base().advertised_region_sync).is_some();
+        if !death_changed && !trap_changed && !sync_changed {
             return;
         }
         let death = death_want.unwrap_or(self.base().advertised_death_link);
         let trap = trap_want.unwrap_or(self.base().advertised_trap_link);
-        let mut tags = Vec::with_capacity(2);
+        let sync = sync_want.unwrap_or(self.base().advertised_region_sync);
+        let mut tags = Vec::with_capacity(3);
         if death {
             tags.push("DeathLink");
         }
         if trap {
             tags.push("TrapLink");
+        }
+        if sync {
+            // The literal, not `er_logic::region_sync::TAG`: `shared` is game-agnostic and does
+            // not depend on the ER crate. er-archipelago#1005 pins the pair.
+            tags.push("RegionSync");
         }
         // Take the send's result before touching `base_mut` -- `client_mut` holds a mutable borrow
         // of `self` for as long as `client` is alive.
@@ -562,10 +584,11 @@ pub trait Core: Send + Sized {
             Ok(()) => {
                 self.base_mut().advertised_death_link = death;
                 self.base_mut().advertised_trap_link = trap;
+                self.base_mut().advertised_region_sync = sync;
                 self.base_mut().death_link_tag_failure_reported = false;
                 info!(
-                    "connection tags reconciled (DeathLink={}, TrapLink={})",
-                    death, trap,
+                    "connection tags reconciled (DeathLink={}, TrapLink={}, RegionSync={})",
+                    death, trap, sync,
                 );
             }
             Err(e) => {

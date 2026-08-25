@@ -35,6 +35,12 @@ pub fn parse_trap_link(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "trap_link")
 }
 
+/// `options.region_sync` (int-or-bool). Seamless-co-op region sharing (er-archipelago#1005):
+/// nonzero = advertise RegionSync, broadcast this slot's region-opens, and apply inbound ones.
+pub fn parse_region_sync(slot_data: &Value) -> bool {
+    parse_bool_option(slot_data, "region_sync")
+}
+
 /// Weapon/spell requirement removal, under EITHER apworld's option name.
 ///
 /// Our apworld emits `options.no_weapon_requirements`; Bedrock's fswap apworld emits
@@ -186,6 +192,17 @@ mod tests {
         let sd = json!({ "options": { "death_link": 0, "trap_link": true } });
         assert!(!parse_death_link(&sd));
         assert!(parse_trap_link(&sd));
+    }
+
+    #[test]
+    fn region_sync_parses_independently() {
+        let sd = json!({ "options": { "trap_link": 0, "region_sync": 1 } });
+        assert!(!parse_trap_link(&sd));
+        assert!(parse_region_sync(&sd));
+        // Absent = off: an older seed never emits the key and the link stays dark.
+        assert!(!parse_region_sync(
+            &json!({ "options": { "death_link": 1 } })
+        ));
     }
 
     #[test]
