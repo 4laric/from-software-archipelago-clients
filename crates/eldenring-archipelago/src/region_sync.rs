@@ -58,7 +58,8 @@ pub fn applied_snapshot() -> HashSet<String> {
 
 fn note_applied(region: &str) {
     if let Ok(mut g) = APPLIED.lock() {
-        g.get_or_insert_with(HashSet::new).insert(region.to_string());
+        g.get_or_insert_with(HashSet::new)
+            .insert(region.to_string());
     }
 }
 

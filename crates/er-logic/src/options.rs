@@ -200,7 +200,9 @@ mod tests {
         assert!(!parse_trap_link(&sd));
         assert!(parse_region_sync(&sd));
         // Absent = off: an older seed never emits the key and the link stays dark.
-        assert!(!parse_region_sync(&json!({ "options": { "death_link": 1 } })));
+        assert!(!parse_region_sync(
+            &json!({ "options": { "death_link": 1 } })
+        ));
     }
 
     #[test]

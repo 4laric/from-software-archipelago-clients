@@ -18,7 +18,7 @@
 
 use std::collections::HashSet;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Bounce tag. Its own link group, like `DeathLink` / `TrapLink`: a slot that did not opt in never
 /// sees these packets, and no other game speaks this tag.
