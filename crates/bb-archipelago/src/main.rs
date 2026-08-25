@@ -16,6 +16,7 @@ use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::LiveEventFlags;
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
+use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
 
 /// Console reporting policy for item-delivery failures (clients#404).
@@ -209,11 +210,24 @@ const UNRECOGNIZED_BUILD_GUIDANCE: &str = "This game build was not recognized, s
 /// because the user asked for native specifically. Neither path silently falls
 /// back to the Cheat Engine bridge (clients#413).
 fn native_attach_failure(error: anyhow::Error, delivery_explicit: bool) -> anyhow::Error {
-    if delivery_explicit {
+    if delivery_explicit || points_at_the_shad_log(&error) {
         error
     } else {
         error.context(UNRECOGNIZED_BUILD_GUIDANCE)
     }
+}
+
+/// True when the attach failure is the clients#418 "no fresh eboot base ever
+/// appeared" outcome: the suspect is the configured `shad_log` path, not the
+/// game build, and the failure already names the path and what to compare it
+/// against. Appending [`UNRECOGNIZED_BUILD_GUIDANCE`] here would send the player
+/// to the Cheat Engine table over a misconfigured log file.
+fn points_at_the_shad_log(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<AttachWaitFailure>()
+            .is_some_and(AttachWaitFailure::is_stale_log_evidence)
+    })
 }
 
 const LIVE_ATTACH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -822,5 +836,36 @@ mod tests {
         let rendered = format!("{error:#}");
         assert!(rendered.contains("image assert"), "{rendered}");
         assert!(!rendered.contains("was not recognized"), "{rendered}");
+    }
+
+    /// clients#418 outcome (a): no fresh base ever appeared. The build is not
+    /// the suspect, so the CE-table guidance must NOT be appended -- the message
+    /// that names the configured log path is the whole answer.
+    #[test]
+    fn a_stale_log_failure_keeps_the_build_guidance_off() {
+        let failure = AttachWaitFailure::NoFreshBase {
+            shad_log: String::from("C:\\shadPS4\\user\\log\\shad_log.txt"),
+            waited: Duration::from_secs(90),
+        };
+        let error = native_attach_failure(anyhow::Error::new(failure), false);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("shad_log.txt"), "{rendered}");
+        assert!(!rendered.contains("was not recognized"), "{rendered}");
+        assert!(!rendered.contains("--delivery=ce-bridge"), "{rendered}");
+    }
+
+    /// clients#418 outcome (b): a confirmed base whose image is not ours. That
+    /// IS an unrecognised build, so the CE-bridge guidance still applies.
+    #[test]
+    fn a_rejected_image_after_the_wait_still_gets_the_build_guidance() {
+        let failure = AttachWaitFailure::ImageRejected {
+            base: 0x5570000,
+            detail: String::from("assert consume_hook mismatched"),
+        };
+        let error = native_attach_failure(anyhow::Error::new(failure), false);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("was not recognized"), "{rendered}");
+        assert!(rendered.contains("--delivery=ce-bridge"), "{rendered}");
+        assert!(rendered.contains("consume_hook"), "{rendered}");
     }
 }
