@@ -125,6 +125,18 @@ impl<R: Runtime> NativeDelivery<R> {
         self.session.runtime_mut()
     }
 
+    /// The live view of one stack, for the client's fresh-grant baseline
+    /// (clients#427). `None` means the inventory geometry is not hydrated --
+    /// never "absent". Read-only: it queues nothing and cannot disturb an
+    /// in-flight grant.
+    pub fn observe_stack(&mut self, normalized_id: u32) -> Option<super::delivery::StackView> {
+        let runtime = self.session.runtime_mut();
+        if !runtime.inventory_ready() {
+            return None;
+        }
+        runtime.find_stack(normalized_id)
+    }
+
     /// The live durable state of the current grant, for the client to persist.
     pub fn state(&self) -> &DurableState {
         self.session.state()

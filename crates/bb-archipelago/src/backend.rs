@@ -35,6 +35,22 @@ pub struct EquipRequest {
     pub tag: String,
 }
 
+/// What a backend can say about the live quantity of one stack *before* a
+/// grant runs (clients#427). This is the fresh-grant precondition: the number
+/// the delivery machine will require the stack to hold, sampled from the game
+/// rather than predicted from the ledger's lifetime delivered sum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StackObservation {
+    /// This backend cannot read inventory (the CE file bridge): the caller
+    /// keeps its pre-clients#427 ledger-derived baseline.
+    Unsupported,
+    /// Inventory geometry is not hydrated yet, or an absent stack has not
+    /// survived the contract's absent-poll grace. Never "zero".
+    NotReady,
+    /// The observed quantity of the stack right now.
+    Quantity(u32),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationProgress {
     Pending,
@@ -76,6 +92,16 @@ pub trait BloodborneBackend {
     /// `None` preserves the received reinforcement level.
     fn target_weapon_level(&mut self) -> Result<Option<u8>>;
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress>;
+    /// The live quantity of a stack, for the fresh-grant baseline
+    /// (clients#427). The default declines, which keeps a backend that cannot
+    /// read inventory on the ledger-derived baseline it always used.
+    fn observe_stack_quantity(
+        &mut self,
+        _normalized_item_id: u32,
+        _reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation> {
+        Ok(StackObservation::Unsupported)
+    }
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress>;
     /// Retract a published-but-unexecuted grant command (clients#296). The
     /// client calls this when the validated context the command was published
@@ -278,11 +304,19 @@ pub struct MockBackend {
     /// finished loading a character -- reads answer `None` ("no accessor"),
     /// never `false`.
     pub event_flags_armed: bool,
+    /// clients#427: whether this mock models a backend that can read the live
+    /// stack quantity. On by default -- native can, and the fresh-grant
+    /// baseline is observed. Off models the CE file bridge, which falls back
+    /// to the ledger-derived baseline.
+    pub stack_observation_supported: bool,
+    /// Off models inventory geometry that has not hydrated yet: no baseline,
+    /// so no grant this poll.
+    pub stack_observation_ready: bool,
     grant_delays: HashMap<String, u8>,
     equip_delays: HashMap<String, u8>,
     completed_grants: HashSet<String>,
     completed_equips: HashSet<String>,
-    terminal_failures: HashSet<String>,
+    terminal_failures: HashMap<String, String>,
 }
 
 impl Default for MockBackend {
@@ -301,11 +335,13 @@ impl Default for MockBackend {
             watermark_supported: false,
             watermark: None,
             event_flags_armed: true,
+            stack_observation_supported: true,
+            stack_observation_ready: true,
             grant_delays: HashMap::new(),
             equip_delays: HashMap::new(),
             completed_grants: HashSet::new(),
             completed_equips: HashSet::new(),
-            terminal_failures: HashSet::new(),
+            terminal_failures: HashMap::new(),
         }
     }
 }
@@ -317,7 +353,17 @@ impl MockBackend {
 
     /// Simulate the harness latching a terminal failure for a tag (clients#399).
     pub fn fail_grant_terminally(&mut self, tag: impl Into<String>) {
-        self.terminal_failures.insert(tag.into());
+        self.fail_grant_terminally_with(tag, "failed");
+    }
+
+    /// The same, with the harness status that names the park reason -- which is
+    /// what decides whether clients#427's startup unpark may retry it.
+    pub fn fail_grant_terminally_with(
+        &mut self,
+        tag: impl Into<String>,
+        status: impl Into<String>,
+    ) {
+        self.terminal_failures.insert(tag.into(), status.into());
     }
 
     pub fn delay_equip(&mut self, tag: impl Into<String>, polls: u8) {
@@ -369,11 +415,30 @@ impl BloodborneBackend for MockBackend {
         Ok(self.upgrade_target_level)
     }
 
+    fn observe_stack_quantity(
+        &mut self,
+        normalized_item_id: u32,
+        reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation> {
+        if !self.stack_observation_supported {
+            return Ok(StackObservation::Unsupported);
+        }
+        if !self.stack_observation_ready {
+            return Ok(StackObservation::NotReady);
+        }
+        Ok(StackObservation::Quantity(
+            self.inventory
+                .get(&(normalized_item_id, reinforcement_level))
+                .copied()
+                .unwrap_or(0),
+        ))
+    }
+
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
-        if self.terminal_failures.contains(&grant.tag) {
+        if let Some(status) = self.terminal_failures.get(&grant.tag) {
             return Err(GrantTerminalFailure {
                 tag: grant.tag.clone(),
-                status: "failed".into(),
+                status: status.clone(),
                 detail: "mock terminal harness failure".into(),
             }
             .into());

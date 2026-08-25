@@ -811,6 +811,26 @@ fn main() -> Result<()> {
                 Ok(false) => {}
                 Err(error) => eprintln!("Pending-command reconciliation failed: {error:#}"),
             }
+            // clients#427: items parked with `quantity_mismatch` were parked by
+            // a precondition that compared the stack against the ledger's
+            // lifetime delivered sum -- false for anything the player spends.
+            // That precondition is now the observed live quantity, so those
+            // parks re-enter the delivery queue instead of needing one manual
+            // bb-blocked invocation each. No other park reason auto-unparks.
+            match new_runtime.requeue_quantity_mismatch_parks() {
+                Ok(indices) if !indices.is_empty() => eprintln!(
+                    "Re-queued {} item(s) parked as quantity_mismatch (indices {}); \
+                     they deliver against the observed inventory now.",
+                    indices.len(),
+                    indices
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!("Re-queuing parked items failed: {error:#}"),
+            }
             runtime = Some(new_runtime);
         }
 

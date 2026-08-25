@@ -50,6 +50,54 @@
 
 ### Fixed
 
+* **A consumable you have spent no longer parks every later copy of it
+  (clients#427).** In oz's live session the first deliveries landed and then 21
+  items parked, all `quantity_mismatch: expected_before=18 actual=0` --
+  quicksilver bullets, blood stone shards, molotovs. The fresh-grant
+  precondition was the receive ledger's *lifetime delivered sum* for that item,
+  which the delivery machine required the live stack to equal. For anything the
+  player spends, actual is below that sum the moment one is used, so every
+  further grant of that item parked, permanently, while unspent item types kept
+  arriving.
+
+  The precondition for a **new** command is now the quantity observed in the
+  game at submit time: the client reads the stack (`observe_stack_quantity`),
+  records it durably on the pending plan as `observed_before`, and delivers the
+  delta against that. Double-delivery protection is untouched -- it has always
+  lived in the ledger's index cursor, which delivers each AP index at most once,
+  never in this arithmetic.
+
+  **Replay recovery is unchanged and still durable.** The baseline is written to
+  the ledger *before* the grant can execute, so a restart mid-grant replays the
+  one uncommitted in-flight command against the very same number and an
+  already-applied stack is still recognised as `recovered_complete` instead of
+  being granted twice. What changed is where that number comes from, not what it
+  protects. A command the client proves was withdrawn unexecuted (a load
+  transition, a save switch) releases its recorded baseline, so a player who
+  spends during that window is not parked on a stale number when it re-publishes.
+
+  Fail-closed details: no grant is published off an inventory that has not
+  hydrated, and an absent stack must survive the contract's `min_absent_polls`
+  grace before zero is accepted as a baseline -- a hydration lie must never be
+  recorded as one. A backend that cannot read inventory (the Cheat Engine file
+  bridge, whose harness ignores the field anyway) keeps the ledger-derived
+  baseline it always used.
+
+* **Items already parked as `quantity_mismatch` re-deliver by themselves
+  (clients#427).** On startup, every ledger entry parked with that status
+  re-enters the delivery queue, so oz's 21 parked items deliver instead of
+  needing 21 manual `bb-blocked` invocations. Only that reason auto-unparks:
+  it is the one whose cause this release removed. `failed`, `write_error` and
+  `command_rejected` parks stay parked for `bb-blocked`, because nothing here
+  fixed them. A requeued index is delivered before anything new, retiring it
+  never moves the delivery cursor backwards, and nothing already delivered is
+  delivered again.
+
+  Ledger format: `PendingItem` gains `observed_before` and `SlotLedger` gains
+  `redeliver`, both `#[serde(default)]`. An older ledger loads unchanged -- an
+  absent `observed_before` simply means "sample on the next poll" -- and a
+  ledger with an empty requeue set serializes exactly as before.
+
 * **A game that has not loaded a character no longer stops the client, and
   never gets told its build is unrecognised (clients#420).** Immediately after
   clients#418 landed, attach got past the base wait and image validation and
