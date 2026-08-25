@@ -373,6 +373,43 @@ mod windows_impl {
 #[cfg(windows)]
 pub use windows_impl::WinProcessMemory;
 
+// -------------------------------------------------------------------------
+// The concrete accessor the native backend attaches. On Windows it is the
+// real `WinProcessMemory`; on other hosts it is a stub that fails to open,
+// so `NativeBackend` compiles everywhere but only functions on Windows --
+// exactly how `event_flags::LiveEventFlags` is split.
+// -------------------------------------------------------------------------
+
+#[cfg(windows)]
+pub type NativeMemory = WinProcessMemory;
+
+#[cfg(not(windows))]
+mod native_stub {
+    use anyhow::{Result, bail};
+
+    use super::ProcessMemory;
+
+    pub struct StubMemory;
+
+    impl StubMemory {
+        pub fn open_shad() -> Result<Self> {
+            bail!("native Bloodborne delivery requires Windows")
+        }
+    }
+
+    impl ProcessMemory for StubMemory {
+        fn read(&self, _address: u64, _len: usize) -> Result<Vec<u8>> {
+            bail!("native Bloodborne delivery requires Windows")
+        }
+        fn write(&self, _address: u64, _data: &[u8]) -> Result<()> {
+            bail!("native Bloodborne delivery requires Windows")
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub use native_stub::StubMemory as NativeMemory;
+
 #[cfg(test)]
 mod tests {
     use super::super::contract::contract;
@@ -459,40 +496,3 @@ Loading module eboot.bin
         assert_eq!(memory.read_u32(0x1000).unwrap(), 0xDEAD_BEEF);
     }
 }
-
-// -------------------------------------------------------------------------
-// The concrete accessor the native backend attaches. On Windows it is the
-// real `WinProcessMemory`; on other hosts it is a stub that fails to open,
-// so `NativeBackend` compiles everywhere but only functions on Windows --
-// exactly how `event_flags::LiveEventFlags` is split.
-// -------------------------------------------------------------------------
-
-#[cfg(windows)]
-pub type NativeMemory = WinProcessMemory;
-
-#[cfg(not(windows))]
-mod native_stub {
-    use anyhow::{Result, bail};
-
-    use super::ProcessMemory;
-
-    pub struct StubMemory;
-
-    impl StubMemory {
-        pub fn open_shad() -> Result<Self> {
-            bail!("native Bloodborne delivery requires Windows")
-        }
-    }
-
-    impl ProcessMemory for StubMemory {
-        fn read(&self, _address: u64, _len: usize) -> Result<Vec<u8>> {
-            bail!("native Bloodborne delivery requires Windows")
-        }
-        fn write(&self, _address: u64, _data: &[u8]) -> Result<()> {
-            bail!("native Bloodborne delivery requires Windows")
-        }
-    }
-}
-
-#[cfg(not(windows))]
-pub use native_stub::StubMemory as NativeMemory;
