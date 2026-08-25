@@ -7,8 +7,11 @@
 //! `bb-native-grant-v5` contract, installs a static grant payload atomically,
 //! and drives the grant state machine the Cheat Engine table paid for live.
 //!
-//! Everything here is **untested against a live game** and gated behind the
-//! delivery flag; the Cheat Engine bridge remains the default delivery path.
+//! Everything here is **untested against a live game**. Native is now the
+//! default delivery backend (clients: default-native-delivery); it fails closed
+//! on any image it cannot validate, and on the default path (no explicit
+//! `--delivery`) that image is delivered through the Cheat Engine bridge fallback
+//! instead of hard-failing the player, so the default never strands anyone.
 //! The pure logic (contract consumption, descriptor encoding, image
 //! verification, install atomicity, the delivery state machine, the inventory
 //! walk) is host-tested against fakes; the live Windows attach/install/thread
