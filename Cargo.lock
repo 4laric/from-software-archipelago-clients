@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "eldenring-archipelago"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "archipelago_rs",
