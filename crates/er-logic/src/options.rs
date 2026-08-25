@@ -91,10 +91,68 @@ pub fn parse_merchant_bells_on_talk(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "merchant_bells_on_talk")
 }
 
+/// `options.coop_difficulty`: extra sphere-scaling tiers added per player past the first, when a
+/// seamless-co-op session is live (#993). `0` (the default, and any absent/garbage value) disables
+/// it. Clamped to a small sane ceiling so a malformed slot can never push the ladder off its top
+/// rung on its own. The count of extra players is the CLIENT's job (its phantom census); this only
+/// reads the per-player knob.
+pub fn parse_coop_difficulty(slot_data: &Value) -> usize {
+    slot_data
+        .pointer("/options/coop_difficulty")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 9) as usize
+}
+
 /// `options.no_fall_damage` (int-or-bool). When on, the player never takes fall damage (the
 /// spirit-spring `fallDamageRate=0` trick, applied permanently -- see [`crate::no_fall_damage`]).
 pub fn parse_no_fall_damage(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "no_fall_damage")
+}
+
+/// `options.locked_abilities`: a JSON array of ability names (`["roll","r1"]`) -> the
+/// `er_logic::ability_lock` u8 locked set. Tolerant like the rest of this module -- a non-array,
+/// a non-string element, or an unknown name is skipped, never fatal, so a garbage option is simply
+/// inert rather than failing the connection. Absent/empty => 0 (the client then falls back to the
+/// `ER_ABILITY_LOCK_TEST` env var, or does nothing).
+pub fn parse_ability_lock(slot_data: &Value) -> u8 {
+    let Some(arr) = slot_data
+        .get("options")
+        .and_then(|o| o.get("locked_abilities"))
+        .and_then(|v| v.as_array())
+    else {
+        return 0;
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(crate::ability_lock::Ability::from_name)
+        .fold(0u8, |set, a| set | a.bit())
+}
+
+/// `abilityUnlockItems`: a JSON object {ap_item_id_string: ability_name} (progressive ability lock,
+/// er-archipelago#980) -> a map from AP item id to the `ability_lock` ability BIT. Receiving one of
+/// these ids unlocks that ability. Tolerant: a non-object, an unparseable id, or an unknown ability
+/// name is skipped, never fatal, so a garbage map is simply inert. Empty/absent => empty map (the
+/// client then never drives the stream unlock path and the abilities stay statically locked).
+pub fn parse_ability_unlock_items(slot_data: &Value) -> std::collections::HashMap<i64, u8> {
+    let mut out = std::collections::HashMap::new();
+    let Some(obj) = slot_data
+        .get("abilityUnlockItems")
+        .and_then(|v| v.as_object())
+    else {
+        return out;
+    };
+    for (id_str, name) in obj {
+        let (Ok(id), Some(a)) = (
+            id_str.parse::<i64>(),
+            name.as_str()
+                .and_then(crate::ability_lock::Ability::from_name),
+        ) else {
+            continue;
+        };
+        out.insert(id, a.bit());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -218,5 +276,67 @@ mod tests {
             &json!({ "options": { "no_fall_damage": 0 } })
         ));
         assert!(!parse_no_fall_damage(&json!({ "options": {} })));
+    }
+
+    #[test]
+    fn ability_lock_folds_names_and_is_tolerant() {
+        use crate::ability_lock::Ability;
+        let sd = json!({ "options": { "locked_abilities": ["roll", "r1", "l2"] } });
+        assert_eq!(
+            parse_ability_lock(&sd),
+            Ability::Roll.bit() | Ability::R1.bit() | Ability::L2.bit()
+        );
+        // unknown names + non-strings are skipped, not fatal
+        let messy = json!({ "options": { "locked_abilities": ["roll", "nope", 7, "jump"] } });
+        assert_eq!(
+            parse_ability_lock(&messy),
+            Ability::Roll.bit() | Ability::Jump.bit()
+        );
+        // absent / wrong-typed => 0
+        assert_eq!(parse_ability_lock(&json!({ "options": {} })), 0);
+        assert_eq!(
+            parse_ability_lock(&json!({ "options": { "locked_abilities": "roll" } })),
+            0
+        );
+    }
+
+    #[test]
+    fn ability_unlock_items_maps_ids_to_bits_and_is_tolerant() {
+        use crate::ability_lock::Ability;
+        let sd = json!({ "abilityUnlockItems": { "7900002": "roll", "7900003": "r1" } });
+        let m = parse_ability_unlock_items(&sd);
+        assert_eq!(m.get(&7900002).copied(), Some(Ability::Roll.bit()));
+        assert_eq!(m.get(&7900003).copied(), Some(Ability::R1.bit()));
+        // garbage id / unknown ability / wrong container -> skipped, never fatal
+        let messy = json!({ "abilityUnlockItems": { "nope": "roll", "7900004": "wat", "7900005": "jump" } });
+        let mm = parse_ability_unlock_items(&messy);
+        assert_eq!(mm.len(), 1);
+        assert_eq!(mm.get(&7900005).copied(), Some(Ability::Jump.bit()));
+        assert!(parse_ability_unlock_items(&json!({ "abilityUnlockItems": [] })).is_empty());
+        assert!(parse_ability_unlock_items(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn coop_difficulty_reads_clamps_and_defaults_off() {
+        assert_eq!(
+            parse_coop_difficulty(&json!({ "options": { "coop_difficulty": 2 } })),
+            2
+        );
+        // absent / missing options => off
+        assert_eq!(parse_coop_difficulty(&json!({ "options": {} })), 0);
+        assert_eq!(parse_coop_difficulty(&json!({})), 0);
+        // negatives clamp to 0, oversized clamps to the 9 ceiling, garbage => 0
+        assert_eq!(
+            parse_coop_difficulty(&json!({ "options": { "coop_difficulty": -5 } })),
+            0
+        );
+        assert_eq!(
+            parse_coop_difficulty(&json!({ "options": { "coop_difficulty": 999 } })),
+            9
+        );
+        assert_eq!(
+            parse_coop_difficulty(&json!({ "options": { "coop_difficulty": "2" } })),
+            0
+        );
     }
 }

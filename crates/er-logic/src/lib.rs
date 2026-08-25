@@ -32,6 +32,7 @@ pub mod client_features;
 pub mod collect_cue;
 pub mod config_reload;
 pub mod config_reload_replay;
+pub mod console_check;
 pub mod death_award_sweep;
 pub mod death_guard;
 pub mod deathlink;

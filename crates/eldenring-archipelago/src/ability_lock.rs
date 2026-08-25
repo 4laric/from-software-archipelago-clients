@@ -1,46 +1,60 @@
-//! ability_lock.rs — TEST-BUILD enforcement of individual ability locks (er-archipelago#945,
-//! SPEC-ability-lock-mode §4.3). The decision is er_logic::ability_lock (host-tested against
-//! the probe-measured menu states); this file is the arm.
+//! ability_lock.rs -- enforcement of individual ability locks (er-archipelago#945,
+//! SPEC-ability-lock-mode). The decision is `er_logic::ability_lock` (host-tested); this file arms
+//! it against the running game and owns the runtime lock/unlock state.
 //!
-//! ## Scope, deliberately narrow
+//! ## The mechanism: the game's own logical-action layer
 //!
-//! Env-driven, no world feature, no slot_data: `ER_ABILITY_LOCK_TEST="roll,r1,l2"` masks those
-//! abilities' GAMEPAD inputs while the game is in gameplay (`ChrMenuFlags & 0b1100 == 0`, the
-//! 2026-08-21 probe finding) and no NPC conversation is live (`esd_probe::inventory_grants_safe`
-//! — B is "back" in dialogue). XInput only: ER pads poll `XInputGetState`, which `input.rs`
-//! already detours; keyboard/mouse masking needs the player's live binds and ships later or not
-//! at all. Not blocked on the SpEffect-9621 field test — that blanket path layers on top if it
-//! proves out.
+//! ER resolves every input -- gamepad, keyboard, mouse -- into `ChrActions` on the player's
+//! `CSChrActionRequestModule` (`chr_ins.modules.action_request`), one bit per LOGICAL action
+//! (r1, jump, rolling, ...), AFTER the keybind map. Each frame [`enforce`] makes that module's
+//! `disabled_action_inputs` -- the game's OWN "these actions are off" field -- agree with our
+//! state: locked abilities' bits are SET, and abilities we govern but have UNLOCKED are CLEARED
+//! (so an unlock actually restores the action, not just "stop re-locking it"). It also clears the
+//! locked bits from `action_requests`/`new_action_presses` the same frame. This is:
+//!   * KEYBIND-AGNOSTIC -- rebind roll to any key/button, it still sets the `rolling` bit;
+//!   * device-agnostic -- one path covers pad AND keyboard/mouse;
+//!   * menu-safe with no predicate -- menu navigation never flows through the character's action
+//!     requests, so a persistent disable does not lock the player out of menus.
 //!
-//! ## The read-back rule (spec §4.3)
+//! ## Runtime state: MANAGED and LIVE
 //!
-//! `no_equip_load` spent a month writing a field no code read, logging success. So this module
-//! logs every suppressed press (rate-limited per ability) and keeps a session tally — if the
-//! log never says "masked", the mask is not proven to be doing anything, whatever this header
-//! claims.
+//! [`MANAGED`] is every ability this feature has governed this session (its domain -- the only
+//! bits it will ever clear, so it never touches a disable the GAME set for its own reasons).
+//! [`LIVE`] is the currently-locked subset (`LIVE ⊆ MANAGED`). Unlock clears a LIVE bit; the next
+//! frame `enforce` restores the action. This is the seam a future find-to-unlock item plugs into:
+//! on receiving an "unlock roll" item the client calls [`unlock`], exactly what the `!ability`
+//! console lever does by hand today.
 //!
-//! ## Threading and the #372 lesson
+//! ## Where the locked set comes from
 //!
-//! `XInputGetState` is called from the game's input path, not our tick, and the hook frame
-//! cannot unwind — so every game-object read here sits inside `catch_unwind`, and any failure
-//! (menu manager not up, mid-teardown, a panic underneath) degrades to NO MASK for that poll.
-//! Fail-open on purpose: a lock that flickers off for a frame is a curiosity; an input system
-//! that panics in a nounwind frame is crash-19968's cousin.
+//! Two sources, slot_data preferred: the apworld's `options.locked_abilities` (parsed by
+//! `er_logic::options::parse_ability_lock` and installed via [`set_locked_mask`]), falling back to
+//! the `ER_ABILITY_LOCK_TEST="roll,r1,l2"` env var for test builds whose apworld predates the
+//! option. `heal` is not here (its mechanism is the flask-charge clamp, spec 4.1). `crouch` -> `l3`
+//! is the one unverified action map (see er_logic).
+//!
+//! ## The read-back rule (spec 4.3)
+//!
+//! `no_equip_load` spent a month writing a field no code read, logging success. So this logs every
+//! locked action the player actually pressed (`new_action_presses`, rate-limited per ability) with
+//! a session tally: if the log never says "blocked", the mask is not proven to be doing anything.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
+use eldenring::cs::WorldChrMan;
 use fromsoftware_shared::FromStatic;
 
 use er_logic::ability_lock::{
-    Ability, GamepadMask, gamepad_mask, parse_set, set_names, suppressed,
+    Ability, chr_action_mask, heal_locked, parse_set, requested_locked, set_names,
 };
 
-static CONFIG: OnceLock<u8> = OnceLock::new();
 static CLOCK: OnceLock<Instant> = OnceLock::new();
-/// Per-ability last-log timestamp (ms), indexed by bit position; 0 = never.
-static LAST_LOG_MS: [AtomicU64; 7] = [
+/// Per-ability last-log timestamp (ms), indexed by this module's bit position; 0 = never.
+static LAST_LOG_MS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -49,103 +63,234 @@ static LAST_LOG_MS: [AtomicU64; 7] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
-static SUPPRESSED_TOTAL: AtomicU32 = AtomicU32::new(0);
+static BLOCKED_TOTAL: AtomicU32 = AtomicU32::new(0);
 const LOG_SPACING_MS: u64 = 1500;
+
+/// Last time the No Flask SpEffect was (re)applied for a heal lock; 0 = never. The trap effect is
+/// deliberately FINITE (`NO_FLASK_SECONDS` = 20s) -- its safety property -- so a persistent heal
+/// lock re-applies it before it lapses. On unlock we simply stop, and the flask returns within 20s.
+static LAST_HEAL_APPLY_MS: AtomicU64 = AtomicU64::new(0);
+/// Last time we *attempted* the No Flask apply (success or not). Caps retries while the SpEffect
+/// param streams in -- fire_no_flask logs a "not loaded yet" line each call, so without this the
+/// pre-in-world frames spam it (~71 lines were seen in a heal test).
+static LAST_HEAL_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
+/// Re-apply cadence, comfortably under the 20s effect so heal never flickers back on while locked.
+const HEAL_REAPPLY_MS: u64 = 15_000;
+/// Retry cadence while the param is not loaded yet -- at most one attempt (and one log) per this.
+const HEAL_RETRY_MS: u64 = 2_000;
+
+/// The feature's domain: every ability it has governed this session. Only these bits are ever
+/// cleared from the game's disable field, so a disable the GAME set is never disturbed.
+static MANAGED: AtomicU8 = AtomicU8::new(0);
+/// The currently-locked subset (`⊆ MANAGED`). The `u8` is er_logic's Ability set, not ChrActions.
+static LIVE: AtomicU8 = AtomicU8::new(0);
+/// Whether the locked set has been sourced yet (env or slot_data). The env read is one-shot.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Progressive mode (#980): AP item id -> the ability BIT its "Unlock: X" item grants. Parsed once
+/// per seed from slot_data (abilityUnlockItems) and read while folding the received stream. Non-empty
+/// only for a progressive seed; when empty the stream unlock path is inert and LIVE is left to
+/// set_locked_mask / the console lever.
+static UNLOCK_MAP: RwLock<Option<HashMap<i64, u8>>> = RwLock::new(None);
 
 fn now_ms() -> u64 {
     CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
-fn locked_set() -> u8 {
-    *CONFIG.get_or_init(|| {
-        let Ok(v) = std::env::var("ER_ABILITY_LOCK_TEST") else {
-            return 0;
-        };
-        match parse_set(&v) {
-            Ok(0) => {
-                log::info!(
-                    "ability-lock: ER_ABILITY_LOCK_TEST is set but names nothing -- inactive"
-                );
-                0
-            }
-            Ok(s) => {
-                log::info!(
-                    "ability-lock TEST ACTIVE (#945): [{}] masked on the GAMEPAD while in \
-                     gameplay (menu predicate + talk gate; menus and dialogue are never \
-                     masked). Keyboard/mouse are NOT masked in this build, and rebinding a \
-                     locked action to another button evades it -- both are documented v1 \
-                     limits. Suppressed presses are logged; unset ER_ABILITY_LOCK_TEST to \
-                     disable.",
-                    set_names(s)
-                );
-                s
-            }
-            Err(e) => {
-                log::warn!("ability-lock: ER_ABILITY_LOCK_TEST rejected ({e}) -- INACTIVE");
-                0
-            }
-        }
-    })
-}
-
-/// The context read: menu flags + talk gate, behind `catch_unwind`. `None` = could not read =
-/// no masking this poll (fail-open; see the header).
-fn mask_now(locked: u8) -> Option<GamepadMask> {
-    std::panic::catch_unwind(|| {
-        let mm = unsafe { eldenring::cs::CSMenuManImp::instance() }.ok()?;
-        let flags = mm.player_menu_ctrl.chr_menu_flags.flags;
-        // The bitfield macro keeps its tuple field private; the struct IS a plain u32 (see
-        // fromsoftware-rs menu_man.rs) and Copy, so transmute is the whole accessor.
-        let raw = unsafe { std::mem::transmute::<eldenring::cs::ChrMenuFlags, u32>(flags) };
-        let talk_quiet = crate::esd_probe::inventory_grants_safe();
-        Some(gamepad_mask(locked, raw, talk_quiet))
-    })
-    .ok()
-    .flatten()
-}
-
-/// Called by `input.rs`'s `XInputGetState` detour with the freshly-read gamepad fields, AFTER
-/// its whole-device block. Edits in place. Cheap when inactive: one OnceLock read.
-pub fn filter_gamepad(buttons: &mut u16, left_trigger: &mut u8, right_trigger: &mut u8) {
-    let locked = locked_set();
-    if locked == 0 {
+/// One-shot env bootstrap: the fallback source for test builds whose apworld has no
+/// `locked_abilities` option. `set_locked_mask` (slot_data) overrides this whenever it carries a
+/// non-empty set. Idempotent -- the env is read at most once.
+fn ensure_initialized() {
+    if INITIALIZED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let Some(mask) = mask_now(locked) else {
+    let Ok(v) = std::env::var("ER_ABILITY_LOCK_TEST") else {
         return;
     };
-    if mask.is_empty() {
-        return;
-    }
-    // Read-back BEFORE the edit: which locked abilities the player is pressing right now.
-    let hit = suppressed(locked, mask, *buttons, *left_trigger, *right_trigger);
-    if hit != 0 {
-        report(hit);
-    }
-    *buttons &= !mask.clear_buttons;
-    if mask.zero_left_trigger {
-        *left_trigger = 0;
-    }
-    if mask.zero_right_trigger {
-        *right_trigger = 0;
+    match parse_set(&v) {
+        Ok(0) => log::info!("ability-lock: ER_ABILITY_LOCK_TEST names nothing -- inactive"),
+        Ok(s) => {
+            MANAGED.fetch_or(s, Ordering::Relaxed);
+            LIVE.store(s, Ordering::Relaxed);
+            log::info!(
+                "ability-lock ACTIVE from env (#945): [{}] disabled at the game's LOGICAL action \
+                 layer -- keybind- and device-agnostic, menus unaffected. `!ability` toggles at \
+                 runtime; blocked presses are logged.",
+                set_names(s)
+            );
+        }
+        Err(e) => log::warn!("ability-lock: ER_ABILITY_LOCK_TEST rejected ({e}) -- INACTIVE"),
     }
 }
 
+/// Install the locked set from slot_data (`options.locked_abilities`). Wins over the env fallback.
+/// A zero mask is ignored so an absent/empty option cannot wipe an env-armed test set.
+pub fn set_locked_mask(mask: u8) {
+    INITIALIZED.store(true, Ordering::Release);
+    if mask == 0 {
+        return;
+    }
+    MANAGED.fetch_or(mask, Ordering::Relaxed);
+    LIVE.store(mask, Ordering::Relaxed);
+    log::info!(
+        "ability-lock ACTIVE from slot_data (#945): [{}] locked at the logical-action layer.",
+        set_names(mask)
+    );
+}
+
+/// The currently-locked set (for the console readout).
+pub fn live_set() -> u8 {
+    LIVE.load(Ordering::Relaxed)
+}
+/// The feature's domain (every ability it governs).
+pub fn managed_set() -> u8 {
+    MANAGED.load(Ordering::Relaxed)
+}
+
+/// Unlock one ability at runtime: clear its LIVE bit. `enforce` restores the action next frame.
+/// The ability stays MANAGED, so it can be re-locked. This is the future item-unlock entry point.
+pub fn unlock(a: Ability) {
+    LIVE.fetch_and(!a.bit(), Ordering::Relaxed);
+}
+/// Lock one ability at runtime: set its LIVE bit and admit it to the managed domain.
+pub fn lock(a: Ability) {
+    MANAGED.fetch_or(a.bit(), Ordering::Relaxed);
+    LIVE.fetch_or(a.bit(), Ordering::Relaxed);
+    INITIALIZED.store(true, Ordering::Release);
+}
+/// Unlock every managed ability (leaves the domain intact so they can be re-locked).
+pub fn unlock_all() {
+    LIVE.store(0, Ordering::Relaxed);
+}
+/// Re-lock every managed ability.
+pub fn lock_all() {
+    LIVE.store(MANAGED.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// Authoritative stream-driven state: set LIVE to exactly "managed minus unlocked". `unlocked` is
+/// the set of abilities whose Unlock item the player has received (progressive mode), recomputed
+/// from the WHOLE received stream every connect -- so this is idempotent and reconnect-safe, and it
+/// is what makes a found unlock persist across a relaunch. Only the progressive receive path calls
+/// this (when abilityUnlockItems is non-empty); env/static seeds leave LIVE to the console lever.
+pub fn set_unlocked(unlocked: u8) {
+    let managed = MANAGED.load(Ordering::Relaxed);
+    LIVE.store(managed & !unlocked, Ordering::Relaxed);
+}
+
+/// Install the progressive id->ability-bit map from slot_data (empty = not a progressive seed).
+pub fn set_unlock_map(map: HashMap<i64, u8>) {
+    *UNLOCK_MAP.write().unwrap() = if map.is_empty() { None } else { Some(map) };
+}
+
+/// True on a progressive seed (a non-empty unlock map): the caller then drives [`set_unlocked`] from
+/// the received stream instead of leaving LIVE to the console lever.
+pub fn has_unlock_map() -> bool {
+    UNLOCK_MAP.read().unwrap().is_some()
+}
+
+/// The ability bit an AP item id unlocks, or 0 if the id is not an unlock item. Folded over the whole
+/// received stream each connect to recompute the unlocked set (reconnect-safe).
+pub fn unlock_bit_for(ap_id: i64) -> u8 {
+    UNLOCK_MAP
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&ap_id).copied())
+        .unwrap_or(0)
+}
+
+/// Seed change / disconnect: forget everything so the next seed re-arms from its own slot_data (or
+/// the env, on next enforce). Mirrors the other per-seed client tables cleared in reset_for_new_seed.
+pub fn reset() {
+    MANAGED.store(0, Ordering::Relaxed);
+    LIVE.store(0, Ordering::Relaxed);
+    INITIALIZED.store(false, Ordering::Release);
+    LAST_HEAL_APPLY_MS.store(0, Ordering::Relaxed);
+    LAST_HEAL_ATTEMPT_MS.store(0, Ordering::Relaxed);
+    *UNLOCK_MAP.write().unwrap() = None;
+}
+
+/// Per-frame: make the player's `disabled_action_inputs` agree with (MANAGED, LIVE). Call from the
+/// overlay frame hook. Fail-open -- if the player/module is not up this frame it does nothing.
+pub fn enforce() {
+    ensure_initialized();
+    let managed = MANAGED.load(Ordering::Relaxed);
+    if managed == 0 {
+        return; // feature never armed -- touch nothing
+    }
+    let live = LIVE.load(Ordering::Relaxed);
+
+    // ---- ChrActions abilities (everything except heal) -------------------------------------
+    // Scoped so the WorldChrMan borrow is dropped before the heal path re-acquires the singleton.
+    let mask_managed = chr_action_mask(managed);
+    if mask_managed != 0 {
+        let mask_live = chr_action_mask(live);
+        // Managed bits currently UNLOCKED -> restore (clear from the disable field).
+        let restore = mask_managed & !mask_live;
+
+        // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the same contract
+        // every other player write in this crate (scaling, traps) relies on.
+        if let Ok(wcm) = unsafe { WorldChrMan::instance_mut() }
+            && let Some(player) = wcm.main_player.as_mut()
+        {
+            let module = &mut *player.chr_ins.modules.action_request;
+            // ChrActions is a u64-backed bitfield (private tuple); reinterpret as the u64.
+            let disabled = &mut module.disabled_action_inputs as *mut _ as *mut u64;
+            let requests = &mut module.action_requests as *mut _ as *mut u64;
+            let presses = &mut module.new_action_presses as *mut _ as *mut u64;
+
+            // Read-back BEFORE clearing: which locked actions were newly pressed this frame.
+            let hit = requested_locked(live, unsafe { *presses });
+            unsafe {
+                *disabled |= mask_live; //  lock:   set the disable bit
+                *disabled &= !restore; //   unlock: restore the managed-but-unlocked bit
+                *requests &= !mask_live; // belt-and-suspenders: drop this frame's requests
+                *presses &= !mask_live;
+            }
+            if hit != 0 {
+                report(hit);
+            }
+        }
+    }
+
+    // ---- heal (no action bit) -- enforced via the flask lockout, re-applied on a timer --------
+    if heal_locked(live) {
+        let now = now_ms();
+        let last_apply = LAST_HEAL_APPLY_MS.load(Ordering::Relaxed);
+        let due = last_apply == 0 || now.saturating_sub(last_apply) >= HEAL_REAPPLY_MS;
+        // fire_no_flask acquires WorldChrMan itself (after the borrow above dropped), is
+        // death-guarded, and returns false until the SpEffect param streams in. Cap the retry so a
+        // waiting heal-lock does not log "not loaded yet" every frame.
+        let last_try = LAST_HEAL_ATTEMPT_MS.load(Ordering::Relaxed);
+        if due && (last_try == 0 || now.saturating_sub(last_try) >= HEAL_RETRY_MS) {
+            LAST_HEAL_ATTEMPT_MS.store(now, Ordering::Relaxed);
+            if crate::traps::fire_no_flask() {
+                LAST_HEAL_APPLY_MS.store(now, Ordering::Relaxed);
+            }
+        }
+    } else {
+        // Unlocked (or never locked): forget the timers so a later re-lock applies immediately.
+        LAST_HEAL_APPLY_MS.store(0, Ordering::Relaxed);
+        LAST_HEAL_ATTEMPT_MS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Rate-limited per-ability read-back log + running session tally.
 fn report(hit: u8) {
     let now = now_ms();
     for a in Ability::ALL {
         if hit & a.bit() == 0 {
             continue;
         }
-        let total = SUPPRESSED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let total = BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let slot = &LAST_LOG_MS[a.bit().trailing_zeros() as usize];
         let last = slot.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < LOG_SPACING_MS {
+        if now.saturating_sub(last) < LOG_SPACING_MS && last != 0 {
             continue;
         }
         slot.store(now, Ordering::Relaxed);
         log::info!(
-            "ability-lock: masked {} (locked; {total} suppressed input poll(s) this session)",
+            "ability-lock: blocked {} (locked; {total} blocked action press(es) this session)",
             a.name()
         );
     }

@@ -111,17 +111,8 @@ unsafe extern "system" fn xinput_get_state_hook(user: u32, state: *mut XInputSta
             thumb_ry: 0,
         };
     }
-    // Per-BUTTON masking for locked abilities (er-archipelago#945 test build) -- after the
-    // whole-device block on purpose: a fully blocked pad is already neutral, and the ability
-    // mask edits only its own bits. One OnceLock read when the feature is off.
-    if ret == 0 && !state.is_null() {
-        let g = &mut (*state).gamepad;
-        crate::ability_lock::filter_gamepad(
-            &mut g.buttons,
-            &mut g.left_trigger,
-            &mut g.right_trigger,
-        );
-    }
+    // (Ability-lock moved off the input device entirely -- it now disables LOGICAL actions on
+    // the player's action-request module, which is keybind- and device-agnostic. See ability_lock.rs.)
     ret
 }
 

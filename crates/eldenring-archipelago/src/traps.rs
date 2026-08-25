@@ -530,7 +530,9 @@ fn drive_spawn_burst() -> bool {
     true
 }
 
-fn fire_no_flask() -> bool {
+/// Apply the No Flask SpEffect (flask heals nothing for `NO_FLASK_SECONDS`). Used by the
+/// F8 trap AND by the ability-lock heal restriction, which re-applies it on a timer to persist.
+pub(crate) fn fire_no_flask() -> bool {
     // SAFETY: FD4 singleton, mutated only on the single-threaded tick -- the contract
     // `no_equip_load` and `scadu_blessing` already rely on for their param writes.
     let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else {

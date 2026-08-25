@@ -1258,6 +1258,35 @@ pub fn tier_rates(tier: usize) -> ScalingTier {
     SCALING_TIERS[tier.min(NUM_TIERS - 1)]
 }
 
+/// Co-op difficulty offset. `#993`: seamless co-op leaves each fight easier than intended because
+/// Seamless's own knobs raise enemy HP but leave enemy DAMAGE at the host's default (bobler's
+/// `ersc_settings.ini`: `enemy_damage_scaling=0`, `boss_damage_scaling=0`), so a second player halves
+/// the incoming threat without the enemies hitting any harder. This bumps the applied sphere TIER by
+/// `per_player` rungs for every player past the first, and a higher rung carries both more HP AND more
+/// attack -- so it restores the missing threat. Each client computes `extra_players` from its own
+/// phantom census and applies this identically; there is no host arbitration (every player is on their
+/// own AP slot, reading the same world). `per_player == 0` (the default) is a no-op, so a solo seed and
+/// any seed that leaves the knob at 0 behave exactly as before.
+///
+/// 🛑 A TIER CARRIES HP TOO. If Seamless's HP scaling is left ON, this stacks a little extra HP on top
+/// of the attack it is really there to restore; pair a non-zero value with Seamless's HP knob turned
+/// down, or accept spongier-and-harder. The clean attack-only version wants a dedicated safe SpEffect
+/// row (a datamine-verified claim) and is deferred until that row can be verified.
+pub fn coop_tier_bump(
+    base_tier: usize,
+    extra_players: usize,
+    per_player: usize,
+    num_tiers: usize,
+) -> usize {
+    if per_player == 0 || extra_players == 0 || num_tiers == 0 {
+        return base_tier;
+    }
+    let max_tier = num_tiers - 1;
+    base_tier
+        .saturating_add(extra_players.saturating_mul(per_player))
+        .min(max_tier)
+}
+
 /// Lowest tier whose HP rate is ≥ `floor_mult` — converts a `completion_scaling_floor` multiplier
 /// into a floor tier index. Below the ladder → tier 0; above it → the top tier.
 /// Highest tier whose HP rate is <= `ceil_mult` -- the MIRROR of `floor_tier_from_multiplier`, and
@@ -1585,6 +1614,33 @@ impl Default for RegionToastLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coop_bump_is_a_noop_when_solo_or_disabled() {
+        // Solo: no extra players -> base tier untouched, whatever the knob.
+        assert_eq!(coop_tier_bump(3, 0, 2, NUM_TIERS), 3);
+        // Knob at 0 (the default): co-op present but no bump.
+        assert_eq!(coop_tier_bump(3, 1, 0, NUM_TIERS), 3);
+        // Degenerate ladder never panics.
+        assert_eq!(coop_tier_bump(3, 1, 2, 0), 3);
+    }
+
+    #[test]
+    fn coop_bump_adds_per_player_rungs() {
+        // One partner, +2 rungs each.
+        assert_eq!(coop_tier_bump(3, 1, 2, NUM_TIERS), 5);
+        // Two partners, +1 rung each.
+        assert_eq!(coop_tier_bump(3, 2, 1, NUM_TIERS), 5);
+    }
+
+    #[test]
+    fn coop_bump_clamps_at_the_top_rung() {
+        let top = NUM_TIERS - 1;
+        // A big co-op party cannot push past the last rung (no OOB into SCALING_TIERS).
+        assert_eq!(coop_tier_bump(top, 9, 9, NUM_TIERS), top);
+        // Already-saturating add stays in range.
+        assert_eq!(coop_tier_bump(usize::MAX, 1, 1, NUM_TIERS), top);
+    }
 
     fn cfg(pairs: &[(i32, i32)], floor: usize) -> ScalingConfig {
         let region_targets: HashMap<i32, i32> = pairs.iter().copied().collect();

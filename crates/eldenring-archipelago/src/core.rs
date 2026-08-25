@@ -81,10 +81,12 @@ console_commands! {
     Region => "!region" => "!region",
     Warp => "!warp" => "!warp <grace entity id>",
     Grace => "!grace" => "!grace <name substring>",
+    Check => "!check" => "!check <name substring>",
     UnlockGrace => "!unlockgrace" => "!unlockgrace <unique name substring|flag>",
     MarkerProbe => "!markerprobe" => "!markerprobe [set|verify|clear]",
     Give => "!give" => "!give <fullId> [qty]",
     SeamlessProbe => "!seamlessprobe" => "!seamlessprobe [start|stop]",
+    Ability => "!ability" => "!ability [lock|unlock <name|all>]",
     Help => "!help" => "!help",
 }
 
@@ -275,6 +277,11 @@ pub struct Core {
     /// which can be mid-load when the game refuses writes -- so a fire-and-forget write would leave
     /// those pickups dead in the world forever. See `er_logic::sweep_flush` (replay-tested).
     sweep_flag_pending: Vec<u32>,
+    /// #1006 sweep-burst telemetry (measure-before-staggering): when a sweep stages owed flags
+    /// while none were pending, we start a burst = (started, peak_owed, ticks). Each flush tick
+    /// updates it; when `sweep_flag_pending` drains we log ms-to-drain (an SC shared-flag
+    /// propagation proxy) + peak size, then reset. Pure diagnostics -- no behaviour change.
+    sweep_flush_burst: Option<(std::time::Instant, usize, u32)>,
     /// AP checks observed in game but not yet accepted by the connection. Unlike the old
     /// one-tick `to_check` vector, this debt survives a player death / load edge and is retried
     /// without requiring another pickup to wake the reporting path (world#720).
@@ -454,6 +461,53 @@ impl shared::Core for Core {
                 }
                 true
             }
+            ConsoleCommand::Check => {
+                let Some(q) = arg.map(|s| s.to_lowercase()) else {
+                    self.log(ap::Print::message(
+                        "usage: !check <name substring>".to_string(),
+                    ));
+                    return true;
+                };
+                // Only FLAG-POLL checks carry a settable acquisition flag (enemy/boss/NPC death
+                // drops, offline pickups) -- the exact "a bunch that didn't fire" category #1008 is
+                // for. Regular world pickups fire on the game's own event and are not listed.
+                let entries: Vec<(i64, u32)> = self
+                    .flag_poll
+                    .as_ref()
+                    .map(|fp| fp.location_flags.iter().map(|(&l, &f)| (l, f)).collect())
+                    .unwrap_or_default();
+                let mut named: Vec<(String, u32, bool)> = Vec::new();
+                if let Some(client) = self.client() {
+                    let game = client.game(client.this_player().game());
+                    for (loc, flag) in entries {
+                        if let Some(name) = game
+                            .as_ref()
+                            .and_then(|g| g.location(loc).map(|l| l.name().to_string()))
+                        {
+                            named.push((name, flag, crate::flags::get_event_flag(flag)));
+                        }
+                    }
+                }
+                let (lines, dropped) = er_logic::console_check::matched_lines(named, &q, 25);
+                if lines.is_empty() {
+                    self.log(ap::Print::message(format!(
+                        "!check: no flag-poll check matches '{q}' (only enemy/boss/NPC-drop checks carry a settable flag)"
+                    )));
+                } else {
+                    for l in &lines {
+                        self.log(ap::Print::message(l.clone()));
+                    }
+                    if dropped > 0 {
+                        self.log(ap::Print::message(format!(
+                            "...{dropped} more match(es); narrow the search"
+                        )));
+                    }
+                    self.log(ap::Print::message(
+                        er_logic::console_check::CHECK_CAVEAT.to_string(),
+                    ));
+                }
+                true
+            }
             ConsoleCommand::UnlockGrace => {
                 let Some(target) = arg.map(str::trim).filter(|s| !s.is_empty()) else {
                     self.log(ap::Print::message(
@@ -624,6 +678,57 @@ impl shared::Core for Core {
                 }
                 true
             }
+            ConsoleCommand::Ability => {
+                // Playtest lever for #945: exercise the lock/unlock TRANSITION by hand -- the same
+                // seam a future find-to-unlock item drives. `!ability` alone reports state.
+                use er_logic::ability_lock::{Ability, set_names};
+                let parts: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+                let msg = match (parts.first().copied(), parts.get(1).copied()) {
+                    (None, _) => {
+                        let managed = crate::ability_lock::managed_set();
+                        let live = crate::ability_lock::live_set();
+                        if managed == 0 {
+                            "ability-lock: inactive (no locked set from slot_data or env)"
+                                .to_string()
+                        } else {
+                            format!(
+                                "ability-lock: locked [{}]; unlocked [{}]",
+                                set_names(live),
+                                set_names(managed & !live),
+                            )
+                        }
+                    }
+                    (Some("unlock"), Some("all")) => {
+                        crate::ability_lock::unlock_all();
+                        "ability-lock: unlocked all".to_string()
+                    }
+                    (Some("lock"), Some("all")) => {
+                        crate::ability_lock::lock_all();
+                        format!(
+                            "ability-lock: locked [{}]",
+                            set_names(crate::ability_lock::live_set())
+                        )
+                    }
+                    (Some(verb @ ("unlock" | "lock")), Some(name)) => {
+                        match Ability::from_name(name) {
+                            Some(a) if verb == "unlock" => {
+                                crate::ability_lock::unlock(a);
+                                format!("ability-lock: unlocked {}", a.name())
+                            }
+                            Some(a) => {
+                                crate::ability_lock::lock(a);
+                                format!("ability-lock: locked {}", a.name())
+                            }
+                            None => format!(
+                                "unknown ability {name:?} -- valid: jump, crouch, roll, r1, r2, l1, l2"
+                            ),
+                        }
+                    }
+                    _ => "usage: !ability [lock|unlock <name|all>]".to_string(),
+                };
+                self.log(ap::Print::message(msg));
+                true
+            }
             ConsoleCommand::Help => {
                 self.log(ap::Print::message(CONSOLE_COMMAND_USAGES.join(" | ")));
                 true
@@ -701,6 +806,7 @@ impl shared::Core for Core {
             sweep_flag_state: HashMap::new(),
             sweep_watch: er_logic::sweep_watch::SweepWatch::new(),
             sweep_flag_pending: Vec::new(),
+            sweep_flush_burst: None,
             check_report_pending: HashSet::new(),
             check_report_error_logged: false,
             collect_cue: er_logic::collect_cue::CollectCue::default(),
@@ -818,6 +924,11 @@ impl shared::Core for Core {
             self.toasts.push(line.to_string(), now);
             self.log(ap::Print::message(line.to_string()));
         }
+
+        // Ability-lock TEST enforcement (#945): disable locked abilities at the game's logical
+        // action layer every frame. No-op unless ER_ABILITY_LOCK_TEST is set. Keybind-agnostic;
+        // menus are never affected (they do not flow through the character's action requests).
+        crate::ability_lock::enforce();
 
         // TRAP PROBE (traps.rs) -- off unless `probes: { "traps": true }`. Function keys for the
         // same reason F6 is one: a letter fights the say input, and a trap fired by a stray
@@ -1122,6 +1233,9 @@ impl shared::Core for Core {
                 crate::no_equip_load::set_mode(er_logic::equip_load::parse(sd));
                 // no_fall_damage: the spirit-spring fallDamageRate=0 SpEffect, kept on the player.
                 crate::no_fall_damage::set_enabled(er_logic::options::parse_no_fall_damage(sd));
+                // ability-lock (#945): the locked set the seed asked for, installed at the game's
+                // logical-action layer. A zero mask leaves any ER_ABILITY_LOCK_TEST env set intact.
+                crate::ability_lock::set_locked_mask(er_logic::options::parse_ability_lock(sd));
                 // flask: history-agnostic reconciled LEVELED flask (charges + potency) driven by the
                 // count of received "Progressive Flask Upgrade" items vs the slot_data `flaskLadder`.
                 // Absent/empty ladder => feature OFF. No ledger; re-runs upward every tick.
@@ -1212,6 +1326,12 @@ impl shared::Core for Core {
                 crate::shop_preview::set_real_goods(real_goods);
                 let counts = i64_map(sd.get("itemCounts"));
                 let armor_bundles = i64_to_i32_list_map(sd.get("armorBundles"));
+                // Progressive ability-lock (#980): AP id -> ability bit. Stored in the ability_lock
+                // module (not threaded through the parse tuple) so the received-stream fold can read
+                // it without a Core field. Empty for a static/non-progressive seed.
+                crate::ability_lock::set_unlock_map(
+                    er_logic::options::parse_ability_unlock_items(sd),
+                );
                 let mut region = crate::region::parse(sd);
                 // Arm shop_preview to MARK region-lock rewards that land in a shop (a lock reward
                 // otherwise reads as its vanilla good, e.g. "Note: Sealed Spiritsprings", with no hint
@@ -2442,6 +2562,10 @@ impl shared::Core for Core {
         // name, so a foreign apworld (Bedrock/fswap) that calls its fragments something else still
         // counts — a name match would fail silently on exactly the seeds we cannot test.
         let mut scadu_fragment_units: i32 = 0;
+        // Progressive ability-lock (#980): OR of the ability bits whose Unlock item is anywhere in
+        // the received stream. Recomputed from the WHOLE stream every pass (like the fragment total
+        // above), so a found unlock survives a relaunch -- see ability_lock::set_unlocked.
+        let mut ability_unlock_bits: u8 = 0;
         // #342, and the SAME history-agnostic doctrine as `flask_upgrade_count` above: a talisman's
         // slot is decided by its position in the received stream and by how many Talisman Pouches
         // preceded it, both walked over the WHOLE stream rather than the watermarked tail.
@@ -2492,6 +2616,7 @@ impl shared::Core for Core {
                 if name == crate::flask::FLASK_UPGRADE_ITEM {
                     flask_upgrade_count += 1;
                 }
+                ability_unlock_bits |= crate::ability_lock::unlock_bit_for(ri.item().id());
                 if let Some(map) = self.item_map.as_ref() {
                     scadu_fragment_units += er_logic::upgrades::fragment_units_for(
                         ri.item().id(),
@@ -2561,6 +2686,12 @@ impl shared::Core for Core {
             // checks once crossed seeds). A reconnect replays the whole stream, so the first pass
             // after connecting recomputes the total from scratch.
             crate::upgrades::set_received_fragments(scadu_fragment_units);
+            // Progressive ability-lock: on a progressive seed, LIVE = locked set minus everything
+            // whose Unlock item has arrived. No-op for static/env seeds (empty map). Idempotent and
+            // reconnect-safe -- the whole stream was just folded, so this is authoritative each pass.
+            if crate::ability_lock::has_unlock_map() {
+                crate::ability_lock::set_unlocked(ability_unlock_bits);
+            }
         }
 
         // #549. Publish the below-watermark spells for `auto_equip::tick_spell_backfill`.
@@ -3246,20 +3377,44 @@ impl shared::Core for Core {
                         self.sweep_flag_pending.push(f);
                     }
                 }
+                // #1006: a fresh burst begins the first tick flags are owed with none in flight.
+                if self.sweep_flush_burst.is_none() && !self.sweep_flag_pending.is_empty() {
+                    self.sweep_flush_burst =
+                        Some((std::time::Instant::now(), self.sweep_flag_pending.len(), 0));
+                }
             }
             if !self.sweep_flag_pending.is_empty() && crate::flags::in_world() {
                 let owed_before = self.sweep_flag_pending.len();
+                // #1006: time the shared-flag WRITE loop -- under seamless co-op each try_set
+                // propagates to every player, so a big burst is exactly what we'd stagger.
+                let write_t0 = std::time::Instant::now();
                 for &f in &self.sweep_flag_pending {
                     let _ = crate::flags::try_set_event_flag(f, true);
                 }
                 er_logic::sweep_flush::retire(&mut self.sweep_flag_pending, |f| {
                     crate::flags::get_event_flag(f)
                 });
+                let write_us = write_t0.elapsed().as_micros();
                 let landed = owed_before - self.sweep_flag_pending.len();
+                if let Some((_, peak, ticks)) = self.sweep_flush_burst.as_mut() {
+                    *ticks += 1;
+                    *peak = (*peak).max(owed_before);
+                }
                 if landed > 0 {
                     log::info!(
-                        "sweep-flush: {landed} swept member flag(s) confirmed set ({} still owed)",
+                        "sweep-flush: {landed} swept member flag(s) confirmed set ({} still owed) [wrote {owed_before} flag(s) in {write_us}us]",
                         self.sweep_flag_pending.len()
+                    );
+                }
+                // Burst drained: report ms-to-confirm + peak size. A large ms-to-drain under co-op
+                // is the signal that a write staggerer would help (issue #1006); a small one means
+                // it would not, and we leave the one-shot flush alone.
+                if self.sweep_flag_pending.is_empty()
+                    && let Some((start, peak, ticks)) = self.sweep_flush_burst.take()
+                {
+                    log::info!(
+                        "sweep-flush burst: drained {peak} flag(s) in {}ms across {ticks} tick(s) -- #1006 staggerer is warranted only if this is large under co-op",
+                        start.elapsed().as_millis()
                     );
                 }
             }
@@ -4785,6 +4940,7 @@ impl Core {
         crate::keyitems::reset_seed_great_runes();
         self.item_counts.clear();
         self.armor_bundles.clear();
+        crate::ability_lock::reset();
         self.region = None;
         self.fogwall = None;
         self.progressive = ProgressiveState::new(HashMap::new());
@@ -5497,8 +5653,21 @@ impl Core {
                             }
                         }
                         Next::Insufficient { price, have } => {
+                            // DISABLED WITH THE COST, never hidden -- and as a BUTTON, not body
+                            // text (world#1014, colombius07 on v0.4.13: "i don't have the hint
+                            // next location button"). `text_disabled` is indistinguishable from
+                            // the rows around it, so the control read as ABSENT for the whole
+                            // early game -- exactly the discoverability failure #412's top-of-
+                            // window placement exists to kill, and the exact opposite of the
+                            // ruling on LockHintOffer::Insufficient. The label keeps the price
+                            // and the progress toward it; the widget id matches the Buyable arm
+                            // so imgui state carries across the afford edge.
                             ui.same_line();
-                            ui.text_disabled(format!("Hint next lock ({price} -- have {have})"));
+                            ui.disabled(true, || {
+                                ui.small_button(format!(
+                                    "Hint next lock ({price} -- have {have})###trk-buy-next"
+                                ));
+                            });
                         }
                         Next::AllFrontierHinted => {
                             ui.same_line();
@@ -5680,9 +5849,16 @@ impl Core {
                             Offer::Insufficient { price, have, .. } => {
                                 // DISABLED WITH THE COST, never hidden: a player who cannot see
                                 // the price, or that they are making progress toward it, learns
-                                // nothing from the mechanic.
+                                // nothing from the mechanic. AS A BUTTON (world#1014) --
+                                // `text_disabled` read as "no such control", so the per-region
+                                // button was reported missing too. The id matches the Buyable arm.
                                 ui.same_line();
-                                ui.text_disabled(format!("hint lock ({price} -- have {have})"));
+                                ui.disabled(true, || {
+                                    ui.small_button(format!(
+                                        "hint lock ({price} -- have {have})###trk-buy-{}",
+                                        region.region
+                                    ));
+                                });
                             }
                             Offer::AlreadyHinted { .. } => {
                                 ui.same_line();
