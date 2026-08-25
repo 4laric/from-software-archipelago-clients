@@ -212,5 +212,5 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
 pub const CONTRACT_HASH: &str = "13db0b3a";
-pub const APWORLD_VERSION_EXPECTED: &str = "0.5.0";
+pub const APWORLD_VERSION_EXPECTED: &str = "0.5.1";
 
