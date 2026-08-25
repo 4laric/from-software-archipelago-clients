@@ -1937,7 +1937,10 @@ mod tests {
         });
 
         r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
-        assert!(g.get_flag(105) && g.get_flag(182), "both prerequisites land");
+        assert!(
+            g.get_flag(105) && g.get_flag(182),
+            "both prerequisites land"
+        );
         assert!(
             !r.desired().owned_flags.contains(&105) && !r.desired().owned_flags.contains(&182),
             "vanilla quest-state flags are NEVER owned (never clearable)"
@@ -1955,7 +1958,9 @@ mod tests {
             "zero flag writes across 200 converged ticks -- the 60Hz reapply/clear loop is dead"
         );
         assert!(
-            !g.flag_set_calls.iter().any(|&(f, on)| (f == 105 || f == 182) && !on),
+            !g.flag_set_calls
+                .iter()
+                .any(|&(f, on)| (f == 105 || f == 182) && !on),
             "no tick ever wrote 105/182 OFF"
         );
 
