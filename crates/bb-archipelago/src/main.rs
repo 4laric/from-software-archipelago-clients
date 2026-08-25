@@ -171,6 +171,18 @@ enum DeliveryMode {
     Native,
 }
 
+impl DeliveryMode {
+    /// ASCII console label for the resolved delivery backend. Derived from the
+    /// resolved `DeliveryMode` so the startup banner reads correctly whichever
+    /// default is in effect (clients#412 flips the default to native).
+    fn label(self) -> &'static str {
+        match self {
+            DeliveryMode::Native => "native",
+            DeliveryMode::CeBridge => "ce-bridge",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Arguments {
     server: String,
@@ -407,6 +419,22 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
 fn main() -> Result<()> {
     let args = arguments()?;
     eprintln!("Bloodborne AP runtime build {RUNTIME_BUILD}");
+    // Console-legibility banner (clients#404 companion): a normal, working
+    // launch otherwise prints only build/attach diagnostics interleaved with
+    // long silent waits, so a healthy client looked identical to a frozen or
+    // dead one -- a playtester (oz, 2026-08-24) saw the console and thought his
+    // run was broken. Print exactly one at-a-glance "alive" line, on every
+    // launch, before any attach/connect work and NOT gated behind any error
+    // path. The delivery label is derived from the *resolved* mode, so it stays
+    // correct whichever default is in effect. This client streams all of its
+    // diagnostics to this console (there is no separate log file), which is the
+    // answer to "is it working / where do I look".
+    eprintln!(
+        "bb-ap-client running - delivery: {} - server: {} - slot: {} - diagnostics stream to this console",
+        args.delivery.label(),
+        args.server,
+        args.slot
+    );
     anyhow::ensure!(
         !(args.mock && args.assume_correct_save),
         "--mock and --assume-correct-save cannot be combined"
@@ -818,6 +846,16 @@ mod tests {
     fn unknown_delivery_mode_is_rejected() {
         let error = parse_args(base_args(&["--delivery=bogus"]).into_iter()).unwrap_err();
         assert!(format!("{error:#}").contains("unknown --delivery mode"));
+    }
+
+    #[test]
+    fn delivery_mode_labels_are_stable_and_ascii() {
+        // The startup banner (console-legibility line) prints these; they must
+        // match the --delivery=... spellings and stay ASCII for the console.
+        assert_eq!(DeliveryMode::Native.label(), "native");
+        assert_eq!(DeliveryMode::CeBridge.label(), "ce-bridge");
+        assert!(DeliveryMode::Native.label().is_ascii());
+        assert!(DeliveryMode::CeBridge.label().is_ascii());
     }
 
     // The backend-construction step (native attach / Live bridge) needs a live

@@ -1,5 +1,20 @@
 ## Unreleased
 
+### Added
+
+* **A one-line startup banner so a working console is legibly alive
+  (clients#404 companion).** On a normal launch the client streams its
+  diagnostics to the console but, between the build line and the long silent
+  attach/connect waits, a healthy run looked identical to a frozen or dead one
+  -- a playtester (oz, 2026-08-24) saw the black console window and assumed his
+  run was broken. The client now prints exactly one at-a-glance line at startup,
+  on every launch and never gated behind an error path:
+  `bb-ap-client running - delivery: <native|ce-bridge> - server: <host:port> - slot: <slot> - diagnostics stream to this console`.
+  The delivery label is derived from the *resolved* `DeliveryMode`, so it stays
+  correct whichever default is in effect (the clients#412 native-default flip).
+  This is the silent-success companion to clients#404's noisy-failure line: it
+  answers "is it working / where do I look" up front.
+
 ### Fixed
 
 * **A game that has not loaded a character no longer stops the client, and
