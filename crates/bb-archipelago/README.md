@@ -125,3 +125,56 @@ as installation evidence.
 Runtime event flags, normalized item IDs, bridge paths, and future executable
 signatures stay in this client-side configuration/backend layer. They are never
 read from Bloodborne world-design data.
+
+## Native delivery (stage 2, experimental, off by default)
+
+Stage 2 replaces the Cheat Engine file bridge with an in-process native
+delivery backend that reads and writes shadPS4 memory directly, installs the
+`bb-native-grant-v5` grant payload, and drives the grant state machine the CE
+table paid for live. It is selected with a flag and is **not** the default:
+
+```
+bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] --delivery=native
+```
+
+`--delivery=ce-bridge` (the default when the flag is absent) keeps the Cheat
+Engine bridge described above. When `--delivery=native` is chosen but the
+running image does not verify against the contract, the client **fails closed**
+with a clear error — it never silently falls back in a way that would hide a
+broken native path.
+
+The native code lives in `src/native/`:
+
+- `contract.rs` consumes `contract/bb-native-grant-contract.v5.json`, a verbatim
+  vendored copy of the world repo's single source of truth. Every hook-site RVA,
+  native-routine RVA, state-cell offset, descriptor prefix, image-assert byte
+  string and relocatable payload blob is read from that file — no address is a
+  hand-copied number, and a unit test refuses to arm if the vendored copy drifts
+  from the crate's `RUNTIME_BUILD`/`HARNESS_VERSION`/`BRIDGE_PROTOCOL`.
+- `mem.rs` puts `ReadProcessMemory`/`WriteProcessMemory`/`VirtualProtectEx`
+  behind a `ProcessMemory` trait with a host `FakeMemory`, and implements
+  `require_validated_image` — every image assert must match before anything is
+  written; CUSA00900 and every other build are refused, not guessed.
+- `install.rs` writes the payload with a thread-suspend atomicity protocol:
+  the caves and state region first, then the two seven-byte detours together,
+  under a single suspend of every guest thread, only once no thread's RIP lies
+  inside either detour window; a persistently obstructed window aborts with **no
+  detour written** and always resumes the threads.
+- `delivery.rs` is the grant state machine (hydration grace, bounded verify,
+  verify-against-the-reported-slot, replay recovery, fail-closed absent Blood
+  Vial), `guest.rs` is the inventory-geometry `Runtime` over `ProcessMemory`,
+  and `engine.rs`/`backend.rs` drive one grant at a time and adapt it to the
+  `BloodborneBackend` trait.
+
+Replay recovery is **coordinated with the receive ledger**, not a parallel
+store: `grant_item` feeds the ledger-derived `expected_before`
+(`SlotLedger::delivered_quantity`) straight into the delivery machine, so a
+restart mid-grant recognises an already-applied stack (`recovered_complete`)
+instead of granting twice.
+
+> ⚠️ **Untested against a live game.** The pure logic (contract consumption,
+> descriptor encoding, image verification, install atomicity, the delivery
+> machine, the inventory walk) is host-tested against fakes. The live Windows
+> attach/install/thread seams (`#[cfg(windows)]`) are compiled and linted by CI
+> only and **must be owner-validated against a running process** before the
+> native path is trusted. Until then, keep `--delivery=ce-bridge` (the default).
