@@ -273,6 +273,11 @@ pub struct MockBackend {
     /// The mock save's watermark field. `None` while `watermark_supported` is
     /// on simulates a recorded field that has become unreadable.
     pub watermark: Option<u64>,
+    /// clients#420: whether the live event-flag accessor is armed. Off models a
+    /// native attach whose flag gate is still pending because the game has not
+    /// finished loading a character -- reads answer `None` ("no accessor"),
+    /// never `false`.
+    pub event_flags_armed: bool,
     grant_delays: HashMap<String, u8>,
     equip_delays: HashMap<String, u8>,
     completed_grants: HashSet<String>,
@@ -295,6 +300,7 @@ impl Default for MockBackend {
             withdrawn: Vec::new(),
             watermark_supported: false,
             watermark: None,
+            event_flags_armed: true,
             grant_delays: HashMap::new(),
             equip_delays: HashMap::new(),
             completed_grants: HashSet::new(),
@@ -353,6 +359,9 @@ impl BloodborneBackend for MockBackend {
     }
 
     fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>> {
+        if !self.event_flags_armed {
+            return Ok(None);
+        }
         Ok(Some(self.set_flags.contains(&event_flag)))
     }
 

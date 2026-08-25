@@ -14,7 +14,7 @@ use bb_archipelago::backend::{
 use bb_archipelago::bridge::{FileBridge, missing_bridge_state};
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
-use bb_archipelago::event_flags::LiveEventFlags;
+use bb_archipelago::event_flags::{LiveEventFlags, is_manager_not_initialized};
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
@@ -210,13 +210,20 @@ const UNRECOGNIZED_BUILD_GUIDANCE: &str = "This game build was not recognized, s
 /// because the user asked for native specifically. Neither path silently falls
 /// back to the Cheat Engine bridge (clients#413).
 fn native_attach_failure(error: anyhow::Error, delivery_explicit: bool) -> anyhow::Error {
-    if delivery_explicit || points_at_the_shad_log(&error) {
+    if delivery_explicit || points_at_the_shad_log(&error) || is_manager_not_initialized(&error) {
         error
     } else {
         error.context(UNRECOGNIZED_BUILD_GUIDANCE)
     }
 }
 
+/// clients#420: a startup-ordering failure -- the event-flag manager global is
+/// still null because the game has not loaded a character -- is never an
+/// unrecognised build. Attach itself no longer treats it as terminal (the flag
+/// gate waits), but if it ever reaches here it must say what it is: the Cheat
+/// Engine lane does not provide flag reads either, so routing the player to the
+/// bridge over this is actively wrong (clients#416).
+///
 /// True when the attach failure is the clients#418 "no fresh eboot base ever
 /// appeared" outcome: the suspect is the configured `shad_log` path, not the
 /// game build, and the failure already names the path and what to compare it
@@ -852,6 +859,25 @@ mod tests {
         assert!(rendered.contains("shad_log.txt"), "{rendered}");
         assert!(!rendered.contains("was not recognized"), "{rendered}");
         assert!(!rendered.contains("--delivery=ce-bridge"), "{rendered}");
+    }
+
+    /// clients#420: the event-flag manager being uninitialized is a
+    /// startup-ordering state, not an unrecognised build. Attach no longer
+    /// treats it as terminal, but the routing must fail safe regardless: this
+    /// class must never carry the Cheat Engine / ce-bridge guidance, because
+    /// the bridge lane provides no flag reads either (clients#416).
+    #[test]
+    fn an_uninitialized_flag_manager_never_gets_the_cheat_engine_guidance() {
+        let error = native_attach_failure(
+            anyhow::Error::new(bb_archipelago::event_flags::EventFlagManagerNotInitialized)
+                .context("attaching live Bloodborne event flags"),
+            false,
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("not initialized yet"), "{rendered}");
+        assert!(!rendered.contains("Cheat Engine"), "{rendered}");
+        assert!(!rendered.contains("ce-bridge"), "{rendered}");
+        assert!(!rendered.contains("was not recognized"), "{rendered}");
     }
 
     /// clients#418 outcome (b): a confirmed base whose image is not ours. That

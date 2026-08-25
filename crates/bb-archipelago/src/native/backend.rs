@@ -32,6 +32,7 @@ use crate::backend::{
 use crate::event_flags::LiveEventFlags;
 
 use super::engine::{GrantStep, NativeDelivery, NativeGrantRequest};
+use super::flag_gate::FlagGate;
 use super::guest::GuestRuntime;
 use super::mem::NativeMemory;
 
@@ -68,7 +69,14 @@ impl AssumedContextGate {
 
 pub struct NativeBackend {
     delivery: NativeDelivery<GuestRuntime<NativeMemory>>,
-    event_flags: LiveEventFlags,
+    /// clients#420: the flag half arms lazily. The event-flag manager is a
+    /// guest global that is null until the game has loaded a character, which
+    /// attach routinely beats; delivery does not depend on it, so attach
+    /// succeeds pending and the loop arms this gate when the manager appears.
+    event_flags: FlagGate<LiveEventFlags>,
+    /// Kept so a pending gate can retry the attach at the base this process
+    /// already confirmed, without re-reading the appended log (clients#418).
+    shad_log: std::path::PathBuf,
     assumed_context: Option<AssumedContextGate>,
     base: u64,
 }
@@ -77,6 +85,26 @@ impl NativeBackend {
     /// The verified eboot base the payload was installed at.
     pub fn base(&self) -> u64 {
         self.base
+    }
+
+    /// True once the live event-flag accessor is armed. While false, item
+    /// delivery runs and location checks abstain (clients#420).
+    pub fn event_flags_armed(&self) -> bool {
+        self.event_flags.is_armed()
+    }
+
+    /// Retry the pending event-flag attach at the already-confirmed base.
+    /// A no-op once armed. Emits the one armed notice on the transition.
+    fn arm_event_flags(&mut self) -> Result<()> {
+        if self.event_flags.is_armed() {
+            return Ok(());
+        }
+        let shad_log = self.shad_log.clone();
+        let base = self.base;
+        self.event_flags.poll(
+            || LiveEventFlags::attach_at_base(&shad_log, base),
+            &mut |line: &str| eprintln!("{line}"),
+        )
     }
 }
 
@@ -154,12 +182,27 @@ impl NativeBackend {
 
         // clients#418: hand over the base this attach already confirmed rather
         // than letting the event-flag attach re-read the log and re-run the race.
-        let event_flags = LiveEventFlags::attach_at_base(shad_log, base)?;
+        //
+        // clients#420: the event-flag manager is a *later* boot step than the
+        // image being mapped and validated -- it stays null until the game has
+        // loaded a character. That is not a reason to refuse the attach: item
+        // delivery does not read it, and location checks cannot fire before
+        // gameplay anyway. So a not-initialized manager leaves the flag gate
+        // pending (one notice) and the client loop arms it; anything else
+        // (signature mismatch, process gone) is still terminal here.
+        let event_flags = match LiveEventFlags::attach_at_base(shad_log, base) {
+            Ok(flags) => FlagGate::armed(flags),
+            Err(error) if crate::event_flags::is_manager_not_initialized(&error) => {
+                FlagGate::pending(&mut |line: &str| eprintln!("{line}"))
+            }
+            Err(error) => return Err(error),
+        };
         let guest = GuestRuntime::new(memory, base)?;
         let delivery = NativeDelivery::new(guest, contract.descriptor, contract.policy);
         Ok(Self {
             delivery,
             event_flags,
+            shad_log: shad_log.to_owned(),
             assumed_context: assumed_identity.map(AssumedContextGate::new),
             base,
         })
@@ -168,12 +211,32 @@ impl NativeBackend {
 
 impl BloodborneBackend for NativeBackend {
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
-        let Some(gate) = self.assumed_context.as_mut() else {
+        // clients#420: every loop gives the pending flag gate one cheap chance
+        // to arm. Still-null is not an error here -- it reports not-ready.
+        let arming = self.arm_event_flags();
+        // Disjoint borrows: the readiness gate and the flag accessor are two
+        // different fields of `self`.
+        let Self {
+            event_flags,
+            assumed_context,
+            ..
+        } = self;
+        let Some(gate) = assumed_context.as_mut() else {
             // Normal live mode stays fail-closed until a real save-identity
             // accessor exists, exactly like FileBackend.
             return Ok(None);
         };
-        if let Err(error) = self.event_flags.probe_manager_resilient() {
+        if let Err(error) = arming {
+            gate.observe(false);
+            return Err(error);
+        }
+        let Some(flags) = event_flags.armed_mut() else {
+            // Waiting for the game to finish loading: not gameplay-ready, which
+            // is exactly what the existing send-gate consumes
+            // (`require_runtime_context` -> Ok(None) -> no checks, no sends).
+            return Ok(Some(gate.observe(false)));
+        };
+        if let Err(error) = flags.probe_manager_resilient() {
             gate.observe(false);
             return Err(error);
         }
@@ -181,7 +244,13 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>> {
-        self.event_flags.read_resilient(event_flag).map(Some)
+        // `None` means "the live accessor is not available", never "false", so
+        // a check can never be missed by reading through a pending gate.
+        self.arm_event_flags()?;
+        match self.event_flags.armed_mut() {
+            Some(flags) => flags.read_resilient(event_flag).map(Some),
+            None => Ok(None),
+        }
     }
 
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {
