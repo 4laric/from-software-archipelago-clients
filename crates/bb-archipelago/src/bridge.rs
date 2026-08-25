@@ -227,9 +227,49 @@ impl FileBridge {
     }
 }
 
+/// The grant bridge has never been written: no state file exists at all
+/// (clients#404).
+///
+/// This is a dedicated error type rather than a string the console has to
+/// sniff, because it is the one bridge failure with a player-facing remedy
+/// ("the grant harness is not running") rather than a diagnosis. Callers
+/// classify it with [`missing_bridge_state`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeStateMissing {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for BridgeStateMissing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "no grant bridge state at {}", self.path.display())
+    }
+}
+
+impl std::error::Error for BridgeStateMissing {}
+
+/// Recover the [`BridgeStateMissing`] cause from anywhere in an error chain.
+///
+/// The condition is raised inside a grant attempt and reaches the console
+/// wrapped in context, so the whole chain is searched.
+pub fn missing_bridge_state(error: &anyhow::Error) -> Option<&BridgeStateMissing> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<BridgeStateMissing>())
+}
+
 fn parse_state_file(path: &Path) -> Result<BridgeState> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading bridge state {}", path.display()))?;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(BridgeStateMissing {
+                path: path.to_path_buf(),
+            }
+            .into());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading bridge state {}", path.display()));
+        }
+    };
     let mut status = None;
     let mut build = None;
     let mut protocol = None;
@@ -289,6 +329,29 @@ mod tests {
             expected_before: None,
             tag: "received_17".into(),
         }
+    }
+
+    /// clients#404: an absent state file is a classifiable condition, not a
+    /// raw `os error 2` the console has to string-match.
+    #[test]
+    fn absent_state_file_is_a_typed_missing_bridge() {
+        let root = temp_root("missing-state");
+        let bridge = FileBridge::new(&root);
+        let error = bridge.read_state().expect_err("no state file exists");
+        let missing = missing_bridge_state(&error).expect("classified as a missing bridge");
+        assert_eq!(missing.path, bridge.state_path());
+        // The same classification survives the context a grant attempt adds.
+        assert!(missing_bridge_state(&error.context("granting ap_7")).is_some());
+    }
+
+    #[test]
+    fn a_malformed_state_file_is_not_a_missing_bridge() {
+        let root = temp_root("malformed-state");
+        let bridge = FileBridge::new(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(bridge.state_path(), "build=x\n").unwrap();
+        let error = bridge.read_state().expect_err("no status key");
+        assert!(missing_bridge_state(&error).is_none());
     }
 
     #[test]
