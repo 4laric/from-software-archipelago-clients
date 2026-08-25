@@ -8,10 +8,12 @@
 //! which under num_regions may sit in a sealed region. Leyndell's separate two-rune threshold is
 //! reconciled from AP receipts below. All idempotent: flags are save-persisted.
 //!
-//! The AP catalog maps each great rune to the boss-drop goods row (8148-8153), but slot-data parsing
-//! normalizes those FullIDs to the restored/equippable rows (191-196) before any delivery consumer
-//! sees them. This module supplies the matching restore flag and disarms the Divine-Tower award
-//! event; it does not issue a second goods grant.
+//! The AP catalog maps each great rune to the boss-drop goods row (8148-8153), and delivery keeps
+//! those rows exactly as the seed sends them (clients#392: the restored rows 191-196 CANNOT be
+//! granted -- AddItem accepts them and materialises them nowhere, which was Corni's re-grant loop;
+//! boss-drop row + this module's restore flag is the empirically working end state). This module
+//! supplies the matching restore flag and disarms the Divine-Tower award event; it does not issue
+//! a second goods grant.
 
 use crate::flags;
 use std::collections::HashSet;
@@ -59,8 +61,9 @@ const COMPANION_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
 ];
 
 /// Vanilla key items whose progression gate reads an obtained event flag, not inventory -- plus the
-/// six great runes, whose "restored" event flag (191-196) makes the received (already-restored-goods)
-/// rune fully usable.
+/// six great runes, whose "restored" event flag (191-196) is the state half of the working grant:
+/// the GOODS half is the boss-drop row 8148-8153 delivered as-sent (clients#392 -- the restored
+/// goods rows cannot be AddItem'd; flag + boss-drop row is the empirically working combination).
 const KEY_ITEM_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Rold Medallion", &[400001]),   // Grand Lift of Rold
     ("Drawing-Room Key", &[400072]), // Volcano Manor drawing-room transition
