@@ -84,6 +84,171 @@ impl ItemErrorReporter {
     }
 }
 
+/// How the client answers a `Disconnected` connection state (clients#423).
+///
+/// `Disconnected` is terminal *for a `Connection` object* -- that is the
+/// archipelago-rs contract, and reconnecting means constructing a new
+/// `Connection`, exactly as shared `Core::reconnect()` does for ER/DS3/SDT.
+/// What differs per error is whether reconnecting can possibly help.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisconnectVerdict {
+    /// A transport failure: refused/closed socket, IO error, dropped
+    /// connection. The room may simply be asleep. Retry with backoff.
+    Retryable,
+    /// The server (or our own argument handling) rejected this login. Retrying
+    /// forever would mask a configuration error, so stop loudly.
+    Terminal,
+}
+
+/// Classify the error stored in `ConnectionState::Disconnected`.
+///
+/// Retryable: [`Error::WebSocket`] (every tungstenite failure -- refused
+/// connect, `ConnectionClosed`, a mid-session drop, transport IO),
+/// [`Error::Async`] (smol IO), [`Error::ConnectionInterrupted`] (a panic in the
+/// connect future -- it says nothing about the configuration), and the two
+/// non-fatal-by-contract variants [`Error::ProtocolError`] /
+/// [`Error::InvalidPacket`], which should never reach a `Disconnected` state at
+/// all but must not be turned into a loud configuration accusation if they ever
+/// do. [`Error::Elsewhere`] is a placeholder that carries no diagnosis, so it is
+/// retried rather than blamed on the player's settings.
+///
+/// Terminal: [`Error::ConnectionRefused`] -- every `ConnectionError` reason is a
+/// login rejection (`InvalidSlot`, `InvalidGame`, `InvalidVersion`,
+/// `InvalidPassword`, `InvalidItemsHandling`, and `Unknown`, which the server
+/// sent us as a refusal reason and which is quoted verbatim) -- plus
+/// [`Error::ArgumentError`] (we called the library wrong),
+/// [`Error::Serialize`] (we produced an unsendable message), and
+/// [`Error::ClientDisconnected`] (this client asked to stop).
+fn classify_disconnect(error: &archipelago_rs::Error) -> DisconnectVerdict {
+    use archipelago_rs::Error;
+    match error {
+        Error::WebSocket(_)
+        | Error::Async(_)
+        | Error::ConnectionInterrupted
+        | Error::ProtocolError(_)
+        | Error::InvalidPacket(_)
+        | Error::Elsewhere => DisconnectVerdict::Retryable,
+        Error::ConnectionRefused(_)
+        | Error::ArgumentError(_)
+        | Error::Serialize(_)
+        | Error::ClientDisconnected => DisconnectVerdict::Terminal,
+    }
+}
+
+/// The loud, final line for a login the server (or our own call) rejected.
+fn terminal_disconnect_message(address: &str, error: &archipelago_rs::Error) -> String {
+    format!(
+        "Archipelago refused this connection to {address} and the client will NOT retry: {error}. \
+         Retrying a rejected login forever would only hide a configuration error. Check the server \
+         address, the slot name, the password, that the slot's game is Bloodborne, and that this \
+         client's version matches the server's."
+    )
+}
+
+const RECONNECT_FIRST_DELAY: Duration = Duration::from_secs(5);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+const RECONNECT_REMINDER: Duration = Duration::from_secs(60);
+/// Printed by the `Event::Connected` arm for the first connect and for every
+/// reconnect alike. [`ReconnectPolicy`] deliberately prints no recovery line of
+/// its own, so recovery is announced exactly once.
+const CONNECTED_LINE: &str = "Connected to Archipelago.";
+
+/// Backoff and console policy for automatic reconnection (clients#423).
+///
+/// Messaging follows the clients#415 [`ItemErrorReporter`] shape: being offline
+/// is one standing condition with a remedy, not a stream of incidents. One line
+/// when retrying begins (naming the address and the sleeping-room remedy), a
+/// short reminder about once a minute while it persists, and nothing on
+/// recovery.
+///
+/// Time is injected (`now: Instant`) so the whole policy is host-testable.
+#[derive(Debug, Default)]
+struct ReconnectPolicy {
+    /// `None` while connected/connecting. `Some(delay)` while offline.
+    delay: Option<Duration>,
+    /// When the next `Connection::new` may be constructed.
+    next_attempt: Option<Instant>,
+    /// When the opening notice or the last reminder was printed.
+    last_notice: Option<Instant>,
+}
+
+impl ReconnectPolicy {
+    /// Called on every tick where the connection is `Disconnected` with a
+    /// retryable error. Returns the line to print, or `None` to stay quiet.
+    fn notice(&mut self, now: Instant, address: &str) -> Option<String> {
+        match self.last_notice {
+            None => {
+                self.last_notice = Some(now);
+                self.delay = Some(RECONNECT_FIRST_DELAY);
+                self.next_attempt = Some(now + RECONNECT_FIRST_DELAY);
+                Some(format!(
+                    "Lost the Archipelago connection to {address}; retrying automatically (first \
+                     retry in {}s, backing off to {}s). If this is an archipelago.gg room, its \
+                     port closes while the room sits idle -- open the room's page in your browser \
+                     to wake it. Nothing is lost while offline: checks found now are sent when the \
+                     connection returns, and so are the items you are owed. This line stays quiet \
+                     until then.",
+                    RECONNECT_FIRST_DELAY.as_secs(),
+                    RECONNECT_MAX_DELAY.as_secs(),
+                ))
+            }
+            Some(last) if now.duration_since(last) >= RECONNECT_REMINDER => {
+                self.last_notice = Some(now);
+                Some(format!(
+                    "Still offline from {address}; still retrying. (Open the room's page to wake a \
+                     sleeping archipelago.gg room.)"
+                ))
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// Whether a fresh `Connection` should be constructed now. Consuming an
+    /// attempt doubles the delay, capped at [`RECONNECT_MAX_DELAY`].
+    fn attempt_due(&mut self, now: Instant) -> bool {
+        let Some(next_attempt) = self.next_attempt else {
+            return false;
+        };
+        if now < next_attempt {
+            return false;
+        }
+        let delay = self.delay.unwrap_or(RECONNECT_FIRST_DELAY);
+        let next = (delay * 2).min(RECONNECT_MAX_DELAY);
+        self.delay = Some(next);
+        self.next_attempt = Some(now + next);
+        true
+    }
+
+    /// Called when the connection comes back. Clears the offline regime; prints
+    /// nothing, because the `Event::Connected` arm already prints
+    /// [`CONNECTED_LINE`] for a reconnect exactly as it does for the first
+    /// connect.
+    fn connected(&mut self) {
+        self.delay = None;
+        self.next_attempt = None;
+        self.last_notice = None;
+    }
+}
+
+/// Refuse a reconnect that landed on a different multiworld (clients#423).
+///
+/// Slot data is parsed once, and the runtime plus the receive ledger are keyed
+/// by the seed name from that first `Connected`. If the host regenerated the
+/// seed while we were offline, the reconnect hands us a *different* seed name;
+/// continuing would deliver the new seed's items against the old seed's ledger
+/// cursor. That is corruption, so it is terminal and loud.
+fn guard_seed_name(bound: &str, offered: &str) -> Result<()> {
+    anyhow::ensure!(
+        bound == offered,
+        "Refusing to continue: this Archipelago connection is serving seed {offered:?}, but this \
+         client and its receive ledger are bound to seed {bound:?}. The host regenerated the \
+         multiworld. Continuing would deliver the new seed's items against the old seed's delivery \
+         ledger. Reconnect to the original room, or start the client again with a fresh ledger for \
+         the new seed."
+    );
+    Ok(())
+}
+
 enum Backend {
     Live(FileBackend),
     Mock(Box<MockBackend>),
@@ -498,16 +663,29 @@ fn main() -> Result<()> {
         .with_context(|| format!("loading receive ledger {}", args.ledger.display()))?;
     let mut backend = Some(backend);
     let mut ledger = Some(ledger);
-    let mut options = ConnectionOptions::new().receive_items(ItemHandling::OtherWorlds {
-        own_world: true,
-        starting_inventory: true,
-    });
-    if let Some(password) = args.password {
-        options = options.password(password);
-    }
-    let mut connection =
-        Connection::<json::Value>::new(args.server, args.slot.clone(), Some("Bloodborne"), options);
-    let mut runtime = None;
+    // Rebuilt for every connection attempt: `ConnectionOptions` is not `Clone`,
+    // and clients#423 constructs a fresh `Connection` per retry.
+    let password = args.password.clone();
+    let connection_options = move || {
+        let options = ConnectionOptions::new().receive_items(ItemHandling::OtherWorlds {
+            own_world: true,
+            starting_inventory: true,
+        });
+        match password.clone() {
+            Some(password) => options.password(password),
+            None => options,
+        }
+    };
+    let mut connection = Connection::<json::Value>::new(
+        args.server.clone(),
+        args.slot.clone(),
+        Some("Bloodborne"),
+        connection_options(),
+    );
+    let mut reconnect = ReconnectPolicy::default();
+    // Annotated because the clients#423 seed guard reads `runtime` above the
+    // point where `ClientLoop::new` would otherwise infer it.
+    let mut runtime: Option<ClientLoop<Backend>> = None;
     let mut goal_location = None;
     let mut goal_reported = false;
     let mut ap_detail_printed = false;
@@ -521,7 +699,10 @@ fn main() -> Result<()> {
             match event {
                 Event::Connected => {
                     connected_now = true;
-                    eprintln!("Connected to Archipelago.");
+                    // The one recovery line, for the first connect and every
+                    // reconnect alike (clients#423): `ReconnectPolicy` prints
+                    // none of its own, so this is never doubled.
+                    eprintln!("{CONNECTED_LINE}");
                 }
                 Event::Print(message) => eprintln!("{message}"),
                 Event::Error(error) => {
@@ -540,8 +721,43 @@ fn main() -> Result<()> {
             eprintln!("Archipelago connection failure detail: {stored}");
             ap_detail_printed = true;
         }
+        if connected_now {
+            reconnect.connected();
+            ap_detail_printed = false;
+            // clients#423: a reconnect that landed on a regenerated seed must
+            // never continue against the old seed's ledger bindings. Checked
+            // before any polling this tick, and before the slot-data parse
+            // below can be reached again.
+            if let (Some(runtime), Some(client)) = (runtime.as_ref(), connection.client()) {
+                guard_seed_name(runtime.seed_name(), client.seed_name())?;
+            }
+        }
         if connected_now && let Some(client) = connection.client_mut() {
+            // A fresh socket knows nothing about what we have already checked:
+            // `sync()` re-requests server state, and the location poll below
+            // re-derives `newly_checked` from that fresh set (never from a
+            // local already-sent cache), so a check found while offline is
+            // re-sent on the next tick.
             client.sync()?;
+        }
+        if connection.is_disconnected() {
+            let error = connection.err();
+            let verdict = classify_disconnect(error);
+            if verdict == DisconnectVerdict::Terminal {
+                bail!("{}", terminal_disconnect_message(&args.server, error));
+            }
+            let now = Instant::now();
+            if let Some(line) = reconnect.notice(now, &args.server) {
+                eprintln!("{line}");
+            }
+            if reconnect.attempt_due(now) {
+                connection = Connection::<json::Value>::new(
+                    args.server.clone(),
+                    args.slot.clone(),
+                    Some("Bloodborne"),
+                    connection_options(),
+                );
+            }
         }
 
         if runtime.is_none()
@@ -931,5 +1147,193 @@ mod tests {
         assert!(rendered.contains("was not recognized"), "{rendered}");
         assert!(rendered.contains("--delivery=ce-bridge"), "{rendered}");
         assert!(rendered.contains("consume_hook"), "{rendered}");
+    }
+
+    // ---- clients#423: automatic reconnection ----------------------------
+
+    fn io_error(kind: std::io::ErrorKind) -> archipelago_rs::Error {
+        archipelago_rs::Error::Async(std::io::Error::new(kind, "socket"))
+    }
+
+    /// Transport failures -- a refused connect, a dropped socket, an IO error --
+    /// are exactly the sleeping-room case the issue is about, so they retry.
+    ///
+    /// `Error::WebSocket(tungstenite::Error)` belongs to this set too but cannot
+    /// be constructed here without taking a `tungstenite` dependency on this
+    /// crate; it is covered by the same match arm.
+    #[test]
+    fn transport_failures_are_retryable() {
+        for error in [
+            io_error(std::io::ErrorKind::ConnectionRefused),
+            io_error(std::io::ErrorKind::ConnectionReset),
+            io_error(std::io::ErrorKind::TimedOut),
+            archipelago_rs::Error::ConnectionInterrupted,
+            archipelago_rs::Error::Elsewhere,
+            archipelago_rs::Error::InvalidPacket("bad".into()),
+            archipelago_rs::Error::ProtocolError(archipelago_rs::ProtocolError::EmptyPlayers),
+        ] {
+            assert_eq!(
+                classify_disconnect(&error),
+                DisconnectVerdict::Retryable,
+                "{error}"
+            );
+        }
+    }
+
+    /// A rejected login is a configuration error. Retrying it forever would
+    /// hide the one thing the player has to fix, so every refusal reason is
+    /// terminal.
+    #[test]
+    fn login_rejections_are_terminal() {
+        use archipelago_rs::ConnectionError;
+        for reason in [
+            ConnectionError::InvalidSlot,
+            ConnectionError::InvalidGame,
+            ConnectionError::InvalidVersion,
+            ConnectionError::InvalidPassword,
+            ConnectionError::InvalidItemsHandling,
+            ConnectionError::Unknown("SomethingNew".into()),
+        ] {
+            let error = archipelago_rs::Error::ConnectionRefused(vec![reason]);
+            assert_eq!(
+                classify_disconnect(&error),
+                DisconnectVerdict::Terminal,
+                "{error}"
+            );
+        }
+        for error in [
+            archipelago_rs::Error::ArgumentError(archipelago_rs::ArgumentError::InvalidSlot(7)),
+            archipelago_rs::Error::ClientDisconnected,
+        ] {
+            assert_eq!(
+                classify_disconnect(&error),
+                DisconnectVerdict::Terminal,
+                "{error}"
+            );
+        }
+    }
+
+    /// The terminal line has to be loud enough to act on: it names the address,
+    /// quotes the server's reason, and says outright that no retry is coming.
+    #[test]
+    fn the_terminal_line_names_the_address_the_reason_and_the_refusal_to_retry() {
+        let error = archipelago_rs::Error::ConnectionRefused(vec![
+            archipelago_rs::ConnectionError::InvalidPassword,
+        ]);
+        let line = terminal_disconnect_message("archipelago.gg:38281", &error);
+        assert!(line.contains("archipelago.gg:38281"), "{line}");
+        assert!(line.contains("will NOT retry"), "{line}");
+        assert!(line.contains("password"), "{line}");
+        assert!(line.is_ascii(), "in-console strings stay ASCII: {line}");
+    }
+
+    /// The clients#415 shape: one line when the outage starts (naming the
+    /// address and the sleeping-room remedy), silence, then a short reminder
+    /// about once a minute for as long as it lasts.
+    #[test]
+    fn the_offline_notice_is_once_then_quiet_then_reminds_each_minute() {
+        let mut policy = ReconnectPolicy::default();
+        let start = Instant::now();
+
+        let first = policy
+            .notice(start, "archipelago.gg:12345")
+            .expect("entering retry must say something");
+        assert!(first.contains("archipelago.gg:12345"), "{first}");
+        assert!(first.contains("retrying automatically"), "{first}");
+        assert!(first.contains("open the room's page"), "{first}");
+        assert!(first.is_ascii(), "in-console strings stay ASCII: {first}");
+
+        for quiet in [1, 5, 30, 59] {
+            assert_eq!(
+                policy.notice(start + Duration::from_secs(quiet), "archipelago.gg:12345"),
+                None,
+                "second {quiet} must stay quiet"
+            );
+        }
+
+        let reminder = policy
+            .notice(start + Duration::from_secs(60), "archipelago.gg:12345")
+            .expect("a quiet reminder is due after a minute offline");
+        assert!(reminder.contains("Still offline"), "{reminder}");
+        assert!(reminder.contains("archipelago.gg:12345"), "{reminder}");
+        assert!(reminder.is_ascii(), "{reminder}");
+
+        assert_eq!(
+            policy.notice(start + Duration::from_secs(119), "archipelago.gg:12345"),
+            None
+        );
+        assert!(
+            policy
+                .notice(start + Duration::from_secs(120), "archipelago.gg:12345")
+                .is_some(),
+            "the reminder cadence continues while the outage does"
+        );
+    }
+
+    /// 5s, doubling, capped at 60s -- and no attempt before the first delay has
+    /// actually elapsed.
+    #[test]
+    fn the_backoff_starts_at_five_seconds_doubles_and_caps_at_sixty() {
+        let mut policy = ReconnectPolicy::default();
+        let start = Instant::now();
+        assert!(
+            !policy.attempt_due(start),
+            "no attempt is due before the connection is known to be down"
+        );
+        let _ = policy.notice(start, "server");
+
+        let mut clock = start;
+        for expected_wait in [5u64, 10, 20, 40, 60, 60] {
+            assert!(
+                !policy.attempt_due(clock + Duration::from_secs(expected_wait - 1)),
+                "an attempt fired early at wait {expected_wait}"
+            );
+            clock += Duration::from_secs(expected_wait);
+            assert!(
+                policy.attempt_due(clock),
+                "the attempt after {expected_wait}s did not fire"
+            );
+        }
+    }
+
+    /// Recovery is announced exactly once, by the `Event::Connected` arm. The
+    /// policy contributes no second line, and a later outage is a fresh
+    /// incident that announces itself again.
+    #[test]
+    fn recovery_prints_connected_once_and_the_policy_adds_nothing() {
+        let mut policy = ReconnectPolicy::default();
+        let start = Instant::now();
+        assert!(policy.notice(start, "server").is_some());
+        policy.connected();
+        assert_eq!(CONNECTED_LINE, "Connected to Archipelago.");
+
+        // Back online: quiet, and no attempt is scheduled.
+        assert!(!policy.attempt_due(start + Duration::from_secs(600)));
+
+        let again = policy.notice(start + Duration::from_secs(601), "server");
+        assert!(
+            again.is_some(),
+            "a later outage is a new incident and announces itself again"
+        );
+    }
+
+    /// A same-seed reconnect is ordinary: it must not refuse, so the runtime and
+    /// its ledger cursor are never rebuilt and nothing re-delivers.
+    #[test]
+    fn a_same_seed_reconnect_is_accepted() {
+        guard_seed_name("BB-12345", "BB-12345").expect("the same seed must reconnect cleanly");
+    }
+
+    /// The host regenerated the multiworld while we were offline. Continuing
+    /// would deliver the new seed's items against the old seed's cursor, so the
+    /// client refuses and names both seeds.
+    #[test]
+    fn a_different_seed_reconnect_refuses_and_names_both_seeds() {
+        let error = guard_seed_name("BB-OLD-1", "BB-NEW-2").unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("BB-OLD-1"), "{rendered}");
+        assert!(rendered.contains("BB-NEW-2"), "{rendered}");
+        assert!(rendered.contains("Refusing to continue"), "{rendered}");
+        assert!(rendered.is_ascii(), "{rendered}");
     }
 }

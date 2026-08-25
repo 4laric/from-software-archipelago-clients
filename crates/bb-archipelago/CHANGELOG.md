@@ -2,6 +2,39 @@
 
 ### Added
 
+* **The client reconnects to Archipelago by itself (clients#423).** An
+  archipelago.gg room closes its port while it sits idle, so a session that
+  paused for lunch came back to a client that had silently stopped talking to
+  the server: `Connection`'s `Disconnected` state is terminal by contract, and
+  nothing here ever left it. The loop now watches for it and rebuilds the
+  connection -- a fresh `Connection::new`, exactly the way shared
+  `Core::reconnect()` does for Elden Ring/DS3/Sekiro; no archipelago-rs change
+  was needed or made. Backoff is 5s, doubling to a 60s cap. Messaging follows
+  the clients#404/#415 once-then-quiet shape: one line when retrying begins,
+  naming the address and the sleeping-room remedy ("open the room's page in
+  your browser to wake it"), a one-line reminder about once a minute while it
+  lasts, and `Connected to Archipelago.` on recovery -- printed by the existing
+  `Event::Connected` arm, so it is never doubled. Nothing is lost while
+  offline: the flag poll re-detects checks every tick and derives what to send
+  from the *server*-checked set that a reconnect's `sync()` refreshes, so a
+  check found offline is re-sent, and owed items deliver from the ledger cursor
+  as usual.
+  Two things are deliberately NOT retried:
+  * **A rejected login is terminal and loud.** Every
+    `Error::ConnectionRefused` reason -- wrong slot, wrong game, wrong
+    password, version mismatch, bad ItemsHandling, or an unknown reason the
+    server named -- stops the client with one actionable line. Retrying a
+    rejected login forever would only hide the setting the player has to fix.
+    Transport failures (`WebSocket`, `Async`/IO, a dropped socket, an
+    interrupted connect) are the retryable set.
+  * **A reconnect that lands on a different seed is refused.** If the host
+    regenerated the multiworld while the client was offline, the reconnect's
+    slot data carries a new seed name while the runtime and the receive ledger
+    are still bound to the old one. Continuing would deliver the new seed's
+    items against the old seed's delivery cursor, so the client stops and names
+    both seeds. A same-seed reconnect changes nothing: the runtime is not
+    re-created and no delivery state is reset, so nothing double-delivers.
+
 * **A one-line startup banner so a working console is legibly alive
   (clients#404 companion).** On a normal launch the client streams its
   diagnostics to the console but, between the build line and the long silent
