@@ -352,7 +352,10 @@ impl<R: Runtime> GrantSession<R> {
             // Without execution evidence nothing changes: the equality and both
             // of its failure directions keep their full meaning there, because
             // an unexecuted delta must never read as delivered.
-            if self.delta_lane && native_result != EMPTY_SLOT && let Some(n) = actual {
+            if self.delta_lane
+                && native_result != EMPTY_SLOT
+                && let Some(n) = actual
+            {
                 let cause = if n > wanted {
                     "concurrent pickup"
                 } else {
