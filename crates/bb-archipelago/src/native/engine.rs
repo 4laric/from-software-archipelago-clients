@@ -23,8 +23,8 @@ use anyhow::{Result, bail};
 
 use super::contract::{DescriptorFormula, Policy};
 use super::delivery::{DurableState, GrantCommand, GrantSession, Runtime};
-use super::diagnostics::{DeliveryRecord, DiagnosticSink, GrantContext};
 use super::descriptor::{CATEGORY_EQUIPMENT, CATEGORY_GOODS};
+use super::diagnostics::{DeliveryRecord, DiagnosticSink, GrantContext};
 
 /// The outcome of one `grant` poll.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,8 +288,8 @@ fn classify(status: &str, state: &DurableState) -> GrantStep {
 mod tests {
     use super::super::contract::contract;
     use super::super::delivery::{Runtime, SlotRecord, StackView};
-    use super::super::diagnostics::DeliveryRecord;
     use super::super::descriptor::ItemGrantDescriptor;
+    use super::super::diagnostics::DeliveryRecord;
     use super::*;
     use std::collections::HashMap;
 
