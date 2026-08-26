@@ -844,6 +844,17 @@ mod tests {
     /// satisfies "the slot holds at least `quantity`" BEFORE the delta lands,
     /// so the shortcut would report `completed` on an unapplied grant. The
     /// delta lane must starve its verify budget and fail instead.
+    ///
+    /// clients#443 moved this test onto the NO-EVIDENCE path, where its
+    /// question is now the only place it is still live. The result cell holds
+    /// the pre-arm `EMPTY_SLOT` sentinel, so nothing says the cave ran, and the
+    /// unmoved stack must park exactly as before. WITH execution evidence this
+    /// same shape completes -- the delta provably applied, and a read-back
+    /// below `expected_after` is then the player's spend or a storage
+    /// overflow, which is
+    /// `a_delta_short_of_its_expected_total_completes_with_execution_evidence`.
+    /// The slot shortcut is still refused on the delta lane in both: it is
+    /// gated on `!delta_lane` and no evidence rule touches it.
     #[test]
     fn a_delta_that_never_lands_fails_instead_of_passing_the_slot_shortcut() {
         let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
@@ -859,6 +870,9 @@ mod tests {
         // The reported slot keeps showing the pre-delta record: id matches and
         // 5 >= 2, which is precisely the shape the shortcut would accept.
         runtime.complete_without_applying = true;
+        // ...and `done` is signalled with the sentinel still in the result
+        // cell, so there is no execution evidence to outrank the equality.
+        runtime.report_no_result = true;
         runtime.slots.insert(
             3,
             SlotRecord {
