@@ -529,10 +529,25 @@ mod tests {
     #[test]
     fn only_the_refused_quantity_write_requeues_among_write_errors() {
         let mut slot = SlotLedger::default();
-        park_with(&mut slot, 0, "write_error", "tag=ap_0 quantity write failed");
-        park_with(&mut slot, 1, "write_error", "tag=ap_1 quantity pointer missing");
+        park_with(
+            &mut slot,
+            0,
+            "write_error",
+            "tag=ap_0 quantity write failed",
+        );
+        park_with(
+            &mut slot,
+            1,
+            "write_error",
+            "tag=ap_1 quantity pointer missing",
+        );
         park_with(&mut slot, 2, "failed", "tag=ap_2 quantity write failed");
-        park_with(&mut slot, 3, "quantity_mismatch", "tag=ap_3 expected_before=5 actual=20");
+        park_with(
+            &mut slot,
+            3,
+            "quantity_mismatch",
+            "tag=ap_3 expected_before=5 actual=20",
+        );
 
         assert_eq!(slot.requeue_fixed_cause_parks(), vec![0, 3]);
         let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();

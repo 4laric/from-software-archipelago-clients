@@ -694,12 +694,22 @@ mod tests {
             .expect("the existing-stack grant queues a native request");
         // Request word 2 semantics: the DELTA (2), plus the slot and the
         // record pointer the cave's existing-stack branch addresses.
-        assert_eq!(queued.1, 2, "the queued quantity is the delta, not the total");
+        assert_eq!(
+            queued.1, 2,
+            "the queued quantity is the delta, not the total"
+        );
         assert_eq!(queued.2, Some(3));
         assert_eq!(queued.3, Some(0x1000));
         // Poll 2 sees the cave's completion and verifies the read-back total.
         assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
-        assert_eq!(session.runtime_mut().find_stack(normalized).unwrap().quantity, 7);
+        assert_eq!(
+            session
+                .runtime_mut()
+                .find_stack(normalized)
+                .unwrap()
+                .quantity,
+            7
+        );
         assert!(
             session.runtime_mut().writes.is_empty(),
             "no external write may reach a guest inventory page"
@@ -723,7 +733,10 @@ mod tests {
             );
             let mut session = session(runtime);
             session
-                .submit(goods_command(0x384, quantity, "recv_w", Some(before)), false)
+                .submit(
+                    goods_command(0x384, quantity, "recv_w", Some(before)),
+                    false,
+                )
                 .unwrap();
             assert_eq!(session.poll(), "executing");
             assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
@@ -856,7 +869,14 @@ mod tests {
             .unwrap();
         assert_eq!(session.poll(), "executing");
         assert_eq!(session.poll(), "completed");
-        assert_eq!(session.runtime_mut().find_stack(normalized).unwrap().quantity, 7);
+        assert_eq!(
+            session
+                .runtime_mut()
+                .find_stack(normalized)
+                .unwrap()
+                .quantity,
+            7
+        );
     }
 
     #[test]
@@ -980,7 +1000,11 @@ mod tests {
         assert_eq!(session.poll(), "executing");
         assert_eq!(session.poll(), "completed");
         assert_eq!(
-            session.runtime_mut().find_stack(normalized).unwrap().quantity,
+            session
+                .runtime_mut()
+                .find_stack(normalized)
+                .unwrap()
+                .quantity,
             7
         );
         assert!(session.runtime_mut().writes.is_empty());
