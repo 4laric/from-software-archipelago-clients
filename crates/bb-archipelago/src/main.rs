@@ -893,6 +893,12 @@ fn run() -> Result<()> {
                 unsuppressed,
                 location_mode
             );
+            // clients: one line, once, at slot-data parse. Provenance is
+            // bookkeeping -- these deliver like any other binding -- but the
+            // operator should see the promotion surface.
+            if let Some(notice) = seed_config.inferred_evidence_notice() {
+                client_eprintln!("{notice}");
+            }
             goal_location = seed_config.goal_location;
             let mut new_runtime = ClientLoop::new(
                 backend.take().context("backend was already initialized")?,
