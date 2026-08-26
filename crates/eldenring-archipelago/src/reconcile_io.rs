@@ -482,9 +482,69 @@ fn inventory_forensics(goods: i32) -> String {
         Some(found) => found.to_string(),
     };
 
+    // CANDIDATE ROWS (clients#439). Everything above reports the SHAPE of the three lists; none of
+    // it reports what is IN them near the row we wanted. TechnoForge's 15 forensics lines settled
+    // that the write dispatched and the read denies it, and explicitly did NOT settle which way to
+    // widen `inventory_has_goods`: "the entry is there and our compare rejects it" and "the entry
+    // genuinely is not in any of the three lists" produce byte-identical lines today. This term
+    // discriminates them, so the next wild park NAMES the raw rows sitting next to the wanted one.
+    //
+    // DO NOT widen the possession predicate until a line here actually shows a near-miss. The whole
+    // reason this exists is that widening blind is how this class earns a third round of theories.
+    let candidates = {
+        // Deliberately category-BLIND: an entry whose row matches but whose `category()` is not
+        // `Goods` is exactly the case `inventory_has_goods` drops on the floor, so excluding it
+        // here would hide the one finding this term was added for. Reports rows only -- nothing in
+        // the possession path reads it and it never decides anything.
+        use fromsoftware_shared::NonEmptyIteratorExt;
+        let lists = [
+            ("normal", inv.normal_entries()),
+            ("key", inv.key_entries()),
+            ("multiplay_key", inv.multiplay_key_entries()),
+        ];
+        let mut counts: Vec<String> = Vec::new();
+        let mut hits: Vec<String> = Vec::new();
+        let mut extra = 0usize;
+        for (name, entries) in lists {
+            let mut filled = 0usize;
+            for entry in entries.iter().non_empty() {
+                filled += 1;
+                let row = entry.item_id.param_id() as i32;
+                if (row - want_row).abs() > CANDIDATE_ROW_WINDOW {
+                    continue;
+                }
+                if hits.len() >= CANDIDATE_PRINT_CAP {
+                    extra += 1;
+                    continue;
+                }
+                hits.push(format!(
+                    "{name}[row={row} delta={} category={:?} id={:?}]",
+                    row - want_row,
+                    entry.item_id.category(),
+                    entry.item_id,
+                ));
+            }
+            counts.push(format!("{name}={filled}"));
+        }
+        let listed = if hits.is_empty() {
+            "candidates NONE (nothing within CANDIDATE_ROW_WINDOW of the wanted row in any of \
+             the three lists, in ANY category)"
+                .to_string()
+        } else {
+            format!("candidates {}", hits.join(" "))
+        };
+        let overflow = if extra > 0 {
+            format!(" (+{extra} more not printed)")
+        } else {
+            String::new()
+        };
+        format!("non_empty[{}] | {listed}{overflow}", counts.join(" "))
+    };
+
     format!(
         "normal {}/{}{} | key {}/{}{} | multiplay_key {}/{}{} | global_cap {} | \
-         key_accessor={} | in_storage={} | great_rune_slot[{}]",
+         key_accessor={} | in_storage={} | great_rune_slot[{}] | \
+         want[full_id={:#010x} category_nibble={:#x} row={}] | {}",
         inv.normal_items_len,
         inv.normal_items_capacity,
         if inv.is_normal_items_full() {
@@ -510,8 +570,24 @@ fn inventory_forensics(goods: i32) -> String {
         },
         in_storage,
         great_rune_slot,
+        goods as u32,
+        (goods as u32) >> 28,
+        want_row,
+        candidates,
     )
 }
+
+/// How far either side of the wanted row an entry still counts as a CANDIDATE, in row space.
+///
+/// Small on purpose. The two shapes worth catching are (a) the same row under a different item
+/// CATEGORY nibble -- which the possession walk's `category() != Goods` guard skips silently -- and
+/// (b) a neighbouring row, which is what an off-by-a-few id mapping would look like. Anything
+/// further away is not evidence of anything and would only make the line unreadable.
+const CANDIDATE_ROW_WINDOW: i32 = 16;
+
+/// At most this many candidate entries are printed. This is a log line, not a dump; a park that
+/// somehow matches dozens of rows has already told us what we needed to know.
+const CANDIDATE_PRINT_CAP: usize = 12;
 
 impl GameIo for LiveGame {
     fn stability(&self) -> WorldStability {
@@ -531,6 +607,12 @@ impl GameIo for LiveGame {
             real_pickup_seen: crate::detour::real_pickup_seen(),
             // Monotonic, load-screen-independent clock feeding the grant PACING gate.
             now_ms: session_now_ms(),
+            // The world epoch (clients#439). This is what the grant-stall guard re-arms on: an
+            // unstable tick is NOT a world edge (a death resets dwell, a merchant talk window
+            // clears `inventory_safe`), and re-arming on one turned TechnoForge's three-popup
+            // burst into 42 popups in 15 minutes. Same counter the `inventory-ptr: retired at
+            // world edge (epoch N)` lines print, so a log's park cadence can be read against it.
+            world_epoch: crate::detour::world_epoch(),
         }
     }
 

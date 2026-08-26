@@ -357,6 +357,16 @@ pub fn prime_inventory_if_needed() {
     }
 }
 
+/// The current world epoch. Bumped once per world edge by [`on_world_edge`],
+/// [`on_world_exit`] and [`on_warp_request`]; the number the `inventory-ptr: retired at ...
+/// (epoch N)` lines carry.
+///
+/// Read by `reconcile_io::stability` so the reconciler's grant-stall guard can re-arm on an actual
+/// world edge rather than on any unstable tick (clients#439).
+pub fn world_epoch() -> u64 {
+    WORLD_EPOCH.load(Ordering::Relaxed)
+}
+
 /// Called on the in-world false->true edge (core.rs), beside the check_lots / enemy_drops /
 /// shop_sell re-arms. Retires the cached inventory pointer: the game may have freed the object
 /// during the load, and a pointer that outlives its world is a native crash the moment the

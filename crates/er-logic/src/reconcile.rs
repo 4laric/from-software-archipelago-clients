@@ -656,6 +656,13 @@ pub struct WorldStability {
     /// mass-grant CTD). Injected (never read from `std` in this pure crate), mirroring
     /// [`crate::region_lock`]'s `now_ms` convention. `0` in tests that don't exercise pacing.
     pub now_ms: u64,
+    /// The client's WORLD EPOCH: a counter the live client bumps once per genuine world edge
+    /// (in-world false->true arrival, world exit, warp request -- `detour::WORLD_EPOCH`, the same
+    /// number the `inventory-ptr: retired at world edge (epoch N)` log lines carry). It is the
+    /// ONLY thing here that distinguishes "the world was rebuilt" from "this tick happened to be
+    /// unstable"; see [`Reconciler::rearm_grant_stalls`] for why the grant-stall guard must key
+    /// its re-arm on this and not on tick stability. `0` in tests that don't exercise world edges.
+    pub world_epoch: u64,
 }
 
 impl WorldStability {
@@ -847,6 +854,21 @@ pub struct Reconciler {
     /// and one named warning instead of `budget.flags` writes per frame forever. NOT persisted —
     /// [`rearm_grant_stalls`] restores them on the next world edge, same as goods.
     stalled_flags: BTreeSet<FlagId>,
+    /// The [`WorldStability::world_epoch`] the current retry allowance was armed for, or `None`
+    /// before the first tick. The stall guard re-arms when this DISAGREES with the epoch the tick
+    /// reports -- one fresh allowance per world edge -- and never otherwise.
+    ///
+    /// ## Why this exists (clients#439, TechnoForge 2026-08-26)
+    ///
+    /// The guard used to re-arm on every UNSTABLE tick, on the reasoning that an unstable tick IS a
+    /// world edge. It is not: `stable()` also goes false when the inventory-safe (talk-script) gate
+    /// closes at a merchant, and when `dwell_ms` resets after a death -- neither of which rebuilds
+    /// anything or changes the refusal's cause. With DeathLink on, TechnoForge's log measured FIVE
+    /// parks inside world epoch 4 with no world edge between them: 15 refusal popups in 92 s, and
+    /// 42 popups over 15 minutes across epochs 4..12. The burst size was always correct (every park
+    /// line reads `accepted 3 grant(s)`); the defect was purely the re-arm RATE. Keying on the
+    /// epoch collapses that to the documented worst case of one bounded burst per world edge.
+    armed_epoch: Option<u64>,
 }
 
 /// How many ACCEPTED-but-unobservable grants of one unique good are tolerated before it is parked.
@@ -906,6 +928,7 @@ impl Reconciler {
             stalled_goods: BTreeSet::new(),
             flag_attempts: BTreeMap::new(),
             stalled_flags: BTreeSet::new(),
+            armed_epoch: None,
         }
     }
 
@@ -924,6 +947,7 @@ impl Reconciler {
             stalled_goods: BTreeSet::new(),
             flag_attempts: BTreeMap::new(),
             stalled_flags: BTreeSet::new(),
+            armed_epoch: None,
         }
     }
 
@@ -1107,14 +1131,43 @@ impl Reconciler {
 
     /// Drop every parked good and every attempt count, restoring a full retry allowance.
     ///
-    /// Called on an UNSTABLE tick (load screen / warp / save-load) because that is the edge where
+    /// UNCONDITIONAL. Called on a WORLD EDGE (see [`rearm_on_world_edge`]) because that is where
     /// the cause of a refusal — a full bag, a key-item accessor switched to the multiplay list —
-    /// can stop being true. Public so the client can also re-arm on an explicit reconnect.
+    /// can stop being true, and public so the client can also re-arm on an explicit reconnect,
+    /// where the same reasoning applies and there is no epoch to compare against.
+    ///
+    /// [`rearm_on_world_edge`]: Reconciler::rearm_on_world_edge
     pub fn rearm_grant_stalls(&mut self) {
         self.grant_attempts.clear();
         self.stalled_goods.clear();
         self.flag_attempts.clear();
         self.stalled_flags.clear();
+    }
+
+    /// Re-arm the stall guard IF `world_epoch` differs from the epoch the current allowance was
+    /// armed for; otherwise do nothing. Returns whether it re-armed.
+    ///
+    /// This is the clients#439 fix. The predicate used to be "this tick is unstable", which fires
+    /// many times inside one world, because `WorldStability::stable()` also goes false for a
+    /// talk-script inventory window and for the post-death dwell reset. The predicate is now "the
+    /// world was rebuilt", which is what the guard's own doc always claimed it meant.
+    ///
+    /// The re-arm that heals a genuinely lost good after a save reload is PRESERVED: a reload is a
+    /// world edge and bumps the epoch, so it still hands back a full allowance. What is gone is the
+    /// allowance handed back by a death, a merchant menu, or a settle flicker.
+    fn rearm_on_world_edge(&mut self, world_epoch: u64) -> bool {
+        if self.armed_epoch == Some(world_epoch) {
+            return false;
+        }
+        self.armed_epoch = Some(world_epoch);
+        self.rearm_grant_stalls();
+        true
+    }
+
+    /// The world epoch the current retry allowance is armed for (`None` before the first tick).
+    /// Exposed for the client's diagnostics and for the replay tests.
+    pub fn armed_epoch(&self) -> Option<u64> {
+        self.armed_epoch
     }
 
     /// One convergence attempt. Reads stability; if not stable, does NOTHING (no read, no write).
@@ -1145,13 +1198,17 @@ impl Reconciler {
         // Between `flags_ready()` and `stable()` the FLAGS class applies while goods + ledger keep
         // waiting out the inventory settle -- see `WorldStability::flags_ready` for why that split is
         // the correct one and what it fixes.
+        // RE-ARM on the WORLD EDGE, and only there. A world edge — load screen, save-load, warp,
+        // respawn — is the moment the reason a grant was refused (full bag, an accessor pointed at
+        // the multiplay key list) can stop being true, so every parked good gets a fresh
+        // MAX_GRANT_ATTEMPTS on the other side and nothing the player is owed is abandoned.
+        //
+        // This runs on EVERY tick, stable or not, and is idempotent within an epoch: the edge must
+        // be detected wherever it is first observed, and an unstable tick is NOT itself evidence of
+        // one (clients#439 — a death's dwell reset and a merchant talk window both clear
+        // `stable()` without rebuilding a thing).
+        self.rearm_on_world_edge(stab.world_epoch);
         if !stab.flags_ready() {
-            // RE-ARM on the world edge. An unstable tick is a load screen / warp / save-load — the
-            // exact moment the reason a grant was refused (full bag, an accessor pointed at the
-            // multiplay key list) can stop being true. Clearing here gives every parked good a
-            // fresh MAX_GRANT_ATTEMPTS on the other side, so the guard bounds the flood WITHOUT
-            // permanently abandoning an item the player is still owed.
-            self.rearm_grant_stalls();
             return TickOutcome {
                 applied: Vec::new(),
                 skipped_unstable: true,
@@ -1161,13 +1218,13 @@ impl Reconciler {
             };
         }
 
-        // PRE-SETTLE: flags only. The inventory is not yet trustworthy, so goods/ledger stay parked
-        // and `rearm_grant_stalls` still runs for them exactly as it did on an unstable tick.
+        // PRE-SETTLE: flags only. The inventory is not yet trustworthy, so goods/ledger stay
+        // parked for this tick. The stall re-arm is NOT tied to this branch (clients#439): a
+        // pre-settle tick is a routine consequence of a death or a talk script, not a world edge.
         let settled = stab.stable();
         let classes = if settled {
             classes
         } else {
-            self.rearm_grant_stalls();
             ApplyClasses {
                 flags: classes.flags,
                 goods: false,
@@ -1498,6 +1555,7 @@ impl Default for MockGame {
                 dwell_ms: WorldStability::SETTLE_MS,
                 real_pickup_seen: true,
                 now_ms: 0,
+                world_epoch: 0,
             },
         }
     }
@@ -1526,6 +1584,7 @@ impl MockGame {
                 dwell_ms: 0,
                 real_pickup_seen: false,
                 now_ms: 0,
+                world_epoch: 0,
             },
             ..MockGame::default()
         }
@@ -1542,6 +1601,7 @@ impl MockGame {
                 dwell_ms: 0,
                 real_pickup_seen: false,
                 now_ms: 0,
+                world_epoch: 0,
             },
             ..MockGame::default()
         }
@@ -1551,6 +1611,14 @@ impl MockGame {
         // Preserve the injected monotonic clock across a stability toggle (a load screen must not
         // rewind `now_ms` — the pacing cooldown is measured on it).
         let now_ms = self.stability.now_ms;
+        // A change in the IN-WORLD read is a world edge, so it bumps the epoch — the live client
+        // does exactly this (`detour::on_world_exit` on the way out, `detour::on_world_edge` on the
+        // way back in). Toggling any of the OTHER stability terms — see `set_inventory_safe` and
+        // `set_settled` — does not, which is the whole point of clients#439.
+        let mut world_epoch = self.stability.world_epoch;
+        if self.stability.in_game != v {
+            world_epoch += 1;
+        }
         if v {
             self.stability = WorldStability {
                 in_game: true,
@@ -1559,6 +1627,7 @@ impl MockGame {
                 dwell_ms: WorldStability::SETTLE_MS,
                 real_pickup_seen: true,
                 now_ms,
+                world_epoch,
             };
         } else {
             // A load screen, matching the live seam: both fields come from one `in_world` read.
@@ -1569,8 +1638,35 @@ impl MockGame {
                 dwell_ms: 0,
                 real_pickup_seen: false,
                 now_ms,
+                world_epoch,
             };
         }
+    }
+
+    /// Close or re-open the talk-script inventory window WITHOUT a world edge. This is the
+    /// merchant / NPC-talk shape: `stable()` goes false, `flags_ready()` stays true, and the world
+    /// epoch does not move because nothing was rebuilt.
+    pub fn set_inventory_safe(&mut self, v: bool) {
+        self.stability.inventory_safe = v;
+    }
+
+    /// Clear or restore the inventory SETTLE terms without a world edge — the post-death shape,
+    /// where the client's dwell clock restarts and no real pickup has fired yet while the player is
+    /// still counted in-world. `stable()` goes false, `flags_ready()` stays true, epoch unchanged.
+    pub fn set_settled(&mut self, v: bool) {
+        if v {
+            self.stability.dwell_ms = WorldStability::SETTLE_MS;
+            self.stability.real_pickup_seen = true;
+        } else {
+            self.stability.dwell_ms = 0;
+            self.stability.real_pickup_seen = false;
+        }
+    }
+
+    /// Bump the world epoch by one WITHOUT touching any stability term: the live warp-request edge,
+    /// which retires the inventory pointer while the player is still nominally in-world.
+    pub fn bump_world_epoch(&mut self) {
+        self.stability.world_epoch += 1;
     }
 
     /// Advance the injected monotonic session clock (`now_ms`) by `dt` ms. Pacing tests use this to
