@@ -2,6 +2,29 @@
 
 ### Fixed
 
+* **A truncated shad log resets the attach-wait freshness floor
+  (clients#440).** shadPS4 appends to `shad_log.txt` within a run but
+  *truncates* it at each launch -- a playtester's file shrank 644KB to 577KB
+  across a relaunch, with the eboot `base_virtual_addr` line near the top.
+  clients#419's wait recorded the log length at attach start as a monotonic
+  freshness floor and accepted a base line only at or past that offset. Since
+  the launcher spawns shadPS4 and the client as simultaneous siblings, the
+  client sometimes read the log *before* the truncation: the floor became the
+  previous run's large size, this run's real base landed near offset 0, and the
+  gate rejected it for the whole 90-second budget. The resulting `NoFreshBase`
+  error blamed the configured `shad_log` path, which was wrong, and cost a
+  playtester an hour. Every past success was the other side of that race --
+  truncate-then-write finished first and the pre-existing-base fast path
+  attached instantly.
+
+  The wait now follows the file the way `tail -F` does: a poll whose text is
+  shorter than the floor means rotation, so the floor drops to 0 and that same
+  poll reconsiders the whole file -- the truncated log's last base line is by
+  definition this run's, so it is the fast-path check re-run. The stale-line
+  guarantee is unchanged for a log that never shrinks. `NoFreshBase` keeps its
+  wrong-path guidance, which is now only reachable when nothing base-shaped
+  ever appears in the file at all.
+
 * **A terminal startup error now prints through the tee (clients#437).**
   `fn main() -> Result<()>` handed any bubbled `Err` to Rust's default
   termination handler, which prints `Error: {err:?}` onto the process's real

@@ -1,11 +1,21 @@
 //! Bounded wait for a *fresh* shadPS4 eboot base (clients#418).
 //!
 //! The launcher spawns shadPS4 and the client as simultaneous siblings, and the
-//! shad log is appended across runs. Reading it once at client startup therefore
-//! yields the PREVIOUS run's `base_virtual_addr` -- a different, unmapped base --
-//! so `verify_base` reads an unmapped page and the client dies with an error
-//! that blames the player's game build. The failure is guaranteed by ordering,
-//! not by the build.
+//! shad log is appended within a run. Reading it once at client startup
+//! therefore yields the PREVIOUS run's `base_virtual_addr` -- a different,
+//! unmapped base -- so `verify_base` reads an unmapped page and the client dies
+//! with an error that blames the player's game build. The failure is guaranteed
+//! by ordering, not by the build.
+//!
+//! The log is appended within a run but *truncated* at each launch (clients#440:
+//! a playtester's file shrank 644KB to 577KB across a relaunch, and the eboot
+//! base line sits near the top). So the freshness floor below is not monotonic:
+//! when the client wins the race and records the previous run's large length,
+//! shadPS4 then truncates and writes this run's base near offset 0, below the
+//! floor. The wait therefore follows the file the way `tail -F` does -- a length
+//! that has *shrunk* below the floor means rotation, and the floor resets to 0.
+//! The truncated file's last base line is by definition this run's, so the same
+//! poll's lookup against the reset floor is the fast-path check re-run.
 //!
 //! [`wait_for_verified_base`] fixes that ordering. It first tries the base the
 //! log already carries -- when shadPS4 is up before the client that base is the
@@ -20,7 +30,10 @@
 //!
 //! * a verified, validated base -- attach proceeds;
 //! * [`AttachWaitFailure::NoFreshBase`] -- no base line ever appeared past the
-//!   start offset, so the configured `shad_log` is probably the wrong file. The
+//!   freshness floor. Since a truncation resets that floor to 0, "the base is
+//!   there but sits below the floor" is impossible by construction: this
+//!   outcome now means nothing base-shaped was ever written to the file, so the
+//!   configured `shad_log` is probably the wrong file. The
 //!   message names the configured path and says what to compare it against, and
 //!   deliberately says nothing about the Cheat Engine bridge: the build is not
 //!   the suspect ([`AttachWaitFailure::is_stale_log_evidence`] is what lets
@@ -100,8 +113,10 @@ pub enum BaseCheck {
 /// be, too.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttachWaitFailure {
-    /// The budget expired without any base line appearing past the attach-start
-    /// offset: the configured log is probably not the running shadPS4's log.
+    /// The budget expired without any base line appearing past the freshness
+    /// floor -- and since a truncation resets that floor to 0, without any base
+    /// line appearing at all: the configured log is probably not the running
+    /// shadPS4's log.
     NoFreshBase { shad_log: String, waited: Duration },
     /// A confirmed base whose image did not match the contract.
     ImageRejected { base: u64, detail: String },
@@ -180,9 +195,12 @@ pub fn logged_eboot_base_after(log_text: &str, min_offset: usize) -> Option<u64>
 
 /// Wait, bounded, for a base this run can be trusted to own.
 ///
-/// `start_log` is the log text read at attach start; its length is the freshness
-/// floor. `read_log` re-reads the file each poll (a read error is retryable --
-/// the log can be rotated or momentarily locked, so it yields `None`). `check`
+/// `start_log` is the log text read at attach start; its length is the initial
+/// freshness floor. `read_log` re-reads the file each poll (a read error is
+/// retryable -- the log can be rotated or momentarily locked, so it yields
+/// `None`). A poll whose text is *shorter* than the floor means shadPS4
+/// truncated the log for this run, so the floor drops to 0 and the same poll
+/// reconsiders the whole file (clients#440). `check`
 /// runs the live verification (`verify_base` + `require_validated_image`) for a
 /// candidate. `notice` receives [`WAITING_NOTICE`] exactly once, when waiting
 /// begins.
@@ -213,7 +231,7 @@ where
         }
     }
 
-    let start_len = start_log.len();
+    let mut floor = start_log.len();
     let mut announced = false;
     loop {
         if !announced {
@@ -221,15 +239,21 @@ where
             announced = true;
         }
         clock.sleep(policy.interval);
-        if let Some(text) = read_log()
-            && let Some(base) = logged_eboot_base_after(&text, start_len)
-        {
-            match check(base) {
-                BaseCheck::Attached => return Ok(base),
-                BaseCheck::ImageRejected(detail) => {
-                    return Err(AttachWaitFailure::ImageRejected { base, detail });
+        if let Some(text) = read_log() {
+            // Rotation, `tail -F` style: a log shorter than the floor was
+            // truncated by this run's shadPS4, so every byte in it -- including
+            // a base line near offset 0 -- belongs to this run.
+            if text.len() < floor {
+                floor = 0;
+            }
+            if let Some(base) = logged_eboot_base_after(&text, floor) {
+                match check(base) {
+                    BaseCheck::Attached => return Ok(base),
+                    BaseCheck::ImageRejected(detail) => {
+                        return Err(AttachWaitFailure::ImageRejected { base, detail });
+                    }
+                    BaseCheck::Unverified => {}
                 }
-                BaseCheck::Unverified => {}
             }
         }
         if clock.elapsed() >= policy.budget {
@@ -458,6 +482,132 @@ mod tests {
         assert_eq!(logged_eboot_base_after(STALE, STALE.len()), None);
         // The floor is compared against the *base line* offset, not the marker.
         assert_eq!(logged_eboot_base_after(STALE, 0), Some(0x5570000));
+    }
+
+    /// clients#440: shadPS4 truncates the log at launch, so the run's own base
+    /// line lands near offset 0 -- below a floor taken from the previous run.
+    #[test]
+    fn a_truncated_log_resets_the_floor_and_its_base_is_accepted() {
+        // A big previous-run log: the client won the race and recorded this
+        // length before shadPS4 truncated.
+        let old_run = format!("{}{}", "noise line\n".repeat(4000), STALE);
+        let fresh_run = format!("{FRESH_LINE}{}", "noise line\n".repeat(3));
+        assert!(
+            fresh_run.len() < old_run.len(),
+            "the truncated run must be the shorter file"
+        );
+
+        let mut polls = 0u32;
+        let mut clock = FakeClock::default();
+        let base = wait_for_verified_base(
+            "C:\\shad\\shad_log.txt",
+            &old_run,
+            || {
+                polls += 1;
+                if polls < 3 {
+                    Some(old_run.clone())
+                } else {
+                    Some(fresh_run.clone())
+                }
+            },
+            |candidate| {
+                if candidate == 0x8000000 {
+                    BaseCheck::Attached
+                } else {
+                    BaseCheck::Unverified
+                }
+            },
+            |_| {},
+            &mut clock,
+            policy(),
+        )
+        .expect("the truncated log's base belongs to this run");
+
+        assert_eq!(base, 0x8000000);
+        assert_eq!(
+            clock.sleeps, 3,
+            "accepted on the very poll that saw the shrink, not a later one"
+        );
+    }
+
+    /// The clients#419 guarantee, unchanged: without a shrink, a line that was
+    /// already in the file when the wait started is still not this run's.
+    #[test]
+    fn a_stale_line_in_a_log_that_never_shrinks_is_still_rejected() {
+        let old_run = format!("{}{}", "noise line\n".repeat(4000), STALE);
+        let mut clock = FakeClock::default();
+        let failure = wait_for_verified_base(
+            "C:\\shad\\shad_log.txt",
+            &old_run,
+            // Grows, never shrinks: the only base line stays below the floor.
+            || Some(format!("{old_run}more noise\n")),
+            |_| BaseCheck::Unverified,
+            |_| {},
+            &mut clock,
+            policy(),
+        )
+        .expect_err("a stale line below an intact floor can never satisfy the wait");
+
+        assert!(failure.is_stale_log_evidence());
+    }
+
+    #[test]
+    fn a_base_written_after_the_truncation_is_accepted_once_it_appears() {
+        let old_run = format!("{}{}", "noise line\n".repeat(4000), STALE);
+        let truncated = String::from("startup line\n");
+        let with_base = format!("{truncated}{FRESH_LINE}");
+
+        let mut polls = 0u32;
+        let mut clock = FakeClock::default();
+        let base = wait_for_verified_base(
+            "C:\\shad\\shad_log.txt",
+            &old_run,
+            || {
+                polls += 1;
+                match polls {
+                    1 => Some(old_run.clone()),
+                    // Truncated, but shadPS4 has not logged the base yet.
+                    2 | 3 => Some(truncated.clone()),
+                    _ => Some(with_base.clone()),
+                }
+            },
+            |candidate| {
+                if candidate == 0x8000000 {
+                    BaseCheck::Attached
+                } else {
+                    BaseCheck::Unverified
+                }
+            },
+            |_| {},
+            &mut clock,
+            policy(),
+        )
+        .expect("a base written after the shrink is this run's");
+
+        assert_eq!(base, 0x8000000);
+        assert_eq!(clock.sleeps, 4);
+    }
+
+    #[test]
+    fn a_truncated_log_that_never_carries_a_base_still_expires_the_budget() {
+        let old_run = format!("{}{}", "noise line\n".repeat(4000), STALE);
+        let mut clock = FakeClock::default();
+        let failure = wait_for_verified_base(
+            "C:\\shad\\shad_log.txt",
+            &old_run,
+            || Some(String::from("startup line\n")),
+            |_| BaseCheck::Unverified,
+            |_| {},
+            &mut clock,
+            policy(),
+        )
+        .expect_err("nothing base-shaped ever appears");
+
+        assert!(
+            failure.is_stale_log_evidence(),
+            "the wrong-path guidance is exactly right when the file has no base line"
+        );
+        assert!(clock.sleeps >= 10);
     }
 
     #[test]
