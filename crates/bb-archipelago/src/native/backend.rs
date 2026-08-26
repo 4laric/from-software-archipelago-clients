@@ -34,6 +34,7 @@ use crate::backend::{
 use crate::client_eprintln;
 use crate::event_flags::LiveEventFlags;
 
+use super::diagnostics::{DiagnosticSink, GrantContext, JsonlFile, diagnostics_path_for_ledger};
 use super::engine::{GrantStep, NativeDelivery, NativeGrantRequest};
 use super::flag_gate::FlagGate;
 use super::guest::GuestRuntime;
@@ -89,6 +90,10 @@ pub struct NativeBackend {
     /// gates the observed baseline too -- otherwise a hydration lie would be
     /// recorded durably as a baseline of zero.
     absent_observations: std::collections::HashMap<u32, u32>,
+    /// clients#445: the last context the loop's `location_context` call
+    /// produced, stamped onto each diagnostic record. Not a guest read -- it is
+    /// the value this backend already returned to the loop this iteration.
+    last_context: GrantContext,
 }
 
 impl NativeBackend {
@@ -101,6 +106,57 @@ impl NativeBackend {
     /// delivery runs and location checks abstain (clients#420).
     pub fn event_flags_armed(&self) -> bool {
         self.event_flags.is_armed()
+    }
+
+    /// Arm the passive per-grant delivery diagnostics (clients#445) beside the
+    /// receive ledger. One JSON line per terminal grant, appended; a write
+    /// failure warns once and never touches a delivery.
+    ///
+    /// The path is derived from the ledger rather than taken as a new CLI
+    /// argument: the launcher already puts `ledger.json`, `client.log` and this
+    /// file in one per-session folder, and the ledger path names that folder.
+    pub fn arm_delivery_diagnostics(&mut self, ledger: &std::path::Path) {
+        let path = diagnostics_path_for_ledger(ledger);
+        client_eprintln!(
+            "Delivery diagnostics: one line per delivered item into {} - send it back with client.log if a delivery looks wrong (clients#445).",
+            path.display()
+        );
+        self.delivery
+            .arm_diagnostics(DiagnosticSink::new(Box::new(JsonlFile::new(path))));
+    }
+
+    /// The live `location_context`, before the diagnostics stamp is taken.
+    fn location_context_inner(&mut self) -> Result<Option<LocationContext>> {
+        // clients#420: every loop gives the pending flag gate one cheap chance
+        // to arm. Still-null is not an error here -- it reports not-ready.
+        let arming = self.arm_event_flags();
+        // Disjoint borrows: the readiness gate and the flag accessor are two
+        // different fields of `self`.
+        let Self {
+            event_flags,
+            assumed_context,
+            ..
+        } = self;
+        let Some(gate) = assumed_context.as_mut() else {
+            // Normal live mode stays fail-closed until a real save-identity
+            // accessor exists, exactly like FileBackend.
+            return Ok(None);
+        };
+        if let Err(error) = arming {
+            gate.observe(false);
+            return Err(error);
+        }
+        let Some(flags) = event_flags.armed_mut() else {
+            // Waiting for the game to finish loading: not gameplay-ready, which
+            // is exactly what the existing send-gate consumes
+            // (`require_runtime_context` -> Ok(None) -> no checks, no sends).
+            return Ok(Some(gate.observe(false)));
+        };
+        if let Err(error) = flags.probe_manager_resilient() {
+            gate.observe(false);
+            return Err(error);
+        }
+        Ok(Some(gate.observe(true)))
     }
 
     /// Retry the pending event-flag attach at the already-confirmed base.
@@ -216,42 +272,25 @@ impl NativeBackend {
             assumed_context: assumed_identity.map(AssumedContextGate::new),
             base,
             absent_observations: std::collections::HashMap::new(),
+            last_context: GrantContext::default(),
         })
     }
 }
 
 impl BloodborneBackend for NativeBackend {
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
-        // clients#420: every loop gives the pending flag gate one cheap chance
-        // to arm. Still-null is not an error here -- it reports not-ready.
-        let arming = self.arm_event_flags();
-        // Disjoint borrows: the readiness gate and the flag accessor are two
-        // different fields of `self`.
-        let Self {
-            event_flags,
-            assumed_context,
-            ..
-        } = self;
-        let Some(gate) = assumed_context.as_mut() else {
-            // Normal live mode stays fail-closed until a real save-identity
-            // accessor exists, exactly like FileBackend.
-            return Ok(None);
+        let result = self.location_context_inner();
+        // clients#445: remember what the loop was told, so a grant record can
+        // say what the client's own readiness looked like around it. `None` is
+        // "this backend reported no context", never "not ready".
+        self.last_context = GrantContext {
+            gameplay_ready: match &result {
+                Ok(Some(context)) => Some(context.gameplay_ready),
+                _ => None,
+            },
+            event_flags_armed: self.event_flags.is_armed(),
         };
-        if let Err(error) = arming {
-            gate.observe(false);
-            return Err(error);
-        }
-        let Some(flags) = event_flags.armed_mut() else {
-            // Waiting for the game to finish loading: not gameplay-ready, which
-            // is exactly what the existing send-gate consumes
-            // (`require_runtime_context` -> Ok(None) -> no checks, no sends).
-            return Ok(Some(gate.observe(false)));
-        };
-        if let Err(error) = flags.probe_manager_resilient() {
-            gate.observe(false);
-            return Err(error);
-        }
-        Ok(Some(gate.observe(true)))
+        result
     }
 
     fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>> {
@@ -309,7 +348,11 @@ impl BloodborneBackend for NativeBackend {
             // mid-grant recover instead of double-granting.
             expected_before: Some(grant.expected_before),
         };
-        match self.delivery.grant(request)? {
+        self.delivery.set_context(self.last_context);
+        let step = self
+            .delivery
+            .grant_with_warning(request, &mut |line: &str| client_eprintln!("{line}"))?;
+        match step {
             GrantStep::Pending => Ok(OperationProgress::Pending),
             GrantStep::Complete => Ok(OperationProgress::Complete),
             GrantStep::Failed { status, detail } => Err(GrantTerminalFailure {

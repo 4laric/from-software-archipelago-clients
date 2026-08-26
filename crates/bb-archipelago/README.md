@@ -190,6 +190,41 @@ The native code lives in `src/native/`:
   Vial), `guest.rs` is the inventory-geometry `Runtime` over `ProcessMemory`,
   and `engine.rs`/`backend.rs` drive one grant at a time and adapt it to the
   `BloodborneBackend` trait.
+- `diagnostics.rs` is the passive per-grant delivery record (clients#445); see
+  below. It is write-only — nothing in the state machine ever branches on it.
+
+### Delivery diagnostics (clients#445)
+
+On the native path the client appends **one JSON line per terminal grant** to
+`delivery-diagnostics.jsonl`, in the same session folder as `ledger.json` and
+`client.log`. There is no flag and nothing to run: play normally, and when a
+delivery looks wrong, send that file back the way you send `client.log`.
+
+The line carries only what the delivery machine already computed for its own
+decisions — tag and AP index, raw/normalized item id, lane (`insert`/`delta`)
+and descriptor source, quantity, the baseline it observed, the total it
+expected, every held-stack read-back the verify loop saw, the cave's result
+cell, the terminal status and detail, and the client's own gameplay-ready state
+at submit and at the terminal step. **No extra read of the game is performed for
+it**, and a failure to write the file warns once and never touches a delivery.
+
+One field is an inference and is named as one: `inferred_destination` is
+`held` when the read-back arithmetic accounts for the delta in the held stack,
+`storage_suspected` when the cave provably executed (clients#443's evidence
+predicate) and the held stack still came in under the expected total, and
+`unknown` otherwise. The client cannot read Bloodborne's storage box; a
+concurrent spend and an overflow into storage are indistinguishable to it, so
+`storage_suspected` is a hypothesis consistent with the numbers, never a
+measurement.
+
+`tools/summarize_delivery_diagnostics.py <file>` groups the records by item,
+status and inferred destination and prints a table to paste into clients#445.
+
+This complements, and does not replace, the manual probe in bb-archipelago#203:
+controlled-condition questions — a unique-item insert, a deliberately at-cap
+arming — still need the probe, because those conditions do not arise on their
+own during play. The passive file answers the question the probe cannot: what
+the distribution looks like across a real session.
 
 Replay recovery is **coordinated with the receive ledger**, not a parallel
 store: `grant_item` feeds the ledger-derived `expected_before`
