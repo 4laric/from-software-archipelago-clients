@@ -2,6 +2,21 @@
 
 ### Fixed
 
+* **The shipped binary actually calls the live-stack observation
+  (clients#427).** `observe_stack_quantity` (clients#428) and
+  `grant_may_have_applied` (clients#429) were implemented on `NativeBackend`
+  but never forwarded by the `Backend` enum in `main.rs`, which is what every
+  dispatch in the real client goes through. Both fell to their silent trait
+  defaults -- `Unsupported` and `true` -- so the native implementations were
+  dead code in the exe and every fresh grant kept using the ledger-sum
+  baseline. That is why oz's clients#428 build still parked with a climbing
+  `expected_before` (10/12/14/16) against an actual stack of 2. The tests were
+  green because they exercise `MockBackend` directly and never the enum. Both
+  methods are now forwarded, both are *required* trait methods (implemented
+  explicitly on `FileBackend` with the CE bridge's documented behaviour), and a
+  regression test dispatches through `Backend::Mock` so the wrapper itself is
+  witnessed.
+
 * **A retained grant command re-observes its baseline instead of comparing a
   stale one (clients#427, follow-up to clients#428).** oz ran the clients#428
   build and the requeued backlog re-parked as `quantity_mismatch`: pebbles
