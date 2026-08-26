@@ -328,6 +328,34 @@ impl<R: Runtime> GrantSession<R> {
             && record.normalized_id == Some(command.normalized_id)
             && record.quantity.is_some_and(|q| q >= command.quantity);
         if !slot_verified && actual != Some(wanted) {
+            // clients#443: on the delta lane, EXECUTION EVIDENCE outranks the
+            // equality. `native_done` is already true here, and the result cell
+            // is no longer the `EMPTY_SLOT` sentinel the guest writes before
+            // arming the cave -- so `native_routines.quantity_delta` ran and
+            // the item IS in the inventory. The equality can still be broken
+            // from ABOVE by a concurrent acquisition: the player loots one more
+            // of the same id between the dequeue-time observation and the
+            // game-thread execution, and the read-back total lands above
+            // `expected_after`. That race is real and unavoidable (PR #429's
+            // body predicted exactly this residue); parking a delivered item
+            // for it is not. A pickup can only ADD, so a surplus is completion.
+            //
+            // A DEFICIT is untouched -- items are genuinely missing, and that
+            // is still the starve-and-park case. So is any wrong count without
+            // execution evidence: an unexecuted delta must never read as
+            // delivered.
+            if self.delta_lane
+                && native_result != EMPTY_SLOT
+                && let Some(surplus) = actual.filter(|a| *a > wanted)
+            {
+                return self.finish(
+                    "completed",
+                    format!(
+                        "tag={} completed with concurrent pickup: expected_after={wanted} actual={surplus} native_result={native_result}",
+                        command.tag
+                    ),
+                );
+            }
             self.verify_polls += 1;
             let hydrating = !self.delta_lane
                 && matches!(record.normalized_id, None | Some(EMPTY_SLOT))
@@ -509,6 +537,16 @@ mod tests {
         // When true, a queued native grant reports done but never actually
         // lands in the inventory, so the bounded verify starves and fails.
         complete_without_applying: bool,
+        // clients#443: quantity of the same id the PLAYER acquires while the
+        // native call is in flight -- the concurrent pickup that pushes the
+        // read-back total above `expected_after`. Applied on the same
+        // `native_done` that lands the delta, which is exactly the window the
+        // client cannot observe.
+        concurrent_pickup: u32,
+        // clients#443: report `done` with the result cell still holding the
+        // `EMPTY_SLOT` sentinel -- completion signalled with NO execution
+        // evidence. Only meaningful together with `complete_without_applying`.
+        report_no_result: bool,
     }
 
     impl FakeRuntime {
@@ -574,8 +612,19 @@ mod tests {
                 // bogus slot; for a delta it reports the REAL slot, whose
                 // record still holds the pre-delta quantity -- the shape the
                 // slot shortcut would wrongly accept.
-                if let Some((_descriptor, _quantity, slot, _address)) = self.queued.take() {
-                    self.result = slot.unwrap_or(7);
+                if let Some((descriptor, _quantity, slot, _address)) = self.queued.take() {
+                    // The player's own pickup lands whether or not the cave
+                    // ran: it is not part of the grant.
+                    if self.concurrent_pickup > 0
+                        && let Some(stack) = self.stacks.get_mut(&descriptor.normalized_id)
+                    {
+                        stack.quantity += self.concurrent_pickup;
+                    }
+                    self.result = if self.report_no_result {
+                        EMPTY_SLOT
+                    } else {
+                        slot.unwrap_or(7)
+                    };
                     if slot.is_none() {
                         self.slots.insert(
                             7,
@@ -601,7 +650,7 @@ mod tests {
                     .stacks
                     .get_mut(&descriptor.normalized_id)
                     .expect("the delta lane is only queued for a live stack");
-                stack.quantity += quantity;
+                stack.quantity += quantity + self.concurrent_pickup;
                 let total = stack.quantity;
                 self.result = slot;
                 self.slots.insert(
@@ -619,6 +668,9 @@ mod tests {
             if let Some((descriptor, quantity, _slot, _address)) = self.queued.take() {
                 let new_slot = 7u32;
                 self.result = new_slot;
+                // clients#443: a concurrent pickup rides along on the insert
+                // too -- the inserted stack lands holding more than the grant.
+                let quantity = quantity + self.concurrent_pickup;
                 self.slots.insert(
                     new_slot,
                     SlotRecord {
@@ -810,6 +862,180 @@ mod tests {
         // The short budget, not the hydration one: a live stack is never
         // "not hydrated yet".
         assert!(session.state().detail.contains("retry_budget=20"));
+    }
+
+    /// clients#443, THE motivating case: the delta lands AND the player loots
+    /// one more of the same id in the window between the dequeue-time
+    /// observation and the game-thread execution. The read-back total comes in
+    /// at `expected_after + 1` with the result cell carrying the routine's
+    /// return -- oz's live park, verbatim:
+    ///
+    /// ```text
+    /// failed (tag=ap_0 expected_after=7 actual=Some(8) native_result=8 retry_budget=20)
+    /// ```
+    ///
+    /// Execution is confirmed, so the item was DELIVERED. A pickup can only
+    /// add, and no number of retries will ever bring 8 back down to 7: the
+    /// equality is broken by the player, not by the grant. This completes.
+    #[test]
+    fn a_concurrent_pickup_during_the_delta_completes_instead_of_parking() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        runtime.concurrent_pickup = 1;
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "ap_0", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        assert_eq!(
+            session.poll(),
+            "completed",
+            "a delivered item must not park: {:?}",
+            session.state()
+        );
+        // The surplus is recorded, not hidden: the operator can see why the
+        // read-back and the expectation disagree.
+        let detail = &session.state().detail;
+        assert!(
+            detail.contains("completed with concurrent pickup")
+                && detail.contains("expected_after=7")
+                && detail.contains("actual=8"),
+            "detail must name the surplus, got: {detail}"
+        );
+        // `expected_after` stays the honest arithmetic of the grant -- the
+        // pickup is the player's, and the durable rows a replay compares
+        // against must not absorb it.
+        assert_eq!(session.state().expected_before, Some(5));
+        assert_eq!(session.state().expected_after, Some(7));
+        assert!(session.state().is_success());
+        assert!(session.runtime_mut().writes.is_empty());
+        assert_eq!(
+            session
+                .runtime_mut()
+                .find_stack(normalized)
+                .unwrap()
+                .quantity,
+            8
+        );
+    }
+
+    /// clients#443 control, the other direction: execution evidence is present
+    /// but the read-back is BELOW `expected_after`. Items are genuinely
+    /// missing, nothing the player can do adds a deficit, and this is still a
+    /// real failure. Surplus tolerance must not become "any inequality passes".
+    #[test]
+    fn a_delta_short_of_its_expected_total_still_parks_with_execution_evidence() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        // Done is reported and the real slot comes back as the result -- the
+        // same execution evidence the surplus path trusts -- but the stack
+        // never moves, so the read-back stays at 5 against a wanted 7.
+        runtime.complete_without_applying = true;
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "ap_1", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        let mut last = String::new();
+        for _ in 0..contract().policy.verify_polls {
+            last = session.poll();
+        }
+        assert_eq!(last, "failed", "state: {:?}", session.state());
+        assert!(session.state().detail.contains("actual=Some(5)"));
+        assert!(
+            !session.state().detail.contains("concurrent pickup"),
+            "a deficit is never a pickup"
+        );
+    }
+
+    /// clients#443 control: a surplus WITHOUT execution evidence is unchanged
+    /// today-behaviour. The result cell still holds the `EMPTY_SLOT` sentinel
+    /// the guest writes before arming the cave, so nothing proves the delta
+    /// ran -- and the stack reading above the expectation is then the player's
+    /// pickup ALONE, with the grant still missing. Trusting the count here
+    /// would acknowledge an item that was never delivered.
+    #[test]
+    fn a_surplus_without_execution_evidence_still_parks() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        runtime.complete_without_applying = true;
+        runtime.report_no_result = true;
+        // The player picks up 3 while the (never-executing) call is in flight:
+        // 5 + 3 = 8, above the wanted 7, and NOT because of the grant.
+        runtime.concurrent_pickup = 3;
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "ap_2", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        let mut last = String::new();
+        for _ in 0..contract().policy.verify_polls {
+            last = session.poll();
+        }
+        assert_eq!(last, "failed", "state: {:?}", session.state());
+        assert!(
+            session
+                .state()
+                .detail
+                .contains(&format!("native_result={EMPTY_SLOT}")),
+            "detail: {}",
+            session.state().detail
+        );
+        assert!(!session.state().detail.contains("concurrent pickup"));
+    }
+
+    /// clients#443 control: the insert lane is untouched. Its witness is the
+    /// reported slot record (`id` + `quantity >= delta`), which is already
+    /// surplus-tolerant, and the surplus rule is gated on `delta_lane`. An
+    /// insert whose read-back exceeds the expectation completes exactly as it
+    /// did before, through `slot_verified`, with no pickup detail.
+    #[test]
+    fn the_insert_lane_keeps_its_own_witness_and_takes_no_pickup_path() {
+        let mut runtime = FakeRuntime {
+            ready: true,
+            ..Default::default()
+        };
+        // Pebble is absent, so this is the insert lane; the player picks two
+        // more up while the insert is in flight.
+        runtime.concurrent_pickup = 2;
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x4CE, 1, "ap_3", Some(0)), false)
+            .unwrap();
+        for _ in 0..(contract().policy.min_absent_polls - 1) {
+            assert_eq!(session.poll(), "awaiting_inventory");
+        }
+        assert_eq!(session.poll(), "executing");
+        assert!(session.state().detail.contains("lane=insert"));
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+        assert!(
+            !session.state().detail.contains("concurrent pickup"),
+            "the insert lane verifies through its slot record, not the delta rule"
+        );
     }
 
     /// clients#433 crash window: a restart mid-delta must not double-apply.

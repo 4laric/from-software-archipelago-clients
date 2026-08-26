@@ -2,6 +2,36 @@
 
 ### Fixed
 
+* **A concurrent pickup during a delta grant no longer parks a delivered item
+  (clients#443).** A playtester's `ap_0` parked as
+  `failed (tag=ap_0 expected_after=7 actual=Some(8) native_result=8 retry_budget=20)`.
+  The delta lane's read-back verification demanded exact equality with
+  `expected_after`, and the player -- actively looting -- picked up one more of
+  the same item in the window between the dequeue-time observation and the
+  cave's execution on the game thread. `native_result=8` is the game's own
+  `quantity_delta` return, so the grant had EXECUTED and the item was in the
+  inventory; the equality was broken by the pickup, and no retry could ever
+  bring 8 back down to 7. This is the residual observe-to-execute race
+  clients#429 predicted; the race was real, the punishment was wrong.
+
+  The delta lane now orders its evidence: with execution confirmed (the state
+  cell reports done and the result cell is no longer the pre-arm sentinel), a
+  read-back ABOVE `expected_after` completes, recording the surplus in the
+  detail -- `completed with concurrent pickup: expected_after=7 actual=8` --
+  because a pickup can only add. A read-back BELOW it is still a real failure
+  and still parks: items are genuinely missing. Without execution evidence
+  nothing changes, so an unexecuted delta is never read as delivered. The
+  surplus completion acknowledges exactly like any other, recording the AP
+  item's own quantity and nothing of the player's pickup, and the next grant of
+  the same item re-observes the live stack. Startup unpark is untouched and
+  cannot match a park of this shape: an execution-evidenced park means the item
+  LANDED, so requeueing it would double-grant. Operators holding one should
+  resolve it with `bb-blocked INDEX --confirm`, never redeliver.
+
+  The insert lane needs no equivalent: its witness is the reported slot record
+  (`id` plus `quantity >= delta`), which a concurrent pickup only ever
+  strengthens.
+
 * **A truncated shad log resets the attach-wait freshness floor
   (clients#440).** shadPS4 appends to `shad_log.txt` within a run but
   *truncates* it at each launch -- a playtester's file shrank 644KB to 577KB

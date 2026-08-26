@@ -512,6 +512,24 @@ mod tests {
         .unwrap();
     }
 
+    /// A minimal pending plan for one Pebble, at the given index.
+    fn pending_pebble(index: u64) -> PendingItem {
+        PendingItem {
+            index,
+            ap_item_id: 1,
+            raw_descriptor: 0xB000_04CE,
+            normalized_item_id: 0x4000_04CE,
+            item_category: 4,
+            quantity: 1,
+            reinforcement_level: None,
+            equip_target: None,
+            upgrade_target_level: None,
+            grant_complete: false,
+            equip_complete: false,
+            observed_before: None,
+        }
+    }
+
     /// The same, with the exact detail text `client_loop` records.
     fn park_with(slot: &mut SlotLedger, index: u64, status: &str, detail: &str) {
         park(slot, index, status);
@@ -552,6 +570,77 @@ mod tests {
         assert_eq!(slot.requeue_fixed_cause_parks(), vec![0, 3]);
         let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();
         assert_eq!(still_parked, vec![1, 2]);
+    }
+
+    /// clients#443: a park carrying EXECUTION EVIDENCE means the item landed,
+    /// so the startup unpark must never touch it -- requeueing would deliver a
+    /// second copy. oz's live park is verbatim below. It cannot match today
+    /// (the status is `failed`, and the filter takes only `quantity_mismatch`
+    /// and the refused quantity write), and this pins that it stays that way:
+    /// the operator resolves such an entry with `bb-blocked --confirm`, never
+    /// by redelivering it.
+    #[test]
+    fn an_execution_evidenced_park_is_never_requeued() {
+        let mut slot = SlotLedger::default();
+        park_with(
+            &mut slot,
+            0,
+            "failed",
+            "tag=ap_0 expected_after=7 actual=Some(8) native_result=8 retry_budget=20",
+        );
+        park_with(
+            &mut slot,
+            1,
+            "quantity_mismatch",
+            "tag=ap_1 expected_before=5 actual=20",
+        );
+        assert_eq!(
+            slot.requeue_fixed_cause_parks(),
+            vec![1],
+            "a delivered item must not re-enter the delivery queue"
+        );
+        let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();
+        assert_eq!(still_parked, vec![0]);
+
+        // And the operator's resolution is the exit: it clears the marker
+        // without ever re-granting.
+        let detail = slot.unblock(0).unwrap();
+        assert!(detail.contains("native_result=8"));
+        assert_eq!(slot.blocked_entries().count(), 0);
+        assert!(slot.redeliver.is_empty());
+    }
+
+    /// clients#443: a surplus completion is acknowledged like any other, and
+    /// the acknowledgement drops the pending plan -- baseline included. So the
+    /// NEXT grant of the same item plans with `observed_before: None` and
+    /// re-observes the live stack, which is the only reading that includes the
+    /// player's concurrent pickup. The surplus cannot poison the next grant.
+    #[test]
+    fn a_completion_drops_the_baseline_so_the_next_grant_re_observes() {
+        let mut slot = SlotLedger::default();
+        let mut first = pending_pebble(0);
+        slot.begin(first.clone()).unwrap();
+        // The grant was submitted against a live reading of 5.
+        slot.record_observed_before(5).unwrap();
+        slot.mark_grant_complete().unwrap();
+        first.observed_before = Some(5);
+        first.grant_complete = true;
+        assert_eq!(slot.pending, Some(first));
+
+        slot.acknowledge(0, acknowledged(0)).unwrap();
+        assert!(
+            slot.pending.is_none(),
+            "the acknowledged baseline must not survive its grant"
+        );
+        // The AP item's own quantity is what is recorded -- the pickup is the
+        // player's and belongs to no delivery.
+        assert_eq!(slot.delivered_quantity(0x4000_04CE, None), 1);
+
+        // The next grant of the SAME item carries no baseline at all, so the
+        // client samples the live stack (pickup included) instead of the
+        // number the previous grant expected.
+        slot.begin(pending_pebble(1)).unwrap();
+        assert_eq!(slot.pending.as_ref().unwrap().observed_before, None);
     }
 
     /// clients#427: only the park reason this issue fixed re-enters the queue,
