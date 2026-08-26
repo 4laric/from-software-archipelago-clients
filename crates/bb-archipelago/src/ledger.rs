@@ -613,11 +613,14 @@ mod tests {
         );
     }
 
-    /// clients#443: a surplus completion is acknowledged like any other, and
+    /// clients#443: a completion driven by concurrent inventory activity --
+    /// in EITHER direction, a pickup above `expected_after` or a spend/storage
+    /// overflow below it -- is acknowledged like any other, and
     /// the acknowledgement drops the pending plan -- baseline included. So the
     /// NEXT grant of the same item plans with `observed_before: None` and
     /// re-observes the live stack, which is the only reading that includes the
-    /// player's concurrent pickup. The surplus cannot poison the next grant.
+    /// player's concurrent activity. Neither direction can poison the next
+    /// grant, and the ledger never needs to know which one happened.
     #[test]
     fn a_completion_drops_the_baseline_so_the_next_grant_re_observes() {
         let mut slot = SlotLedger::default();

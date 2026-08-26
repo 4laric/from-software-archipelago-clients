@@ -2,8 +2,8 @@
 
 ### Fixed
 
-* **A concurrent pickup during a delta grant no longer parks a delivered item
-  (clients#443).** A playtester's `ap_0` parked as
+* **Concurrent inventory activity (either direction) during a delta grant no
+  longer parks a delivered item (clients#443).** A playtester's `ap_0` parked as
   `failed (tag=ap_0 expected_after=7 actual=Some(8) native_result=8 retry_budget=20)`.
   The delta lane's read-back verification demanded exact equality with
   `expected_after`, and the player -- actively looting -- picked up one more of
@@ -15,22 +15,31 @@
   clients#429 predicted; the race was real, the punishment was wrong.
 
   The delta lane now orders its evidence: with execution confirmed (the state
-  cell reports done and the result cell is no longer the pre-arm sentinel), a
-  read-back ABOVE `expected_after` completes, recording the surplus in the
-  detail -- `completed with concurrent pickup: expected_after=7 actual=8` --
-  because a pickup can only add. A read-back BELOW it is still a real failure
-  and still parks: items are genuinely missing. Without execution evidence
-  nothing changes, so an unexecuted delta is never read as delivered. The
-  surplus completion acknowledges exactly like any other, recording the AP
-  item's own quantity and nothing of the player's pickup, and the next grant of
-  the same item re-observes the live stack. Startup unpark is untouched and
-  cannot match a park of this shape: an execution-evidenced park means the item
-  LANDED, so requeueing it would double-grant. Operators holding one should
-  resolve it with `bb-blocked INDEX --confirm`, never redeliver.
+  cell reports done and the result cell -- written only by the routine's own
+  return -- is no longer the pre-arm sentinel), `quantity_delta` ran, and
+  because it is an unconditional ADD, the delta APPLIED. What the read-back
+  TOTAL then says is a statement about the player, not about the grant, so ANY
+  disagreement with `expected_after` completes and names its direction in the
+  detail: `completed with concurrent pickup: expected_after=7 actual=8` above
+  it, `completed with concurrent spend or storage overflow: expected_after=7
+  actual=5` below it. A deficit is a concurrent SPEND in the same unobservable
+  window, or a capped stack overflowing into storage -- Bloodborne consumables
+  overflow, and the pouch count can sit still while the items land in storage.
+  With execution evidence those two cannot be told apart and need not be: both
+  mean delivered.
+
+  Without execution evidence nothing changes: the equality and both of its
+  failure directions keep their full meaning there, so an unexecuted delta is
+  never read as delivered. Such a completion acknowledges exactly like any
+  other, recording the AP item's own quantity and nothing of the player's
+  activity, and the next grant of the same item re-observes the live stack.
+  Startup unpark is untouched and cannot match a park of this shape: an
+  execution-evidenced park means the item LANDED, so requeueing it would
+  double-grant. Operators holding one should resolve it with
+  `bb-blocked INDEX --confirm`, never redeliver.
 
   The insert lane needs no equivalent: its witness is the reported slot record
-  (`id` plus `quantity >= delta`), which a concurrent pickup only ever
-  strengthens.
+  (`id` plus `quantity >= delta`), which concurrent activity does not weaken.
 
 * **A truncated shad log resets the attach-wait freshness floor
   (clients#440).** shadPS4 appends to `shad_log.txt` within a run but

@@ -329,29 +329,39 @@ impl<R: Runtime> GrantSession<R> {
             && record.quantity.is_some_and(|q| q >= command.quantity);
         if !slot_verified && actual != Some(wanted) {
             // clients#443: on the delta lane, EXECUTION EVIDENCE outranks the
-            // equality. `native_done` is already true here, and the result cell
-            // is no longer the `EMPTY_SLOT` sentinel the guest writes before
-            // arming the cave -- so `native_routines.quantity_delta` ran and
-            // the item IS in the inventory. The equality can still be broken
-            // from ABOVE by a concurrent acquisition: the player loots one more
-            // of the same id between the dequeue-time observation and the
-            // game-thread execution, and the read-back total lands above
-            // `expected_after`. That race is real and unavoidable (PR #429's
-            // body predicted exactly this residue); parking a delivered item
-            // for it is not. A pickup can only ADD, so a surplus is completion.
+            // equality, in EITHER direction. `native_done` is already true
+            // here, and the result cell is no longer the `EMPTY_SLOT` sentinel
+            // the guest writes before arming the cave -- and that cell is
+            // written only by the routine's own return, so
+            // `native_routines.quantity_delta` ran. `quantity_delta` is an
+            // unconditional add: if it ran, the delta APPLIED and the item was
+            // delivered. What the read-back TOTAL then says is a statement
+            // about the player, not about the grant.
             //
-            // A DEFICIT is untouched -- items are genuinely missing, and that
-            // is still the starve-and-park case. So is any wrong count without
-            // execution evidence: an unexecuted delta must never read as
-            // delivered.
-            if self.delta_lane
-                && native_result != EMPTY_SLOT
-                && let Some(surplus) = actual.filter(|a| *a > wanted)
-            {
+            // Above `expected_after`: a concurrent acquisition -- the player
+            // loots more of the same id between the dequeue-time observation
+            // and the game-thread execution. Below it: a concurrent SPEND in
+            // that same window, or a capped stack overflowing into storage
+            // (Bloodborne consumables overflow; the pouch count can sit still
+            // while the items land in storage). With execution evidence we
+            // cannot separate a spend from an overflow, and do not need to --
+            // both mean delivered. That race is real and unavoidable (PR #429's
+            // body predicted exactly this residue); parking a delivered item
+            // for it is not.
+            //
+            // Without execution evidence nothing changes: the equality and both
+            // of its failure directions keep their full meaning there, because
+            // an unexecuted delta must never read as delivered.
+            if self.delta_lane && native_result != EMPTY_SLOT && let Some(n) = actual {
+                let cause = if n > wanted {
+                    "concurrent pickup"
+                } else {
+                    "concurrent spend or storage overflow"
+                };
                 return self.finish(
                     "completed",
                     format!(
-                        "tag={} completed with concurrent pickup: expected_after={wanted} actual={surplus} native_result={native_result}",
+                        "tag={} completed with {cause}: expected_after={wanted} actual={n} native_result={native_result}",
                         command.tag
                     ),
                 );
@@ -543,6 +553,13 @@ mod tests {
         // `native_done` that lands the delta, which is exactly the window the
         // client cannot observe.
         concurrent_pickup: u32,
+        // clients#443: quantity of the same id the PLAYER consumes while the
+        // native call is in flight -- the concurrent SPEND that pulls the
+        // read-back total below `expected_after` even though the delta landed.
+        // The inverse of `concurrent_pickup`, and the same unobservable window.
+        // It equally models a capped stack overflowing into storage: the delta
+        // ran, and the pouch count the client reads back does not show it.
+        concurrent_spend: u32,
         // clients#443: report `done` with the result cell still holding the
         // `EMPTY_SLOT` sentinel -- completion signalled with NO execution
         // evidence. Only meaningful together with `complete_without_applying`.
@@ -650,7 +667,8 @@ mod tests {
                     .stacks
                     .get_mut(&descriptor.normalized_id)
                     .expect("the delta lane is only queued for a live stack");
-                stack.quantity += quantity + self.concurrent_pickup;
+                stack.quantity = (stack.quantity + quantity + self.concurrent_pickup)
+                    .saturating_sub(self.concurrent_spend);
                 let total = stack.quantity;
                 self.result = slot;
                 self.slots.insert(
@@ -927,12 +945,19 @@ mod tests {
         );
     }
 
-    /// clients#443 control, the other direction: execution evidence is present
-    /// but the read-back is BELOW `expected_after`. Items are genuinely
-    /// missing, nothing the player can do adds a deficit, and this is still a
-    /// real failure. Surplus tolerance must not become "any inequality passes".
+    /// clients#443, owner review of PR #444: the surplus-only rule was half
+    /// done. This test asserted a park and now asserts a completion -- a
+    /// deliberate premise change, not a loosened assertion. The reviewer's
+    /// point: `quantity_delta` is an unconditional ADD and the result cell is
+    /// written only by that routine's own return, so execution evidence proves
+    /// the delta APPLIED. A read-back that then sits BELOW `expected_after` is
+    /// a statement about the player -- a concurrent spend in the
+    /// observe-to-execute window, or a capped stack overflowing into storage --
+    /// not about the grant, which was delivered either way. Here the fake
+    /// reports done with the real slot as the result and the stack never
+    /// moves: maximal deficit, full evidence, and it completes.
     #[test]
-    fn a_delta_short_of_its_expected_total_still_parks_with_execution_evidence() {
+    fn a_delta_short_of_its_expected_total_completes_with_execution_evidence() {
         let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
         let mut runtime = FakeRuntime::default().with_stack(
             normalized,
@@ -943,24 +968,87 @@ mod tests {
                 quantity_address: Some(0x1000),
             },
         );
-        // Done is reported and the real slot comes back as the result -- the
-        // same execution evidence the surplus path trusts -- but the stack
-        // never moves, so the read-back stays at 5 against a wanted 7.
         runtime.complete_without_applying = true;
         let mut session = session(runtime);
         session
             .submit(goods_command(0x384, 2, "ap_1", Some(5)), false)
             .unwrap();
         assert_eq!(session.poll(), "executing");
-        let mut last = String::new();
-        for _ in 0..contract().policy.verify_polls {
-            last = session.poll();
-        }
-        assert_eq!(last, "failed", "state: {:?}", session.state());
-        assert!(session.state().detail.contains("actual=Some(5)"));
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+        let detail = &session.state().detail;
         assert!(
-            !session.state().detail.contains("concurrent pickup"),
-            "a deficit is never a pickup"
+            detail.contains("completed with concurrent spend or storage overflow")
+                && detail.contains("expected_after=7")
+                && detail.contains("actual=5"),
+            "detail must name the deficit and its cause, got: {detail}"
+        );
+        assert!(
+            !detail.contains("concurrent pickup"),
+            "a deficit is not a pickup"
+        );
+        // Durable arithmetic is untouched in this direction too: the rows a
+        // replay compares against stay the honest arithmetic of the grant.
+        assert_eq!(session.state().expected_before, Some(5));
+        assert_eq!(session.state().expected_after, Some(7));
+        assert!(session.state().is_success());
+        assert!(session.runtime_mut().writes.is_empty());
+    }
+
+    /// clients#443: the modelled inverse of the concurrent pickup. The delta
+    /// DOES land on the game thread, and the player spends three of the same
+    /// id in the same unobservable window, so the read-back total (5 + 2 - 3)
+    /// sits below `expected_after=7`. The identical fake stands in for a
+    /// capped stack overflowing into storage -- the delta ran, the pouch count
+    /// the client reads back does not show it -- which is why the detail names
+    /// both and claims neither. Execution evidence completes it, and the
+    /// ledger seam is direction-blind: the acknowledgement records the AP
+    /// item's own quantity, drops the baseline, and the next grant of the same
+    /// id re-observes the live stack -- pinned once for both directions by
+    /// `ledger::tests::a_completion_drops_the_baseline_so_the_next_grant_re_observes`.
+    #[test]
+    fn a_concurrent_spend_during_a_delta_completes_with_execution_evidence() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        runtime.concurrent_spend = 3;
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "ap_4", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        assert_eq!(
+            session.poll(),
+            "completed",
+            "a delivered item must not park: {:?}",
+            session.state()
+        );
+        let detail = &session.state().detail;
+        assert!(
+            detail.contains("completed with concurrent spend or storage overflow")
+                && detail.contains("expected_after=7")
+                && detail.contains("actual=4"),
+            "detail must name the deficit, got: {detail}"
+        );
+        assert_eq!(session.state().expected_before, Some(5));
+        assert_eq!(session.state().expected_after, Some(7));
+        assert!(session.state().is_success());
+        assert!(session.runtime_mut().writes.is_empty());
+        // The stack really is short of the expectation, and the grant really
+        // did land in it: 5 + 2 - 3.
+        assert_eq!(
+            session
+                .runtime_mut()
+                .find_stack(normalized)
+                .unwrap()
+                .quantity,
+            4
         );
     }
 
