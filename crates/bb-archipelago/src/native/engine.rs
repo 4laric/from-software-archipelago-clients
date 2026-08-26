@@ -137,6 +137,30 @@ impl<R: Runtime> NativeDelivery<R> {
         runtime.find_stack(normalized_id)
     }
 
+    /// Whether the command published for `tag` may already have applied
+    /// (clients#427 follow-up). False only for the statuses that provably
+    /// precede any write -- the command is held in the machine and nothing has
+    /// been queued for the cave or written to the stack -- and for a tag this
+    /// machine has no record of at all. Those are exactly the states in which
+    /// the client's recorded baseline must be re-sampled instead of compared,
+    /// because the only thing that can have moved the stack is the player.
+    ///
+    /// A durable prior restored by [`Self::with_prior`] is classified the same
+    /// way, so a restart mid-execution still replays against its baseline.
+    pub fn command_may_have_applied(&self, tag: &str) -> bool {
+        if self.finished.contains_key(tag) {
+            return true;
+        }
+        let state = self.session.state();
+        if state.tag != tag {
+            return false;
+        }
+        !matches!(
+            state.status.as_str(),
+            "queued" | "awaiting_inventory" | "busy"
+        )
+    }
+
     /// The live durable state of the current grant, for the client to persist.
     pub fn state(&self) -> &DurableState {
         self.session.state()
@@ -352,5 +376,53 @@ mod tests {
             .grant(goods_request(0x384, 2, "recv_m", Some(5)))
             .unwrap();
         assert!(matches!(step, GrantStep::Failed { status, .. } if status == "quantity_mismatch"));
+    }
+
+    /// clients#427 follow-up: the machine tells the client whether a published
+    /// command may already have applied. A command retained in
+    /// `awaiting_inventory` (the stack is absent, the operator is being asked
+    /// to acquire one) has not -- so the client re-observes instead of
+    /// comparing the baseline it sampled before that wait. A command that ran
+    /// has, and keeps its baseline for replay recovery.
+    #[test]
+    fn a_retained_command_has_not_applied_but_an_executed_one_has() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut engine = NativeDelivery::new(
+            FakeRuntime::default(),
+            contract().descriptor,
+            contract().policy,
+        );
+        // Unknown tag: nothing was ever published, so nothing can have applied.
+        assert!(!engine.command_may_have_applied("recv_1"));
+
+        // Inventory is not hydrated: the command is retained, not executed.
+        assert_eq!(
+            engine
+                .grant(goods_request(0x384, 2, "recv_1", Some(3)))
+                .unwrap(),
+            GrantStep::Pending
+        );
+        assert_eq!(engine.state().status, "awaiting_inventory");
+        assert!(!engine.command_may_have_applied("recv_1"));
+
+        // The stack shows up and the direct write runs: now it may have
+        // applied, and stays that way once terminal.
+        engine.runtime_mut().ready = true;
+        engine.runtime_mut().stacks.insert(
+            normalized,
+            StackView {
+                quantity: 3,
+                exists: true,
+                slot: Some(1),
+                quantity_address: Some(0x2000),
+            },
+        );
+        assert_eq!(
+            engine
+                .grant(goods_request(0x384, 2, "recv_1", Some(3)))
+                .unwrap(),
+            GrantStep::Complete
+        );
+        assert!(engine.command_may_have_applied("recv_1"));
     }
 }

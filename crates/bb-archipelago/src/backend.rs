@@ -102,6 +102,22 @@ pub trait BloodborneBackend {
     ) -> Result<StackObservation> {
         Ok(StackObservation::Unsupported)
     }
+    /// Whether the command published for `tag` may already have applied to the
+    /// game (clients#427 follow-up).
+    ///
+    /// The recorded baseline is only binding while this is true. A command the
+    /// harness is merely *retaining* -- the native machine's
+    /// `awaiting_inventory`, which can wait minutes for the player to acquire
+    /// a stack of the item -- cannot have moved the stack, so drift from the
+    /// recorded number is the player's own doing and re-observing is both safe
+    /// and required. Freezing the baseline there is what re-parked oz's
+    /// requeued backlog as `quantity_mismatch`.
+    ///
+    /// The default `true` is the pre-existing freeze-on-first-observe
+    /// behaviour, for a backend that cannot tell (the CE file bridge).
+    fn grant_may_have_applied(&mut self, _tag: &str) -> Result<bool> {
+        Ok(true)
+    }
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress>;
     /// Retract a published-but-unexecuted grant command (clients#296). The
     /// client calls this when the validated context the command was published
@@ -312,6 +328,11 @@ pub struct MockBackend {
     /// Off models inventory geometry that has not hydrated yet: no baseline,
     /// so no grant this poll.
     pub stack_observation_ready: bool,
+    /// clients#427 follow-up: tags whose published command this mock models as
+    /// *retained but never handed to the game* -- the native machine sitting in
+    /// `awaiting_inventory`. Their recorded baseline is not binding, so the
+    /// next publication re-observes the live stack.
+    pub retained_unwitnessed: HashSet<String>,
     grant_delays: HashMap<String, u8>,
     equip_delays: HashMap<String, u8>,
     completed_grants: HashSet<String>,
@@ -337,6 +358,7 @@ impl Default for MockBackend {
             event_flags_armed: true,
             stack_observation_supported: true,
             stack_observation_ready: true,
+            retained_unwitnessed: HashSet::new(),
             grant_delays: HashMap::new(),
             equip_delays: HashMap::new(),
             completed_grants: HashSet::new(),
@@ -432,6 +454,10 @@ impl BloodborneBackend for MockBackend {
                 .copied()
                 .unwrap_or(0),
         ))
+    }
+
+    fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
+        Ok(!self.retained_unwitnessed.contains(tag))
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {

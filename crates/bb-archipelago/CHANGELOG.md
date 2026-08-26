@@ -1,5 +1,39 @@
 ## Unreleased
 
+### Fixed
+
+* **A retained grant command re-observes its baseline instead of comparing a
+  stale one (clients#427, follow-up to clients#428).** oz ran the clients#428
+  build and the requeued backlog re-parked as `quantity_mismatch`: pebbles
+  `expected_before=5 actual=20`, bullets `expected_before=18 actual=17`.
+  The premise "the baseline is sampled at enqueue time" is refuted: the client
+  observes at the *head of the queue*, in the same call that publishes the
+  command, with one command in flight at a time
+  (`client_loop.rs`, the observation immediately precedes `grant_item`). The
+  stale number comes from afterwards. A published command is not always an
+  executed one: the native machine can *retain* it in `awaiting_inventory` --
+  the state whose own operator message asks the player to go acquire a stack of
+  the item -- for an unbounded number of polls. The baseline sampled before that
+  wait was frozen, so everything the player did during it (spending a bullet,
+  buying twenty pebbles) read back as a mismatch and parked the item.
+  A backend now reports whether the command for a tag *may already have
+  applied*. The recorded baseline is binding only while that is true; while the
+  command is merely retained the next publication re-observes the live stack and
+  records the fresh number durably before publishing. The replay contract is
+  unchanged: a command that may have applied -- anything past `queued` /
+  `awaiting_inventory` / `busy`, including a durable prior restored after a
+  restart -- keeps its recorded number, so `recovered_complete` still decides a
+  restart mid-grant instead of double-granting. Backends that cannot tell (the
+  CE file bridge) keep the previous freeze-on-first-observe behaviour.
+  Residual and stated rather than papered over: the observation and the
+  execution are one poll tick apart at most (the same `poll_items` call
+  publishes the command the machine then evaluates), so a player who spends in
+  that window can still park an item. What is closed is the *unbounded* window
+  -- a baseline no longer survives a wait of arbitrary length.
+  The startup requeue from clients#428 covers today's re-parks unchanged: they
+  carry the same `quantity_mismatch` park status, so they re-enter the delivery
+  queue on the next launch and deliver against a freshly observed stack.
+
 ### Added
 
 * **The client tees its own output: console AND `--log-file` (clients#425).**

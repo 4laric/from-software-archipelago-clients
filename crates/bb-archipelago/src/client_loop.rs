@@ -506,10 +506,23 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             //    ledger's lifetime delivered sum is NOT the current inventory
             //    of anything the player can spend, which is why every grant of
             //    a consumable parked once one was used.
+            //  * RETAINED -- a baseline exists, but the backend reports the
+            //    command it belongs to cannot have applied yet (it is still
+            //    waiting on inventory, or on the player). It is re-observed
+            //    below: a number sampled before a wait of unbounded length is
+            //    not a precondition, it is the stale number that re-parked
+            //    oz's requeued backlog.
             //
             // Double-delivery protection is unchanged and still lives in the
             // ledger's index cursor: an index is delivered at most once.
-            let expected_before = match pending.observed_before {
+            let recorded_baseline = pending.observed_before;
+            let baseline_is_binding = match recorded_baseline {
+                Some(_) => self
+                    .backend
+                    .grant_may_have_applied(&grant_tag(item.index))?,
+                None => false,
+            };
+            let expected_before = match recorded_baseline.filter(|_| baseline_is_binding) {
                 Some(recorded) => recorded,
                 None => match self.backend.observe_stack_quantity(
                     pending.normalized_item_id,
@@ -2387,6 +2400,200 @@ mod tests {
         );
         assert_eq!(settled.poll_items(&received).unwrap(), ItemPollResult::Idle);
         assert!(settled.backend().grants.is_empty());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427 follow-up (clients#428 re-park): THE motivating case. The
+    /// startup requeue hands the loop a backlog of many grants of the SAME
+    /// item, and each delivery raises that stack. Every grant must observe the
+    /// stack as it stands when its own command reaches the head of the queue --
+    /// including after the player spends some mid-drain -- so the whole backlog
+    /// drains and nothing parks.
+    #[test]
+    fn a_same_typed_backlog_drains_without_parking() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_04CE, None), 5);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received: Vec<IncomingItem> = (0..6)
+            .map(|index| IncomingItem {
+                index,
+                ap_item_id: 2000,
+            })
+            .collect();
+
+        for index in 0..6u64 {
+            if index == 3 {
+                // The player uses two of the item mid-drain.
+                let current = client.backend().inventory[&(0x4000_04CE, None)];
+                client
+                    .backend_mut()
+                    .inventory
+                    .insert((0x4000_04CE, None), current - 2);
+            }
+            assert!(
+                matches!(
+                    client.poll_items(&received).unwrap(),
+                    ItemPollResult::Completed(CompletedItem { index: done, .. }) if done == index
+                ),
+                "index {index} did not deliver"
+            );
+        }
+        // Six deliveries of one each onto a stack of 5, minus the two spent.
+        assert_eq!(client.backend().grants.len(), 6);
+        assert_eq!(client.backend().inventory[&(0x4000_04CE, None)], 9);
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .blocked_entries()
+                .count(),
+            0
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427 follow-up: the defect oz reproduced within the hour. A
+    /// published command that the harness is only RETAINING (native
+    /// `awaiting_inventory` -- it can wait minutes, and its own operator
+    /// message asks the player to go acquire the item) had its baseline frozen
+    /// at publication. Everything the player did during that wait then read as
+    /// a `quantity_mismatch`. The baseline is binding only while the command
+    /// may have applied; while it is merely retained the next publication
+    /// re-observes, and the fresh number is what is recorded and delivered
+    /// against.
+    #[test]
+    fn a_retained_command_re_observes_before_it_publishes() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_04CE, None), 5);
+        backend.delay_grant("ap_0", 1);
+        backend.retained_unwitnessed.insert("ap_0".into());
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .observed_before,
+            Some(5)
+        );
+
+        // The wait is what the operator was told to do something about: the
+        // player stocks up while the command sits retained.
+        client
+            .backend_mut()
+            .inventory
+            .insert((0x4000_04CE, None), 20);
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        // Delivered against 20, not the stale 5 that parked oz's backlog.
+        assert_eq!(client.backend().grants[0].expected_before, 20);
+        assert_eq!(client.backend().inventory[&(0x4000_04CE, None)], 21);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427 follow-up: the replay contract is unchanged for a command
+    /// that may have applied. The same fixture, with the harness NOT reporting
+    /// the command as merely retained, still freezes its baseline -- so a
+    /// restart mid-grant replays against the recorded number instead of a
+    /// fresh sample. (The paired witness is
+    /// `a_restart_mid_grant_replays_against_the_recorded_baseline`.)
+    #[test]
+    fn a_command_that_may_have_applied_keeps_its_recorded_baseline() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_04CE, None), 5);
+        backend.delay_grant("ap_0", 1);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        client
+            .backend_mut()
+            .inventory
+            .insert((0x4000_04CE, None), 20);
+        let error = client.poll_items(&received).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("expected 5, found 20"),
+            "a possibly-applied command must keep its baseline, got: {error:#}"
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427 follow-up, point 4: entries parked as `quantity_mismatch`
+    /// by the clients#428 build itself re-enter the queue on startup. The park
+    /// reason is recorded the same way, so the requeue that shipped with
+    /// clients#428 covers today's re-parks -- and after the requeue they
+    /// deliver against a freshly observed stack.
+    #[test]
+    fn a_quantity_mismatch_park_from_the_previous_build_requeues_and_delivers() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_04CE, None), 5);
+        backend.fail_grant_terminally_with("ap_0", "quantity_mismatch");
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Blocked(BlockedItem { index: 0, .. })
+        ));
+
+        // Restart: the park requeues, and the retry observes the stack as it
+        // now stands (the player picked more up in the meantime).
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_04CE, None), 20);
+        let mut client = loop_with(backend, persisted, ledger_path.clone(), config());
+        assert_eq!(client.requeue_quantity_mismatch_parks().unwrap(), vec![0]);
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        assert_eq!(client.backend().grants[0].expected_before, 20);
         std::fs::remove_file(ledger_path).unwrap();
     }
 }
