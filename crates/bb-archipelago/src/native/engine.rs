@@ -243,6 +243,9 @@ mod tests {
         queued: Option<(u32, u32, u32)>, // normalized id, delta, slot
         result: u32,
         writes: usize,
+        // clients#443: quantity of the same id the player acquires while the
+        // native call is in flight.
+        concurrent_pickup: u32,
     }
 
     impl Runtime for FakeRuntime {
@@ -306,7 +309,7 @@ mod tests {
                     slot: Some(slot),
                     quantity_address: Some(0x2000),
                 });
-                stack.quantity += delta;
+                stack.quantity += delta + self.concurrent_pickup;
                 stack.exists = true;
                 self.result = slot;
             }
@@ -328,6 +331,61 @@ mod tests {
             quantity: qty,
             expected_before: before,
         }
+    }
+
+    /// clients#443: a surplus completion is a COMPLETION at the engine seam.
+    /// This is what the client loop consumes, and `GrantStep::Complete` is the
+    /// only thing it needs to acknowledge the item in order, mark the grant
+    /// complete, and move the cursor -- byte for byte the normal path, with
+    /// the AP item's own quantity recorded and the player's pickup recorded
+    /// nowhere. A `Failed` here is what parked oz's delivered item.
+    #[test]
+    fn a_concurrent_pickup_reaches_the_client_as_a_normal_completion() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime {
+            ready: true,
+            concurrent_pickup: 1,
+            ..Default::default()
+        };
+        runtime.stacks.insert(
+            normalized,
+            StackView {
+                quantity: 3,
+                exists: true,
+                slot: Some(1),
+                quantity_address: Some(0x2000),
+            },
+        );
+        let mut engine = NativeDelivery::new(runtime, contract().descriptor, contract().policy);
+        assert_eq!(
+            engine
+                .grant(goods_request(0x384, 2, "ap_0", Some(3)))
+                .unwrap(),
+            GrantStep::Pending
+        );
+        let step = engine
+            .grant(goods_request(0x384, 2, "ap_0", Some(3)))
+            .unwrap();
+        assert_eq!(
+            step,
+            GrantStep::Complete,
+            "the client must acknowledge, not park: {:?}",
+            engine.state()
+        );
+        // The stack really does hold the surplus, and the durable rows the
+        // client persists still describe the GRANT, not the pickup.
+        assert_eq!(engine.runtime_mut().stacks[&normalized].quantity, 6);
+        assert_eq!(engine.state().expected_after, Some(5));
+        assert!(engine.state().is_success());
+        assert_eq!(engine.runtime_mut().writes, 0);
+        // Idempotent like any other completion: re-asking never re-drives.
+        assert_eq!(
+            engine
+                .grant(goods_request(0x384, 2, "ap_0", Some(3)))
+                .unwrap(),
+            GrantStep::Complete
+        );
+        assert_eq!(engine.runtime_mut().stacks[&normalized].quantity, 6);
     }
 
     /// clients#433: the existing-stack grant is the cave's delta lane. Two
