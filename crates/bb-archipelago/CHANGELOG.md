@@ -2,6 +2,25 @@
 
 ### Fixed
 
+* **A terminal startup error now prints through the tee (clients#437).**
+  `fn main() -> Result<()>` handed any bubbled `Err` to Rust's default
+  termination handler, which prints `Error: {err:?}` onto the process's real
+  stderr. Since clients#426 the client owns its own tee and the launcher no
+  longer pipes the child's stderr, so that line reached neither `client.log`
+  nor the launcher's early-exit dialog: the log stopped mid-startup and the
+  dialog showed exit code 1 over a healthy-looking tail. Badgerous hit this
+  live -- `verify_suppression_install` refused an installed binder and the
+  reason evaporated.
+
+  The run moved into `fn run() -> Result<()>`; `fn main()` prints the full
+  anyhow chain via `client_eprintln!` in the same text the default handler
+  produced (`Error: ` plus the `Caused by:` chain) and then exits 1. Nothing
+  double-prints: no path both prints an error and returns it. Unchanged
+  residual: a failure inside `arguments()` happens before the log path is
+  known and can still only reach the console.
+
+### Fixed
+
 * **Existing-stack grants go through the cave, not an external write
   (clients#433).** oz's fresh seed parked consumables intermittently as
   `write_error: tag=ap_N quantity write failed` -- the same item type
