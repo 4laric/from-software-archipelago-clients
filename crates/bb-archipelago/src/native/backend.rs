@@ -293,6 +293,10 @@ impl BloodborneBackend for NativeBackend {
         Ok(StackObservation::Quantity(stack.quantity))
     }
 
+    fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
+        Ok(self.delivery.command_may_have_applied(tag))
+    }
+
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
         let request = NativeGrantRequest {
             tag: grant.tag.clone(),
