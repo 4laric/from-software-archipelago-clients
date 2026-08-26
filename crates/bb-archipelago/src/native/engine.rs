@@ -8,10 +8,12 @@
 //! already enforce.
 //!
 //! Category branch (contract `source_selection`): category-4 goods use the
-//! in-frame descriptor and, when a stack already exists, a direct quantity
-//! write; category-0 equipment uses the persistent descriptor and the native
-//! `ItemGrant`. Both routes are chosen inside [`GrantSession`] by whether the
-//! stack exists and whether the raw id takes the persistent-source branch. The
+//! in-frame descriptor, category-0 equipment the persistent one. Both are
+//! chosen inside [`GrantSession`] by whether the raw id takes the
+//! persistent-source branch. *Every* quantity change, existing stack or not,
+//! goes through the cave on the game thread -- an insert (`request = 1`) when
+//! the stack is absent, a delta (`request = 2`) when it exists. There is no
+//! external-write lane any more (clients#433). The
 //! raw/normalized descriptor pairing is validated here before anything is
 //! queued, matching `FileBackend::grant_item` and `config.rs`.
 
@@ -232,12 +234,15 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // A minimal cave-modelling runtime (a trimmed copy of delivery's fake): a
-    // direct-write path over an existing stack.
+    // A minimal cave-modelling runtime (a trimmed copy of delivery's fake):
+    // the existing-stack delta lane, applied on the next `native_done`.
     #[derive(Default)]
     struct FakeRuntime {
         ready: bool,
         stacks: HashMap<u32, StackView>,
+        queued: Option<(u32, u32, u32)>, // normalized id, delta, slot
+        result: u32,
+        writes: usize,
     }
 
     impl Runtime for FakeRuntime {
@@ -260,34 +265,55 @@ mod tests {
                     }),
             )
         }
-        fn read_slot_record(&mut self, _slot: u32) -> SlotRecord {
-            SlotRecord::default()
-        }
-        fn write_quantity(&mut self, address: u64, value: u32) -> bool {
-            for stack in self.stacks.values_mut() {
-                if stack.quantity_address == Some(address) {
-                    stack.quantity = value;
-                }
+        fn read_slot_record(&mut self, slot: u32) -> SlotRecord {
+            let found = self
+                .stacks
+                .iter()
+                .find(|(_, view)| view.slot == Some(slot))
+                .map(|(id, view)| (*id, view.quantity, view.quantity_address));
+            match found {
+                Some((id, quantity, address)) => SlotRecord {
+                    normalized_id: Some(id),
+                    quantity: Some(quantity),
+                    address,
+                },
+                None => SlotRecord::default(),
             }
-            true
+        }
+        fn write_quantity(&mut self, _address: u64, _value: u32) -> bool {
+            // clients#433: nothing may reach this. Counted, never honoured.
+            self.writes += 1;
+            false
         }
         fn request_pending(&mut self) -> bool {
-            false
+            self.queued.is_some()
         }
         fn queue_native(
             &mut self,
-            _d: &ItemGrantDescriptor,
-            _q: u32,
-            _s: Option<u32>,
+            d: &ItemGrantDescriptor,
+            q: u32,
+            s: Option<u32>,
             _a: Option<u64>,
             _m: bool,
         ) {
+            self.queued = Some((d.normalized_id, q, s.unwrap_or(0)));
         }
         fn native_done(&mut self) -> bool {
+            if let Some((normalized, delta, slot)) = self.queued.take() {
+                let stack = self.stacks.entry(normalized).or_insert(StackView {
+                    quantity: 0,
+                    exists: true,
+                    slot: Some(slot),
+                    quantity_address: Some(0x2000),
+                });
+                stack.quantity += delta;
+                stack.exists = true;
+                self.result = slot;
+            }
             true
         }
         fn native_result(&mut self) -> u32 {
-            0
+            self.result
         }
         fn clear_request(&mut self) {}
     }
@@ -304,8 +330,11 @@ mod tests {
         }
     }
 
+    /// clients#433: the existing-stack grant is the cave's delta lane. Two
+    /// polls (queue, then verify the cave's completion), and the cached
+    /// terminal step answers every later ask without re-driving.
     #[test]
-    fn a_direct_write_grant_completes_and_is_idempotent() {
+    fn an_existing_stack_grant_completes_over_the_delta_lane_and_is_idempotent() {
         let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
         let mut runtime = FakeRuntime {
             ready: true,
@@ -321,10 +350,17 @@ mod tests {
             },
         );
         let mut engine = NativeDelivery::new(runtime, contract().descriptor, contract().policy);
+        assert_eq!(
+            engine
+                .grant(goods_request(0x384, 2, "recv_9", Some(3)))
+                .unwrap(),
+            GrantStep::Pending
+        );
         let step = engine
             .grant(goods_request(0x384, 2, "recv_9", Some(3)))
             .unwrap();
         assert_eq!(step, GrantStep::Complete);
+        assert_eq!(engine.runtime_mut().writes, 0);
         // Asking again returns the cached terminal step without re-driving.
         assert_eq!(
             engine
@@ -405,7 +441,7 @@ mod tests {
         assert_eq!(engine.state().status, "awaiting_inventory");
         assert!(!engine.command_may_have_applied("recv_1"));
 
-        // The stack shows up and the direct write runs: now it may have
+        // The stack shows up and the delta is queued: now it may have
         // applied, and stays that way once terminal.
         engine.runtime_mut().ready = true;
         engine.runtime_mut().stacks.insert(
@@ -417,6 +453,13 @@ mod tests {
                 quantity_address: Some(0x2000),
             },
         );
+        assert_eq!(
+            engine
+                .grant(goods_request(0x384, 2, "recv_1", Some(3)))
+                .unwrap(),
+            GrantStep::Pending
+        );
+        assert!(engine.command_may_have_applied("recv_1"));
         assert_eq!(
             engine
                 .grant(goods_request(0x384, 2, "recv_1", Some(3)))

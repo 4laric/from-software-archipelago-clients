@@ -126,6 +126,15 @@ impl<P: ProcessMemory> GuestRuntime<P> {
     }
 }
 
+/// `state_cells.request` = 1: the cave inserts a new stack via `ItemGrant`.
+pub const REQUEST_NATIVE_INSERT: u32 = 1;
+/// `state_cells.request` = 2: the cave applies `quantity` as a DELTA to the
+/// stack named by `slot_index` / `item_quantity_pointer`, via
+/// `native_routines.quantity_delta`. Running it on the game thread is what
+/// clients#433 needed: the external write it replaced is refused
+/// intermittently by shadPS4's protection tracking of the inventory pages.
+pub const REQUEST_EXISTING_STACK_DELTA: u32 = 2;
+
 impl<P: ProcessMemory> Runtime for GuestRuntime<P> {
     fn inventory_ready(&mut self) -> bool {
         self.record(self.memory.read_u64(self.cells.inventory))
@@ -220,7 +229,17 @@ impl<P: ProcessMemory> Runtime for GuestRuntime<P> {
         let _ = self.record(self.memory.write_u32(self.cells.quantity, quantity));
         let _ = self.record(self.memory.write_u32(self.cells.result, EMPTY_SLOT));
         let _ = self.record(self.memory.write_u32(self.cells.done, 0));
-        let _ = self.record(self.memory.write_u32(self.cells.request, 1));
+        // Contract v5 `state_cells.request`: 1 = native insert, 2 =
+        // existing-stack delta. The delta branch is the one that takes
+        // `slot_index` and `item_quantity_pointer` and reads `quantity` as a
+        // DELTA (`native_routines.quantity_delta`, edx = delta); an insert
+        // has neither argument. So the lane IS "both arguments present".
+        let request = if slot.is_some() && quantity_address.is_some() {
+            REQUEST_EXISTING_STACK_DELTA
+        } else {
+            REQUEST_NATIVE_INSERT
+        };
+        let _ = self.record(self.memory.write_u32(self.cells.request, request));
     }
 
     fn native_done(&mut self) -> bool {
@@ -326,6 +345,41 @@ mod tests {
         let mut guest = GuestRuntime::new(memory, base).unwrap();
         assert!(!guest.inventory_ready());
         assert!(guest.take_error().is_some());
+    }
+
+    /// clients#433: the `request` value IS the lane. Both arguments present
+    /// (slot + record pointer) is the contract's existing-stack delta branch
+    /// (`request = 2`, `quantity` read as a delta); neither is the insert
+    /// (`request = 1`).
+    #[test]
+    fn the_request_value_names_the_lane() {
+        let c = contract();
+        let base = 0x4000_0000;
+        let request_rva = base + c.state_cell("request").unwrap().rva;
+        let quantity_rva = base + c.state_cell("quantity").unwrap().rva;
+        let slot_rva = base + c.state_cell("slot_index").unwrap().rva;
+        let pointer_rva = base + c.state_cell("item_quantity_pointer").unwrap().rva;
+        let descriptor = ItemGrantDescriptor::new(0xB000_0384, 0x4000_0384);
+
+        let mut guest = GuestRuntime::new(FakeMemory::new(), base).unwrap();
+        guest.queue_native(&descriptor, 2, Some(3), Some(0x1000), false);
+        assert_eq!(
+            guest.memory().read_u32(request_rva).unwrap(),
+            REQUEST_EXISTING_STACK_DELTA
+        );
+        // The delta, not the resulting total, and both cave arguments.
+        assert_eq!(guest.memory().read_u32(quantity_rva).unwrap(), 2);
+        assert_eq!(guest.memory().read_u32(slot_rva).unwrap(), 3);
+        assert_eq!(guest.memory().read_u64(pointer_rva).unwrap(), 0x1000);
+
+        let mut guest = GuestRuntime::new(FakeMemory::new(), base).unwrap();
+        guest.queue_native(&descriptor, 2, None, None, false);
+        assert_eq!(
+            guest.memory().read_u32(request_rva).unwrap(),
+            REQUEST_NATIVE_INSERT
+        );
+        assert_eq!(guest.memory().read_u32(slot_rva).unwrap(), EMPTY_SLOT);
+        assert_eq!(guest.memory().read_u64(pointer_rva).unwrap(), 0);
     }
 
     #[test]

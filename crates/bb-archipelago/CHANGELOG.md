@@ -2,6 +2,40 @@
 
 ### Fixed
 
+* **Existing-stack grants go through the cave, not an external write
+  (clients#433).** oz's fresh seed parked consumables intermittently as
+  `write_error: tag=ap_N quantity write failed` -- the same item type
+  delivering at one AP index and failing at the next. `GrantSession` took a
+  `direct_write` branch whenever the stack already existed, and that branch
+  issued an external `WriteProcessMemory` into the guest *inventory heap*.
+  bb-archipelago#144 established with two live repros that shadPS4
+  protection-tracks those pages: the write fails intermittently
+  (read-ok/write-ok/read-FAIL microseconds apart) and can wound the emulator.
+  The CLI tool was moved off it in bb-archipelago#145; the client's port kept
+  the branch. It is deleted. An existing stack now takes the contract's
+  existing-stack delta lane -- `state_cells.request = 2`, `quantity` read as a
+  DELTA by `native_routines.quantity_delta` (`edx = delta`), addressed by
+  `slot_index` and `item_quantity_pointer` -- which runs on the game thread.
+  No contract change: value `2` and the routine are already validated in v5.
+  Eboot-image writes (the caves and the state cells) are unaffected; only
+  inventory-heap writes were ever the hazard.
+
+  Two consequences that are tested, not assumed. The verify no longer accepts
+  the reported slot as a witness on the delta lane -- a stack of 5 owed 2 more
+  already satisfies "the slot holds at least `quantity`" *before* the delta
+  lands -- so only the read-back total completes it. And an existing stack with
+  no record pointer now parks as `write_error (... quantity pointer missing)`
+  rather than falling back to a write, because the fallback is what was
+  removed.
+
+* **Parks caused by that refused write redeliver on startup (clients#433).**
+  The startup unpark (clients#427) generalises from `quantity_mismatch` to
+  "every park whose cause is known to be fixed", which is now also a
+  `write_error` whose detail ends `quantity write failed`. Every other park
+  stays put for `bb-blocked` -- including `write_error (... quantity pointer
+  missing)`, a different cause. `SlotLedger::requeue_quantity_mismatch_parks`
+  is renamed `requeue_fixed_cause_parks` to say what it does.
+
 * **The shipped binary actually calls the live-stack observation
   (clients#427).** `observe_stack_quantity` (clients#428) and
   `grant_may_have_applied` (clients#429) were implemented on `NativeBackend`

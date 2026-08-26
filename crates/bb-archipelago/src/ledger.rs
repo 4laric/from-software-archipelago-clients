@@ -304,20 +304,47 @@ impl SlotLedger {
         Some(blocked.split(' ').next().unwrap_or(blocked))
     }
 
-    /// Requeue every entry parked with `quantity_mismatch` (clients#427).
+    /// The park detail recorded on a blocked entry, i.e. everything inside
+    /// the parentheses of `"{status} ({detail})"`.
+    fn park_detail(item: &AcknowledgedItem) -> Option<&str> {
+        let blocked = item.blocked.as_deref()?;
+        let open = blocked.find(" (")?;
+        blocked[open + 2..].strip_suffix(')')
+    }
+
+    /// Whether a park is one of the two whose *cause is known to be fixed*, so
+    /// re-delivering it either lands the item or fails for a real reason.
     ///
-    /// Those parks were caused by the fresh-grant precondition comparing the
-    /// stack against the ledger's lifetime delivered sum, which any spent
-    /// consumable falsifies; the precondition is now the observed live
-    /// quantity, so re-delivering them either lands the item or fails for a
-    /// real reason. Only that reason auto-unparks: `failed`, `write_error` and
-    /// `command_rejected` parks stay put for `bb-blocked`, because their cause
-    /// is not known to be fixed. Returns the requeued indices in order.
-    pub fn requeue_quantity_mismatch_parks(&mut self) -> Vec<u64> {
+    /// * `quantity_mismatch` (clients#427) -- produced by the fresh-grant
+    ///   precondition comparing the stack against the ledger's lifetime
+    ///   delivered sum, which any spent consumable falsifies. That
+    ///   precondition is now the observed live quantity.
+    /// * `write_error` whose detail is exactly `quantity write failed`
+    ///   (clients#433) -- produced by the external `WriteProcessMemory` into
+    ///   the guest inventory page that shadPS4 intermittently refuses. That
+    ///   lane is gone; existing-stack grants run on the game thread now.
+    ///
+    /// Every other park stays put for `bb-blocked`, because its cause is not
+    /// known to be fixed. In particular `write_error (... quantity pointer
+    /// missing)` is NOT requeued: a missing record pointer is a geometry
+    /// problem, not the refused write.
+    fn park_cause_is_fixed(item: &AcknowledgedItem) -> bool {
+        match Self::park_status(item) {
+            Some("quantity_mismatch") => true,
+            Some("write_error") => {
+                Self::park_detail(item).is_some_and(|d| d.ends_with("quantity write failed"))
+            }
+            _ => false,
+        }
+    }
+
+    /// Requeue every park whose cause is known to be fixed
+    /// (clients#427, clients#433). Returns the requeued indices in order.
+    pub fn requeue_fixed_cause_parks(&mut self) -> Vec<u64> {
         let indices: Vec<u64> = self
             .acknowledged
             .iter()
-            .filter(|(_, item)| Self::park_status(item) == Some("quantity_mismatch"))
+            .filter(|(_, item)| Self::park_cause_is_fixed(item))
             .map(|(index, _)| *index)
             .collect();
         for index in &indices {
@@ -485,6 +512,48 @@ mod tests {
         .unwrap();
     }
 
+    /// The same, with the exact detail text `client_loop` records.
+    fn park_with(slot: &mut SlotLedger, index: u64, status: &str, detail: &str) {
+        park(slot, index, status);
+        slot.acknowledged
+            .get_mut(&index)
+            .unwrap()
+            .blocked
+            .replace(format!("{status} ({detail})"));
+    }
+
+    /// clients#433: a `write_error` park re-enters the queue if and only if its
+    /// detail is the shadPS4-refused quantity write, whose lane is gone. A
+    /// `quantity pointer missing` write_error is a different cause and stays
+    /// parked -- the status alone is NOT the discriminator.
+    #[test]
+    fn only_the_refused_quantity_write_requeues_among_write_errors() {
+        let mut slot = SlotLedger::default();
+        park_with(
+            &mut slot,
+            0,
+            "write_error",
+            "tag=ap_0 quantity write failed",
+        );
+        park_with(
+            &mut slot,
+            1,
+            "write_error",
+            "tag=ap_1 quantity pointer missing",
+        );
+        park_with(&mut slot, 2, "failed", "tag=ap_2 quantity write failed");
+        park_with(
+            &mut slot,
+            3,
+            "quantity_mismatch",
+            "tag=ap_3 expected_before=5 actual=20",
+        );
+
+        assert_eq!(slot.requeue_fixed_cause_parks(), vec![0, 3]);
+        let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();
+        assert_eq!(still_parked, vec![1, 2]);
+    }
+
     /// clients#427: only the park reason this issue fixed re-enters the queue,
     /// it is delivered before anything new, and retiring it never regresses the
     /// cursor or re-delivers a neighbour.
@@ -496,7 +565,7 @@ mod tests {
         park(&mut slot, 2, "quantity_mismatch");
         assert_eq!(slot.next_index(), 3);
 
-        assert_eq!(slot.requeue_quantity_mismatch_parks(), vec![0, 2]);
+        assert_eq!(slot.requeue_fixed_cause_parks(), vec![0, 2]);
         assert_eq!(slot.blocked_entries().count(), 1);
         assert_eq!(slot.next_index(), 0);
 
@@ -536,7 +605,7 @@ mod tests {
         assert_eq!(slot.next_index(), 3);
         assert!(slot.redeliver.is_empty());
         // A second startup finds nothing left to requeue.
-        assert!(slot.requeue_quantity_mismatch_parks().is_empty());
+        assert!(slot.requeue_fixed_cause_parks().is_empty());
         assert_eq!(slot.blocked_entries().count(), 1);
     }
 

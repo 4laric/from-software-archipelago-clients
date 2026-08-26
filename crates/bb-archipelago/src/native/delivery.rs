@@ -18,7 +18,13 @@
 //! * **replay recovery** -- a durable `expected_before` from a previous process
 //!   lets a restart decide "already applied" instead of granting twice;
 //! * **fail closed** -- absent Blood Vial insertion is refused outright after
-//!   the live `?ItemInfo?` (`0xF00003E8`) reproduction.
+//!   the live `?ItemInfo?` (`0xF00003E8`) reproduction;
+//! * **never write the guest heap from outside** -- an existing stack is bumped
+//!   by the cave's existing-stack delta branch (`request = 2`) on the game
+//!   thread, not by an external `WriteProcessMemory` into the inventory page.
+//!   shadPS4 protection-tracks those pages: the write fails intermittently
+//!   (bb-archipelago#144) and can wound the emulator, which is what parked
+//!   oz's grants as `write_error: quantity write failed` (clients#433).
 //!
 //! Statuses are kept as the exact strings the `BBGRANT1` durable state uses
 //! (`native-grant-state.txt`), both so this port can be compared line-for-line
@@ -83,6 +89,15 @@ pub trait Runtime {
     fn inventory_ready(&mut self) -> bool;
     fn find_stack(&mut self, normalized_id: u32) -> Option<StackView>;
     fn read_slot_record(&mut self, slot: u32) -> SlotRecord;
+    /// **Not used by the delivery machine, and it must stay that way.**
+    ///
+    /// An external write to a *guest-heap* address is exactly what clients#433
+    /// removed: shadPS4 protection-tracks the inventory pages, so the write
+    /// fails intermittently and can wound the emulator. Every quantity change
+    /// now goes through [`Runtime::queue_native`], which runs on the game
+    /// thread. The method is retained only so a fake can *witness* that no
+    /// lane calls it; any future caller must be an eboot-image address, never
+    /// an inventory record.
     fn write_quantity(&mut self, address: u64, value: u32) -> bool;
     fn request_pending(&mut self) -> bool;
     fn queue_native(
@@ -176,6 +191,9 @@ pub struct GrantSession<R: Runtime> {
     expected_before: Option<u32>,
     active: bool,
     manual: bool,
+    /// The in-flight native call is the existing-stack delta branch
+    /// (`request = 2`), not an insert. It changes how the verify is read.
+    delta_lane: bool,
 }
 
 impl<R: Runtime> GrantSession<R> {
@@ -205,6 +223,7 @@ impl<R: Runtime> GrantSession<R> {
             expected_before: None,
             active: false,
             manual: false,
+            delta_lane: false,
         }
     }
 
@@ -299,11 +318,19 @@ impl<R: Runtime> GrantSession<R> {
             .expect("expected_before set before active")
             .saturating_add(command.quantity);
         let record = self.runtime.read_slot_record(native_result);
-        let slot_verified = record.normalized_id == Some(command.normalized_id)
+        // The insert lane can accept the reported slot as the witness: a
+        // freshly inserted stack holding at least `quantity` of the right id
+        // IS the grant. The delta lane cannot -- an existing stack of 5 that
+        // is owed 2 more already satisfies `q >= quantity` before the delta
+        // lands, so the shortcut would report `completed` on an unapplied
+        // grant. There the read-back total is the only honest witness.
+        let slot_verified = !self.delta_lane
+            && record.normalized_id == Some(command.normalized_id)
             && record.quantity.is_some_and(|q| q >= command.quantity);
         if !slot_verified && actual != Some(wanted) {
             self.verify_polls += 1;
-            let hydrating = matches!(record.normalized_id, None | Some(EMPTY_SLOT))
+            let hydrating = !self.delta_lane
+                && matches!(record.normalized_id, None | Some(EMPTY_SLOT))
                 && !actual.is_some_and(|a| a != 0);
             let budget = if hydrating {
                 self.policy.hydration_verify_polls
@@ -385,11 +412,20 @@ impl<R: Runtime> GrantSession<R> {
             );
         }
 
-        if stack.exists {
-            return self.direct_write(&command, wanted);
+        // An existing stack takes the cave's existing-stack branch
+        // (`request = 2`, `quantity` read as a DELTA) and needs both of its
+        // arguments; without the record pointer the cave cannot address the
+        // stack, and there is no fallback -- the external write that used to
+        // be one is what clients#433 removed.
+        if stack.exists && stack.quantity_address.is_none() {
+            return self.finish(
+                "write_error",
+                format!("tag={} quantity pointer missing", command.tag),
+            );
         }
 
-        if command.normalized_id == self.blood_vial_normalized()
+        if !stack.exists
+            && command.normalized_id == self.blood_vial_normalized()
             && !self.policy.absent_blood_vial_allowed
         {
             return self.finish(
@@ -414,50 +450,19 @@ impl<R: Runtime> GrantSession<R> {
         );
         self.active = true;
         self.verify_polls = 0;
+        self.delta_lane = stack.exists;
         let source = if descriptor.uses_persistent_source(&self.formula) {
             "persistent"
         } else {
             "in_frame"
         };
+        let lane = if stack.exists { "delta" } else { "insert" };
         self.set(
             "executing",
-            format!("tag={} native source={source}", command.tag),
-        )
-    }
-
-    fn direct_write(&mut self, command: &GrantCommand, wanted: u32) -> String {
-        let stack = self.runtime.find_stack(command.normalized_id);
-        let address = stack.and_then(|s| s.quantity_address);
-        let Some(address) = address else {
-            return self.finish(
-                "write_error",
-                format!("tag={} quantity pointer missing", command.tag),
-            );
-        };
-        self.set(
-            "executing",
-            format!("tag={} direct expected_after={wanted}", command.tag),
-        );
-        if !self.runtime.write_quantity(address, wanted) {
-            return self.finish(
-                "write_error",
-                format!("tag={} quantity write failed", command.tag),
-            );
-        }
-        let after = self.runtime.find_stack(command.normalized_id);
-        if after.is_none_or(|a| a.quantity != wanted) {
-            return self.finish(
-                "failed",
-                format!(
-                    "tag={} direct expected_after={wanted} actual={:?}",
-                    command.tag,
-                    after.map(|a| a.quantity)
-                ),
-            );
-        }
-        self.finish(
-            "completed",
-            format!("tag={} direct after={wanted}", command.tag),
+            format!(
+                "tag={} native lane={lane} source={source} expected_after={wanted}",
+                command.tag
+            ),
         )
     }
 
@@ -499,7 +504,7 @@ mod tests {
         done: bool,
         result: u32,
         // A queued native grant that the next `native_done()` will "apply".
-        queued: Option<(ItemGrantDescriptor, u32, Option<u32>)>,
+        queued: Option<(ItemGrantDescriptor, u32, Option<u32>, Option<u64>)>,
         writes: Vec<(u64, u32)>,
         // When true, a queued native grant reports done but never actually
         // lands in the inventory, so the bounded verify starves and fails.
@@ -555,34 +560,63 @@ mod tests {
             descriptor: &ItemGrantDescriptor,
             quantity: u32,
             slot: Option<u32>,
-            _quantity_address: Option<u64>,
+            quantity_address: Option<u64>,
             _manual_trigger: bool,
         ) {
             self.request = true;
             self.done = false;
-            self.queued = Some((*descriptor, quantity, slot));
+            self.queued = Some((*descriptor, quantity, slot, quantity_address));
         }
         fn native_done(&mut self) -> bool {
             if self.complete_without_applying {
-                // Reports completion, writes a bogus result slot, and never
-                // updates the real stack: the verify can never be satisfied.
-                if self.queued.take().is_some() {
-                    self.result = 7;
-                    self.slots.insert(
-                        7,
-                        SlotRecord {
-                            normalized_id: Some(0x0BAD_0BAD),
-                            quantity: Some(0),
-                            address: Some(0),
-                        },
-                    );
+                // Reports completion and never updates the real stack, so the
+                // verify can never be satisfied. For an insert it reports a
+                // bogus slot; for a delta it reports the REAL slot, whose
+                // record still holds the pre-delta quantity -- the shape the
+                // slot shortcut would wrongly accept.
+                if let Some((_descriptor, _quantity, slot, _address)) = self.queued.take() {
+                    self.result = slot.unwrap_or(7);
+                    if slot.is_none() {
+                        self.slots.insert(
+                            7,
+                            SlotRecord {
+                                normalized_id: Some(0x0BAD_0BAD),
+                                quantity: Some(0),
+                                address: Some(0),
+                            },
+                        );
+                    }
                     self.request = false;
                     self.done = true;
                 }
                 return self.done;
             }
-            // Model the cave applying the grant exactly once.
-            if let Some((descriptor, quantity, _slot)) = self.queued.take() {
+            // Model the cave applying the grant exactly once. Both branches of
+            // the contract's `request` cell: with a slot AND a record pointer
+            // it is the existing-stack delta (`quantity` ADDED to the live
+            // stack, slot unchanged); without them it is the insert.
+            if let Some((descriptor, quantity, Some(slot), Some(address))) = self.queued {
+                self.queued = None;
+                let stack = self
+                    .stacks
+                    .get_mut(&descriptor.normalized_id)
+                    .expect("the delta lane is only queued for a live stack");
+                stack.quantity += quantity;
+                let total = stack.quantity;
+                self.result = slot;
+                self.slots.insert(
+                    slot,
+                    SlotRecord {
+                        normalized_id: Some(descriptor.normalized_id),
+                        quantity: Some(total),
+                        address: Some(address),
+                    },
+                );
+                self.request = false;
+                self.done = true;
+                return self.done;
+            }
+            if let Some((descriptor, quantity, _slot, _address)) = self.queued.take() {
                 let new_slot = 7u32;
                 self.result = new_slot;
                 self.slots.insert(
@@ -630,8 +664,13 @@ mod tests {
         }
     }
 
+    /// clients#433, THE motivating case: an existing stack is bumped by the
+    /// cave's existing-stack delta branch on the game thread. The delta lands,
+    /// the read-back total verifies, and NOT ONE external write is issued --
+    /// the write that shadPS4 intermittently refuses is what parked oz's
+    /// grants as `write_error: quantity write failed`.
     #[test]
-    fn direct_write_bumps_an_existing_stack() {
+    fn an_existing_stack_is_bumped_through_the_native_delta_lane() {
         let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
         let runtime = FakeRuntime::default().with_stack(
             normalized,
@@ -646,9 +685,198 @@ mod tests {
         session
             .submit(goods_command(0x384, 2, "recv_1", Some(5)), false)
             .unwrap();
-        let status = session.poll();
-        assert_eq!(status, "completed", "state: {:?}", session.state());
-        assert_eq!(session.runtime_mut().writes, vec![(0x1000, 7)]);
+        // Poll 1 queues the delta; the cave has not run yet.
+        assert_eq!(session.poll(), "executing", "state: {:?}", session.state());
+        assert!(session.state().detail.contains("lane=delta"));
+        let queued = session
+            .runtime_mut()
+            .queued
+            .expect("the existing-stack grant queues a native request");
+        // Request word 2 semantics: the DELTA (2), plus the slot and the
+        // record pointer the cave's existing-stack branch addresses.
+        assert_eq!(
+            queued.1, 2,
+            "the queued quantity is the delta, not the total"
+        );
+        assert_eq!(queued.2, Some(3));
+        assert_eq!(queued.3, Some(0x1000));
+        // Poll 2 sees the cave's completion and verifies the read-back total.
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+        assert_eq!(
+            session
+                .runtime_mut()
+                .find_stack(normalized)
+                .unwrap()
+                .quantity,
+            7
+        );
+        assert!(
+            session.runtime_mut().writes.is_empty(),
+            "no external write may reach a guest inventory page"
+        );
+    }
+
+    /// clients#433, the witness that the deleted lane stays deleted: whatever
+    /// the stack looks like, the machine reaches `write_quantity` never.
+    #[test]
+    fn no_grant_path_ever_calls_write_quantity() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        for (before, quantity) in [(5u32, 2u32), (0, 1), (98, 1)] {
+            let runtime = FakeRuntime::default().with_stack(
+                normalized,
+                StackView {
+                    quantity: before,
+                    exists: true,
+                    slot: Some(3),
+                    quantity_address: Some(0x1000),
+                },
+            );
+            let mut session = session(runtime);
+            session
+                .submit(
+                    goods_command(0x384, quantity, "recv_w", Some(before)),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(session.poll(), "executing");
+            assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+            assert!(session.runtime_mut().writes.is_empty());
+        }
+    }
+
+    /// clients#433: the cave's existing-stack branch needs the record pointer.
+    /// Without it there is nothing to fall back to -- the external write that
+    /// used to be the fallback is exactly what was removed -- so this parks,
+    /// and it parks under a detail the startup unpark must NOT requeue.
+    #[test]
+    fn an_existing_stack_without_a_record_pointer_parks_as_a_pointer_error() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: None,
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "recv_p", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "write_error");
+        assert!(session.state().detail.contains("quantity pointer missing"));
+        assert!(session.runtime_mut().writes.is_empty());
+    }
+
+    /// clients#433: the insert lane may accept the reported slot as its
+    /// witness, the delta lane may not. A stack of 5 owed 2 more already
+    /// satisfies "the slot holds at least `quantity`" BEFORE the delta lands,
+    /// so the shortcut would report `completed` on an unapplied grant. The
+    /// delta lane must starve its verify budget and fail instead.
+    #[test]
+    fn a_delta_that_never_lands_fails_instead_of_passing_the_slot_shortcut() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        // The reported slot keeps showing the pre-delta record: id matches and
+        // 5 >= 2, which is precisely the shape the shortcut would accept.
+        runtime.complete_without_applying = true;
+        runtime.slots.insert(
+            3,
+            SlotRecord {
+                normalized_id: Some(normalized),
+                quantity: Some(5),
+                address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "recv_s", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        let mut last = String::new();
+        for _ in 0..contract().policy.verify_polls {
+            last = session.poll();
+        }
+        assert_eq!(last, "failed", "state: {:?}", session.state());
+        // The short budget, not the hydration one: a live stack is never
+        // "not hydrated yet".
+        assert!(session.state().detail.contains("retry_budget=20"));
+    }
+
+    /// clients#433 crash window: a restart mid-delta must not double-apply.
+    /// The delta lane records `expected_before`/`expected_after` durably before
+    /// the cave is armed, exactly as the insert lane does, so the next process
+    /// reads the live stack against that prior -- `after` means applied
+    /// (`recovered_complete`, nothing queued), `before` means it never landed
+    /// and the delta is re-queued.
+    #[test]
+    fn a_restart_mid_delta_recovers_instead_of_double_applying() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let prior = DurableState {
+            status: "executing".into(),
+            tag: "recv_c".into(),
+            expected_before: Some(5),
+            expected_after: Some(7),
+            detail: String::new(),
+        };
+        // (a) The delta HAD landed before the crash: the stack reads 7.
+        let applied = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 7,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = GrantSession::with_prior(
+            applied,
+            contract().descriptor,
+            contract().policy,
+            prior.clone(),
+        );
+        session
+            .submit(goods_command(0x384, 2, "recv_c", None), false)
+            .unwrap();
+        assert_eq!(session.poll(), "recovered_complete");
+        assert!(session.runtime_mut().queued.is_none());
+        assert!(session.runtime_mut().writes.is_empty());
+
+        // (b) It had NOT landed: the stack still reads 5, so the delta is
+        // queued once and completes at 7 -- never 9.
+        let unapplied = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session =
+            GrantSession::with_prior(unapplied, contract().descriptor, contract().policy, prior);
+        session
+            .submit(goods_command(0x384, 2, "recv_c", None), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        assert_eq!(session.poll(), "completed");
+        assert_eq!(
+            session
+                .runtime_mut()
+                .find_stack(normalized)
+                .unwrap()
+                .quantity,
+            7
+        );
     }
 
     #[test]
@@ -753,8 +981,8 @@ mod tests {
 
     #[test]
     fn auto_baseline_without_a_matching_prior_grants_from_the_live_quantity() {
-        // No prior: auto baseline samples the live quantity (5) and the direct
-        // write bumps to 7.
+        // No prior: auto baseline samples the live quantity (5) and the delta
+        // lane bumps to 7.
         let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
         let runtime = FakeRuntime::default().with_stack(
             normalized,
@@ -769,8 +997,17 @@ mod tests {
         session
             .submit(goods_command(0x384, 2, "recv_1", None), false)
             .unwrap();
+        assert_eq!(session.poll(), "executing");
         assert_eq!(session.poll(), "completed");
-        assert_eq!(session.runtime_mut().writes, vec![(0x1000, 7)]);
+        assert_eq!(
+            session
+                .runtime_mut()
+                .find_stack(normalized)
+                .unwrap()
+                .quantity,
+            7
+        );
+        assert!(session.runtime_mut().writes.is_empty());
     }
 
     #[test]

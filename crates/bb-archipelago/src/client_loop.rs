@@ -365,17 +365,18 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(())
     }
 
-    /// Startup unpark (clients#427): every entry parked with
-    /// `quantity_mismatch` re-enters the delivery queue, because the
-    /// precondition that produced those parks -- the ledger's lifetime
-    /// delivered sum standing in for current inventory -- is gone. They now
-    /// deliver, or fail for a real reason. Parks with any other status stay
-    /// parked for `bb-blocked`. Returns the requeued indices.
-    pub fn requeue_quantity_mismatch_parks(&mut self) -> Result<Vec<u64>> {
+    /// Startup unpark (clients#427, clients#433): every entry whose park
+    /// cause is known to be fixed re-enters the delivery queue --
+    /// `quantity_mismatch` (the ledger's lifetime delivered sum no longer
+    /// stands in for current inventory) and `write_error` detailed
+    /// `quantity write failed` (the external guest-heap write shadPS4 refuses
+    /// is gone). They now deliver, or fail for a real reason. Every other park
+    /// stays parked for `bb-blocked`. Returns the requeued indices.
+    pub fn requeue_fixed_cause_parks(&mut self) -> Result<Vec<u64>> {
         let indices = self
             .ledger
             .slot_mut(&self.seed_name, &self.slot_name)
-            .requeue_quantity_mismatch_parks();
+            .requeue_fixed_cause_parks();
         if !indices.is_empty() {
             self.ledger.save(&self.ledger_path)?;
         }
@@ -1263,7 +1264,7 @@ mod tests {
             ledger_path.clone(),
             config(),
         );
-        assert_eq!(reloaded.requeue_quantity_mismatch_parks().unwrap(), vec![0]);
+        assert_eq!(reloaded.requeue_fixed_cause_parks().unwrap(), vec![0]);
 
         assert!(matches!(
             reloaded.poll_items(&received).unwrap(),
@@ -2588,7 +2589,7 @@ mod tests {
         let mut backend = MockBackend::default();
         backend.inventory.insert((0x4000_04CE, None), 20);
         let mut client = loop_with(backend, persisted, ledger_path.clone(), config());
-        assert_eq!(client.requeue_quantity_mismatch_parks().unwrap(), vec![0]);
+        assert_eq!(client.requeue_fixed_cause_parks().unwrap(), vec![0]);
         assert!(matches!(
             client.poll_items(&received).unwrap(),
             ItemPollResult::Completed(CompletedItem { index: 0, .. })
