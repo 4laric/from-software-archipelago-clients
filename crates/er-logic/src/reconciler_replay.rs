@@ -953,6 +953,163 @@ mod replay {
         );
     }
 
+    /// The 2026-08-26 WILD timeline (TechnoForge, clients#439, player log `archipelago-2026-08-26.log`,
+    /// build `379756368cbb`): Glintstone Whetblade (goods `0x4000230d`) went readback-blind LIVE and
+    /// the guard parked it **14 times in 15 minutes = 42 refusal popups**, 13:58:01 -> 14:13:01.
+    ///
+    /// The burst size was never wrong. Every one of the 14 park lines reads `accepted 3 grant(s)`,
+    /// and the dispatch counter steps by exactly 3 between consecutive parks (seq 65, 68, 71 ...
+    /// 98). `MAX_GRANT_ATTEMPTS` did its whole job. What was wrong is the RE-ARM RATE: the guard
+    /// re-armed on every UNSTABLE tick, and `stable()` goes false for things that are not world
+    /// edges -- the post-death dwell reset (the seed runs `death_link=true`; three local deaths at
+    /// 14:01:36 / 14:02:33 / 14:04:19) and the talk-script inventory window at a merchant. So the
+    /// log shows FIVE parks inside world epoch 4 with no world edge whatsoever between them
+    /// (13:59:11, 13:59:26, 13:59:34, 14:00:19, 14:00:35 -- 15 popups in 92 s, ~9.8/min), and the
+    /// same shape in epochs 8 and 10 (three parks, one edge each).
+    ///
+    /// The negative control is in the same log: between epochs the parking DOES hold. 14:04:52 ->
+    /// 14:11:38 is 6m46s of silence inside one epoch. And session B, same blind good but no deaths,
+    /// cost 3 popups total.
+    ///
+    /// Encoded below as the measured per-epoch park counts for epochs 4..12, driven by
+    /// death/talk-shaped unstable stretches that do NOT bump the world epoch. Pre-fix (re-arm on
+    /// every unstable tick, spelled out here as the explicit `rearm_grant_stalls()` the old code
+    /// path performed) reproduces the wild 42; post-fix each epoch costs exactly one bounded burst.
+    #[test]
+    fn wild_20260826_technoforge_deathlink_rearm_cadence_replay() {
+        // Parks the log actually recorded, per world epoch, over 13:58:01 -> 14:13:01.
+        // epoch 4 is the peak stretch (five parks, no intervening edge); epochs 8 and 10 are the
+        // same shape at three; the rest are a single burst each.
+        //
+        // The three multi-park stretches are the ones the forensics names outright: epoch 4 with
+        // five, epochs 8 and 10 with three each. The remaining three parks are single bursts in the
+        // epochs around them (the first, 13:58:01, precedes the 13:59:03 edge into epoch 4). The
+        // sum is the measured 14; the parked-epoch COUNT, six, is what the fix reduces the flood to.
+        const WILD_PARKS_PER_EPOCH: [(u64, usize); 6] =
+            [(3, 1), (4, 5), (6, 1), (8, 3), (10, 3), (11, 1)];
+
+        // One epoch's worth of play: `unstable_stretches` death/merchant windows, each a few ticks
+        // of `stable() == false` with `flags_ready()` still true and the world epoch UNMOVED,
+        // separated by stable stretches long enough to spend a whole allowance if one is armed.
+        fn drive_epoch(
+            r: &mut Reconciler,
+            g: &mut MockGame,
+            unstable_stretches: usize,
+            legacy_rearm_on_unstable_tick: bool,
+        ) -> usize {
+            let mut parks = 0usize;
+            for _ in 0..unstable_stretches {
+                // The death / talk-script window. NOT a world edge: `set_settled(false)` is the
+                // dwell reset a respawn causes and `set_inventory_safe(false)` is the merchant talk
+                // window; neither rebuilds the world, so neither moves the epoch.
+                g.set_settled(false);
+                g.set_inventory_safe(false);
+                for _ in 0..4 {
+                    let out = r.tick(g, TickBudget::default());
+                    // PRE-FIX BEHAVIOUR, verbatim: `tick` cleared the stall set on any tick that
+                    // was not fully stable.
+                    if legacy_rearm_on_unstable_tick {
+                        r.rearm_grant_stalls();
+                    }
+                    parks += out.newly_stalled.len();
+                }
+                g.set_inventory_safe(true);
+                g.set_settled(true);
+                for _ in 0..40 {
+                    let out = r.tick(g, TickBudget::default());
+                    parks += out.newly_stalled.len();
+                }
+            }
+            parks
+        }
+
+        // ---- PRE-FIX: the wild 42 popups, reproduced ----
+        let mut g = MockGame::stable();
+        g.refuse_unique_adds = true; // accepted, never observable -- the whetblade's failure mode
+        let mut r = Reconciler::new(rune_inputs());
+        let mut wild_parks = 0usize;
+        for (epoch, stretches) in WILD_PARKS_PER_EPOCH {
+            // The world edge into this epoch (a death reload / warp arrival).
+            g.set_stable(false);
+            r.tick(&mut g, TickBudget::default());
+            g.set_stable(true);
+            let _ = epoch;
+            wild_parks += drive_epoch(&mut r, &mut g, stretches, true);
+        }
+        let wild_total: usize = WILD_PARKS_PER_EPOCH.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            wild_total, 14,
+            "the log records 14 parks across epochs 4..12"
+        );
+        assert_eq!(
+            wild_parks, wild_total,
+            "PRE-FIX: one park per unstable stretch -- the measured 14, not one per epoch"
+        );
+        assert_eq!(
+            wild_parks * (MAX_GRANT_ATTEMPTS as usize),
+            42,
+            "PRE-FIX: 14 bounded bursts of 3 is the 42 popups TechnoForge counted in 15 minutes"
+        );
+
+        // ---- POST-FIX: one bounded burst per epoch ----
+        let mut g = MockGame::stable();
+        g.refuse_unique_adds = true;
+        let mut r = Reconciler::new(rune_inputs());
+        let mut per_epoch: Vec<usize> = Vec::new();
+        let mut fixed_grants_before = 0usize;
+        for (epoch, stretches) in WILD_PARKS_PER_EPOCH {
+            g.set_stable(false);
+            r.tick(&mut g, TickBudget::default());
+            g.set_stable(true);
+            let parks = drive_epoch(&mut r, &mut g, stretches, false);
+            per_epoch.push(parks);
+            let spent = g.unique_grant_calls.len() - fixed_grants_before;
+            fixed_grants_before = g.unique_grant_calls.len();
+            assert_eq!(
+                spent, MAX_GRANT_ATTEMPTS as usize,
+                "epoch {epoch}: exactly one allowance per world edge, not {spent}"
+            );
+        }
+        assert_eq!(
+            per_epoch,
+            vec![1; WILD_PARKS_PER_EPOCH.len()],
+            "FIX: every epoch parks ONCE -- epoch 4's five parks collapse to one"
+        );
+        assert_eq!(
+            per_epoch.iter().sum::<usize>() * (MAX_GRANT_ATTEMPTS as usize),
+            18,
+            "FIX: 6 parked epochs x 3 popups = 18 over the same 15 minutes, down from 42 -- and \
+             the within-epoch rate falls from 15 popups in 92 s to 3, which is the documented \
+             worst case of one bounded burst per world edge"
+        );
+
+        // The negative control the same log supplies: 6m46s of silence inside ONE epoch. A long
+        // stable stretch with no world edge must cost NOTHING once the good is parked.
+        let quiet_before = g.unique_grant_calls.len();
+        for _ in 0..2000 {
+            let out = r.tick(&mut g, TickBudget::default());
+            assert!(
+                out.newly_stalled.is_empty(),
+                "no re-park may happen inside an epoch"
+            );
+        }
+        assert_eq!(
+            g.unique_grant_calls.len(),
+            quiet_before,
+            "parking must HOLD for the rest of the epoch (14:04:52 -> 14:11:38 was silent)"
+        );
+
+        // And the guard must not have gone permanent: the next world edge still re-arms, which is
+        // what let the whetblade heal at the epoch-11/12 reload instead of being abandoned.
+        g.set_stable(false);
+        r.tick(&mut g, TickBudget::default());
+        g.set_stable(true);
+        assert!(
+            r.stalled_goods().is_empty(),
+            "a real world edge must still hand back a full allowance"
+        );
+    }
+
     // ---- possession = bag lists UNION the great-rune EQUIP SLOT UNION the STORAGE BOX ----
 
     /// Which OUT-OF-BAG stores [`PossessionGame`]'s readback consults. Flipping one to `false` is
