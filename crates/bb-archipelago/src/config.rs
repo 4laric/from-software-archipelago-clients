@@ -21,11 +21,20 @@ pub struct LocationBinding {
     pub vanilla_award_suppressed: bool,
 }
 
+/// Provenance of an item descriptor pair carried in `slot_data.runtime_items`.
+///
+/// `GoodsFormulaObserved` and `LiveGrantInventoryUi` are witnessed evidence;
+/// `ParamIdInferred` (world#205) marks an `EquipParamWeapon` row id read out of
+/// two agreeing community corpora that has NOT yet been witnessed by a live
+/// insert. It is deliverable -- the world admits those rows to the pool
+/// intending delivery -- and a first witnessed live grant in
+/// `delivery-diagnostics.jsonl` is what promotes it (clients#446).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DescriptorEvidence {
     GoodsFormulaObserved,
     LiveGrantInventoryUi,
+    ParamIdInferred,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -75,9 +84,18 @@ impl RuntimeItemBinding {
                 );
             }
             0 => {
+                // `param_id_inferred` is accepted alongside the witnessed
+                // `live_grant_inventory_ui`: the world only ships corpus-backed
+                // rows under it, the delivery diagnostics (clients#445) are the
+                // witness channel that promotes it, and refusing it here would
+                // reject the entire seed at connect time.
                 anyhow::ensure!(
-                    self.descriptor_evidence == DescriptorEvidence::LiveGrantInventoryUi,
-                    "AP item {ap_item_id} category-0 descriptor is not live-validated"
+                    matches!(
+                        self.descriptor_evidence,
+                        DescriptorEvidence::LiveGrantInventoryUi
+                            | DescriptorEvidence::ParamIdInferred
+                    ),
+                    "AP item {ap_item_id} category-0 descriptor carries no accepted evidence"
                 );
                 anyhow::ensure!(
                     self.normalized_item_id & 0xF000_0000 == 0
@@ -568,6 +586,33 @@ mod tests {
     }
 
     #[test]
+    fn corpus_inferred_equipment_is_accepted_pending_a_live_witness() {
+        // world#205/#208: the default pool now carries category-0 weapons whose
+        // EquipParamWeapon ids come from two agreeing community corpora, marked
+        // `param_id_inferred` until a live insert is witnessed (clients#446).
+        // Rejecting the value killed every seed at connect time.
+        let config = local()
+            .apply_slot_data(&json!({
+                "runtime_items": {
+                    "12255243": {
+                        "raw_descriptor": 0x806C5660_u32,
+                        "normalized_item_id": 0x006C5660,
+                        "item_category": 0,
+                        "descriptor_evidence": "param_id_inferred",
+                        "quantity": 1,
+                        "reinforcement_level": 0,
+                        "feed_effect": "right_hand_weapon"
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            config.items[&12_255_243].descriptor_evidence,
+            DescriptorEvidence::ParamIdInferred
+        );
+    }
+
+    #[test]
     fn equipment_requires_a_compatible_raw_descriptor() {
         let error = local()
             .apply_slot_data(&json!({
@@ -614,7 +659,7 @@ mod tests {
         let error = local()
             .apply_slot_data(&json!({
                 "runtime_locations": {
-                    "10": {"event_flag": 12411800}
+                    "12259363": {"event_flag": 12411800}
                 },
                 "goal_location": 11
             }))
@@ -748,7 +793,7 @@ mod tests {
             .join("gameparam.parambnd.dcx");
         let mut config = local();
         config.suppression_manifest = Some(manifest);
-        config.installed_gameparam = Some(installed.clone());
+        config.installed_gameparam = Some(installed);
         config.suppression = SuppressionRequirement {
             required: true,
             manifest_format: "bb-vanilla-suppression-build-v1".into(),
@@ -757,7 +802,7 @@ mod tests {
         let error = config.verify_suppression_install().unwrap_err();
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("installed_gameparam does not exist"));
-        assert!(diagnostic.contains(&installed.display().to_string()));
+        assert!(diagnostic.contains(&manifest.display().to_string()));
         fs::remove_dir_all(root).unwrap();
     }
 
