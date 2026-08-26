@@ -145,6 +145,31 @@ pub fn emit(arguments: Arguments<'_>) {
     }
 }
 
+/// Render a terminal error exactly as Rust's default termination handler would
+/// (clients#437).
+///
+/// `fn main() -> Result<()>` used to be the client's exit path, and the runtime
+/// printed a bubbled `Err` as `Error: {err:?}` -- the anyhow debug rendering,
+/// which is the top-level message followed by an indented, numbered
+/// `Caused by:` chain -- onto the process's real stderr. That stream is not the
+/// tee: since clients#426 the launcher no longer pipes the child's stderr, so
+/// that line reached neither `client.log` nor the launcher's early-exit dialog,
+/// and a terminal startup failure looked like a log that simply stopped.
+///
+/// This reproduces the handler's exact text so the line can go through
+/// [`emit`] instead. It is deliberately a pure function: the format is what the
+/// tests pin, and [`report_terminal_error`] is the one line that prints it.
+pub fn terminal_error_report(error: &anyhow::Error) -> String {
+    format!("Error: {error:?}")
+}
+
+/// Print a terminal error through the tee, console and session log alike.
+///
+/// Call this instead of letting an `Err` bubble out of `main`.
+pub fn report_terminal_error(error: &anyhow::Error) {
+    emit(format_args!("{}", terminal_error_report(error)));
+}
+
 /// `eprintln!` that goes through the tee (clients#425).
 ///
 /// Every diagnostic lane in this client uses this instead of `eprintln!`. With
@@ -186,6 +211,73 @@ mod tests {
         let path = std::env::temp_dir().join(format!("bb-logging-{name}-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn a_terminal_error_renders_the_message_and_every_caused_by_segment() {
+        let error = anyhow::anyhow!("no fresh eboot base appeared")
+            .context("attaching the native backend")
+            .context("could not start the Bloodborne client");
+        let report = terminal_error_report(&error);
+        // The shape Rust's default handler printed: `Error: ` + the anyhow
+        // debug rendering, top message first, then the numbered chain.
+        assert!(
+            report.starts_with("Error: could not start the Bloodborne client"),
+            "report: {report:?}"
+        );
+        assert!(report.contains("Caused by:"), "report: {report:?}");
+        assert!(
+            report.contains("attaching the native backend"),
+            "the middle of the chain must survive: {report:?}"
+        );
+        assert!(
+            report.contains("no fresh eboot base appeared"),
+            "the root cause must survive: {report:?}"
+        );
+        // Ordering: outermost context first, root cause last.
+        let middle = report.find("attaching the native backend").expect("middle");
+        let root = report.find("no fresh eboot base appeared").expect("root");
+        assert!(middle < root, "report: {report:?}");
+    }
+
+    #[test]
+    fn a_single_error_with_no_causes_still_renders_without_a_chain() {
+        let report = terminal_error_report(&anyhow::anyhow!(
+            "--mock and --assume-correct-save cannot be combined"
+        ));
+        assert_eq!(
+            report,
+            "Error: --mock and --assume-correct-save cannot be combined"
+        );
+    }
+
+    #[test]
+    fn a_bubbled_error_reaches_the_log_file_and_the_console_not_raw_stderr() {
+        let _guard = serialized();
+        reset_sink();
+        let path = scratch("terminal-error");
+        install_log_file(&path).expect("install");
+        let error =
+            anyhow::anyhow!("refused an installed binder").context("verifying the seed contract");
+        report_terminal_error(&error);
+        let console = captured_console();
+        sink().file = None;
+        let file = std::fs::read_to_string(&path).expect("read log");
+        // This is the whole point of clients#437: the reason a run died is in
+        // the session log the launcher's early-exit dialog reads.
+        assert!(
+            file.contains("Error: verifying the seed contract"),
+            "file: {file:?}"
+        );
+        assert!(
+            file.contains("refused an installed binder"),
+            "the cause must be in the log too: {file:?}"
+        );
+        assert!(
+            console.contains("Error: verifying the seed contract"),
+            "console: {console:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -631,13 +631,44 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     })
 }
 
-fn main() -> Result<()> {
+/// The process entry point: run the client, and print a terminal error through
+/// the tee rather than letting it escape (clients#437).
+///
+/// `main` used to return `Result<()>`, which handed a bubbled `Err` to Rust's
+/// default termination handler. That handler prints `Error: {err:?}` onto the
+/// process's real stderr -- and since clients#426 the client owns its own tee
+/// and the launcher no longer pipes the child's stderr, so that line reached
+/// neither `client.log` nor the launcher's early-exit dialog. A terminal
+/// startup failure looked like a log that simply stopped mid-startup under an
+/// "exit code 1" dialog with a healthy-looking tail (Badgerous, live: a
+/// `verify_suppression_install` binder refusal whose reason evaporated).
+///
+/// So the run lives in [`run`] and the final print happens here, through
+/// [`client_eprintln!`], in the same text the default handler produced. The
+/// exit code stays 1.
+///
+/// No path in [`run`] both prints an error and returns it, so this never
+/// doubles a line: the two waiting loops print progress while retrying and the
+/// error they eventually return is a *different*, terminal one; the recoverable
+/// lanes (`Grant bridge state unavailable at startup`, pending-command
+/// reconciliation, park re-queue, location/item polling) print and carry on
+/// without returning `Err` at all.
+fn main() {
+    if let Err(error) = run() {
+        client_eprintln!("{}", logging::terminal_error_report(&error));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let args = arguments()?;
     // The tee is armed before ANY other output (clients#425), so the session log
     // carries the whole run rather than its tail. Everything below prints through
     // `client_eprintln!`, which reaches both the console the player is watching
-    // and this file. Residual, accepted: a failure inside `arguments()` above
-    // happens before the path is known and can only reach the console.
+    // and this file -- including the terminal error, which `main` prints from the
+    // `Err` this function returns. Residual, accepted and unchanged: a failure
+    // inside `arguments()` above happens before the path is known, so `main`
+    // prints it to the console only.
     if let Some(path) = args.log_file.as_deref() {
         logging::install_log_file(path)
             .with_context(|| format!("could not open the client log {}", path.display()))?;
