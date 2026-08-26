@@ -879,15 +879,18 @@ fn main() -> Result<()> {
                 Ok(false) => {}
                 Err(error) => client_eprintln!("Pending-command reconciliation failed: {error:#}"),
             }
-            // clients#427: items parked with `quantity_mismatch` were parked by
-            // a precondition that compared the stack against the ledger's
-            // lifetime delivered sum -- false for anything the player spends.
-            // That precondition is now the observed live quantity, so those
-            // parks re-enter the delivery queue instead of needing one manual
-            // bb-blocked invocation each. No other park reason auto-unparks.
-            match new_runtime.requeue_quantity_mismatch_parks() {
+            // clients#427 + clients#433: two park causes are known to be
+            // fixed, so those parks re-enter the delivery queue instead of
+            // needing one manual bb-blocked invocation each --
+            // `quantity_mismatch` (the precondition compared the stack against
+            // the ledger's lifetime delivered sum; it is the observed live
+            // quantity now) and `write_error (... quantity write failed)` (the
+            // external write into the guest inventory page that shadPS4
+            // refuses; existing-stack grants run on the game thread now). No
+            // other park reason auto-unparks.
+            match new_runtime.requeue_fixed_cause_parks() {
                 Ok(indices) if !indices.is_empty() => eprintln!(
-                    "Re-queued {} item(s) parked as quantity_mismatch (indices {}); \
+                    "Re-queued {} item(s) whose park cause is fixed (indices {}); \
                      they deliver against the observed inventory now.",
                     indices.len(),
                     indices
