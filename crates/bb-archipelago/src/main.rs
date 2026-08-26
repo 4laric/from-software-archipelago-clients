@@ -9,7 +9,7 @@ use archipelago_rs::{ClientStatus, Connection, ConnectionOptions, Event, ItemHan
 use bb_archipelago::RUNTIME_BUILD;
 use bb_archipelago::backend::{
     BloodborneBackend, EquipRequest, FileBackend, ItemGrant, LocationContext, MockBackend,
-    OperationProgress,
+    OperationProgress, StackObservation,
 };
 use bb_archipelago::bridge::{FileBridge, missing_bridge_state};
 use bb_archipelago::client_eprintln;
@@ -287,6 +287,38 @@ impl BloodborneBackend for Backend {
             Self::Live(backend) => backend.grant_item(grant),
             Self::Mock(backend) => backend.grant_item(grant),
             Self::Native(backend) => backend.grant_item(grant),
+        }
+    }
+
+    // clients#427: these two must be forwarded or the shipped binary silently
+    // loses the native backend's live-stack baseline -- every dispatch in the
+    // real client goes through this enum, and the tests exercise MockBackend
+    // directly. They are required trait methods now, so a future addition that
+    // misses this wrapper fails to compile instead of failing at a player's
+    // house.
+    fn observe_stack_quantity(
+        &mut self,
+        normalized_item_id: u32,
+        reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation> {
+        match self {
+            Self::Live(backend) => {
+                backend.observe_stack_quantity(normalized_item_id, reinforcement_level)
+            }
+            Self::Mock(backend) => {
+                backend.observe_stack_quantity(normalized_item_id, reinforcement_level)
+            }
+            Self::Native(backend) => {
+                backend.observe_stack_quantity(normalized_item_id, reinforcement_level)
+            }
+        }
+    }
+
+    fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
+        match self {
+            Self::Live(backend) => backend.grant_may_have_applied(tag),
+            Self::Mock(backend) => backend.grant_may_have_applied(tag),
+            Self::Native(backend) => backend.grant_may_have_applied(tag),
         }
     }
 
@@ -997,6 +1029,52 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use bb_archipelago::bridge::BridgeStateMissing;
+
+    /// clients#427 motivating case: the shipped client dispatches through the
+    /// `Backend` enum, not through a bare `MockBackend`. Before this fix the
+    /// enum had no `observe_stack_quantity` arm, so the trait default fired and
+    /// every fresh grant fell back to the ledger-sum baseline -- which is why
+    /// the clients#428 build still parked with a climbing `expected_before`
+    /// against an actual stack of 2. Asserting through the enum is the only
+    /// way to witness that.
+    #[test]
+    fn enum_backend_forwards_observe_stack_quantity_to_the_inner_backend() {
+        let mut mock = MockBackend::default();
+        mock.inventory.insert((0x4000_0000, None), 7);
+        let mut backend = Backend::Mock(Box::new(mock));
+
+        let observed = backend
+            .observe_stack_quantity(0x4000_0000, None)
+            .expect("observing through the enum must not error");
+        assert_eq!(
+            observed,
+            StackObservation::Quantity(7),
+            "the enum wrapper must reach the inner backend, not the trait default"
+        );
+    }
+
+    /// The clients#427 follow-up half of the same trap: a retained-but-
+    /// unwitnessed command's baseline is not binding, and the enum must say so
+    /// instead of inheriting the conservative `true`.
+    #[test]
+    fn enum_backend_forwards_grant_may_have_applied_to_the_inner_backend() {
+        let mut mock = MockBackend::default();
+        mock.retained_unwitnessed.insert("ap_7".to_string());
+        let mut backend = Backend::Mock(Box::new(mock));
+
+        let retained = backend
+            .grant_may_have_applied("ap_7")
+            .expect("asking through the enum must not error");
+        assert!(
+            !retained,
+            "a retained, unwitnessed command cannot have applied"
+        );
+
+        let untracked = backend
+            .grant_may_have_applied("ap_8")
+            .expect("asking through the enum must not error");
+        assert!(untracked, "an unretained command may have applied");
+    }
 
     fn missing_bridge_error() -> anyhow::Error {
         // The condition reaches the console wrapped in grant context, exactly

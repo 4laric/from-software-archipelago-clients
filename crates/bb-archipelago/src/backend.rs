@@ -93,15 +93,19 @@ pub trait BloodborneBackend {
     fn target_weapon_level(&mut self) -> Result<Option<u8>>;
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress>;
     /// The live quantity of a stack, for the fresh-grant baseline
-    /// (clients#427). The default declines, which keeps a backend that cannot
-    /// read inventory on the ledger-derived baseline it always used.
+    /// (clients#427).
+    ///
+    /// Required, deliberately: this trait is implemented once more by the
+    /// `Backend` enum the shipped binary dispatches through, and a defaulted
+    /// method that the enum forgets to forward silently swallows every real
+    /// implementation beneath it. A backend that cannot read inventory answers
+    /// [`StackObservation::Unsupported`] explicitly, which keeps it on the
+    /// ledger-derived baseline it always used.
     fn observe_stack_quantity(
         &mut self,
-        _normalized_item_id: u32,
-        _reinforcement_level: Option<u8>,
-    ) -> Result<StackObservation> {
-        Ok(StackObservation::Unsupported)
-    }
+        normalized_item_id: u32,
+        reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation>;
     /// Whether the command published for `tag` may already have applied to the
     /// game (clients#427 follow-up).
     ///
@@ -113,11 +117,11 @@ pub trait BloodborneBackend {
     /// and required. Freezing the baseline there is what re-parked oz's
     /// requeued backlog as `quantity_mismatch`.
     ///
-    /// The default `true` is the pre-existing freeze-on-first-observe
-    /// behaviour, for a backend that cannot tell (the CE file bridge).
-    fn grant_may_have_applied(&mut self, _tag: &str) -> Result<bool> {
-        Ok(true)
-    }
+    /// Required for the same reason as [`Self::observe_stack_quantity`]: a
+    /// default here is invisible to the enum wrapper the binary dispatches
+    /// through. A backend that cannot tell (the CE file bridge) answers `true`
+    /// explicitly, the pre-existing freeze-on-first-observe behaviour.
+    fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool>;
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress>;
     /// Retract a published-but-unexecuted grant command (clients#296). The
     /// client calls this when the validated context the command was published
@@ -222,6 +226,22 @@ impl BloodborneBackend for FileBackend {
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {
         // Weapon inventory/reinforcement state has not been resolved on v0.18.
         Ok(None)
+    }
+
+    /// The CE file bridge cannot read inventory, so the caller keeps its
+    /// ledger-derived baseline (clients#427).
+    fn observe_stack_quantity(
+        &mut self,
+        _normalized_item_id: u32,
+        _reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation> {
+        Ok(StackObservation::Unsupported)
+    }
+
+    /// The bridge cannot tell whether a published command already reached the
+    /// game, so it keeps the conservative freeze-on-first-observe answer.
+    fn grant_may_have_applied(&mut self, _tag: &str) -> Result<bool> {
+        Ok(true)
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
