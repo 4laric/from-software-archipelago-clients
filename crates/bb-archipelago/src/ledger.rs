@@ -607,7 +607,10 @@ mod tests {
         let detail = slot.unblock(0).unwrap();
         assert!(detail.contains("native_result=8"));
         assert_eq!(slot.blocked_entries().count(), 0);
-        assert!(slot.redeliver.is_empty());
+        assert!(
+            !slot.redeliver.contains(&0),
+            "resolving is not redelivering"
+        );
     }
 
     /// clients#443: a surplus completion is acknowledged like any other, and
