@@ -397,7 +397,9 @@ mod tests {
 
         // Inventory is not hydrated: the command is retained, not executed.
         assert_eq!(
-            engine.grant(goods_request(0x384, 2, "recv_1", Some(3))).unwrap(),
+            engine
+                .grant(goods_request(0x384, 2, "recv_1", Some(3)))
+                .unwrap(),
             GrantStep::Pending
         );
         assert_eq!(engine.state().status, "awaiting_inventory");
@@ -416,7 +418,9 @@ mod tests {
             },
         );
         assert_eq!(
-            engine.grant(goods_request(0x384, 2, "recv_1", Some(3))).unwrap(),
+            engine
+                .grant(goods_request(0x384, 2, "recv_1", Some(3)))
+                .unwrap(),
             GrantStep::Complete
         );
         assert!(engine.command_may_have_applied("recv_1"));
