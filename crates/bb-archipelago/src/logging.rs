@@ -242,7 +242,9 @@ mod tests {
 
     #[test]
     fn a_single_error_with_no_causes_still_renders_without_a_chain() {
-        let report = terminal_error_report(&anyhow::anyhow!("--mock and --assume-correct-save cannot be combined"));
+        let report = terminal_error_report(&anyhow::anyhow!(
+            "--mock and --assume-correct-save cannot be combined"
+        ));
         assert_eq!(
             report,
             "Error: --mock and --assume-correct-save cannot be combined"

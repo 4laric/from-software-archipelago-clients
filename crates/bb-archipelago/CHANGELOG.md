@@ -19,8 +19,6 @@
   residual: a failure inside `arguments()` happens before the log path is
   known and can still only reach the console.
 
-### Fixed
-
 * **Existing-stack grants go through the cave, not an external write
   (clients#433).** oz's fresh seed parked consumables intermittently as
   `write_error: tag=ap_N quantity write failed` -- the same item type
