@@ -1065,7 +1065,10 @@ mod tests {
         let retained = backend
             .grant_may_have_applied("ap_7")
             .expect("asking through the enum must not error");
-        assert!(!retained, "a retained, unwitnessed command cannot have applied");
+        assert!(
+            !retained,
+            "a retained, unwitnessed command cannot have applied"
+        );
 
         let untracked = backend
             .grant_may_have_applied("ap_8")
