@@ -732,7 +732,12 @@ fn run() -> Result<()> {
             .assume_correct_save
             .then(|| ASSUMED_IDENTITY.to_string());
         match attach_native_backend(shad_log, assumed_identity) {
-            Ok(backend) => {
+            Ok(mut backend) => {
+                // clients#445: passive per-grant forensics beside the ledger.
+                // Armed unconditionally on the native path -- it costs one
+                // appended line per delivered item and it is the only way the
+                // storage-routing question gets answered from ordinary play.
+                backend.arm_delivery_diagnostics(&args.ledger);
                 client_eprintln!(
                     "Bloodborne AP client {} | CUSA03173 01.09 | native payload installed | eboot 0x{:X} | native delivery armed",
                     env!("CARGO_PKG_VERSION"),

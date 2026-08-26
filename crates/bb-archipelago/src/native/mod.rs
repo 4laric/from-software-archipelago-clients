@@ -28,6 +28,7 @@ pub mod backend;
 pub mod contract;
 pub mod delivery;
 pub mod descriptor;
+pub mod diagnostics;
 pub mod engine;
 pub mod flag_gate;
 pub mod guest;

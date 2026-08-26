@@ -24,6 +24,7 @@ use anyhow::{Result, bail};
 use super::contract::{DescriptorFormula, Policy};
 use super::delivery::{DurableState, GrantCommand, GrantSession, Runtime};
 use super::descriptor::{CATEGORY_EQUIPMENT, CATEGORY_GOODS};
+use super::diagnostics::{DeliveryRecord, DiagnosticSink, GrantContext};
 
 /// The outcome of one `grant` poll.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +93,13 @@ pub struct NativeDelivery<R: Runtime> {
     current_tag: Option<String>,
     finished: HashMap<String, GrantStep>,
     manual_trigger: bool,
+    /// clients#445. Disabled unless the client arms it; when armed, exactly one
+    /// line per terminal grant. Nothing below ever branches on it.
+    diagnostics: DiagnosticSink,
+    /// The client-side context, refreshed by the loop through
+    /// [`Self::set_context`]. Latched at submit, re-read at the terminal step.
+    context: GrantContext,
+    submit_context: GrantContext,
 }
 
 impl<R: Runtime> NativeDelivery<R> {
@@ -102,6 +110,9 @@ impl<R: Runtime> NativeDelivery<R> {
             current_tag: None,
             finished: HashMap::new(),
             manual_trigger: false,
+            diagnostics: DiagnosticSink::disabled(),
+            context: GrantContext::default(),
+            submit_context: GrantContext::default(),
         }
     }
 
@@ -120,11 +131,29 @@ impl<R: Runtime> NativeDelivery<R> {
             current_tag: None,
             finished: HashMap::new(),
             manual_trigger: false,
+            diagnostics: DiagnosticSink::disabled(),
+            context: GrantContext::default(),
+            submit_context: GrantContext::default(),
         }
     }
 
     pub fn runtime_mut(&mut self) -> &mut R {
         self.session.runtime_mut()
+    }
+
+    /// Arm the passive per-grant diagnostics (clients#445). Off until called.
+    pub fn arm_diagnostics(&mut self, sink: DiagnosticSink) {
+        self.diagnostics = sink;
+    }
+
+    pub fn diagnostics_armed(&self) -> bool {
+        self.diagnostics.is_armed()
+    }
+
+    /// Refresh the client-side context stamped onto the next record. Cheap and
+    /// idempotent; the loop calls it with state it already has in hand.
+    pub fn set_context(&mut self, context: GrantContext) {
+        self.context = context;
     }
 
     /// The live view of one stack, for the client's fresh-grant baseline
@@ -170,6 +199,16 @@ impl<R: Runtime> NativeDelivery<R> {
 
     /// Advance the delivery of one request by one poll.
     pub fn grant(&mut self, request: NativeGrantRequest) -> Result<GrantStep> {
+        self.grant_with_warning(request, &mut |_: &str| {})
+    }
+
+    /// [`Self::grant`] with an explicit warning sink, so the one-shot
+    /// diagnostics write failure has somewhere to go that a test can read.
+    pub fn grant_with_warning(
+        &mut self,
+        request: NativeGrantRequest,
+        warn: &mut dyn FnMut(&str),
+    ) -> Result<GrantStep> {
         let tag = request.tag.clone();
         if let Some(step) = self.finished.get(&tag) {
             return Ok(step.clone());
@@ -183,15 +222,34 @@ impl<R: Runtime> NativeDelivery<R> {
             );
             let command = request.into_command(&self.formula)?;
             self.session.submit(command, self.manual_trigger)?;
+            self.submit_context = self.context;
             self.current_tag = Some(tag.clone());
         }
         let status = self.session.poll();
         let step = classify(&status, self.session.state());
         if !matches!(step, GrantStep::Pending) {
+            self.emit_diagnostic(&status, matches!(step, GrantStep::Complete), warn);
             self.finished.insert(tag, step.clone());
             self.current_tag = None;
         }
         Ok(step)
+    }
+
+    /// One line per terminal grant. Nothing here can fail into the delivery:
+    /// the sink swallows its own errors after a single warning.
+    fn emit_diagnostic(&mut self, status: &str, is_success: bool, warn: &mut dyn FnMut(&str)) {
+        if !self.diagnostics.is_armed() {
+            return;
+        }
+        let record = DeliveryRecord::build(
+            self.session.trace(),
+            status,
+            &self.session.state().detail,
+            is_success,
+            self.submit_context,
+            self.context,
+        );
+        self.diagnostics.record(&record, warn);
     }
 
     /// Best-effort withdrawal of an in-flight request the client can no longer
@@ -231,6 +289,7 @@ mod tests {
     use super::super::contract::contract;
     use super::super::delivery::{Runtime, SlotRecord, StackView};
     use super::super::descriptor::ItemGrantDescriptor;
+    use super::super::diagnostics::DeliveryRecord;
     use super::*;
     use std::collections::HashMap;
 
@@ -246,6 +305,9 @@ mod tests {
         // clients#443: quantity of the same id the player acquires while the
         // native call is in flight.
         concurrent_pickup: u32,
+        // clients#443's other direction: quantity spent -- or overflowed into
+        // storage -- in the same window. This is the shape clients#445 counts.
+        concurrent_spend: u32,
     }
 
     impl Runtime for FakeRuntime {
@@ -309,7 +371,8 @@ mod tests {
                     slot: Some(slot),
                     quantity_address: Some(0x2000),
                 });
-                stack.quantity += delta + self.concurrent_pickup;
+                stack.quantity = (stack.quantity + delta + self.concurrent_pickup)
+                    .saturating_sub(self.concurrent_spend);
                 stack.exists = true;
                 self.result = slot;
             }
@@ -525,5 +588,241 @@ mod tests {
             GrantStep::Complete
         );
         assert!(engine.command_may_have_applied("recv_1"));
+    }
+
+    // ----------------------------------------------------------------------
+    // clients#445: the passive per-grant delivery diagnostic.
+    // ----------------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    struct CapturingWriter {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl super::super::diagnostics::DiagnosticWriter for CapturingWriter {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            self.lines.lock().expect("lines").push(line.to_string());
+            Ok(())
+        }
+    }
+
+    struct RefusingWriter;
+
+    impl super::super::diagnostics::DiagnosticWriter for RefusingWriter {
+        fn write_line(&mut self, _line: &str) -> std::io::Result<()> {
+            Err(std::io::Error::other("no diagnostics for you"))
+        }
+    }
+
+    type CapturedLines = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn armed_engine(runtime: FakeRuntime) -> (NativeDelivery<FakeRuntime>, CapturedLines) {
+        let writer = CapturingWriter::default();
+        let lines = std::sync::Arc::clone(&writer.lines);
+        let mut engine = NativeDelivery::new(runtime, contract().descriptor, contract().policy);
+        engine.arm_diagnostics(super::super::diagnostics::DiagnosticSink::new(Box::new(
+            writer,
+        )));
+        engine.set_context(super::super::diagnostics::GrantContext {
+            gameplay_ready: Some(true),
+            event_flags_armed: true,
+        });
+        (engine, lines)
+    }
+
+    fn stocked(quantity: u32) -> FakeRuntime {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime {
+            ready: true,
+            ..Default::default()
+        };
+        runtime.stacks.insert(
+            normalized,
+            StackView {
+                quantity,
+                exists: true,
+                slot: Some(1),
+                quantity_address: Some(0x2000),
+            },
+        );
+        runtime
+    }
+
+    fn drain(
+        engine: &mut NativeDelivery<FakeRuntime>,
+        request: NativeGrantRequest,
+    ) -> Result<GrantStep> {
+        let mut step = GrantStep::Pending;
+        for _ in 0..64 {
+            step = engine.grant(request.clone())?;
+            if !matches!(step, GrantStep::Pending) {
+                return Ok(step);
+            }
+        }
+        Ok(step)
+    }
+
+    fn only_record(lines: &CapturedLines) -> DeliveryRecord {
+        let captured = lines.lock().expect("lines");
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one record per grant: {captured:?}"
+        );
+        json::from_str(&captured[0]).expect("a diagnostics line is valid json")
+    }
+
+    /// A plain, boring, successful delivery still writes its line -- that is the
+    /// whole point of a PASSIVE diagnostic. A file that only ever records
+    /// failures cannot answer "how often does this happen", which is what
+    /// clients#445 is asking.
+    #[test]
+    fn a_completed_grant_writes_one_record_with_the_delivery_it_actually_saw() {
+        let (mut engine, lines) = armed_engine(stocked(3));
+        assert_eq!(
+            drain(&mut engine, goods_request(0x384, 2, "ap_7", Some(3))).unwrap(),
+            GrantStep::Complete
+        );
+        let record = only_record(&lines);
+        assert_eq!(record.tag, "ap_7");
+        assert_eq!(record.ap_index, Some(7));
+        assert_eq!(record.quantity, 2);
+        assert_eq!(record.observed_before, Some(3));
+        assert_eq!(record.expected_after, Some(5));
+        assert_eq!(record.lane.as_deref(), Some("delta"));
+        assert_eq!(record.source.as_deref(), Some("in_frame"));
+        assert_eq!(record.terminal_status, "completed");
+        assert_eq!(record.readbacks.last().copied().flatten(), Some(5));
+        assert_eq!(record.readback_surplus, Some(0));
+        assert!(record.execution_evidence);
+        assert_eq!(record.inferred_destination, "held");
+        assert_eq!(record.gameplay_ready_at_submit, Some(true));
+        assert_eq!(record.gameplay_ready_at_terminal, Some(true));
+        assert!(record.event_flags_armed_at_terminal);
+        assert_eq!(
+            record.item_id_normalized,
+            contract().descriptor.goods_normalized_prefix | 0x384
+        );
+    }
+
+    /// clients#443's surplus direction: the player looted one more of the same
+    /// id mid-flight. The held stack still absorbed the grant, so the inference
+    /// is `held` and the surplus is recorded as the +1 it is.
+    #[test]
+    fn a_concurrent_pickup_completion_records_its_surplus_and_still_infers_held() {
+        let mut runtime = stocked(3);
+        runtime.concurrent_pickup = 1;
+        let (mut engine, lines) = armed_engine(runtime);
+        assert_eq!(
+            drain(&mut engine, goods_request(0x384, 2, "ap_0", Some(3))).unwrap(),
+            GrantStep::Complete
+        );
+        let record = only_record(&lines);
+        assert_eq!(record.terminal_status, "completed");
+        assert_eq!(record.expected_after, Some(5));
+        assert_eq!(record.readbacks.last().copied().flatten(), Some(6));
+        assert_eq!(record.readback_surplus, Some(1));
+        assert_eq!(record.inferred_destination, "held");
+        assert!(
+            record.terminal_detail.contains("concurrent pickup"),
+            "{}",
+            record.terminal_detail
+        );
+    }
+
+    /// clients#443's DEFICIT direction, which is the case clients#445 exists
+    /// for: the cave provably executed and the held stack came in under
+    /// `expected_after`. That is the shape a capped pouch overflowing into
+    /// storage produces -- and a concurrent spend produces it too, which is why
+    /// the field is `inferred_destination` and the value is `storage_suspected`
+    /// rather than `storage`.
+    #[test]
+    fn an_executed_deficit_completion_records_the_deficit_and_suspects_storage() {
+        let mut runtime = stocked(3);
+        runtime.concurrent_spend = 2;
+        let (mut engine, lines) = armed_engine(runtime);
+        assert_eq!(
+            drain(&mut engine, goods_request(0x384, 2, "ap_1", Some(3))).unwrap(),
+            GrantStep::Complete
+        );
+        let record = only_record(&lines);
+        assert_eq!(record.terminal_status, "completed");
+        assert_eq!(record.expected_after, Some(5));
+        assert_eq!(record.readbacks.last().copied().flatten(), Some(3));
+        assert_eq!(record.readback_surplus, Some(-2));
+        assert!(record.execution_evidence);
+        assert_eq!(record.inferred_destination, "storage_suspected");
+        assert!(
+            record
+                .terminal_detail
+                .contains("concurrent spend or storage overflow"),
+            "{}",
+            record.terminal_detail
+        );
+    }
+
+    /// A parked grant records its park, and infers nothing from it. The whole
+    /// value of the file is that the parks and the completions are counted in
+    /// the same place.
+    #[test]
+    fn a_parked_grant_records_its_park_and_infers_no_destination() {
+        // Baseline 3 against a live stack of 9: off-baseline, so the machine
+        // parks before anything is queued.
+        let (mut engine, lines) = armed_engine(stocked(9));
+        let step = drain(&mut engine, goods_request(0x384, 2, "ap_2", Some(3))).unwrap();
+        assert!(matches!(step, GrantStep::Failed { .. }), "{step:?}");
+        let record = only_record(&lines);
+        assert_eq!(record.terminal_status, "quantity_mismatch");
+        assert_eq!(record.observed_before, Some(3));
+        assert_eq!(record.expected_after, Some(5));
+        assert_eq!(record.readbacks.last().copied().flatten(), Some(9));
+        assert!(!record.execution_evidence);
+        assert_eq!(record.native_result, None, "nothing was ever queued");
+        assert_eq!(record.inferred_destination, "unknown");
+        assert!(
+            record.terminal_detail.contains("expected_before=3"),
+            "{}",
+            record.terminal_detail
+        );
+    }
+
+    /// The diagnostic must never become a new way for a delivery to fail. A
+    /// writer that refuses every line still leaves the grant COMPLETE, and says
+    /// so exactly once.
+    #[test]
+    fn a_refusing_writer_warns_once_and_the_item_is_still_delivered() {
+        let mut engine = NativeDelivery::new(stocked(3), contract().descriptor, contract().policy);
+        engine.arm_diagnostics(super::super::diagnostics::DiagnosticSink::new(Box::new(
+            RefusingWriter,
+        )));
+        let mut warnings = Vec::new();
+        let request = goods_request(0x384, 2, "ap_3", Some(3));
+        let mut step = GrantStep::Pending;
+        for _ in 0..64 {
+            step = engine
+                .grant_with_warning(request.clone(), &mut |line| warnings.push(line.to_string()))
+                .expect("a diagnostics failure is never a grant error");
+            if !matches!(step, GrantStep::Pending) {
+                break;
+            }
+        }
+        assert_eq!(step, GrantStep::Complete, "the item is delivered anyway");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("deliveries are unaffected"),
+            "{warnings:?}"
+        );
+    }
+
+    /// Off by default: a client that never arms the sink writes nothing and
+    /// behaves exactly as it did before clients#445.
+    #[test]
+    fn diagnostics_are_off_until_armed() {
+        let mut engine = NativeDelivery::new(stocked(3), contract().descriptor, contract().policy);
+        assert!(!engine.diagnostics_armed());
+        assert_eq!(
+            drain(&mut engine, goods_request(0x384, 2, "ap_4", Some(3))).unwrap(),
+            GrantStep::Complete
+        );
     }
 }

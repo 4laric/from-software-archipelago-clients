@@ -166,6 +166,84 @@ fn is_recoverable_prior(status: &str) -> bool {
     )
 }
 
+/// The maximum number of individual read-backs one [`GrantTrace`] retains.
+/// The verify budget is small, but `hydration_verify_polls` is not bounded by
+/// anything this module controls, so the vector is capped: the first half and
+/// the most recent half are kept, and [`GrantTrace::readbacks_seen`] carries
+/// the true count so a truncated list can never be mistaken for a short one.
+const MAX_RECORDED_READBACKS: usize = 16;
+
+/// A passive, write-only record of what one grant's delivery actually saw.
+///
+/// Every field here is a value the machine already computes for its own
+/// decisions -- no extra guest read exists to populate any of it, and nothing
+/// in the state machine ever branches on a [`GrantTrace`]. It exists so the
+/// storage-routing question (clients#445) can be answered from normal play
+/// instead of from a manual probe session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GrantTrace {
+    pub tag: String,
+    pub raw_id: u32,
+    pub normalized_id: u32,
+    pub quantity: u32,
+    /// The baseline the machine resolved for this grant (durable or sampled).
+    pub observed_before: Option<u32>,
+    /// `observed_before + quantity`, the total the verify loop demands.
+    pub expected_after: Option<u32>,
+    /// `"insert"` or `"delta"`, once a lane has been chosen.
+    pub lane: Option<&'static str>,
+    /// `"persistent"` or `"in_frame"`, the descriptor source branch.
+    pub source: Option<&'static str>,
+    /// Held-stack totals read back after the native call, in order. `None` is
+    /// "geometry unavailable", exactly as [`Runtime::find_stack`] means it.
+    pub readbacks: Vec<Option<u32>>,
+    /// How many read-backs actually happened, truncation included.
+    pub readbacks_seen: u32,
+    /// The last value of the cave's result cell the machine observed.
+    pub native_result: Option<u32>,
+    /// Verify attempts consumed.
+    pub verify_polls: u32,
+    /// The clients#443 evidence predicate: the native call reported done and
+    /// the result cell is no longer the pre-arm sentinel, so the routine ran.
+    pub execution_evidence: bool,
+}
+
+impl GrantTrace {
+    fn begin(command: &GrantCommand) -> Self {
+        Self {
+            tag: command.tag.clone(),
+            raw_id: command.raw_id,
+            normalized_id: command.normalized_id,
+            quantity: command.quantity,
+            ..Self::default()
+        }
+    }
+
+    fn record_readback(&mut self, value: Option<u32>) {
+        self.readbacks_seen = self.readbacks_seen.saturating_add(1);
+        if self.readbacks.len() == MAX_RECORDED_READBACKS {
+            // Drop the oldest of the recent half, keeping the first half (the
+            // shape right after execution) and the tail (the shape at the end).
+            self.readbacks.remove(MAX_RECORDED_READBACKS / 2);
+        }
+        self.readbacks.push(value);
+    }
+
+    /// The last held-stack total seen, if any read-back produced one.
+    pub fn last_readback(&self) -> Option<u32> {
+        self.readbacks.iter().rev().copied().flatten().next()
+    }
+
+    /// `last_readback - expected_after`, the clients#443 surplus (positive) or
+    /// deficit (negative). `None` when either side is unknown.
+    pub fn readback_surplus(&self) -> Option<i64> {
+        match (self.last_readback(), self.expected_after) {
+            (Some(actual), Some(wanted)) => Some(i64::from(actual) - i64::from(wanted)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeliveryError(pub String);
 
@@ -194,6 +272,9 @@ pub struct GrantSession<R: Runtime> {
     /// The in-flight native call is the existing-stack delta branch
     /// (`request = 2`), not an insert. It changes how the verify is read.
     delta_lane: bool,
+    /// Passive forensics for the current grant (clients#445). Written on every
+    /// transition, read by nothing inside this module.
+    trace: GrantTrace,
 }
 
 impl<R: Runtime> GrantSession<R> {
@@ -224,6 +305,7 @@ impl<R: Runtime> GrantSession<R> {
             active: false,
             manual: false,
             delta_lane: false,
+            trace: GrantTrace::default(),
         }
     }
 
@@ -233,6 +315,11 @@ impl<R: Runtime> GrantSession<R> {
 
     pub fn runtime_mut(&mut self) -> &mut R {
         &mut self.runtime
+    }
+
+    /// The passive delivery trace for the grant currently held (clients#445).
+    pub fn trace(&self) -> &GrantTrace {
+        &self.trace
     }
 
     fn blood_vial_normalized(&self) -> u32 {
@@ -282,6 +369,7 @@ impl<R: Runtime> GrantSession<R> {
         self.verify_polls = 0;
         self.expected_before = command.expected_before;
         let detail = format!("tag={}", command.tag);
+        self.trace = GrantTrace::begin(&command);
         self.command = Some(command);
         self.manual = manual_trigger;
         self.set("queued", detail);
@@ -318,6 +406,11 @@ impl<R: Runtime> GrantSession<R> {
             .expect("expected_before set before active")
             .saturating_add(command.quantity);
         let record = self.runtime.read_slot_record(native_result);
+        // clients#445 forensics only: these are the values the verify loop is
+        // about to branch on, captured before any of the branches run.
+        self.trace.native_result = Some(native_result);
+        self.trace.execution_evidence = native_result != EMPTY_SLOT;
+        self.trace.record_readback(actual);
         // The insert lane can accept the reported slot as the witness: a
         // freshly inserted stack holding at least `quantity` of the right id
         // IS the grant. The delta lane cannot -- an existing stack of 5 that
@@ -370,6 +463,7 @@ impl<R: Runtime> GrantSession<R> {
                 );
             }
             self.verify_polls += 1;
+            self.trace.verify_polls = self.verify_polls;
             let hydrating = !self.delta_lane
                 && matches!(record.normalized_id, None | Some(EMPTY_SLOT))
                 && !actual.is_some_and(|a| a != 0);
@@ -436,14 +530,18 @@ impl<R: Runtime> GrantSession<R> {
         });
         let expected_before = self.expected_before.unwrap();
         let wanted = expected_before.saturating_add(command.quantity);
+        self.trace.observed_before = Some(expected_before);
+        self.trace.expected_after = Some(wanted);
 
         if stack.quantity == wanted {
+            self.trace.record_readback(Some(stack.quantity));
             return self.finish(
                 "recovered_complete",
                 format!("tag={} quantity={}", command.tag, stack.quantity),
             );
         }
         if stack.quantity != expected_before {
+            self.trace.record_readback(Some(stack.quantity));
             return self.finish(
                 "quantity_mismatch",
                 format!(
@@ -498,6 +596,9 @@ impl<R: Runtime> GrantSession<R> {
             "in_frame"
         };
         let lane = if stack.exists { "delta" } else { "insert" };
+        self.trace.lane = Some(lane);
+        self.trace.source = Some(source);
+        self.trace.verify_polls = 0;
         self.set(
             "executing",
             format!(

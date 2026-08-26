@@ -1,5 +1,47 @@
 ## Unreleased
 
+### Added
+
+* **Passive per-grant delivery diagnostics (clients#445).** On the native path
+  every grant that reaches a terminal outcome -- completed, completed with the
+  clients#443 concurrent activity, parked, or recovered -- appends one JSON line
+  to `delivery-diagnostics.jsonl` in the session folder, beside `ledger.json`
+  and `client.log`. The operator flow is the whole point: play normally, then
+  send that file the way you send `client.log`. There is no probe step, no flag,
+  and no new argument -- the path is derived from the ledger path the client is
+  already given, because the launcher already puts all three files in one
+  folder. Each line carries only values the delivery machine already computed
+  for a decision it already makes: tag and AP index, raw and normalized item id,
+  lane (`insert`/`delta`) and descriptor source, quantity, the observed
+  baseline, the expected total, every held-stack read-back the verify loop saw
+  (first and most recent sixteen, with the true count), the cave's result cell
+  and whether it constitutes clients#443 execution evidence, the verify poll
+  count, the terminal status and detail, and the client's own gameplay-ready and
+  flag-gate state at submit and at the terminal step. **No new read of the game
+  is performed for any of it**, and nothing in the state machine branches on the
+  record. A failure to write warns exactly once and is then silent: a diagnostic
+  that can park a delivery is worse than no diagnostic, and there is a test that
+  refuses every write and asserts the item is delivered anyway.
+
+  One field is an inference and says so in its name. `inferred_destination` is
+  `held` when the read-back arithmetic accounts for the delta in the held stack
+  (a clients#443 surplus included -- the stack still absorbed the grant),
+  `storage_suspected` when the cave provably executed and the held stack came in
+  *under* the expected total, and `unknown` otherwise. That deficit shape is
+  what a capped Bloodborne pouch overflowing into storage produces -- and what a
+  concurrent spend in the same unobservable window produces too. The client has
+  no read of the storage box and cannot separate them, which is why the value
+  says *suspected*; these counts must never be reported as measured storage
+  routing.
+
+  This complements the manual probe in bb-archipelago#203 rather than replacing
+  it. Controlled-condition questions -- a unique-item insert, a deliberately
+  at-cap arming -- still belong to the probe, because those conditions do not
+  arise on their own during play. This answers the one the probe cannot: the
+  distribution across a real session. `tools/summarize_delivery_diagnostics.py`
+  groups the records by item, terminal status and inferred destination and
+  prints a table to paste into clients#445.
+
 ### Fixed
 
 * **Concurrent inventory activity (either direction) during a delta grant no
