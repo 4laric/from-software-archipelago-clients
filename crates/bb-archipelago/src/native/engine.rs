@@ -672,6 +672,62 @@ mod tests {
         json::from_str(&captured[0]).expect("a diagnostics line is valid json")
     }
 
+    /// The Saw Spear id, already owned at slot 1 -- the clients#451 shape:
+    /// `find_stack` matches the weapon's record, so the pre-guard machine chose
+    /// the delta lane and the diagnostics record said `delta`.
+    fn owned_weapon() -> FakeRuntime {
+        let mut runtime = FakeRuntime {
+            ready: true,
+            ..Default::default()
+        };
+        // Slot 0 on purpose: this fake reports `s.unwrap_or(0)` as the result
+        // cell, so an INSERT (which passes no slot) reads its record back at 0.
+        // The owned record living there is what lets the test witness the
+        // insert's slot read-back instead of starving the hydration budget,
+        // which is 240 polls -- longer than `drain`.
+        runtime.stacks.insert(
+            0x006C_5660,
+            StackView {
+                quantity: 1,
+                exists: true,
+                slot: Some(0),
+                quantity_address: Some(0x2000),
+            },
+        );
+        runtime
+    }
+
+    fn weapon_request(tag: &str) -> NativeGrantRequest {
+        NativeGrantRequest {
+            tag: tag.into(),
+            raw_descriptor: contract().descriptor.persistent_source_marker | 0x006C_5660,
+            normalized_item_id: 0x006C_5660,
+            item_category: 0,
+            quantity: 1,
+            expected_before: None,
+        }
+    }
+
+    /// clients#451 at the diagnostics seam (clients#447): an equipment grant
+    /// against an ALREADY-OWNED matching record must report lane `insert`, and
+    /// must publish no count arithmetic -- a stack total for an instance record
+    /// is not an instance count, so there is nothing to infer a destination
+    /// from. Before the guard this record read `lane: "delta"`.
+    #[test]
+    fn an_owned_weapon_records_the_insert_lane() {
+        let (mut engine, lines) = armed_engine(owned_weapon());
+        let step = drain(&mut engine, weapon_request("ap_7")).unwrap();
+        assert_eq!(step, GrantStep::Complete, "{step:?}");
+        let record = only_record(&lines);
+        assert_eq!(record.lane.as_deref(), Some("insert"));
+        assert_eq!(record.source.as_deref(), Some("persistent"));
+        assert_eq!(record.terminal_status, "completed");
+        assert_eq!(record.observed_before, None);
+        assert_eq!(record.expected_after, None);
+        assert_eq!(record.readback_surplus, None);
+        assert_eq!(record.inferred_destination, "unknown");
+    }
+
     /// A plain, boring, successful delivery still writes its line -- that is the
     /// whole point of a PASSIVE diagnostic. A file that only ever records
     /// failures cannot answer "how often does this happen", which is what
