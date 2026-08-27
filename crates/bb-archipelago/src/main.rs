@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use archipelago_rs::{ClientStatus, Connection, ConnectionOptions, Event, ItemHandling};
-use bb_archipelago::RUNTIME_BUILD;
 use bb_archipelago::backend::{
     BloodborneBackend, EquipRequest, FileBackend, ItemGrant, LocationContext, MockBackend,
     OperationProgress, StackObservation,
@@ -20,6 +19,7 @@ use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
 use bb_archipelago::logging;
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
+use bb_archipelago::{RUNTIME_BUILD, client_version};
 
 /// Console reporting policy for item-delivery failures (clients#404).
 ///
@@ -549,7 +549,7 @@ fn attach_live_backend(config: &RuntimeConfig, assume_correct_save: bool) -> Res
     let attachment = event_flags.info();
     client_eprintln!(
         "Bloodborne AP client {} | CUSA03173 01.09 | shad PID {} | eboot 0x{:X} | direct flag backend ready",
-        env!("CARGO_PKG_VERSION"),
+        client_version(),
         attachment.process_id,
         attachment.eboot_base
     );
@@ -654,10 +654,35 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
 /// reconciliation, park re-queue, location/item polling) print and carry on
 /// without returning `Err` at all.
 fn main() {
+    match version_request(env::args().skip(1)) {
+        Ok(Some(version)) => {
+            println!("{version}");
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            client_eprintln!("{}", logging::terminal_error_report(&error));
+            std::process::exit(1);
+        }
+    }
     if let Err(error) = run() {
         client_eprintln!("{}", logging::terminal_error_report(&error));
         std::process::exit(1);
     }
+}
+
+fn version_request<I: Iterator<Item = String>>(mut args: I) -> Result<Option<String>> {
+    let Some(first) = args.next() else {
+        return Ok(None);
+    };
+    if first != "--version" {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        args.next().is_none(),
+        "--version does not accept any other arguments"
+    );
+    Ok(Some(client_version()))
 }
 
 fn run() -> Result<()> {
@@ -673,7 +698,10 @@ fn run() -> Result<()> {
         logging::install_log_file(path)
             .with_context(|| format!("could not open the client log {}", path.display()))?;
     }
-    client_eprintln!("Bloodborne AP runtime build {RUNTIME_BUILD}");
+    client_eprintln!(
+        "Bloodborne AP client {} | runtime build {RUNTIME_BUILD}",
+        client_version()
+    );
     // Console-legibility banner (clients#404 companion): a normal, working
     // launch otherwise prints only build/attach diagnostics interleaved with
     // long silent waits, so a healthy client looked identical to a frozen or
@@ -740,7 +768,7 @@ fn run() -> Result<()> {
                 backend.arm_delivery_diagnostics(&args.ledger);
                 client_eprintln!(
                     "Bloodborne AP client {} | CUSA03173 01.09 | native payload installed | eboot 0x{:X} | native delivery armed",
-                    env!("CARGO_PKG_VERSION"),
+                    client_version(),
                     backend.base()
                 );
                 Backend::Native(Box::new(backend))
@@ -1294,6 +1322,21 @@ mod tests {
     fn unknown_delivery_mode_is_rejected() {
         let error = parse_args(base_args(&["--delivery=bogus"]).into_iter()).unwrap_err();
         assert!(format!("{error:#}").contains("unknown --delivery mode"));
+    }
+
+    #[test]
+    fn version_flag_prints_the_exact_binary_version_without_runtime_arguments() {
+        let version = version_request(["--version".to_string()].into_iter())
+            .expect("version request")
+            .expect("version line");
+        assert_eq!(version, client_version());
+    }
+
+    #[test]
+    fn version_flag_refuses_ambiguous_trailing_arguments() {
+        let error = version_request(["--version".to_string(), "server".to_string()].into_iter())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("does not accept"));
     }
 
     #[test]

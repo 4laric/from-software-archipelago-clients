@@ -23,6 +23,7 @@ on:
   workflow_dispatch:
 
 env:
+  BB_BUILD_SHA: ${{ github.sha }}
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
 
