@@ -21,11 +21,69 @@ pub struct LocationBinding {
     pub vanilla_award_suppressed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// How the world documented the descriptor it is asking this client to grant.
+///
+/// Provenance strength is bookkeeping, not behavior: a binding whose evidence
+/// this client understands is delivered exactly like every other one. The
+/// variant matters in two places only -- [`RuntimeItemBinding::validate`],
+/// which still refuses a category-4 descriptor that was never observed through
+/// the goods formula, and the [`DescriptorEvidence::Unknown`] catch-all.
+///
+/// `Unknown` exists because a slot-data enum is a two-repo contract: the world
+/// can grow a variant before any client build knows it. Hard-failing the parse
+/// turns that skew into "the client exits at startup and the seed is
+/// unplayable". Instead the unknown value is carried verbatim, the session
+/// arms, and the *individual* binding is refused at delivery time -- parked, by
+/// name -- fail-closed per item rather than per seed.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DescriptorEvidence {
+    /// The descriptor was read back out of an observed goods formula.
     GoodsFormulaObserved,
+    /// The descriptor was witnessed live, arriving in the inventory UI.
     LiveGrantInventoryUi,
+    /// The param id is documented by two independent sources but has not been
+    /// witnessed live yet (bb-archipelago #208). Deliverable exactly like the
+    /// others: the first live delivery of such a binding is its validation.
+    ParamIdInferred,
+    /// A provenance string minted by a world newer than this client.
+    Unknown(String),
+}
+
+impl DescriptorEvidence {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::GoodsFormulaObserved => "goods_formula_observed",
+            Self::LiveGrantInventoryUi => "live_grant_inventory_ui",
+            Self::ParamIdInferred => "param_id_inferred",
+            Self::Unknown(raw) => raw.as_str(),
+        }
+    }
+
+    /// False only for a value this client build has never heard of.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Unknown(_))
+    }
+}
+
+impl Serialize for DescriptorEvidence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DescriptorEvidence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Deliberately total: every string parses. `#[serde(other)]` cannot be
+        // used here because it discards the value, and the refusal this client
+        // owes the operator has to name the evidence it actually saw.
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "goods_formula_observed" => Self::GoodsFormulaObserved,
+            "live_grant_inventory_ui" => Self::LiveGrantInventoryUi,
+            "param_id_inferred" => Self::ParamIdInferred,
+            _ => Self::Unknown(raw),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -59,7 +117,12 @@ impl RuntimeItemBinding {
         match self.item_category {
             4 => {
                 anyhow::ensure!(
-                    self.descriptor_evidence == DescriptorEvidence::GoodsFormulaObserved,
+                    matches!(
+                        self.descriptor_evidence,
+                        DescriptorEvidence::GoodsFormulaObserved
+                            // Refused individually at delivery, not here.
+                            | DescriptorEvidence::Unknown(_)
+                    ),
                     "AP item {ap_item_id} category-4 descriptor lacks observed-goods evidence"
                 );
                 anyhow::ensure!(
@@ -76,7 +139,14 @@ impl RuntimeItemBinding {
             }
             0 => {
                 anyhow::ensure!(
-                    self.descriptor_evidence == DescriptorEvidence::LiveGrantInventoryUi,
+                    matches!(
+                        self.descriptor_evidence,
+                        DescriptorEvidence::LiveGrantInventoryUi
+                            | DescriptorEvidence::ParamIdInferred
+                            // An unknown provenance is not judged here: this
+                            // binding is refused individually at delivery.
+                            | DescriptorEvidence::Unknown(_)
+                    ),
                     "AP item {ap_item_id} category-0 descriptor is not live-validated"
                 );
                 anyhow::ensure!(
@@ -319,6 +389,22 @@ impl RuntimeConfig {
         Ok(self)
     }
 
+    /// One line for the operator when the seed carries bindings whose param
+    /// ids are documented but not yet live-witnessed (bb-archipelago #208).
+    /// `None` when there are none, so the healthy seed prints nothing.
+    pub fn inferred_evidence_notice(&self) -> Option<String> {
+        let count = self
+            .items
+            .values()
+            .filter(|binding| binding.descriptor_evidence == DescriptorEvidence::ParamIdInferred)
+            .count();
+        (count > 0).then(|| {
+            format!(
+                "{count} item binding(s) carry inferred param ids; first live delivery of each is its validation."
+            )
+        })
+    }
+
     fn validate_items(&self) -> Result<()> {
         for (&ap_item_id, binding) in &self.items {
             binding.validate(ap_item_id)?;
@@ -545,26 +631,129 @@ mod tests {
         assert!(format!("{error:#}").contains("invalid AP location id"));
     }
 
+    fn weapon_row(evidence: &str) -> json::Value {
+        json!({
+            "runtime_items": {
+                "12255243": {
+                    "raw_descriptor": 0x8132B3A0_u32,
+                    "normalized_item_id": 0x0132B3A0_u32,
+                    "item_category": 0,
+                    "descriptor_evidence": evidence,
+                    "quantity": 1,
+                    "reinforcement_level": 0,
+                    "feed_effect": "right_hand_weapon"
+                }
+            }
+        })
+    }
+
+    /// The live break: a bb-archipelago #208 world binds weapons whose param
+    /// ids are two-source-documented but not yet live-witnessed. The old enum
+    /// rejected the string and the client exited at startup.
     #[test]
-    fn equipment_requires_explicit_live_descriptor_evidence() {
+    fn param_id_inferred_parses_and_binds_like_the_others() {
+        let config = local()
+            .apply_slot_data(&weapon_row("param_id_inferred"))
+            .unwrap();
+        let binding = &config.items[&12_255_243];
+        assert_eq!(
+            binding.descriptor_evidence,
+            DescriptorEvidence::ParamIdInferred
+        );
+        assert!(binding.descriptor_evidence.is_known());
+        // Deliverable exactly like a live-witnessed binding: same descriptors,
+        // same quantity, same receive policy.
+        assert_eq!(binding.raw_descriptor, 0x8132_B3A0);
+        assert_eq!(binding.normalized_item_id, 0x0132_B3A0);
+        assert_eq!(binding.reinforcement_level, Some(0));
+        assert_eq!(binding.feed_effect, FeedEffectBinding::RightHandWeapon);
+    }
+
+    /// CONTROL: the two original variants are untouched by the catch-all.
+    #[test]
+    fn the_original_two_evidence_variants_are_unchanged() {
+        let live = local()
+            .apply_slot_data(&weapon_row("live_grant_inventory_ui"))
+            .unwrap();
+        assert_eq!(
+            live.items[&12_255_243].descriptor_evidence,
+            DescriptorEvidence::LiveGrantInventoryUi
+        );
+        let goods = local()
+            .apply_slot_data(&json!({
+                "runtime_items": {
+                    "12255488": {
+                        "raw_descriptor": 0xB000_04CE_u32,
+                        "normalized_item_id": 0x4000_04CE_u32,
+                        "item_category": 4,
+                        "descriptor_evidence": "goods_formula_observed",
+                        "quantity": 2
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            goods.items[&12_255_488].descriptor_evidence,
+            DescriptorEvidence::GoodsFormulaObserved
+        );
+        // A category-4 row still cannot claim live-grant evidence.
         let error = local()
             .apply_slot_data(&json!({
                 "runtime_items": {
-                    "12255243": {
-                        "raw_descriptor": 0x8132B3A0_u32,
-                        "normalized_item_id": 0x0132B3A0_u32,
-                        "item_category": 0,
-                        "descriptor_evidence": "item_lot_inferred",
-                        "quantity": 1,
-                        "reinforcement_level": 0,
-                        "feed_effect": "right_hand_weapon"
+                    "12255488": {
+                        "raw_descriptor": 0xB000_04CE_u32,
+                        "normalized_item_id": 0x4000_04CE_u32,
+                        "item_category": 4,
+                        "descriptor_evidence": "live_grant_inventory_ui",
+                        "quantity": 2
                     }
                 }
             }))
             .unwrap_err();
-        let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("slot_data.runtime_items"));
-        assert!(diagnostic.contains("item_lot_inferred"));
+        assert!(format!("{error:#}").contains("observed-goods evidence"));
+    }
+
+    /// Forward compatibility: an evidence string minted by a newer world no
+    /// longer kills the seed parse. It is carried verbatim so the delivery
+    /// path can refuse that one binding by name.
+    #[test]
+    fn an_unknown_evidence_string_survives_the_parse_verbatim() {
+        let config = local()
+            .apply_slot_data(&weapon_row("item_lot_inferred"))
+            .unwrap();
+        let evidence = &config.items[&12_255_243].descriptor_evidence;
+        assert_eq!(
+            evidence,
+            &DescriptorEvidence::Unknown("item_lot_inferred".to_string())
+        );
+        assert!(!evidence.is_known());
+        assert_eq!(evidence.as_str(), "item_lot_inferred");
+        // Round-trips: the client re-serializes what the world said.
+        assert_eq!(
+            json::to_value(evidence).unwrap(),
+            json!("item_lot_inferred")
+        );
+    }
+
+    #[test]
+    fn the_inferred_notice_counts_only_inferred_bindings_and_is_silent_otherwise() {
+        assert!(
+            local()
+                .apply_slot_data(&weapon_row("live_grant_inventory_ui"))
+                .unwrap()
+                .inferred_evidence_notice()
+                .is_none(),
+            "a seed with no inferred binding prints nothing"
+        );
+        let notice = local()
+            .apply_slot_data(&weapon_row("param_id_inferred"))
+            .unwrap()
+            .inferred_evidence_notice()
+            .expect("an inferred binding announces itself once");
+        assert_eq!(
+            notice,
+            "1 item binding(s) carry inferred param ids; first live delivery of each is its validation."
+        );
     }
 
     #[test]
