@@ -1703,8 +1703,7 @@ mod tests {
             .expect("a native call was queued");
         assert_eq!(queued.2, None, "the owned record's slot must not be passed");
         assert_eq!(
-            queued.3,
-            None,
+            queued.3, None,
             "the owned record's pointer must not be passed"
         );
         // The insert completes on the slot the routine reports back.
@@ -1771,7 +1770,12 @@ mod tests {
             last = session.poll();
         }
         assert_eq!(last, "failed", "state: {:?}", session.state());
-        assert!(session.state().detail.contains("instance insert unwitnessed"));
+        assert!(
+            session
+                .state()
+                .detail
+                .contains("instance insert unwitnessed")
+        );
     }
 
     /// ...but a slot that simply never reads back, with the routine provably
