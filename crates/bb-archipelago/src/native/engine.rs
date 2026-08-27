@@ -168,6 +168,10 @@ impl<R: Runtime> NativeDelivery<R> {
         runtime.find_stack(normalized_id)
     }
 
+    pub fn target_weapon_level(&mut self) -> Option<u8> {
+        self.session.runtime_mut().target_weapon_level()
+    }
+
     /// Whether the command published for `tag` may already have applied
     /// (clients#427 follow-up). False only for the statuses that provably
     /// precede any write -- the command is held in the machine and nothing has

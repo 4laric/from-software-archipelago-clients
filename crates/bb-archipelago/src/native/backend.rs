@@ -304,8 +304,7 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {
-        // Weapon inventory/reinforcement state is not resolved on v0.18.
-        Ok(None)
+        Ok(self.delivery.target_weapon_level())
     }
 
     fn observe_stack_quantity(

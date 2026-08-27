@@ -91,6 +91,12 @@ pub struct SlotRecord {
 /// Everything the machine needs from the guest process. `None` from a scan
 /// means "geometry unavailable", never "absent".
 pub trait Runtime {
+    /// Highest reinforcement level among recognized held player weapons.
+    /// Backends without a live inventory census preserve the received level.
+    fn target_weapon_level(&mut self) -> Option<u8> {
+        None
+    }
+
     fn inventory_ready(&mut self) -> bool;
     fn find_stack(&mut self, normalized_id: u32) -> Option<StackView>;
     fn read_slot_record(&mut self, slot: u32) -> SlotRecord;
