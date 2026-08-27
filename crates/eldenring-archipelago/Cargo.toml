@@ -43,13 +43,20 @@ archipelago_rs.workspace = true        # ensure the workspace is on 3.0.1 (try-a
 # bumps that executable. A release has to be able to say which revision answered for it.
 # The rev below is the SHA `branch = "main"` had ALREADY resolved to, so this pin changes no code;
 # it only stops the next change from being silent. Bump it deliberately, in its own PR.
-# UPSTREAM PIN (#241, Tarnished Edition). vswarte/fromsoftware-rs PR #320 (merged 2026-08-27,
-# `0b44ede3`) shipped generated RVA tables for ELDEN RING 1.17.0 -- exe versions WW 2.7.0.0 and
-# JP 2.7.0.1 -- which retired the 4laric test-build fork this file pinned in the interim.
-# 🛑 Upstream REMOVED the 2.6.2.x arms in the same change, so from this rev on the crate cannot
-# serve pre-Tarnished executables and neither can this client; the gate refuses them in words.
-# Bump this rev deliberately, in its own PR, and keep game_version_gate.rs's arms in lockstep.
-fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs", rev = "0b44ede3ae9d95d39bfef65edc0694380a1b83c3" }
+# 🛑🛑 THIN FORK PIN (#241, Tarnished Edition). Both git deps below point at
+# 4laric/fromsoftware-rs @ 8c0afd1b = upstream vswarte/fromsoftware-rs `0b44ede3` (PR #320, the
+# GENERATED RVA tables for game 1.17.0 -- exe 2.7.0.0 WW and 2.7.0.1 JP) plus EXACTLY ONE commit.
+# That commit restores the 2.6.2.0/2.6.2.1 tables and their `ERGameVersion` arms, which upstream
+# DELETED in the same change that added 1.17.0. Upstream at that rev cannot serve a pre-Tarnished
+# executable at all; we can, because players who did not update -- or who downgraded on purpose
+# for an older Seamless Co-op or an older fifthmatt randomizer -- are on 2.6.2.x today.
+# The restored tables are the old ones VERBATIM from upstream `8c67a84f`, not re-derived. The
+# 2.7.0.x tables are untouched upstream output. (This retires the earlier `tarnished-2700-candidates`
+# fork, whose derived 2.7.0.0 table upstream's generated one agrees with 93/93 exactly.)
+# RETIRE THIS PIN when upstream re-adds pre-Tarnished support, or when this project drops 2.6.2.x:
+# at that point both entries move straight back to vswarte/fromsoftware-rs and this note goes.
+# Bump the rev deliberately, in its own PR, and keep game_version_gate.rs's arms in lockstep.
+fromsoftware-shared = { git = "https://github.com/4laric/fromsoftware-rs", rev = "8c0afd1bbf7b7fea8ddd93a3ada2a8556b0d5a13" }
 hudhook.workspace = true
 # Item-tracker overlay window (shared::Core render_overlay_* hooks take &imgui::Ui). Same spec as
 # crates/shared so the workspace [patch.crates-io] git pin resolves both to ONE imgui instance.
@@ -67,12 +74,12 @@ pelite = "0.10"
 # resolves, so this shares one copy in the tree.
 chrono = "0.4"
 oneshot = { version = "0.2.1", features = ["std"] }   # scout_proof: archipelago_rs hands back a oneshot::Receiver from scout_locations (VERIFY shape on 3.0.1)
-# ER game bindings: rva.rs at this rev lists ER WW 2.7.0.0 / JP 2.7.0.1 (Tarnished Edition; the
-# 1.17.0 tables from upstream PR #320) and NOTHING older. Must track the SAME ref as
-# fromsoftware-shared above so they're ONE source instance (one fss copy → SharedTaskImp/
-# SharedTaskImpExt resolve). Isolated from the workspace's 0.13 by being a different git ref than
-# the framework's default-branch source.
-eldenring = { git = "https://github.com/vswarte/fromsoftware-rs", rev = "0b44ede3ae9d95d39bfef65edc0694380a1b83c3" }
+# ER game bindings (0.14): rva.rs at this rev lists all four supported executables -- ER WW 2.7.0.0
+# / JP 2.7.0.1 (upstream's generated 1.17.0 tables) and WW 2.6.2.0 / JP 2.6.2.1 (fork-restored).
+# Must track the SAME ref as fromsoftware-shared above so
+# they're ONE source instance (one fss copy → SharedTaskImp/SharedTaskImpExt resolve). Isolated from
+# the workspace's 0.13 by being a different git ref than the framework's default-branch source.
+eldenring = { git = "https://github.com/4laric/fromsoftware-rs", rev = "8c0afd1bbf7b7fea8ddd93a3ada2a8556b0d5a13" }
 # ER pure-logic crates (host-tested).
 er-codec = { path = "../er-codec" }
 er-logic = { path = "../er-logic" }
