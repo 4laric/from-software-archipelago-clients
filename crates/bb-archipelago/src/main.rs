@@ -424,6 +424,7 @@ impl LedgerLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&lock_path)
             .with_context(|| {
                 format!(
@@ -1405,7 +1406,9 @@ mod tests {
         );
 
         drop(first);
-        LedgerLock::acquire(&ledger).expect("a crashed/exited owner cannot leave a stale lock");
+        let replacement =
+            LedgerLock::acquire(&ledger).expect("a crashed/exited owner cannot leave a stale lock");
+        drop(replacement);
         let _ = std::fs::remove_file(lock_path);
     }
 
