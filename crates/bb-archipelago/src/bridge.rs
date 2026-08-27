@@ -93,11 +93,15 @@ impl BridgeState {
 #[derive(Clone, Debug)]
 pub struct FileBridge {
     root: PathBuf,
+    session_started: SystemTime,
 }
 
 impl FileBridge {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            session_started: SystemTime::now(),
+        }
     }
 
     pub fn command_path(&self) -> PathBuf {
@@ -136,6 +140,40 @@ impl FileBridge {
 
     pub fn command_pending(&self) -> bool {
         self.command_path().exists()
+    }
+
+    /// Whether a state for `tag` has a witness from this client session.
+    ///
+    /// A matching command is the durable crash-recovery witness. Without one,
+    /// the harness must have rewritten the state file since this bridge was
+    /// attached; otherwise a completed state left by a dead CE session could
+    /// falsely acknowledge a later grant that happens to reuse the same tag.
+    pub fn state_is_current_for(&self, tag: &str) -> Result<bool> {
+        let command_modified = match fs::read_to_string(self.command_path()) {
+            Ok(command) if command.split_whitespace().last() == Some(tag) => {
+                Some(fs::metadata(self.command_path())?.modified()?)
+            }
+            Ok(_) => None,
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reading bridge command {}", self.command_path().display())
+                });
+            }
+        };
+        let modified = match fs::metadata(self.state_path()) {
+            Ok(metadata) => metadata.modified(),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading bridge state metadata {}",
+                        self.state_path().display()
+                    )
+                });
+            }
+        }?;
+        Ok(modified >= command_modified.unwrap_or(self.session_started))
     }
 
     pub fn command_is_stale(&self, timeout: Duration) -> Result<bool> {
@@ -385,6 +423,39 @@ mod tests {
         state.require_compatible().unwrap();
         assert!(state.concerns_tag("received_17"));
         assert_eq!(state.pid, Some(5040));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_success_without_a_session_witness_is_not_current() {
+        let root = temp_root("stale-success");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("native-grant-state.txt");
+        fs::write(&state_path, "status=completed\ntag=received_17\n").unwrap();
+        let modified = fs::metadata(&state_path).unwrap().modified().unwrap();
+        let bridge = FileBridge {
+            root: root.clone(),
+            session_started: modified + Duration::from_secs(1),
+        };
+        assert!(!bridge.state_is_current_for("received_17").unwrap());
+
+        bridge.enqueue(&pebble()).unwrap();
+        assert!(!bridge.state_is_current_for("received_17").unwrap());
+        fs::write(&state_path, "status=completed\ntag=received_17\n").unwrap();
+        assert!(bridge.state_is_current_for("received_17").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn state_rewritten_during_this_session_is_current_without_a_command() {
+        let root = temp_root("fresh-success");
+        fs::create_dir_all(&root).unwrap();
+        let bridge = FileBridge {
+            root: root.clone(),
+            session_started: SystemTime::UNIX_EPOCH,
+        };
+        fs::write(bridge.state_path(), "status=completed\ntag=received_17\n").unwrap();
+        assert!(bridge.state_is_current_for("received_17").unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

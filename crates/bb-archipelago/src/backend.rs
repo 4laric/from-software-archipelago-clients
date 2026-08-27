@@ -269,7 +269,7 @@ impl BloodborneBackend for FileBackend {
         }
         let state = self.bridge.read_state()?;
         state.require_compatible()?;
-        if state.concerns_tag(&grant.tag) {
+        if state.concerns_tag(&grant.tag) && self.bridge.state_is_current_for(&grant.tag)? {
             if state.is_success() {
                 self.bridge.acknowledge_command(&grant.tag)?;
                 return Ok(OperationProgress::Complete);
