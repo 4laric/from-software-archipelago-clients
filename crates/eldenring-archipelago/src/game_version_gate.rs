@@ -158,6 +158,7 @@ pub fn measured_clause() -> String {
         Ok(Ok(Supported::Ww262)) => Ok((game_version::REQUIRED_WW, LANG_ID_EN)),
         Ok(Ok(Supported::Ww270)) => Ok((game_version::REQUIRED_WW_TARNISHED, LANG_ID_EN)),
         Ok(Ok(Supported::Jp2621)) => Ok((game_version::REQUIRED_JP, LANG_ID_JP)),
+        Ok(Ok(Supported::Jp2701)) => Ok((game_version::REQUIRED_JP_TARNISHED, LANG_ID_JP)),
         Ok(Err(rejection)) => Err(rejection.clone()),
         Err(_) => Err(Rejection::Metadata {
             missing: "readable version resource",
