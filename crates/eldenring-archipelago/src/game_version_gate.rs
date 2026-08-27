@@ -35,11 +35,21 @@ use windows::core::{HSTRING, PCSTR};
 /// table and ours are decided by one detection rather than two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Supported {
+    /// Pre-Tarnished, Worldwide (exe 2.6.2.0). VERIFIED -- the build the client has shipped and
+    /// played on. Served by the 4laric fromsoftware-rs fork, which restores the tables upstream
+    /// deleted when it regenerated for 1.17.0.
     Ww262,
-    /// Tarnished Edition, Worldwide. 🛑 Both the crate's table for this build and the client's own
-    /// are CANDIDATES -- derived, never executed. See `crate::rva_table`.
+    /// Tarnished Edition, Worldwide (exe 2.7.0.0). The crate's 93 RVAs for this build are
+    /// upstream's GENERATED 1.17.0 table (vswarte PR #320); the client's own eight are still
+    /// derived CANDIDATES. See `crate::rva_table`.
     Ww270,
+    /// Pre-Tarnished, Japanese (exe 2.6.2.1). Same fork-restored provenance as [`Self::Ww262`].
     Jp2621,
+    /// Tarnished Edition, Japanese (exe 2.7.0.1). Covered by upstream's generated `rva_jp`
+    /// table, which is what closed the old "JP Tarnished is not supported" gap. The client's own
+    /// eight RVAs were never derived for a Japanese binary and fall back to the Worldwide
+    /// column under the `_SIG` prologue guards, exactly as JP 2.6.2.1 always did.
+    Jp2701,
 }
 
 impl GameVersion for Supported {
@@ -52,6 +62,8 @@ impl GameVersion for Supported {
             Some(Self::Ww270)
         } else if lang_id == LANG_ID_JP && version == game_version::REQUIRED_JP {
             Some(Self::Jp2621)
+        } else if lang_id == LANG_ID_JP && version == game_version::REQUIRED_JP_TARNISHED {
+            Some(Self::Jp2701)
         } else {
             None
         }
@@ -99,14 +111,15 @@ pub fn check() -> Result<(), String> {
 
     match detected {
         Ok(Ok(version)) => {
-            if *version == Supported::Ww270 {
-                // 🛑 STARTUP HONESTY (#241). Every address this session is about to use on 2.7.0.0
-                // -- the crate's 93 and the client's own 8 -- was derived offline and has never
-                // been executed. A player reading a log after something goes strange must find
-                // that fact stated, not have to infer it from a version number.
+            if matches!(*version, Supported::Ww270 | Supported::Jp2701) {
+                // 🛑 STARTUP HONESTY (#241). The crate's 93 RVAs for the Tarnished executables
+                // are upstream's GENERATED 1.17.0 tables, but the client's OWN eight
+                // (`crate::rva_table::WW270`) are still derived offline and have never been
+                // executed. A player reading a log after something goes strange must find that
+                // fact stated, not have to infer it from a version number.
                 log::warn!(
-                    "2.7.0.0 support is running on DERIVED, UNVERIFIED offsets \
-                     (candidate table 2026-08-27) -- test-build only"
+                    "Tarnished Edition: the client's own 8 RVAs are DERIVED, UNVERIFIED \
+                     (candidate table 2026-08-27); the crate's 93 are upstream-generated"
                 );
             }
             Ok(())
@@ -145,6 +158,7 @@ pub fn measured_clause() -> String {
         Ok(Ok(Supported::Ww262)) => Ok((game_version::REQUIRED_WW, LANG_ID_EN)),
         Ok(Ok(Supported::Ww270)) => Ok((game_version::REQUIRED_WW_TARNISHED, LANG_ID_EN)),
         Ok(Ok(Supported::Jp2621)) => Ok((game_version::REQUIRED_JP, LANG_ID_JP)),
+        Ok(Ok(Supported::Jp2701)) => Ok((game_version::REQUIRED_JP_TARNISHED, LANG_ID_JP)),
         Ok(Err(rejection)) => Err(rejection.clone()),
         Err(_) => Err(Rejection::Metadata {
             missing: "readable version resource",

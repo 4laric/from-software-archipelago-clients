@@ -86,7 +86,7 @@ const VANILLA_MULTI_SLOT_ROWS_WW270: u32 = 105;
 /// executable we have no table for.
 fn expected_for(version: Option<Supported>) -> u32 {
     match version {
-        Some(Supported::Ww270) => VANILLA_MULTI_SLOT_ROWS_WW270,
+        Some(Supported::Ww270) | Some(Supported::Jp2701) => VANILLA_MULTI_SLOT_ROWS_WW270,
         Some(Supported::Ww262) | Some(Supported::Jp2621) | None => VANILLA_MULTI_SLOT_ROWS_WW262,
     }
 }
@@ -201,13 +201,20 @@ mod tests {
         );
     }
 
-    /// Undetected / JP fall back to the VERIFIED column, exactly as `rva_table::current` does.
+    /// Undetected / JP fall back to the VERIFIED column, exactly as `rva_table::current` does --
+    /// and each JP build falls back to the Worldwide column of ITS OWN generation, not to a
+    /// single baked one. The JP counts are UNMEASURED; these numbers are logged, never asserted
+    /// against a live install.
     #[test]
     fn an_unmeasured_build_falls_back_to_the_verified_count() {
         assert_eq!(expected_for(None), VANILLA_MULTI_SLOT_ROWS_WW262);
         assert_eq!(
             expected_for(Some(Supported::Jp2621)),
             VANILLA_MULTI_SLOT_ROWS_WW262
+        );
+        assert_eq!(
+            expected_for(Some(Supported::Jp2701)),
+            VANILLA_MULTI_SLOT_ROWS_WW270
         );
     }
 }

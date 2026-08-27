@@ -88,13 +88,13 @@ pub const WW270: ClientRvas = ClientRvas {
 /// all on an executable we have no table for, so nothing that reads these RVAs gets built. The
 /// fallback picks the VERIFIED column rather than the candidate one on principle.
 ///
-/// JP 2.6.2.1 also maps here to [`WW262`]. That is not a claim these eight addresses are correct
-/// on the Japanese executable -- they were never derived for it. It preserves exactly what the
+/// JP maps to the WORLDWIDE column of its own generation: JP 2.6.2.1 to [`WW262`], JP 2.7.0.1 to
+/// [`WW270`]. That is not a claim these eight addresses are correct on the Japanese executable -- they were never derived for it. It preserves exactly what the
 /// client did before this module existed (one baked Worldwide constant for every build), and the
 /// per-call-site `_SIG` prologue guards are what actually keep it honest there.
 pub fn current() -> &'static ClientRvas {
     match detected() {
-        Some(Supported::Ww270) => &WW270,
+        Some(Supported::Ww270) | Some(Supported::Jp2701) => &WW270,
         Some(Supported::Ww262) | Some(Supported::Jp2621) | None => &WW262,
     }
 }

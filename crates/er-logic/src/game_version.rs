@@ -29,13 +29,19 @@
 pub const REQUIRED_WW: &str = "2.6.2.0";
 /// The Worldwide **Tarnished Edition** executable this build ALSO carries a table for.
 ///
-/// 🛑 That table is a CANDIDATE: derived offline from the 2.7.0.0 executable and never executed
-/// in a live game (see the fork note in `crates/eldenring-archipelago/Cargo.toml`). The two
-/// Worldwide arms coexist -- the `eldenring` crate dispatches per version, so accepting this one
-/// takes nothing away from 2.6.2.0.
+/// The crate's 93 RVAs for this build are upstream's GENERATED 1.17.0 table (vswarte
+/// PR #320). The client's OWN eight (`eldenring_archipelago::rva_table::WW270`) are still
+/// offline-derived candidates -- see the pin note in `crates/eldenring-archipelago/Cargo.toml`.
+/// All four arms coexist: the `eldenring` crate dispatches per version and keeps every table, so
+/// accepting Tarnished takes nothing away from 2.6.2.x.
 pub const REQUIRED_WW_TARNISHED: &str = "2.7.0.0";
 /// The Japanese executable version this build's RVA table was compiled against.
 pub const REQUIRED_JP: &str = "2.6.2.1";
+/// The Japanese **Tarnished Edition** executable this build ALSO carries a table for.
+///
+/// Covered by upstream's generated `rva_jp` table -- which is what closed the "Japanese
+/// Tarnished Edition is NOT yet supported" gap this module used to have to state.
+pub const REQUIRED_JP_TARNISHED: &str = "2.7.0.1";
 /// `LANG_ID` of the Worldwide executable, masked to the primary language.
 pub const LANG_ID_EN: u16 = 0x0009;
 /// `LANG_ID` of the Japanese executable, masked to the primary language.
@@ -71,10 +77,7 @@ pub fn explain(rejection: &Rejection) -> String {
              \n\
              Your Elden Ring:  {detected}\n\
              This build needs: {REQUIRED_WW} or {REQUIRED_WW_TARNISHED} (Worldwide)\n\
-             \x20                 {REQUIRED_JP} (Japanese)\n\
-             \n\
-             The Japanese Tarnished Edition executable (2.7.0.x JP) is NOT yet supported --\n\
-             only the Worldwide one. If that is what you have, this is a gap on our side.\n\
+             \x20                 {REQUIRED_JP} or {REQUIRED_JP_TARNISHED} (Japanese)\n\
              \n\
              There are two ways to land here.\n\
              \n\
@@ -118,7 +121,7 @@ pub fn explain(rejection: &Rejection) -> String {
              so we cannot tell which build of Elden Ring this is.\n\
              \n\
              This build needs {REQUIRED_WW} or {REQUIRED_WW_TARNISHED} (Worldwide), or\n\
-             {REQUIRED_JP} (Japanese). An executable\n\
+             {REQUIRED_JP} or {REQUIRED_JP_TARNISHED} (Japanese). An executable\n\
              with its version resource stripped is usually a repack or a cracked copy; the mod\n\
              cannot support those, because every memory address it uses is keyed to a known build.\n\
              \n\
@@ -191,27 +194,46 @@ mod tests {
         let msg = explain(&Rejection::Version {
             detected: "2.2.0.0".into(),
         });
-        for required in [REQUIRED_WW, REQUIRED_WW_TARNISHED, REQUIRED_JP] {
+        for required in [
+            REQUIRED_WW,
+            REQUIRED_WW_TARNISHED,
+            REQUIRED_JP,
+            REQUIRED_JP_TARNISHED,
+        ] {
             assert!(msg.contains(required), "dropped {required}: {msg}");
         }
     }
 
-    /// The JP Tarnished executable (2.7.0.x JP) has no table -- its binary was never available to
-    /// derive one from. A JP player on Tarnished must not read "needs 2.7.0.0" and conclude their
-    /// game is fine; the message has to name the gap explicitly.
+    /// The JP Tarnished gap CLOSED (#241): upstream's generated `rva_jp` table covers 2.7.0.1,
+    /// so the message must no longer tell a JP Tarnished player they are unsupported. This is
+    /// the inverse of the test it replaces -- kept, rather than deleted, because the wording it
+    /// guards is what a JP player acts on.
     #[test]
-    fn the_jp_tarnished_gap_is_stated_not_implied() {
+    fn the_jp_tarnished_gap_is_closed_and_the_wording_followed() {
         let msg = explain(&Rejection::Version {
-            detected: "2.7.0.1".into(),
+            detected: "1.0.0.0".into(),
         });
         assert!(
-            msg.contains("Japanese Tarnished Edition"),
-            "must name the unsupported JP Tarnished exe: {msg}"
+            msg.contains(REQUIRED_JP_TARNISHED),
+            "must offer the JP Tarnished exe as supported: {msg}"
         );
         assert!(
-            msg.contains("NOT yet supported"),
-            "must say plainly that it is unsupported: {msg}"
+            !msg.contains("NOT yet supported"),
+            "the JP Tarnished gap is closed; stale wording: {msg}"
         );
+    }
+
+    /// All four supported builds are named. The client serves BOTH the Tarnished executables and
+    /// the pre-Tarnished ones (the 4laric fromsoftware-rs fork restores the 2.6.2.x tables
+    /// upstream deleted), and a player who downgraded deliberately must not be told to update.
+    #[test]
+    fn every_supported_build_is_named_and_none_is_called_retired() {
+        let msg = explain(&Rejection::Version {
+            detected: "2.2.0.0".into(),
+        });
+        for required in ["2.6.2.0", "2.6.2.1", "2.7.0.0", "2.7.0.1"] {
+            assert!(msg.contains(required), "dropped {required}: {msg}");
+        }
     }
 
     /// The metadata arm quotes the required set too, and it drifted out of step with the version
@@ -219,7 +241,12 @@ mod tests {
     #[test]
     fn the_metadata_message_names_the_same_required_set() {
         let msg = explain(&Rejection::Metadata { missing: "version" });
-        for required in [REQUIRED_WW, REQUIRED_WW_TARNISHED, REQUIRED_JP] {
+        for required in [
+            REQUIRED_WW,
+            REQUIRED_WW_TARNISHED,
+            REQUIRED_JP,
+            REQUIRED_JP_TARNISHED,
+        ] {
             assert!(msg.contains(required), "dropped {required}: {msg}");
         }
     }
