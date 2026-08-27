@@ -123,21 +123,21 @@ const EQUIP_INDEX_OFF: usize = 0x08;
 const _: () = assert!(std::mem::offset_of!(EquipGameData, chr_asm) == 0x6C);
 
 /// `equipment_entries` is indexed by raw `ChrAsmSlot`, so its field order must match the enum and
-/// its size must be exactly 22 + 10 quick + 6 pouch = 38 `u32`s. If the crate ever reshapes it,
-/// this fails the build instead of silently writing the wrong field.
-const _: () = assert!(size_of::<ChrAsmEquipEntries>() == 38 * 4);
+/// its size must be exactly 22 + 10 quick + 6 pouch = 38 `u32`s, plus the trailing `unk98` dword
+/// upstream folded into the struct at `0b44ede3` (it used to be the anonymous +4 gap between
+/// `equipment_entries` and the physick pair). If the crate ever reshapes it, this fails the
+/// build instead of silently writing the wrong field.
+const _: () = assert!(size_of::<ChrAsmEquipEntries>() == 39 * 4);
 
 /// Byte offset of the Flask of Wondrous Physick's two-tear mixture inside `EquipGameData`.
 ///
-/// MEASURED, not guessed (see the module docs). The crate keeps the region private and mistyped
-/// (`unk3e0: usize, unk3e8: usize`), so it has to be reached by raw offset. The assert below pins
-/// it to the END of `equipment_entries` -- which IS public -- so a crate reshape fails the build
-/// instead of letting us write into whatever moved there. Same guard shape as `EQUIP_INDEX_OFF`.
+/// MEASURED, not guessed (see the module docs), and since upstream `0b44ede3` the crate MODELS
+/// the pair itself as `physick_tears: [OptionalItemId; 2]`, so the assert pins our measured
+/// offset against the real field rather than a derived sum. The reads and writes stay raw-offset
+/// dword ops on purpose: the measured behaviour (unrefcounted plain stores) is documented above
+/// against exactly that representation.
 const PHYSICK_MIXTURE_OFF: usize = 0x3E4;
-const _: () = assert!(
-    std::mem::offset_of!(EquipGameData, equipment_entries) + size_of::<ChrAsmEquipEntries>() + 4
-        == PHYSICK_MIXTURE_OFF
-);
+const _: () = assert!(std::mem::offset_of!(EquipGameData, physick_tears) == PHYSICK_MIXTURE_OFF);
 const _: () = assert!(
     PHYSICK_MIXTURE_OFF + 4 * er_logic::physick::MIXTURE_SLOTS <= size_of::<EquipGameData>()
 );
