@@ -29,13 +29,25 @@
 //! Gated on `auto_equip` rather than an option of its own: it exists only to make that feature's
 //! modulus exact, has no meaning without it, and so needs no new contract key.
 //!
-//! ## The count is an oracle
+//! ## The count is an oracle -- and the oracle is PER BUILD
 //!
-//! On a vanilla `Magic` table exactly **25** rows have `slotLength > 1`: the 24 memorisable spells
-//! above, plus one unnamed non-memorisable row (`2050001`). The log line reports what it actually
-//! normalised, so any other number means the param table is not vanilla -- which on a stacked
-//! install (matt's randomizer ships its own `regulation.bin`) is worth knowing and is otherwise
-//! invisible to us.
+//! The log line reports what it actually normalised, so a number that disagrees with the vanilla
+//! count means the param table is not vanilla -- which on a stacked install (matt's randomizer
+//! ships its own `regulation.bin`) is worth knowing and is otherwise invisible to us. THAT is what
+//! the check is for, and it stays.
+//!
+//! 🛑 **The expected number is a property of the executable, not a constant.** On 2.6.2.0 exactly
+//! **25** rows of 213 have `slotLength > 1`: the 24 memorisable spells above, plus one unnamed
+//! non-memorisable row (`2050001`). Tarnished Edition (2.7.0.0) ships a bigger `Magic` table and a
+//! different distribution: **105 of 317**, measured on the first 2.7.0.0 smoke run (clients PR #456
+//! triage, log `archipelago-2026-08-27.log`) on an install with no data mod in sight. Left as one
+//! hardcoded 25, the oracle accused EVERY Tarnished player's vanilla table of being modded -- a
+//! cry-wolf warning is worse than no warning, because the next real one reads as noise.
+//!
+//! So the count is version-aware, off the SAME detection [`crate::rva_table`] dispatches on, and a
+//! build with no measured count falls back to the 2.6.2.0 figure exactly as `rva_table::current`
+//! falls back to the verified column. Adding a build means measuring its count on a clean install
+//! and adding an arm -- not widening a tolerance.
 //!
 //! ⚠ The oracle reads on the FIRST apply only. This module is re-armed on the `in_world` edge like
 //! every other param writer, and a re-pass over a table the load never reverted finds 0 rows to
@@ -49,12 +61,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use eldenring::cs::{Magic, SoloParamRepository};
 use fromsoftware_shared::FromStatic;
 
+use crate::game_version_gate::{Supported, detected};
+
 /// What every spell is normalised to. One slot, so the planner's modulus is exact.
 const ONE_SLOT: u8 = 1;
 
-/// Rows expected to need normalising on a vanilla table. Logged, never asserted -- a mismatch is
-/// information about the install, not a failure.
-const VANILLA_MULTI_SLOT_ROWS: u32 = 25;
+/// Rows expected to need normalising on a vanilla 2.6.2.0 `Magic` table (24 memorisable spells +
+/// row `2050001`). Logged, never asserted -- a mismatch is information about the install, not a
+/// failure.
+const VANILLA_MULTI_SLOT_ROWS_WW262: u32 = 25;
+
+/// The same count measured on vanilla 2.7.0.0 (Tarnished Edition): 105 of 317 `Magic` rows.
+/// MEASURED, not derived -- the first 2.7.0.0 smoke run's own probe line, triaged in clients PR
+/// #456 on an install carrying no data mod. It is here so that run stops being reported as modded.
+const VANILLA_MULTI_SLOT_ROWS_WW270: u32 = 105;
+
+/// The vanilla count for one detected executable. Split out from [`expected_multi_slot_rows`] so
+/// the mapping is testable without a game: the defect this fixes was a per-build number frozen as a
+/// constant, and a test is what stops the next build freezing it again.
+///
+/// `None` (detection failed) and the JP build take the 2.6.2.0 figure -- the same principle as
+/// `rva_table::current`'s fallback: prefer the VERIFIED column, and note that this arm is not
+/// reachable in a normal session because the version gate refuses to initialise at all on an
+/// executable we have no table for.
+fn expected_for(version: Option<Supported>) -> u32 {
+    match version {
+        Some(Supported::Ww270) => VANILLA_MULTI_SLOT_ROWS_WW270,
+        Some(Supported::Ww262) | Some(Supported::Jp2621) | None => VANILLA_MULTI_SLOT_ROWS_WW262,
+    }
+}
+
+/// The vanilla count for the executable we are actually running in.
+fn expected_multi_slot_rows() -> u32 {
+    expected_for(detected())
+}
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static APPLIED: AtomicBool = AtomicBool::new(false);
@@ -115,14 +155,19 @@ pub fn tick() {
     }
     APPLIED.store(true, Ordering::Relaxed);
     let first_apply = !APPLIED_ONCE.swap(true, Ordering::Relaxed);
-    if normalised == VANILLA_MULTI_SLOT_ROWS {
+    let expected = expected_multi_slot_rows();
+    if normalised == expected {
         log::info!("spell_slot_length: normalised {normalised} of {rows} Magic rows to one slot");
     } else if first_apply {
         // Not an error. A stacked data mod (e.g. a host randomizer's regulation.bin) legitimately
-        // changes this count, and this is the only place we would ever see that.
+        // changes this count, and this is the only place we would ever see that. The expectation is
+        // per-build (see the module header): saying so keeps the reader from re-deriving whether
+        // the number or the build is the surprise.
         log::info!(
             "spell_slot_length: normalised {normalised} of {rows} Magic rows to one slot \
-             (expected {VANILLA_MULTI_SLOT_ROWS} on a vanilla table -- param table may be modded)"
+             (expected {expected} on a vanilla table for this build [{}] -- param table may be \
+             modded)",
+            crate::game_version_gate::measured_clause()
         );
     } else if normalised == 0 {
         // Re-arm re-pass and the table still holds our write: the load did NOT re-stream Magic.
@@ -136,6 +181,33 @@ pub fn tick() {
         log::info!(
             "spell_slot_length: re-normalised {normalised} of {rows} Magic rows after the load \
              reverted the table"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The defect: one hardcoded 25 accused every 2.7.0.0 player of running a modded table, because
+    /// vanilla Tarnished Edition normalises 105 of 317 rows. The counts must differ per build.
+    #[test]
+    fn each_supported_build_carries_its_own_measured_count() {
+        assert_eq!(expected_for(Some(Supported::Ww262)), 25);
+        assert_eq!(expected_for(Some(Supported::Ww270)), 105);
+        assert_ne!(
+            expected_for(Some(Supported::Ww262)),
+            expected_for(Some(Supported::Ww270))
+        );
+    }
+
+    /// Undetected / JP fall back to the VERIFIED column, exactly as `rva_table::current` does.
+    #[test]
+    fn an_unmeasured_build_falls_back_to_the_verified_count() {
+        assert_eq!(expected_for(None), VANILLA_MULTI_SLOT_ROWS_WW262);
+        assert_eq!(
+            expected_for(Some(Supported::Jp2621)),
+            VANILLA_MULTI_SLOT_ROWS_WW262
         );
     }
 }
