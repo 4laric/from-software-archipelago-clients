@@ -640,7 +640,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "eldenring"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs?rev=8c67a84f394bd58efdb06a5be47f988e0c1a9995#8c67a84f394bd58efdb06a5be47f988e0c1a9995"
+source = "git+https://github.com/4laric/fromsoftware-rs?rev=63a0c3727daf9ed7382d0316e66ae71a1ca27a51#63a0c3727daf9ed7382d0316e66ae71a1ca27a51"
 dependencies = [
  "bitfield",
  "bitflags 2.11.1",
@@ -822,7 +822,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs?rev=8c67a84f394bd58efdb06a5be47f988e0c1a9995#8c67a84f394bd58efdb06a5be47f988e0c1a9995"
+source = "git+https://github.com/4laric/fromsoftware-rs?rev=63a0c3727daf9ed7382d0316e66ae71a1ca27a51#63a0c3727daf9ed7382d0316e66ae71a1ca27a51"
 dependencies = [
  "bitflags 2.11.1",
  "from-singleton",
@@ -849,7 +849,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-macros"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs?rev=8c67a84f394bd58efdb06a5be47f988e0c1a9995#8c67a84f394bd58efdb06a5be47f988e0c1a9995"
+source = "git+https://github.com/4laric/fromsoftware-rs?rev=63a0c3727daf9ed7382d0316e66ae71a1ca27a51#63a0c3727daf9ed7382d0316e66ae71a1ca27a51"
 dependencies = [
  "inflections",
  "proc-macro2",
@@ -860,7 +860,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-stl"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs?rev=8c67a84f394bd58efdb06a5be47f988e0c1a9995#8c67a84f394bd58efdb06a5be47f988e0c1a9995"
+source = "git+https://github.com/4laric/fromsoftware-rs?rev=63a0c3727daf9ed7382d0316e66ae71a1ca27a51#63a0c3727daf9ed7382d0316e66ae71a1ca27a51"
 
 [[package]]
 name = "fs_extra"

@@ -51,6 +51,7 @@ mod reconcile_io;
 mod region;
 mod region_sync;
 mod runes;
+mod rva_table;
 mod save_backup;
 mod scadu_blessing;
 mod scaling;

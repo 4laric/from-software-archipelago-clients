@@ -241,7 +241,10 @@ pub fn real_pickup_seen() -> bool {
     REAL_PICKUP_SEEN.load(Ordering::Relaxed)
 }
 
-const ADD_ITEM_FUNC_RVA: usize = 0x0056_05B0;
+/// `AddItemFunc` for the running build. Per-version; see [`crate::rva_table`].
+fn add_item_func_rva() -> usize {
+    crate::rva_table::current().add_item_func
+}
 const ADD_ITEM_FUNC_SIG: &[u8] = &[
     0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24,
 ];
@@ -253,10 +256,11 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let target_addr =
-        current_module_base().ok_or("no module base for eldenring.exe")? + ADD_ITEM_FUNC_RVA;
+        current_module_base().ok_or("no module base for eldenring.exe")? + add_item_func_rva();
     if !signature_matches(target_addr) {
         return Err(format!(
-            "AddItemFunc signature mismatch @ {target_addr:#x} — pinned 2.6.2.0 RVA stale for this build"
+            "AddItemFunc signature mismatch @ {target_addr:#x} — pinned RVA stale for this build ({})",
+            crate::game_version_gate::measured_clause()
         )
         .into());
     }
@@ -307,13 +311,15 @@ fn static_inventory_ptr() -> Option<usize> {
 }
 
 /// SECOND inventory-resolver candidate: the pointer stored at the pinned static slot
-/// `Inventory_PtrLoc_RVA` — the value the C++ client (`Inventory_PtrLoc_RVA = 0x03D67A50`) read and
+/// `inventory_ptrloc_rva()` — the value the C++ client (`Inventory_PtrLoc_RVA = 0x03D67A50`) read and
 /// granted through successfully on 2.6.2.0. This reads a POINTER from a static location, vs
 /// `static_inventory_ptr`'s ADDRESS-of-embedded-field. The confirm log reports both so one pickup
 /// identifies which (if either) equals the pointer the game hands the detour.
-const INVENTORY_PTRLOC_RVA: usize = 0x03D6_7A50;
+fn inventory_ptrloc_rva() -> usize {
+    crate::rva_table::current().inventory_ptrloc
+}
 fn static_inventory_ptr_rva() -> Option<usize> {
-    let slot = current_module_base()? + INVENTORY_PTRLOC_RVA;
+    let slot = current_module_base()? + inventory_ptrloc_rva();
     // SAFETY: pinned data RVA inside the loaded eldenring.exe image; reads one pointer-sized word.
     // Only called inside the one-time, in-world confirm block (mapped memory). Diagnostic only.
     let inst = unsafe { (slot as *const usize).read_unaligned() };
@@ -714,7 +720,8 @@ fn add_item_detour_inner(
         // the game's pointer. Point `static_inventory_ptr` at whichever CONFIRMs, then enable the prime.
         match static_inventory_ptr_rva() {
             Some(s) if s == game => log::info!(
-                "inventory-ptr CONFIRM (rva-slot): *(base+{INVENTORY_PTRLOC_RVA:#x}) == game ({game:#x}) — use the pointer-slot resolver"
+                "inventory-ptr CONFIRM (rva-slot): *(base+{ptrloc:#x}) == game ({game:#x}) — use the pointer-slot resolver",
+                ptrloc = inventory_ptrloc_rva()
             ),
             Some(s) => log::warn!("inventory-ptr rva-slot {s:#x} != game {game:#x}"),
             None => log::warn!("inventory-ptr rva-slot unresolved at first pickup"),

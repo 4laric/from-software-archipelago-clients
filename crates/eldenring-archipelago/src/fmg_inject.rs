@@ -66,8 +66,16 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const REPO_RVA: usize = 0x3D7D4F8;
-const SEARCH_RVA: usize = 0x266D3C0;
+/// FMG repository static slot for the running build. Per-version; see [`crate::rva_table`].
+/// 🛑 The 2.7.0.0 candidate for THIS one is the weakest row in the whole port (2/20 reference-site
+/// vote) and nothing calls it, so no prologue guard covers it -- only `plausible()` below.
+fn repo_rva() -> usize {
+    crate::rva_table::current().fmg_repo
+}
+/// `SearchStringTable` for the running build. Per-version; see [`crate::rva_table`].
+fn search_rva() -> usize {
+    crate::rva_table::current().fmg_search
+}
 const SEARCH_SIG: &[u8] = &[
     0x3B, 0x51, 0x10, 0x73, 0x29, 0x44, 0x3B, 0x41, 0x14, 0x73, 0x23, 0x48, 0x8B, 0x41, 0x08,
 ];
@@ -162,7 +170,7 @@ fn sig_ok(addr: usize) -> bool {
 }
 
 unsafe fn goods_msgdata(base: usize) -> Option<usize> {
-    let repo = read_usize(base + REPO_RVA);
+    let repo = read_usize(base + repo_rva());
     if !plausible(repo) {
         return None;
     }
@@ -453,7 +461,7 @@ unsafe fn build_block(
 }
 
 unsafe fn swap_goods(base: usize, newblock: usize) -> bool {
-    let repo = read_usize(base + REPO_RVA);
+    let repo = read_usize(base + repo_rva());
     let base_arr = read_usize(repo + 0x08);
     let sub = read_usize(base_arr);
     if !plausible(sub) {
@@ -467,7 +475,7 @@ unsafe fn swap_goods(base: usize, newblock: usize) -> bool {
 /// Resolve `base_array[0][category]` (the MsgData* for an arbitrary FMG category). Generalization of
 /// `goods_msgdata` for the caption path; `category_msgdata(base, GOODS_CATEGORY) == goods_msgdata`.
 unsafe fn category_msgdata(base: usize, category: u32) -> Option<usize> {
-    let repo = read_usize(base + REPO_RVA);
+    let repo = read_usize(base + repo_rva());
     if !plausible(repo) {
         return None;
     }
@@ -485,7 +493,7 @@ unsafe fn category_msgdata(base: usize, category: u32) -> Option<usize> {
 
 /// Atomically point `base_array[0][category]` at a freshly-built block. Generalization of `swap_goods`.
 unsafe fn swap_category(base: usize, category: u32, newblock: usize) -> bool {
-    let repo = read_usize(base + REPO_RVA);
+    let repo = read_usize(base + repo_rva());
     let base_arr = read_usize(repo + 0x08);
     let sub = read_usize(base_arr);
     if !plausible(sub) {
@@ -621,12 +629,12 @@ fn resolve_synth_injects(ids: &[u32]) -> (FmgInjects, FmgInjects) {
 #[allow(dead_code)] // kept as a ready-to-use live-FMG reader for shop_preview / future callers
 pub fn read_goods_string(category: u32, id: u32) -> Option<String> {
     let base = current_module_base()?;
-    let search_addr = base + SEARCH_RVA;
+    let search_addr = base + search_rva();
     if !sig_ok(search_addr) {
         return None;
     }
     let search: SearchFn = unsafe { std::mem::transmute::<usize, SearchFn>(search_addr) };
-    let repo = unsafe { read_usize(base + REPO_RVA) };
+    let repo = unsafe { read_usize(base + repo_rva()) };
     if !plausible(repo) {
         return None;
     }
@@ -840,8 +848,8 @@ unsafe fn build_validate_swap(
     // one thing a mid-array insert newly risks (it binary-searches; we scan). `SearchStringTable`
     // takes the repo, not a block, so this is only possible AFTER the swap; the window is a few
     // microseconds on the game thread and a failure reverts to the block we parsed from.
-    let repo_addr = read_usize(base + REPO_RVA);
-    if !sig_ok(base + SEARCH_RVA) || !plausible(repo_addr) {
+    let repo_addr = read_usize(base + repo_rva());
+    if !sig_ok(base + search_rva()) || !plausible(repo_addr) {
         // Verification was PROMISED (verify_live) and cannot be delivered, so the swap does not get
         // to stand on "probably fine". Revert; the caller falls back to redirect-only.
         log::error!(
@@ -854,7 +862,7 @@ unsafe fn build_validate_swap(
         swap_category(base, category, r.md);
         return None;
     }
-    let search: SearchFn = std::mem::transmute::<usize, SearchFn>(base + SEARCH_RVA);
+    let search: SearchFn = std::mem::transmute::<usize, SearchFn>(base + search_rva());
     let repo = repo_addr as *mut c_void;
     let mut bad: Vec<u32> = Vec::new();
     for (id, txt) in r.injects.iter().chain(r.overrides.iter()) {
@@ -904,7 +912,7 @@ static INSERT_UNSAFE: AtomicBool = AtomicBool::new(false);
 /// Two deliberate limits, both the same reasoning:
 ///
 ///   * HOST-SAFE. The probe registry runs this on a CI runner with no Elden Ring in sight, where
-///     `GetModuleHandleW(None)` returns the TEST binary and `sig_ok(base + SEARCH_RVA)` would read
+///     `GetModuleHandleW(None)` returns the TEST binary and `sig_ok(base + search_rva())` would read
 ///     unmapped memory -- an access violation, not a clean `false`. So the signature is not read
 ///     here.
 ///   * NO SIG CHECK AT CONNECT. A moved `SearchStringTable` signature is already handled where it
@@ -917,14 +925,14 @@ pub fn insert_path_live() -> bool {
 }
 
 /// The verified runtime address of the game's `SearchStringTable`, or `None` when the module
-/// base or the signature check fails. The single source of truth for `SEARCH_RVA`/`SEARCH_SIG`
+/// base or the signature check fails. The single source of truth for `search_rva()`/`SEARCH_SIG`
 /// beyond the read-back: `hover_probe` hooks this address (er-archipelago#937), and it must
 /// verify the same bytes the read-back trusts rather than carrying a second copy of the
 /// signature.
 pub fn search_string_table_addr() -> Option<usize> {
     let base = current_module_base()?;
-    if sig_ok(base + SEARCH_RVA) {
-        Some(base + SEARCH_RVA)
+    if sig_ok(base + search_rva()) {
+        Some(base + search_rva())
     } else {
         None
     }
@@ -1007,7 +1015,7 @@ pub fn extend_swap_overrides_tracked(
     // moved it) we cannot check, so we do not insert. Same once an insert has already been caught.
     if !injects.is_empty() {
         let latched = INSERT_UNSAFE.load(Ordering::Relaxed);
-        if latched || !sig_ok(base + SEARCH_RVA) {
+        if latched || !sig_ok(base + search_rva()) {
             let sample: Vec<u32> = injects.iter().map(|(id, _)| *id).take(8).collect();
             log::warn!(
                 "FMG extend-swap(cat {category}): {} of {} id(s) are in NO vanilla group and entry \
@@ -1091,7 +1099,7 @@ pub fn run() -> bool {
         Some(m) => m,
         None => return false,
     };
-    let search_addr = base + SEARCH_RVA;
+    let search_addr = base + search_rva();
     if !sig_ok(search_addr) {
         // R10 (SWEEP): latch DONE -- without it this warned EVERY tick for the whole session
         // (a game patch shifts the RVA; one warn then a permanent no-op is the right degrade).
@@ -1104,7 +1112,7 @@ pub fn run() -> bool {
         return true;
     }
     let search: SearchFn = unsafe { std::mem::transmute::<usize, SearchFn>(search_addr) };
-    let repo = unsafe { read_usize(base + REPO_RVA) } as *mut c_void;
+    let repo = unsafe { read_usize(base + repo_rva()) } as *mut c_void;
 
     let (groups, offsets) = match unsafe { parse(md) } {
         Some(p) => p,

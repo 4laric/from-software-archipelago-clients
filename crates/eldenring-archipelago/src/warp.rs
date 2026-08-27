@@ -24,15 +24,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use eldenring::cs::{BonfireWarpParam, SoloParamRepository};
 use fromsoftware_shared::FromStatic;
 
-/// `LuaWarp` entry, 2.6.2.0. Re-resolve via the module AOB above on a game update.
-pub(crate) const LUA_WARP_FUNC_RVA: usize = 0x0059_9C10;
+/// `LuaWarp` entry for the RUNNING build -- 2.6.2.0 and 2.7.0.0 have different ones; see
+/// [`crate::rva_table`]. Re-resolve via the module AOB above on a game update.
+pub(crate) fn lua_warp_func_rva() -> usize {
+    crate::rva_table::current().lua_warp_func
+}
 /// First 16 bytes at the entry (standard prologue), read from the pinned exe. A mismatch means
 /// the RVA is stale for the running build — refuse to call.
 const LUA_WARP_FUNC_SIG: &[u8] = &[
     0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xFA, 0x44, 0x89, 0x41,
 ];
-/// CSLuaEventManager static-slot candidates (see module docs). Probe order = CE scan order.
-const CSLEM_CANDIDATE_RVAS: [usize; 2] = [0x03D6_7E48, 0x03D5_AFE0];
+/// `CSLuaEventManager` static-slot candidates for the running build (see module docs). Probe
+/// order = CE scan order. Per-version; see [`crate::rva_table`].
+fn cslem_candidate_rvas() -> [usize; 2] {
+    crate::rva_table::current().cslem_candidates
+}
 
 /// The CE dropdown ids are grace ENTITY ids; the warp arg is that id minus 1000.
 pub(crate) const GRACE_TO_WARP_ARG_DELTA: u32 = 1000;
@@ -92,7 +98,7 @@ pub(crate) fn current_module_base() -> Option<usize> {
 /// Resolve the live CSLuaEventManager instance by probing both candidate static slots.
 /// Returns `(rcx, rdx)` for the call, i.e. `([inst+0x18], [inst+0x08])`.
 fn resolve_lua_event_manager(base: usize) -> Option<(*mut c_void, *mut c_void)> {
-    for (i, rva) in CSLEM_CANDIDATE_RVAS.iter().enumerate() {
+    for (i, rva) in cslem_candidate_rvas().iter().enumerate() {
         // SAFETY: pinned data RVA inside the loaded eldenring.exe image; reads pointer-sized
         // words and dereferences only after non-null checks.
         unsafe {
@@ -119,7 +125,7 @@ fn resolve_lua_event_manager(base: usize) -> Option<(*mut c_void, *mut c_void)> 
 }
 
 pub(crate) fn warp_fn(base: usize) -> Option<LuaWarpFn> {
-    let addr = base + LUA_WARP_FUNC_RVA;
+    let addr = base + lua_warp_func_rva();
     // Once warp_hook's LuaWarp detour is installed, retour has PATCHED the prologue (a jmp to
     // the detour), so the raw byte check below would false-negative and break every client
     // warp. The hook only installs after verifying this same signature, so the address is

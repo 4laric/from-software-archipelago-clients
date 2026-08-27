@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use retour::GenericDetour;
 
-use crate::warp::{self, LUA_WARP_FUNC_RVA, LuaWarpFn};
+use crate::warp::{self, LuaWarpFn, lua_warp_func_rva};
 
 static HOOK: OnceLock<GenericDetour<LuaWarpFn>> = OnceLock::new();
 /// One-shot attempt latch: `install` runs its body exactly once per session. Every failure mode
@@ -63,7 +63,7 @@ pub fn install() {
         log::warn!(
             "LuaWarp hook NOT installed: signature mismatch @ {:#x} (pinned 2.6.2.0 RVA stale \
              for this build) — menu warps fall back to the per-tick capital latch",
-            base + LUA_WARP_FUNC_RVA
+            base + lua_warp_func_rva()
         );
         return;
     };
@@ -84,7 +84,7 @@ pub fn install() {
     let _ = HOOK.set(hook);
     log::info!(
         "LuaWarp hook installed @ {:#x} -- every warp (menu or client) logs its target and reconciles 9116",
-        base + LUA_WARP_FUNC_RVA
+        base + lua_warp_func_rva()
     );
 }
 
