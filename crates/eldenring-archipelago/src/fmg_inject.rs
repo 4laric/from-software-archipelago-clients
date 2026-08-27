@@ -64,11 +64,13 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// FMG repository static slot for the running build. Per-version; see [`crate::rva_table`].
 /// 🛑 The 2.7.0.0 candidate for THIS one is the weakest row in the whole port (2/20 reference-site
-/// vote) and nothing calls it, so no prologue guard covers it -- only `plausible()` below.
+/// vote) and nothing calls it, so no prologue guard covers it. `plausible()` used to be the ONLY
+/// screen; [`repo_trusted`] is now the real one -- it validates the structure the pointer leads to
+/// (via `er_logic::fmg_repo_guard`) at first use and fails CLOSED for the session.
 fn repo_rva() -> usize {
     crate::rva_table::current().fmg_repo
 }
@@ -118,6 +120,107 @@ struct Group {
 
 fn plausible(p: usize) -> bool {
     (0x10000..0x7FFF_FFFF_FFFF).contains(&p)
+}
+
+// ---------------------------------------------------------------------------------------------
+// FAIL-CLOSED GUARD ON `repo_rva()` -- the one derived address that is READ, never CALLED.
+//
+// Every other client RVA is proved at its call site by a `_SIG` prologue match before the jump.
+// This one has no call site: it is a static data slot, so the only screen it ever had was
+// `plausible()` above -- a range test any pointer-shaped word passes. On 2.7.0.0 it is also the
+// weakest row in the port (2 of 20 reference sites voted). A wrong slot does not fault; it walks
+// into unrelated heap and every step after it -- the parse, the string reads, and finally a
+// POINTER WRITE into `base_array[0][cat]` -- aims at a structure we invented.
+//
+// So: at FIRST USE, parse the block the pointer leads to and put it through
+// `er_logic::fmg_repo_guard::validate` (host-tested there on synthetic inputs, including the
+// garbage-records case). Rejected => the FMG feature is OFF for the session, ONE log line, no
+// crash, no garbage names, and the rest of the client runs untouched.
+//
+// 🛑 Only a PARSED-BUT-WRONG structure latches. A chain that does not resolve yet is the boot
+// case the module already retries on, and latching it would turn "too early" into "off forever".
+const REPO_UNKNOWN: u8 = 0;
+const REPO_TRUSTED: u8 = 1;
+const REPO_REJECTED: u8 = 2;
+static REPO_STATE: AtomicU8 = AtomicU8::new(REPO_UNKNOWN);
+
+/// Has the guard already ruled the repo pointer out this session? Pure atomic read -- reads NO
+/// game memory, so it is safe to call on a CI host (see `insert_path_live`).
+fn repo_rejected() -> bool {
+    REPO_STATE.load(Ordering::Relaxed) == REPO_REJECTED
+}
+
+/// Walk the repo chain WITHOUT the guard. The guard itself needs this, and so does every gated
+/// caller once the verdict is in; going through the gated wrapper here would recurse.
+unsafe fn category_msgdata_unchecked(base: usize, category: u32) -> Option<usize> {
+    let repo = read_usize(base + repo_rva());
+    if !plausible(repo) {
+        return None;
+    }
+    let base_arr = read_usize(repo + 0x08);
+    if !plausible(base_arr) {
+        return None;
+    }
+    let sub = read_usize(base_arr);
+    if !plausible(sub) {
+        return None;
+    }
+    let md = read_usize(sub + category as usize * 8);
+    if plausible(md) { Some(md) } else { None }
+}
+
+/// Run the guard once and cache the answer. `false` means "do not touch the FMG layer": either the
+/// structure was rejected (latched, logged) or it is not up yet (not latched, retried).
+unsafe fn repo_trusted(base: usize) -> bool {
+    match REPO_STATE.load(Ordering::Relaxed) {
+        REPO_TRUSTED => return true,
+        REPO_REJECTED => return false,
+        _ => {}
+    }
+    // GoodsName is the category every install has and the one this module rebuilds; if the pointer
+    // is right for it, it is right.
+    let Some(md) = category_msgdata_unchecked(base, GOODS_CATEGORY) else {
+        return false; // chain not up yet -- transient, do NOT latch
+    };
+    let Some((groups, offsets)) = parse(md) else {
+        return false; // same: an unparseable read this early is the boot case, not a verdict
+    };
+    let spans: Vec<er_logic::fmg_groups::Span> = groups
+        .iter()
+        .map(|g| er_logic::fmg_groups::Span::new(g.first_id, g.last_id))
+        .collect();
+    let texts: Vec<(u32, Option<String>)> = CHECK_IDS
+        .iter()
+        .map(|&id| (id, my_lookup(md, &groups, &offsets, id)))
+        .collect();
+    let probes: Vec<er_logic::fmg_repo_guard::Probe<'_>> =
+        texts.iter().map(|(id, t)| (*id, t.as_deref())).collect();
+    match er_logic::fmg_repo_guard::validate(&spans, offsets.len() as u32, &probes) {
+        er_logic::fmg_repo_guard::Verdict::Trusted => {
+            REPO_STATE.store(REPO_TRUSTED, Ordering::Relaxed);
+            log::info!(
+                "FMG repo pointer validated at {md:#x}: {} group(s), {} entries, {} known vanilla \
+                 id(s) resolve to text ({})",
+                spans.len(),
+                offsets.len(),
+                CHECK_IDS.len(),
+                crate::game_version_gate::measured_clause()
+            );
+            true
+        }
+        er_logic::fmg_repo_guard::Verdict::Rejected(r) => {
+            REPO_STATE.store(REPO_REJECTED, Ordering::Relaxed);
+            log::error!(
+                "FMG DISABLED for this session: the FMG repository address does not point at a \
+                 message table ({}) -- {}. No FMG memory was read or written past this check; item \
+                 names and shop previews fall back to the vanilla text and the rest of the client \
+                 is unaffected.",
+                crate::game_version_gate::measured_clause(),
+                r.reason()
+            );
+            false
+        }
+    }
 }
 fn current_module_base() -> Option<usize> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -170,20 +273,7 @@ fn sig_ok(addr: usize) -> bool {
 }
 
 unsafe fn goods_msgdata(base: usize) -> Option<usize> {
-    let repo = read_usize(base + repo_rva());
-    if !plausible(repo) {
-        return None;
-    }
-    let base_arr = read_usize(repo + 0x08);
-    if !plausible(base_arr) {
-        return None;
-    }
-    let sub = read_usize(base_arr);
-    if !plausible(sub) {
-        return None;
-    }
-    let md = read_usize(sub + GOODS_CATEGORY as usize * 8);
-    if plausible(md) { Some(md) } else { None }
+    category_msgdata(base, GOODS_CATEGORY)
 }
 
 unsafe fn parse(md: usize) -> Option<(Vec<Group>, Vec<u64>)> {
@@ -461,6 +551,9 @@ unsafe fn build_block(
 }
 
 unsafe fn swap_goods(base: usize, newblock: usize) -> bool {
+    if !repo_trusted(base) {
+        return false;
+    }
     let repo = read_usize(base + repo_rva());
     let base_arr = read_usize(repo + 0x08);
     let sub = read_usize(base_arr);
@@ -475,24 +568,17 @@ unsafe fn swap_goods(base: usize, newblock: usize) -> bool {
 /// Resolve `base_array[0][category]` (the MsgData* for an arbitrary FMG category). Generalization of
 /// `goods_msgdata` for the caption path; `category_msgdata(base, GOODS_CATEGORY) == goods_msgdata`.
 unsafe fn category_msgdata(base: usize, category: u32) -> Option<usize> {
-    let repo = read_usize(base + repo_rva());
-    if !plausible(repo) {
+    if !repo_trusted(base) {
         return None;
     }
-    let base_arr = read_usize(repo + 0x08);
-    if !plausible(base_arr) {
-        return None;
-    }
-    let sub = read_usize(base_arr);
-    if !plausible(sub) {
-        return None;
-    }
-    let md = read_usize(sub + category as usize * 8);
-    if plausible(md) { Some(md) } else { None }
+    category_msgdata_unchecked(base, category)
 }
 
 /// Atomically point `base_array[0][category]` at a freshly-built block. Generalization of `swap_goods`.
 unsafe fn swap_category(base: usize, category: u32, newblock: usize) -> bool {
+    if !repo_trusted(base) {
+        return false;
+    }
     let repo = read_usize(base + repo_rva());
     let base_arr = read_usize(repo + 0x08);
     let sub = read_usize(base_arr);
@@ -634,6 +720,11 @@ pub fn read_goods_string(category: u32, id: u32) -> Option<String> {
         return None;
     }
     let search: SearchFn = unsafe { std::mem::transmute::<usize, SearchFn>(search_addr) };
+    // The repo pointer is HANDED TO the game's own lookup here, so a wrong one is walked by the
+    // game's code rather than ours -- the guard is if anything more load-bearing on this path.
+    if !unsafe { repo_trusted(base) } {
+        return None;
+    }
     let repo = unsafe { read_usize(base + repo_rva()) };
     if !plausible(repo) {
         return None;
@@ -921,7 +1012,10 @@ static INSERT_UNSAFE: AtomicBool = AtomicBool::new(false);
 ///     #536-shaped "regenerate the seed" message for a failure whose fix is a CLIENT update --
 ///     the message's "updating this client will NOT help" would be exactly backwards.
 pub fn insert_path_live() -> bool {
-    !INSERT_UNSAFE.load(Ordering::Relaxed)
+    // `repo_rejected()` is the same shape: a cached atomic, no game memory, host-safe. A session
+    // whose repo pointer failed validation writes no FMG at all, so the insert path is not live
+    // either -- and the feature tag must say so rather than promising a capability that is off.
+    !INSERT_UNSAFE.load(Ordering::Relaxed) && !repo_rejected()
 }
 
 /// The verified runtime address of the game's `SearchStringTable`, or `None` when the module

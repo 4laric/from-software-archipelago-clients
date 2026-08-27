@@ -46,6 +46,7 @@ pub mod fast_travel_replay;
 pub mod flagpoll_baseline_replay;
 pub mod flask_reconcile;
 pub mod fmg_groups;
+pub mod fmg_repo_guard;
 pub mod game_version;
 pub mod goal_approach;
 pub mod goal_gate;
