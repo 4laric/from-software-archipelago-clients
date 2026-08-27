@@ -680,12 +680,17 @@ mod tests {
             ready: true,
             ..Default::default()
         };
+        // Slot 0 on purpose: this fake reports `s.unwrap_or(0)` as the result
+        // cell, so an INSERT (which passes no slot) reads its record back at 0.
+        // The owned record living there is what lets the test witness the
+        // insert's slot read-back instead of starving the hydration budget,
+        // which is 240 polls -- longer than `drain`.
         runtime.stacks.insert(
             0x006C_5660,
             StackView {
                 quantity: 1,
                 exists: true,
-                slot: Some(1),
+                slot: Some(0),
                 quantity_address: Some(0x2000),
             },
         );
