@@ -363,7 +363,7 @@ enum DeliveryMode {
     /// explicitly with `--delivery=ce-bridge`, and the remedy the default native
     /// path points the player to when it cannot validate the running image.
     CeBridge,
-    /// The default: grant in-process via the native `bb-native-grant-v5` payload
+    /// The default: grant in-process via the native `bb-native-grant-v7` payload
     /// (stage 2). Fails closed on any image it cannot validate; on the default
     /// path (no explicit `--delivery`) an unrecognised image hard-fails with
     /// guidance rather than silently falling back to the bridge (clients#413).

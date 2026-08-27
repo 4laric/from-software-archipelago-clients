@@ -1,7 +1,7 @@
 {
   "format": "bb-native-grant-contract-v5",
-  "harness": "bb-native-grant-v5",
-  "build": "bb-0.1.0-r5",
+  "harness": "bb-native-grant-v7",
+  "build": "bb-0.1.0-r7",
   "bridge_protocol": "BBGRANT1",
   "target": {
     "serial": "CUSA03173",
@@ -40,6 +40,32 @@
     }
   ],
   "native_routines": [
+    {
+      "name": "allocate_equipment_instance",
+      "rva": 27816544,
+      "provenance": "validated",
+      "signature": "(rdi=descriptor, rsi=equipment registry, edx=raw id) -> descriptor handle",
+      "note": "live-validated with a Beast Claw whose allocated handle resolved to a weapon object"
+    },
+    {
+      "name": "allocate_armor_instance",
+      "rva": 27816848,
+      "provenance": "validated",
+      "signature": "(rdi=descriptor, rsi=equipment registry, edx=raw id) -> armor handle",
+      "note": "Charred Hunter Garb appeared in inventory and equipped successfully"
+    },
+    {
+      "name": "resolve_descriptor",
+      "rva": 27824240,
+      "provenance": "validated",
+      "signature": "(rdi=descriptor) -> backing equipment object"
+    },
+    {
+      "name": "lookup_weapon_param",
+      "rva": 32676512,
+      "provenance": "validated",
+      "signature": "(rdi=lookup result, esi=normalized weapon id) -> param row at result+8"
+    },
     {
       "name": "ItemGrant",
       "rva": 21864608,
@@ -88,7 +114,7 @@
     },
     "source_selection": {
       "test": "raw_id & 0xF0000000 == 0x80000000",
-      "true": "persistent descriptor cell (category 0, equipment)",
+      "true": "persistent descriptor cell after native equipment-instance allocation; the backing object's durability is initialized from EquipParamWeapon +0xBE",
       "false": "24 bytes materialized in the consume frame (category 4, goods)",
       "provenance": "validated"
     }
@@ -236,16 +262,36 @@
       {
         "name": "consume_cave",
         "rva": 84785664,
-        "size": 219,
-        "bytes": "4C892D09040000833DF2030000000F84BB000000833DE5030000020F8468000000C705D5030000000000008B052F04000089042448C7442408000000008B052D04000089442410C744241400000000498BFD488BF48B050504000025000000F03D000000800F8507000000488D35EE0300008B158C03000048B8A0A04D0100000000FFD0E936000000C7056D03000000000000498BFD8B35980300008B1562030000488D0D870300004C8B05880300004531C948B8A0944D0100000000FFD0890543030000C7053D030000010000004489E04883C428E9A1DA3FFC",
+        "size": 398,
+        "bytes": "4C892D09040000833DF2030000000F846E010000833DE5030000020F841B010000C705D5030000000000008B052F04000089042448C7442408000000008B052D04000089442410C744241400000000498BFD488BF48B050504000025000000F03D000000800F84100000003D000000900F8414000000E9AA00000048B86072A80100000000E90F00000048B89073A80100000000E9000000008B15C1030000488D3DBA030000488B35E32E4600FFD08B05AB03000025000000F03D000000800F8556000000488D3D9403000048B87090A80100000000FFD0C70424FFFFFFFF48C744240800000000C7442410FFFFFFFF488BFC8B357703000048B8A09AF20100000000FFD0488B4424080FB788BE000000488B0550030000894818498BFD488D353B0300008B15D902000048B8A0A04D0100000000FFD0E936000000C705BA02000000000000498BFD8B35E50200008B15AF020000488D0DD40200004C8B05D50200004531C948B8A0944D0100000000FFD0890590020000C7058A020000010000004489E04883C428E9EED93FFC",
         "relocations": [
           {
-            "offset": 122,
+            "offset": 125,
+            "width": 8,
+            "target_rva": 27816544
+          },
+          {
+            "offset": 140,
+            "width": 8,
+            "target_rva": 27816848
+          },
+          {
+            "offset": 206,
+            "width": 8,
+            "target_rva": 27824240
+          },
+          {
+            "offset": 251,
+            "width": 8,
+            "target_rva": 32676512
+          },
+          {
+            "offset": 301,
             "width": 8,
             "target_rva": 21864608
           },
           {
-            "offset": 181,
+            "offset": 360,
             "width": 8,
             "target_rva": 21861536
           }
@@ -296,7 +342,9 @@
   "policy": {
     "absent_blood_vial": "refused",
     "absent_blood_vial_reason": "live reproduction created raw 0xF00003E8 '?ItemInfo?' instead of 0xB00003E8",
-    "equipment": "allowlist only; Saw Spear raw 0x806C5660 is the sole validated row",
+    "equipment": "allowlist only; allocate a category-0 instance, resolve its backing object, and initialize current durability at object+0x18 from durabilityMax at EquipParamWeapon row+0xBE before ItemGrant",
+    "armor": "exact allowlist; category-1 allocator; Charred Hunter Garb insert and equip validated",
+    "blood_gems": "refused; category-8 lot ids require generation semantics not yet mapped",
     "excluded": [
       "Torch (ItemLot 20100000)",
       "Rifle Spear (ItemLot 10000000)"
