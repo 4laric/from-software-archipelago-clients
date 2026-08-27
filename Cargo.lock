@@ -640,7 +640,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "eldenring"
 version = "0.14.0"
-source = "git+https://github.com/4laric/fromsoftware-rs?rev=63a0c3727daf9ed7382d0316e66ae71a1ca27a51#63a0c3727daf9ed7382d0316e66ae71a1ca27a51"
+source = "git+https://github.com/vswarte/fromsoftware-rs?rev=0b44ede3ae9d95d39bfef65edc0694380a1b83c3#0b44ede3ae9d95d39bfef65edc0694380a1b83c3"
 dependencies = [
  "bitfield",
  "bitflags 2.11.1",
@@ -719,7 +719,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -792,7 +792,7 @@ dependencies = [
  "memchr",
  "pelite",
  "smallvec",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -822,7 +822,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared"
 version = "0.14.0"
-source = "git+https://github.com/4laric/fromsoftware-rs?rev=63a0c3727daf9ed7382d0316e66ae71a1ca27a51#63a0c3727daf9ed7382d0316e66ae71a1ca27a51"
+source = "git+https://github.com/vswarte/fromsoftware-rs?rev=0b44ede3ae9d95d39bfef65edc0694380a1b83c3#0b44ede3ae9d95d39bfef65edc0694380a1b83c3"
 dependencies = [
  "bitflags 2.11.1",
  "from-singleton",
@@ -849,7 +849,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-macros"
 version = "0.14.0"
-source = "git+https://github.com/4laric/fromsoftware-rs?rev=63a0c3727daf9ed7382d0316e66ae71a1ca27a51#63a0c3727daf9ed7382d0316e66ae71a1ca27a51"
+source = "git+https://github.com/vswarte/fromsoftware-rs?rev=0b44ede3ae9d95d39bfef65edc0694380a1b83c3#0b44ede3ae9d95d39bfef65edc0694380a1b83c3"
 dependencies = [
  "inflections",
  "proc-macro2",
@@ -860,7 +860,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-stl"
 version = "0.14.0"
-source = "git+https://github.com/4laric/fromsoftware-rs?rev=63a0c3727daf9ed7382d0316e66ae71a1ca27a51#63a0c3727daf9ed7382d0316e66ae71a1ca27a51"
+source = "git+https://github.com/vswarte/fromsoftware-rs?rev=0b44ede3ae9d95d39bfef65edc0694380a1b83c3#0b44ede3ae9d95d39bfef65edc0694380a1b83c3"
 
 [[package]]
 name = "fs_extra"
@@ -1764,7 +1764,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2168,7 +2168,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2580,7 +2580,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -69,6 +69,7 @@ const ONE_SLOT: u8 = 1;
 /// Rows expected to need normalising on a vanilla 2.6.2.0 `Magic` table (24 memorisable spells +
 /// row `2050001`). Logged, never asserted -- a mismatch is information about the install, not a
 /// failure.
+#[allow(dead_code)] // retired build; kept as the measured baseline the WW270 figure is tested against
 const VANILLA_MULTI_SLOT_ROWS_WW262: u32 = 25;
 
 /// The same count measured on vanilla 2.7.0.0 (Tarnished Edition): 105 of 317 `Magic` rows.
@@ -80,14 +81,15 @@ const VANILLA_MULTI_SLOT_ROWS_WW270: u32 = 105;
 /// the mapping is testable without a game: the defect this fixes was a per-build number frozen as a
 /// constant, and a test is what stops the next build freezing it again.
 ///
-/// `None` (detection failed) and the JP build take the 2.6.2.0 figure -- the same principle as
-/// `rva_table::current`'s fallback: prefer the VERIFIED column, and note that this arm is not
-/// reachable in a normal session because the version gate refuses to initialise at all on an
-/// executable we have no table for.
+/// `None` (detection failed) and the JP build take the 2.7.0.0 figure -- the same principle as
+/// `rva_table::current`'s fallback: with the 2.6.2.x arms retired, the WW Tarnished column is
+/// the only one any admitted executable can be, and the `None` arm is not reachable in a normal
+/// session because the version gate refuses to initialise at all on an executable we have no
+/// table for. The JP 2.7.0.1 count is UNMEASURED -- the WW figure is a stand-in, and this number
+/// is logged, never asserted.
 fn expected_for(version: Option<Supported>) -> u32 {
     match version {
-        Some(Supported::Ww270) => VANILLA_MULTI_SLOT_ROWS_WW270,
-        Some(Supported::Ww262) | Some(Supported::Jp2621) | None => VANILLA_MULTI_SLOT_ROWS_WW262,
+        Some(Supported::Ww270) | Some(Supported::Jp2701) | None => VANILLA_MULTI_SLOT_ROWS_WW270,
     }
 }
 
@@ -193,21 +195,23 @@ mod tests {
     /// vanilla Tarnished Edition normalises 105 of 317 rows. The counts must differ per build.
     #[test]
     fn each_supported_build_carries_its_own_measured_count() {
-        assert_eq!(expected_for(Some(Supported::Ww262)), 25);
         assert_eq!(expected_for(Some(Supported::Ww270)), 105);
+        // The retired 2.6.2.0 figure stays declared above; keep the delta visible so a future
+        // edit that resurrects the old constant wholesale is noticed.
         assert_ne!(
-            expected_for(Some(Supported::Ww262)),
-            expected_for(Some(Supported::Ww270))
+            expected_for(Some(Supported::Ww270)),
+            VANILLA_MULTI_SLOT_ROWS_WW262
         );
     }
 
-    /// Undetected / JP fall back to the VERIFIED column, exactly as `rva_table::current` does.
+    /// Undetected / JP fall back to the only remaining column, exactly as `rva_table::current`
+    /// does now that the 2.6.2.x arms are retired.
     #[test]
-    fn an_unmeasured_build_falls_back_to_the_verified_count() {
-        assert_eq!(expected_for(None), VANILLA_MULTI_SLOT_ROWS_WW262);
+    fn an_unmeasured_build_falls_back_to_the_ww_tarnished_count() {
+        assert_eq!(expected_for(None), VANILLA_MULTI_SLOT_ROWS_WW270);
         assert_eq!(
-            expected_for(Some(Supported::Jp2621)),
-            VANILLA_MULTI_SLOT_ROWS_WW262
+            expected_for(Some(Supported::Jp2701)),
+            VANILLA_MULTI_SLOT_ROWS_WW270
         );
     }
 }

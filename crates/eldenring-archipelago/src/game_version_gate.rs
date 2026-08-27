@@ -35,11 +35,14 @@ use windows::core::{HSTRING, PCSTR};
 /// table and ours are decided by one detection rather than two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Supported {
-    Ww262,
-    /// Tarnished Edition, Worldwide. 🛑 Both the crate's table for this build and the client's own
-    /// are CANDIDATES -- derived, never executed. See `crate::rva_table`.
+    /// Tarnished Edition, Worldwide (exe 2.7.0.0). The crate's 93 RVAs for this build are
+    /// upstream's GENERATED 1.17.0 table (vswarte PR #320); the client's own eight are still the
+    /// derived candidates. See `crate::rva_table`.
     Ww270,
-    Jp2621,
+    /// Tarnished Edition, Japanese (exe 2.7.0.1). Covered by upstream's generated `rva_jp` table;
+    /// the client's own eight RVAs were never derived for the JP binary and fall back to the
+    /// Worldwide column under the `_SIG` prologue guards, exactly as JP 2.6.2.1 did before.
+    Jp2701,
 }
 
 impl GameVersion for Supported {
@@ -47,11 +50,9 @@ impl GameVersion for Supported {
 
     fn from_lang_version(lang_id: u16, version: &str) -> Option<Self> {
         if lang_id == LANG_ID_EN && version == game_version::REQUIRED_WW {
-            Some(Self::Ww262)
-        } else if lang_id == LANG_ID_EN && version == game_version::REQUIRED_WW_TARNISHED {
             Some(Self::Ww270)
         } else if lang_id == LANG_ID_JP && version == game_version::REQUIRED_JP {
-            Some(Self::Jp2621)
+            Some(Self::Jp2701)
         } else {
             None
         }
@@ -99,16 +100,17 @@ pub fn check() -> Result<(), String> {
 
     match detected {
         Ok(Ok(version)) => {
-            if *version == Supported::Ww270 {
-                // 🛑 STARTUP HONESTY (#241). Every address this session is about to use on 2.7.0.0
-                // -- the crate's 93 and the client's own 8 -- was derived offline and has never
-                // been executed. A player reading a log after something goes strange must find
-                // that fact stated, not have to infer it from a version number.
-                log::warn!(
-                    "2.7.0.0 support is running on DERIVED, UNVERIFIED offsets \
-                     (candidate table 2026-08-27) -- test-build only"
-                );
-            }
+            let _ = version;
+            // 🛑 STARTUP HONESTY (#241). The crate's 93 RVAs are now upstream's generated
+            // 1.17.0 tables (vswarte PR #320, merged 2026-08-27), but the client's OWN eight
+            // (`crate::rva_table::WW270`) are still the offline-derived candidates and have
+            // never been executed in a live game. A player reading a log after something goes
+            // strange must find that fact stated, not have to infer it from a version number.
+            log::warn!(
+                "client-private RVAs for Tarnished Edition are DERIVED, UNVERIFIED \
+                 (candidate table 2026-08-27; crate RVAs are upstream-generated) -- \
+                 Windows acceptance still owed"
+            );
             Ok(())
         }
         Ok(Err(rejection)) => Err(game_version::explain(rejection)),
@@ -142,9 +144,8 @@ fn rejection_of(error: DetectError) -> Rejection {
 /// the failure by hand, so every SearchStringTable reject carries this clause.
 pub fn measured_clause() -> String {
     let result = match detect_once() {
-        Ok(Ok(Supported::Ww262)) => Ok((game_version::REQUIRED_WW, LANG_ID_EN)),
-        Ok(Ok(Supported::Ww270)) => Ok((game_version::REQUIRED_WW_TARNISHED, LANG_ID_EN)),
-        Ok(Ok(Supported::Jp2621)) => Ok((game_version::REQUIRED_JP, LANG_ID_JP)),
+        Ok(Ok(Supported::Ww270)) => Ok((game_version::REQUIRED_WW, LANG_ID_EN)),
+        Ok(Ok(Supported::Jp2701)) => Ok((game_version::REQUIRED_JP, LANG_ID_JP)),
         Ok(Err(rejection)) => Err(rejection.clone()),
         Err(_) => Err(Rejection::Metadata {
             missing: "readable version resource",

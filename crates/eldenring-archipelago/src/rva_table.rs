@@ -47,7 +47,10 @@ pub struct ClientRvas {
 }
 
 /// Elden Ring 2.6.2.0 Worldwide. VERIFIED: these are the addresses the client has shipped and
-/// played on.
+/// played on. 🛑 NO LONGER DISPATCHED -- the 2.6.2.x arms are retired (the `eldenring` crate at
+/// the current pin has no tables for them). Kept as the verified baseline the [`WW270`] port was
+/// derived FROM: the delta tests below are what notice a silent wholesale copy.
+#[allow(dead_code)] // referenced only by the delta tests since the 2.6.2.x retirement
 pub const WW262: ClientRvas = ClientRvas {
     add_item_func: 0x0056_05B0,
     inventory_ptrloc: 0x03D6_7A50,
@@ -83,19 +86,19 @@ pub const WW270: ClientRvas = ClientRvas {
 
 /// The table for the executable we are actually running in.
 ///
-/// Falls back to [`WW262`] when detection fails. That arm is not reachable in a normal session:
+/// Falls back to [`WW270`] when detection fails. That arm is not reachable in a normal session:
 /// `DllMain` runs [`crate::game_version_gate::check`] first and refuses to initialise anything at
-/// all on an executable we have no table for, so nothing that reads these RVAs gets built. The
-/// fallback picks the VERIFIED column rather than the candidate one on principle.
+/// all on an executable we have no table for, so nothing that reads these RVAs gets built. With
+/// the 2.6.2.x arms retired (upstream dropped their tables in vswarte PR #320), [`WW270`] is the
+/// only column any admitted executable can be.
 ///
-/// JP 2.6.2.1 also maps here to [`WW262`]. That is not a claim these eight addresses are correct
+/// JP 2.7.0.1 also maps here to [`WW270`]. That is not a claim these eight addresses are correct
 /// on the Japanese executable -- they were never derived for it. It preserves exactly what the
-/// client did before this module existed (one baked Worldwide constant for every build), and the
-/// per-call-site `_SIG` prologue guards are what actually keep it honest there.
+/// client did for JP 2.6.2.1 before (the Worldwide column for every build), and the per-call-site
+/// `_SIG` prologue guards are what actually keep it honest there.
 pub fn current() -> &'static ClientRvas {
     match detected() {
-        Some(Supported::Ww270) => &WW270,
-        Some(Supported::Ww262) | Some(Supported::Jp2621) | None => &WW262,
+        Some(Supported::Ww270) | Some(Supported::Jp2701) | None => &WW270,
     }
 }
 
