@@ -1,5 +1,5 @@
 //! `NativeBackend`: a [`BloodborneBackend`] that grants items in-process via the
-//! native `bb-native-grant-v5` payload, replacing the Cheat Engine file bridge.
+//! native `bb-native-grant-v7` payload, replacing the Cheat Engine file bridge.
 //!
 //! Native is now the default delivery backend (see `main.rs`). Regardless of how
 //! it is selected, [`NativeBackend::attach`] itself always fails closed: when the

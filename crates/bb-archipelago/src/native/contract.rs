@@ -1,4 +1,4 @@
-//! Typed access to the vendored `bb-native-grant-v5` runtime contract.
+//! Typed access to the vendored `bb-native-grant-v7` runtime contract.
 //!
 //! Every hook-site RVA, native-routine RVA, state-cell offset, descriptor
 //! prefix, image-assert byte string and relocatable payload blob the native
@@ -621,9 +621,10 @@ mod tests {
         let detour = c.blobs.iter().find(|b| b.name == "consume_detour").unwrap();
         assert_eq!(detour.bytes.len(), 7);
         assert_eq!(detour.bytes[0], 0xE9); // jmp rel32
-        // The two caves carry the only relocations, both 8-byte quadwords.
+        // The consume cave relocates its validated native routine calls as
+        // 8-byte quadwords; r7 adds the equipment allocator/resolver lookups.
         let cave = c.blobs.iter().find(|b| b.name == "consume_cave").unwrap();
-        assert_eq!(cave.relocations.len(), 2);
+        assert_eq!(cave.relocations.len(), 6);
         assert!(cave.relocations.iter().all(|r| r.width == 8));
     }
 

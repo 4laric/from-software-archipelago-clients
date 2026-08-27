@@ -4,7 +4,7 @@
 //! This is stage 2 of the CE-free client (SPEC-client-without-cheat-engine.md
 //! "client-side injection"). It reads and writes shadPS4 process memory
 //! directly, verifies the running image against the vendored
-//! `bb-native-grant-v5` contract, installs a static grant payload atomically,
+//! `bb-native-grant-v7` contract, installs a static grant payload atomically,
 //! and drives the grant state machine the Cheat Engine table paid for live.
 //!
 //! Everything here is **untested against a live game**. Native is now the
