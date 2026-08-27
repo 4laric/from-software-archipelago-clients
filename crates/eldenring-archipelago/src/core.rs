@@ -5471,7 +5471,9 @@ impl Core {
             |n| received.contains(n),
         );
 
-        // #936 seed truth for the baked ", also granted by <boss>" sweep clause: the clause is
+        // #936 seed truth for the baked ", may be sweep-granted by <boss>" sweep clause (world
+        // v0.5.2; older seeds' datapackages say ", also granted by <boss>" and are recognised
+        // too, since the names come from the GENERATOR). The clause is
         // corpus-wide (every check a sweep COULD pay); slot_data `dungeonSweepFlags` is already
         // rung-filtered + surface-cut, so its member union is exactly what THIS seed grants.
         // `None` while the flag-poll config is unknown -- er_logic::sweep_clause never strips on
