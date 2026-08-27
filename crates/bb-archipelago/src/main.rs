@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::env;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -404,6 +405,50 @@ struct Arguments {
     log_file: Option<PathBuf>,
 }
 
+/// Process-lifetime ownership of one receive ledger (clients#430).
+///
+/// The lock file may remain on disk, but the OS lock cannot go stale: the kernel releases it when
+/// the process exits or crashes.  Holding the file handle in this guard keeps ownership until the
+/// client finishes, and taking it before backend attachment prevents a losing second instance from
+/// touching guest memory.
+struct LedgerLock {
+    _file: File,
+}
+
+impl LedgerLock {
+    fn acquire(ledger: &Path) -> Result<Self> {
+        let mut lock_name = ledger.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "opening instance lock {} for receive ledger {}",
+                    lock_path.display(),
+                    ledger.display()
+                )
+            })?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(TryLockError::WouldBlock) => bail!(
+                "another bb-ap-client instance is already running for receive ledger {}. Close the other client before starting this one",
+                ledger.display()
+            ),
+            Err(TryLockError::Error(error)) => Err(error).with_context(|| {
+                format!(
+                    "locking {} for receive ledger {}",
+                    lock_path.display(),
+                    ledger.display()
+                )
+            }),
+        }
+    }
+}
+
 /// The explicitly unsafe assumed-correct-save identity token. Set by
 /// `--assume-correct-save`; consulted by both the native and Cheat Engine paths.
 const ASSUMED_IDENTITY: &str = "unsafe-operator-attested-correct-save";
@@ -698,6 +743,7 @@ fn run() -> Result<()> {
         logging::install_log_file(path)
             .with_context(|| format!("could not open the client log {}", path.display()))?;
     }
+    let _ledger_lock = LedgerLock::acquire(&args.ledger)?;
     client_eprintln!(
         "Bloodborne AP client {} | runtime build {RUNTIME_BUILD}",
         client_version()
@@ -1337,6 +1383,30 @@ mod tests {
         let error = version_request(["--version".to_string(), "server".to_string()].into_iter())
             .unwrap_err();
         assert!(format!("{error:#}").contains("does not accept"));
+    }
+
+    #[test]
+    fn receive_ledger_has_exactly_one_live_process_owner() {
+        let ledger =
+            env::temp_dir().join(format!("bb-ledger-lock-test-{}.json", std::process::id()));
+        let lock_path = PathBuf::from(format!("{}.lock", ledger.display()));
+        let first = LedgerLock::acquire(&ledger).expect("first owner");
+        let error = LedgerLock::acquire(&ledger)
+            .err()
+            .expect("second owner must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("another bb-ap-client instance"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&ledger.display().to_string()),
+            "{rendered}"
+        );
+
+        drop(first);
+        LedgerLock::acquire(&ledger).expect("a crashed/exited owner cannot leave a stale lock");
+        let _ = std::fs::remove_file(lock_path);
     }
 
     #[test]
