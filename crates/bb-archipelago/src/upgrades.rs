@@ -60,7 +60,6 @@ mod tests {
         assert_eq!(auto_upgrade_level(true, 3, None), 3);
     }
 
-
     #[test]
     fn descriptor_pair_moves_to_the_selected_reinforcement_row() {
         assert_eq!(

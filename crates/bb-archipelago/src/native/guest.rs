@@ -29,10 +29,9 @@ const MAX_SLOTS: u64 = 4096;
 /// membership prevents armour/runes that happen to resemble a +N row from
 /// influencing the target.
 const WEAPON_FAMILIES: &[u32] = &[
-    2_000_000, 4_000_000, 5_000_000, 5_100_000, 6_000_000, 6_100_000,
-    7_000_000, 7_100_000, 8_000_000, 8_100_000, 9_000_000, 10_000_000,
-    10_100_000, 11_000_000, 12_000_000, 13_000_000, 14_000_000, 14_200_000,
-    15_000_000, 22_000_000,
+    2_000_000, 4_000_000, 5_000_000, 5_100_000, 6_000_000, 6_100_000, 7_000_000, 7_100_000,
+    8_000_000, 8_100_000, 9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000,
+    14_000_000, 14_200_000, 15_000_000, 22_000_000,
 ];
 
 /// Which of the two banks holds `slot`. Pure, so it is testable without memory.
@@ -110,7 +109,9 @@ impl<P: ProcessMemory> GuestRuntime<P> {
             let entry = entry_address(slot, split, primary, secondary, g.record_stride);
             let id = self.record(self.memory.read_u32(entry + g.record_id))?;
             for &family in WEAPON_FAMILIES {
-                let Some(delta) = id.checked_sub(family) else { continue };
+                let Some(delta) = id.checked_sub(family) else {
+                    continue;
+                };
                 if delta <= 1_000 && delta % 100 == 0 {
                     highest = highest.max((delta / 100) as u8);
                     break;
