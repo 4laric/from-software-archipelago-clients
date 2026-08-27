@@ -70,6 +70,51 @@ impl ItemGrantDescriptor {
         })
     }
 
+    /// The Bloodborne item category this descriptor pair encodes, or `None`
+    /// when the pair matches neither validated shape.
+    ///
+    /// The category is not a separate field on the wire: it *is* the high
+    /// nibble of the normalized id, and the contract's two prefix pairs are
+    /// exactly the two categories the client supports. Goods carry
+    /// `normalized = goods_normalized_prefix | id` (`0x4...`, i.e. category 4)
+    /// with `raw = goods_raw_prefix | id`; equipment carries a normalized id
+    /// with a zero high nibble (category 0) and
+    /// `raw = persistent_source_marker | id`. These are the same two pairings
+    /// `NativeGrantRequest::into_command` validates against the *declared*
+    /// category, so this derivation cannot disagree with the declared one for
+    /// any command that reaches the delivery machine -- which is why the
+    /// machine can derive it instead of carrying the byte down.
+    ///
+    /// Anything else is `None` and must be treated as **not stackable**: an
+    /// unrecognised pair is exactly the case where guessing "stack" would add a
+    /// delta into a field that is not a quantity (clients#451).
+    pub fn category(&self, formula: &DescriptorFormula) -> Option<u8> {
+        let raw_prefix = self.raw_id & 0xF000_0000;
+        let normalized_prefix = self.normalized_id & 0xF000_0000;
+        if raw_prefix == formula.goods_raw_prefix
+            && normalized_prefix == formula.goods_normalized_prefix
+        {
+            return Some(CATEGORY_GOODS);
+        }
+        if raw_prefix == formula.persistent_source_marker && normalized_prefix == 0 {
+            return Some(CATEGORY_EQUIPMENT);
+        }
+        None
+    }
+
+    /// True only for a category the inventory actually *stacks*, and so the
+    /// only case where the cave's existing-stack delta branch is meaningful.
+    ///
+    /// Category 4 (goods) stacks. Category 0 (equipment) does not: a weapon is
+    /// an instance record whose "quantity" position is not a count, so a second
+    /// Hunter Pistol is a second INSTANCE, never `+1` on the first -- which is
+    /// the point of the Uncanny/Lost design, and is equally true of a plain
+    /// duplicate. Armour, when it arrives, joins the equipment side of this
+    /// test, not the goods side. Unknown pairs fail closed to non-stackable.
+    pub fn is_stackable_category(&self, formula: &DescriptorFormula) -> bool {
+        self.category(formula) == Some(CATEGORY_GOODS)
+    }
+
     /// True when the cave takes the `lea rsi,[descriptor]` (persistent,
     /// equipment) branch: `raw & 0xF0000000 == persistent_source_marker`.
     pub fn uses_persistent_source(&self, formula: &DescriptorFormula) -> bool {
@@ -120,6 +165,29 @@ mod tests {
         // Saw Spear raw 0x806C5660 is the sole validated equipment row.
         let d = ItemGrantDescriptor::new(0x806C_5660, 0x006C_5660);
         assert!(d.uses_persistent_source(&formula()));
+    }
+
+    #[test]
+    fn category_is_derived_from_the_descriptor_pair() {
+        let f = formula();
+        let goods = ItemGrantDescriptor::for_goods(&f, 0x4CE).unwrap();
+        assert_eq!(goods.category(&f), Some(CATEGORY_GOODS));
+        assert!(goods.is_stackable_category(&f));
+
+        // Saw Spear, the validated equipment row.
+        let weapon = ItemGrantDescriptor::new(0x806C_5660, 0x006C_5660);
+        assert_eq!(weapon.category(&f), Some(CATEGORY_EQUIPMENT));
+        assert!(!weapon.is_stackable_category(&f));
+    }
+
+    #[test]
+    fn an_unrecognised_pair_is_never_stackable() {
+        let f = formula();
+        // Goods raw prefix with an equipment-shaped normalized id: neither
+        // validated pairing, so it must not be allowed onto the delta lane.
+        let odd = ItemGrantDescriptor::new(0xB000_0384, 0x0000_0384);
+        assert_eq!(odd.category(&f), None);
+        assert!(!odd.is_stackable_category(&f));
     }
 
     #[test]

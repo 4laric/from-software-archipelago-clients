@@ -534,6 +534,13 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             //
             // Double-delivery protection is unchanged and still lives in the
             // ledger's index cursor: an index is delivered at most once.
+            // clients#451: for category-0 equipment this baseline is recorded
+            // but is NOT used as an instance count -- the native machine takes
+            // the insert lane for equipment unconditionally and ignores the
+            // stack quantity, because `observe_stack_quantity` reports the
+            // first matching RECORD, which says nothing about how many
+            // instances the player holds. It stays observed and durable so the
+            // ledger row keeps one shape for both categories.
             let recorded_baseline = pending.observed_before;
             let baseline_is_binding = match recorded_baseline {
                 Some(_) => self

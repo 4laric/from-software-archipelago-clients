@@ -19,6 +19,11 @@
 //!   lets a restart decide "already applied" instead of granting twice;
 //! * **fail closed** -- absent Blood Vial insertion is refused outright after
 //!   the live `?ItemInfo?` (`0xF00003E8`) reproduction;
+//! * **category before contents** -- the lane is chosen by the item's CATEGORY
+//!   first and the inventory's contents second. Only a stackable category
+//!   (goods) may take the delta branch; equipment always inserts, because a
+//!   duplicate weapon is a second INSTANCE and a weapon record's "quantity"
+//!   position is not a count (clients#451);
 //! * **never write the guest heap from outside** -- an existing stack is bumped
 //!   by the cave's existing-stack delta branch (`request = 2`) on the game
 //!   thread, not by an external `WriteProcessMemory` into the inventory page.
@@ -272,6 +277,10 @@ pub struct GrantSession<R: Runtime> {
     /// The in-flight native call is the existing-stack delta branch
     /// (`request = 2`), not an insert. It changes how the verify is read.
     delta_lane: bool,
+    /// The in-flight call is an INSERT of a non-stackable instance record
+    /// (clients#451). Count read-backs are not a witness for it; see
+    /// [`GrantSession::poll_active`].
+    instance_insert: bool,
     /// Passive forensics for the current grant (clients#445). Written on every
     /// transition, read by nothing inside this module.
     trace: GrantTrace,
@@ -305,6 +314,7 @@ impl<R: Runtime> GrantSession<R> {
             active: false,
             manual: false,
             delta_lane: false,
+            instance_insert: false,
             trace: GrantTrace::default(),
         }
     }
@@ -367,6 +377,8 @@ impl<R: Runtime> GrantSession<R> {
         }
         self.absent_tag = command.tag.clone();
         self.verify_polls = 0;
+        self.delta_lane = false;
+        self.instance_insert = false;
         self.expected_before = command.expected_before;
         let detail = format!("tag={}", command.tag);
         self.trace = GrantTrace::begin(&command);
@@ -410,7 +422,13 @@ impl<R: Runtime> GrantSession<R> {
         // about to branch on, captured before any of the branches run.
         self.trace.native_result = Some(native_result);
         self.trace.execution_evidence = native_result != EMPTY_SLOT;
-        self.trace.record_readback(actual);
+        if !self.instance_insert {
+            self.trace.record_readback(actual);
+        }
+
+        if self.instance_insert {
+            return self.verify_instance_insert(&command, native_result, record);
+        }
         // The insert lane can accept the reported slot as the witness: a
         // freshly inserted stack holding at least `quantity` of the right id
         // IS the grant. The delta lane cannot -- an existing stack of 5 that
@@ -495,6 +513,82 @@ impl<R: Runtime> GrantSession<R> {
         )
     }
 
+    /// Verify an INSERT of a non-stackable instance record (clients#451).
+    ///
+    /// The clients#444/#443 evidence rule is about a delta whose arithmetic the
+    /// client can check. Here it cannot: `find_stack` returns the FIRST record
+    /// matching the id, and its quantity position is not an instance count, so
+    /// "the player now holds two Hunter Pistols" is not a number this client
+    /// can read. **Instance-count read-back is not available.** Rather than
+    /// park a delivered weapon on a count disagreement that means nothing, the
+    /// count checks are skipped here, stated as such, and the witness is:
+    ///
+    /// * the cave's state cell -- `native_done` is true and `native_result` is
+    ///   no longer the pre-arm `EMPTY_SLOT` sentinel, so the routine ran; and
+    /// * the slot record the routine reports back: reading `native_result` and
+    ///   finding OUR normalized id in it is a genuine read-back of the record
+    ///   this insert created, and it is per-slot, so an already-owned duplicate
+    ///   in a different slot cannot forge it.
+    ///
+    /// A reported slot that holds a DIFFERENT id is a contradiction and burns
+    /// the normal verify budget. A slot that reads back as empty/unreadable is
+    /// the hydration shape and gets the hydration budget; if it never resolves
+    /// but the routine provably ran, the grant completes on execution evidence
+    /// alone, with the reason recorded in the detail.
+    fn verify_instance_insert(
+        &mut self,
+        command: &GrantCommand,
+        native_result: u32,
+        record: SlotRecord,
+    ) -> String {
+        let executed = native_result != EMPTY_SLOT;
+        if executed && record.normalized_id == Some(command.normalized_id) {
+            return self.finish(
+                "completed",
+                format!(
+                    "tag={} instance insert verified at slot native_result={native_result} (count checks skipped: instance-count read-back is unavailable)",
+                    command.tag
+                ),
+            );
+        }
+        let unreadable = matches!(record.normalized_id, None | Some(EMPTY_SLOT));
+        self.verify_polls += 1;
+        self.trace.verify_polls = self.verify_polls;
+        let budget = if unreadable {
+            self.policy.hydration_verify_polls
+        } else {
+            self.policy.verify_polls
+        };
+        if self.verify_polls < budget {
+            return self.set(
+                "verify_pending",
+                format!(
+                    "tag={tag} instance insert awaiting slot read-back native_result={native_result} record={record:?} attempt={attempt}/{budget}",
+                    tag = command.tag,
+                    record = record.normalized_id,
+                    attempt = self.verify_polls,
+                ),
+            );
+        }
+        if executed && unreadable {
+            return self.finish(
+                "completed",
+                format!(
+                    "tag={} instance insert completed on execution evidence: slot {native_result} never read back (count checks skipped: instance-count read-back is unavailable)",
+                    command.tag
+                ),
+            );
+        }
+        self.finish(
+            "failed",
+            format!(
+                "tag={tag} instance insert unwitnessed: native_result={native_result} slot_record={record:?} retry_budget={budget}",
+                tag = command.tag,
+                record = record.normalized_id,
+            ),
+        )
+    }
+
     fn poll_pending(&mut self) -> String {
         let command = self.command.clone().expect("command present in pending");
         if !self.runtime.inventory_ready() {
@@ -524,31 +618,68 @@ impl<R: Runtime> GrantSession<R> {
             self.absent_polls = 0;
         }
 
-        self.expected_before = Some(match command.expected_before {
-            Some(before) => before,
-            None => self.recovered_baseline(&command, stack.quantity),
-        });
+        // clients#451: the lane is chosen by the item's CATEGORY first and the
+        // inventory's contents second. A stackable category (goods) with an
+        // existing stack takes the cave's delta branch; equipment NEVER does,
+        // however many matching records the scan finds. A weapon record's
+        // "quantity" position is not a count, so a delta there adds into a
+        // field that is not quantity -- the live Hunter Pistol duplicate that
+        // was delivered as `delta persistent ... storage_suspected`, with the
+        // owned weapon's record possibly corrupted. A duplicate weapon is a
+        // second INSTANCE; the only correct lane for it is insert.
+        let descriptor = ItemGrantDescriptor::new(command.raw_id, command.normalized_id);
+        let stackable = descriptor.is_stackable_category(&self.formula);
+        let delta = stack.exists && stackable;
+
+        if stackable {
+            // Goods, present or absent: the baseline is the live quantity (zero
+            // when absent), or the durable prior for a replayed grant.
+            self.expected_before = Some(match command.expected_before {
+                Some(before) => before,
+                None => self.recovered_baseline(&command, stack.quantity),
+            });
+        } else {
+            // Instance insert. `observed_before` as a stack COUNT has no
+            // meaning here: `find_stack` returns the first record matching the
+            // id, and owning one Hunter Pistol says nothing about whether the
+            // second one was delivered. The machine still needs a numeric
+            // baseline internally (the durable row carries
+            // `expected_before`/`expected_after`), so it uses 0 -- the number
+            // of instances THIS grant is responsible for before it runs -- and
+            // the trace deliberately leaves `observed_before`/`expected_after`
+            // unset so that nothing downstream (the clients#447 destination
+            // inference included) performs count arithmetic it cannot justify.
+            //
+            // Known, stated limitation: quantity-based replay recovery
+            // (`recovered_complete`) is not available for an instance insert,
+            // because a matching record is not evidence that THIS grant landed.
+            // A replayed equipment grant is guarded by the client's ledger
+            // acknowledgement, not by an inventory count.
+            self.expected_before = Some(0);
+        }
         let expected_before = self.expected_before.unwrap();
         let wanted = expected_before.saturating_add(command.quantity);
-        self.trace.observed_before = Some(expected_before);
-        self.trace.expected_after = Some(wanted);
+        if stackable {
+            self.trace.observed_before = Some(expected_before);
+            self.trace.expected_after = Some(wanted);
 
-        if stack.quantity == wanted {
-            self.trace.record_readback(Some(stack.quantity));
-            return self.finish(
-                "recovered_complete",
-                format!("tag={} quantity={}", command.tag, stack.quantity),
-            );
-        }
-        if stack.quantity != expected_before {
-            self.trace.record_readback(Some(stack.quantity));
-            return self.finish(
-                "quantity_mismatch",
-                format!(
-                    "tag={} expected_before={expected_before} actual={}",
-                    command.tag, stack.quantity
-                ),
-            );
+            if stack.quantity == wanted {
+                self.trace.record_readback(Some(stack.quantity));
+                return self.finish(
+                    "recovered_complete",
+                    format!("tag={} quantity={}", command.tag, stack.quantity),
+                );
+            }
+            if stack.quantity != expected_before {
+                self.trace.record_readback(Some(stack.quantity));
+                return self.finish(
+                    "quantity_mismatch",
+                    format!(
+                        "tag={} expected_before={expected_before} actual={}",
+                        command.tag, stack.quantity
+                    ),
+                );
+            }
         }
 
         // An existing stack takes the cave's existing-stack branch
@@ -556,7 +687,7 @@ impl<R: Runtime> GrantSession<R> {
         // arguments; without the record pointer the cave cannot address the
         // stack, and there is no fallback -- the external write that used to
         // be one is what clients#433 removed.
-        if stack.exists && stack.quantity_address.is_none() {
+        if delta && stack.quantity_address.is_none() {
             return self.finish(
                 "write_error",
                 format!("tag={} quantity pointer missing", command.tag),
@@ -579,23 +710,32 @@ impl<R: Runtime> GrantSession<R> {
             return self.set("busy", "Native request already pending".into());
         }
 
-        let descriptor = ItemGrantDescriptor::new(command.raw_id, command.normalized_id);
+        // The slot and quantity-address arguments address an EXISTING record
+        // for the delta branch. An insert must not carry them: passing the
+        // matched weapon record here is precisely what would point the cave at
+        // the owned instance.
+        let (slot, quantity_address) = if delta {
+            (stack.slot, stack.quantity_address)
+        } else {
+            (None, None)
+        };
         self.runtime.queue_native(
             &descriptor,
             command.quantity,
-            stack.slot,
-            stack.quantity_address,
+            slot,
+            quantity_address,
             self.manual,
         );
         self.active = true;
         self.verify_polls = 0;
-        self.delta_lane = stack.exists;
+        self.delta_lane = delta;
+        self.instance_insert = !stackable;
         let source = if descriptor.uses_persistent_source(&self.formula) {
             "persistent"
         } else {
             "in_frame"
         };
-        let lane = if stack.exists { "delta" } else { "insert" };
+        let lane = if delta { "delta" } else { "insert" };
         self.trace.lane = Some(lane);
         self.trace.source = Some(source);
         self.trace.verify_polls = 0;
@@ -668,6 +808,9 @@ mod tests {
         // `EMPTY_SLOT` sentinel -- completion signalled with NO execution
         // evidence. Only meaningful together with `complete_without_applying`.
         report_no_result: bool,
+        // clients#451: report `done` with a result slot whose record is not
+        // readable at all (all-`None`), the hydration shape for an insert.
+        blank_insert_record: bool,
     }
 
     impl FakeRuntime {
@@ -746,7 +889,7 @@ mod tests {
                     } else {
                         slot.unwrap_or(7)
                     };
-                    if slot.is_none() {
+                    if slot.is_none() && !self.blank_insert_record {
                         self.slots.insert(
                             7,
                             SlotRecord {
@@ -1509,6 +1652,189 @@ mod tests {
             .submit(goods_command(0x4CE, 1, "recv_b", Some(0)), false)
             .unwrap_err();
         assert!(err.to_string().contains("already in flight"));
+    }
+
+    /// Saw Spear id, the validated category-0 pair: raw carries the persistent
+    /// source marker, normalized has a zero high nibble.
+    fn weapon_command(id: u32, tag: &str) -> GrantCommand {
+        GrantCommand {
+            raw_id: contract().descriptor.persistent_source_marker | id,
+            normalized_id: id,
+            quantity: 1,
+            tag: tag.into(),
+            expected_before: None,
+        }
+    }
+
+    /// clients#451, THE motivating case: `ap_7` Hunter Pistol was delivered on
+    /// the DELTA lane because the player already owned one and `find_stack`
+    /// matched the weapon's record, so the cave added the "quantity" into a
+    /// field that is not a quantity for an instance record. Equipment must take
+    /// the insert lane regardless of a matching record, and must NOT hand the
+    /// cave the owned record's slot or pointer. Fails before the guard: the
+    /// lane reads `delta` and the queued call carries `Some(3)/Some(0x1000)`.
+    #[test]
+    fn an_owned_weapon_still_takes_the_insert_lane() {
+        let normalized = 0x006C_5660; // Saw Spear
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 1,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(weapon_command(normalized, "recv_dup"), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing", "state: {:?}", session.state());
+        assert!(
+            session.state().detail.contains("lane=insert"),
+            "detail: {}",
+            session.state().detail
+        );
+        assert_eq!(session.trace().lane, Some("insert"));
+        assert_eq!(session.trace().source, Some("persistent"));
+        let queued = session
+            .runtime_mut()
+            .queued
+            .expect("a native call was queued");
+        assert_eq!(queued.2, None, "the owned record's slot must not be passed");
+        assert_eq!(
+            queued.3,
+            None,
+            "the owned record's pointer must not be passed"
+        );
+        // The insert completes on the slot the routine reports back.
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+        assert!(session.runtime_mut().writes.is_empty());
+    }
+
+    /// The clients#444 evidence rule must not park an equipment insert on a
+    /// count disagreement it cannot meaningfully evaluate. The owned Hunter
+    /// Pistol means `find_stack` reports a total that has nothing to do with
+    /// how many instances this grant delivered, so the trace carries no count
+    /// baseline at all and the verify is the reported slot record.
+    #[test]
+    fn an_equipment_insert_does_not_park_on_a_meaningless_count() {
+        let normalized = 0x006C_5660;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 1,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(weapon_command(normalized, "recv_pistol"), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+        assert!(
+            session.state().detail.contains("count checks skipped"),
+            "detail: {}",
+            session.state().detail
+        );
+        // No count arithmetic is published for an instance insert, so nothing
+        // downstream can infer a destination from it.
+        assert_eq!(session.trace().observed_before, None);
+        assert_eq!(session.trace().expected_after, None);
+        assert_eq!(session.trace().readback_surplus(), None);
+        assert!(session.trace().execution_evidence);
+    }
+
+    /// An equipment insert whose reported slot reads back a DIFFERENT id is a
+    /// contradiction, not a missing count, and still fails.
+    #[test]
+    fn an_equipment_insert_with_a_contradicting_slot_fails() {
+        let normalized = 0x006C_5660;
+        let runtime = FakeRuntime {
+            ready: true,
+            complete_without_applying: true,
+            ..Default::default()
+        };
+        let mut session = session(runtime);
+        session
+            .submit(weapon_command(normalized, "recv_bad"), false)
+            .unwrap();
+        let mut last = session.poll();
+        while last == "awaiting_inventory" {
+            last = session.poll();
+        }
+        assert_eq!(last, "executing");
+        while last == "executing" || last == "verify_pending" {
+            last = session.poll();
+        }
+        assert_eq!(last, "failed", "state: {:?}", session.state());
+        assert!(session.state().detail.contains("instance insert unwitnessed"));
+    }
+
+    /// ...but a slot that simply never reads back, with the routine provably
+    /// run, completes on execution evidence rather than parking a delivered
+    /// weapon on a count check that does not exist for instance records.
+    #[test]
+    fn an_unreadable_slot_completes_on_execution_evidence() {
+        let normalized = 0x006C_5660;
+        let runtime = FakeRuntime {
+            ready: true,
+            complete_without_applying: true,
+            blank_insert_record: true,
+            ..Default::default()
+        };
+        let mut session = session(runtime);
+        session
+            .submit(weapon_command(normalized, "recv_blind"), false)
+            .unwrap();
+        let mut last = session.poll();
+        while last == "awaiting_inventory" {
+            last = session.poll();
+        }
+        assert_eq!(last, "executing");
+        while last == "executing" || last == "verify_pending" {
+            last = session.poll();
+        }
+        assert_eq!(last, "completed", "state: {:?}", session.state());
+        assert!(
+            session
+                .state()
+                .detail
+                .contains("completed on execution evidence"),
+            "detail: {}",
+            session.state().detail
+        );
+    }
+
+    /// Control: goods with an existing stack are untouched by the category
+    /// guard and still take the delta lane.
+    #[test]
+    fn goods_with_an_existing_stack_still_delta() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 5,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 2, "recv_goods", Some(5)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        assert_eq!(session.trace().lane, Some("delta"));
+        let queued = session.runtime_mut().queued.expect("queued");
+        assert_eq!(queued.2, Some(3));
+        assert_eq!(queued.3, Some(0x1000));
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+        assert_eq!(session.trace().observed_before, Some(5));
+        assert_eq!(session.trace().expected_after, Some(7));
     }
 
     #[test]
