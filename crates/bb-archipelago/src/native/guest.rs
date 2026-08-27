@@ -4,9 +4,9 @@
 //! A port of `tools/bb_native_delivery/guest.py`. The geometry is transcribed
 //! from the Cheat Engine harness's `findItem`: the cached inventory pointer
 //! leads to a split pair of fixed-stride record arrays. Every offset comes from
-//! the contract, not this file. It is `observed`, not `validated`: exercised
-//! live by the CE harness, but this transcription of it has never run against
-//! the game.
+//! the contract, not this file. The walk is live-validated: on 2026-08-27 it
+//! identified Ludwig's Holy Blade +1 as normalized id 8,100,100 and selected
+//! target level 1; the native grant then delivered Saw Cleaver +1 as 7,000,100.
 //!
 //! Guest I/O can fail (a torn read during a load, the process exiting). Because
 //! the delivery state machine's [`Runtime`] is infallible by design, a failed
@@ -23,6 +23,16 @@ use super::descriptor::ItemGrantDescriptor;
 use super::mem::ProcessMemory;
 
 const MAX_SLOTS: u64 = 4096;
+
+/// Base-game player weapon families in CUSA03173 01.09. These are the same
+/// EquipParamWeapon bases the world uses for requirement removal. Exact
+/// membership prevents armour/runes that happen to resemble a +N row from
+/// influencing the target.
+const WEAPON_FAMILIES: &[u32] = &[
+    2_000_000, 4_000_000, 5_000_000, 5_100_000, 6_000_000, 6_100_000, 7_000_000, 7_100_000,
+    8_000_000, 8_100_000, 9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000,
+    14_000_000, 14_200_000, 15_000_000, 22_000_000,
+];
 
 /// Which of the two banks holds `slot`. Pure, so it is testable without memory.
 pub fn entry_address(slot: u64, split: u64, primary: u64, secondary: u64, stride: u64) -> u64 {
@@ -89,6 +99,28 @@ impl<P: ProcessMemory> GuestRuntime<P> {
         &self.memory
     }
 
+    /// Highest reinforcement level among recognized player weapon records.
+    /// Read-only and bounded by the already-validated inventory geometry.
+    pub fn target_weapon_level(&self) -> Option<u8> {
+        let (_inventory, split, last, primary, secondary) = self.geometry()?;
+        let g = self.contract.geometry;
+        let mut highest = 0u8;
+        for slot in 0..=last {
+            let entry = entry_address(slot, split, primary, secondary, g.record_stride);
+            let id = self.record(self.memory.read_u32(entry + g.record_id))?;
+            for &family in WEAPON_FAMILIES {
+                let Some(delta) = id.checked_sub(family) else {
+                    continue;
+                };
+                if delta <= 1_000 && delta % 100 == 0 {
+                    highest = highest.max((delta / 100) as u8);
+                    break;
+                }
+            }
+        }
+        Some(highest)
+    }
+
     /// Take the first captured I/O error, if any, clearing it.
     pub fn take_error(&self) -> Option<String> {
         self.error.borrow_mut().take()
@@ -136,6 +168,10 @@ pub const REQUEST_NATIVE_INSERT: u32 = 1;
 pub const REQUEST_EXISTING_STACK_DELTA: u32 = 2;
 
 impl<P: ProcessMemory> Runtime for GuestRuntime<P> {
+    fn target_weapon_level(&mut self) -> Option<u8> {
+        GuestRuntime::target_weapon_level(self)
+    }
+
     fn inventory_ready(&mut self) -> bool {
         self.record(self.memory.read_u64(self.cells.inventory))
             .is_some_and(|inventory| inventory != 0)
@@ -313,6 +349,24 @@ mod tests {
             entry_address(1, 2, 0x9100_0000, 0x9200_0000, g.record_stride) + g.record_quantity;
         assert_eq!(stack.quantity_address, Some(expected));
         assert!(guest.take_error().is_none());
+    }
+
+    #[test]
+    fn target_level_reads_only_recognized_weapon_families() {
+        let (memory, base, _normalized) = laid_out_inventory();
+        let c = contract();
+        let g = c.geometry;
+        let inventory = memory
+            .read_u64(base + c.state_cell("inventory").unwrap().rva)
+            .unwrap();
+        let primary = memory.read_u64(inventory + g.primary_array).unwrap();
+        let secondary = memory.read_u64(inventory + g.secondary_array).unwrap();
+        let ludwig = entry_address(0, 2, primary, secondary, g.record_stride);
+        memory.store(ludwig + g.record_id, &8_100_100u32.to_le_bytes());
+        let lookalike = entry_address(2, 2, primary, secondary, g.record_stride);
+        memory.store(lookalike + g.record_id, &1_000_900u32.to_le_bytes());
+        let guest = GuestRuntime::new(memory, base).unwrap();
+        assert_eq!(guest.target_weapon_level(), Some(1));
     }
 
     #[test]

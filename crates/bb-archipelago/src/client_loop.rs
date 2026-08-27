@@ -11,7 +11,7 @@ use crate::client_eprintln;
 use crate::config::RuntimeConfig;
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
 use crate::ledger::{AcknowledgedItem, PendingItem, ReceiveLedger, WatermarkOutcome};
-use crate::upgrades::auto_upgrade_level;
+use crate::upgrades::{auto_upgrade_level, reinforced_descriptor_pair};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IncomingItem {
@@ -315,11 +315,22 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         let delivered_level = binding
             .reinforcement_level
             .map(|received| auto_upgrade_level(self.config.auto_upgrade, received, target_level));
+        let (raw_descriptor, normalized_item_id) =
+            match (binding.reinforcement_level, delivered_level) {
+                (Some(received), Some(delivered)) => reinforced_descriptor_pair(
+                    binding.raw_descriptor,
+                    binding.normalized_item_id,
+                    received,
+                    delivered,
+                )
+                .context("weapon reinforcement descriptor overflow or downgrade")?,
+                _ => (binding.raw_descriptor, binding.normalized_item_id),
+            };
         Ok(PendingItem {
             index: item.index,
             ap_item_id: item.ap_item_id,
-            raw_descriptor: binding.raw_descriptor,
-            normalized_item_id: binding.normalized_item_id,
+            raw_descriptor,
+            normalized_item_id,
             item_category: binding.item_category,
             quantity: binding.quantity,
             upgrade_target_level: target_level,
@@ -2266,9 +2277,10 @@ mod tests {
 
         // Restore to before index 1: the save keeps the first weapon (granted
         // and auto-upgraded to +6) and forgets the second entirely.
-        client
-            .backend_mut()
-            .restore_save(Some(0), HashMap::from([((0x0012_3400, Some(6)), 1)]));
+        client.backend_mut().restore_save(
+            Some(0),
+            HashMap::from([((0x0012_3400 + 6 * 100, Some(6)), 1)]),
+        );
         assert_eq!(
             client.poll_items(&received).unwrap(),
             ItemPollResult::Reconciled(WatermarkOutcome::Reissue)

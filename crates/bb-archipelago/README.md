@@ -39,9 +39,12 @@ appeared in the feed, attire uses its fixed body slot, and Oath Runes use their
 dedicated slot. Upgrade targeting is raise-only and clamped to +10. A durable
 pending plan records the selected level, target slot, and completed stages
 before the receive watermark advances, so a restart between grant and equip
-does not re-grant. The live bridge accepts allowlisted category-0 equipment such
-as the clean-save Saw Spear canary. Live auto-equip and reinforcement mutation
-remain disarmed until their separate v0.18 memory contracts are validated.
+does not re-grant. The native backend's read-only inventory census now selects
+the highest held weapon level and grants a received weapon directly from that
+reinforcement row; the first live canary raised a Saw Cleaver from +0 to +1
+against a held Ludwig's Holy Blade +1. It never mutates an existing inventory
+record or spends materials. Live auto-equip remains disarmed until its separate
+v0.18 memory contract is validated.
 
 ## Standalone client
 
