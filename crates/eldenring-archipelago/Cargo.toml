@@ -43,7 +43,14 @@ archipelago_rs.workspace = true        # ensure the workspace is on 3.0.1 (try-a
 # bumps that executable. A release has to be able to say which revision answered for it.
 # The rev below is the SHA `branch = "main"` had ALREADY resolved to, so this pin changes no code;
 # it only stops the next change from being silent. Bump it deliberately, in its own PR.
-fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs", rev = "8c67a84f394bd58efdb06a5be47f988e0c1a9995" }
+# 🛑🛑 TEST-BUILD FORK PIN (#241, Tarnished Edition). Both git deps below point at
+# 4laric/fromsoftware-rs @ 63a0c372 -- a fork of upstream's 8c67a84f (the rev this file pinned
+# before) whose ONLY delta is an added `(LANG_ID_EN, "2.7.0.0") => Ww270` arm backed by a
+# CANDIDATE RVA table: derived offline, never executed in a live game. 2.6.2.0/2.6.2.1 are
+# untouched by the fork, so this build still supports the old executables exactly as before.
+# THIS PIN IS TEMPORARY. The moment upstream ships its own generated 2.7.0.0 arm, move both
+# entries back to vswarte/fromsoftware-rs at that rev and delete this note.
+fromsoftware-shared = { git = "https://github.com/4laric/fromsoftware-rs", rev = "63a0c3727daf9ed7382d0316e66ae71a1ca27a51" }
 hudhook.workspace = true
 # Item-tracker overlay window (shared::Core render_overlay_* hooks take &imgui::Ui). Same spec as
 # crates/shared so the workspace [patch.crates-io] git pin resolves both to ONE imgui instance.
@@ -65,7 +72,7 @@ oneshot = { version = "0.2.1", features = ["std"] }   # scout_proof: archipelago
 # current game (893cdd37 only had 2.6.1.x). Must track the SAME ref as fromsoftware-shared above so
 # they're ONE source instance (one fss copy → SharedTaskImp/SharedTaskImpExt resolve). Isolated from
 # the workspace's 0.13 by being a different git ref than the framework's default-branch source.
-eldenring = { git = "https://github.com/vswarte/fromsoftware-rs", rev = "8c67a84f394bd58efdb06a5be47f988e0c1a9995" }
+eldenring = { git = "https://github.com/4laric/fromsoftware-rs", rev = "63a0c3727daf9ed7382d0316e66ae71a1ca27a51" }
 # ER pure-logic crates (host-tested).
 er-codec = { path = "../er-codec" }
 er-logic = { path = "../er-logic" }

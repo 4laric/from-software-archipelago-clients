@@ -27,6 +27,13 @@
 
 /// The Worldwide executable version this build's RVA table was compiled against.
 pub const REQUIRED_WW: &str = "2.6.2.0";
+/// The Worldwide **Tarnished Edition** executable this build ALSO carries a table for.
+///
+/// 🛑 That table is a CANDIDATE: derived offline from the 2.7.0.0 executable and never executed
+/// in a live game (see the fork note in `crates/eldenring-archipelago/Cargo.toml`). The two
+/// Worldwide arms coexist -- the `eldenring` crate dispatches per version, so accepting this one
+/// takes nothing away from 2.6.2.0.
+pub const REQUIRED_WW_TARNISHED: &str = "2.7.0.0";
 /// The Japanese executable version this build's RVA table was compiled against.
 pub const REQUIRED_JP: &str = "2.6.2.1";
 /// `LANG_ID` of the Worldwide executable, masked to the primary language.
@@ -63,7 +70,11 @@ pub fn explain(rejection: &Rejection) -> String {
             "Elden Ring Archipelago cannot start: unsupported game version.\n\
              \n\
              Your Elden Ring:  {detected}\n\
-             This build needs: {REQUIRED_WW} (Worldwide) or {REQUIRED_JP} (Japanese)\n\
+             This build needs: {REQUIRED_WW} or {REQUIRED_WW_TARNISHED} (Worldwide)\n\
+             \x20                 {REQUIRED_JP} (Japanese)\n\
+             \n\
+             The Japanese Tarnished Edition executable (2.7.0.x JP) is NOT yet supported --\n\
+             only the Worldwide one. If that is what you have, this is a gap on our side.\n\
              \n\
              There are two ways to land here.\n\
              \n\
@@ -106,7 +117,8 @@ pub fn explain(rejection: &Rejection) -> String {
             "Elden Ring Archipelago cannot start: the executable carries no {missing} information,\n\
              so we cannot tell which build of Elden Ring this is.\n\
              \n\
-             This build needs {REQUIRED_WW} (Worldwide) or {REQUIRED_JP} (Japanese). An executable\n\
+             This build needs {REQUIRED_WW} or {REQUIRED_WW_TARNISHED} (Worldwide), or\n\
+             {REQUIRED_JP} (Japanese). An executable\n\
              with its version resource stripped is usually a repack or a cracked copy; the mod\n\
              cannot support those, because every memory address it uses is keyed to a known build.\n\
              \n\
@@ -168,6 +180,59 @@ mod tests {
             msg.contains("2.6.2.1"),
             "must name the required JP version: {msg}"
         );
+    }
+
+    /// #241. The 2.7.0.0 (Tarnished Edition, Worldwide) arm ships alongside 2.6.2.0 rather than
+    /// replacing it -- the `eldenring` crate dispatches per version and keeps both tables. A
+    /// rejection message that named only one of them would send half the players to the wrong
+    /// remedy, and on 2026-08-28 it is the 2.7.0.0 half that is everybody.
+    #[test]
+    fn a_version_rejection_names_both_worldwide_builds() {
+        let msg = explain(&Rejection::Version {
+            detected: "2.2.0.0".into(),
+        });
+        for required in [REQUIRED_WW, REQUIRED_WW_TARNISHED, REQUIRED_JP] {
+            assert!(msg.contains(required), "dropped {required}: {msg}");
+        }
+    }
+
+    /// The JP Tarnished executable (2.7.0.x JP) has no table -- its binary was never available to
+    /// derive one from. A JP player on Tarnished must not read "needs 2.7.0.0" and conclude their
+    /// game is fine; the message has to name the gap explicitly.
+    #[test]
+    fn the_jp_tarnished_gap_is_stated_not_implied() {
+        let msg = explain(&Rejection::Version {
+            detected: "2.7.0.1".into(),
+        });
+        assert!(
+            msg.contains("Japanese Tarnished Edition"),
+            "must name the unsupported JP Tarnished exe: {msg}"
+        );
+        assert!(
+            msg.contains("NOT yet supported"),
+            "must say plainly that it is unsupported: {msg}"
+        );
+    }
+
+    /// The metadata arm quotes the required set too, and it drifted out of step with the version
+    /// arm once before. Assert them together so the next arm added cannot update only one.
+    #[test]
+    fn the_metadata_message_names_the_same_required_set() {
+        let msg = explain(&Rejection::Metadata { missing: "version" });
+        for required in [REQUIRED_WW, REQUIRED_WW_TARNISHED, REQUIRED_JP] {
+            assert!(msg.contains(required), "dropped {required}: {msg}");
+        }
+    }
+
+    /// A covered version must render as covered. `measured_clause`'s `Ok` arm is what the
+    /// sig-mismatch warns self-date against, so a 2.7.0.0 hit has to say RVA-covered -- the
+    /// opposite of what the old test above assumed.
+    #[test]
+    fn tarnished_measures_as_covered_not_as_a_miss() {
+        let hit = measured_clause(&Ok((REQUIRED_WW_TARNISHED, LANG_ID_EN)));
+        assert!(hit.contains("2.7.0.0"), "{hit}");
+        assert!(hit.contains("RVA-covered"), "{hit}");
+        assert!(!hit.contains("NOT covered"), "{hit}");
     }
 
     /// The whole point is that the player stops seeing a Rust panic. If any of these words come
@@ -287,11 +352,14 @@ mod tests {
             "hit must name the version: {hit}"
         );
         assert!(hit.contains("RVA-covered"), "{hit}");
+        // NB: this used to use 2.7.0.0 as the stand-in for "uncovered". It is COVERED now
+        // (Tarnished Edition, candidate table), so the miss example has to be a version we
+        // really do not have a table for -- otherwise the test asserts a false premise.
         let miss = measured_clause(&Err(Rejection::Version {
-            detected: "2.7.0.0".into(),
+            detected: "2.8.0.0".into(),
         }));
         assert!(
-            miss.contains("2.7.0.0"),
+            miss.contains("2.8.0.0"),
             "miss must name the version: {miss}"
         );
         assert!(miss.contains("NOT covered"), "{miss}");

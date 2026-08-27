@@ -22,7 +22,7 @@
 //! The handle is NOT derived from an item id by any function -- it is read straight off the
 //! inventory entry (`EquipInventoryDataListEntry.gaitem_handle`), which is the same list this
 //! module already walks. Handles are refcounted, so (1) goes through the game's own copy-assign,
-//! `ChrAsm::operator=` at [`CHR_ASM_COMMIT_RVA`], which acquires the new handle and releases the
+//! `ChrAsm::operator=` at [`chr_asm_commit_rva`], which acquires the new handle and releases the
 //! old one across all 22 slots. Writing the handle field directly would leak a reference.
 //!
 //! (3) is a plain `ItemId` array with no refcounting, so it is written directly.
@@ -94,13 +94,16 @@ use eldenring::cs::{
 use er_logic::auto_equip::Equipable;
 use fromsoftware_shared::FromStatic;
 
-/// `ChrAsm::operator=` on 2.6.2.0 WW -- the refcounted commit. `(rcx = dest_chr_asm,
+/// `ChrAsm::operator=` -- the refcounted commit. Per-version; see [`crate::rva_table`]. (The
+/// 2.7.0.0 port found this address UNCHANGED from 2.6.2.0.) The description below is 2.6.2.0 WW. `(rcx = dest_chr_asm,
 /// rdx = src_chr_asm)`. Copies both weapon ids, the xmm block, then loops 22 times calling the
 /// handle-assign helper at `+0x682580` (acquire `+0x671A80` / release `+0x671B00`) for
 /// `gaitem_handles`, then copies `equipment_param_ids[22]`.
-const CHR_ASM_COMMIT_RVA: usize = 0x245C00;
+fn chr_asm_commit_rva() -> usize {
+    crate::rva_table::current().chr_asm_commit
+}
 
-/// First 16 bytes at [`CHR_ASM_COMMIT_RVA`], read from the pinned exe. A mismatch means the RVA is
+/// First 16 bytes at [`chr_asm_commit_rva`], read from the pinned exe. A mismatch means the RVA is
 /// stale for the running build -> refuse to call rather than jump into the middle of something else.
 const CHR_ASM_COMMIT_SIG: &[u8] = &[
     0x48, 0x89, 0x5C, 0x24, 0x08, // mov [rsp+8], rbx
@@ -797,7 +800,7 @@ fn current_module_base() -> Option<usize> {
 /// Resolve the commit entry, verifying the prologue. `None` (logged once) if the pin is stale.
 fn commit_fn(base: usize) -> Option<ChrAsmCommit> {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    let addr = base + CHR_ASM_COMMIT_RVA;
+    let addr = base + chr_asm_commit_rva();
     // SAFETY: reading bytes inside the mapped image at a pinned RVA.
     let actual = unsafe { std::slice::from_raw_parts(addr as *const u8, CHR_ASM_COMMIT_SIG.len()) };
     if actual != CHR_ASM_COMMIT_SIG {
