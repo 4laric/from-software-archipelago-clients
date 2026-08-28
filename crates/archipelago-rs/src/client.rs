@@ -1,5 +1,5 @@
 use serde::de::DeserializeOwned;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::{mem, ptr, sync::Arc, time::SystemTime};
 use ustr::{Ustr, UstrMap, UstrSet};
 
@@ -61,8 +61,14 @@ pub struct Client<S: DeserializeOwned + 'static = serde_json::Value> {
     player_key: (u32, u32),
 
     /// A map from location IDs for this game to booleans indicating whether or
-    /// not they've been checked.
+    /// not they've been checked. This includes checks optimistically marked by
+    /// this client before the server echoes them back.
     local_locations_checked: HashMap<i64, bool>,
+
+    /// Locations the server itself has reported checked, either in Connected
+    /// or RoomUpdate. Kept separate from the optimistic cache above so callers
+    /// can retry checks until the server confirms receipt.
+    server_locations_checked: HashSet<i64>,
 
     /// A list of all the items this client has ever received. This is
     /// overwritten if the server sends a new [ServerMessage::ReceivedItems]
@@ -272,6 +278,8 @@ impl<S: DeserializeOwned + 'static> Client<S> {
         let game_ptr = ptr::from_ref(game);
 
         let mut local_locations_checked = HashMap::with_capacity(total_locations);
+        let mut server_locations_checked =
+            HashSet::with_capacity(connected.checked_locations.len());
         for id in connected.missing_locations {
             game.verify_location(id)?;
             local_locations_checked.insert(id, false);
@@ -279,6 +287,7 @@ impl<S: DeserializeOwned + 'static> Client<S> {
         for id in connected.checked_locations {
             game.verify_location(id)?;
             local_locations_checked.insert(id, true);
+            server_locations_checked.insert(id);
         }
 
         Ok(Client {
@@ -299,6 +308,7 @@ impl<S: DeserializeOwned + 'static> Client<S> {
             players,
             player_key,
             local_locations_checked,
+            server_locations_checked,
             received_items: Default::default(),
             location_scout_senders: Default::default(),
             get_senders: Default::default(),
@@ -507,13 +517,31 @@ impl<S: DeserializeOwned + 'static> Client<S> {
         })
     }
 
-    /// Returns all the locations that the player has already checked.
+    /// Returns all locations this client currently considers checked.
+    ///
+    /// This view is optimistic: [`Client::mark_checked`] updates it as soon as
+    /// the message is accepted by the local socket, before the server confirms
+    /// receipt. Use [`Client::server_checked_locations`] when retry behavior
+    /// must be based only on server acknowledgement.
     pub fn checked_locations(&self) -> impl UnsizedIter<Location> {
         let game = self.this_game();
         self.local_locations_checked
             .iter()
             .filter(|(_, checked)| **checked)
             .map(|(id, _)| game.assert_location(*id))
+    }
+
+    /// Returns locations whose checked state has been reported by the server.
+    ///
+    /// Unlike [`Client::checked_locations`], this does not include an
+    /// optimistic local [`Client::mark_checked`] until a subsequent
+    /// `RoomUpdate` acknowledges it. This is the appropriate view for clients
+    /// that resend idempotent location checks across a silently dead socket.
+    pub fn server_checked_locations(&self) -> impl UnsizedIter<Location> {
+        let game = self.this_game();
+        self.server_locations_checked
+            .iter()
+            .map(|id| game.assert_location(*id))
     }
 
     /// Returns all the locations that the player has not yet checked.
@@ -1137,6 +1165,8 @@ impl<S: DeserializeOwned + 'static> Client<S> {
         }
 
         if let Some(locations) = checked_locations {
+            self.server_locations_checked
+                .extend(locations.iter().map(|location| location.id()));
             updated.push(UpdatedField::CheckedLocations(
                 locations
                     .into_iter()
