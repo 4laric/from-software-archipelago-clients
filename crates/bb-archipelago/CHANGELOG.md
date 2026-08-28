@@ -7,8 +7,10 @@
   after which archipelago-rs's optimistic checked-location cache made the
   Bloodborne loop believe the server knew about the check. The loop now reads
   a distinct server-confirmed view and harmlessly resends `LocationChecks`
-  until a `RoomUpdate` acknowledges them. Relaunching is no longer required to
-  recover checks sent into a zombie connection.
+  until a `RoomUpdate` acknowledges them. Retries use a per-location
+  1/2/4/8/16/30-second capped backoff, reset on reconnect, so a zombie socket
+  cannot produce a 20-message-per-second retry loop. Relaunching is no longer
+  required to recover checks sent into a zombie connection.
 
 * **Equipment never takes the delta lane (clients#451).** The first
   `delivery-diagnostics.jsonl` from the field showed `ap_7` Hunter Pistol
