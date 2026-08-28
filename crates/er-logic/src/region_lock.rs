@@ -6,6 +6,32 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// What the client owes the vanilla Leyndell two-rune flag while an AP count gate is armed.
+///
+/// Flag 182 is also derived by vanilla from local shardbearer progress. That derivation is not
+/// evidence that the shuffled Great Rune items arrived through AP, so an armed gate must hold the
+/// flag false until the AP receive stream reaches its configured threshold. A zero threshold is
+/// deliberately unmanaged: gate-off and vanilla-placement seeds retain vanilla behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeyndellGateFlagAction {
+    Unmanaged,
+    HoldClosed,
+    Open,
+}
+
+pub fn leyndell_gate_flag_action(
+    runes_required: usize,
+    ap_received_runes: usize,
+) -> LeyndellGateFlagAction {
+    if runes_required == 0 {
+        LeyndellGateFlagAction::Unmanaged
+    } else if ap_received_runes < runes_required {
+        LeyndellGateFlagAction::HoldClosed
+    } else {
+        LeyndellGateFlagAction::Open
+    }
+}
+
 /// Decide whether the player should be KICKED this tick: the current region is in a locked range
 /// AND the random-start guard allows it (non-random seed, or the random-start warp already done).
 ///
@@ -928,6 +954,23 @@ mod tests {
         let clauses = rune_count_clause(2);
         let recv = names(&["Godrick's Great Rune", "Rusty Key", "Uchigatana"]);
         assert!(!natural_key_fired(&clauses, &recv, &|_| false));
+    }
+
+    #[test]
+    fn leyndell_gate_ignores_local_boss_progress_until_ap_runes_arrive() {
+        use super::LeyndellGateFlagAction::{HoldClosed, Open, Unmanaged};
+
+        // Replay the field report: local shardbearer defeats made vanilla flag 182 true, but the
+        // AP receive stream still contains zero Great Runes. The decision remains HoldClosed;
+        // vanilla's observed flag is intentionally not an input.
+        assert_eq!(leyndell_gate_flag_action(2, 0), HoldClosed);
+        assert_eq!(leyndell_gate_flag_action(2, 1), HoldClosed);
+        assert_eq!(leyndell_gate_flag_action(2, 2), Open);
+        assert_eq!(leyndell_gate_flag_action(2, 7), Open);
+
+        // Gate-off / vanilla-placement slot data advertises no AP count gate.
+        assert_eq!(leyndell_gate_flag_action(0, 0), Unmanaged);
+        assert_eq!(leyndell_gate_flag_action(0, 7), Unmanaged);
     }
 
     #[test]

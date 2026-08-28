@@ -3797,7 +3797,12 @@ impl shared::Core for Core {
             // the same idempotent flags, while this path independently reads back and retries writes
             // that did not stick. Covers normal receive, server /send and reconnect replay because
             // `received_all` is the cumulative stream.
-            crate::keyitems::tick_leyndell_gate_flags(&received_all);
+            let leyndell_runes_required = self
+                .region
+                .as_ref()
+                .map(|cfg| cfg.leyndell_runes_required)
+                .unwrap_or(0);
+            crate::keyitems::tick_leyndell_gate_flags(&received_all, leyndell_runes_required);
         }
         let mut region_completion_ready = true;
         let incomplete_regions = if crate::region::goal_gate_uses_region_completion() {
@@ -4848,7 +4853,13 @@ impl Core {
             // and server `/send`; the reconciler self-heals the write, and the keyitems backstop
             // stays as the independent readback/retry boundary -- with both now pulling the same
             // direction.
-            prereq_set_flags: crate::keyitems::leyndell_gate_flags(&received_names),
+            prereq_set_flags: crate::keyitems::leyndell_gate_flags(
+                &received_names,
+                self.region
+                    .as_ref()
+                    .map(|cfg| cfg.leyndell_runes_required)
+                    .unwrap_or(0),
+            ),
             start_graces: sc.map(|s| s.start_graces.clone()).unwrap_or_default(),
             always_map_flags: sc
                 .map(crate::startgrants::always_map_flags_for)
