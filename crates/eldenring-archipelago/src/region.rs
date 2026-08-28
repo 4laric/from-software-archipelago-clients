@@ -410,6 +410,9 @@ pub struct RegionConfig {
     /// apparatus blooms WITHOUT an AP lock item being received (vanilla keys / world flags). The
     /// region's open flag doubles as the once-latch. (Ported from the standalone naturalKeyTriggers.)
     pub natural_key_triggers: HashMap<String, Vec<NkClause>>,
+    /// AP Great Rune receipts required by the synthetic Leyndell wall. Zero means the wall is
+    /// disarmed (including vanilla placement) and the client must not manage vanilla flag 182.
+    pub leyndell_runes_required: usize,
     /// lock item name -> packed FullIDs to physically grant in-game on that lock's FIRST open
     /// (slot_data `lockGrantItems`). Currently the unpooled medallions riding their locks
     /// (Rold -> Mountaintops Lock; both Secret Medallion halves -> Snowfield Lock), so the Grand
@@ -447,6 +450,21 @@ pub fn parse(sd: &Value) -> RegionConfig {
     // region key (a region-lock-ignorant foreign apworld), core.rs may prepare the baked-table
     // fallback -- see `prepare_baked_fallback` / `tick_baked_fallback` below.
     let area_lock_flags = parse_triples(sd.get("areaLockFlags"));
+    let natural_key_triggers = parse_natural_keys(sd.get("naturalKeyTriggers"));
+    let leyndell_runes_required = natural_key_triggers
+        .get("Leyndell Lock")
+        .into_iter()
+        .flatten()
+        .filter(|clause| {
+            clause.count > 0
+                && clause
+                    .count_items
+                    .iter()
+                    .any(|name| name.contains("Great Rune"))
+        })
+        .map(|clause| clause.count)
+        .max()
+        .unwrap_or(0);
     RegionConfig {
         area_lock_flags,
         random_start_done_flag: sd
@@ -470,7 +488,8 @@ pub fn parse(sd: &Value) -> RegionConfig {
         region_graces: str_to_u32vec(sd.get("regionGraces")),
         grace_items: str_to_u32(sd.get("graceItems")),
         grace_attunement: parse_grace_attunement(sd.get("graceAttunement")),
-        natural_key_triggers: parse_natural_keys(sd.get("naturalKeyTriggers")),
+        natural_key_triggers,
+        leyndell_runes_required,
         lock_grant_items: str_to_i32vec(sd.get("lockGrantItems")),
         baked_fallback: None,
     }
@@ -1417,6 +1436,34 @@ mod foreign_apworld_degrade {
         assert_eq!(c.random_start_warp_flag, 0, "0 = no random start");
         assert_eq!(c.random_start_area_id, 0);
         assert_eq!(c.random_start_grace_id, 0);
+        assert_eq!(c.leyndell_runes_required, 0);
+    }
+
+    #[test]
+    fn leyndell_ap_rune_threshold_comes_from_the_count_trigger() {
+        let armed = parse(&json!({
+            "naturalKeyTriggers": {
+                "Leyndell Lock": {"anyOf": [{
+                    "countItems": [
+                        "Godrick's Great Rune",
+                        "Great Rune of the Unborn",
+                        "Morgott's Great Rune"
+                    ],
+                    "count": 2
+                }]}
+            }
+        }));
+        assert_eq!(armed.leyndell_runes_required, 2);
+
+        let disarmed = parse(&json!({
+            "naturalKeyTriggers": {
+                "Leyndell Lock": {"anyOf": [{"items": [], "flags": []}]}
+            }
+        }));
+        assert_eq!(
+            disarmed.leyndell_runes_required, 0,
+            "the always-open fallback must retain vanilla flag behaviour"
+        );
     }
 
     #[test]

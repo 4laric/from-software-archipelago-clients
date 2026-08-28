@@ -104,8 +104,12 @@ fn received_great_rune_count(received: &HashSet<String>) -> usize {
 /// Non-location prerequisites owed to the physical Leyndell seal by the cumulative AP receive
 /// stream. This is shared by the active reconciler and the runtime-fallback handler so normal
 /// delivery, server `/send`, reconnect replay, and `RECONCILE_APPLY=none` cannot diverge.
-pub fn leyndell_gate_flags(received: &HashSet<String>) -> Vec<u32> {
-    if received_great_rune_count(received) >= 2 {
+pub fn leyndell_gate_flags(received: &HashSet<String>, runes_required: usize) -> Vec<u32> {
+    if er_logic::region_lock::leyndell_gate_flag_action(
+        runes_required,
+        received_great_rune_count(received),
+    ) == er_logic::region_lock::LeyndellGateFlagAction::Open
+    {
         LEYNDELL_TWO_RUNES_FLAGS.to_vec()
     } else {
         Vec::new()
@@ -119,10 +123,43 @@ pub fn leyndell_gate_flags(received: &HashSet<String>) -> Vec<u32> {
 /// path gives the seal an independent readback/retry boundary. Bobler's 2026-08-18 playtest reached
 /// four AP Great Runes under the active reconciler but still found the wall closed; coupling the
 /// only fallback to `!owns_flags()` left no recovery or named evidence for that state.
-pub fn tick_leyndell_gate_flags(received: &HashSet<String>) {
+pub fn tick_leyndell_gate_flags(received: &HashSet<String>, runes_required: usize) {
     let rune_count = received_great_rune_count(received);
+    match er_logic::region_lock::leyndell_gate_flag_action(runes_required, rune_count) {
+        er_logic::region_lock::LeyndellGateFlagAction::Unmanaged => return,
+        er_logic::region_lock::LeyndellGateFlagAction::HoldClosed => {
+            // Vanilla event 730 derives 182 from LOCAL shardbearer progress. While the synthetic
+            // AP wall is armed, that must not impersonate AP Great Rune receipts. Leave flag 105
+            // alone -- it is ordinary Roundtable quest state; holding only the counted-rune half
+            // false is sufficient to keep the physical seal closed.
+            if flags::get_event_flag(182) {
+                let accepted = flags::try_set_event_flag(182, false);
+                if flags::get_event_flag(182) {
+                    if LEYNDELL_GATE_WARNED.fetch_or(1 << 2, Ordering::Relaxed) & (1 << 2) == 0 {
+                        log::warn!(
+                            "great runes: {rune_count}/{runes_required} AP-received -- vanilla \
+                             Leyndell flag 182 did not clear (write accepted={accepted}); retrying"
+                        );
+                    }
+                } else {
+                    LEYNDELL_GATE_WARNED.fetch_and(!(1 << 2), Ordering::Relaxed);
+                    log::info!(
+                        "great runes: {rune_count}/{runes_required} AP-received -- held vanilla \
+                         Leyndell flag 182 closed"
+                    );
+                }
+            }
+            return;
+        }
+        er_logic::region_lock::LeyndellGateFlagAction::Open => {
+            LEYNDELL_GATE_WARNED.fetch_and(!(1 << 2), Ordering::Relaxed);
+        }
+    }
     let mut applied = Vec::new();
-    for (index, flag) in leyndell_gate_flags(received).into_iter().enumerate() {
+    for (index, flag) in leyndell_gate_flags(received, runes_required)
+        .into_iter()
+        .enumerate()
+    {
         let bit = 1u32 << index;
         if flags::get_event_flag(flag) {
             LEYNDELL_GATE_WARNED.fetch_and(!bit, Ordering::Relaxed);
@@ -319,8 +356,12 @@ mod tests {
             "Godrick's Great Rune".to_string(),
             "Great Rune of the Unborn".to_string(),
         ]);
-        assert!(leyndell_gate_flags(&one).is_empty());
-        assert_eq!(leyndell_gate_flags(&two), vec![105, 182]);
+        assert!(leyndell_gate_flags(&one, 2).is_empty());
+        assert_eq!(leyndell_gate_flags(&two, 2), vec![105, 182]);
+        assert!(
+            leyndell_gate_flags(&two, 0).is_empty(),
+            "gate-off seeds leave vanilla flag state unmanaged"
+        );
         assert!(
             LEYNDELL_TWO_RUNES_FLAGS
                 .iter()
