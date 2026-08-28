@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -12,6 +13,15 @@ use crate::config::RuntimeConfig;
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
 use crate::ledger::{AcknowledgedItem, PendingItem, ReceiveLedger, WatermarkOutcome};
 use crate::upgrades::{auto_upgrade_level, reinforced_descriptor_pair};
+
+const LOCATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const LOCATION_RETRY_MAX: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+struct LocationRetry {
+    next_attempt: Instant,
+    delay: Duration,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IncomingItem {
@@ -71,6 +81,7 @@ pub struct ClientLoop<B> {
     slot_name: String,
     location_identity: Option<String>,
     location_true_streaks: HashMap<i64, u8>,
+    location_retries: HashMap<i64, LocationRetry>,
     last_watermark_outcome: WatermarkOutcome,
     watermark_notice: Option<WatermarkOutcome>,
 }
@@ -93,6 +104,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             slot_name: slot_name.into(),
             location_identity: None,
             location_true_streaks: HashMap::new(),
+            location_retries: HashMap::new(),
             last_watermark_outcome: WatermarkOutcome::Resume,
             watermark_notice: None,
         }
@@ -198,24 +210,40 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(Some(context.save_identity))
     }
 
+    pub fn reset_location_retry_backoff(&mut self) {
+        self.location_retries.clear();
+    }
+
     pub fn poll_locations(&mut self, server_checked: &HashSet<i64>) -> Result<Vec<i64>> {
+        self.poll_locations_at(server_checked, Instant::now())
+    }
+
+    fn poll_locations_at(
+        &mut self,
+        server_checked: &HashSet<i64>,
+        now: Instant,
+    ) -> Result<Vec<i64>> {
         let context_identity = match self.require_runtime_context("automatic location checks") {
             Ok(Some(identity)) => identity,
             Ok(None) => {
                 self.location_true_streaks.clear();
+                self.location_retries.clear();
                 return Ok(Vec::new());
             }
             Err(error) => {
                 self.location_true_streaks.clear();
+                self.location_retries.clear();
                 return Err(error);
             }
         };
         if self.config.location_check_debounce < 2 {
             self.location_true_streaks.clear();
+            self.location_retries.clear();
             anyhow::bail!("location_check_debounce must be at least 2");
         }
         if self.location_identity.as_deref() != Some(&context_identity) {
             self.location_true_streaks.clear();
+            self.location_retries.clear();
             self.location_identity = Some(context_identity);
         }
         // A held watermark silences checks as well as grants (§5): a save
@@ -224,6 +252,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         // restored save simply reads false until the flags are earned again.
         if self.reconcile_watermark()? == WatermarkOutcome::Hold {
             self.location_true_streaks.clear();
+            self.location_retries.clear();
             return Ok(Vec::new());
         }
 
@@ -231,12 +260,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         for binding in &self.config.locations {
             if server_checked.contains(&binding.ap_location_id) {
                 self.location_true_streaks.remove(&binding.ap_location_id);
+                self.location_retries.remove(&binding.ap_location_id);
                 continue;
             }
             let read = match self.backend.read_event_flag(binding.event_flag) {
                 Ok(read) => read,
                 Err(error) => {
                     self.location_true_streaks.clear();
+                    self.location_retries.clear();
                     return Err(error);
                 }
             };
@@ -248,11 +279,29 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                         .or_default();
                     *streak = streak.saturating_add(1);
                     if *streak >= self.config.location_check_debounce {
-                        newly_checked.push(binding.ap_location_id);
+                        match self.location_retries.get_mut(&binding.ap_location_id) {
+                            None => {
+                                newly_checked.push(binding.ap_location_id);
+                                self.location_retries.insert(
+                                    binding.ap_location_id,
+                                    LocationRetry {
+                                        next_attempt: now + LOCATION_RETRY_INITIAL,
+                                        delay: LOCATION_RETRY_INITIAL,
+                                    },
+                                );
+                            }
+                            Some(retry) if now >= retry.next_attempt => {
+                                newly_checked.push(binding.ap_location_id);
+                                retry.delay = retry.delay.saturating_mul(2).min(LOCATION_RETRY_MAX);
+                                retry.next_attempt = now + retry.delay;
+                            }
+                            Some(_) => {}
+                        }
                     }
                 }
                 Some(false) | None => {
                     self.location_true_streaks.remove(&binding.ap_location_id);
+                    self.location_retries.remove(&binding.ap_location_id);
                 }
             }
         }
@@ -856,10 +905,9 @@ mod tests {
     /// *server-confirmed* set handed in each tick, never the archipelago-rs
     /// optimistic `checked_locations()` cache. As long as the server does not
     /// know about a location whose flag reads true, the poll keeps reporting
-    /// it. This test is the decision-layer witness:
-    /// the location is reported, and reported again on the next tick while the
-    /// server-checked set stays empty; once the server acknowledges it, the poll
-    /// goes quiet.
+    /// it with bounded exponential backoff. This test is the decision-layer
+    /// witness: the first report is immediate after debounce, retries follow
+    /// the 1/2/4-second schedule, and server acknowledgement silences them.
     #[test]
     fn a_check_the_server_does_not_know_about_is_reported_again() {
         let ledger_path = path();
@@ -876,18 +924,127 @@ mod tests {
             config(),
         );
         let none = HashSet::new();
+        let start = Instant::now();
 
         // debounce is 3.
-        assert!(client.poll_locations(&none).unwrap().is_empty());
-        assert!(client.poll_locations(&none).unwrap().is_empty());
-        assert_eq!(client.poll_locations(&none).unwrap(), vec![1000]);
-        // The send did not land (we were offline / the socket dropped): the
-        // server-checked set is still empty, so the very next poll re-reports.
-        assert_eq!(client.poll_locations(&none).unwrap(), vec![1000]);
+        assert!(client.poll_locations_at(&none, start).unwrap().is_empty());
+        assert!(client.poll_locations_at(&none, start).unwrap().is_empty());
+        assert_eq!(client.poll_locations_at(&none, start).unwrap(), vec![1000]);
+        assert!(
+            client
+                .poll_locations_at(&none, start + Duration::from_millis(999))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            client
+                .poll_locations_at(&none, start + Duration::from_secs(1))
+                .unwrap(),
+            vec![1000]
+        );
+        assert!(
+            client
+                .poll_locations_at(&none, start + Duration::from_secs(2))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            client
+                .poll_locations_at(&none, start + Duration::from_secs(3))
+                .unwrap(),
+            vec![1000]
+        );
 
         // The reconnect's fresh client now reports it as checked: quiet.
         let acknowledged = HashSet::from([1000]);
-        assert!(client.poll_locations(&acknowledged).unwrap().is_empty());
+        assert!(
+            client
+                .poll_locations_at(&acknowledged, start + Duration::from_secs(7))
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(&ledger_path);
+    }
+
+    #[test]
+    fn reconnect_resets_location_retry_backoff() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let none = HashSet::new();
+        let start = Instant::now();
+
+        assert!(client.poll_locations_at(&none, start).unwrap().is_empty());
+        assert!(client.poll_locations_at(&none, start).unwrap().is_empty());
+        assert_eq!(client.poll_locations_at(&none, start).unwrap(), vec![1000]);
+        assert!(
+            client
+                .poll_locations_at(&none, start + Duration::from_millis(500))
+                .unwrap()
+                .is_empty()
+        );
+
+        client.reset_location_retry_backoff();
+        assert_eq!(
+            client
+                .poll_locations_at(&none, start + Duration::from_millis(500))
+                .unwrap(),
+            vec![1000]
+        );
+        let _ = std::fs::remove_file(&ledger_path);
+    }
+
+    #[test]
+    fn location_retry_backoff_caps_at_thirty_seconds() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let none = HashSet::new();
+        let start = Instant::now();
+
+        assert!(client.poll_locations_at(&none, start).unwrap().is_empty());
+        assert!(client.poll_locations_at(&none, start).unwrap().is_empty());
+        assert_eq!(client.poll_locations_at(&none, start).unwrap(), vec![1000]);
+        for elapsed in [1, 3, 7, 15, 31, 61] {
+            assert_eq!(
+                client
+                    .poll_locations_at(&none, start + Duration::from_secs(elapsed))
+                    .unwrap(),
+                vec![1000]
+            );
+        }
+        assert!(
+            client
+                .poll_locations_at(&none, start + Duration::from_secs(90))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            client
+                .poll_locations_at(&none, start + Duration::from_secs(91))
+                .unwrap(),
+            vec![1000]
+        );
         let _ = std::fs::remove_file(&ledger_path);
     }
 

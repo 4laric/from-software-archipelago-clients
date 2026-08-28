@@ -906,6 +906,12 @@ fn run() -> Result<()> {
             if let (Some(runtime), Some(client)) = (runtime.as_ref(), connection.client()) {
                 guard_seed_name(runtime.seed_name(), client.seed_name())?;
             }
+            if let Some(runtime) = runtime.as_mut() {
+                // A fresh transport is the best opportunity to recover a
+                // check that was written into the old zombie socket. Do not
+                // carry that socket's retry delay across the reconnect.
+                runtime.reset_location_retry_backoff();
+            }
         }
         if connected_now && let Some(client) = connection.client_mut() {
             // A fresh socket knows nothing about what we have already checked:
