@@ -2,6 +2,14 @@
 
 ### Fixed
 
+* **Location checks retry until the server confirms them (clients#455).** A
+  socket killed without a detected transport error could accept a local write,
+  after which archipelago-rs's optimistic checked-location cache made the
+  Bloodborne loop believe the server knew about the check. The loop now reads
+  a distinct server-confirmed view and harmlessly resends `LocationChecks`
+  until a `RoomUpdate` acknowledges them. Relaunching is no longer required to
+  recover checks sent into a zombie connection.
+
 * **Equipment never takes the delta lane (clients#451).** The first
   `delivery-diagnostics.jsonl` from the field showed `ap_7` Hunter Pistol
   delivered as `delta persistent ... storage_suspected`: the player already

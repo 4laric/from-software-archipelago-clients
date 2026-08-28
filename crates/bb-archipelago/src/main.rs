@@ -1045,7 +1045,13 @@ fn run() -> Result<()> {
                 }
             }
             let checked = client
-                .checked_locations()
+                // clients#455: checked_locations() is optimistic --
+                // mark_checked() updates it before the server echoes the
+                // LocationChecks back. A write into a dead-but-undetected
+                // socket therefore looked acknowledged forever. Derive from
+                // the server-only view so a true game flag is resent until a
+                // RoomUpdate confirms it; LocationChecks are idempotent.
+                .server_checked_locations()
                 .map(|location| location.id())
                 .collect::<HashSet<_>>();
             if !goal_reported && goal_location.is_some_and(|goal| checked.contains(&goal)) {

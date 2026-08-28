@@ -851,12 +851,12 @@ mod tests {
         let _ = std::fs::remove_file(&ledger_path);
     }
 
-    /// clients#423 (point 4): a check found while the client is offline must be
-    /// re-sent after reconnecting. `newly_checked` is derived from the
-    /// *server-checked* set handed in each tick -- which the loop rebuilds from
-    /// the fresh client after `sync()` -- and never from a local "already sent"
-    /// cache, so as long as the server does not yet know about a location whose
-    /// flag reads true, the poll keeps reporting it. This test is the witness:
+    /// clients#423/#455: a check found while offline or sent into a silently
+    /// dead socket must be re-sent. `newly_checked` is derived from the
+    /// *server-confirmed* set handed in each tick, never the archipelago-rs
+    /// optimistic `checked_locations()` cache. As long as the server does not
+    /// know about a location whose flag reads true, the poll keeps reporting
+    /// it. This test is the decision-layer witness:
     /// the location is reported, and reported again on the next tick while the
     /// server-checked set stays empty; once the server acknowledges it, the poll
     /// goes quiet.
