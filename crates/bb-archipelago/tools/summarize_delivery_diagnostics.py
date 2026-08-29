@@ -95,6 +95,44 @@ def main():
     print("inferred_destination is an INFERENCE from read-back arithmetic, not a "
           "read of the storage box; storage_suspected and a concurrent spend are "
           "indistinguishable to the client.")
+
+    candidates = []
+    for position, record in enumerate(records):
+        suspect = record.get("inferred_destination") == "storage_suspected"
+        after_suspect = record.get("previous_inferred_destination") == "storage_suspected"
+        insert_to_storage = record.get("lane") == "insert" and record.get("native_result") == 2
+        if suspect or after_suspect or insert_to_storage:
+            reasons = []
+            if suspect:
+                reasons.append("held deficit after executed grant")
+            if after_suspect:
+                reasons.append("immediately follows suspected storage routing")
+            if insert_to_storage:
+                reasons.append("insert returned 2 (observed storage result)")
+            candidates.append((position, record, "; ".join(reasons)))
+
+    print("")
+    print("OZ VERIFICATION SHORTLIST (check these exact AP items in held inventory vs storage):")
+    if not candidates:
+        print("  none -- return the JSONL anyway; a no-storage run is useful evidence")
+    else:
+        for position, record, reason in candidates[:12]:
+            normalized = record.get("item_id_normalized")
+            item_id = "0x{:08X}".format(normalized) if isinstance(normalized, int) else "?"
+            print(
+                "  AP index {index} | {item_id} | lane={lane} result={result} "
+                "gap_ms={gap} | {reason}".format(
+                    index=record.get("ap_index", "?"),
+                    item_id=item_id,
+                    lane=record.get("lane") or "-",
+                    result=record.get("native_result", "?"),
+                    gap=record.get("milliseconds_since_previous_terminal", "?"),
+                    reason=reason,
+                )
+            )
+        if len(candidates) > 12:
+            print("  ... {} more candidate(s); the JSONL retains all of them".format(
+                len(candidates) - 12))
     return 0
 
 

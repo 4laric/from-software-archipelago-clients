@@ -208,7 +208,10 @@ decisions — tag and AP index, raw/normalized item id, lane (`insert`/`delta`)
 and descriptor source, quantity, the baseline it observed, the total it
 expected, every held-stack read-back the verify loop saw, the cave's result
 cell, the terminal status and detail, and the client's own gameplay-ready state
-at submit and at the terminal step. **No extra read of the game is performed for
+at submit and at the terminal step. It also records a session sequence number,
+the millisecond gap from the preceding terminal grant, and that grant's inferred
+destination so release-flood and sticky-overflow hypotheses can be tested from
+an ordinary playthrough. **No extra read of the game is performed for
 it**, and a failure to write the file warns once and never touches a delivery.
 
 One field is an inference and is named as one: `inferred_destination` is
@@ -221,7 +224,8 @@ concurrent spend and an overflow into storage are indistinguishable to it, so
 measurement.
 
 `tools/summarize_delivery_diagnostics.py <file>` groups the records by item,
-status and inferred destination and prints a table to paste into clients#445.
+status and inferred destination, then prints a short player-verification list
+for suspected storage deliveries and the grants immediately after them.
 
 This complements, and does not replace, the manual probe in bb-archipelago#203:
 controlled-condition questions — a unique-item insert, a deliberately at-cap

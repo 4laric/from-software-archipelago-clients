@@ -439,6 +439,10 @@ mod tests {
         };
         assert!(!bridge.state_is_current_for("received_17").unwrap());
 
+        // Keep the stale state and newly-created command on distinct filesystem
+        // timestamps. Fast Windows runners can otherwise coalesce both writes,
+        // making the test claim the old state was rewritten after enqueue.
+        std::thread::sleep(Duration::from_millis(10));
         bridge.enqueue(&pebble()).unwrap();
         assert!(!bridge.state_is_current_for("received_17").unwrap());
         fs::write(&state_path, "status=completed\ntag=received_17\n").unwrap();

@@ -73,6 +73,15 @@ pub struct DeliveryRecord {
     /// ISO-8601 UTC, second resolution.
     pub utc: String,
     pub unix_seconds: u64,
+    /// Millisecond timestamp used to correlate rapid release floods.
+    pub unix_millis: u64,
+    /// Monotonic terminal-grant sequence within this client process.
+    pub session_sequence: u64,
+    /// Wall-clock gap from the preceding terminal grant in this process.
+    pub milliseconds_since_previous_terminal: Option<u64>,
+    /// The preceding record's inference, copied here so one row can answer
+    /// whether it immediately followed a suspected overflow.
+    pub previous_inferred_destination: Option<String>,
     pub tag: String,
     /// Parsed out of the `ap_<index>` tag the client loop mints. `None` for a
     /// tag that does not carry one (a manual grant).
@@ -153,13 +162,18 @@ impl DeliveryRecord {
         submit: GrantContext,
         terminal: GrantContext,
     ) -> Self {
-        let unix_seconds = SystemTime::now()
+        let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
             .unwrap_or_default();
+        let unix_seconds = elapsed.as_secs();
+        let unix_millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         Self {
             utc: format_utc(unix_seconds),
             unix_seconds,
+            unix_millis,
+            session_sequence: 0,
+            milliseconds_since_previous_terminal: None,
+            previous_inferred_destination: None,
             tag: trace.tag.clone(),
             ap_index: ap_index_from_tag(&trace.tag),
             item_id_raw: trace.raw_id,
@@ -249,6 +263,9 @@ impl DiagnosticWriter for JsonlFile {
 pub struct DiagnosticSink {
     writer: Option<Box<dyn DiagnosticWriter + Send>>,
     warned: bool,
+    sequence: u64,
+    previous_unix_millis: Option<u64>,
+    previous_inferred_destination: Option<String>,
 }
 
 impl Default for DiagnosticSink {
@@ -262,6 +279,9 @@ impl DiagnosticSink {
         Self {
             writer: None,
             warned: false,
+            sequence: 0,
+            previous_unix_millis: None,
+            previous_inferred_destination: None,
         }
     }
 
@@ -269,6 +289,9 @@ impl DiagnosticSink {
         Self {
             writer: Some(writer),
             warned: false,
+            sequence: 0,
+            previous_unix_millis: None,
+            previous_inferred_destination: None,
         }
     }
 
@@ -282,7 +305,16 @@ impl DiagnosticSink {
         let Some(writer) = self.writer.as_mut() else {
             return;
         };
-        let outcome = json::to_string(record)
+        let mut record = record.clone();
+        self.sequence += 1;
+        record.session_sequence = self.sequence;
+        record.milliseconds_since_previous_terminal = self
+            .previous_unix_millis
+            .map(|previous| record.unix_millis.saturating_sub(previous));
+        record.previous_inferred_destination = self.previous_inferred_destination.clone();
+        self.previous_unix_millis = Some(record.unix_millis);
+        self.previous_inferred_destination = Some(record.inferred_destination.clone());
+        let outcome = json::to_string(&record)
             .map_err(|error| error.to_string())
             .and_then(|line| writer.write_line(&line).map_err(|error| error.to_string()));
         if let Err(error) = outcome
@@ -299,6 +331,7 @@ impl DiagnosticSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn the_ledger_directory_is_where_the_jsonl_lands() {
@@ -411,6 +444,44 @@ mod tests {
     #[derive(Default)]
     struct FailingWriter {
         attempts: u32,
+    }
+
+    struct CapturingWriter(Arc<Mutex<Vec<String>>>);
+
+    impl DiagnosticWriter for CapturingWriter {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(line.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_sink_stamps_sequence_gap_and_previous_destination() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = DiagnosticSink::new(Box::new(CapturingWriter(lines.clone())));
+        let first = DeliveryRecord {
+            unix_millis: 1_000,
+            inferred_destination: "storage_suspected".into(),
+            ..DeliveryRecord::default()
+        };
+        let second = DeliveryRecord {
+            unix_millis: 1_275,
+            inferred_destination: "held".into(),
+            ..DeliveryRecord::default()
+        };
+        sink.record(&first, &mut |_| {});
+        sink.record(&second, &mut |_| {});
+        let captured = lines.lock().unwrap();
+        let first: DeliveryRecord = json::from_str(&captured[0]).unwrap();
+        let second: DeliveryRecord = json::from_str(&captured[1]).unwrap();
+        assert_eq!(first.session_sequence, 1);
+        assert_eq!(first.milliseconds_since_previous_terminal, None);
+        assert_eq!(second.session_sequence, 2);
+        assert_eq!(second.milliseconds_since_previous_terminal, Some(275));
+        assert_eq!(
+            second.previous_inferred_destination.as_deref(),
+            Some("storage_suspected")
+        );
     }
 
     impl DiagnosticWriter for FailingWriter {
