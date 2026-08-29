@@ -176,6 +176,18 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
     )
 }
 
+/// One audited older wire contract that the current client can consume safely.
+///
+/// v0.5.0 moved the contract hash solely by adding optional `abilityUnlockItems`.
+/// A v0.4.13 seed cannot enable progressive ability locks and therefore omits that
+/// key, which the current parser and generated validator already interpret as the
+/// feature being off. Match both tokens: the hash was shared by other 0.4.x builds,
+/// and compatibility has not been audited for those releases.
+pub fn is_legacy_contract_compatible(versions: &str) -> bool {
+    let has = |wanted: &str| versions.split_whitespace().any(|token| token == wanted);
+    has("apworld/0.4.13") && has("contract/dc0dc687")
+}
+
 // ---------------------------------------------------------------------------------------------
 // DECLARED vs ARMED -- the half this handshake was missing until 2026-08-11
 // ---------------------------------------------------------------------------------------------
@@ -558,5 +570,19 @@ mod tests {
     fn a_quiet_seed_produces_a_wholly_empty_handshake() {
         let h = reconcile(&[], &[("auto_equip", false), ("scaling_ceiling", false)]);
         assert_eq!(h, Handshake::default());
+    }
+
+    #[test]
+    fn only_the_audited_v0413_contract_is_legacy_compatible() {
+        assert!(is_legacy_contract_compatible(
+            "apworld/0.4.13 contract/dc0dc687 data/old"
+        ));
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.4.12 contract/dc0dc687 data/old"
+        ));
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.4.13 contract/not-the-audited-contract data/old"
+        ));
+        assert!(!is_legacy_contract_compatible("apworld/0.4.13"));
     }
 }
