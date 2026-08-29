@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Changed
+
+* **Normal play now captures storage-routing correlations (clients#445).** Each
+  delivery diagnostic records its terminal sequence number, the millisecond gap
+  from the preceding grant, and the preceding destination inference. The
+  summarizer prints an Oz verification shortlist containing suspected storage
+  deliveries, the grants immediately following them, and insert-lane result 2
+  cases. This is passive instrumentation only; delivery timing and routing are
+  unchanged while the hypothesis is still being measured.
+
 ### Fixed
 
 * **Location checks retry until the server confirms them (clients#455).** A
