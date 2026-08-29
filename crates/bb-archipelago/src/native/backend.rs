@@ -37,6 +37,7 @@ use crate::event_flags::LiveEventFlags;
 use super::diagnostics::{DiagnosticSink, GrantContext, JsonlFile, diagnostics_path_for_ledger};
 use super::engine::{GrantStep, NativeDelivery, NativeGrantRequest};
 use super::flag_gate::FlagGate;
+use super::gem_capture::GemCapture;
 use super::guest::GuestRuntime;
 use super::mem::NativeMemory;
 
@@ -94,6 +95,7 @@ pub struct NativeBackend {
     /// produced, stamped onto each diagnostic record. Not a guest read -- it is
     /// the value this backend already returned to the loop this iteration.
     last_context: GrantContext,
+    gem_capture: Option<GemCapture>,
 }
 
 impl NativeBackend {
@@ -123,6 +125,15 @@ impl NativeBackend {
         );
         self.delivery
             .arm_diagnostics(DiagnosticSink::new(Box::new(JsonlFile::new(path))));
+        match GemCapture::beside_ledger(ledger) {
+            Ok(capture) => {
+                client_eprintln!(
+                    "Blood-gem diagnostics: natural inventory changes stream beside the ledger to blood-gem-capture.jsonl."
+                );
+                self.gem_capture = Some(capture);
+            }
+            Err(error) => client_eprintln!("Blood-gem diagnostics unavailable: {error}"),
+        }
     }
 
     /// The live `location_context`, before the diagnostics stamp is taken.
@@ -273,12 +284,16 @@ impl NativeBackend {
             base,
             absent_observations: std::collections::HashMap::new(),
             last_context: GrantContext::default(),
+            gem_capture: None,
         })
     }
 }
 
 impl BloodborneBackend for NativeBackend {
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
+        if let Some(capture) = &mut self.gem_capture {
+            capture.observe(self.delivery.runtime_mut().inventory_entries());
+        }
         let result = self.location_context_inner();
         // clients#445: remember what the loop was told, so a grant record can
         // say what the client's own readiness looked like around it. `None` is

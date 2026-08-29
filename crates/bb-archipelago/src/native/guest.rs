@@ -24,6 +24,19 @@ use super::mem::ProcessMemory;
 
 const MAX_SLOTS: u64 = 4096;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InventoryEntry {
+    pub slot: u32,
+    pub address: u64,
+    pub bytes: [u8; 16],
+}
+
+impl InventoryEntry {
+    pub fn word(&self, offset: usize) -> u32 {
+        u32::from_le_bytes(self.bytes[offset..offset + 4].try_into().unwrap())
+    }
+}
+
 /// Base-game player weapon families in CUSA03173 01.09. These are the same
 /// EquipParamWeapon bases the world uses for requirement removal. Exact
 /// membership prevents armour/runes that happen to resemble a +N row from
@@ -119,6 +132,29 @@ impl<P: ProcessMemory> GuestRuntime<P> {
             }
         }
         Some(highest)
+    }
+
+    /// Complete non-empty inventory records for passive natural-award
+    /// diagnostics. This is a read-only view: it never stages a request or
+    /// writes into the guest. Category 8 deliberately has no filtering rule
+    /// yet, so the caller diffs every record and discovers its real shape.
+    pub fn inventory_entries(&self) -> Option<Vec<InventoryEntry>> {
+        let (_inventory, split, last, primary, secondary) = self.geometry()?;
+        let g = self.contract.geometry;
+        let mut entries = Vec::new();
+        for slot in 0..=last {
+            let address = entry_address(slot, split, primary, secondary, g.record_stride);
+            let raw = self.record(self.memory.read(address, 16))?;
+            let bytes: [u8; 16] = raw.try_into().expect("exact inventory record read");
+            if bytes.iter().any(|byte| *byte != 0) {
+                entries.push(InventoryEntry {
+                    slot: slot as u32,
+                    address,
+                    bytes,
+                });
+            }
+        }
+        Some(entries)
     }
 
     /// Take the first captured I/O error, if any, clearing it.
