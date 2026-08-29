@@ -5720,16 +5720,15 @@ impl Core {
                 // Above the filters, not on a region header: the balance and the one control that
                 // spends it must be visible the moment the window opens, without scrolling and
                 // without a locked region happening to be on screen.
+                // The withheld goal Lock is NOT part of the hint economy: it was never placed and
+                // opens automatically when the authoritative goal gate is satisfied. Keep this
+                // outside the `hud` guard so seeds without paid hints still explain where their
+                // finale Lock went (#1128).
+                if let Some(gs) = &goal_status {
+                    ui.text(format!("goal: {gs}"));
+                }
                 if let Some((have, price)) = hud {
                     ui.text(format!("lock hints: {have}/{price} surface checks"));
-                    // The goal ledger, ON SCREEN (2026-08-21): the gate's held/outstanding
-                    // accounting lived only in the log, so a player holding every lock read
-                    // "no Ashen yet" as a defect while the (correct) answer -- Great Runes
-                    // (1/2) -- was never shown. Rendered beside the hint economy because this
-                    // is the same question: "what am I still looking for".
-                    if let Some(gs) = &goal_status {
-                        ui.text(format!("goal: {gs}"));
-                    }
                     if ui.is_item_hovered() {
                         ui.tooltip_text(
                             "You earn 1 per progression-surface check -- the * rows below.\nSpend them to publish a real Archipelago hint for a region lock.",
@@ -5791,6 +5790,8 @@ impl Core {
                         }
                         Next::Idle => {}
                     }
+                }
+                if goal_status.is_some() || hud.is_some() {
                     ui.separator();
                 }
                 // ---- where you are standing, and how hard it is ----------------------------

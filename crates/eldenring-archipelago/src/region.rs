@@ -245,20 +245,7 @@ pub fn tick_goal_gate(
 
     // The tracker header mirrors the gate on EVERY evaluation (the log line stays edge-latched
     // below). ASCII by construction: region names and the rune counter are ASCII already.
-    match &decision {
-        er_logic::goal_gate::Decision::Withhold { outstanding } => set_goal_gate_status(format!(
-            "{} outstanding -- {}",
-            outstanding.len(),
-            outstanding.join(", ")
-        )),
-        _ => set_goal_gate_status(format!(
-            "requirements met -- {} opens",
-            lock_item
-                .strip_suffix(" Lock")
-                .filter(|n| !n.is_empty())
-                .unwrap_or("the goal region")
-        )),
-    }
+    set_goal_gate_status(er_logic::goal_gate::tracker_status(&decision, &lock_item));
     if !decision.opens() {
         // Say the outstanding list ONCE, then stay quiet until something changes it.
         if !GOAL_GATE_SAID_SHUT.swap(true, Ordering::Relaxed) {
