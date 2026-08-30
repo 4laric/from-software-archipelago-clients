@@ -245,6 +245,11 @@ impl BloodborneBackend for FileBackend {
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
+        if grant.item_category == 255 {
+            self.event_flags
+                .write_resilient(grant.normalized_item_id, true)?;
+            return Ok(OperationProgress::Complete);
+        }
         match grant.item_category {
             4 => anyhow::ensure!(
                 grant.normalized_item_id & 0xF000_0000 == 0x4000_0000
@@ -494,6 +499,12 @@ impl BloodborneBackend for MockBackend {
         }
         if Self::delayed(&mut self.grant_delays, &grant.tag) {
             return Ok(OperationProgress::Pending);
+        }
+        if grant.item_category == 255 {
+            self.set_flags.insert(grant.normalized_item_id);
+            self.grants.push(grant.clone());
+            self.completed_grants.insert(grant.tag.clone());
+            return Ok(OperationProgress::Complete);
         }
         let key = (grant.normalized_item_id, grant.reinforcement_level);
         let current = self.inventory.get(&key).copied().unwrap_or(0);

@@ -697,35 +697,39 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     .grant_may_have_applied(&grant_tag(item.index))?,
                 None => false,
             };
-            let expected_before = match recorded_baseline.filter(|_| baseline_is_binding) {
-                Some(recorded) => recorded,
-                None => match self.backend.observe_stack_quantity(
-                    pending.normalized_item_id,
-                    pending.reinforcement_level,
-                )? {
-                    StackObservation::Quantity(observed) => {
-                        self.ledger
-                            .slot_mut(&self.seed_name, &self.slot_name)
-                            .record_observed_before(observed)?;
-                        self.ledger.save(&self.ledger_path)?;
-                        pending.observed_before = Some(observed);
-                        observed
-                    }
-                    // No trustworthy reading yet: nothing is published.
-                    StackObservation::NotReady => return Ok(ItemPollResult::Pending),
-                    // A backend that cannot read inventory (the CE file bridge,
-                    // whose harness ignores the field anyway) keeps the
-                    // pre-clients#427 ledger-derived baseline.
-                    StackObservation::Unsupported => self
-                        .ledger
-                        .slot(&self.seed_name, &self.slot_name)
-                        .map_or(0, |slot| {
-                            slot.delivered_quantity(
-                                pending.normalized_item_id,
-                                pending.reinforcement_level,
-                            )
-                        }),
-                },
+            let expected_before = if pending.item_category == 255 {
+                0
+            } else {
+                match recorded_baseline.filter(|_| baseline_is_binding) {
+                    Some(recorded) => recorded,
+                    None => match self.backend.observe_stack_quantity(
+                        pending.normalized_item_id,
+                        pending.reinforcement_level,
+                    )? {
+                        StackObservation::Quantity(observed) => {
+                            self.ledger
+                                .slot_mut(&self.seed_name, &self.slot_name)
+                                .record_observed_before(observed)?;
+                            self.ledger.save(&self.ledger_path)?;
+                            pending.observed_before = Some(observed);
+                            observed
+                        }
+                        // No trustworthy reading yet: nothing is published.
+                        StackObservation::NotReady => return Ok(ItemPollResult::Pending),
+                        // A backend that cannot read inventory (the CE file bridge,
+                        // whose harness ignores the field anyway) keeps the
+                        // pre-clients#427 ledger-derived baseline.
+                        StackObservation::Unsupported => self
+                            .ledger
+                            .slot(&self.seed_name, &self.slot_name)
+                            .map_or(0, |slot| {
+                                slot.delivered_quantity(
+                                    pending.normalized_item_id,
+                                    pending.reinforcement_level,
+                                )
+                            }),
+                    },
+                }
             };
             let grant = ItemGrant {
                 raw_descriptor: pending.raw_descriptor,
