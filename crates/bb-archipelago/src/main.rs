@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs::{File, OpenOptions, TryLockError};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -867,7 +869,92 @@ fn run() -> Result<()> {
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut item_errors = ItemErrorReporter::default();
 
+    // A deliberately small, offline-capable rescue surface. stdin lives on a
+    // reader thread so a disconnected AP socket never makes the console hang.
+    let (console_tx, console_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            match line {
+                Ok(line) => {
+                    if console_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    client_eprintln!(
+        "Developer rescue console ready. Type 'help'. Mutations require an explicit CONFIRM token and reuse the validated delivery pipeline."
+    );
+
     loop {
+        while let Ok(line) = console_rx.try_recv() {
+            let words = line.split_whitespace().collect::<Vec<_>>();
+            let command = words.first().map(|word| word.to_ascii_lowercase());
+            match command.as_deref() {
+                None | Some("") => {}
+                Some("help") => client_eprintln!(
+                    "Rescue commands: help | status | flag EVENT_FLAG | blocked | retry INDEX CONFIRM | export. Unknown/unmapped writes and warps fail closed."
+                ),
+                Some("status") => match runtime.as_mut() {
+                    Some(runtime) => match runtime.rescue_status() {
+                        Ok(status) => client_eprintln!("{status}"),
+                        Err(error) => client_eprintln!("Rescue status unavailable: {error:#}"),
+                    },
+                    None => client_eprintln!(
+                        "Runtime contract not loaded yet; AP may be offline before the first successful connection."
+                    ),
+                },
+                Some("flag") => match (runtime.as_mut(), words.get(1)) {
+                    (Some(runtime), Some(raw)) => match raw.parse::<u32>() {
+                        Ok(flag) => match runtime.rescue_read_flag(flag) {
+                            Ok(value) => client_eprintln!("{value}"),
+                            Err(error) => client_eprintln!("Rescue flag read refused: {error:#}"),
+                        },
+                        Err(_) => client_eprintln!("Usage: flag EVENT_FLAG"),
+                    },
+                    (None, _) => client_eprintln!("Runtime contract not loaded yet."),
+                    _ => client_eprintln!("Usage: flag EVENT_FLAG"),
+                },
+                Some("blocked") => match runtime.as_ref() {
+                    Some(runtime) => client_eprintln!("{}", runtime.rescue_list_blocked()),
+                    None => client_eprintln!("Runtime contract not loaded yet."),
+                },
+                Some("retry") => match (runtime.as_mut(), words.get(1), words.get(2)) {
+                    (Some(runtime), Some(raw), Some(confirm))
+                        if confirm.eq_ignore_ascii_case("CONFIRM") =>
+                    {
+                        match raw.parse::<u64>() {
+                            Ok(index) => match runtime.rescue_retry_blocked(index) {
+                                Ok(()) => client_eprintln!(
+                                    "AUDIT rescue retry index={index}: requeued through the normal ordered delivery pipeline."
+                                ),
+                                Err(error) => client_eprintln!("Rescue retry refused: {error:#}"),
+                            },
+                            Err(_) => client_eprintln!("Usage: retry INDEX CONFIRM"),
+                        }
+                    }
+                    (None, _, _) => client_eprintln!("Runtime contract not loaded yet."),
+                    _ => client_eprintln!(
+                        "Usage: retry INDEX CONFIRM (inspect 'blocked' first; this is audited)"
+                    ),
+                },
+                Some("export") => match runtime.as_ref() {
+                    Some(runtime) => match runtime.rescue_export() {
+                        Ok(path) => {
+                            client_eprintln!("Exported rescue diagnostics to {}", path.display())
+                        }
+                        Err(error) => client_eprintln!("Diagnostic export failed: {error:#}"),
+                    },
+                    None => client_eprintln!("Runtime contract not loaded yet."),
+                },
+                Some("setflag" | "give" | "item" | "warp") => client_eprintln!(
+                    "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes."
+                ),
+                Some(other) => client_eprintln!("Unknown rescue command {other:?}; type 'help'."),
+            }
+        }
         let mut connected_now = false;
         let mut ap_error_seen = false;
         for event in connection.update() {

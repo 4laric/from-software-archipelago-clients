@@ -362,6 +362,25 @@ impl SlotLedger {
             .map(|(index, item)| (*index, item))
     }
 
+    /// Requeue one terminally parked delivery for the normal, ordered receive
+    /// pipeline. The caller is responsible for operator confirmation and save
+    /// identity validation; this method deliberately creates no second grant
+    /// path.
+    pub fn requeue_blocked(&mut self, index: u64) -> Result<()> {
+        let item = self
+            .acknowledged
+            .get(&index)
+            .with_context(|| format!("no acknowledged entry at index {index}"))?;
+        anyhow::ensure!(
+            item.blocked.is_some(),
+            "entry at index {index} is not a parked delivery"
+        );
+        anyhow::ensure!(self.pending.is_none(), "a delivery is already pending");
+        self.acknowledged.remove(&index);
+        self.redeliver.insert(index);
+        Ok(())
+    }
+
     /// Operator-confirmed resolution of a parked entry (bb-blocked INDEX
     /// --confirm): clears the blocked marker after the operator has verified
     /// the item physically arrived. Returns the detail that was cleared.
