@@ -4999,13 +4999,24 @@ impl Core {
         if let Some(members) = self.armor_bundles.get(&ap_id) {
             return ItemSemantics::ArmorBundle(members.clone());
         }
-        // 4. Key item / great rune: the base grant gives the goods row exactly as the seed's map
+        // 4. Whetblades: their complete functional state is the affinity flag set. Elden Ring 1.17
+        //    can accept AddItem for rows 8970..8974 without ever inserting them (client #482:
+        //    Black Whetblade 0x4000230e re-armed another refused burst after reload). Do not make the
+        //    unobservable inventory shell a convergence target; keep every affinity flag as a
+        //    strict read-back/self-healing target.
+        let acq = crate::keyitems::acquire_flags(name);
+        if er_logic::whetblade::WHETBLADES
+            .iter()
+            .any(|w| w.name == name)
+        {
+            return ItemSemantics::FlagOnlyKeyItem(acq);
+        }
+        // 5. Key item / great rune: the base grant gives the goods row exactly as the seed's map
         //    sends it (for great runes: the boss-drop row 8148-8153 -- the restored rows 191-196
         //    cannot be AddItem'd, clients#392), plus vanilla obtained/restored companion flags from
         //    the keyitems table. Both classes are a unique good + set-only companion flags, so both
         //    map to KeyItem.
         let full_id = self.item_map.as_ref().and_then(|m| m.get(&ap_id)).copied();
-        let acq = crate::keyitems::acquire_flags(name);
         if !acq.is_empty()
             && let Some(fid) = full_id
         {
@@ -5014,7 +5025,7 @@ impl Core {
                 obtained_flags: acq,
             };
         }
-        // 5. Plain grant: mapped -> ledgered consumable; unmapped -> inert (region locks / boss keys
+        // 6. Plain grant: mapped -> ledgered consumable; unmapped -> inert (region locks / boss keys
         //    fell out at step 2 / are name-gated, so an unmapped id here is genuinely effect-less).
         match full_id {
             Some(fid) => {

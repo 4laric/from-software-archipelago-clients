@@ -174,6 +174,11 @@ pub enum ItemSemantics {
         goods: GoodsId,
         obtained_flags: Vec<FlagId>,
     },
+    /// A key whose complete functional state is observable through flags. Some Elden Ring builds
+    /// accept the corresponding AddItem call but never materialise the inventory row (the five
+    /// Whetblades on 1.17). Keeping the refused good in `unique_goods` would make convergence
+    /// impossible; the flags remain strict read-back/self-healing targets.
+    FlagOnlyKeyItem(Vec<FlagId>),
     /// A GREAT RUNE: an observable good plus its `restored` companion flag. The restored flag is
     /// ALSO an observable flag that self-heals independently (gf-great-rune-double-grant fix:
     /// grant the good ONCE, never re-emit while it is present).
@@ -417,6 +422,11 @@ impl DesiredState {
                     );
                     for &f in obtained_flags {
                         d.flags.insert(f, true); // obtained flags self-heal; never cleared (not owned)
+                    }
+                }
+                ItemSemantics::FlagOnlyKeyItem(fs) => {
+                    for &f in fs {
+                        d.flags.insert(f, true); // functional unlock flags; never cleared (not owned)
                     }
                 }
                 ItemSemantics::GreatRune {
@@ -1854,6 +1864,13 @@ mod tests {
             },
         }
     }
+    fn flag_only_key_item(index: ItemIndex, name: &str, flags: &[FlagId]) -> ReceivedItem {
+        ReceivedItem {
+            index,
+            name: name.into(),
+            semantics: ItemSemantics::FlagOnlyKeyItem(flags.to_vec()),
+        }
+    }
     fn goal_flag(index: ItemIndex, name: &str, flag: FlagId) -> ReceivedItem {
         ReceivedItem {
             index,
@@ -3042,6 +3059,30 @@ mod tests {
             !d.owned_flags.contains(&400001),
             "obtained flag not owned (never cleared)"
         );
+    }
+
+    #[test]
+    fn flag_only_key_item_requires_flags_but_never_an_unobservable_good() {
+        let d = DesiredState::build(&inputs(
+            "A",
+            vec![flag_only_key_item(
+                235,
+                "Black Whetblade",
+                &[65720, 65700, 65710],
+            )],
+            vec![],
+        ));
+        assert!(
+            d.unique_goods.is_empty(),
+            "a refused Whetblade inventory row must not prevent convergence"
+        );
+        for flag in [65720, 65700, 65710] {
+            assert_eq!(d.flags.get(&flag), Some(&true));
+            assert!(
+                !d.owned_flags.contains(&flag),
+                "affinity unlocks self-heal but are never cleared"
+            );
+        }
     }
 
     // ---- Gap 1: slot-data BULK grants (start graces / start items / reveal_all_maps / goal) ----
