@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 /// question is "ours, and from which writer family", not a per-row provenance database.
 pub const SRC_ENEMY_DROP_ROLL: u32 = 0b01;
 pub const SRC_SHOP: u32 = 0b10;
+pub const SRC_MINE_MATERIAL_ROLL: u32 = 0b100;
 
 /// Table capacity (power of two). Distinct ids recorded per seed are the enemy-drops POOL (a few
 /// hundred goods), the shop preview wares (~500 rows), and the infinite-stock reroll (455 rows) --
@@ -161,6 +162,9 @@ fn src_names(src: u32) -> String {
     }
     if src & SRC_SHOP != 0 {
         names.push("shop (shopPreviewGoods/shopInfiniteStock)");
+    }
+    if src & SRC_MINE_MATERIAL_ROLL != 0 {
+        names.push("mineMaterialRoll");
     }
     if names.is_empty() {
         format!("unknown bits {src:#x}")
@@ -310,6 +314,10 @@ mod tests {
         assert!(line.contains("goods FullID row 10101"), "{line}");
         assert!(line.contains("PRESENT"), "{line}");
         assert!(line.contains("enemyDropRoll"), "{line}");
+
+        record(goods_10101, SRC_MINE_MATERIAL_ROLL);
+        let line = annotate_value("register r13", 0x2_4000_2775).unwrap();
+        assert!(line.contains("mineMaterialRoll"), "{line}");
 
         // A band-shaped id nobody recorded annotates WITHOUT the membership claim (the weak half
         // of the signal, labeled as such).

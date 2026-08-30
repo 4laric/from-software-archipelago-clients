@@ -76,6 +76,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "checkLotZeroEnemy", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "apPlaceholderGoods", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "enemyDropRoll", shape: Shape::ListvalIntMap, required: false, greenfield: true },
+    ContractKey { name: "mineMaterialRoll", shape: Shape::ScalarIntMap, required: false, greenfield: true },
     ContractKey { name: "shopInfiniteStock", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "shopRunePrices", shape: Shape::ScalarIntMap, required: false, greenfield: true },
     ContractKey { name: "shopPreviewGoods", shape: Shape::ScalarIntMap, required: false, greenfield: true },
@@ -229,8 +230,8 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "13db0b3a";
-pub const APWORLD_VERSION_EXPECTED: &str = "0.5.4";
+pub const CONTRACT_HASH: &str = "8397a952";
+pub const APWORLD_VERSION_EXPECTED: &str = "0.5.5";
 
 #[cfg(test)]
 mod nested_grants_tests {
