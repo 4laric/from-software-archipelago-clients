@@ -166,6 +166,95 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         &self.ledger
     }
 
+    /// Human-readable, non-mutating rescue-console status. This intentionally
+    /// exposes stable contract/ledger facts rather than raw process addresses.
+    pub fn rescue_status(&mut self) -> Result<String> {
+        let context = self.backend.location_context()?;
+        let slot = self.ledger.slot(&self.seed_name, &self.slot_name);
+        let blocked = slot.map_or(0, |slot| slot.blocked_entries().count());
+        let cursor = slot.and_then(|slot| slot.highest_processed_index);
+        let context = match context {
+            Some(context) => format!(
+                "save={:?} gameplay_ready={}",
+                context.save_identity, context.gameplay_ready
+            ),
+            None => "save=<unvalidated> gameplay_ready=false".to_string(),
+        };
+        Ok(format!(
+            "seed={:?} slot={:?} {context} locations={} items={} receive_cursor={cursor:?} blocked={blocked}",
+            self.seed_name,
+            self.slot_name,
+            self.config.locations.len(),
+            self.config.items.len(),
+        ))
+    }
+
+    pub fn rescue_read_flag(&mut self, event_flag: u32) -> Result<String> {
+        let _ = self.require_runtime_context("rescue flag read")?;
+        let mapped = self
+            .config
+            .locations
+            .iter()
+            .any(|binding| binding.event_flag == event_flag);
+        anyhow::ensure!(
+            mapped,
+            "event flag {event_flag} is not in this seed contract"
+        );
+        let value = self
+            .backend
+            .read_event_flag(event_flag)?
+            .context("live event-flag accessor is unavailable")?;
+        Ok(format!("event flag {event_flag} = {value}"))
+    }
+
+    pub fn rescue_list_blocked(&self) -> String {
+        let Some(slot) = self.ledger.slot(&self.seed_name, &self.slot_name) else {
+            return "No receive ledger exists for this seed/slot yet.".to_string();
+        };
+        let rows = slot
+            .blocked_entries()
+            .map(|(index, item)| {
+                format!(
+                    "index={index} ap_item={} reason={}",
+                    item.ap_item_id,
+                    item.blocked.as_deref().unwrap_or("unknown")
+                )
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            "No parked deliveries.".to_string()
+        } else {
+            rows.join("\n")
+        }
+    }
+
+    pub fn rescue_retry_blocked(&mut self, index: u64) -> Result<()> {
+        let _ = self.require_runtime_context("rescue delivery retry")?;
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .requeue_blocked(index)?;
+        self.ledger.save(&self.ledger_path)
+    }
+
+    pub fn rescue_export(&self) -> Result<PathBuf> {
+        let output = self.ledger_path.with_file_name("rescue-diagnostics.json");
+        let slot = self.ledger.slot(&self.seed_name, &self.slot_name);
+        let document = json::json!({
+            "format": "bb-rescue-diagnostics-v1",
+            "runtime_build": crate::RUNTIME_BUILD,
+            "seed": self.seed_name,
+            "slot": self.slot_name,
+            "location_count": self.config.locations.len(),
+            "item_count": self.config.items.len(),
+            "ledger": slot,
+        });
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&output, json::to_vec_pretty(&document)?)?;
+        Ok(output)
+    }
+
     /// Validate and durably bind the game context shared by every read or
     /// mutation. `Ok(None)` is a normal non-gameplay transition; missing or
     /// mismatched identity is an actionable refusal.
