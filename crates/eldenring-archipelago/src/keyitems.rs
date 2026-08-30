@@ -94,7 +94,7 @@ const LEYNDELL_TWO_RUNES_FLAGS: &[u32] = &[105, 182];
 /// says so once instead of flooding the log. The bit clears when readback eventually confirms.
 static LEYNDELL_GATE_WARNED: AtomicU32 = AtomicU32::new(0);
 
-fn received_great_rune_count(received: &HashSet<String>) -> usize {
+pub fn received_great_rune_count(received: &HashSet<String>) -> usize {
     GREAT_RUNE_NAMES
         .iter()
         .filter(|name| received.contains(**name))

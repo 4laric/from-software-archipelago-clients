@@ -5375,6 +5375,20 @@ impl Core {
         // entirely in CALL ORDER at an impure site no er-logic test could observe.
         let open_coarse = self.open_coarse_regions();
 
+        // Leyndell has TWO independent gates in region-lock seeds: its AP Lock and the resolved
+        // AP Great Rune threshold. Both facts already drive enforcement; put their cumulative
+        // receive truth beside the other tracker ledgers so "I have four runes" cannot hide a
+        // missing Lock (or vice versa). A lockless / zero-threshold seed has no compound line.
+        let leyndell_gate_status = self.region.as_ref().and_then(|cfg| {
+            let lock_item = self.coarse_lock_items.get("Leyndell")?;
+            er_logic::region_lock::leyndell_gate_status(
+                lock_item,
+                received.contains(lock_item),
+                cfg.leyndell_runes_required,
+                crate::keyitems::received_great_rune_count(&received),
+            )
+        });
+
         // ---- Boss sweeps (Alaric, 2026-08-07: "display how many sweep checks are attached to a
         // boss"). A sweep is the single largest payout in the game -- 49 and 50 checks in one of
         // bobler's sessions -- and it was invisible until it fired. Assembled here, outside the
@@ -5640,6 +5654,9 @@ impl Core {
         if let Some(gs) = &goal_status {
             measured.push((format!("goal: {gs}"), false));
         }
+        if let Some(capital) = &leyndell_gate_status {
+            measured.push((capital.clone(), false));
+        }
         if let Some(line) = &scaling_here {
             measured.push((line.clone(), false));
         }
@@ -5727,6 +5744,9 @@ impl Core {
                 if let Some(gs) = &goal_status {
                     ui.text(format!("goal: {gs}"));
                 }
+                if let Some(capital) = &leyndell_gate_status {
+                    ui.text(capital);
+                }
                 if let Some((have, price)) = hud {
                     ui.text(format!("lock hints: {have}/{price} surface checks"));
                     if ui.is_item_hovered() {
@@ -5791,7 +5811,7 @@ impl Core {
                         Next::Idle => {}
                     }
                 }
-                if goal_status.is_some() || hud.is_some() {
+                if goal_status.is_some() || leyndell_gate_status.is_some() || hud.is_some() {
                     ui.separator();
                 }
                 // ---- where you are standing, and how hard it is ----------------------------

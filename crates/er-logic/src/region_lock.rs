@@ -32,6 +32,58 @@ pub fn leyndell_gate_flag_action(
     }
 }
 
+/// One-line tracker truth for Leyndell's compound AP Lock + Great Rune gate.
+///
+/// `runes_required == 0` means the synthetic rune wall is not armed, so there is no compound gate
+/// to explain. The caller supplies the resolved seed threshold and cumulative AP receive facts --
+/// the same inputs enforcement uses, never local shardbearer kills.
+pub fn leyndell_gate_status(
+    lock_item: &str,
+    lock_held: bool,
+    runes_required: usize,
+    runes_held: usize,
+) -> Option<String> {
+    if runes_required == 0 || lock_item.is_empty() {
+        return None;
+    }
+    let lock = if lock_held { "held" } else { "missing" };
+    let state = if lock_held && runes_held >= runes_required {
+        "open"
+    } else {
+        "closed"
+    };
+    Some(format!(
+        "Leyndell gate: {lock_item} {lock}; Great Runes {runes_held}/{runes_required} -- {state}"
+    ))
+}
+
+#[cfg(test)]
+mod leyndell_gate_status_tests {
+    use super::*;
+
+    #[test]
+    fn names_both_halves_of_the_compound_gate() {
+        assert_eq!(
+            leyndell_gate_status("Leyndell Lock", false, 4, 4).as_deref(),
+            Some("Leyndell gate: Leyndell Lock missing; Great Runes 4/4 -- closed")
+        );
+        assert_eq!(
+            leyndell_gate_status("Leyndell Lock", true, 4, 3).as_deref(),
+            Some("Leyndell gate: Leyndell Lock held; Great Runes 3/4 -- closed")
+        );
+        assert_eq!(
+            leyndell_gate_status("Leyndell Lock", true, 4, 4).as_deref(),
+            Some("Leyndell gate: Leyndell Lock held; Great Runes 4/4 -- open")
+        );
+    }
+
+    #[test]
+    fn an_unarmed_or_lockless_seed_has_no_compound_gate_line() {
+        assert_eq!(leyndell_gate_status("Leyndell Lock", true, 0, 7), None);
+        assert_eq!(leyndell_gate_status("", false, 2, 2), None);
+    }
+}
+
 /// Decide whether the player should be KICKED this tick: the current region is in a locked range
 /// AND the random-start guard allows it (non-random seed, or the random-start warp already done).
 ///
