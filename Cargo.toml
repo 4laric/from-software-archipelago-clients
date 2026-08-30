@@ -52,6 +52,7 @@ features = [
     # Win32_System_Diagnostics_ToolHelp: thread enumeration for the native-delivery
     # install atomicity protocol (crates/bb-archipelago/src/native/threads.rs).
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Console",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     # Media_Audio: the multiworld-pickup audio cue (client#336) — PlaySoundW + SND_* flags live in
