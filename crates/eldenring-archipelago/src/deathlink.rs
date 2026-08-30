@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use eldenring::cs::WorldChrMan;
-use er_logic::deathlink::KeepRunes;
+use er_logic::deathlink::{AmnestyCounter, KeepRunes};
 use fromsoftware_shared::FromStatic;
 
 /// Flag the baked `common.emevd` reactor (event 6996) watches: set on an incoming DeathLink -> the
@@ -31,19 +31,54 @@ static WAS_DEAD: AtomicBool = AtomicBool::new(false);
 /// Keep-runes decision state for incoming DeathLink deaths (see `drive_kill`). Single-threaded
 /// game-tick access; the `Mutex` just satisfies `static` mutability. Logic lives in er-logic.
 static KEEP_RUNES: Mutex<KeepRunes> = Mutex::new(KeepRunes::new());
+static INBOUND_AMNESTY: Mutex<AmnestyCounter> = Mutex::new(AmnestyCounter::new());
+static OUTBOUND_AMNESTY: Mutex<AmnestyCounter> = Mutex::new(AmnestyCounter::new());
 
 /// Set from slot_data `options.death_link` at connect.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
     log::info!("DeathLink: {}", if on { "ENABLED" } else { "off" });
 }
+
+pub fn set_amnesty(inbound_every: u32, outbound_every: u32) {
+    if let Ok(mut counter) = INBOUND_AMNESTY.lock() {
+        counter.configure(inbound_every);
+    }
+    if let Ok(mut counter) = OUTBOUND_AMNESTY.lock() {
+        counter.configure(outbound_every);
+    }
+    log::info!(
+        "DeathLink amnesty: inbound every {}, outbound every {}",
+        inbound_every.max(1),
+        outbound_every.max(1)
+    );
+}
+
+pub fn amnesty_configured() -> bool {
+    let inbound = INBOUND_AMNESTY
+        .lock()
+        .map(|counter| counter.every())
+        .unwrap_or(1);
+    let outbound = OUTBOUND_AMNESTY
+        .lock()
+        .map(|counter| counter.every())
+        .unwrap_or(1);
+    inbound > 1 || outbound > 1
+}
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
 /// A foreign DeathLink arrived (caller already applied the self-source guard): latch a kill.
-pub fn latch_incoming_kill() {
-    KILL_PENDING.store(true, Ordering::Relaxed);
+pub fn latch_incoming_kill() -> bool {
+    let admitted = INBOUND_AMNESTY
+        .lock()
+        .map(|mut counter| counter.admit())
+        .unwrap_or(true);
+    if admitted {
+        KILL_PENDING.store(true, Ordering::Relaxed);
+    }
+    admitted
 }
 
 /// Per-tick driver for INCOMING DeathLink. Two legs:
@@ -113,7 +148,17 @@ pub fn drive_kill(effective_enabled: bool) {
 pub fn poll_local_death() -> bool {
     let dead = read_local_death();
     let was = WAS_DEAD.swap(dead, Ordering::Relaxed);
-    dead && !was
+    if !(dead && !was) {
+        return false;
+    }
+    let admitted = OUTBOUND_AMNESTY
+        .lock()
+        .map(|mut counter| counter.admit())
+        .unwrap_or(true);
+    if !admitted {
+        log::info!("DeathLink: local death pardoned by outbound amnesty");
+    }
+    admitted
 }
 
 /// Typed access to the local player's current HP (fromsoftware-rs `eldenring` crate):

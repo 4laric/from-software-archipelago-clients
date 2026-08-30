@@ -1263,6 +1263,9 @@ impl shared::Core for Core {
                 // int-or-bool tolerant (er_logic::options): the apworld serializes options
                 // as ints (death_link: 1), which .as_bool() silently read as false.
                 crate::deathlink::set_enabled(er_logic::options::parse_death_link(sd));
+                let (inbound_amnesty, outbound_amnesty) =
+                    er_logic::options::parse_death_link_amnesty(sd);
+                crate::deathlink::set_amnesty(inbound_amnesty, outbound_amnesty);
                 crate::traps::set_trap_link_enabled(er_logic::options::parse_trap_link(sd));
                 // Region Sync (#1005): seamless-co-op region sharing. Same tolerant int-or-bool
                 // parse; absent (any seed rolled before this option) reads false, so the link is
@@ -4179,7 +4182,12 @@ impl shared::Core for Core {
                     // R2 (SWEEP H2): honor the slot's death_link option on the incoming side too.
                     if self.death_link_enabled() == Some(true) {
                         log::info!("DeathLink received from '{source}'");
-                        crate::deathlink::latch_incoming_kill();
+                        if !crate::deathlink::latch_incoming_kill() {
+                            log::info!(
+                                "DeathLink received from '{source}' but inbound amnesty pardoned it"
+                            );
+                            continue;
+                        }
                         // SAY IT ON SCREEN. This kills the player, and until now the only record
                         // was the log line above -- so a death with no visible cause reads as the
                         // mod misbehaving rather than as another world's death arriving. Both
