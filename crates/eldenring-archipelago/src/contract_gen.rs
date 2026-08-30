@@ -119,6 +119,8 @@ pub const CONTRACT: &[ContractKey] = &[
 /// Declared sub-keys of the top-level `options` echo (validated when `options` is present).
 pub const OPTIONS_SUBKEYS: &[ContractKey] = &[
     ContractKey { name: "death_link", shape: Shape::BoolOrInt, required: true, greenfield: true },
+    ContractKey { name: "death_link_amnesty_inbound", shape: Shape::Int, required: false, greenfield: true },
+    ContractKey { name: "death_link_amnesty_outbound", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "trap_link", shape: Shape::BoolOrInt, required: false, greenfield: true },
     ContractKey { name: "enable_dlc", shape: Shape::BoolOrInt, required: true, greenfield: true },
     ContractKey { name: "no_weapon_requirements", shape: Shape::BoolOrInt, required: true, greenfield: true },
