@@ -302,6 +302,10 @@ pub struct Core {
     /// refreshes identical text rather than stacking). `None` when the handshake was OK or the
     /// seed predates it.
     version_warn: Option<String>,
+    /// Presentation-only acknowledgement for [`version_warn`]. The mismatch remains logged and
+    /// visible in the menu/tracker; this only stops the full-width toast refresh for this
+    /// connection. Slot-data parsing resets it, so reconnecting makes the warning prominent again.
+    version_warn_acknowledged: bool,
     /// Last OBSERVED flask-upgrade count. `None` until primed: the count is history-agnostic, so
     /// the first observation after a connect is a baseline, not news.
     flask_seen: Option<usize>,
@@ -813,6 +817,7 @@ impl shared::Core for Core {
             toasts: er_logic::toast::Deck::new(4, 6000),
             toast_clock: std::time::Instant::now(),
             version_warn: None,
+            version_warn_acknowledged: false,
             flask_seen: None,
             region_toast_primed: false,
             icon_override_warned: false,
@@ -890,6 +895,16 @@ impl shared::Core for Core {
         }
         if ui.menu_item("Tracker (F6)") {
             self.tracker_visible = !self.tracker_visible;
+        }
+        if self.version_warn.is_some() {
+            let label = if self.version_warn_acknowledged {
+                "VERSION MISMATCH -- details (F6)"
+            } else {
+                "VERSION MISMATCH -- acknowledge in Tracker (F6)"
+            };
+            if ui.menu_item(label) {
+                self.tracker_visible = true;
+            }
         }
         // ---- lock-hint balance, issue #412 (the discoverability half) -------------------------
         // The economy shipped entirely behind three closed doors at once: a tracker window that
@@ -2150,6 +2165,10 @@ impl shared::Core for Core {
                 // Latch the contract-mismatch banner; the re-push lives beside the marker
                 // refusal's (the same persists-until-the-player-acts contract).
                 self.version_warn = version_warn;
+                // Per-CONNECTION acknowledgement: reconnecting must make a still-unsafe pairing
+                // prominent again, even when it is the same seed and `reset_for_new_seed` did not
+                // run.
+                self.version_warn_acknowledged = false;
                 // Phase 1 of the updater: one background fetch of /er/latest.json per session,
                 // fail-silent. Its toast (safe-mid-seed vs contract-moved) arrives via
                 // update_check::take_toast() in the tick below.
@@ -4645,9 +4664,11 @@ impl shared::Core for Core {
             }
             // Same re-push-every-tick contract for a version mismatch: the pairing stays wrong
             // for the whole session, and the deck refreshes identical text rather than stacking.
-            if let Some(warn) = self.version_warn.clone() {
-                let now = self.toast_clock.elapsed().as_millis() as u64;
-                self.toasts.push(warn, now);
+            if !self.version_warn_acknowledged {
+                if let Some(warn) = self.version_warn.clone() {
+                    let now = self.toast_clock.elapsed().as_millis() as u64;
+                    self.toasts.push(warn, now);
+                }
             }
             // The update verdict: ONE toast per session, not re-pushed -- "an update exists" is
             // news, not a condition the player must clear before playing.
@@ -5094,6 +5115,8 @@ impl Core {
         self.lock_hint_hud_at = 0;
         self.lock_hint_affordable_prev = None;
         self.lock_hint_intro_done = false;
+        self.version_warn = None;
+        self.version_warn_acknowledged = false;
         // Boss-lock mode A: drop the parsed defs AND re-arm the felled-edge state, so the new
         // seed re-parses bossLockItems and re-primes its baseline on the next in-world poll.
         self.boss_defs.clear();
@@ -5615,6 +5638,8 @@ impl Core {
         // Filter state as locals (the closure stays self-free); written back to self after.
         let mut in_logic_only = self.tracker_in_logic_only;
         let mut surface_only = self.tracker_surface_only;
+        let mismatch_warning = self.version_warn.clone();
+        let mut mismatch_acknowledged = self.version_warn_acknowledged;
         // bobler, 2026-08-10: "you forgot to resize the box though i have to drag it out to read".
         // 480 was never wide enough -- several header rows below compose a text and a widget with
         // `same_line()`, and imgui does not wrap, so the tail was simply clipped.
@@ -5736,6 +5761,16 @@ impl Core {
             .horizontal_scrollbar(true)
             .opened(&mut open)
             .build(|| {
+                if let Some(warning) = &mismatch_warning {
+                    ui.text_colored([1.0, 0.35, 0.2, 1.0], "VERSION MISMATCH -- UNSAFE PAIRING");
+                    ui.text_wrapped(warning);
+                    if mismatch_acknowledged {
+                        ui.text_disabled("Warning acknowledged for this connection; reconnecting will show it again.");
+                    } else if ui.small_button("I understand -- collapse on-screen warning###ack-version-mismatch") {
+                        mismatch_acknowledged = true;
+                    }
+                    ui.separator();
+                }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 if ui.collapsing_header(
                     &region_roster_header,
@@ -6146,6 +6181,16 @@ impl Core {
         }
         self.tracker_in_logic_only = in_logic_only;
         self.tracker_surface_only = surface_only;
+        if mismatch_acknowledged && !self.version_warn_acknowledged {
+            self.version_warn_acknowledged = true;
+            if let Some(warning) = &self.version_warn {
+                self.toasts.dismiss(warning);
+            }
+            self.log(ap::Print::message(
+                "Version mismatch warning acknowledged for this connection; pairing remains unsafe"
+                    .to_string(),
+            ));
+        }
     }
 
     /// Select the positive ReceivedItems frontier belonging to the live Elden Ring character.
