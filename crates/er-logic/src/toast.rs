@@ -123,6 +123,15 @@ impl Deck {
         self.items.is_empty()
     }
 
+    /// Remove a specific notice immediately.
+    ///
+    /// Persistent conditions normally refresh their notice every frame. A UI acknowledgement can
+    /// stop that refresh and call this once so the already-visible copy does not linger for the
+    /// remainder of its TTL.
+    pub fn dismiss(&mut self, text: &str) {
+        self.items.retain(|toast| toast.text != text);
+    }
+
     /// Fade factor in `0.0..=1.0` for a notice: solid until the last quarter of its life, then out.
     pub fn alpha(&self, t: &Toast, now_ms: u64) -> f32 {
         let age = now_ms.saturating_sub(t.born_ms);
@@ -229,6 +238,16 @@ mod tests {
         assert_eq!(d.visible().len(), 1, "refreshed, so still alive at 1200ms");
         d.expire(1500);
         assert!(d.is_empty(), "and gone once the REFRESHED lifetime elapses");
+    }
+
+    #[test]
+    fn dismiss_removes_only_the_named_notice() {
+        let mut d = Deck::new(4, 1000);
+        d.push("keep", 0);
+        d.push("dismiss", 0);
+        d.dismiss("dismiss");
+        let texts: Vec<&str> = d.visible().iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, vec!["keep"]);
     }
 
     #[test]
