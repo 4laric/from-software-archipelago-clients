@@ -37,6 +37,11 @@ pub struct Overlay<G: Game> {
     /// been initialized and the viewport has a non-zero size.
     viewport_size: Option<[f32; 2]>,
 
+    /// Whether ImGui has been pointed at the stable, mod-local ini file. Without this, window
+    /// placement is process-local (or depends on the game's working directory), so the main
+    /// overlay returns to the top-right corner every launch (#436).
+    ini_configured: bool,
+
     /// The URL field in the modal connection popup.
     popup_url: String,
 
@@ -220,6 +225,7 @@ impl<G: Game> Overlay<G> {
             // Default values. We can't use [Default::default] because G doesn't
             // require `Default`.
             viewport_size: None,
+            ini_configured: false,
             popup_url: Default::default(),
             popup_slot: Default::default(),
             popup_password: Default::default(),
@@ -332,6 +338,14 @@ impl<G: Game> Overlay<G> {
         ctx: &mut Context,
         _render_context: &'a mut dyn RenderContext,
     ) {
+        if !self.ini_configured {
+            match crate::utils::mod_directory() {
+                Ok(dir) => ctx.set_ini_filename(Some(dir.join("ap-overlay.ini"))),
+                Err(err) => warn!("overlay: cannot persist window placement: {err:#}"),
+            }
+            // A discovery failure is stable for this process; do not repeat it every frame.
+            self.ini_configured = true;
+        }
         self.frames_since_new_logs += 1;
         self.viewport_size = match ctx.main_viewport().size {
             [0., 0.] => None,
