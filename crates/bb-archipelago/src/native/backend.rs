@@ -376,7 +376,15 @@ impl BloodborneBackend for NativeBackend {
             .grant_with_warning(request, &mut |line: &str| client_eprintln!("{line}"))?;
         match step {
             GrantStep::Pending => Ok(OperationProgress::Pending),
-            GrantStep::Complete => Ok(OperationProgress::Complete),
+            GrantStep::Complete => {
+                if self.delivery.last_completion_went_to_storage(&grant.tag) {
+                    client_eprintln!(
+                        "Delivered AP item {} to storage because it did not enter held inventory. Check the storage box in the Hunter's Dream.",
+                        grant.tag
+                    );
+                }
+                Ok(OperationProgress::Complete)
+            }
             GrantStep::Failed { status, detail } => Err(GrantTerminalFailure {
                 tag: grant.tag.clone(),
                 status,
