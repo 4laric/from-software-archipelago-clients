@@ -185,6 +185,38 @@ pub fn status_line(d: &Decision, goal_region: &str) -> String {
     }
 }
 
+/// Player-facing tracker copy for the deliberately withheld goal-region Lock.
+///
+/// Unlike [`status_line`], this must explain the design rather than merely report the gate's
+/// decision: the player will search the multiworld for a familiar `<Region> Lock` unless the one
+/// surface they use to find Locks says that this one was never placed.
+pub fn tracker_status(d: &Decision, goal_lock_item: &str) -> String {
+    let goal_region = goal_lock_item
+        .strip_suffix(" Lock")
+        .filter(|name| !name.is_empty())
+        .unwrap_or("the goal region");
+    match d {
+        Decision::Withhold { outstanding } => {
+            let (noun, verb) = if outstanding.len() == 1 {
+                ("requirement", "is")
+            } else {
+                ("requirements", "are")
+            };
+            format!(
+                "{goal_lock_item} is automatic (not in the pool) -- {goal_region} opens when the {} outstanding {noun} {verb} met: {}",
+                outstanding.len(),
+                outstanding.join(", ")
+            )
+        }
+        Decision::Open => format!(
+            "{goal_lock_item} is automatic (not in the pool) -- requirements met; {goal_region} is open"
+        ),
+        Decision::OpenUnresolvable { .. } => "goal-region Lock is automatic (not in the pool) -- \
+             gate data did not resolve; the goal region was opened fail-safe"
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +393,40 @@ mod tests {
         assert!(s.contains("Ashen Capital"), "{s}");
         let open = status_line(&decide(&g, &holding(&["Caelid Lock"])), "Ashen Capital");
         assert!(open.contains("opening"), "{open}");
+    }
+
+    #[test]
+    fn tracker_explains_that_the_goal_lock_was_never_placed() {
+        let shut = Decision::Withhold {
+            outstanding: vec!["Caelid Lock".to_string(), "Great Runes (1/2)".to_string()],
+        };
+        let line = tracker_status(&shut, "Ashen Capital Lock");
+        assert!(
+            line.contains("Ashen Capital Lock is automatic (not in the pool)"),
+            "{line}"
+        );
+        assert!(line.contains("2 outstanding requirements"), "{line}");
+        assert!(line.contains("Caelid Lock"), "{line}");
+        assert!(line.contains("Great Runes (1/2)"), "{line}");
+
+        let open = tracker_status(&Decision::Open, "Ashen Capital Lock");
+        assert!(open.contains("requirements met"), "{open}");
+        assert!(open.contains("Ashen Capital is open"), "{open}");
+
+        let one = tracker_status(
+            &Decision::Withhold {
+                outstanding: vec!["Caelid Lock".to_string()],
+            },
+            "Ashen Capital Lock",
+        );
+        assert!(one.contains("1 outstanding requirement "), "{one}");
+    }
+
+    #[test]
+    fn unresolved_tracker_copy_does_not_invent_a_lock_name() {
+        let line = tracker_status(&Decision::OpenUnresolvable { why: "missing" }, "");
+        assert!(line.contains("goal-region Lock"), "{line}");
+        assert!(line.contains("opened fail-safe"), "{line}");
+        assert!(!line.contains("Ashen Capital"), "{line}");
     }
 }
