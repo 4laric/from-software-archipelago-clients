@@ -122,6 +122,11 @@ pub const PROBES: &[(&str, Probe)] = &[
     // live rather than merely compiled in. The world declares this tag only when the option is on,
     // so `false` here is a genuine dark feature and not a seed that never asked.
     ("region_sync", |_| crate::region_sync::is_enabled()),
+    // The world declares this only when either cadence is above the compatibility default. Read
+    // back the configured counters themselves so a missing options payload reports dark.
+    ("death_link_amnesty", |_| {
+        crate::deathlink::amnesty_configured()
+    }),
     // Parsed per connect into Core. Non-empty means wrapper receipt has concrete members to apply.
     ("armor_bundles", |c| c.armor_bundles),
     ("region_completion_goal_gate", |c| {

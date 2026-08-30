@@ -101,6 +101,10 @@ pub const SUPPORTED: &[&str] = &[
     // broken rather than the client being old. So the seed declares the tag and an older build
     // refuses loudly -- the same call `trap_link` makes, for the same reason.
     "region_sync",
+    // options.death_link_amnesty_{inbound,outbound}: separate one-in-N gates for received and
+    // locally broadcast deaths. A seed only declares this when either cadence exceeds 1; an older
+    // client would silently link every death, the exact opposite of the requested safety valve.
+    "death_link_amnesty",
     // armorBundles -> synthetic wrapper receipt reconciles every observable protector member.
     "armor_bundles",
     "region_completion_goal_gate",

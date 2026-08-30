@@ -38,6 +38,7 @@ fn real_generated_slot_data_parses_through_every_er_logic_consumer() {
     );
     let _ = er_logic::options::parse_dlc(&sd);
     let _ = er_logic::options::parse_death_link(&sd);
+    let _ = er_logic::options::parse_death_link_amnesty(&sd);
 
     // --- version gate string ---
     let versions = sd

@@ -30,6 +30,25 @@ pub fn parse_death_link(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "death_link")
 }
 
+fn parse_positive_u32_option(slot_data: &Value, key: &str) -> u32 {
+    slot_data
+        .get("options")
+        .and_then(|o| o.get(key))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// Independent one-in-N DeathLink cadences: `(inbound, outbound)`. Missing or malformed values
+/// preserve historical behavior by admitting every event.
+pub fn parse_death_link_amnesty(slot_data: &Value) -> (u32, u32) {
+    (
+        parse_positive_u32_option(slot_data, "death_link_amnesty_inbound"),
+        parse_positive_u32_option(slot_data, "death_link_amnesty_outbound"),
+    )
+}
+
 /// `options.trap_link` (int-or-bool).
 pub fn parse_trap_link(slot_data: &Value) -> bool {
     parse_bool_option(slot_data, "trap_link")
@@ -185,6 +204,27 @@ mod tests {
         let sd = json!({ "options": { "enable_dlc": 0, "death_link": 1 } });
         assert!(!parse_dlc(&sd));
         assert!(parse_death_link(&sd));
+    }
+
+    #[test]
+    fn death_link_amnesty_parses_independent_positive_cadences() {
+        let sd = json!({
+            "options": {
+                "death_link_amnesty_inbound": 2,
+                "death_link_amnesty_outbound": 5
+            }
+        });
+        assert_eq!(parse_death_link_amnesty(&sd), (2, 5));
+        assert_eq!(parse_death_link_amnesty(&json!({ "options": {} })), (1, 1));
+        assert_eq!(
+            parse_death_link_amnesty(&json!({
+                "options": {
+                    "death_link_amnesty_inbound": 0,
+                    "death_link_amnesty_outbound": "three"
+                }
+            })),
+            (1, 1)
+        );
     }
 
     #[test]

@@ -3,6 +3,48 @@
 
 use crate::hook::GameHook;
 
+/// Independent one-in-N admission counter for a DeathLink direction. `every = 1` preserves the
+/// historical behavior: every event is admitted. Counts are session-local; reconnecting resets
+/// both directions through the client's slot-data configuration path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmnestyCounter {
+    every: u32,
+    seen: u32,
+}
+
+impl AmnestyCounter {
+    pub const fn new() -> Self {
+        Self { every: 1, seen: 0 }
+    }
+
+    /// Install a new cadence and reset its phase. Zero is invalid on the wire and degrades to the
+    /// compatibility default rather than creating a divide-by-zero or an always-pardoned link.
+    pub fn configure(&mut self, every: u32) {
+        self.every = every.max(1);
+        self.seen = 0;
+    }
+
+    /// Count one event and admit exactly every Nth event.
+    pub fn admit(&mut self) -> bool {
+        self.seen = self.seen.saturating_add(1);
+        self.seen.is_multiple_of(self.every)
+    }
+
+    pub fn every(&self) -> u32 {
+        self.every
+    }
+
+    pub fn seen(&self) -> u32 {
+        self.seen
+    }
+}
+
+impl Default for AmnestyCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Cross-tick DeathLink state (replaces the `static AtomicBool`s `KILL_PENDING`/`SEND_PENDING`/
 /// `WAS_DEAD`).
 #[derive(Default)]
@@ -153,6 +195,39 @@ impl KeepRunes {
 mod tests {
     use super::*;
     use crate::hook::{fake::FakeGame, DEATHLINK_KILL_FLAG};
+
+    #[test]
+    fn amnesty_one_preserves_every_event() {
+        let mut counter = AmnestyCounter::new();
+        assert!(counter.admit());
+        assert!(counter.admit());
+        assert_eq!((counter.every(), counter.seen()), (1, 2));
+    }
+
+    #[test]
+    fn amnesty_admits_exactly_every_nth_event() {
+        let mut counter = AmnestyCounter::new();
+        counter.configure(3);
+        assert_eq!(
+            (0..7).map(|_| counter.admit()).collect::<Vec<_>>(),
+            vec![false, false, true, false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn amnesty_directions_are_independent_and_reconfigure_resets_phase() {
+        let mut inbound = AmnestyCounter::new();
+        let mut outbound = AmnestyCounter::new();
+        inbound.configure(2);
+        outbound.configure(3);
+        assert!(!inbound.admit());
+        assert!(inbound.admit());
+        assert!(!outbound.admit());
+        assert_eq!((inbound.seen(), outbound.seen()), (2, 1));
+        inbound.configure(0);
+        assert_eq!((inbound.every(), inbound.seen()), (1, 0));
+        assert!(inbound.admit());
+    }
 
     #[test]
     fn incoming_kill_sets_dedicated_flag_not_hp() {
