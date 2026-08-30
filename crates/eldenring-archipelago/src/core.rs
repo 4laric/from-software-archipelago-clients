@@ -4664,11 +4664,11 @@ impl shared::Core for Core {
             }
             // Same re-push-every-tick contract for a version mismatch: the pairing stays wrong
             // for the whole session, and the deck refreshes identical text rather than stacking.
-            if !self.version_warn_acknowledged {
-                if let Some(warn) = self.version_warn.clone() {
-                    let now = self.toast_clock.elapsed().as_millis() as u64;
-                    self.toasts.push(warn, now);
-                }
+            if !self.version_warn_acknowledged
+                && let Some(warn) = self.version_warn.clone()
+            {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(warn, now);
             }
             // The update verdict: ONE toast per session, not re-pushed -- "an update exists" is
             // news, not a condition the player must clear before playing.
