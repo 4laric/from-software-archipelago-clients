@@ -233,6 +233,22 @@ arming — still need the probe, because those conditions do not arise on their
 own during play. The passive file answers the question the probe cannot: what
 the distribution looks like across a real session.
 
+### Zero-Vial diagnostic (bb-archipelago#70)
+
+Native sessions also append read-only samples to `blood-vial-capture.jsonl`
+beside the ledger. Every five seconds it records whether a canonical
+`0x400003E8` Vial stack exists and includes any inventory row whose low item id
+is 1000. This deliberately includes the known shop-only/HUD collision without
+mistaking it for a stack. When a natural enemy or world pickup creates the
+canonical row, the existing game-thread resolver captures its read-only backing
+object bytes. The diagnostic never stages or grants a Vial.
+
+For the dedicated capture: begin at zero Vials, leave the client running for
+one heartbeat, buy the first shop Vial, wait for another heartbeat, then obtain
+one Vial from an enemy or world pickup and wait five seconds. Send
+`blood-vial-capture.jsonl` with `client.log`. Discarding the throwaway save is
+still recommended; absent-stack AP Vial insertion remains refused.
+
 Replay recovery is **coordinated with the receive ledger**, not a parallel
 store: `grant_item` feeds the ledger-derived `expected_before`
 (`SlotLedger::delivered_quantity`) straight into the delivery machine, so a

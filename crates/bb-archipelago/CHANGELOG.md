@@ -2,6 +2,12 @@
 
 ### Changed
 
+* **A read-only zero-Blood-Vial diagnostic is ready for bb-archipelago#70.**
+  Native sessions sample Vial-shaped inventory rows every five seconds into
+  `blood-vial-capture.jsonl`, distinguish the known shop/HUD low-ID collision
+  from a canonical stack, and capture the backing object when a natural world
+  pickup creates that stack. The unsafe absent-stack insertion remains refused.
+
 * **The Bloodborne client window is translucent by default.** Its console now
   starts at 85% opacity so it can remain visible over the game without hiding
   the action. `--window-opacity 35-100` tunes it; 100 keeps the traditional

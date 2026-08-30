@@ -40,6 +40,7 @@ use super::flag_gate::FlagGate;
 use super::gem_capture::GemCapture;
 use super::guest::GuestRuntime;
 use super::mem::NativeMemory;
+use super::vial_capture::VialCapture;
 
 /// Consecutive gameplay-ready probes required before the unsafe assumed-save
 /// mode reports readiness. Mirrors `FileBackend`.
@@ -96,6 +97,7 @@ pub struct NativeBackend {
     /// the value this backend already returned to the loop this iteration.
     last_context: GrantContext,
     gem_capture: Option<GemCapture>,
+    vial_capture: Option<VialCapture>,
 }
 
 impl NativeBackend {
@@ -133,6 +135,15 @@ impl NativeBackend {
                 self.gem_capture = Some(capture);
             }
             Err(error) => client_eprintln!("Blood-gem diagnostics unavailable: {error}"),
+        }
+        match VialCapture::beside_ledger(ledger) {
+            Ok(capture) => {
+                client_eprintln!(
+                    "Zero-Vial diagnostics: read-only samples stream beside the ledger to blood-vial-capture.jsonl (bb-archipelago#70)."
+                );
+                self.vial_capture = Some(capture);
+            }
+            Err(error) => client_eprintln!("Zero-Vial diagnostics unavailable: {error}"),
         }
     }
 
@@ -285,21 +296,36 @@ impl NativeBackend {
             absent_observations: std::collections::HashMap::new(),
             last_context: GrantContext::default(),
             gem_capture: None,
+            vial_capture: None,
         })
     }
 }
 
 impl BloodborneBackend for NativeBackend {
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
-        if let Some(capture) = &mut self.gem_capture {
-            let generated = capture.observe(self.delivery.runtime_mut().inventory_entries());
-            let candidate = generated.into_iter().next();
+        let entries = self.delivery.runtime_mut().inventory_entries();
+        let vial_candidate = self
+            .vial_capture
+            .as_mut()
+            .and_then(|capture| capture.observe(entries.clone()));
+        let gem_candidate = self
+            .gem_capture
+            .as_mut()
+            .and_then(|capture| capture.observe(entries).into_iter().next());
+        if self.vial_capture.is_some() || self.gem_capture.is_some() {
+            let candidate = vial_candidate.or(gem_candidate);
             if let Some(probe) = self
                 .delivery
                 .runtime_mut()
                 .probe_generated_object(candidate)
             {
-                capture.record_generated_object(&probe);
+                if probe.entry.word(4) == 0x4000_03E8 {
+                    if let Some(capture) = &mut self.vial_capture {
+                        capture.record_generated_object(&probe);
+                    }
+                } else if let Some(capture) = &mut self.gem_capture {
+                    capture.record_generated_object(&probe);
+                }
             }
         }
         let result = self.location_context_inner();
