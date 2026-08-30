@@ -2,6 +2,13 @@
 
 ### Changed
 
+* **A read-only shop-enablement diagnostic is ready for the next playtest.**
+  Native sessions write `shop-capture.jsonl` beside the ledger, recording exact
+  inventory-row transitions and five-second snapshots of the Hunter Chief
+  Emblem, workshop tools, and hunter badges. A badge acquisition followed by a
+  natural shop purchase now gives us the live evidence needed to map stock
+  unlocks and purchase descriptors without modifying the save.
+
 * **A read-only zero-Blood-Vial diagnostic is ready for bb-archipelago#70.**
   Native sessions sample Vial-shaped inventory rows every five seconds into
   `blood-vial-capture.jsonl`, distinguish the known shop/HUD low-ID collision

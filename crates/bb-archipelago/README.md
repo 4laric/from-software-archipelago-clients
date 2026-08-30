@@ -249,6 +249,23 @@ one Vial from an enemy or world pickup and wait five seconds. Send
 `blood-vial-capture.jsonl` with `client.log`. Discarding the throwaway save is
 still recommended; absent-stack AP Vial insertion remains refused.
 
+### Shop-enablement diagnostic
+
+Native sessions also append a read-only `shop-capture.jsonl` beside the ledger.
+It records inventory transitions in full and keeps a five-second focused
+heartbeat for the Hunter Chief Emblem, workshop tools, and hunter badges. This
+is the live witness needed before general shop randomization: it distinguishes
+the inventory good that unlocks a shelf from the exact descriptor and quantity
+record created by a natural purchase. It never edits shop rows, inventory, or
+event flags.
+
+For the dedicated capture, wait for one heartbeat before acquiring a badge,
+acquire it naturally or through AP, wait five seconds, open the Bath Messenger
+shop and note which new wares appear, then buy one newly unlocked item and wait
+for one final heartbeat. Send `shop-capture.jsonl` with `client.log` and report
+the badge and purchased item names. A throwaway save is recommended so the
+before/after shelf comparison is unambiguous.
+
 Replay recovery is **coordinated with the receive ledger**, not a parallel
 store: `grant_item` feeds the ledger-derived `expected_before`
 (`SlotLedger::delivered_quantity`) straight into the delivery machine, so a
