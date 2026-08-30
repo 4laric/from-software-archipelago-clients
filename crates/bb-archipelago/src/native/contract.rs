@@ -622,9 +622,10 @@ mod tests {
         assert_eq!(detour.bytes.len(), 7);
         assert_eq!(detour.bytes[0], 0xE9); // jmp rel32
         // The consume cave relocates its validated native routine calls as
-        // 8-byte quadwords; r7 adds the equipment allocator/resolver lookups.
+        // 8-byte quadwords; the diagnostic payload has a second, read-only
+        // resolver call for naturally generated category instances.
         let cave = c.blobs.iter().find(|b| b.name == "consume_cave").unwrap();
-        assert_eq!(cave.relocations.len(), 6);
+        assert_eq!(cave.relocations.len(), 7);
         assert!(cave.relocations.iter().all(|r| r.width == 8));
     }
 

@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::guest::InventoryEntry;
+use super::guest::{GeneratedObjectProbe, InventoryEntry};
 
 pub struct GemCapture {
     file: File,
@@ -32,8 +32,10 @@ impl GemCapture {
         })
     }
 
-    pub fn observe(&mut self, entries: Option<Vec<InventoryEntry>>) {
-        let Some(entries) = entries else { return };
+    pub fn observe(&mut self, entries: Option<Vec<InventoryEntry>>) -> Vec<InventoryEntry> {
+        let Some(entries) = entries else {
+            return Vec::new();
+        };
         let current: BTreeMap<_, _> = entries
             .into_iter()
             .map(|entry| (entry.slot, entry))
@@ -45,7 +47,7 @@ impl GemCapture {
                 "occupied_slots": current.len(), "entries": rows,
             }));
             self.previous = Some(current);
-            return;
+            return Vec::new();
         }
         let previous = self.previous.as_ref().unwrap();
         let slots: BTreeSet<_> = previous.keys().chain(current.keys()).copied().collect();
@@ -63,12 +65,34 @@ impl GemCapture {
                 })
             })
             .collect::<Vec<_>>();
+        // Retain the concrete records before mutably borrowing the logger.
+        let generated = current
+            .iter()
+            .filter(|(slot, entry)| {
+                previous.get(slot) != Some(*entry) && entry.word(4) & 0xF000_0000 == 0x1000_0000
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect();
         if !deltas.is_empty() {
             self.write(json::json!({
                 "event": "inventory_delta", "at_unix_ms": now_ms(), "deltas": deltas,
             }));
         }
+        // Return concrete newly-added category-8-shaped records to the
+        // game-thread resolver probe. Inventory JSON values above are for the
+        // log only; retain the original records here.
         self.previous = Some(current);
+        generated
+    }
+
+    pub fn record_generated_object(&mut self, probe: &GeneratedObjectProbe) {
+        self.write(json::json!({
+            "event": "generated_object",
+            "at_unix_ms": now_ms(),
+            "entry": entry_json(&probe.entry),
+            "backing_address": format!("0x{:X}", probe.address),
+            "backing_bytes": probe.bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" "),
+        }));
     }
 
     fn write(&mut self, value: json::Value) {
@@ -129,7 +153,8 @@ mod tests {
         let ledger = root.join("ledger.json");
         let mut capture = GemCapture::beside_ledger(&ledger).unwrap();
         capture.observe(Some(vec![entry(4, 0x4000_03E8)]));
-        capture.observe(Some(vec![entry(4, 0x4000_03E8), entry(9, 0x8001_E078)]));
+        let generated = capture.observe(Some(vec![entry(4, 0x4000_03E8), entry(9, 0x1001_E078)]));
+        assert_eq!(generated.len(), 1);
         drop(capture);
 
         let text = std::fs::read_to_string(root.join("blood-gem-capture.jsonl")).unwrap();
@@ -139,7 +164,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rows[0]["event"], "baseline");
         assert_eq!(rows[1]["event"], "inventory_delta");
-        assert_eq!(rows[1]["deltas"][0]["after"]["normalized_id"], "0x8001E078");
+        assert_eq!(rows[1]["deltas"][0]["after"]["normalized_id"], "0x1001E078");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
