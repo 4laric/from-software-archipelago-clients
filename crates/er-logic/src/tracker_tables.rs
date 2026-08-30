@@ -84,6 +84,34 @@ impl TrackerTables {
     }
 }
 
+/// The authoritative region roster for this seed (#1129).
+///
+/// `lock_items` is derived only from regions represented in this seed's `locationRegions`; the
+/// generated `REGION_LOCKS` table is the complete vocabulary. Their difference therefore means
+/// "intentionally excluded", not "the Lock is remote". Keep that distinction pure and tested so
+/// the overlay never tries to infer it from which items the player has received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionRoster {
+    pub included: Vec<String>,
+    pub excluded: Vec<String>,
+}
+
+pub fn region_roster(lock_items: &HashMap<RegionId, String>) -> RegionRoster {
+    let mut included: Vec<String> = crate::region_locks::REGION_LOCKS
+        .iter()
+        .filter(|row| lock_items.contains_key(row.region))
+        .map(|row| row.region.to_string())
+        .collect();
+    let mut excluded: Vec<String> = crate::region_locks::REGION_LOCKS
+        .iter()
+        .filter(|row| !lock_items.contains_key(row.region))
+        .map(|row| row.region.to_string())
+        .collect();
+    included.sort();
+    excluded.sort();
+    RegionRoster { included, excluded }
+}
+
 /// Why the tables look the way they do. The caller logs this ONCE at connect: a feature is armed,
 /// or it says why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +237,23 @@ mod tests {
     #[test]
     fn agreeing_goal_locations_resolve_to_one_lock() {
         assert_eq!(tt().goal_lock_item(&[10, 11, 12]), Some("Enir Ilim Lock"));
+    }
+
+    #[test]
+    fn roster_distinguishes_an_unreceived_lock_from_an_excluded_region() {
+        let mut locks = HashMap::new();
+        locks.insert("Stormveil".to_string(), "Stormveil Lock".to_string());
+        locks.insert("Weeping".to_string(), "Weeping Lock".to_string());
+
+        let roster = region_roster(&locks);
+        assert!(roster.included.contains(&"Stormveil".to_string()));
+        assert!(roster.included.contains(&"Weeping".to_string()));
+        assert!(!roster.excluded.contains(&"Stormveil".to_string()));
+        assert!(roster.excluded.contains(&"Haligtree".to_string()));
+        assert_eq!(
+            roster.included.len() + roster.excluded.len(),
+            crate::region_locks::REGION_LOCKS.len()
+        );
     }
 
     /// 🛑 TWO REGIONS IS NOT ONE ARENA. Same rule `describe_goal` uses when it declines to name a

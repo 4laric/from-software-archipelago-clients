@@ -5374,6 +5374,16 @@ impl Core {
         // not computed yet. Same shape as the weapons-hold ordering bug -- that defect lived
         // entirely in CALL ORDER at an impure site no er-logic test could observe.
         let open_coarse = self.open_coarse_regions();
+        // `coarse_lock_items` is seed-scoped: a key exists whether its Lock is local, remote,
+        // received, or still unhinted. Comparing it with the generated complete vocabulary gives
+        // the one distinction the server's generic `!hint` error cannot explain (#1129): a region
+        // absent here was intentionally excluded by num_regions and has no Lock in this seed.
+        let region_roster = er_logic::tracker_tables::region_roster(&self.coarse_lock_items);
+        let region_roster_header = format!(
+            "regions in seed: {}/{} (expand for included/excluded)",
+            region_roster.included.len(),
+            region_roster.included.len() + region_roster.excluded.len()
+        );
 
         // Leyndell has TWO independent gates in region-lock seeds: its AP Lock and the resolved
         // AP Great Rune threshold. Both facts already drive enforcement; put their cumulative
@@ -5636,6 +5646,7 @@ impl Core {
         // drifts costs width, never correctness, because the floor only ever grows the window.
         let mut measured: Vec<(String, bool)> = vec![
             (format!("checks: {}/{}", model.done, model.total), false),
+            (region_roster_header.clone(), false),
             (
                 format!(
                     "in-logic: {}/{}   surface: {}/{}",
@@ -5726,6 +5737,26 @@ impl Core {
             .opened(&mut open)
             .build(|| {
                 ui.text(format!("checks: {}/{}", model.done, model.total));
+                if ui.collapsing_header(
+                    &region_roster_header,
+                    imgui::TreeNodeFlags::empty(),
+                ) {
+                    ui.text_wrapped(format!(
+                        "Included (their Locks exist): {}",
+                        region_roster.included.join(", ")
+                    ));
+                    if region_roster.excluded.is_empty() {
+                        ui.text("Excluded: none");
+                    } else {
+                        ui.text_wrapped(format!(
+                            "Excluded (no Lock; intentionally inaccessible): {}",
+                            region_roster.excluded.join(", ")
+                        ));
+                    }
+                    ui.text_disabled(
+                        "An included Lock may still be remote or unhinted. An excluded Lock does not exist in this multiworld.",
+                    );
+                }
                 ui.text(format!(
                     "in-logic: {}/{}   surface: {}/{}",
                     model.in_logic_done,
