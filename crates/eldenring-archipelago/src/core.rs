@@ -1574,6 +1574,30 @@ impl shared::Core for Core {
                     }
                 }
 
+                // mineMaterialRoll: {"<ItemLotParam_map row>": goodsId}. These are the 11 placed,
+                // unflagged, repeatable mine-asset templates. Configure even when absent/empty so a
+                // reconnect from an enabled seed to a disabled one cannot retain the old table.
+                {
+                    let roll: std::collections::HashMap<u32, i32> = sd
+                        .get("mineMaterialRoll")
+                        .and_then(|value| value.as_object())
+                        .map(|map| {
+                            map.iter()
+                                .filter_map(|(key, value)| {
+                                    Some((key.parse::<u32>().ok()?, value.as_i64()? as i32))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for &goods in roll.values() {
+                        shared::seed_ids::record(
+                            er_codec::CATEGORY_GOODS | goods as u32,
+                            shared::seed_ids::SRC_MINE_MATERIAL_ROLL,
+                        );
+                    }
+                    crate::mine_materials::configure(roll);
+                }
+
                 // checkLotBlank {"<lot id>": [goods slot idx, ...]} + apPlaceholderGoods.
                 // Repoints each CHECK lot's goods slot at ONE placeholder id, which detour.rs then
                 // suppresses UNCONDITIONALLY -- so the vanilla ware is never handed out at a check, and
@@ -4443,6 +4467,7 @@ impl shared::Core for Core {
             // affinity flag keyitems sets (the false-collect this split exists to kill).
             crate::whetblade_lots::reset();
             crate::enemy_drops::reset();
+            crate::mine_materials::reset();
             // THE CTD (2026-07-24, symbolized): the inventory pointer grant_full_id hands to the
             // game's AddItemFunc is captured once and was trusted forever. A load frees that
             // object, so the next grant made the GAME dereference freed memory
@@ -4617,6 +4642,7 @@ impl shared::Core for Core {
             let _ = crate::shop_sell::run();
             let _ = crate::shop_stock::run();
             let _ = crate::enemy_drops::run();
+            let _ = crate::mine_materials::run();
             let _ = crate::check_lots::run();
             // The whetblade check-flag split (repoint getItemFlagId; see whetblade_lots.rs).
             let _ = crate::whetblade_lots::run();

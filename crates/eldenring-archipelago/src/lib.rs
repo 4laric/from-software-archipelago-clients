@@ -38,6 +38,7 @@ mod key_resolver;
 mod keyitems;
 mod lock_hints;
 mod merchant_bells;
+mod mine_materials;
 mod minibaker;
 mod no_equip_load;
 mod no_fall_damage;
