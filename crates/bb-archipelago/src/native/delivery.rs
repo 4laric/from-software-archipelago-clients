@@ -435,15 +435,25 @@ impl<R: Runtime> GrantSession<R> {
         if self.instance_insert {
             return self.verify_instance_insert(&command, native_result, record);
         }
-        // The insert lane can accept the reported slot as the witness: a
-        // freshly inserted stack holding at least `quantity` of the right id
-        // IS the grant. The delta lane cannot -- an existing stack of 5 that
+        // The insert lane can accept ItemGrant's non-empty return as the
+        // witness. Oz's 2026-08-29 playtest proved that a successful insert
+        // may be routed to storage: ItemGrant returned a real slot while both
+        // the held-stack scan and the held-array slot read remained empty.
+        // Requiring a held record therefore parked an item the game had
+        // accepted. Descriptor validation has already happened before this
+        // point, so this does not revive the invisible-record canaries.
+        //
+        // A matching freshly inserted held record remains useful evidence,
+        // but is no longer required when ItemGrant itself returned success.
+        // The delta lane cannot use this rule -- an existing stack of 5 that
         // is owed 2 more already satisfies `q >= quantity` before the delta
         // lands, so the shortcut would report `completed` on an unapplied
         // grant. There the read-back total is the only honest witness.
-        let slot_verified = !self.delta_lane
-            && record.normalized_id == Some(command.normalized_id)
-            && record.quantity.is_some_and(|q| q >= command.quantity);
+        let insert_accepted = !self.delta_lane && native_result != EMPTY_SLOT;
+        let slot_verified = insert_accepted
+            || (!self.delta_lane
+                && record.normalized_id == Some(command.normalized_id)
+                && record.quantity.is_some_and(|q| q >= command.quantity));
         if !slot_verified && actual != Some(wanted) {
             // clients#443: on the delta lane, EXECUTION EVIDENCE outranks the
             // equality, in EITHER direction. `native_done` is already true
@@ -1611,10 +1621,11 @@ mod tests {
     }
 
     #[test]
-    fn native_insert_that_never_verifies_fails_after_the_budget() {
+    fn native_insert_with_an_empty_return_that_never_verifies_fails_after_the_budget() {
         let runtime = FakeRuntime {
             ready: true,
             complete_without_applying: true,
+            report_no_result: true,
             ..Default::default()
         };
         let mut session = session(runtime);
@@ -1626,16 +1637,40 @@ mod tests {
             assert_eq!(session.poll(), "awaiting_inventory");
         }
         assert_eq!(session.poll(), "executing"); // queues the native insert
-        // native reports done but the stack never reflects it, and the reported
-        // slot holds a contradicting record -> the short verify budget applies.
-        let budget = contract().policy.verify_polls;
+        // Native reports done without a result and the stack never reflects
+        // it. With neither a slot nor a held record this takes the hydration
+        // budget before it fails closed.
+        let budget = contract().policy.hydration_verify_polls;
         let mut last = String::new();
         for _ in 0..budget {
             last = session.poll();
         }
         assert_eq!(last, "failed", "state: {:?}", session.state());
-        // The verify budget, not the long hydration one, was used.
-        assert!(session.state().detail.contains("retry_budget=20"));
+        assert!(session.state().detail.contains("retry_budget=240"));
+    }
+
+    /// Oz's 2026-08-29 playtest: Blood Stone Chunk, Thick Coldblood and
+    /// Executioner's Gloves insertions returned real native slots, but the
+    /// held-inventory scan remained at zero because the game routed the new
+    /// records outside that view. A successful ItemGrant return is the only
+    /// storage-aware witness available and must not be parked.
+    #[test]
+    fn a_successful_stack_insert_can_complete_without_a_held_record() {
+        let runtime = FakeRuntime {
+            ready: true,
+            complete_without_applying: true,
+            ..Default::default()
+        };
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x4CE, 1, "ap_storage", Some(0)), false)
+            .unwrap();
+        for _ in 0..contract().policy.min_absent_polls {
+            session.poll();
+        }
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+        assert!(session.trace().execution_evidence);
+        assert_eq!(session.trace().native_result, Some(7));
     }
 
     #[test]
