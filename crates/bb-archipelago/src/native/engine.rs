@@ -201,6 +201,24 @@ impl<R: Runtime> NativeDelivery<R> {
         self.session.state()
     }
 
+    /// True only for the live-validated insert shape where ItemGrant returned
+    /// success but the held inventory remained short. Oz's 2026-08-29 capture
+    /// confirmed those inserted records in storage. Delta-lane deficits remain
+    /// ambiguous with concurrent spending and are deliberately excluded.
+    pub fn last_completion_went_to_storage(&self, tag: &str) -> bool {
+        let trace = self.session.trace();
+        self.finished
+            .get(tag)
+            .is_some_and(|step| matches!(step, GrantStep::Complete))
+            && trace.tag == tag
+            && trace.lane == Some("insert")
+            && trace.execution_evidence
+            && matches!(
+                (trace.readbacks.last().copied().flatten(), trace.expected_after),
+                (Some(actual), Some(expected)) if actual < expected
+            )
+    }
+
     /// Advance the delivery of one request by one poll.
     pub fn grant(&mut self, request: NativeGrantRequest) -> Result<GrantStep> {
         self.grant_with_warning(request, &mut |_: &str| {})
@@ -312,6 +330,7 @@ mod tests {
         // clients#443's other direction: quantity spent -- or overflowed into
         // storage -- in the same window. This is the shape clients#445 counts.
         concurrent_spend: u32,
+        route_insert_to_storage: bool,
     }
 
     impl Runtime for FakeRuntime {
@@ -369,6 +388,10 @@ mod tests {
         }
         fn native_done(&mut self) -> bool {
             if let Some((normalized, delta, slot)) = self.queued.take() {
+                if self.route_insert_to_storage && !self.stacks.contains_key(&normalized) {
+                    self.result = 2;
+                    return true;
+                }
                 let stack = self.stacks.entry(normalized).or_insert(StackView {
                     quantity: 0,
                     exists: true,
@@ -453,6 +476,19 @@ mod tests {
             GrantStep::Complete
         );
         assert_eq!(engine.runtime_mut().stacks[&normalized].quantity, 6);
+    }
+
+    #[test]
+    fn a_successful_insert_missing_from_held_inventory_is_named_as_storage() {
+        let runtime = FakeRuntime {
+            ready: true,
+            route_insert_to_storage: true,
+            ..Default::default()
+        };
+        let mut engine = NativeDelivery::new(runtime, contract().descriptor, contract().policy);
+        let request = goods_request(0x384, 2, "ap_9", Some(0));
+        assert_eq!(drain(&mut engine, request).unwrap(), GrantStep::Complete);
+        assert!(engine.last_completion_went_to_storage("ap_9"));
     }
 
     /// clients#433: the existing-stack grant is the cave's delta lane. Two
