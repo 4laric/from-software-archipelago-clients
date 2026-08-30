@@ -2,6 +2,11 @@
 
 ### Changed
 
+* **The Bloodborne client window is translucent by default.** Its console now
+  starts at 85% opacity so it can remain visible over the game without hiding
+  the action. `--window-opacity 35-100` tunes it; 100 keeps the traditional
+  fully opaque window.
+
 * **Normal play now captures storage-routing correlations (clients#445).** Each
   delivery diagnostic records its terminal sequence number, the millisecond gap
   from the preceding grant, and the preceding destination inference. The

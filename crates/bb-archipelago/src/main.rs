@@ -405,6 +405,52 @@ struct Arguments {
     /// before -- the launcher's generated plan supplies it, a hand-started
     /// client need not.
     log_file: Option<PathBuf>,
+    /// Opacity of the Windows console, as a player-facing percentage. The
+    /// translucent default lets the client sit over the game without hiding it;
+    /// 100 restores the ordinary opaque console.
+    window_opacity: u8,
+}
+
+const DEFAULT_WINDOW_OPACITY: u8 = 85;
+
+fn parse_window_opacity(value: &str) -> Result<u8> {
+    let percent: u8 = value
+        .parse()
+        .with_context(|| format!("invalid --window-opacity {value:?}; expected 35-100"))?;
+    anyhow::ensure!(
+        (35..=100).contains(&percent),
+        "invalid --window-opacity {percent}; expected 35-100"
+    );
+    Ok(percent)
+}
+
+#[cfg(windows)]
+fn apply_console_opacity(percent: u8) -> Result<()> {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::System::Console::GetConsoleWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongW,
+        WS_EX_LAYERED,
+    };
+
+    if percent == 100 {
+        return Ok(());
+    }
+    let window = unsafe { GetConsoleWindow() };
+    anyhow::ensure!(
+        !window.0.is_null(),
+        "this client does not own a console window"
+    );
+    let style = unsafe { GetWindowLongW(window, GWL_EXSTYLE) };
+    unsafe { SetWindowLongW(window, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as i32) };
+    let alpha = ((u16::from(percent) * 255 + 50) / 100) as u8;
+    unsafe { SetLayeredWindowAttributes(window, COLORREF(0), alpha, LWA_ALPHA) }
+        .context("setting client console opacity")
+}
+
+#[cfg(not(windows))]
+fn apply_console_opacity(_percent: u8) -> Result<()> {
+    Ok(())
 }
 
 /// Process-lifetime ownership of one receive ledger (clients#430).
@@ -625,7 +671,7 @@ fn arguments() -> Result<Arguments> {
 fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let Some(server) = args.next() else {
         bail!(
-            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native|ce-bridge] [--log-file PATH] (native is the default; on an image it cannot validate the default hard-fails and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge)"
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native|ce-bridge] [--log-file PATH] [--window-opacity 35-100] (native is the default; client window opacity defaults to 85)"
         )
     };
     let slot = args.next().context("missing SLOT")?;
@@ -640,6 +686,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let mut delivery = DeliveryMode::Native;
     let mut delivery_explicit = false;
     let mut log_file = None;
+    let mut window_opacity = DEFAULT_WINDOW_OPACITY;
     while let Some(argument) = args.next() {
         if argument == "--mock" {
             mock = true;
@@ -661,6 +708,13 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
             log_file = Some(PathBuf::from(path));
         } else if let Some(path) = argument.strip_prefix("--log-file=") {
             log_file = Some(PathBuf::from(path));
+        } else if argument == "--window-opacity" {
+            let value = args
+                .next()
+                .context("--window-opacity requires a percentage from 35 to 100")?;
+            window_opacity = parse_window_opacity(&value)?;
+        } else if let Some(value) = argument.strip_prefix("--window-opacity=") {
+            window_opacity = parse_window_opacity(value)?;
         } else if password.replace(argument).is_some() {
             bail!("only one password may be supplied");
         }
@@ -676,6 +730,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
         delivery,
         delivery_explicit,
         log_file,
+        window_opacity,
     })
 }
 
@@ -745,6 +800,12 @@ fn run() -> Result<()> {
     if let Some(path) = args.log_file.as_deref() {
         logging::install_log_file(path)
             .with_context(|| format!("could not open the client log {}", path.display()))?;
+    }
+    if let Err(error) = apply_console_opacity(args.window_opacity) {
+        client_eprintln!(
+            "WARNING: could not make the client window {}% opaque: {error:#}",
+            args.window_opacity
+        );
     }
     let _ledger_lock = LedgerLock::acquire(&args.ledger)?;
     client_eprintln!(
@@ -1441,6 +1502,34 @@ mod tests {
     fn no_log_file_by_default() {
         let args = parse_args(base_args(&[]).into_iter()).expect("parse");
         assert!(args.log_file.is_none());
+    }
+
+    #[test]
+    fn client_window_is_translucent_by_default() {
+        let args = parse_args(base_args(&[]).into_iter()).expect("parse");
+        assert_eq!(args.window_opacity, 85);
+    }
+
+    #[test]
+    fn window_opacity_accepts_separate_and_joined_forms() {
+        let separate = parse_args(base_args(&["--window-opacity", "70"]).into_iter())
+            .expect("parse separate form");
+        let joined = parse_args(base_args(&["--window-opacity=100"]).into_iter())
+            .expect("parse joined form");
+        assert_eq!(separate.window_opacity, 70);
+        assert_eq!(joined.window_opacity, 100);
+    }
+
+    #[test]
+    fn window_opacity_refuses_invisible_or_invalid_values() {
+        for value in ["0", "34", "101", "mist"] {
+            let error = parse_args(base_args(&["--window-opacity", value]).into_iter())
+                .expect_err("unsafe opacity must fail");
+            assert!(
+                format!("{error:#}").contains("--window-opacity"),
+                "{error:#}"
+            );
+        }
     }
 
     /// A bare trailing `--log-file` must fail loudly rather than silently
