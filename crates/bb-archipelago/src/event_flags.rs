@@ -1,4 +1,4 @@
-//! Read-only Bloodborne event-flag access through shadPS4 process memory.
+//! Bloodborne event-flag access through shadPS4 process memory.
 //!
 //! All executable offsets here are runtime/version data for Bloodborne 01.09.
 //! They intentionally do not live in AP world data.
@@ -83,10 +83,11 @@ mod platform {
 
     use anyhow::{Context, Result, bail, ensure};
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
     use windows::Win32::System::ProcessStatus::{EnumProcesses, GetModuleBaseNameW};
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
     };
 
     use super::{
@@ -145,6 +146,25 @@ mod platform {
             );
             Ok(())
         }
+
+        fn write_byte(&self, address: u64, value: u8) -> Result<()> {
+            let mut bytes_written = 0usize;
+            unsafe {
+                WriteProcessMemory(
+                    self.0,
+                    address as *const c_void,
+                    (&value as *const u8).cast(),
+                    1,
+                    Some(&mut bytes_written),
+                )
+            }
+            .with_context(|| format!("writing shadPS4 memory at 0x{address:X}"))?;
+            ensure!(
+                bytes_written == 1,
+                "short shadPS4 memory write at 0x{address:X}"
+            );
+            Ok(())
+        }
     }
 
     fn process_name(handle: HANDLE) -> Option<String> {
@@ -173,7 +193,10 @@ mod platform {
         {
             let Ok(handle) = (unsafe {
                 OpenProcess(
-                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                    PROCESS_QUERY_INFORMATION
+                        | PROCESS_VM_READ
+                        | PROCESS_VM_WRITE
+                        | PROCESS_VM_OPERATION,
                     false,
                     process_id,
                 )
@@ -260,7 +283,7 @@ mod platform {
             }
         }
 
-        pub fn read(&self, event_flag: u32) -> Result<bool> {
+        fn address_and_mask(&self, event_flag: u32) -> Result<(u64, u8)> {
             let manager: u64 = self.process.read(self.eboot_base + MANAGER_ROOT_RVA)?;
             ensure!(
                 manager != 0,
@@ -311,10 +334,34 @@ mod platform {
             };
             ensure!(bank_base != 0, "event-flag group {group} has no storage");
 
-            let address = bank_base + u64::from(suffix / 8);
-            let value: u8 = self.process.read(address)?;
             let mask = 1u8 << (7 - (suffix % 8));
+            Ok((bank_base + u64::from(suffix / 8), mask))
+        }
+
+        pub fn read(&self, event_flag: u32) -> Result<bool> {
+            let (address, mask) = self.address_and_mask(event_flag)?;
+            let value: u8 = self.process.read(address)?;
             Ok(value & mask != 0)
+        }
+
+        /// Set a save-resident event flag and verify the resulting byte.
+        /// The operation is idempotent, which makes received-item replay safe.
+        pub fn write(&self, event_flag: u32, enabled: bool) -> Result<()> {
+            let (address, mask) = self.address_and_mask(event_flag)?;
+            let before: u8 = self.process.read(address)?;
+            let after = if enabled {
+                before | mask
+            } else {
+                before & !mask
+            };
+            if after != before {
+                self.process.write_byte(address, after)?;
+            }
+            ensure!(
+                self.read(event_flag)? == enabled,
+                "event flag {event_flag} write did not stick"
+            );
+            Ok(())
         }
 
         /// Validate the minimum live event-flag-manager structure needed for
@@ -377,6 +424,22 @@ mod platform {
                 }
             }
         }
+
+        pub fn write_resilient(&mut self, event_flag: u32, enabled: bool) -> Result<()> {
+            match self.write(event_flag, enabled) {
+                Ok(()) => Ok(()),
+                Err(write_error) => {
+                    let replacement = Self::attach(&self.shad_log).with_context(|| {
+                        format!(
+                            "reattaching to shadPS4 after event-flag write failed: {write_error:#}"
+                        )
+                    })?;
+                    *self = replacement;
+                    self.write(event_flag, enabled)
+                        .context("writing event flag after shadPS4 reattachment")
+                }
+            }
+        }
     }
 }
 
@@ -405,6 +468,10 @@ mod platform {
 
         pub fn read_resilient(&mut self, _event_flag: u32) -> Result<bool> {
             bail!("live Bloodborne event-flag reads require Windows")
+        }
+
+        pub fn write_resilient(&mut self, _event_flag: u32, _enabled: bool) -> Result<()> {
+            bail!("live Bloodborne event-flag writes require Windows")
         }
 
         pub fn probe_manager(&self) -> Result<()> {

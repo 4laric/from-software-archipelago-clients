@@ -359,6 +359,14 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
+        if grant.item_category == 255 {
+            self.arm_event_flags()?;
+            let Some(flags) = self.event_flags.armed_mut() else {
+                return Ok(OperationProgress::Pending);
+            };
+            flags.write_resilient(grant.normalized_item_id, true)?;
+            return Ok(OperationProgress::Complete);
+        }
         let request = NativeGrantRequest {
             tag: grant.tag.clone(),
             raw_descriptor: grant.raw_descriptor,

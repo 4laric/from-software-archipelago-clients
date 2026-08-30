@@ -45,6 +45,8 @@ pub enum DescriptorEvidence {
     /// witnessed live yet (bb-archipelago #208). Deliverable exactly like the
     /// others: the first live delivery of such a binding is its validation.
     ParamIdInferred,
+    /// A synthetic AP item whose normalized id is a save-resident event flag.
+    EventFlagEffect,
     /// A provenance string minted by a world newer than this client.
     Unknown(String),
 }
@@ -55,6 +57,7 @@ impl DescriptorEvidence {
             Self::GoodsFormulaObserved => "goods_formula_observed",
             Self::LiveGrantInventoryUi => "live_grant_inventory_ui",
             Self::ParamIdInferred => "param_id_inferred",
+            Self::EventFlagEffect => "event_flag_effect",
             Self::Unknown(raw) => raw.as_str(),
         }
     }
@@ -81,6 +84,7 @@ impl<'de> Deserialize<'de> for DescriptorEvidence {
             "goods_formula_observed" => Self::GoodsFormulaObserved,
             "live_grant_inventory_ui" => Self::LiveGrantInventoryUi,
             "param_id_inferred" => Self::ParamIdInferred,
+            "event_flag_effect" => Self::EventFlagEffect,
             _ => Self::Unknown(raw),
         })
     }
@@ -171,6 +175,20 @@ impl RuntimeItemBinding {
                     ),
                     "AP item {ap_item_id} category-0 weapon has incompatible receive policy {:?}",
                     self.feed_effect
+                );
+            }
+            255 => {
+                anyhow::ensure!(
+                    self.descriptor_evidence == DescriptorEvidence::EventFlagEffect,
+                    "AP item {ap_item_id} event-flag effect lacks explicit evidence"
+                );
+                anyhow::ensure!(
+                    self.raw_descriptor == self.normalized_item_id,
+                    "AP item {ap_item_id} event-flag effect has mismatched flag ids"
+                );
+                anyhow::ensure!(
+                    self.quantity == 1 && self.reinforcement_level.is_none(),
+                    "AP item {ap_item_id} event-flag effect has invalid quantity or level"
                 );
             }
             category => anyhow::bail!(
@@ -667,6 +685,42 @@ mod tests {
         assert_eq!(binding.normalized_item_id, 0x0132_B3A0);
         assert_eq!(binding.reinforcement_level, Some(0));
         assert_eq!(binding.feed_effect, FeedEffectBinding::RightHandWeapon);
+    }
+
+    #[test]
+    fn event_flag_effect_requires_an_explicit_matching_flag_contract() {
+        let config = local()
+            .apply_slot_data(&json!({
+                "runtime_items": {
+                    "12255543": {
+                        "raw_descriptor": 12401803,
+                        "normalized_item_id": 12401803,
+                        "item_category": 255,
+                        "descriptor_evidence": "event_flag_effect",
+                        "quantity": 1
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            config.items[&12_255_543].descriptor_evidence,
+            DescriptorEvidence::EventFlagEffect
+        );
+
+        let error = local()
+            .apply_slot_data(&json!({
+                "runtime_items": {
+                    "12255543": {
+                        "raw_descriptor": 12401804,
+                        "normalized_item_id": 12401803,
+                        "item_category": 255,
+                        "descriptor_evidence": "event_flag_effect",
+                        "quantity": 1
+                    }
+                }
+            }))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("mismatched flag ids"));
     }
 
     /// CONTROL: the two original variants are untouched by the catch-all.

@@ -1,7 +1,7 @@
 {
   "format": "bb-native-grant-contract-v5",
   "harness": "bb-native-grant-v7",
-  "build": "bb-0.1.0-r7",
+  "build": "bb-0.1.0-r8",
   "bridge_protocol": "BBGRANT1",
   "target": {
     "serial": "CUSA03173",
