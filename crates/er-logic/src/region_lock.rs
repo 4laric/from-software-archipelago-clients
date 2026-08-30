@@ -1244,6 +1244,23 @@ mod derive_tests {
     }
 
     #[test]
+    fn fortissax_play_region_is_gated_by_deeproot_not_leyndell() {
+        // #1002 reported a Leyndell-lock screen at Fortissax's portal. The arena and portal are
+        // m12_03, whose measured PlayRegionParam bucket is 12030. Pin the runtime fallback table:
+        // 12030 must carry Deeproot's flag and must never be claimed by Leyndell.
+        let d = derive_region_locks(["Deeproot Depths Lock", "Leyndell Lock"]);
+        assert!(d.ranges.contains(&[12030, 12030, 71231]));
+        assert!(!d.ranges.contains(&[12030, 12030, 76980]));
+        assert_eq!(
+            crate::region_locks::REGION_LOCKS
+                .iter()
+                .find(|row| row.play_regions.contains(&12030))
+                .map(|row| row.region),
+            Some("Deeproot Depths")
+        );
+    }
+
+    #[test]
     fn whole_item_tables_pass_through_only_locks() {
         // Feed a realistic mixed table: gear, key items, and one real lock. Non-" Lock" names
         // never show up anywhere — not even in `unknown`.
