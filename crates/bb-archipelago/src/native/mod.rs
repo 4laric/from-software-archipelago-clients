@@ -36,3 +36,4 @@ pub mod guest;
 pub mod install;
 pub mod mem;
 pub mod threads;
+pub mod vial_capture;
