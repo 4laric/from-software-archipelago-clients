@@ -40,6 +40,7 @@ use super::flag_gate::FlagGate;
 use super::gem_capture::GemCapture;
 use super::guest::GuestRuntime;
 use super::mem::NativeMemory;
+use super::shop_capture::ShopCapture;
 use super::vial_capture::VialCapture;
 
 /// Consecutive gameplay-ready probes required before the unsafe assumed-save
@@ -97,6 +98,7 @@ pub struct NativeBackend {
     /// the value this backend already returned to the loop this iteration.
     last_context: GrantContext,
     gem_capture: Option<GemCapture>,
+    shop_capture: Option<ShopCapture>,
     vial_capture: Option<VialCapture>,
 }
 
@@ -144,6 +146,15 @@ impl NativeBackend {
                 self.vial_capture = Some(capture);
             }
             Err(error) => client_eprintln!("Zero-Vial diagnostics unavailable: {error}"),
+        }
+        match ShopCapture::beside_ledger(ledger) {
+            Ok(capture) => {
+                client_eprintln!(
+                    "Shop diagnostics: read-only badge and purchase transitions stream beside the ledger to shop-capture.jsonl."
+                );
+                self.shop_capture = Some(capture);
+            }
+            Err(error) => client_eprintln!("Shop diagnostics unavailable: {error}"),
         }
     }
 
@@ -296,6 +307,7 @@ impl NativeBackend {
             absent_observations: std::collections::HashMap::new(),
             last_context: GrantContext::default(),
             gem_capture: None,
+            shop_capture: None,
             vial_capture: None,
         })
     }
@@ -304,6 +316,9 @@ impl NativeBackend {
 impl BloodborneBackend for NativeBackend {
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
         let entries = self.delivery.runtime_mut().inventory_entries();
+        if let Some(capture) = &mut self.shop_capture {
+            capture.observe(entries.clone());
+        }
         let vial_candidate = self
             .vial_capture
             .as_mut()

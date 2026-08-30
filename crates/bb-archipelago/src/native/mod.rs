@@ -35,5 +35,6 @@ pub mod gem_capture;
 pub mod guest;
 pub mod install;
 pub mod mem;
+pub mod shop_capture;
 pub mod threads;
 pub mod vial_capture;
