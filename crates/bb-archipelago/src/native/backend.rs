@@ -292,7 +292,15 @@ impl NativeBackend {
 impl BloodborneBackend for NativeBackend {
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
         if let Some(capture) = &mut self.gem_capture {
-            capture.observe(self.delivery.runtime_mut().inventory_entries());
+            let generated = capture.observe(self.delivery.runtime_mut().inventory_entries());
+            let candidate = generated.into_iter().next();
+            if let Some(probe) = self
+                .delivery
+                .runtime_mut()
+                .probe_generated_object(candidate)
+            {
+                capture.record_generated_object(&probe);
+            }
         }
         let result = self.location_context_inner();
         // clients#445: remember what the loop was told, so a grant record can

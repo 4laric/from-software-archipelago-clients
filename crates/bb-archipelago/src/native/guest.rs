@@ -31,6 +31,13 @@ pub struct InventoryEntry {
     pub bytes: [u8; 16],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedObjectProbe {
+    pub entry: InventoryEntry,
+    pub address: u64,
+    pub bytes: Vec<u8>,
+}
+
 impl InventoryEntry {
     pub fn word(&self, offset: usize) -> u32 {
         u32::from_le_bytes(self.bytes[offset..offset + 4].try_into().unwrap())
@@ -77,6 +84,7 @@ pub struct GuestRuntime<P: ProcessMemory> {
     contract: &'static Contract,
     cells: CellAddresses,
     error: RefCell<Option<String>>,
+    generated_probe: Option<InventoryEntry>,
 }
 
 impl<P: ProcessMemory> GuestRuntime<P> {
@@ -101,6 +109,7 @@ impl<P: ProcessMemory> GuestRuntime<P> {
             contract,
             cells,
             error: RefCell::new(None),
+            generated_probe: None,
         })
     }
 
@@ -155,6 +164,53 @@ impl<P: ProcessMemory> GuestRuntime<P> {
             }
         }
         Some(entries)
+    }
+
+    /// Resolve one naturally-created category instance on the game thread and
+    /// return a read-only snapshot of its backing object. Request 3 never calls
+    /// ItemGrant and the cave never writes through the resolved pointer.
+    pub fn probe_generated_object(
+        &mut self,
+        candidate: Option<InventoryEntry>,
+    ) -> Option<GeneratedObjectProbe> {
+        if self.generated_probe.is_none()
+            && let Some(entry) = candidate
+            && self.record(self.memory.read_u32(self.cells.request)) == Some(0)
+        {
+            let descriptor = ItemGrantDescriptor::new(entry.word(0), entry.word(4));
+            let staged = descriptor.encode(&self.contract.descriptor);
+            let _ = self.record(self.memory.write(self.cells.descriptor, &staged));
+            let _ = self.record(self.memory.write_u64(self.cells.item_quantity_pointer, 0));
+            let _ = self.record(self.memory.write_u32(self.cells.result, EMPTY_SLOT));
+            let _ = self.record(self.memory.write_u32(self.cells.done, 0));
+            let _ = self.record(self.memory.write_u32(self.cells.request, 3));
+            self.generated_probe = Some(entry);
+            return None;
+        }
+
+        let entry = self.generated_probe.clone()?;
+        if self.record(self.memory.read_u32(self.cells.done)) != Some(1) {
+            return None;
+        }
+        let address = self
+            .record(self.memory.read_u64(self.cells.item_quantity_pointer))
+            .unwrap_or(0);
+        self.generated_probe = None;
+        if address == 0 {
+            return Some(GeneratedObjectProbe {
+                entry,
+                address,
+                bytes: Vec::new(),
+            });
+        }
+        let bytes = self
+            .record(self.memory.read(address, 0x80))
+            .unwrap_or_default();
+        Some(GeneratedObjectProbe {
+            entry,
+            address,
+            bytes,
+        })
     }
 
     /// Take the first captured I/O error, if any, clearing it.
