@@ -233,27 +233,26 @@ arming — still need the probe, because those conditions do not arise on their
 own during play. The passive file answers the question the probe cannot: what
 the distribution looks like across a real session.
 
-### Blood-gem container diagnostic
+### Blood-gem ItemGrant diagnostic
 
-Native sessions append a bounded, read-only snapshot to
-`blood-gem-capture.jsonl` every five seconds and whenever the sampled structure
-changes. It records the inventory manager's first `0x200` bytes plus up to 24
-distinct guest-memory blocks directly referenced by that manager. Speculative
-pointers that cannot be read are ignored, and the diagnostic never writes to
-the game.
+The earlier inventory-manager snapshot was retired after two clean natural-gem
+acquisitions changed only ordinary consumable stacks. Native sessions now hook
+the already validated `ItemGrant(inventory, descriptor, quantity)` boundary and
+append one compact, read-only record to `blood-gem-capture.jsonl` for each call.
+The guest cave copies the transient descriptor fields, quantity and caller into
+dedicated diagnostic cells before replaying the exact displaced prologue. It
+does not alter the call or any pointed-to object.
 
-This replaces an invalid classifier that treated runtime ids beginning in
-`0x1...` as ItemLot category 8. Those observed rows were category-1 armor;
-ItemLot category 8 describes how a generated gem is awarded and is not encoded
-as that runtime-id prefix. Natural gems also do not appear in the ordinary
-held-item arrays currently used for delivery, so their separate live container
-must be located before safe insertion can be implemented.
+The probe is fail-soft: an unexpected prologue or occupied scratch region leaves
+delivery available and prints that blood-gem diagnostics are inactive. Each
+record includes a sequence gap so a burst faster than the client poll is visible
+rather than silently mistaken for a complete capture.
 
-For a focused capture, wait five seconds for a baseline, acquire one natural
-blood gem, wait five seconds, acquire a second natural blood gem, and wait five
-seconds again. Send `blood-gem-capture.jsonl` with `client.log`, naming the two
-gems and their pickup order. Existing gems are fine; changes between snapshots
-are the useful evidence.
+For a focused capture, relaunch through a bundle that prints `Blood-gem
+ItemGrant probe armed`, acquire one ordinary pickup, then two natural blood gems.
+Send `blood-gem-capture.jsonl` with `client.log`, naming the two gems and their
+pickup order. A gem-shaped descriptor proves this boundary owns category-8
+insertion; no call across both clean acquisitions rules it out directly.
 
 ### Zero-Vial diagnostic (bb-archipelago#70)
 
