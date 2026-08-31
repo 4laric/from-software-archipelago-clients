@@ -261,7 +261,6 @@ impl FeedEffectBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    pub bridge_root: PathBuf,
     /// shadPS4's current log, used only to discover the launch-relative eboot base.
     #[serde(default)]
     pub shad_log: Option<PathBuf>,
@@ -527,19 +526,6 @@ impl RuntimeConfig {
         );
         Ok(Some(installed_hash))
     }
-
-    /// clients#369: fail fast on path misconfiguration that would otherwise
-    /// surface deep in the polling loop as a bare OS error. `shad_log` is
-    /// intentionally NOT checked here: the attach retry loop tolerates
-    /// shadPS4 starting after the client, and its error now names the setting.
-    pub fn preflight_paths(&self) -> Result<()> {
-        fs::create_dir_all(&self.bridge_root).map_err(|error| {
-            anyhow::Error::new(error).context(format!(
-                "bridge_root cannot be created: {}",
-                self.bridge_root.display()
-            ))
-        })
-    }
 }
 
 fn require_sha256(label: &str, value: &str) -> Result<()> {
@@ -600,7 +586,6 @@ mod tests {
 
     fn local() -> RuntimeConfig {
         RuntimeConfig {
-            bridge_root: PathBuf::from("bridge"),
             shad_log: None,
             locations: vec![LocationBinding {
                 ap_location_id: 1,
@@ -1046,20 +1031,6 @@ mod tests {
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("installed_gameparam does not exist"));
         assert!(diagnostic.contains(&installed.display().to_string()));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn preflight_reports_an_uncreatable_bridge_root() {
-        let root = std::env::temp_dir().join(format!("bb-369-bridge-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let blocker = root.join("blocker");
-        fs::write(&blocker, b"not a directory").unwrap();
-        let mut config = local();
-        config.bridge_root = blocker.join("bridge");
-        let error = config.preflight_paths().unwrap_err();
-        assert!(format!("{error:#}").contains("bridge_root"));
         fs::remove_dir_all(root).unwrap();
     }
 }

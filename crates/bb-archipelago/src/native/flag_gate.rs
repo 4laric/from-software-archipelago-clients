@@ -5,8 +5,7 @@
 //! The launcher starts shadPS4 and the client together, so native attach
 //! routinely reaches [`crate::event_flags::LiveEventFlags::attach_at_base`]
 //! before that global exists. Treating it as terminal exits the client during a
-//! normal startup, and (worse) inherited the unrecognised-build guidance, which
-//! points at a Cheat Engine lane that does not provide flag reads either.
+//! normal startup, and (worse) inherited misleading unrecognised-build guidance.
 //!
 //! So the flag half is armed *lazily*. Attach succeeds with the gate
 //! [`FlagGate::pending`], native item delivery is armed immediately, and the

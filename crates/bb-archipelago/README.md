@@ -2,25 +2,25 @@
 
 This crate is the standalone Bloodborne client path. Unlike the native Dark
 Souls III and Sekiro DLLs, it reads Bloodborne location flags directly from
-shadPS4 process memory. Item delivery now defaults to the in-process **native**
-backend (see below), with the shadPS4/Cheat Engine file bridge kept as an
-explicit escape (`--delivery=ce-bridge`) and as the remedy the default points
-you to when native cannot validate the running image.
+shadPS4 process memory. Item delivery uses the in-process **native** backend
+(see below). Unsupported or mismatched game images fail closed before delivery
+is armed or any Archipelago item is acknowledged.
 
-The first bridge contract supports received-item grants:
+The native grant contract supports received-item grants:
 
-- The client writes one atomic `GRANT` command only when no command is pending.
+- The client stages one grant only when no command is pending.
 - The runtime validates the expected current quantity before changing anything.
 - Existing stacks use a guarded record update; absent items use the native
   game-thread `ItemGrant` path.
 - The runtime clears the command only after verifying completion.
 - The client advances its durable received-item watermark only after observing
-  a terminal success state and an absent command file.
+  terminal success.
 
-The current bridge contract is `BBGRANT1` with harness
-`bb-native-grant-v5`. Both tokens must appear in the harness state before the
-client publishes a command. A terminal harness failure blocks that AP item with
-a bounded diagnostic while location polling and the server connection continue.
+The vendored native contract retains compatibility identifiers from its
+prototype lineage. They validate the compiled payload artifact only; there is
+no external command-file transport or table dependency. A terminal harness
+failure blocks that AP item with a bounded diagnostic while location polling
+and the server connection continue.
 
 Item-ID mappings and location checks are deliberately not hard-coded here. The
 local rows are only a migration/test fallback. On connect, the apworld's
@@ -137,49 +137,36 @@ independently hashes that installed file, and refuses the seed if it does not
 equal the manifest output; the separate build artifact is explicitly rejected
 as installation evidence.
 
-Runtime event flags, normalized item IDs, bridge paths, and future executable
+Runtime event flags, normalized item IDs, and executable
 signatures stay in this client-side configuration/backend layer. They are never
 read from Bloodborne world-design data.
 
-## Native delivery (stage 2, now the default)
+## Native delivery
 
-Stage 2 replaces the Cheat Engine file bridge with an in-process native
-delivery backend that reads and writes shadPS4 memory directly, installs the
-`bb-native-grant-v5` grant payload, and drives the grant state machine the CE
-table paid for live. It is **now the default** — the client uses native when no
-`--delivery` flag is passed:
+The client reads and writes shadPS4 memory directly, installs the native grant
+payload, and drives its grant state machine in-process. Native delivery is the
+only supported live backend. The old spelling `--delivery=native` remains
+accepted for launch-plan compatibility, but selecting a backend is unnecessary:
 
 ```
-bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD]                 # native (default)
+bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD]                 # native
 bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] --delivery=native
-bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] --delivery=ce-bridge
 ```
 
 Defaulting to native is safe because native **fails closed** on any image it
 cannot validate: `require_validated_image` refuses CUSA00900 and every other
 serial/build, so a recognised-and-validated image gets native and nothing else
-is ever patched. On the **default** path (no `--delivery`), an image native
-cannot validate makes the client **stop with a clear, actionable error** — it
-does **not** silently fall back to the Cheat Engine bridge. The message is:
+is ever patched. An image native cannot validate makes the client **stop with a
+clear, actionable error**:
 
 > This game build was not recognized, so native item delivery cannot run
-> safely. To play now, load the Cheat Engine table and re-run with
-> `--delivery=ce-bridge`. Otherwise this build is not yet supported.
+> safely. Delivery was not armed and no Archipelago item was acknowledged. Use
+> the launcher's Open Logs & Diagnostics action and send the session bundle so
+> native support can be added for this build.
 
-A silent fallback would be unsafe: with native as the default the Cheat Engine
-table is not loaded, so the bridge's `GRANT` command files would sit unconsumed
-and delivered items would silently vanish. `--delivery=ce-bridge` forces the
-bridge directly and is exactly the remedy the error points to; use it once the
-CE table is loaded.
-
-An **explicit** `--delivery=native` also keeps the strict behaviour: it **fails
-closed** with a clear error, because the user asked for native specifically.
-Neither path falls back to the bridge; the fail-closed image check,
-no-double-grant, install atomicity and image-mismatch guards are unchanged.
-
-A safe, *detected* fallback — a liveness handshake that confirms a loaded CE
-table before offering the bridge — is the planned successor, tracked in
-clients#413.
+`--delivery=ce-bridge` is rejected with a migration error. The fail-closed image
+check, no-double-grant, install atomicity and image-mismatch guards are
+unchanged.
 
 The native code lives in `src/native/`:
 
@@ -340,5 +327,4 @@ instead of granting twice.
 > fail-closed image check: an unrecognised build hard-fails with instructions
 > rather than being delivered, so nothing is patched on an image native cannot
 > validate. Owner-checklist item 3 (the CUSA00900 wrong-image refusal) is still
-> untested against a dump. If you want to avoid native entirely, load the Cheat
-> Engine table and pass `--delivery=ce-bridge`.
+> untested against a dump.

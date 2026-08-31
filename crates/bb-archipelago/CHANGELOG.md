@@ -9,6 +9,12 @@
   production-loop regression carries a held Whirligig Saw +7 across families
   to a received Ludwig's Holy Blade.
 
+* **Native-only delivery (clients#526).** Removed the live command-file backend,
+  bridge-root configuration, startup probes, and backend selector. Legacy
+  `--delivery=ce-bridge` launch plans now stop with an explicit migration error.
+  Unsupported images continue to fail closed before delivery is armed and now
+  direct players to the session diagnostics bundle instead of external tooling.
+
 * **The standalone command window is keyboard accessible.** Enter submits the
   command field through the same bounded worker channel as the Send button;
   Tab and Shift+Tab traverse every interactive control, and Alt-key mnemonics

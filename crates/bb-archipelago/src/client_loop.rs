@@ -1080,7 +1080,6 @@ mod tests {
 
     fn config() -> RuntimeConfig {
         RuntimeConfig {
-            bridge_root: PathBuf::from("unused"),
             shad_log: None,
             locations: vec![LocationBinding {
                 ap_location_id: 1000,
