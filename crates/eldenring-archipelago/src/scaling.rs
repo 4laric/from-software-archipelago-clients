@@ -965,6 +965,11 @@ pub fn tick() -> Option<String> {
     };
     let target_tier = dbg.tier;
 
+    // #1091: direct payouts follow the same tier that was actually selected for combat. The
+    // reward module is default-off, snapshots the loaded regulation once, and is idempotent across
+    // repeat sweeps; a false return only means the param holders are restreaming and will retry.
+    let _ = crate::rune_rewards::run(target_tier);
+
     let sample_on = sampling();
     let mut tally = SweepTally::new();
 

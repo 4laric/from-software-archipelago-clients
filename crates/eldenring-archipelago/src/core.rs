@@ -1827,6 +1827,7 @@ impl shared::Core for Core {
                     sd.get("stoneswordVendorRow").and_then(|v| v.as_i64()).unwrap_or(0) as u32,
                 );
                 crate::scaling::configure(sd); // runtime enemy scaling (regionSphereTargets)
+                crate::rune_rewards::configure(sd); // opt-in direct enemy/boss rune payouts
                 // checkItemFlags: full raw item id -> check acquisition flags (the PORT-GAP
                 // vanilla-suppress table; LIVE in the detour since 2026-07-01).
                 let check_flags: std::collections::HashMap<u32, Vec<u32>> = sd
