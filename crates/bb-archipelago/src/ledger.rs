@@ -53,6 +53,21 @@ pub struct SlotLedger {
     /// cannot silently reset the cadence.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub death_link_amnesty_used: u32,
+    /// Console rescue grants, isolated from the AP receive cursor. The map key
+    /// is a seed-contract AP item id; retaining the completed plan makes a
+    /// repeated command or restart a fixed point.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operator_grants: BTreeMap<i64, PendingItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_actions: Vec<OperatorAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperatorAction {
+    pub timestamp_ms: u64,
+    pub command: String,
+    pub argument: i64,
+    pub resolved_name: String,
 }
 
 const fn is_zero(value: &u32) -> bool {

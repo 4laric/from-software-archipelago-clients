@@ -13,7 +13,7 @@ use bb_archipelago::backend::{
     BloodborneBackend, EquipRequest, ItemGrant, LocationContext, MockBackend, OperationProgress,
     StackObservation,
 };
-use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
+use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult, OperatorGrantPoll};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::is_manager_not_initialized;
 use bb_archipelago::health::HealthReporter;
@@ -259,6 +259,13 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Mock(backend) => backend.read_event_flag(event_flag),
             Self::Native(backend) => backend.read_event_flag(event_flag),
+        }
+    }
+
+    fn write_event_flag(&mut self, event_flag: u32, enabled: bool) -> Result<()> {
+        match self {
+            Self::Mock(backend) => backend.write_event_flag(event_flag, enabled),
+            Self::Native(backend) => backend.write_event_flag(event_flag, enabled),
         }
     }
 
@@ -705,6 +712,13 @@ fn item_label(game: &archipelago_rs::Game, ap_item_id: i64) -> String {
     bb_archipelago::names::item_label(name.as_ref().map(|name| name.as_str()), ap_item_id)
 }
 
+#[cfg(windows)]
+fn location_label(game: &archipelago_rs::Game, location_id: i64) -> String {
+    game.location(location_id).map_or_else(
+        || format!("location #{location_id}"),
+        |location| location.name().to_string(),
+    )
+}
 /// Which feed lane a server print belongs in.
 ///
 /// Hints get their own lane because they are the one server print players actively hunt for in a
@@ -971,6 +985,17 @@ fn run() -> Result<()> {
                         );
                     }
                 }
+                client_ui::UiAction::RetryBlocked { index } => {
+                    let result = match runtime.as_mut() {
+                        Some(runtime) => runtime.rescue_retry_blocked(index).map_or_else(
+                            |error| format!("Rescue retry refused: {error:#}"),
+                            |()| format!("AUDIT rescue retry index={index}: requeued through the normal ordered delivery pipeline."),
+                        ),
+                        None => "Rescue retry refused: runtime contract not loaded yet.".to_owned(),
+                    };
+                    client_eprintln!("{result}");
+                    ui_reducer.activity(client_ui::ActivityKind::CommandResult, result);
+                }
                 client_ui::UiAction::Connect { .. } | client_ui::UiAction::Disconnect => {}
             }
         }
@@ -983,7 +1008,7 @@ fn run() -> Result<()> {
             let command = words.first().map(|word| word.to_ascii_lowercase());
             let result = match command.as_deref() {
                 None | Some("") => continue,
-                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | blocked | retry INDEX CONFIRM | export. Unknown/unmapped writes and warps fail closed.".to_owned(),
+                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM (contract flags only; sends the check) | give INDEX CONFIRM (contract items only). Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
                     Some(runtime) => runtime
                         .rescue_status()
@@ -1002,7 +1027,14 @@ fn run() -> Result<()> {
                 },
                 Some("blocked") => runtime.as_ref().map_or_else(
                     || "Runtime contract not loaded yet.".to_owned(),
-                    |runtime| runtime.rescue_list_blocked(),
+                    |runtime| {
+                        runtime.rescue_list_blocked_with_names(|ap_item_id| {
+                            connection.client().map_or_else(
+                                || bb_archipelago::names::item_label(None, ap_item_id),
+                                |client| item_label(client.this_game(), ap_item_id),
+                            )
+                        })
+                    },
                 ),
                 Some("retry") => match (runtime.as_mut(), words.get(1), words.get(2)) {
                     (Some(runtime), Some(raw), Some(confirm))
@@ -1026,12 +1058,57 @@ fn run() -> Result<()> {
                     ),
                     None => "Runtime contract not loaded yet.".to_owned(),
                 },
-                Some("setflag" | "give" | "item" | "warp") => "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes.".to_owned(),
+                Some("setflag") => match (runtime.as_mut(), words.get(1), words.get(2)) {
+                    (Some(runtime), Some(raw), Some(confirm))
+                        if confirm.eq_ignore_ascii_case("CONFIRM") =>
+                    {
+                        match raw.parse::<u32>() {
+                            Ok(flag) => runtime
+                                .rescue_location_for_flag(flag)
+                                .and_then(|location_id| {
+                                    let name = connection.client().map_or_else(
+                                        || format!("location #{location_id}"),
+                                        |client| location_label(client.this_game(), location_id),
+                                    );
+                                    runtime.rescue_set_flag(flag, &name).map(|_| {
+                                        format!("AUDIT rescue setflag flag={flag} ({name:?}): written. If this location was not legitimately reached, its check has now been sent anyway.")
+                                    })
+                                })
+                                .unwrap_or_else(|error| format!("Rescue setflag refused: {error:#}")),
+                            Err(_) => "Usage: setflag EVENT_FLAG CONFIRM".to_owned(),
+                        }
+                    }
+                    (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
+                    _ => "Usage: setflag EVENT_FLAG CONFIRM (contract flags only; this sends the check)".to_owned(),
+                },
+                Some("give") => match (runtime.as_mut(), words.get(1), words.get(2)) {
+                    (Some(runtime), Some(raw), Some(confirm))
+                        if confirm.eq_ignore_ascii_case("CONFIRM") =>
+                    {
+                        match raw.parse::<i64>() {
+                            Ok(index) => {
+                                let name = connection.client().map_or_else(
+                                    || bb_archipelago::names::item_label(None, index),
+                                    |client| item_label(client.this_game(), index),
+                                );
+                                match runtime.rescue_give(index, &name) {
+                                    Ok(true) => format!("AUDIT rescue give index={index} ({name:?}): queued through normal delivery."),
+                                    Ok(false) => format!("AUDIT rescue give index={index} ({name:?}): already recorded; no second grant queued."),
+                                    Err(error) => format!("Rescue give refused: {error:#}"),
+                                }
+                            }
+                            Err(_) => "Usage: give ITEM_INDEX CONFIRM".to_owned(),
+                        }
+                    }
+                    (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
+                    _ => "Usage: give ITEM_INDEX CONFIRM (contract items only)".to_owned(),
+                },
+                Some("item" | "warp") => "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes.".to_owned(),
                 Some(other) => format!("Unknown rescue command {other:?}; type 'help'."),
             };
             client_eprintln!("{result}");
             #[cfg(windows)]
-            if from_ui {
+            if from_ui || result.starts_with("AUDIT ") {
                 ui_reducer.activity(client_ui::ActivityKind::CommandResult, result);
             }
         }
@@ -1381,7 +1458,33 @@ fn run() -> Result<()> {
                     ap_item_id: item.item().id(),
                 })
                 .collect::<Vec<_>>();
-            let items_idle = match runtime.poll_items(&received) {
+            let operator_busy = match runtime.poll_operator_grant() {
+                Ok(OperatorGrantPoll::Idle) => false,
+                Ok(OperatorGrantPoll::Pending) => true,
+                Ok(OperatorGrantPoll::Completed(ap_item_id)) => {
+                    let line = format!(
+                        "AUDIT rescue give index={ap_item_id} ({:?}): delivered through normal delivery.",
+                        item_label(client.this_game(), ap_item_id)
+                    );
+                    client_eprintln!("{line}");
+                    #[cfg(windows)]
+                    ui_reducer.activity(client_ui::ActivityKind::CommandResult, line);
+                    false
+                }
+                Err(error) => {
+                    let line = format!("Rescue give delivery held: {error:#}");
+                    client_eprintln!("{line}");
+                    #[cfg(windows)]
+                    ui_reducer.activity(client_ui::ActivityKind::CommandResult, line);
+                    true
+                }
+            };
+            let item_poll = if operator_busy {
+                Ok(ItemPollResult::Pending)
+            } else {
+                runtime.poll_items(&received)
+            };
+            let items_idle = match item_poll {
                 Ok(ItemPollResult::Completed(item)) => {
                     #[cfg(windows)]
                     {
@@ -1516,25 +1619,65 @@ fn run() -> Result<()> {
                 client_ui::ApState::Connecting
             };
             let attached = runtime.is_some();
-            let (seed, ledger) = runtime.as_ref().map_or_else(
-                || (None, client_ui::LedgerTotals::default()),
-                |runtime| {
-                    let totals = runtime
-                        .ledger()
-                        .slot(runtime.seed_name(), &args.slot)
-                        .map_or_else(client_ui::LedgerTotals::default, |slot| {
-                            let parked = slot.blocked_entries().count() as u32;
-                            client_ui::LedgerTotals {
-                                queued: u32::from(slot.pending.is_some())
-                                    + slot.redeliver.len() as u32,
-                                delivered: (slot.acknowledged.len() as u32).saturating_sub(parked),
-                                storage_routed: None,
-                                parked,
-                            }
-                        });
-                    (Some(runtime.seed_name().to_owned()), totals)
-                },
-            );
+            let game = connection.client().map(|client| client.this_game());
+            let (seed, ledger, blocked, save_identity, gameplay_ready, receive_cursor) =
+                runtime.as_mut().map_or_else(
+                    || {
+                        (
+                            None,
+                            client_ui::LedgerTotals::default(),
+                            Vec::new(),
+                            None,
+                            false,
+                            None,
+                        )
+                    },
+                    |runtime| {
+                        let totals = runtime
+                            .ledger()
+                            .slot(runtime.seed_name(), &args.slot)
+                            .map_or_else(client_ui::LedgerTotals::default, |slot| {
+                                let parked = slot.blocked_entries().count() as u32;
+                                client_ui::LedgerTotals {
+                                    queued: u32::from(slot.pending.is_some())
+                                        + slot.redeliver.len() as u32,
+                                    delivered: (slot.acknowledged.len() as u32)
+                                        .saturating_sub(parked),
+                                    storage_routed: None,
+                                    parked,
+                                }
+                            });
+                        let blocked = runtime
+                            .rescue_blocked_entries()
+                            .into_iter()
+                            .map(|(index, ap_item_id, reason)| client_ui::BlockedEntry {
+                                index,
+                                item_name: game.map_or_else(
+                                    || bb_archipelago::names::item_label(None, ap_item_id),
+                                    |game| item_label(game, ap_item_id),
+                                ),
+                                reason,
+                            })
+                            .collect();
+                        let context = runtime.rescue_context().ok().flatten();
+                        let save_identity = context
+                            .as_ref()
+                            .map(|context| context.save_identity.clone());
+                        let gameplay_ready = context.is_some_and(|context| context.gameplay_ready);
+                        let receive_cursor = runtime
+                            .ledger()
+                            .slot(runtime.seed_name(), &args.slot)
+                            .and_then(|slot| slot.highest_processed_index);
+                        (
+                            Some(runtime.seed_name().to_owned()),
+                            totals,
+                            blocked,
+                            save_identity,
+                            gameplay_ready,
+                            receive_cursor,
+                        )
+                    },
+                );
             if ledger.parked > 0 {
                 ui_delivery = client_ui::DeliveryState::Blocked;
                 ui_delivery_detail.get_or_insert_with(|| {
@@ -1562,6 +1705,10 @@ fn run() -> Result<()> {
                     total: location_ids.len() as u32,
                 }),
                 ledger,
+                blocked,
+                save_identity,
+                gameplay_ready,
+                receive_cursor,
                 ..Default::default()
             }));
         }

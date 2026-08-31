@@ -1,5 +1,6 @@
 //! The eframe shell. Everything it *decides* lives in [`crate::view`]; this file only draws.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,26 @@ fn color(rgb: view::Rgb) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
+fn rescue_rows(snapshot: &ClientSnapshot) -> Vec<client_ui::BlockedEntry> {
+    snapshot.blocked.clone()
+}
+
+fn retry_confirmation(rows: &[client_ui::BlockedEntry]) -> String {
+    if rows.len() == 1 {
+        format!(
+            "Requeue {} (index {}) through normal delivery?",
+            rows[0].item_name, rows[0].index
+        )
+    } else {
+        let listed = rows
+            .iter()
+            .map(|row| format!("{} (index {})", row.item_name, row.index))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Requeue these items through normal delivery, in index order? {listed}")
+    }
+}
+
 pub struct StandaloneApp {
     endpoint: HostEndpoint,
     state_path: Option<PathBuf>,
@@ -52,6 +73,10 @@ pub struct StandaloneApp {
     /// worse than a feature that is missing.
     escape: Option<Escape>,
     guidance: GuidanceGate,
+    rescue_open: bool,
+    rescue_confirm: Vec<client_ui::BlockedEntry>,
+    retry_pending: BTreeSet<u64>,
+    last_activity_sequence: u64,
 }
 
 impl StandaloneApp {
@@ -70,6 +95,10 @@ impl StandaloneApp {
             shutdown_sent: false,
             escape: hotkey::register(),
             guidance: GuidanceGate::default(),
+            rescue_open: false,
+            rescue_confirm: Vec::new(),
+            retry_pending: BTreeSet::new(),
+            last_activity_sequence: 0,
         }
     }
 
@@ -78,6 +107,17 @@ impl StandaloneApp {
     fn drain_snapshots(&mut self) -> bool {
         let mut updated = false;
         while let Some(snapshot) = self.endpoint.latest_snapshot() {
+            if snapshot.activity.iter().any(|event| {
+                event.sequence > self.last_activity_sequence
+                    && event.kind == client_ui::ActivityKind::CommandResult
+                    && event.text.starts_with("Rescue retry refused:")
+            }) {
+                self.retry_pending.clear();
+            }
+            self.last_activity_sequence = snapshot
+                .activity
+                .back()
+                .map_or(self.last_activity_sequence, |event| event.sequence);
             self.snapshot = Some(snapshot);
             updated = true;
         }
@@ -256,11 +296,18 @@ impl StandaloneApp {
                 Severity::Warn => view::palette::WARN,
                 Severity::Bad => view::palette::BAD,
             };
-            ui.label(RichText::new(headline).color(color(tint)));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(headline).color(color(tint)));
+                if snapshot.delivery == client_ui::DeliveryState::Blocked
+                    && ui.link("Rescue…").clicked()
+                {
+                    self.rescue_open = true;
+                }
+            });
         }
     }
 
-    fn progress(&self, ui: &mut egui::Ui, snapshot: &ClientSnapshot) {
+    fn progress(&mut self, ui: &mut egui::Ui, snapshot: &ClientSnapshot) {
         if let Some((fraction, label)) = checks_progress(snapshot) {
             ui.add(
                 egui::ProgressBar::new(fraction)
@@ -273,6 +320,16 @@ impl StandaloneApp {
             ui.label(RichText::new(items_line(&snapshot.ledger)).color(color(view::palette::TEXT)));
         if snapshot.ledger.storage_routed.is_none() {
             items.on_hover_text(STORAGE_TOOLTIP);
+        }
+        if snapshot.ledger.parked > 0
+            && ui
+                .button(
+                    RichText::new(format!("\u{23f8} {} parked", snapshot.ledger.parked))
+                        .color(color(view::palette::WARN)),
+                )
+                .clicked()
+        {
+            self.rescue_open = true;
         }
         if let Some((goal, go_mode)) = goal_line(snapshot) {
             ui.horizontal(|ui| {
@@ -334,17 +391,12 @@ impl StandaloneApp {
     fn command_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("\u{22ef}", |ui| {
-                // Rescue actions, not primary UI. Same UiActions the Win32 buttons emitted.
+                if ui.button("Rescue\u{2026}").clicked() {
+                    self.rescue_open = true;
+                    ui.close();
+                }
                 if ui.button("Status").clicked() {
                     self.send(UiAction::SubmitCommand("status".into()));
-                    ui.close();
-                }
-                if ui.button("Export diagnostics").clicked() {
-                    self.send(UiAction::SubmitCommand("export".into()));
-                    ui.close();
-                }
-                if ui.button("Open session folder").clicked() {
-                    self.send(UiAction::OpenSessionFolder);
                     ui.close();
                 }
             });
@@ -440,6 +492,115 @@ impl StandaloneApp {
             .color(color(view::palette::MUTED))
             .size(11.0),
         );
+    }
+
+    fn rescue_panel(&mut self, ctx: &egui::Context, snapshot: &ClientSnapshot) {
+        let blocked = rescue_rows(snapshot);
+        self.retry_pending
+            .retain(|index| blocked.iter().any(|entry| entry.index == *index));
+        if !self.rescue_open {
+            return;
+        }
+        let mut open = self.rescue_open;
+        egui::Window::new("Rescue")
+            .open(&mut open)
+            .default_width(520.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("Session facts");
+                let identity = snapshot.save_identity.as_deref().unwrap_or("unvalidated");
+                let facts = format!(
+                    "Seed: {}\nSlot: {}\nSave: {}\nGameplay ready: {}\nReceive cursor: {}\nItems: {} delivered, {} queued, {} parked\nChecks: {}",
+                    snapshot.seed.as_deref().unwrap_or("unknown"),
+                    snapshot.slot.as_deref().unwrap_or("unknown"),
+                    identity,
+                    snapshot.gameplay_ready,
+                    snapshot.receive_cursor.map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                    snapshot.ledger.delivered,
+                    snapshot.ledger.queued,
+                    snapshot.ledger.parked,
+                    snapshot.locations.as_ref().map_or_else(|| "unknown".to_owned(), |v| format!("{}/{}", v.checked, v.total)),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(RichText::new(&facts).monospace()).selectable(true));
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(facts.clone());
+                    }
+                });
+                if snapshot.save_identity.is_none() {
+                    ui.label(RichText::new("Save identity is unvalidated; rescue mutations remain disarmed.").color(color(view::palette::WARN)));
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.heading("Parked deliveries");
+                    if !blocked.is_empty()
+                        && ui.button("Retry all").clicked()
+                    {
+                        self.rescue_confirm = blocked.clone();
+                    }
+                });
+                if blocked.is_empty() {
+                    ui.label("No parked deliveries.");
+                    ui.label(RichText::new("Items land here instead of being lost when delivery isn't safe; they wait here until you retry them.").color(color(view::palette::MUTED)));
+                } else {
+                    egui::Grid::new("rescue_blocked").striped(true).show(ui, |ui| {
+                        for entry in &blocked {
+                            ui.label(RichText::new(entry.index.to_string()).color(color(view::palette::MUTED)).monospace());
+                            ui.label(&entry.item_name);
+                            ui.add(egui::Label::new(&entry.reason).wrap());
+                            let pending = self.retry_pending.contains(&entry.index);
+                            if ui.add_enabled(!pending, egui::Button::new(if pending { "Queued…" } else { "Retry" })).clicked() {
+                                self.rescue_confirm = vec![entry.clone()];
+                            }
+                            ui.end_row();
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.heading("Diagnostics");
+                ui.horizontal(|ui| {
+                    if ui.button("Export diagnostics").clicked() {
+                        self.send(UiAction::SubmitCommand("export".into()));
+                    }
+                    if ui.button("Open session folder").clicked() {
+                        self.send(UiAction::OpenSessionFolder);
+                    }
+                });
+                ui.separator();
+                ui.label(RichText::new("Typed equivalents: status · blocked · retry N CONFIRM · flag N · export").color(color(view::palette::MUTED)).size(11.0));
+            });
+        self.rescue_open = open;
+
+        if !self.rescue_confirm.is_empty() {
+            let rows = self.rescue_confirm.clone();
+            let title = if rows.len() == 1 {
+                "Retry parked delivery?"
+            } else {
+                "Retry all parked deliveries?"
+            };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(retry_confirmation(&rows));
+                    ui.label(RichText::new("This is audited and safe to repeat — a delivery that already applied will not double-grant.").color(color(view::palette::MUTED)));
+                    ui.horizontal(|ui| {
+                        if ui.button("Confirm retry").clicked() {
+                            let mut indices = rows.iter().map(|row| row.index).collect::<Vec<_>>();
+                            indices.sort_unstable();
+                            for index in indices {
+                                self.send(UiAction::RetryBlocked { index });
+                                self.retry_pending.insert(index);
+                            }
+                            self.rescue_confirm.clear();
+                        }
+                        if ui.button("Cancel").clicked() { self.rescue_confirm.clear(); }
+                    });
+                });
+        }
     }
 }
 
@@ -547,6 +708,10 @@ impl eframe::App for StandaloneApp {
                 }
             });
 
+        if !compact {
+            self.rescue_panel(ctx, &snapshot);
+        }
+
         ctx.request_repaint_after(HEARTBEAT);
     }
 
@@ -651,5 +816,20 @@ mod tests {
     #[test]
     fn filters_start_permissive() {
         assert_eq!(WindowOptions::default().filters, FeedFilters::default());
+    }
+
+    #[test]
+    fn rescue_view_model_preserves_named_rows_and_confirmation_identity() {
+        let mut snapshot = ClientSnapshot::default();
+        snapshot.blocked.push(client_ui::BlockedEntry {
+            index: 7,
+            item_name: "Fire Paper x2".into(),
+            reason: "quantity mismatch".into(),
+        });
+        let rows = rescue_rows(&snapshot);
+        assert_eq!(rows, snapshot.blocked);
+        let copy = retry_confirmation(&rows);
+        assert!(copy.contains("Fire Paper x2"));
+        assert!(copy.contains("index 7"));
     }
 }

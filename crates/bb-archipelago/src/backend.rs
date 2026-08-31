@@ -85,6 +85,11 @@ pub trait BloodborneBackend {
     fn location_context(&mut self) -> Result<Option<LocationContext>>;
     /// `None` means the live accessor is not available, never "flag is false".
     fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>>;
+    /// Contract-bounded rescue write. Callers must validate membership before
+    /// invoking this; unsupported backends remain fail-closed.
+    fn write_event_flag(&mut self, _event_flag: u32, _enabled: bool) -> Result<()> {
+        anyhow::bail!("live event-flag writer is unavailable")
+    }
     /// `None` preserves the received reinforcement level.
     fn target_weapon_level(&mut self) -> Result<Option<u8>>;
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress>;
@@ -295,6 +300,18 @@ impl BloodborneBackend for MockBackend {
             return Ok(None);
         }
         Ok(Some(self.set_flags.contains(&event_flag)))
+    }
+
+    fn write_event_flag(&mut self, event_flag: u32, enabled: bool) -> Result<()> {
+        if !self.event_flags_armed {
+            anyhow::bail!("live event-flag accessor is unavailable");
+        }
+        if enabled {
+            self.set_flags.insert(event_flag);
+        } else {
+            self.set_flags.remove(&event_flag);
+        }
+        Ok(())
     }
 
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {
