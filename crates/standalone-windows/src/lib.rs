@@ -98,6 +98,17 @@ pub trait StandaloneHost {
 pub const CONTROL_STATUS: usize = 1001;
 pub const CONTROL_EXPORT: usize = 1002;
 pub const CONTROL_SESSION_FOLDER: usize = 1003;
+pub const CONTROL_COMMAND_INPUT: usize = 1004;
+pub const CONTROL_COMMAND_SEND: usize = 1005;
+
+/// Keep the host a transport rather than a command authority. The worker still parses commands
+/// and enforces confirmation/audit policy; this only prevents pasted text from becoming multiple
+/// commands and bounds the message sent over the non-blocking channel.
+pub fn normalize_command_input(input: &str) -> Option<String> {
+    let command = input.replace(['\r', '\n'], " ");
+    let command = command.trim();
+    (!command.is_empty()).then(|| command.chars().take(512).collect())
+}
 
 /// Map native controls onto the same bounded action channel used by every future renderer.
 /// This slice intentionally exposes only read-only diagnostics and filesystem navigation.
@@ -170,17 +181,18 @@ mod native {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetClientRect, GetWindowRect, IDC_ARROW, LWA_ALPHA, LoadCursorW, MSG, MoveWindow,
-        PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
-        SetLayeredWindowAttributes, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_STYLE,
-        WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW,
-        WS_VISIBLE,
+        GetClientRect, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, LWA_ALPHA,
+        LoadCursorW, MSG, MoveWindow, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW,
+        SW_SHOW, SetLayeredWindowAttributes, SetWindowTextW, ShowWindow, TranslateMessage,
+        WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_BORDER, WS_CHILD,
+        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
     use windows::core::{HSTRING, Result as WindowsResult, w};
 
     use super::{
-        CONTROL_EXPORT, CONTROL_SESSION_FOLDER, CONTROL_STATUS, StandaloneHost, WindowGeometry,
-        WindowOptions, client_ui, control_action, render_snapshot,
+        CONTROL_COMMAND_INPUT, CONTROL_COMMAND_SEND, CONTROL_EXPORT, CONTROL_SESSION_FOLDER,
+        CONTROL_STATUS, StandaloneHost, WindowGeometry, WindowOptions, client_ui, control_action,
+        normalize_command_input, render_snapshot,
     };
 
     /// Dependency-light native shell. It owns only windowing and rendering; the game client owns
@@ -276,9 +288,41 @@ mod native {
                     16,
                     16,
                     geometry.width - 48,
-                    geometry.height - 72,
+                    geometry.height - 116,
                     Some(window),
                     None,
+                    Some(instance),
+                    None,
+                )?;
+                let command_input = CreateWindowExW(
+                    Default::default(),
+                    w!("EDIT"),
+                    w!(""),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0),
+                    16,
+                    geometry.height - 92,
+                    geometry.width - 136,
+                    28,
+                    Some(window),
+                    Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                        CONTROL_COMMAND_INPUT as *mut _,
+                    )),
+                    Some(instance),
+                    None,
+                )?;
+                let send = CreateWindowExW(
+                    Default::default(),
+                    w!("BUTTON"),
+                    w!("Send"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    geometry.width - 112,
+                    geometry.height - 92,
+                    96,
+                    28,
+                    Some(window),
+                    Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                        CONTROL_COMMAND_SEND as *mut _,
+                    )),
                     Some(instance),
                     None,
                 )?;
@@ -339,10 +383,23 @@ mod native {
                         if message.message == WM_QUIT {
                             break 'running;
                         }
-                        if message.message == WM_COMMAND
-                            && let Some(action) = control_action(message.wParam.0 & 0xffff)
-                        {
-                            let _ = endpoint.send_action(action);
+                        if message.message == WM_COMMAND {
+                            let control = message.wParam.0 & 0xffff;
+                            if control == CONTROL_COMMAND_SEND {
+                                let length = GetWindowTextLengthW(command_input);
+                                let mut buffer = vec![0u16; (length + 1) as usize];
+                                let copied = GetWindowTextW(command_input, &mut buffer);
+                                let input = String::from_utf16_lossy(&buffer[..copied as usize]);
+                                if let Some(command) = normalize_command_input(&input)
+                                    && endpoint
+                                        .send_action(client_ui::UiAction::SubmitCommand(command))
+                                        .is_ok()
+                                {
+                                    SetWindowTextW(command_input, w!(""))?;
+                                }
+                            } else if let Some(action) = control_action(control) {
+                                let _ = endpoint.send_action(action);
+                            }
                         }
                         let _ = TranslateMessage(&message);
                         DispatchMessageW(&message);
@@ -366,10 +423,20 @@ mod native {
                         16,
                         16,
                         (bounds.right - 32).max(1),
-                        (bounds.bottom - 76).max(1),
+                        (bounds.bottom - 120).max(1),
                         true,
                     )?;
                     let button_y = (bounds.bottom - 44).max(1);
+                    let command_y = (bounds.bottom - 84).max(1);
+                    MoveWindow(
+                        command_input,
+                        16,
+                        command_y,
+                        (bounds.right - 136).max(1),
+                        28,
+                        true,
+                    )?;
+                    MoveWindow(send, (bounds.right - 112).max(1), command_y, 96, 28, true)?;
                     MoveWindow(status, 16, button_y, 96, 28, true)?;
                     MoveWindow(export, 120, button_y, 144, 28, true)?;
                     MoveWindow(folder, 272, button_y, 152, 28, true)?;
@@ -507,5 +574,22 @@ mod tests {
             Some(client_ui::UiAction::OpenSessionFolder)
         ));
         assert!(control_action(9999).is_none());
+    }
+
+    #[test]
+    fn command_input_is_single_and_bounded() {
+        assert_eq!(
+            normalize_command_input("  status\r\n"),
+            Some("status".into())
+        );
+        assert_eq!(
+            normalize_command_input("flag 1\nretry 2"),
+            Some("flag 1 retry 2".into())
+        );
+        assert_eq!(normalize_command_input("  \n"), None);
+        assert_eq!(
+            normalize_command_input(&"x".repeat(600)).unwrap().len(),
+            512
+        );
     }
 }

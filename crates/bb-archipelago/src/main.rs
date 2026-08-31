@@ -1049,11 +1049,14 @@ fn run() -> Result<()> {
         } else {
             client_ui::DeliveryState::NotArmed
         };
-        let mut command_lines = console_rx.try_iter().collect::<Vec<_>>();
+        let mut command_lines = console_rx
+            .try_iter()
+            .map(|line| (line, false))
+            .collect::<Vec<_>>();
         #[cfg(windows)]
         while let Ok(action) = ui_client.try_action() {
             match action {
-                client_ui::UiAction::SubmitCommand(line) => command_lines.push(line),
+                client_ui::UiAction::SubmitCommand(line) => command_lines.push((line, true)),
                 client_ui::UiAction::RequestShutdown => return Ok(()),
                 // Connection identity is owned by this process invocation. These actions become
                 // active when the connection form lands; silently changing the current seed or
@@ -1072,70 +1075,65 @@ fn run() -> Result<()> {
                 client_ui::UiAction::Connect { .. } | client_ui::UiAction::Disconnect => {}
             }
         }
-        for line in command_lines {
+        for (line, from_ui) in command_lines {
+            #[cfg(windows)]
+            if from_ui {
+                ui_reducer.activity(client_ui::ActivityKind::Command, format!("> {line}"));
+            }
             let words = line.split_whitespace().collect::<Vec<_>>();
             let command = words.first().map(|word| word.to_ascii_lowercase());
-            match command.as_deref() {
-                None | Some("") => {}
-                Some("help") => client_eprintln!(
-                    "Rescue commands: help | status | flag EVENT_FLAG | blocked | retry INDEX CONFIRM | export. Unknown/unmapped writes and warps fail closed."
-                ),
+            let result = match command.as_deref() {
+                None | Some("") => continue,
+                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | blocked | retry INDEX CONFIRM | export. Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
-                    Some(runtime) => match runtime.rescue_status() {
-                        Ok(status) => client_eprintln!("{status}"),
-                        Err(error) => client_eprintln!("Rescue status unavailable: {error:#}"),
-                    },
-                    None => client_eprintln!(
-                        "Runtime contract not loaded yet; AP may be offline before the first successful connection."
-                    ),
+                    Some(runtime) => runtime
+                        .rescue_status()
+                        .unwrap_or_else(|error| format!("Rescue status unavailable: {error:#}")),
+                    None => "Runtime contract not loaded yet; AP may be offline before the first successful connection.".to_owned(),
                 },
                 Some("flag") => match (runtime.as_mut(), words.get(1)) {
                     (Some(runtime), Some(raw)) => match raw.parse::<u32>() {
-                        Ok(flag) => match runtime.rescue_read_flag(flag) {
-                            Ok(value) => client_eprintln!("{value}"),
-                            Err(error) => client_eprintln!("Rescue flag read refused: {error:#}"),
-                        },
-                        Err(_) => client_eprintln!("Usage: flag EVENT_FLAG"),
+                        Ok(flag) => runtime
+                            .rescue_read_flag(flag)
+                            .unwrap_or_else(|error| format!("Rescue flag read refused: {error:#}")),
+                        Err(_) => "Usage: flag EVENT_FLAG".to_owned(),
                     },
-                    (None, _) => client_eprintln!("Runtime contract not loaded yet."),
-                    _ => client_eprintln!("Usage: flag EVENT_FLAG"),
+                    (None, _) => "Runtime contract not loaded yet.".to_owned(),
+                    _ => "Usage: flag EVENT_FLAG".to_owned(),
                 },
-                Some("blocked") => match runtime.as_ref() {
-                    Some(runtime) => client_eprintln!("{}", runtime.rescue_list_blocked()),
-                    None => client_eprintln!("Runtime contract not loaded yet."),
-                },
+                Some("blocked") => runtime.as_ref().map_or_else(
+                    || "Runtime contract not loaded yet.".to_owned(),
+                    |runtime| runtime.rescue_list_blocked(),
+                ),
                 Some("retry") => match (runtime.as_mut(), words.get(1), words.get(2)) {
                     (Some(runtime), Some(raw), Some(confirm))
                         if confirm.eq_ignore_ascii_case("CONFIRM") =>
                     {
                         match raw.parse::<u64>() {
-                            Ok(index) => match runtime.rescue_retry_blocked(index) {
-                                Ok(()) => client_eprintln!(
-                                    "AUDIT rescue retry index={index}: requeued through the normal ordered delivery pipeline."
-                                ),
-                                Err(error) => client_eprintln!("Rescue retry refused: {error:#}"),
-                            },
-                            Err(_) => client_eprintln!("Usage: retry INDEX CONFIRM"),
+                            Ok(index) => runtime.rescue_retry_blocked(index).map_or_else(
+                                |error| format!("Rescue retry refused: {error:#}"),
+                                |()| format!("AUDIT rescue retry index={index}: requeued through the normal ordered delivery pipeline."),
+                            ),
+                            Err(_) => "Usage: retry INDEX CONFIRM".to_owned(),
                         }
                     }
-                    (None, _, _) => client_eprintln!("Runtime contract not loaded yet."),
-                    _ => client_eprintln!(
-                        "Usage: retry INDEX CONFIRM (inspect 'blocked' first; this is audited)"
-                    ),
+                    (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
+                    _ => "Usage: retry INDEX CONFIRM (inspect 'blocked' first; this is audited)".to_owned(),
                 },
                 Some("export") => match runtime.as_ref() {
-                    Some(runtime) => match runtime.rescue_export() {
-                        Ok(path) => {
-                            client_eprintln!("Exported rescue diagnostics to {}", path.display())
-                        }
-                        Err(error) => client_eprintln!("Diagnostic export failed: {error:#}"),
-                    },
-                    None => client_eprintln!("Runtime contract not loaded yet."),
+                    Some(runtime) => runtime.rescue_export().map_or_else(
+                        |error| format!("Diagnostic export failed: {error:#}"),
+                        |path| format!("Exported rescue diagnostics to {}", path.display()),
+                    ),
+                    None => "Runtime contract not loaded yet.".to_owned(),
                 },
-                Some("setflag" | "give" | "item" | "warp") => client_eprintln!(
-                    "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes."
-                ),
-                Some(other) => client_eprintln!("Unknown rescue command {other:?}; type 'help'."),
+                Some("setflag" | "give" | "item" | "warp") => "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes.".to_owned(),
+                Some(other) => format!("Unknown rescue command {other:?}; type 'help'."),
+            };
+            client_eprintln!("{result}");
+            #[cfg(windows)]
+            if from_ui {
+                ui_reducer.activity(client_ui::ActivityKind::CommandResult, result);
             }
         }
         let mut connected_now = false;
