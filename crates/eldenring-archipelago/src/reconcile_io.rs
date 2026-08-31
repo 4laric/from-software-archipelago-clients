@@ -1238,6 +1238,9 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         b.min_grant_interval_ms
     );
     let slot = inputs.save.0.clone();
+    // Scan before `persist_path` moves into WatermarkStore. This is advisory and I/O failures are
+    // false, so it cannot disturb init even if the directory is unavailable.
+    let other_room_history = has_other_room_history(&persist_path, &inputs.seed, &slot);
     let mut store = WatermarkStore::load(persist_path);
     let save_slot = read_save_slot();
     let play_time = read_play_time_ms().unwrap_or(0);
@@ -1303,7 +1306,7 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         // No marker yet (pre-minibake save, or a genuinely new character): keep the battle-tested
         // seed_trust migration. The tick commit then writes a marker, so future connects Resume.
         marker::InitDecision::Fresh => {
-            if has_other_room_history(&persist_path, &inputs.seed, &slot) {
+            if other_room_history {
                 let notice = marker::other_room_history_toast();
                 log::warn!("[reattach] {notice}");
                 if let Ok(mut pending) = ROOM_HISTORY_NOTICE.lock() {
