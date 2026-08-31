@@ -363,6 +363,11 @@ struct Arguments {
     /// translucent default lets the client sit over the game without hiding it;
     /// 100 restores the ordinary opaque console.
     window_opacity: u8,
+    /// `--legacy-window`: run the original raw-Win32 shell instead of the egui
+    /// window. Kept for one release as the fallback path while the new renderer
+    /// collects live-session acceptance; it is not a supported configuration
+    /// beyond that, and the flag goes when the Win32 shell does.
+    legacy_window: bool,
 }
 
 const DEFAULT_WINDOW_OPACITY: u8 = 70;
@@ -561,7 +566,7 @@ fn arguments() -> Result<Arguments> {
 fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let Some(server) = args.next() else {
         bail!(
-            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native] [--log-file PATH] [--window-opacity 35-100] (native delivery is required; client window opacity defaults to 70)"
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native] [--log-file PATH] [--window-opacity 35-100] [--legacy-window] (native delivery is required; client window opacity defaults to 70)"
         )
     };
     let slot = args.next().context("missing SLOT")?;
@@ -576,8 +581,11 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let mut delivery_explicit = false;
     let mut log_file = None;
     let mut window_opacity = DEFAULT_WINDOW_OPACITY;
+    let mut legacy_window = false;
     while let Some(argument) = args.next() {
-        if argument == "--mock" {
+        if argument == "--legacy-window" {
+            legacy_window = true;
+        } else if argument == "--mock" {
             mock = true;
         } else if argument == "--assume-correct-save" {
             assume_correct_save = true;
@@ -620,6 +628,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
         delivery_explicit,
         log_file,
         window_opacity,
+        legacy_window,
     })
 }
 
@@ -677,6 +686,48 @@ fn version_request<I: Iterator<Item = String>>(mut args: I) -> Result<Option<Str
     Ok(Some(client_version()))
 }
 
+/// Resolve an Archipelago item id to the name the datapackage gives it.
+///
+/// The window's half of this rule is that it never sees an id at all: the renderer receives text.
+/// See [`bb_archipelago::names`] for the formatting policy and its tests.
+#[cfg(windows)]
+fn item_label(game: &archipelago_rs::Game, ap_item_id: i64) -> String {
+    let name = game.item(ap_item_id).map(|item| item.name());
+    bb_archipelago::names::item_label(name.as_ref().map(|name| name.as_str()), ap_item_id)
+}
+
+/// Resolve a batch of location ids into one feed line.
+#[cfg(windows)]
+fn location_check_line(game: &archipelago_rs::Game, locations: &[i64]) -> String {
+    let names = locations
+        .iter()
+        .map(|&id| {
+            game.location(id).map_or_else(
+                || format!("location #{id}"),
+                |location| location.name().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    bb_archipelago::names::location_check_line(&names)
+}
+
+/// Which feed lane a server print belongs in.
+///
+/// Hints get their own lane because they are the one server print players actively hunt for in a
+/// long feed; command results get the monospaced lane so they line up with the console. Everything
+/// else is chat.
+#[cfg(windows)]
+fn print_activity_kind(print: &archipelago_rs::Print) -> client_ui::ActivityKind {
+    match print {
+        archipelago_rs::Print::Hint { .. } => client_ui::ActivityKind::Hint,
+        archipelago_rs::Print::CommandResult { .. }
+        | archipelago_rs::Print::AdminCommandResult { .. } => {
+            client_ui::ActivityKind::CommandResult
+        }
+        _ => client_ui::ActivityKind::Message,
+    }
+}
+
 fn run() -> Result<()> {
     let args = arguments()?;
     // The tee is armed before ANY other output (clients#425), so the session log
@@ -718,8 +769,19 @@ fn run() -> Result<()> {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("client-window.json");
-        standalone_windows::spawn_persisted(host, options, window_state);
-        let mut reducer = client_ui::SnapshotReducer::new(100);
+        // The egui window is the default renderer; `--legacy-window` keeps the
+        // original Win32 shell available for one release as a fallback. Both
+        // consume the same `HostEndpoint` and emit the same `UiAction`s, so the
+        // choice is a renderer choice and nothing more.
+        if args.legacy_window {
+            client_eprintln!(
+                "Using the legacy Win32 client window (--legacy-window). This shell is scheduled for removal; report anything the default window does worse."
+            );
+            standalone_windows::spawn_persisted(host, options, window_state);
+        } else {
+            standalone_egui::spawn_persisted(host, options, window_state);
+        }
+        let mut reducer = client_ui::SnapshotReducer::default();
         client.publish(reducer.reduce(client_ui::DeliveryFacts {
             process: client_ui::ProcessState::Attaching,
             ap: client_ui::ApState::Connecting,
@@ -885,6 +947,11 @@ fn run() -> Result<()> {
         } else {
             client_ui::DeliveryState::NotArmed
         };
+        // Why delivery is where it is, in the words the console already uses.
+        // The window shows this instead of a bare `Blocked`, which told a player
+        // nothing they could act on.
+        #[cfg(windows)]
+        let mut ui_delivery_detail: Option<String> = None;
         let mut command_lines = console_rx
             .try_iter()
             .map(|line| (line, false))
@@ -988,11 +1055,16 @@ fn run() -> Result<()> {
                 }
                 Event::Print(message) => {
                     #[cfg(windows)]
-                    ui_reducer.activity(client_ui::ActivityKind::Message, message.to_string());
+                    ui_reducer.activity(print_activity_kind(&message), message.to_string());
                     client_eprintln!("{message}");
                 }
                 Event::Error(error) => {
                     ap_error_seen = true;
+                    #[cfg(windows)]
+                    ui_reducer.activity(
+                        client_ui::ActivityKind::Error,
+                        format!("Archipelago error: {error}"),
+                    );
                     client_eprintln!("Archipelago error: {error}");
                 }
                 Event::DeathLink { source, cause, .. } => {
@@ -1255,7 +1327,7 @@ fn run() -> Result<()> {
                         #[cfg(windows)]
                         ui_reducer.activity(
                             client_ui::ActivityKind::LocationCheck,
-                            format!("Sent {} location check(s)", newly_checked.len()),
+                            location_check_line(client.this_game(), &newly_checked),
                         );
                         runtime.record_location_checks(&newly_checked);
                         if !goal_reported
@@ -1306,8 +1378,8 @@ fn run() -> Result<()> {
                         ui_reducer.activity(
                             client_ui::ActivityKind::ReceivedItem,
                             format!(
-                                "Received AP item {} (index {})",
-                                item.ap_item_id, item.index
+                                "Received {}",
+                                item_label(client.this_game(), item.ap_item_id)
                             ),
                         );
                     }
@@ -1330,11 +1402,15 @@ fn run() -> Result<()> {
                     #[cfg(windows)]
                     {
                         ui_delivery = client_ui::DeliveryState::Blocked;
+                        ui_delivery_detail =
+                            Some(format!("{} ({})", blocked.status, blocked.detail));
                         ui_reducer.activity(
                             client_ui::ActivityKind::ParkedDelivery,
                             format!(
-                                "Parked AP item {} (index {})",
-                                blocked.ap_item_id, blocked.index
+                                "Parked {} - {} ({})",
+                                item_label(client.this_game(), blocked.ap_item_id),
+                                blocked.status,
+                                blocked.detail
                             ),
                         );
                     }
@@ -1425,6 +1501,12 @@ fn run() -> Result<()> {
             );
             if ledger.parked > 0 {
                 ui_delivery = client_ui::DeliveryState::Blocked;
+                ui_delivery_detail.get_or_insert_with(|| {
+                    format!(
+                        "{} item(s) parked; type `blocked` to inspect",
+                        ledger.parked
+                    )
+                });
             }
             ui_client.publish(ui_reducer.reduce(client_ui::DeliveryFacts {
                 process: if attached {
@@ -1434,6 +1516,7 @@ fn run() -> Result<()> {
                 },
                 ap,
                 delivery: ui_delivery,
+                delivery_detail: ui_delivery_detail,
                 server: Some(args.server.clone()),
                 slot: Some(args.slot.clone()),
                 seed,
@@ -1597,6 +1680,30 @@ mod tests {
     fn client_window_is_translucent_by_default() {
         let args = parse_args(base_args(&[]).into_iter()).expect("parse");
         assert_eq!(args.window_opacity, 70);
+    }
+
+    /// The fallback shell has to stay reachable by flag until a live Windows session has accepted
+    /// the egui window; a typo'd flag that silently parsed as the PASSWORD positional would send
+    /// "--legacy-window" to the server as a password.
+    #[test]
+    fn the_legacy_window_is_opt_in_and_is_not_mistaken_for_a_password() {
+        let default = parse_args(
+            ["server", "slot", "config", "ledger"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(!default.legacy_window);
+        assert_eq!(default.password, None);
+
+        let legacy = parse_args(
+            ["server", "slot", "config", "ledger", "--legacy-window"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(legacy.legacy_window);
+        assert_eq!(legacy.password, None);
     }
 
     #[test]

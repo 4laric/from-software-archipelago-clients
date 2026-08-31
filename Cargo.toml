@@ -7,6 +7,7 @@ members = [
     "crates/ds3-archipelago",
     "crates/sdt-archipelago",
     "crates/shared",
+    "crates/standalone-egui",
     "crates/standalone-windows",
     # --- Elden Ring (DRAFT) -------------------------------------------------
     # Alaric's Phase-5 ER runtime client + its two pure-logic crates.
@@ -66,6 +67,10 @@ features = [
     "Win32_Media_Audio",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    # Win32_UI_Input_KeyboardAndMouse: RegisterHotKey, for the standalone window's click-through
+    # escape hatch (crates/standalone-egui/src/hotkey.rs). A window that ignores the mouse also
+    # ignores the control that turned that on, so the way back cannot itself be a click.
+    "Win32_UI_Input_KeyboardAndMouse",
 ]
 
 [patch.crates-io]

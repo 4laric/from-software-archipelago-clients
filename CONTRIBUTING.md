@@ -71,10 +71,11 @@ As of 2026-08-15 the job runs, in this order:
    **build and test run before style**: on this repo's first ever CI run a
    `cargo fmt` failure skipped the build while three genuine compile errors sat
    on `main`.
-2. `cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago
-   -p shared -p archipelago_rs` — **six** packages, not four. `shared` and
-   `archipelago_rs` each spent a period being built here but never tested,
-   which means their suites ran nowhere at all.
+2. `cargo test` over an explicit package list — read the workflow for the
+   current one. It has grown four times, each time because a crate was being
+   built here and tested nowhere at all: `shared`, `archipelago_rs`,
+   `bb-archipelago`, and (2026-08-31) the three UI crates `client-ui`,
+   `standalone-windows`, `standalone-egui`.
 3. `cargo fmt -- --check`
 4. `cargo clippy -- -D warnings` **and**
    `cargo clippy --features=profile -- -D warnings` — **two** invocations. A
@@ -97,7 +98,7 @@ Run the whole thing before pushing:
 ```
 export RUSTFLAGS=-Dwarnings
 cargo build
-cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago -p shared -p archipelago_rs
+cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago -p shared -p archipelago_rs -p bb-archipelago -p client-ui -p standalone-windows -p standalone-egui
 cargo fmt -- --check
 cargo clippy -- -D warnings
 cargo clippy --features=profile -- -D warnings

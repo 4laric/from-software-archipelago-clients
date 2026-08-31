@@ -24,6 +24,7 @@ pub mod feed;
 pub mod health;
 pub mod ledger;
 pub mod logging;
+pub mod names;
 pub mod native;
 pub mod upgrades;
 
