@@ -181,11 +181,11 @@ mod native {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetClientRect, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, LWA_ALPHA,
-        LoadCursorW, MSG, MoveWindow, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW,
-        SW_SHOW, SetLayeredWindowAttributes, SetWindowTextW, ShowWindow, TranslateMessage,
-        WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_BORDER, WS_CHILD,
-        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        GetClientRect, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
+        IsDialogMessageW, LWA_ALPHA, LoadCursorW, MSG, MoveWindow, PM_REMOVE, PeekMessageW,
+        PostQuitMessage, RegisterClassW, SW_SHOW, SetLayeredWindowAttributes, SetWindowTextW,
+        ShowWindow, TranslateMessage, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN,
+        WM_QUIT, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
     };
     use windows::core::{HSTRING, Result as WindowsResult, w};
 
@@ -224,6 +224,30 @@ mod native {
             // SAFETY: all unhandled messages retain the platform default behavior.
             _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
         }
+    }
+
+    /// Submit the edit control as one bounded worker command. Kept in one helper so clicking
+    /// Send and pressing Enter have exactly the same validation, queueing, and clear-on-success
+    /// behavior.
+    unsafe fn submit_command(
+        command_input: HWND,
+        endpoint: &client_ui::HostEndpoint,
+    ) -> WindowsResult<()> {
+        // SAFETY: `command_input` belongs to this UI thread and remains alive for the loop.
+        unsafe {
+            let length = GetWindowTextLengthW(command_input);
+            let mut buffer = vec![0u16; (length + 1) as usize];
+            let copied = GetWindowTextW(command_input, &mut buffer);
+            let input = String::from_utf16_lossy(&buffer[..copied as usize]);
+            if let Some(command) = normalize_command_input(&input)
+                && endpoint
+                    .send_action(client_ui::UiAction::SubmitCommand(command))
+                    .is_ok()
+            {
+                SetWindowTextW(command_input, w!(""))?;
+            }
+        }
+        Ok(())
     }
 
     impl StandaloneHost for NativeWindowHost {
@@ -298,7 +322,7 @@ mod native {
                     Default::default(),
                     w!("EDIT"),
                     w!(""),
-                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_TABSTOP.0),
                     16,
                     geometry.height - 92,
                     geometry.width - 136,
@@ -313,8 +337,8 @@ mod native {
                 let send = CreateWindowExW(
                     Default::default(),
                     w!("BUTTON"),
-                    w!("Send"),
-                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    w!("&Send"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0),
                     geometry.width - 112,
                     geometry.height - 92,
                     96,
@@ -329,8 +353,8 @@ mod native {
                 let status = CreateWindowExW(
                     Default::default(),
                     w!("BUTTON"),
-                    w!("Status"),
-                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    w!("&Status"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0),
                     16,
                     geometry.height - 92,
                     96,
@@ -345,8 +369,8 @@ mod native {
                 let export = CreateWindowExW(
                     Default::default(),
                     w!("BUTTON"),
-                    w!("Export diagnostics"),
-                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    w!("&Export diagnostics"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0),
                     120,
                     geometry.height - 92,
                     144,
@@ -361,8 +385,8 @@ mod native {
                 let folder = CreateWindowExW(
                     Default::default(),
                     w!("BUTTON"),
-                    w!("Open session folder"),
-                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    w!("Open session &folder"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0),
                     272,
                     geometry.height - 92,
                     152,
@@ -383,23 +407,28 @@ mod native {
                         if message.message == WM_QUIT {
                             break 'running;
                         }
+                        // A single-line edit does not emit a button notification for Enter.
+                        // Intercept it before translation and route through the same helper as
+                        // clicking Send; never forward the keystroke as a second action.
+                        if message.hwnd == command_input
+                            && message.message == WM_KEYDOWN
+                            && message.wParam.0 == 0x0d
+                        {
+                            submit_command(command_input, &endpoint)?;
+                            continue;
+                        }
                         if message.message == WM_COMMAND {
                             let control = message.wParam.0 & 0xffff;
                             if control == CONTROL_COMMAND_SEND {
-                                let length = GetWindowTextLengthW(command_input);
-                                let mut buffer = vec![0u16; (length + 1) as usize];
-                                let copied = GetWindowTextW(command_input, &mut buffer);
-                                let input = String::from_utf16_lossy(&buffer[..copied as usize]);
-                                if let Some(command) = normalize_command_input(&input)
-                                    && endpoint
-                                        .send_action(client_ui::UiAction::SubmitCommand(command))
-                                        .is_ok()
-                                {
-                                    SetWindowTextW(command_input, w!(""))?;
-                                }
+                                submit_command(command_input, &endpoint)?;
                             } else if let Some(action) = control_action(control) {
                                 let _ = endpoint.send_action(action);
                             }
+                        }
+                        // Gives the ordinary child controls standard Tab/Shift+Tab traversal and
+                        // activates their ampersand mnemonics without adding UI-owned state.
+                        if IsDialogMessageW(window, &message).as_bool() {
+                            continue;
                         }
                         let _ = TranslateMessage(&message);
                         DispatchMessageW(&message);
