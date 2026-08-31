@@ -3970,7 +3970,11 @@ impl shared::Core for Core {
         //     its 9130/9412 writes. Backfill those two only; common event 3040 still owns 9413 and
         //     therefore preserves the Jerren-dialogue / out-of-area timing.
         crate::radahn_festival::tick();
-        // 6d. BOSS GRANTS (#413): hand the player the tool the BOSS assumes they arrived with.
+        // 6d. Morgott post-boss progression (#1100): replacement bosses set the arena defeat flag
+        //     without guaranteeing the removed Erdtree/Melina interaction. Supply that one vanilla
+        //     prerequisite; event 11002501 still owns its SpEffects and final seal-release flag.
+        crate::morgott_progression::tick();
+        // 6e. BOSS GRANTS (#413): hand the player the tool the BOSS assumes they arrived with.
         //     Keyed on the CHARACTER, never the arena -- an enemy randomiser moves bosses between
         //     rooms, so a place key would arm the wrong fight (Alaric, 2026-08-06).
         //

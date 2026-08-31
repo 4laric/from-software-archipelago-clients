@@ -40,6 +40,7 @@ mod lock_hints;
 mod merchant_bells;
 mod mine_materials;
 mod minibaker;
+mod morgott_progression;
 mod no_equip_load;
 mod no_fall_damage;
 mod no_weapon_reqs;
