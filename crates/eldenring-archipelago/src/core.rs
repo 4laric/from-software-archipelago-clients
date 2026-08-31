@@ -4659,6 +4659,13 @@ impl shared::Core for Core {
                 let now = self.toast_clock.elapsed().as_millis() as u64;
                 self.toasts.push(refusal, now);
             }
+            // Advisory only: the marker says this character is fresh, but the persist directory
+            // has another room for the same AP slot name. This catches the wiped-save/re-roll
+            // ambiguity from #402 without rejecting a deliberate reroll.
+            if let Some(notice) = crate::reconcile_io::take_room_history_toast() {
+                let now = self.toast_clock.elapsed().as_millis() as u64;
+                self.toasts.push(notice, now);
+            }
             // Same re-push-every-tick contract for a version mismatch: the pairing stays wrong
             // for the whole session, and the deck refreshes identical text rather than stacking.
             if !self.version_warn_acknowledged
@@ -6391,12 +6398,11 @@ fn save_file_path(seed: &str, name: &str) -> Option<PathBuf> {
             return None;
         }
     };
-    let safe = |s: &str| -> String {
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect()
-    };
-    Some(dir.join(format!("ap_save_{}_{}.json", safe(seed), safe(name))))
+    Some(dir.join(format!(
+        "ap_save_{}_{}.json",
+        er_logic::marker::safe_file_identity_part(seed),
+        er_logic::marker::safe_file_identity_part(name)
+    )))
 }
 
 /// Choose a shipped static table. The release contract puts both tables beside the AP DLL.

@@ -807,6 +807,15 @@ pub fn is_refused() -> bool {
 type RefusalState = (marker::Refusal, Option<(String, String)>);
 static REFUSAL: Mutex<Option<RefusalState>> = Mutex::new(None);
 
+/// Advisory, one-shot notice for clients#402's wiped-save/new-room ambiguity. Unlike [`REFUSED`],
+/// this never gates anything: a deliberate reroll with the same slot name is valid.
+static ROOM_HISTORY_NOTICE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Take the one-shot new-room heads-up, if init found older history for this AP slot name.
+pub fn take_room_history_toast() -> Option<String> {
+    ROOM_HISTORY_NOTICE.lock().ok()?.take()
+}
+
 /// The on-screen notice owed while this session is refused, or `None` when it is healthy.
 ///
 /// Re-computed every tick by design: the condition PERSISTS (a refused session never heals without
@@ -854,6 +863,28 @@ fn wrong_save_room_hint(stored: marker::Identity) -> Option<(String, String)> {
         }
     }
     marker::wrong_save_room(stored, &siblings)
+}
+
+/// Does the current `ap_save_<seed>_<slot>.json` have a sibling for the SAME sanitized slot name
+/// under a different seed? File-name evidence is enough for an advisory warning and deliberately
+/// not enough for a refusal. Every I/O failure degrades to `false`.
+fn has_other_room_history(persist_path: &std::path::Path, seed: &str, slot: &str) -> bool {
+    let Some(dir) = persist_path.parent() else {
+        return false;
+    };
+    let siblings: Vec<(String, String)> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(marker::save_file_identity_parts)
+            })
+            .collect(),
+        Err(_) => return false,
+    };
+    marker::has_other_room_for_slot(seed, slot, &siblings)
 }
 
 /// RELEASE a latched refusal, if this is one of the refusals that may be released. Returns `true`
@@ -1196,6 +1227,9 @@ fn apply_classes() -> ApplyClasses {
 /// `DesiredInputs` are built AND the world is loaded (`has_inventory() && in_world()`).
 pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_through: i64) {
     reset_fresh_character_verdict();
+    if let Ok(mut notice) = ROOM_HISTORY_NOTICE.lock() {
+        *notice = None;
+    }
     log::info!("[reconcile] mode: {}", mode_desc());
     let b = paced_budget();
     log::info!(
@@ -1204,6 +1238,9 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         b.min_grant_interval_ms
     );
     let slot = inputs.save.0.clone();
+    // Scan before `persist_path` moves into WatermarkStore. This is advisory and I/O failures are
+    // false, so it cannot disturb init even if the directory is unavailable.
+    let other_room_history = has_other_room_history(&persist_path, &inputs.seed, &slot);
     let mut store = WatermarkStore::load(persist_path);
     let save_slot = read_save_slot();
     let play_time = read_play_time_ms().unwrap_or(0);
@@ -1269,6 +1306,13 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         // No marker yet (pre-minibake save, or a genuinely new character): keep the battle-tested
         // seed_trust migration. The tick commit then writes a marker, so future connects Resume.
         marker::InitDecision::Fresh => {
+            if other_room_history {
+                let notice = marker::other_room_history_toast();
+                log::warn!("[reattach] {notice}");
+                if let Ok(mut pending) = ROOM_HISTORY_NOTICE.lock() {
+                    *pending = Some(notice);
+                }
+            }
             let (fresh_character, persisted) = seed_trust(entry, play_time);
             (
                 Reconciler::seeded(inputs, persisted, received_through, fresh_character),
