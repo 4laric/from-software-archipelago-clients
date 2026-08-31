@@ -2,6 +2,12 @@
 
 ### Changed
 
+* **An opt-in pickup-notification correlation probe is ready for live mapping.**
+  Setting `pickup_notification_probe` in the local runtime config writes a
+  bounded `pickup-notification-capture.jsonl` that joins AP checks and delivery
+  states to native ItemGrant caller RVAs. It is observation-only and leaves
+  banners, item transactions, suppression, and acknowledgement untouched.
+
 * **Randomized fixed pickups now sustain exploration with one Quicksilver
   Bullet.** Their suppressed ItemLot already supplies one Blood Vial; after a
   new check is sent, the client queues the matching Bullet through the native

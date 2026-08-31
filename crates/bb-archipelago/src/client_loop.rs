@@ -97,6 +97,9 @@ pub struct ClientLoop<B> {
 }
 
 impl<B: BloodborneBackend> ClientLoop<B> {
+    pub fn record_location_checks(&mut self, locations: &[i64]) {
+        self.backend.record_location_checks(locations);
+    }
     pub fn new(
         backend: B,
         config: RuntimeConfig,
@@ -1049,6 +1052,7 @@ mod tests {
             auto_upgrade: false,
             auto_equip: false,
             death_link: false,
+            pickup_notification_probe: false,
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,

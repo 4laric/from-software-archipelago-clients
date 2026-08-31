@@ -265,6 +265,13 @@ enum Backend {
 }
 
 impl BloodborneBackend for Backend {
+    fn record_location_checks(&mut self, locations: &[i64]) {
+        match self {
+            Self::Live(backend) => backend.record_location_checks(locations),
+            Self::Mock(backend) => backend.record_location_checks(locations),
+            Self::Native(backend) => backend.record_location_checks(locations),
+        }
+    }
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
         match self {
             Self::Live(backend) => backend.location_context(),
@@ -896,7 +903,7 @@ fn run() -> Result<()> {
                 // Armed unconditionally on the native path -- it costs one
                 // appended line per delivered item and it is the only way the
                 // storage-routing question gets answered from ordinary play.
-                backend.arm_delivery_diagnostics(&args.ledger);
+                backend.arm_delivery_diagnostics(&args.ledger, config.pickup_notification_probe);
                 client_eprintln!(
                     "Bloodborne AP client {} | CUSA03173 01.09 | native payload installed | eboot 0x{:X} | native delivery armed",
                     client_version(),
@@ -1283,6 +1290,7 @@ fn run() -> Result<()> {
                         client_eprintln!("Bloodborne location polling recovered.");
                     }
                     if !newly_checked.is_empty() {
+                        runtime.record_location_checks(&newly_checked);
                         if !goal_reported
                             && goal_location.is_some_and(|goal| newly_checked.contains(&goal))
                         {

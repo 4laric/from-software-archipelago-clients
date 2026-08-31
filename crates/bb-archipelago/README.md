@@ -255,6 +255,24 @@ Send `blood-gem-capture.jsonl` with `client.log`, naming the two gems and their
 pickup order. A gem-shaped descriptor proves this boundary owns category-8
 insertion; no call across both clean acquisitions rules it out directly.
 
+### Pickup-notification diagnostic (clients#510)
+
+Set `"pickup_notification_probe": true` in the local `runtime-config.json` to
+create `pickup-notification-capture.jsonl` beside the receive ledger. The probe
+is disabled by default and cannot be enabled by seed slot data. It is strictly
+observation-only: it correlates newly sent AP location IDs and delivery states
+with the already validated native `ItemGrant` boundary, including its stable
+caller RVA. It neither calls a message function nor changes suppression,
+acknowledgement, delivery, or inventory.
+
+For the focused playtest, number the visible actions in a note and perform: one
+ordinary vanilla pickup; one AP-owned pickup whose result is local; one whose
+result is remote; one direct consumable delivery; one weapon delivery; and, if
+convenient, one at-cap delivery routed to storage. Note the exact banner shown
+for each action and send `pickup-notification-capture.jsonl` with `client.log`.
+The capture is bounded to 4096 records and repeated pending states/native-call
+sequences are deduplicated. A write failure is non-fatal.
+
 ### Zero-Vial diagnostic (bb-archipelago#70)
 
 Native sessions also append read-only samples to `blood-vial-capture.jsonl`

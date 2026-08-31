@@ -21,6 +21,7 @@
   },
   "auto_upgrade": false,
   "auto_equip": false,
+  "pickup_notification_probe": false,
   "expected_save_identity": "mock-save",
   "suppression_manifest": null,
   "installed_gameparam": null,
