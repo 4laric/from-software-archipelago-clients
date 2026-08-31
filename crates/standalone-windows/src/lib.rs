@@ -195,7 +195,8 @@ mod native {
 
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, UpdateWindow,
+        COLOR_WINDOW, GetMonitorInfoW, GetSysColorBrush, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+        MONITORINFO, MonitorFromRect, UpdateWindow,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -316,6 +317,9 @@ mod native {
                     lpfnWndProc: Some(window_proc),
                     hInstance: instance,
                     hCursor: LoadCursorW(None, IDC_ARROW)?,
+                    // Layered windows must have an opaque erase brush. Without one, moving or
+                    // updating child controls leaves their previous pixels in the backing bitmap.
+                    hbrBackground: GetSysColorBrush(COLOR_WINDOW),
                     lpszClassName: class_name,
                     ..Default::default()
                 };
@@ -445,6 +449,8 @@ mod native {
                 let _ = UpdateWindow(window);
 
                 let mut message = MSG::default();
+                let mut last_rendered = String::new();
+                let mut last_client_size = None;
                 'running: loop {
                     while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                         if message.message == WM_QUIT {
@@ -477,7 +483,11 @@ mod native {
                         DispatchMessageW(&message);
                     }
                     if let Some(snapshot) = endpoint.latest_snapshot() {
-                        SetWindowTextW(body, &HSTRING::from(render_snapshot(&snapshot)))?;
+                        let rendered = render_snapshot(&snapshot);
+                        if rendered != last_rendered {
+                            SetWindowTextW(body, &HSTRING::from(&rendered))?;
+                            last_rendered = rendered;
+                        }
                     }
                     let mut bounds = RECT::default();
                     GetClientRect(window, &mut bounds)?;
@@ -490,28 +500,36 @@ mod native {
                             height: window_bounds.bottom - window_bounds.top,
                         };
                     }
-                    MoveWindow(
-                        body,
-                        16,
-                        16,
-                        (bounds.right - 32).max(1),
-                        (bounds.bottom - 120).max(1),
-                        true,
-                    )?;
-                    let button_y = (bounds.bottom - 44).max(1);
-                    let command_y = (bounds.bottom - 84).max(1);
-                    MoveWindow(
-                        command_input,
-                        16,
-                        command_y,
-                        (bounds.right - 136).max(1),
-                        28,
-                        true,
-                    )?;
-                    MoveWindow(send, (bounds.right - 112).max(1), command_y, 96, 28, true)?;
-                    MoveWindow(status, 16, button_y, 96, 28, true)?;
-                    MoveWindow(export, 120, button_y, 144, 28, true)?;
-                    MoveWindow(folder, 272, button_y, 152, 28, true)?;
+                    let client_size = (bounds.right, bounds.bottom);
+                    if last_client_size != Some(client_size) {
+                        // Erase the old child footprints before placing controls at their new
+                        // coordinates. This is essential for a translucent layered parent.
+                        let _ = InvalidateRect(Some(window), None, true);
+                        MoveWindow(
+                            body,
+                            16,
+                            16,
+                            (bounds.right - 32).max(1),
+                            (bounds.bottom - 120).max(1),
+                            true,
+                        )?;
+                        let button_y = (bounds.bottom - 44).max(1);
+                        let command_y = (bounds.bottom - 84).max(1);
+                        MoveWindow(
+                            command_input,
+                            16,
+                            command_y,
+                            (bounds.right - 136).max(1),
+                            28,
+                            true,
+                        )?;
+                        MoveWindow(send, (bounds.right - 112).max(1), command_y, 96, 28, true)?;
+                        MoveWindow(status, 16, button_y, 96, 28, true)?;
+                        MoveWindow(export, 120, button_y, 144, 28, true)?;
+                        MoveWindow(folder, 272, button_y, 152, 28, true)?;
+                        let _ = UpdateWindow(window);
+                        last_client_size = Some(client_size);
+                    }
                     thread::sleep(Duration::from_millis(50));
                 }
                 if let Some(path) = self.state_path.as_deref()
