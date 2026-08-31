@@ -1,7 +1,6 @@
 //! Standalone Bloodborne Archipelago client components.
 
-/// Exact cross-repository runtime contract. The apworld, native client, and
-/// Cheat Engine harness bump this together whenever their shared shape changes.
+/// Exact cross-repository runtime contract shared by the apworld and native client.
 pub const RUNTIME_BUILD: &str = "bb-0.1.0-r9";
 
 /// Version that identifies the exact client binary, not merely its Cargo package version.
@@ -18,7 +17,6 @@ pub fn client_version() -> String {
 }
 
 pub mod backend;
-pub mod bridge;
 pub mod client_loop;
 pub mod config;
 pub mod event_flags;

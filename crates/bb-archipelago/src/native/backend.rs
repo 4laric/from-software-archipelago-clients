@@ -1,17 +1,11 @@
 //! `NativeBackend`: a [`BloodborneBackend`] that grants items in-process via the
-//! native `bb-native-grant-v7` payload, replacing the Cheat Engine file bridge.
+//! native `bb-native-grant-v7` payload.
 //!
 //! Native is now the default delivery backend (see `main.rs`). Regardless of how
 //! it is selected, [`NativeBackend::attach`] itself always fails closed: when the
 //! running image does not verify against the contract it returns a clear error
-//! and patches nothing -- this layer never silently falls back. `main.rs` never
-//! turns that failure into a CE-bridge fallback: on the *default* path (no
-//! explicit `--delivery`) a failed attach hard-fails with guidance telling the
-//! player to load the Cheat Engine table and re-run with `--delivery=ce-bridge`,
-//! and an explicit `--delivery=native` propagates the raw error. A silent
-//! fallback would arm a bridge the player has no CE table loaded for, so grants
-//! would vanish; clients#413 tracks the liveness handshake that will let the
-//! client detect a loaded table and offer the bridge safely.
+//! and patches nothing. `main.rs` reports actionable native diagnostics and
+//! never arms another backend.
 //!
 //! The live attach/install path is `#[cfg(windows)]` and CI/owner-validated; the
 //! grant, flag and context logic it drives is host-tested through `engine.rs`,
@@ -45,7 +39,7 @@ use super::shop_capture::ShopCapture;
 use super::vial_capture::VialCapture;
 
 /// Consecutive gameplay-ready probes required before the unsafe assumed-save
-/// mode reports readiness. Mirrors `FileBackend`.
+/// mode reports readiness.
 const ASSUMED_CONTEXT_STABLE_READS: u8 = 3;
 
 #[derive(Clone, Debug)]
@@ -185,7 +179,7 @@ impl NativeBackend {
         } = self;
         let Some(gate) = assumed_context.as_mut() else {
             // Normal live mode stays fail-closed until a real save-identity
-            // accessor exists, exactly like FileBackend.
+            // accessor exists.
             return Ok(None);
         };
         if let Err(error) = arming {

@@ -1,14 +1,7 @@
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
-use anyhow::{Result, bail};
-
-use crate::bridge::{FileBridge, GrantCommand};
-use crate::event_flags::LiveEventFlags;
 use crate::feed::EquipTarget;
-
-const GRANT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const ASSUMED_CONTEXT_STABLE_READS: u8 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocationContext {
@@ -41,8 +34,8 @@ pub struct EquipRequest {
 /// rather than predicted from the ledger's lifetime delivered sum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StackObservation {
-    /// This backend cannot read inventory (the CE file bridge): the caller
-    /// keeps its pre-clients#427 ledger-derived baseline.
+    /// This backend cannot read inventory: the caller keeps its
+    /// pre-clients#427 ledger-derived baseline.
     Unsupported,
     /// Inventory geometry is not hydrated yet, or an absent stack has not
     /// survived the contract's absent-poll grace. Never "zero".
@@ -122,8 +115,7 @@ pub trait BloodborneBackend {
     ///
     /// Required for the same reason as [`Self::observe_stack_quantity`]: a
     /// default here is invisible to the enum wrapper the binary dispatches
-    /// through. A backend that cannot tell (the CE file bridge) answers `true`
-    /// explicitly, the pre-existing freeze-on-first-observe behaviour.
+    /// through.
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool>;
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress>;
     /// Kill the loaded player for an incoming DeathLink. `false` means the
@@ -134,8 +126,7 @@ pub trait BloodborneBackend {
     /// under is gone -- a save switch, a non-gameplay transition, or a process
     /// restart that finds a leftover command. Returns `true` when a command
     /// was actually withdrawn; `false` when there was nothing unwitnessed to
-    /// withdraw. See `FileBridge::withdraw_unwitnessed_command` for what
-    /// "unwitnessed" means and why witnessed commands are left alone.
+    /// withdraw.
     fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool>;
     /// Read the save-resident receive watermark (bb-archipelago#77). `None`
     /// means no watermark is available: either the backend has no writable
@@ -151,184 +142,6 @@ pub trait BloodborneBackend {
     /// non-fatal: the delivery is already acknowledged in the durable ledger.
     fn write_save_watermark(&mut self, _cursor: u64) -> Result<bool> {
         Ok(false)
-    }
-}
-
-pub struct FileBackend {
-    bridge: FileBridge,
-    event_flags: LiveEventFlags,
-    assumed_context: Option<AssumedContextGate>,
-}
-
-#[derive(Clone, Debug)]
-struct AssumedContextGate {
-    identity: String,
-    consecutive_ready: u8,
-}
-
-impl AssumedContextGate {
-    fn new(identity: String) -> Self {
-        Self {
-            identity,
-            consecutive_ready: 0,
-        }
-    }
-
-    fn observe(&mut self, ready: bool) -> LocationContext {
-        if ready {
-            self.consecutive_ready = self.consecutive_ready.saturating_add(1);
-        } else {
-            self.consecutive_ready = 0;
-        }
-        LocationContext {
-            save_identity: self.identity.clone(),
-            gameplay_ready: self.consecutive_ready >= ASSUMED_CONTEXT_STABLE_READS,
-        }
-    }
-}
-
-impl FileBackend {
-    pub fn new(bridge: FileBridge, event_flags: LiveEventFlags) -> Self {
-        Self {
-            bridge,
-            event_flags,
-            assumed_context: None,
-        }
-    }
-
-    /// Enable the explicitly unsafe vertical-slice mode. The supplied identity
-    /// is an operator attestation, not a value read from the game save.
-    pub fn assuming_correct_save(
-        bridge: FileBridge,
-        event_flags: LiveEventFlags,
-        assumed_identity: String,
-    ) -> Self {
-        Self {
-            bridge,
-            event_flags,
-            assumed_context: Some(AssumedContextGate::new(assumed_identity)),
-        }
-    }
-}
-
-impl BloodborneBackend for FileBackend {
-    fn location_context(&mut self) -> Result<Option<LocationContext>> {
-        let Some(gate) = self.assumed_context.as_mut() else {
-            // The normal live mode remains fail-closed until a real save
-            // identity accessor is available.
-            return Ok(None);
-        };
-        if let Err(error) = self.event_flags.probe_manager_resilient() {
-            gate.observe(false);
-            return Err(error);
-        }
-        Ok(Some(gate.observe(true)))
-    }
-
-    fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>> {
-        self.event_flags.read_resilient(event_flag).map(Some)
-    }
-
-    fn target_weapon_level(&mut self) -> Result<Option<u8>> {
-        // Weapon inventory/reinforcement state has not been resolved on v0.18.
-        Ok(None)
-    }
-
-    fn death_link_kill(&mut self) -> Result<bool> {
-        // The legacy file bridge has no HP command. DeathLink is native-only;
-        // fail closed instead of inventing an unversioned side channel.
-        Ok(false)
-    }
-
-    /// The CE file bridge cannot read inventory, so the caller keeps its
-    /// ledger-derived baseline (clients#427).
-    fn observe_stack_quantity(
-        &mut self,
-        _normalized_item_id: u32,
-        _reinforcement_level: Option<u8>,
-    ) -> Result<StackObservation> {
-        Ok(StackObservation::Unsupported)
-    }
-
-    /// The bridge cannot tell whether a published command already reached the
-    /// game, so it keeps the conservative freeze-on-first-observe answer.
-    fn grant_may_have_applied(&mut self, _tag: &str) -> Result<bool> {
-        Ok(true)
-    }
-
-    fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
-        if grant.item_category == 255 {
-            self.event_flags
-                .write_resilient(grant.normalized_item_id, true)?;
-            return Ok(OperationProgress::Complete);
-        }
-        match grant.item_category {
-            4 => anyhow::ensure!(
-                grant.normalized_item_id & 0xF000_0000 == 0x4000_0000
-                    && grant.raw_descriptor & 0xF000_0000 == 0xB000_0000
-                    && (grant.normalized_item_id & 0x0FFF_FFFF)
-                        == (grant.raw_descriptor & 0x0FFF_FFFF),
-                "grant {} has an invalid category-4 raw/normalized descriptor pair",
-                grant.tag
-            ),
-            0 => anyhow::ensure!(
-                grant.normalized_item_id & 0xF000_0000 == 0
-                    && grant.raw_descriptor & 0xF000_0000 == 0x8000_0000
-                    && (grant.normalized_item_id & 0x0FFF_FFFF)
-                        == (grant.raw_descriptor & 0x0FFF_FFFF),
-                "grant {} has an invalid category-0 raw/normalized descriptor pair",
-                grant.tag
-            ),
-            category => bail!(
-                "grant {} uses unsupported Bloodborne item category {category}",
-                grant.tag
-            ),
-        }
-        let state = self.bridge.read_state()?;
-        state.require_compatible()?;
-        if state.concerns_tag(&grant.tag) && self.bridge.state_is_current_for(&grant.tag)? {
-            if state.is_success() {
-                self.bridge.acknowledge_command(&grant.tag)?;
-                return Ok(OperationProgress::Complete);
-            }
-            if state.is_terminal_failure() {
-                return Err(GrantTerminalFailure {
-                    tag: grant.tag.clone(),
-                    status: state.status.clone(),
-                    detail: state.detail.clone(),
-                }
-                .into());
-            }
-        }
-        if self.bridge.command_pending() {
-            anyhow::ensure!(
-                !self.bridge.command_is_stale(GRANT_COMMAND_TIMEOUT)?,
-                "grant {} timed out after {} seconds; command left in place for diagnosis",
-                grant.tag,
-                GRANT_COMMAND_TIMEOUT.as_secs()
-            );
-            return Ok(OperationProgress::Pending);
-        }
-        self.bridge.enqueue(&GrantCommand {
-            raw_id: grant.raw_descriptor,
-            normalized_id: grant.normalized_item_id,
-            quantity: grant.quantity,
-            expected_before: None,
-            tag: grant.tag.clone(),
-        })?;
-        Ok(OperationProgress::Pending)
-    }
-
-    fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress> {
-        bail!(
-            "live auto-equip is not armed for {:?}; item {} remains durably pending",
-            request.target,
-            request.tag
-        )
-    }
-
-    fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
-        self.bridge.withdraw_unwitnessed_command(tag)
     }
 }
 
@@ -572,22 +385,5 @@ impl BloodborneBackend for MockBackend {
         }
         self.watermark = Some(cursor);
         Ok(true)
-    }
-}
-
-#[cfg(test)]
-mod assumed_context_tests {
-    use super::*;
-
-    #[test]
-    fn assumed_context_arms_after_three_reads_and_disarms_immediately() {
-        let mut gate = AssumedContextGate::new("unsafe-test".into());
-        assert!(!gate.observe(true).gameplay_ready);
-        assert!(!gate.observe(true).gameplay_ready);
-        assert!(gate.observe(true).gameplay_ready);
-        assert!(!gate.observe(false).gameplay_ready);
-        assert!(!gate.observe(true).gameplay_ready);
-        assert!(!gate.observe(true).gameplay_ready);
-        assert!(gate.observe(true).gameplay_ready);
     }
 }

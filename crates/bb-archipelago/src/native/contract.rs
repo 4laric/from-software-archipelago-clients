@@ -25,7 +25,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::RUNTIME_BUILD;
-use crate::bridge::{BRIDGE_PROTOCOL, HARNESS_VERSION};
+
+/// Compatibility identifiers embedded in the native payload contract. The
+/// JSON field keeps its historical name so existing contract artifacts remain
+/// readable; neither value selects or communicates with a file bridge.
+const NATIVE_PROTOCOL: &str = "BBGRANT1";
+const NATIVE_HARNESS_VERSION: &str = "bb-native-grant-v7";
 
 /// The vendored contract text, compiled into the binary.
 pub const CONTRACT_JSON: &str = include_str!("../../contract/bb-native-grant-contract.v5.json");
@@ -426,13 +431,13 @@ impl Contract {
             self.build
         );
         anyhow::ensure!(
-            self.harness == HARNESS_VERSION,
-            "vendored contract harness {:?} != crate HARNESS_VERSION {HARNESS_VERSION:?}",
+            self.harness == NATIVE_HARNESS_VERSION,
+            "vendored contract harness {:?} != crate native harness {NATIVE_HARNESS_VERSION:?}",
             self.harness
         );
         anyhow::ensure!(
-            self.bridge_protocol == BRIDGE_PROTOCOL,
-            "vendored contract protocol {:?} != crate BRIDGE_PROTOCOL {BRIDGE_PROTOCOL:?}",
+            self.bridge_protocol == NATIVE_PROTOCOL,
+            "vendored contract protocol {:?} != crate native protocol {NATIVE_PROTOCOL:?}",
             self.bridge_protocol
         );
         Ok(())

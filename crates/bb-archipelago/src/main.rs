@@ -10,13 +10,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use archipelago_rs::{ClientStatus, Connection, ConnectionOptions, Event, ItemHandling};
 use bb_archipelago::backend::{
-    BloodborneBackend, EquipRequest, FileBackend, ItemGrant, LocationContext, MockBackend,
-    OperationProgress, StackObservation,
+    BloodborneBackend, EquipRequest, ItemGrant, LocationContext, MockBackend, OperationProgress,
+    StackObservation,
 };
-use bb_archipelago::bridge::{FileBridge, missing_bridge_state};
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
-use bb_archipelago::event_flags::{LiveEventFlags, is_manager_not_initialized};
+use bb_archipelago::event_flags::is_manager_not_initialized;
 use bb_archipelago::health::HealthReporter;
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
 use bb_archipelago::logging;
@@ -42,7 +41,6 @@ use bb_archipelago::{client_debugln, client_eprintln};
 #[derive(Debug, Default)]
 struct ItemErrorReporter {
     last: Option<(String, Instant)>,
-    bridge_missing: bool,
 }
 
 const ITEM_ERROR_DEDUP: Duration = Duration::from_secs(10);
@@ -56,27 +54,6 @@ impl ItemErrorReporter {
     /// Returns the line to print for `error`, or `None` to stay quiet.
     fn report(&mut self, error: &anyhow::Error, now: Instant) -> Option<String> {
         let message = format!("{error:#}");
-        if let Some(missing) = missing_bridge_state(error) {
-            let already_said = self.bridge_missing
-                && self
-                    .last
-                    .as_ref()
-                    .is_some_and(|(previous, _)| previous == &message);
-            self.bridge_missing = true;
-            self.last = Some((message, now));
-            if already_said {
-                return None;
-            }
-            return Some(format!(
-                "Item grants are paused: no grant bridge state at {}. \
-                 The Cheat Engine grant table is not running -- start it from the launcher, \
-                 or re-run the client without --delivery=ce-bridge to use native delivery. \
-                 Nothing is lost: queued items deliver once the bridge appears, \
-                 and this line stays quiet until then.",
-                missing.path.display()
-            ));
-        }
-        self.bridge_missing = false;
         let report = self.last.as_ref().is_none_or(|(previous, when)| {
             previous != &message || now.duration_since(*when) >= ITEM_ERROR_DEDUP
         });
@@ -89,7 +66,6 @@ impl ItemErrorReporter {
 
     /// Returns the recovery line when a failure regime was in effect.
     fn recovered(&mut self) -> Option<&'static str> {
-        self.bridge_missing = false;
         self.last.take().map(|_| ITEM_DELIVERY_RECOVERED)
     }
 }
@@ -260,7 +236,6 @@ fn guard_seed_name(bound: &str, offered: &str) -> Result<()> {
 }
 
 enum Backend {
-    Live(FileBackend),
     Mock(Box<MockBackend>),
     Native(Box<NativeBackend>),
 }
@@ -268,14 +243,12 @@ enum Backend {
 impl BloodborneBackend for Backend {
     fn record_location_checks(&mut self, locations: &[i64]) {
         match self {
-            Self::Live(backend) => backend.record_location_checks(locations),
             Self::Mock(backend) => backend.record_location_checks(locations),
             Self::Native(backend) => backend.record_location_checks(locations),
         }
     }
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
         match self {
-            Self::Live(backend) => backend.location_context(),
             Self::Mock(backend) => backend.location_context(),
             Self::Native(backend) => backend.location_context(),
         }
@@ -283,7 +256,6 @@ impl BloodborneBackend for Backend {
 
     fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>> {
         match self {
-            Self::Live(backend) => backend.read_event_flag(event_flag),
             Self::Mock(backend) => backend.read_event_flag(event_flag),
             Self::Native(backend) => backend.read_event_flag(event_flag),
         }
@@ -291,7 +263,6 @@ impl BloodborneBackend for Backend {
 
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {
         match self {
-            Self::Live(backend) => backend.target_weapon_level(),
             Self::Mock(backend) => backend.target_weapon_level(),
             Self::Native(backend) => backend.target_weapon_level(),
         }
@@ -299,7 +270,6 @@ impl BloodborneBackend for Backend {
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
         match self {
-            Self::Live(backend) => backend.grant_item(grant),
             Self::Mock(backend) => backend.grant_item(grant),
             Self::Native(backend) => backend.grant_item(grant),
         }
@@ -317,9 +287,6 @@ impl BloodborneBackend for Backend {
         reinforcement_level: Option<u8>,
     ) -> Result<StackObservation> {
         match self {
-            Self::Live(backend) => {
-                backend.observe_stack_quantity(normalized_item_id, reinforcement_level)
-            }
             Self::Mock(backend) => {
                 backend.observe_stack_quantity(normalized_item_id, reinforcement_level)
             }
@@ -331,7 +298,6 @@ impl BloodborneBackend for Backend {
 
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
         match self {
-            Self::Live(backend) => backend.grant_may_have_applied(tag),
             Self::Mock(backend) => backend.grant_may_have_applied(tag),
             Self::Native(backend) => backend.grant_may_have_applied(tag),
         }
@@ -339,7 +305,6 @@ impl BloodborneBackend for Backend {
 
     fn death_link_kill(&mut self) -> Result<bool> {
         match self {
-            Self::Live(backend) => backend.death_link_kill(),
             Self::Mock(backend) => backend.death_link_kill(),
             Self::Native(backend) => backend.death_link_kill(),
         }
@@ -347,7 +312,6 @@ impl BloodborneBackend for Backend {
 
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress> {
         match self {
-            Self::Live(backend) => backend.equip_item(request),
             Self::Mock(backend) => backend.equip_item(request),
             Self::Native(backend) => backend.equip_item(request),
         }
@@ -355,7 +319,6 @@ impl BloodborneBackend for Backend {
 
     fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
         match self {
-            Self::Live(backend) => backend.withdraw_unwitnessed_grant(tag),
             Self::Mock(backend) => backend.withdraw_unwitnessed_grant(tag),
             Self::Native(backend) => backend.withdraw_unwitnessed_grant(tag),
         }
@@ -365,7 +328,6 @@ impl BloodborneBackend for Backend {
     // defaults, or mock mode could never exercise the watermark path.
     fn read_save_watermark(&mut self) -> Result<Option<u64>> {
         match self {
-            Self::Live(backend) => backend.read_save_watermark(),
             Self::Mock(backend) => backend.read_save_watermark(),
             Self::Native(backend) => backend.read_save_watermark(),
         }
@@ -373,34 +335,8 @@ impl BloodborneBackend for Backend {
 
     fn write_save_watermark(&mut self, cursor: u64) -> Result<bool> {
         match self {
-            Self::Live(backend) => backend.write_save_watermark(cursor),
             Self::Mock(backend) => backend.write_save_watermark(cursor),
             Self::Native(backend) => backend.write_save_watermark(cursor),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeliveryMode {
-    /// Grant via the Cheat Engine file bridge. Not the default; selected
-    /// explicitly with `--delivery=ce-bridge`, and the remedy the default native
-    /// path points the player to when it cannot validate the running image.
-    CeBridge,
-    /// The default: grant in-process via the native `bb-native-grant-v7` payload
-    /// (stage 2). Fails closed on any image it cannot validate; on the default
-    /// path (no explicit `--delivery`) an unrecognised image hard-fails with
-    /// guidance rather than silently falling back to the bridge (clients#413).
-    Native,
-}
-
-impl DeliveryMode {
-    /// ASCII console label for the resolved delivery backend. Derived from the
-    /// resolved `DeliveryMode` so the startup banner reads correctly whichever
-    /// default is in effect (clients#412 flips the default to native).
-    fn label(self) -> &'static str {
-        match self {
-            DeliveryMode::Native => "native",
-            DeliveryMode::CeBridge => "ce-bridge",
         }
     }
 }
@@ -414,11 +350,9 @@ struct Arguments {
     password: Option<String>,
     mock: bool,
     assume_correct_save: bool,
-    delivery: DeliveryMode,
     /// True only when the user passed `--delivery=...` explicitly. Shapes the
-    /// native attach-failure message: the default path hard-fails with guidance
-    /// to load the Cheat Engine table and re-run with `--delivery=ce-bridge`,
-    /// while an explicit `--delivery=native` propagates the raw error.
+    /// native attach-failure message; retained for `--delivery=native`
+    /// compatibility while the backend selector itself is removed.
     delivery_explicit: bool,
     /// `--log-file <path>`: tee everything this client prints into that file as
     /// well as the console (clients#425). Absent means console only, exactly as
@@ -523,26 +457,20 @@ impl LedgerLock {
 }
 
 /// The explicitly unsafe assumed-correct-save identity token. Set by
-/// `--assume-correct-save`; consulted by both the native and Cheat Engine paths.
+/// `--assume-correct-save`; consulted by the native path.
 const ASSUMED_IDENTITY: &str = "unsafe-operator-attested-correct-save";
 
-/// Actionable guidance shown when the *default* native path cannot attach to and
-/// validate the running image. The default deliberately does NOT silently fall
-/// back to the Cheat Engine bridge: with native as the default the CE table will
-/// not be loaded, so a file-drop grant would sit unconsumed and delivered items
-/// would silently vanish. clients#413 tracks the liveness handshake that will
-/// let the client detect a loaded table before offering the bridge; until then
-/// an unrecognised build hard-fails and tells the player exactly how to play now.
-const UNRECOGNIZED_BUILD_GUIDANCE: &str = "This game build was not recognized, so native item delivery cannot run safely. To play now, load the Cheat Engine table and re-run with --delivery=ce-bridge. Otherwise this build is not yet supported.";
+/// Actionable guidance shown when native delivery cannot validate the running
+/// image. Unsupported builds fail closed before any item can be acknowledged.
+const UNRECOGNIZED_BUILD_GUIDANCE: &str = "This game build was not recognized, so native item delivery cannot run safely. Delivery was not armed and no Archipelago item was acknowledged. Use the launcher's Open Logs & Diagnostics action and send the session bundle so native support can be added for this build.";
 
 /// Map a native attach/validate failure onto the error the client exits with.
 ///
 /// Both paths hard-fail -- native fails closed, so nothing was patched or
 /// written. The default path (no explicit `--delivery`) wraps the failure with
 /// [`UNRECOGNIZED_BUILD_GUIDANCE`] so an unrecognised build tells the player how
-/// to play now; an explicit `--delivery=native` propagates the raw error,
-/// because the user asked for native specifically. Neither path silently falls
-/// back to the Cheat Engine bridge (clients#413).
+/// to gather diagnostics; an explicit `--delivery=native` propagates the raw
+/// error because the user asked for native specifically.
 fn native_attach_failure(error: anyhow::Error, delivery_explicit: bool) -> anyhow::Error {
     if delivery_explicit || points_at_the_shad_log(&error) || is_manager_not_initialized(&error) {
         error
@@ -561,8 +489,7 @@ fn native_attach_failure(error: anyhow::Error, delivery_explicit: bool) -> anyho
 /// True when the attach failure is the clients#418 "no fresh eboot base ever
 /// appeared" outcome: the suspect is the configured `shad_log` path, not the
 /// game build, and the failure already names the path and what to compare it
-/// against. Appending [`UNRECOGNIZED_BUILD_GUIDANCE`] here would send the player
-/// to the Cheat Engine table over a misconfigured log file.
+/// against.
 fn points_at_the_shad_log(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -573,38 +500,8 @@ fn points_at_the_shad_log(error: &anyhow::Error) -> bool {
 
 const LIVE_ATTACH_TIMEOUT: Duration = Duration::from_secs(600);
 
-fn attach_live_event_flags(shad_log: &Path, health: &mut HealthReporter) -> Result<LiveEventFlags> {
-    let deadline = Instant::now() + LIVE_ATTACH_TIMEOUT;
-    let mut next_report = Instant::now();
-    loop {
-        let _ = health.publish(
-            false,
-            false,
-            "Waiting for Bloodborne gameplay initialization",
-        );
-        match LiveEventFlags::attach(shad_log) {
-            Ok(flags) => return Ok(flags),
-            Err(error) => {
-                if Instant::now() >= deadline {
-                    bail!(
-                        "timed out after {} seconds waiting for live Bloodborne event flags; last error: {error:#}",
-                        LIVE_ATTACH_TIMEOUT.as_secs()
-                    );
-                }
-                if Instant::now() >= next_report {
-                    client_eprintln!(
-                        "Waiting for shadPS4 and Bloodborne gameplay initialization: {error:#}"
-                    );
-                    next_report = Instant::now() + Duration::from_secs(5);
-                }
-                thread::sleep(Duration::from_millis(250));
-            }
-        }
-    }
-}
-
-/// Attach the native (stage 2) backend, tolerating shadPS4 starting after the
-/// client the same way the CE path does: retry only while the process is not
+/// Attach the native backend, tolerating shadPS4 starting after the client:
+/// retry only while the process is not
 /// yet open, but fail fast on an image mismatch or any other refusal so a wrong
 /// build never spins silently.
 #[cfg(windows)]
@@ -657,53 +554,6 @@ fn attach_native_backend(
     bail!("native Bloodborne delivery requires Windows")
 }
 
-/// Attach the Cheat Engine file-bridge backend (the `ce-bridge` delivery path).
-///
-/// Selected explicitly with `--delivery=ce-bridge`; it is the remedy the default
-/// native path points the player to when it cannot validate the running image.
-/// Factored out so the explicit selection here has one home. Note the default
-/// native path does NOT call this on failure -- it hard-fails with guidance
-/// rather than silently arming a bridge the player has no CE table loaded for
-/// (clients#413).
-fn attach_live_backend(
-    config: &RuntimeConfig,
-    assume_correct_save: bool,
-    health: &mut HealthReporter,
-) -> Result<Backend> {
-    let shad_log = config
-        .shad_log
-        .as_deref()
-        .context("live mode requires shad_log in the runtime config")?;
-    // clients#369: fail fast on path misconfiguration (bridge_root) before
-    // arming. shad_log is deliberately not preflighted: the attach retry loop
-    // tolerates shadPS4 starting after the client, and its error now names the
-    // setting.
-    config.preflight_paths()?;
-    let event_flags = attach_live_event_flags(shad_log, health)?;
-    let attachment = event_flags.info();
-    client_eprintln!(
-        "Bloodborne AP client {} | CUSA03173 01.09 | shad PID {} | eboot 0x{:X} | direct flag backend ready",
-        client_version(),
-        attachment.process_id,
-        attachment.eboot_base
-    );
-    let bridge = FileBridge::new(&config.bridge_root);
-    match bridge.read_state() {
-        Ok(state) => client_eprintln!(
-            "Grant bridge reports build {} | protocol {} | harness {}",
-            state.build.as_deref().unwrap_or("missing"),
-            state.protocol.as_deref().unwrap_or("missing"),
-            state.harness.as_deref().unwrap_or("missing")
-        ),
-        Err(error) => client_eprintln!("Grant bridge state unavailable at startup: {error:#}"),
-    }
-    Ok(Backend::Live(if assume_correct_save {
-        FileBackend::assuming_correct_save(bridge, event_flags, ASSUMED_IDENTITY.into())
-    } else {
-        FileBackend::new(bridge, event_flags)
-    }))
-}
-
 fn arguments() -> Result<Arguments> {
     parse_args(env::args().skip(1))
 }
@@ -711,7 +561,7 @@ fn arguments() -> Result<Arguments> {
 fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let Some(server) = args.next() else {
         bail!(
-            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native|ce-bridge] [--log-file PATH] [--window-opacity 35-100] (native is the default; client window opacity defaults to 85)"
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native] [--log-file PATH] [--window-opacity 35-100] (native delivery is required; client window opacity defaults to 70)"
         )
     };
     let slot = args.next().context("missing SLOT")?;
@@ -723,7 +573,6 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     // Native is the default delivery backend. It fails closed on any image it
     // cannot validate; on the default path an unrecognised image hard-fails with
     // guidance -- it does NOT fall back to the bridge (see `main`, clients#413).
-    let mut delivery = DeliveryMode::Native;
     let mut delivery_explicit = false;
     let mut log_file = None;
     let mut window_opacity = DEFAULT_WINDOW_OPACITY;
@@ -733,12 +582,13 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
         } else if argument == "--assume-correct-save" {
             assume_correct_save = true;
         } else if let Some(mode) = argument.strip_prefix("--delivery=") {
-            delivery = match mode {
-                "ce-bridge" => DeliveryMode::CeBridge,
-                "native" => DeliveryMode::Native,
-                other => bail!("unknown --delivery mode {other:?}; expected native or ce-bridge"),
-            };
-            delivery_explicit = true;
+            match mode {
+                "native" => delivery_explicit = true,
+                "ce-bridge" => bail!(
+                    "--delivery=ce-bridge has been removed; Bloodborne now requires native delivery. Rebuild the launch plan with the current launcher."
+                ),
+                other => bail!("unknown --delivery mode {other:?}; expected native"),
+            }
         } else if argument == "--log-file" {
             // Two-token form: what the launcher's generated plan emits
             // ("--log-file", "{client_log}"). A bare flag is refused rather
@@ -767,7 +617,6 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
         password,
         mock,
         assume_correct_save,
-        delivery,
         delivery_explicit,
         log_file,
         window_opacity,
@@ -898,7 +747,7 @@ fn run() -> Result<()> {
     // file, and the banner names it so the player knows what to send back.
     client_eprintln!(
         "bb-ap-client running - delivery: {} - server: {} - slot: {} - diagnostics stream to this console{}",
-        args.delivery.label(),
+        "native",
         args.server,
         args.slot,
         match args.log_file.as_deref() {
@@ -924,19 +773,18 @@ fn run() -> Result<()> {
             .set_flags
             .extend(config.mock_set_flags.iter().copied());
         Backend::Mock(Box::new(backend))
-    } else if args.delivery == DeliveryMode::Native {
+    } else {
         let shad_log = config
             .shad_log
             .as_deref()
             .context("native delivery requires shad_log in the runtime config")?;
-        config.preflight_paths()?;
         if args.delivery_explicit {
             client_eprintln!(
                 "Native delivery selected explicitly (--delivery=native). It fails closed on any image mismatch and will NOT fall back: a build it cannot validate is refused, not delivered through the bridge."
             );
         } else {
             client_eprintln!(
-                "Native delivery is the default. It fails closed on any image mismatch: a build it cannot validate is refused, not delivered. If this build is not recognized the client stops and asks you to load the Cheat Engine table and re-run with --delivery=ce-bridge (it does NOT silently fall back to the bridge)."
+                "Native delivery is required. It fails closed on any image mismatch: a build it cannot validate is refused before delivery is armed."
             );
         }
         let assumed_identity = args
@@ -957,32 +805,17 @@ fn run() -> Result<()> {
                 Backend::Native(Box::new(backend))
             }
             // Native could not attach and validate this image -- an unknown
-            // serial/build, a failed image assert, or another refusal. Native
-            // fails closed by design, so nothing was patched or written. We do
-            // NOT silently fall back to the Cheat Engine bridge: with native as
-            // the default the CE table will not be loaded, so a file-drop grant
-            // would sit unconsumed and delivered items would vanish (clients#413
-            // tracks the liveness handshake that will make a safe fallback
-            // possible). The default path hard-fails with actionable guidance;
-            // an explicit --delivery=native propagates the raw error.
+            // serial/build, a failed image assert, or another refusal. Fail
+            // closed before delivery is armed or any AP item is acknowledged.
             Err(error) => return Err(native_attach_failure(error, args.delivery_explicit)),
         }
-    } else {
-        attach_live_backend(&config, args.assume_correct_save, &mut health)?
     };
-    // Native/mock delivery is armed by successful backend construction. The
-    // legacy CE bridge is external and cannot be proven live from attachment
-    // alone, so its sidecar stays conservatively false rather than presenting
-    // an old bridge state as ready.
-    let delivery_armed = args.mock || args.delivery == DeliveryMode::Native;
+    // Native/mock delivery is armed only by successful backend construction.
+    let delivery_armed = true;
     if let Err(error) = health.publish(
         false,
         delivery_armed,
-        if delivery_armed {
-            "Delivery backend attached; connecting to AP"
-        } else {
-            "CE bridge selected; delivery readiness is not proven"
-        },
+        "Delivery backend attached; connecting to AP",
     ) {
         client_eprintln!("WARNING: could not publish launcher health status: {error}");
     }
@@ -1601,7 +1434,6 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bb_archipelago::bridge::BridgeStateMissing;
 
     /// clients#427 motivating case: the shipped client dispatches through the
     /// `Backend` enum, not through a bare `MockBackend`. Before this fix the
@@ -1649,57 +1481,6 @@ mod tests {
         assert!(untracked, "an unretained command may have applied");
     }
 
-    fn missing_bridge_error() -> anyhow::Error {
-        // The condition reaches the console wrapped in grant context, exactly
-        // as it does in the live poll loop.
-        anyhow::Error::new(BridgeStateMissing {
-            path: PathBuf::from("C:\\bridge\\native-grant-state.txt"),
-        })
-        .context("granting ap_7")
-    }
-
-    /// clients#404 motivating case, end to end: one actionable sentence, then
-    /// silence for as long as the bridge stays missing, then the recovery line
-    /// on the first successful delivery.
-    #[test]
-    fn missing_bridge_says_something_actionable_once_then_goes_quiet_then_recovers() {
-        let mut reporter = ItemErrorReporter::default();
-        let start = Instant::now();
-
-        let first = reporter
-            .report(&missing_bridge_error(), start)
-            .expect("the first missing-bridge failure must say something");
-        assert!(first.contains("Item grants are paused"), "{first}");
-        assert!(first.contains("native-grant-state.txt"), "{first}");
-        assert!(first.contains("Cheat Engine grant table"), "{first}");
-        assert!(first.contains("--delivery=ce-bridge"), "{first}");
-        assert!(first.is_ascii(), "in-console strings stay ASCII: {first}");
-
-        // Quiet, and quiet even far past the generic dedup window: this is a
-        // standing condition, not a stream of incidents.
-        for elapsed in [1, 10, 11, 600] {
-            let later = start + Duration::from_secs(elapsed);
-            assert_eq!(reporter.report(&missing_bridge_error(), later), None);
-        }
-
-        assert_eq!(reporter.recovered(), Some(ITEM_DELIVERY_RECOVERED));
-        // ...and only once: a second success is silent.
-        assert_eq!(reporter.recovered(), None);
-    }
-
-    #[test]
-    fn missing_bridge_speaks_again_after_a_recovery() {
-        let mut reporter = ItemErrorReporter::default();
-        let start = Instant::now();
-        assert!(reporter.report(&missing_bridge_error(), start).is_some());
-        assert_eq!(reporter.recovered(), Some(ITEM_DELIVERY_RECOVERED));
-        let after = reporter.report(&missing_bridge_error(), start + Duration::from_secs(1));
-        assert!(
-            after.is_some(),
-            "a fresh outage is a new incident and must be announced again"
-        );
-    }
-
     #[test]
     fn other_errors_keep_the_ten_second_dedup() {
         let mut reporter = ItemErrorReporter::default();
@@ -1723,18 +1504,15 @@ mod tests {
     }
 
     #[test]
-    fn a_different_error_after_the_missing_bridge_is_reported() {
+    fn a_different_error_is_reported_immediately() {
         let mut reporter = ItemErrorReporter::default();
         let start = Instant::now();
-        assert!(reporter.report(&missing_bridge_error(), start).is_some());
-        let other = anyhow::anyhow!("grant bridge protocol mismatch");
+        assert!(reporter.report(&anyhow::anyhow!("first"), start).is_some());
+        let other = anyhow::anyhow!("native grant protocol mismatch");
         let line = reporter
             .report(&other, start + Duration::from_secs(1))
-            .expect("an unrelated failure is not silenced by the paused bridge");
+            .expect("an unrelated failure is not silenced");
         assert!(line.contains("protocol mismatch"), "{line}");
-        // Back to missing: that is a new announcement, not a continuation.
-        let again = reporter.report(&missing_bridge_error(), start + Duration::from_secs(2));
-        assert!(again.is_some());
     }
 
     fn base_args(extra: &[&str]) -> Vec<String> {
@@ -1751,21 +1529,20 @@ mod tests {
     #[test]
     fn default_delivery_is_native_and_not_explicit() {
         let args = parse_args(base_args(&[]).into_iter()).expect("parse");
-        assert_eq!(args.delivery, DeliveryMode::Native);
         assert!(!args.delivery_explicit);
     }
 
     #[test]
-    fn explicit_ce_bridge_selects_bridge_and_is_explicit() {
-        let args = parse_args(base_args(&["--delivery=ce-bridge"]).into_iter()).expect("parse");
-        assert_eq!(args.delivery, DeliveryMode::CeBridge);
-        assert!(args.delivery_explicit);
+    fn removed_ce_bridge_has_actionable_migration_error() {
+        let error = parse_args(base_args(&["--delivery=ce-bridge"]).into_iter()).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("has been removed"), "{rendered}");
+        assert!(rendered.contains("native delivery"), "{rendered}");
     }
 
     #[test]
     fn explicit_native_selects_native_and_is_explicit() {
         let args = parse_args(base_args(&["--delivery=native"]).into_iter()).expect("parse");
-        assert_eq!(args.delivery, DeliveryMode::Native);
         assert!(args.delivery_explicit);
     }
 
@@ -1893,29 +1670,16 @@ mod tests {
         let _ = std::fs::remove_file(lock_path);
     }
 
-    #[test]
-    fn delivery_mode_labels_are_stable_and_ascii() {
-        // The startup banner (console-legibility line) prints these; they must
-        // match the --delivery=... spellings and stay ASCII for the console.
-        assert_eq!(DeliveryMode::Native.label(), "native");
-        assert_eq!(DeliveryMode::CeBridge.label(), "ce-bridge");
-        assert!(DeliveryMode::Native.label().is_ascii());
-        assert!(DeliveryMode::CeBridge.label().is_ascii());
-    }
-
-    // The backend-construction step (native attach / Live bridge) needs a live
-    // shadPS4 process and, for native, `#[cfg(windows)]` seams, so "default on a
-    // recognized image -> native" and "explicit ce-bridge -> Live backend"
-    // cannot be exercised host-side. What IS host-testable is the decision that
-    // governs Direction A: given a native attach/validate failure, the default
-    // path must hard-fail with guidance (never a Live-backend fallback), while
-    // an explicit --delivery=native propagates the raw error.
+    // Native attachment needs a live shadPS4 process and `#[cfg(windows)]`
+    // seams. What is host-testable is the fail-closed error policy.
     #[test]
     fn default_native_failure_hard_fails_with_guidance_not_fallback() {
         let error = native_attach_failure(anyhow::anyhow!("image assert: unknown build"), false);
         let rendered = format!("{error:#}");
         assert!(rendered.contains("was not recognized"), "{rendered}");
-        assert!(rendered.contains("--delivery=ce-bridge"), "{rendered}");
+        assert!(rendered.contains("Open Logs & Diagnostics"), "{rendered}");
+        assert!(!rendered.contains("Cheat Engine"), "{rendered}");
+        assert!(!rendered.contains("ce-bridge"), "{rendered}");
         // The underlying failure is preserved in the error chain.
         assert!(rendered.contains("image assert"), "{rendered}");
     }
@@ -1929,7 +1693,7 @@ mod tests {
     }
 
     /// clients#418 outcome (a): no fresh base ever appeared. The build is not
-    /// the suspect, so the CE-table guidance must NOT be appended -- the message
+    /// the suspect, so build guidance must NOT be appended -- the message
     /// that names the configured log path is the whole answer.
     #[test]
     fn a_stale_log_failure_keeps_the_build_guidance_off() {
@@ -1947,8 +1711,7 @@ mod tests {
     /// clients#420: the event-flag manager being uninitialized is a
     /// startup-ordering state, not an unrecognised build. Attach no longer
     /// treats it as terminal, but the routing must fail safe regardless: this
-    /// class must never carry the Cheat Engine / ce-bridge guidance, because
-    /// the bridge lane provides no flag reads either (clients#416).
+    /// class must never carry unrecognised-build guidance.
     #[test]
     fn an_uninitialized_flag_manager_never_gets_the_cheat_engine_guidance() {
         let error = native_attach_failure(
@@ -1964,7 +1727,7 @@ mod tests {
     }
 
     /// clients#418 outcome (b): a confirmed base whose image is not ours. That
-    /// IS an unrecognised build, so the CE-bridge guidance still applies.
+    /// IS an unrecognised build, so native diagnostic guidance still applies.
     #[test]
     fn a_rejected_image_after_the_wait_still_gets_the_build_guidance() {
         let failure = AttachWaitFailure::ImageRejected {
@@ -1974,7 +1737,8 @@ mod tests {
         let error = native_attach_failure(anyhow::Error::new(failure), false);
         let rendered = format!("{error:#}");
         assert!(rendered.contains("was not recognized"), "{rendered}");
-        assert!(rendered.contains("--delivery=ce-bridge"), "{rendered}");
+        assert!(rendered.contains("Open Logs & Diagnostics"), "{rendered}");
+        assert!(!rendered.contains("ce-bridge"), "{rendered}");
         assert!(rendered.contains("consume_hook"), "{rendered}");
     }
 
