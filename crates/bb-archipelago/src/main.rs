@@ -324,6 +324,14 @@ impl BloodborneBackend for Backend {
         }
     }
 
+    fn retire_grant(&mut self, tag: &str, reason: &str) -> Result<bool> {
+        match self {
+            Self::Mock(backend) => backend.retire_grant(tag, reason),
+            #[cfg(windows)]
+            Self::Native(backend) => backend.retire_grant(tag, reason),
+        }
+    }
+
     // Forward the watermark hooks rather than inheriting the attested-mode
     // defaults, or mock mode could never exercise the watermark path.
     fn read_save_watermark(&mut self) -> Result<Option<u64>> {
@@ -1391,6 +1399,16 @@ fn run() -> Result<()> {
                         "Pickup sustain pending independently of AP item delivery: {error:#}"
                     ),
                 }
+            }
+            if let Some(bb_archipelago::client_loop::SustainPollResult::Retired {
+                location,
+                command_withdrawn,
+                reason,
+            }) = runtime.take_sustain_notice()
+            {
+                client_eprintln!(
+                    "Pickup sustain retired for location {location}: {reason}; native command withdrawn={command_withdrawn}. AP item delivery remains available."
+                );
             }
         }
 
