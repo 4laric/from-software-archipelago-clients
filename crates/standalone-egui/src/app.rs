@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use client_ui::{ActivityEvent, ClientSnapshot, HostEndpoint, Severity, UiAction};
+use client_ui::{ActivityEvent, ClientSnapshot, GuidanceGate, HostEndpoint, Severity, UiAction};
 use egui::{Align, Color32, FontId, Layout, RichText, TextStyle, Vec2};
 use standalone_windows::{WindowGeometry, WindowOptions, normalize_command_input};
 
@@ -51,6 +51,7 @@ pub struct StandaloneApp {
     /// under which the click-through toggle is refused: an escape hatch that does not exist is
     /// worse than a feature that is missing.
     escape: Option<Escape>,
+    guidance: GuidanceGate,
 }
 
 impl StandaloneApp {
@@ -68,6 +69,7 @@ impl StandaloneApp {
             applied: None,
             shutdown_sent: false,
             escape: hotkey::register(),
+            guidance: GuidanceGate::default(),
         }
     }
 
@@ -245,7 +247,10 @@ impl StandaloneApp {
                 });
             });
         } else {
-            let (severity, headline) = client_ui::delivery_headline(snapshot);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64);
+            let (severity, headline) = self.guidance.observe(snapshot, now_ms);
             let tint = match severity {
                 Severity::Ok => view::palette::OK,
                 Severity::Warn => view::palette::WARN,
