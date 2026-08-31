@@ -64,6 +64,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// FMG repository static slot for the running build. Per-version; see [`crate::rva_table`].
@@ -272,6 +273,27 @@ fn read_string(ptr: usize) -> Option<String> {
 fn sig_ok(addr: usize) -> bool {
     let b = unsafe { std::slice::from_raw_parts(addr as *const u8, SEARCH_SIG.len()) };
     b == SEARCH_SIG
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// A mismatch must carry enough evidence to distinguish a moved function from a changed prologue.
+/// Reading these bytes adds no new unsafe surface: `sig_ok` has already read the same mapped span.
+fn signature_mismatch_evidence(addr: usize) -> String {
+    let observed = unsafe { std::slice::from_raw_parts(addr as *const u8, SEARCH_SIG.len()) };
+    format!(
+        "{}; rva {:#x}; expected {}; observed {}",
+        crate::game_version_gate::measured_clause(),
+        search_rva(),
+        hex_bytes(SEARCH_SIG),
+        hex_bytes(observed),
+    )
 }
 
 unsafe fn goods_msgdata(base: usize) -> Option<usize> {
@@ -1138,7 +1160,7 @@ pub fn extend_swap_overrides_tracked(
                 } else {
                     format!(
                         "SearchStringTable signature mismatch ({}), so a swap cannot be verified",
-                        crate::game_version_gate::measured_clause()
+                        signature_mismatch_evidence(base + search_rva())
                     )
                 }
             );
@@ -1216,7 +1238,7 @@ pub fn run() -> bool {
         log::warn!(
             "FMG-inject: SearchStringTable sig mismatch ({}); abort (latched -- synthetic naming \
              OFF this session)",
-            crate::game_version_gate::measured_clause()
+            signature_mismatch_evidence(search_addr)
         );
         DONE.store(true, Ordering::Relaxed);
         return true;
@@ -1363,4 +1385,16 @@ pub fn run() -> bool {
     }
     DONE.store(true, Ordering::Relaxed);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_bytes;
+
+    #[test]
+    fn signature_bytes_are_compact_complete_and_ascii() {
+        let rendered = hex_bytes(&[0x00, 0x0f, 0x10, 0xab, 0xff]);
+        assert_eq!(rendered, "000f10abff");
+        assert!(rendered.is_ascii());
+    }
 }
