@@ -2,6 +2,10 @@
 
 ### Changed
 
+* **Routine item acknowledgements no longer flood the player console.** The
+  detailed per-index acknowledgement lines remain in `client.log` for support
+  and replay diagnosis; blocked deliveries, failures, and recovery notices
+  remain visible in the console.
 * **Bloodborne can receive DeathLinks when the seed opts in.** Runtime r9
   advertises the `DeathLink` tag only for enabled slots, queues incoming links
   across loads, and kills through a validated current-HP write once the native

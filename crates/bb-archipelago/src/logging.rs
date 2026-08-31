@@ -145,6 +145,17 @@ pub fn emit(arguments: Arguments<'_>) {
     }
 }
 
+/// Write a routine diagnostic to the durable session log without cluttering
+/// the player-facing console. If no log file is installed, the line is simply
+/// discarded; debug output must never change client behaviour.
+pub fn emit_debug(arguments: Arguments<'_>) {
+    let line = format!("{arguments}\n");
+    if let Some(file) = sink().file.as_mut() {
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.flush();
+    }
+}
+
 /// Render a terminal error exactly as Rust's default termination handler would
 /// (clients#437).
 ///
@@ -180,6 +191,14 @@ pub fn report_terminal_error(error: &anyhow::Error) {
 macro_rules! client_eprintln {
     ($($argument:tt)*) => {
         $crate::logging::emit(::std::format_args!($($argument)*))
+    };
+}
+
+/// File-only companion to [`client_eprintln!`] for successful routine detail.
+#[macro_export]
+macro_rules! client_debugln {
+    ($($argument:tt)*) => {
+        $crate::logging::emit_debug(::std::format_args!($($argument)*))
     };
 }
 
@@ -334,6 +353,20 @@ mod tests {
             !path.exists(),
             "no log file may be created without --log-file"
         );
+    }
+
+    #[test]
+    fn debug_lines_reach_the_log_but_not_the_console() {
+        let _guard = serialized();
+        reset_sink();
+        let path = scratch("debug-only");
+        install_log_file(&path).expect("install");
+        client_debugln!("acknowledged item {}", 41);
+        assert_eq!(captured_console(), "");
+        sink().file = None;
+        let file = std::fs::read_to_string(&path).expect("read log");
+        assert!(file.contains("acknowledged item 41\n"), "{file:?}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
