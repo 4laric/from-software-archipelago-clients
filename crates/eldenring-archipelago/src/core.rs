@@ -4122,7 +4122,7 @@ impl shared::Core for Core {
         let my_name = self.my_name.clone();
         for ev in self.take_events() {
             match ev {
-                ap::Event::DeathLink { source, .. } => {
+                ap::Event::DeathLink { source, cause, .. } => {
                     let foreign = my_name.as_deref().map(|n| n != source).unwrap_or(true);
                     if !foreign {
                         continue;
@@ -4143,7 +4143,7 @@ impl shared::Core for Core {
                         // catches them mid-fight, the client feed keeps the history.
                         // The line is built in er-logic because the payload is an arbitrary
                         // player-chosen slot name and has to be sanitised to drawable ASCII.
-                        let line = er_logic::toast::deathlink_line(&source);
+                        let line = er_logic::toast::deathlink_line(&source, cause.as_deref());
                         let now = self.toast_clock.elapsed().as_millis() as u64;
                         self.toasts.push(line.clone(), now);
                         self.log(ap::Print::message(line));
@@ -4209,7 +4209,11 @@ impl shared::Core for Core {
             && let Some(client) = self.client_mut()
         {
             log::info!("DeathLink: local death detected -> broadcasting");
-            if let Err(e) = client.death_link(ap::DeathLinkOptions::default()) {
+            let cause = my_name
+                .as_deref()
+                .map(|name| format!("{name} died in the Lands Between."))
+                .unwrap_or_else(|| "A Tarnished died in the Lands Between.".to_owned());
+            if let Err(e) = client.death_link(ap::DeathLinkOptions::default().cause(cause)) {
                 log::warn!("DeathLink: broadcast failed: {e}");
             }
         }
