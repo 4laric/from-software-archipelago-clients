@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -138,6 +138,10 @@ pub struct ClientLoop<B> {
 impl<B: BloodborneBackend> ClientLoop<B> {
     pub fn record_location_checks(&mut self, locations: &[i64]) {
         self.backend.record_location_checks(locations);
+    }
+
+    pub fn record_presentation_marker(&mut self, note: &str) -> bool {
+        self.backend.record_presentation_marker(note)
     }
     pub fn new(
         backend: B,
@@ -565,8 +569,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     pub fn rescue_export(&self) -> Result<PathBuf> {
         let output = self.ledger_path.with_file_name("rescue-diagnostics.json");
         let slot = self.ledger.slot(&self.seed_name, &self.slot_name);
+        let capture_files = collect_capture_files(&self.ledger_path)?;
         let document = json::json!({
-            "format": "bb-rescue-diagnostics-v1",
+            "format": "bb-rescue-diagnostics-v2",
             "runtime_build": crate::RUNTIME_BUILD,
             "seed": self.seed_name,
             "slot": self.slot_name,
@@ -574,6 +579,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             "item_count": self.config.items.len(),
             "ledger": slot,
             "operator_actions": slot.map(|slot| &slot.operator_actions),
+            "capture_files": capture_files,
         });
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1348,9 +1354,48 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     }
 }
 
+fn collect_capture_files(ledger: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let folder = ledger.parent().unwrap_or_else(|| Path::new("."));
+    let mut captures = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let include = name.ends_with("-capture.jsonl")
+            || name == "boss-flag-census.jsonl"
+            || name == crate::health::HEALTH_FILE_NAME;
+        if include {
+            captures.insert(name, std::fs::read_to_string(entry.path())?);
+        }
+    }
+    Ok(captures)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescue_capture_collection_includes_every_probe_sidecar() {
+        let root = std::env::temp_dir().join(format!("bb-export-probes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in [
+            "rune-capture.jsonl",
+            "pickup-notification-capture.jsonl",
+            "boss-flag-census.jsonl",
+            crate::health::HEALTH_FILE_NAME,
+        ] {
+            std::fs::write(root.join(name), name).unwrap();
+        }
+        std::fs::write(root.join("unrelated.txt"), "no").unwrap();
+        let files = collect_capture_files(&root.join("ledger.json")).unwrap();
+        assert_eq!(files.len(), 4);
+        assert!(!files.contains_key("unrelated.txt"));
+        let _ = std::fs::remove_dir_all(root);
+    }
     use crate::backend::{
         EquipRequest, ItemGrant, LocationContext, MockBackend, OperationProgress, StackObservation,
     };
@@ -1396,6 +1441,10 @@ mod tests {
             auto_equip: false,
             death_link: false,
             pickup_notification_probe: false,
+            boss_flag_census: false,
+            rune_capture: false,
+            insight_probe: false,
+            readiness_durations: false,
             death_link_amnesty: 0,
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,

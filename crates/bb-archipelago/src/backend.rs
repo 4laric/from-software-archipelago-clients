@@ -79,6 +79,11 @@ pub trait BloodborneBackend {
     /// Observation-only seam for clients#510. Backends without the native
     /// diagnostic intentionally ignore it.
     fn record_location_checks(&mut self, _locations: &[i64]) {}
+    /// Append a human observation beside the native pickup capture. Returns
+    /// false when that optional capture is not armed.
+    fn record_presentation_marker(&mut self, _note: &str) -> bool {
+        false
+    }
     /// Returns a validated live-play/save identity, or `None` when every game
     /// read and mutation must abstain. A process handle or raw event-flag read
     /// is not enough to prove that the intended character save is loaded.
