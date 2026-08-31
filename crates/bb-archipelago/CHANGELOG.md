@@ -2,6 +2,11 @@
 
 ### Changed
 
+* **The standalone command window is keyboard accessible.** Enter submits the
+  command field through the same bounded worker channel as the Send button;
+  Tab and Shift+Tab traverse every interactive control, and Alt-key mnemonics
+  activate Send, Status, diagnostics export, and the session folder.
+
 * **The zero-Vial diagnostic now captures the actual record-creation
   transition.** On the first canonical Vial row it records the chosen slot,
   neighboring before/after bytes, and inventory tail movement. Delivery remains
