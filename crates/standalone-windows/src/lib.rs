@@ -14,6 +14,67 @@ pub struct WindowOptions {
     pub compact: bool,
     pub opacity: f32,
     pub geometry: WindowGeometry,
+    /// Which activity classes the feed shows. Added after this file already shipped, so it is
+    /// `#[serde(default)]`: a `client-window.json` written by an older build has no `filters` key
+    /// and must still restore the player's geometry and opacity rather than being discarded and
+    /// silently replaced by defaults.
+    #[serde(default)]
+    pub filters: FeedFilters,
+}
+
+/// Feed visibility toggles, persisted beside the window's own state.
+///
+/// These live in `WindowOptions` rather than in renderer-local state because they share its one
+/// durable property: a player who hid chat wants it hidden on the next launch, and there is
+/// already an atomic tmp+rename writer for exactly this file. Every field defaults to `true`, so
+/// an unknown or absent value can only ever show more than the player asked for -- never hide a
+/// delivery failure behind a stale saved toggle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedFilters {
+    #[serde(default = "shown")]
+    pub checks: bool,
+    #[serde(default = "shown")]
+    pub items: bool,
+    #[serde(default = "shown")]
+    pub chat: bool,
+    #[serde(default = "shown")]
+    pub system: bool,
+}
+
+const fn shown() -> bool {
+    true
+}
+
+impl Default for FeedFilters {
+    fn default() -> Self {
+        Self {
+            checks: true,
+            items: true,
+            chat: true,
+            system: true,
+        }
+    }
+}
+
+impl FeedFilters {
+    /// Whether one activity entry survives the current toggles.
+    ///
+    /// `system` deliberately covers commands, errors and parked deliveries together: they are the
+    /// lines a player mutes while playing and un-mutes while diagnosing, and splitting errors out
+    /// would let someone hide a failure while believing they had only hidden command echoes.
+    pub fn admits(self, kind: &client_ui::ActivityKind) -> bool {
+        match kind {
+            client_ui::ActivityKind::LocationCheck => self.checks,
+            client_ui::ActivityKind::ReceivedItem | client_ui::ActivityKind::StorageDelivery => {
+                self.items
+            }
+            client_ui::ActivityKind::Message | client_ui::ActivityKind::Hint => self.chat,
+            client_ui::ActivityKind::Command
+            | client_ui::ActivityKind::CommandResult
+            | client_ui::ActivityKind::ParkedDelivery
+            | client_ui::ActivityKind::Error => self.system,
+        }
+    }
 }
 
 impl Default for WindowOptions {
@@ -24,6 +85,7 @@ impl Default for WindowOptions {
             compact: false,
             opacity: 0.85,
             geometry: WindowGeometry::default(),
+            filters: FeedFilters::default(),
         }
     }
 }
@@ -119,6 +181,31 @@ pub fn normalize_command_input(input: &str) -> Option<String> {
     let command = input.replace(['\r', '\n'], " ");
     let command = command.trim();
     (!command.is_empty()).then(|| command.chars().take(512).collect())
+}
+
+/// Read persisted window state, or `None` when there is nothing usable on disk.
+///
+/// Every failure -- missing file, unreadable file, JSON from a build whose schema this one cannot
+/// make sense of -- is the same answer: fall back to defaults. Window chrome is never worth
+/// failing a client launch over.
+pub fn load_options(path: &std::path::Path) -> Option<WindowOptions> {
+    let bytes = std::fs::read(path).ok()?;
+    json::from_slice::<WindowOptions>(&bytes).ok()
+}
+
+/// Persist window state through a temporary file and a rename.
+///
+/// The rename is the point: a client killed mid-write leaves either the previous state or the new
+/// one, never a half-written file that the next launch silently discards.
+pub fn store_options(path: &std::path::Path, options: &WindowOptions) -> std::io::Result<()> {
+    let bytes = json::to_vec_pretty(options)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(temporary, path)
 }
 
 /// Map native controls onto the same bounded action channel used by every future renderer.
@@ -702,5 +789,135 @@ mod tests {
             normalize_command_input(&"x".repeat(600)).unwrap().len(),
             512
         );
+    }
+    /// A `client-window.json` written before the feed filters existed. Byte-for-byte the shape the
+    /// shipped Win32 shell persists, kept as a fixture rather than a string literal so a future
+    /// schema change has something concrete to be checked against.
+    const OLD_SCHEMA_STATE: &str = include_str!("../tests/fixtures/client-window-v1.json");
+
+    #[test]
+    fn an_old_state_file_still_parses_and_round_trips() {
+        let restored: WindowOptions =
+            json::from_str(OLD_SCHEMA_STATE).expect("an old state file must still parse");
+
+        // The fields the old file did carry survive verbatim: the failure this guards against is
+        // a parse error that silently discards a player's saved geometry and opacity.
+        assert_eq!(restored.opacity, 0.7);
+        assert_eq!(
+            restored.geometry,
+            WindowGeometry {
+                x: 120,
+                y: 64,
+                width: 560,
+                height: 720
+            }
+        );
+        assert!(restored.always_on_top);
+        assert!(!restored.click_through);
+        assert!(!restored.compact);
+        // The field the old file did not carry defaults to showing everything.
+        assert_eq!(restored.filters, FeedFilters::default());
+
+        // Re-serialising and re-reading is stable, so one launch under the new build does not
+        // rewrite the file into something the next launch reads differently.
+        let rewritten = json::to_string(&restored).expect("serialise");
+        assert_eq!(
+            json::from_str::<WindowOptions>(&rewritten).unwrap(),
+            restored
+        );
+    }
+
+    #[test]
+    fn a_partial_filter_block_only_ever_defaults_to_visible() {
+        // Forward compatibility in the other direction: a file written by a build that knew about
+        // fewer toggles must not hide a class the reader does know about.
+        let restored: WindowOptions = json::from_str(
+            r#"{"always_on_top":false,"click_through":false,"compact":true,"opacity":0.5,
+                "geometry":{"x":0,"y":0,"width":420,"height":560},
+                "filters":{"chat":false}}"#,
+        )
+        .expect("parse");
+        assert!(!restored.filters.chat);
+        assert!(restored.filters.checks);
+        assert!(restored.filters.items);
+        assert!(restored.filters.system);
+    }
+
+    #[test]
+    fn filters_route_every_activity_kind_to_exactly_one_toggle() {
+        use client_ui::ActivityKind::*;
+
+        let all = FeedFilters::default();
+        for kind in [
+            Message,
+            Command,
+            CommandResult,
+            LocationCheck,
+            ReceivedItem,
+            StorageDelivery,
+            ParkedDelivery,
+            Error,
+            Hint,
+        ] {
+            assert!(all.admits(&kind), "{kind:?} must be visible by default");
+        }
+
+        let none = FeedFilters {
+            checks: false,
+            items: false,
+            chat: false,
+            system: false,
+        };
+        for kind in [
+            Message,
+            Command,
+            CommandResult,
+            LocationCheck,
+            ReceivedItem,
+            StorageDelivery,
+            ParkedDelivery,
+            Error,
+            Hint,
+        ] {
+            assert!(!none.admits(&kind), "{kind:?} must be hidable");
+        }
+
+        // Muting chat must not mute a delivery failure.
+        let quiet = FeedFilters {
+            chat: false,
+            ..FeedFilters::default()
+        };
+        assert!(!quiet.admits(&Message));
+        assert!(!quiet.admits(&Hint));
+        assert!(quiet.admits(&Error));
+        assert!(quiet.admits(&ParkedDelivery));
+    }
+
+    #[test]
+    fn persisted_options_survive_a_round_trip_through_the_atomic_writer() {
+        let directory = std::env::temp_dir().join(format!(
+            "bb-window-state-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = directory.join("client-window.json");
+        assert_eq!(load_options(&path), None, "no file means no options");
+
+        let options = WindowOptions {
+            opacity: 0.55,
+            compact: true,
+            filters: FeedFilters {
+                chat: false,
+                ..FeedFilters::default()
+            },
+            ..Default::default()
+        };
+        store_options(&path, &options).expect("write");
+        assert_eq!(load_options(&path), Some(options));
+
+        // A corrupt file is not an error a player should see; it is a return to defaults.
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(load_options(&path), None);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

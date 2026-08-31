@@ -98,7 +98,15 @@ jobs:
     # `bb-archipelago` ADDED 2026-08-19. The first equipment-descriptor PR exposed the same
     # omission again: workspace build/clippy compiled the Bloodborne crate, but this explicit
     # package list skipped its receive-ledger and fail-closed descriptor tests entirely.
-    - run: cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago -p shared -p archipelago_rs -p bb-archipelago
+    #
+    # `client-ui`, `standalone-windows` and `standalone-egui` ADDED 2026-08-31 with the GUI
+    # rewrite. Same omission a fourth time: all three were compiled by the workspace `cargo build`
+    # above and tested by nothing, so the snapshot bridge's ordering and back-pressure tests -- the
+    # guarantee that a stalled renderer stays outside the delivery acknowledgement path -- ran
+    # nowhere. The rewrite adds the delivery-headline table, the feed styling map and the
+    # window-state round-trip to that same set; a presentation gate whose tests never run is how
+    # `WaitingForGameplay` reached a player's screen in the first place.
+    - run: cargo test -p er-codec -p er-semver -p er-logic -p eldenring-archipelago -p shared -p archipelago_rs -p bb-archipelago -p client-ui -p standalone-windows -p standalone-egui
 
     - run: cargo fmt -- --check
     # RE-ARMED 2026-07-12. eldenring-archipelago had 44 accumulated lints -- the whole backlog of a crate

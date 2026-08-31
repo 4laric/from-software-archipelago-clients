@@ -1,0 +1,12 @@
+{
+  "always_on_top": true,
+  "click_through": false,
+  "compact": false,
+  "opacity": 0.7,
+  "geometry": {
+    "x": 120,
+    "y": 64,
+    "width": 560,
+    "height": 720
+  }
+}

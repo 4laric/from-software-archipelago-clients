@@ -19,3 +19,8 @@ sha2.workspace = true
 windows.workspace = true
 client-ui = { path = "../client-ui" }
 standalone-windows = { path = "../standalone-windows" }
+
+# The egui window is the default renderer and the Win32 shell is the `--legacy-window` fallback.
+# Both are Windows-only, and so is everything that spawns them.
+[target.'cfg(windows)'.dependencies]
+standalone-egui = { path = "../standalone-egui" }

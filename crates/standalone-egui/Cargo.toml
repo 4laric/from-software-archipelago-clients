@@ -1,0 +1,26 @@
+[package]
+name = "standalone-egui"
+version = "0.0.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = false
+
+[dependencies]
+client-ui = { path = "../client-ui" }
+standalone-windows = { path = "../standalone-windows" }
+
+# The renderer is Windows-only for the same reason the client is. Scoping the window stack to the
+# target keeps `view.rs` -- where every presentation decision this crate makes actually lives --
+# building and testing on any host.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.32"
+# `with_any_thread`: the client worker owns the process's main thread, so the event loop has to be
+# allowed to start on the one this crate spawns. Windows permits it; winit requires it to be asked
+# for explicitly.
+winit = "0.30"
+# Local clock offset for the feed's HH:MM:SS column, and nothing else.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# `RegisterHotKey` for the click-through escape hatch (see `hotkey.rs`).
+windows.workspace = true

@@ -1,0 +1,565 @@
+//! Presentation decisions, with no renderer in them.
+//!
+//! Everything a player reads on the standalone window is derived here: the colour a feed row gets,
+//! the sentence under the status pills, the shape of the items line. None of it touches egui, so
+//! all of it builds and tests on any host -- which is the point. The previous shell made these
+//! decisions inline inside a Win32 message loop, where the only way to check that `WaitingForGameplay`
+//! reached a player as a debug-formatted enum name was to launch the game.
+
+use client_ui::{ActivityKind, ApState, ClientSnapshot, DeliveryState, LedgerTotals, ProcessState};
+
+/// An sRGB colour, as bytes. Deliberately not `egui::Color32`: this module must stay compilable on
+/// a host with no windowing stack at all.
+pub type Rgb = [u8; 3];
+
+/// Dark-theme palette. One place, so a row's colour and a pill's colour cannot drift apart.
+pub mod palette {
+    use super::Rgb;
+
+    pub const TEXT: Rgb = [0xd4, 0xd0, 0xc8];
+    pub const MUTED: Rgb = [0x8a, 0x86, 0x80];
+    pub const OK: Rgb = [0x6f, 0xc2, 0x76];
+    pub const WARN: Rgb = [0xdd, 0xb5, 0x4f];
+    pub const BAD: Rgb = [0xe0, 0x6c, 0x6c];
+    /// Checks sent by this slot: the accent the window is otherwise built around.
+    pub const ACCENT: Rgb = [0x7a, 0xb8, 0xe8];
+    /// Items granted into the game.
+    pub const ITEM: Rgb = [0xc9, 0xa6, 0xe8];
+    /// Hints. Distinct from `ITEM` on purpose -- a hint names an item and would otherwise be
+    /// indistinguishable from actually receiving one.
+    pub const HINT: Rgb = [0xb0, 0x8c, 0xd8];
+    pub const BACKGROUND: Rgb = [0x14, 0x14, 0x16];
+    pub const PANEL: Rgb = [0x1c, 0x1c, 0x20];
+}
+
+/// How one activity row is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivityStyle {
+    pub color: Rgb,
+    /// Leading glyph, or `""` for rows that get none. ASCII only: the standalone window inherits
+    /// whatever font the host has, and the in-game toast path next door is ASCII-only for the same
+    /// reason. A missing glyph is a worse bug than a plain row.
+    pub glyph: &'static str,
+    /// Command echoes and their results are machine text; a proportional font makes them harder to
+    /// compare against the log.
+    pub monospace: bool,
+}
+
+/// The whole styling table for the feed. Exhaustive over [`ActivityKind`] so a new kind cannot be
+/// added without deciding how a player sees it.
+pub fn activity_style(kind: &ActivityKind) -> ActivityStyle {
+    let style = |color, glyph, monospace| ActivityStyle {
+        color,
+        glyph,
+        monospace,
+    };
+    match kind {
+        ActivityKind::LocationCheck => style(palette::ACCENT, "+", false),
+        ActivityKind::ReceivedItem => style(palette::ITEM, "->", false),
+        ActivityKind::StorageDelivery => style(palette::ITEM, "->", false),
+        ActivityKind::ParkedDelivery => style(palette::WARN, "||", false),
+        ActivityKind::Error => style(palette::BAD, "!", false),
+        ActivityKind::Hint => style(palette::HINT, "?", false),
+        ActivityKind::Command => style(palette::MUTED, ">", true),
+        ActivityKind::CommandResult => style(palette::MUTED, "", true),
+        ActivityKind::Message => style(palette::TEXT, "", false),
+    }
+}
+
+/// A header status pill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pill {
+    pub label: &'static str,
+    pub value: &'static str,
+    pub tone: Tone,
+}
+
+/// Pill colouring. `Muted` exists for exactly one situation: the worker has stopped reporting, so
+/// every pill on screen describes the past and must stop claiming to describe the present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Ok,
+    Warn,
+    Bad,
+    Muted,
+}
+
+impl Tone {
+    pub fn color(self) -> Rgb {
+        match self {
+            Tone::Ok => palette::OK,
+            Tone::Warn => palette::WARN,
+            Tone::Bad => palette::BAD,
+            Tone::Muted => palette::MUTED,
+        }
+    }
+}
+
+/// The three header pills, in fixed order: Game, AP, Delivery.
+pub fn pills(snapshot: &ClientSnapshot) -> [Pill; 3] {
+    let mute = |pill: Pill| {
+        if snapshot.stale {
+            Pill {
+                tone: Tone::Muted,
+                ..pill
+            }
+        } else {
+            pill
+        }
+    };
+    let (game_value, game_tone) = match snapshot.process {
+        ProcessState::Attached => ("Attached", Tone::Ok),
+        ProcessState::Attaching => ("Attaching", Tone::Warn),
+        ProcessState::Waiting => ("Waiting", Tone::Warn),
+        ProcessState::Lost => ("Lost", Tone::Bad),
+    };
+    let (ap_value, ap_tone) = match snapshot.ap {
+        ApState::Authenticated => ("Connected", Tone::Ok),
+        ApState::Connecting => ("Connecting", Tone::Warn),
+        ApState::Reconnecting => ("Reconnecting", Tone::Warn),
+        ApState::Disconnected => ("Offline", Tone::Bad),
+    };
+    let (delivery_value, delivery_tone) = match snapshot.delivery {
+        DeliveryState::Ready => ("Ready", Tone::Ok),
+        DeliveryState::WaitingForGameplay => ("Waiting", Tone::Warn),
+        DeliveryState::CommandPending => ("Working", Tone::Warn),
+        DeliveryState::NotArmed => ("Not armed", Tone::Bad),
+        DeliveryState::Blocked => ("Blocked", Tone::Bad),
+    };
+    [
+        mute(Pill {
+            label: "Game",
+            value: game_value,
+            tone: game_tone,
+        }),
+        mute(Pill {
+            label: "AP",
+            value: ap_value,
+            tone: ap_tone,
+        }),
+        mute(Pill {
+            label: "Delivery",
+            value: delivery_value,
+            tone: delivery_tone,
+        }),
+    ]
+}
+
+/// Slot name and server, as two separately styled pieces. `None` for the slot means the worker has
+/// not published an identity yet.
+pub fn identity(snapshot: &ClientSnapshot) -> (String, Option<String>) {
+    match (&snapshot.slot, &snapshot.server) {
+        (Some(slot), Some(server)) => (slot.clone(), Some(format!("@ {server}"))),
+        (Some(slot), None) => (slot.clone(), None),
+        (None, _) => ("Starting...".to_owned(), None),
+    }
+}
+
+/// `checked / total` plus the 0.0..=1.0 bar fraction, or `None` when the seed contract has not
+/// been parsed yet. A bar drawn against a zero total is a bar that always reads empty.
+pub fn checks_progress(snapshot: &ClientSnapshot) -> Option<(f32, String)> {
+    let locations = snapshot.locations.as_ref()?;
+    if locations.total == 0 {
+        return None;
+    }
+    let fraction = (f64::from(locations.checked) / f64::from(locations.total)).clamp(0.0, 1.0);
+    Some((
+        fraction as f32,
+        format!("{} / {}", locations.checked, locations.total),
+    ))
+}
+
+/// The items line: `N delivered - N queued`, with parked appended only when there are any.
+///
+/// Storage routing is absent by design. `storage_routed: None` means "ordinary ledger
+/// acknowledgement cannot prove a native destination", and the old shell rendered that as
+/// `unknown storage`, which players read as breakage. The count appears only when it is a fact;
+/// the caveat belongs in [`STORAGE_TOOLTIP`].
+pub fn items_line(ledger: &LedgerTotals) -> String {
+    let mut parts = vec![
+        format!("{} delivered", ledger.delivered),
+        format!("{} queued", ledger.queued),
+    ];
+    if let Some(routed) = ledger.storage_routed {
+        parts.push(format!("{routed} to storage"));
+    }
+    if ledger.parked > 0 {
+        parts.push(format!("{} parked", ledger.parked));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// Shown on hover over the items line whenever storage routing is unproven.
+pub const STORAGE_TOOLTIP: &str = "storage routing unverified this session";
+
+/// The goal line, and whether the GO MODE badge is drawn beside it.
+///
+/// `go_mode: None` and `go_mode: Some(false)` both render no badge: the word "unknown" on a goal
+/// line is read as a fault, and the absence of a badge already says everything a player needs.
+pub fn goal_line(snapshot: &ClientSnapshot) -> Option<(String, bool)> {
+    let goal = snapshot.goal.as_ref()?;
+    Some((format!("Goal: {goal}"), snapshot.go_mode == Some(true)))
+}
+
+/// `HH:MM:SS` in the viewer's local time, from a Unix-epoch millisecond stamp.
+///
+/// Hand-rolled rather than pulled from a date crate because this is the only date arithmetic in
+/// the window and the whole of it is "seconds within a day". `offset_seconds` is the local UTC
+/// offset supplied by the caller; an unstamped event (`0`) renders as blanks so the column stays
+/// aligned instead of claiming a time.
+pub fn clock_label(timestamp_ms: u64, offset_seconds: i64) -> String {
+    if timestamp_ms == 0 {
+        return "--:--:--".to_owned();
+    }
+    let seconds = (timestamp_ms / 1000) as i64 + offset_seconds;
+    let day_seconds = seconds.rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        day_seconds / 3600,
+        (day_seconds % 3600) / 60,
+        day_seconds % 60
+    )
+}
+
+/// Session-local command history for the Up/Down arrows.
+///
+/// Bounded and duplicate-collapsing: a player retrying `status` six times wants one entry back,
+/// not six. Never persisted -- a command history that outlives the process would carry rescue
+/// commands into a session where they mean something different.
+#[derive(Clone, Debug, Default)]
+pub struct CommandHistory {
+    entries: Vec<String>,
+    /// `None` means "editing a fresh line"; `Some(i)` indexes `entries` from the newest end.
+    cursor: Option<usize>,
+}
+
+impl CommandHistory {
+    pub const CAPACITY: usize = 50;
+
+    pub fn record(&mut self, command: &str) {
+        self.cursor = None;
+        if command.is_empty() {
+            return;
+        }
+        if self.entries.last().is_some_and(|last| last == command) {
+            return;
+        }
+        self.entries.push(command.to_owned());
+        if self.entries.len() > Self::CAPACITY {
+            self.entries.remove(0);
+        }
+    }
+
+    /// Steps one entry towards the past (`older`, not `previous`: an `Option`-returning `next` on a
+    /// non-iterator is a clippy lint and a genuine misreading). Returns the line to place in the input, or `None` when
+    /// there is no history at all.
+    pub fn older(&mut self) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let next = match self.cursor {
+            None => 0,
+            Some(index) => (index + 1).min(self.entries.len() - 1),
+        };
+        self.cursor = Some(next);
+        self.entries.get(self.entries.len() - 1 - next).cloned()
+    }
+
+    /// Steps one entry towards the present. Returns `Some("")` when it walks off the newest entry,
+    /// which restores the empty input line rather than sticking on the last command.
+    pub fn newer(&mut self) -> Option<String> {
+        match self.cursor {
+            None | Some(0) => {
+                self.cursor = None;
+                Some(String::new())
+            }
+            Some(index) => {
+                self.cursor = Some(index - 1);
+                self.entries.get(self.entries.len() - index).cloned()
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use client_ui::{ActivityEvent, LocationTotals, Severity, SnapshotReducer, delivery_headline};
+
+    #[test]
+    fn every_activity_kind_has_a_distinct_enough_style() {
+        use ActivityKind::*;
+
+        assert_eq!(
+            activity_style(&LocationCheck),
+            ActivityStyle {
+                color: palette::ACCENT,
+                glyph: "+",
+                monospace: false
+            }
+        );
+        assert_eq!(activity_style(&ReceivedItem).color, palette::ITEM);
+        assert_eq!(activity_style(&ReceivedItem).glyph, "->");
+        assert_eq!(activity_style(&Error).color, palette::BAD);
+        assert_eq!(activity_style(&Hint).color, palette::HINT);
+        assert_eq!(activity_style(&ParkedDelivery).color, palette::WARN);
+        assert_eq!(activity_style(&Message).color, palette::TEXT);
+
+        // Command traffic is the only monospaced traffic, and the only traffic that is muted.
+        for kind in [Command, CommandResult] {
+            assert!(activity_style(&kind).monospace, "{kind:?}");
+            assert_eq!(activity_style(&kind).color, palette::MUTED);
+        }
+        for kind in [
+            Message,
+            LocationCheck,
+            ReceivedItem,
+            StorageDelivery,
+            ParkedDelivery,
+            Error,
+            Hint,
+        ] {
+            assert!(!activity_style(&kind).monospace, "{kind:?}");
+        }
+
+        // A failure must never be styled as ordinary chat: this is the pairing the old one-blob
+        // shell could not make, and the reason a dead bridge looked like a healthy one.
+        assert_ne!(activity_style(&Error).color, activity_style(&Message).color);
+        assert_ne!(
+            activity_style(&Hint).color,
+            activity_style(&ReceivedItem).color
+        );
+
+        // Every style is ASCII, because the window inherits the host's font.
+        for kind in [
+            Message,
+            Command,
+            CommandResult,
+            LocationCheck,
+            ReceivedItem,
+            StorageDelivery,
+            ParkedDelivery,
+            Error,
+            Hint,
+        ] {
+            assert!(activity_style(&kind).glyph.is_ascii(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn pills_read_as_words_not_as_enum_names() {
+        let snapshot = ClientSnapshot {
+            process: ProcessState::Attached,
+            ap: ApState::Authenticated,
+            delivery: DeliveryState::WaitingForGameplay,
+            ..Default::default()
+        };
+        let pills = pills(&snapshot);
+        assert_eq!(pills[0].value, "Attached");
+        assert_eq!(pills[0].tone, Tone::Ok);
+        assert_eq!(pills[1].value, "Connected");
+        assert_eq!(pills[2].value, "Waiting");
+        assert_eq!(pills[2].tone, Tone::Warn);
+        for pill in &pills {
+            assert!(!pill.value.contains("ForGameplay"), "{pill:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_snapshot_greys_every_pill_including_the_healthy_ones() {
+        let snapshot = ClientSnapshot {
+            process: ProcessState::Attached,
+            ap: ApState::Authenticated,
+            delivery: DeliveryState::Ready,
+            stale: true,
+            ..Default::default()
+        };
+        for pill in pills(&snapshot) {
+            assert_eq!(pill.tone, Tone::Muted, "{pill:?}");
+        }
+    }
+
+    #[test]
+    fn the_headline_and_the_delivery_pill_never_disagree() {
+        for delivery in [
+            DeliveryState::NotArmed,
+            DeliveryState::WaitingForGameplay,
+            DeliveryState::Ready,
+            DeliveryState::CommandPending,
+            DeliveryState::Blocked,
+        ] {
+            let snapshot = ClientSnapshot {
+                delivery: delivery.clone(),
+                ..Default::default()
+            };
+            let expected = match delivery_headline(&snapshot).0 {
+                Severity::Ok => Tone::Ok,
+                Severity::Warn => Tone::Warn,
+                Severity::Bad => Tone::Bad,
+            };
+            assert_eq!(pills(&snapshot)[2].tone, expected, "{delivery:?}");
+        }
+    }
+
+    #[test]
+    fn the_items_line_hides_what_it_cannot_prove() {
+        assert_eq!(
+            items_line(&LedgerTotals {
+                delivered: 12,
+                queued: 1,
+                storage_routed: None,
+                parked: 0,
+            }),
+            "12 delivered \u{b7} 1 queued"
+        );
+        assert_eq!(
+            items_line(&LedgerTotals {
+                delivered: 12,
+                queued: 0,
+                storage_routed: Some(3),
+                parked: 2,
+            }),
+            "12 delivered \u{b7} 0 queued \u{b7} 3 to storage \u{b7} 2 parked"
+        );
+        // The word players read as breakage never appears.
+        assert!(!items_line(&LedgerTotals::default()).contains("unknown"));
+    }
+
+    #[test]
+    fn a_goal_never_says_unknown() {
+        assert_eq!(goal_line(&ClientSnapshot::default()), None);
+        let with_goal = |go_mode| {
+            goal_line(&ClientSnapshot {
+                goal: Some("Moon Presence".into()),
+                go_mode,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(with_goal(Some(true)), ("Goal: Moon Presence".into(), true));
+        assert_eq!(
+            with_goal(Some(false)),
+            ("Goal: Moon Presence".into(), false)
+        );
+        assert_eq!(with_goal(None), ("Goal: Moon Presence".into(), false));
+    }
+
+    #[test]
+    fn checks_progress_is_absent_rather_than_empty_before_the_contract_loads() {
+        assert_eq!(checks_progress(&ClientSnapshot::default()), None);
+        assert_eq!(
+            checks_progress(&ClientSnapshot {
+                locations: Some(LocationTotals {
+                    checked: 0,
+                    total: 0
+                }),
+                ..Default::default()
+            }),
+            None
+        );
+        let (fraction, label) = checks_progress(&ClientSnapshot {
+            locations: Some(LocationTotals {
+                checked: 42,
+                total: 168,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!((fraction - 0.25).abs() < f32::EPSILON);
+        assert_eq!(label, "42 / 168");
+    }
+
+    #[test]
+    fn identity_degrades_to_a_skeleton_rather_than_a_panic() {
+        assert_eq!(
+            identity(&ClientSnapshot::default()),
+            ("Starting...".to_owned(), None)
+        );
+        assert_eq!(
+            identity(&ClientSnapshot {
+                slot: Some("hunter".into()),
+                server: Some("archipelago.gg:12345".into()),
+                ..Default::default()
+            }),
+            (
+                "hunter".to_owned(),
+                Some("@ archipelago.gg:12345".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn the_clock_column_stays_aligned_even_without_a_stamp() {
+        assert_eq!(clock_label(0, 0), "--:--:--");
+        // 2026-08-31T01:02:03Z
+        assert_eq!(clock_label(1_787_101_323_000, 0), "01:02:03");
+        // ... read an hour later, and across the midnight wrap in the other direction.
+        assert_eq!(clock_label(1_787_101_323_000, 3600), "02:02:03");
+        assert_eq!(clock_label(1_787_101_323_000, -2 * 3600), "23:02:03");
+    }
+
+    #[test]
+    fn command_history_walks_both_ways_and_returns_to_a_blank_line() {
+        let mut history = CommandHistory::default();
+        for command in ["status", "status", "blocked", "export"] {
+            history.record(command);
+        }
+        assert_eq!(history.len(), 3, "consecutive repeats collapse");
+
+        assert_eq!(history.older().as_deref(), Some("export"));
+        assert_eq!(history.older().as_deref(), Some("blocked"));
+        assert_eq!(history.older().as_deref(), Some("status"));
+        assert_eq!(
+            history.older().as_deref(),
+            Some("status"),
+            "clamps at the oldest"
+        );
+        assert_eq!(history.newer().as_deref(), Some("blocked"));
+        assert_eq!(history.newer().as_deref(), Some("export"));
+        assert_eq!(
+            history.newer().as_deref(),
+            Some(""),
+            "walks off into a fresh line"
+        );
+        assert_eq!(history.newer().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn an_empty_history_never_hijacks_the_arrow_keys() {
+        let mut history = CommandHistory::default();
+        assert!(history.is_empty());
+        assert_eq!(history.older(), None);
+    }
+
+    #[test]
+    fn history_is_bounded_at_fifty() {
+        let mut history = CommandHistory::default();
+        for index in 0..80 {
+            history.record(&format!("flag {index}"));
+        }
+        assert_eq!(history.len(), CommandHistory::CAPACITY);
+        assert_eq!(history.older().as_deref(), Some("flag 79"));
+    }
+
+    #[test]
+    fn a_real_reducer_feed_styles_end_to_end() {
+        // Guards the seam rather than the table: an event that came through the reducer carries a
+        // kind this module can style and a stamp this module can print.
+        let mut reducer = SnapshotReducer::default();
+        reducer.activity(ActivityKind::ReceivedItem, "Saw Cleaver from Oz");
+        reducer.activity(ActivityKind::Error, "Archipelago error: connection reset");
+        let snapshot = reducer.reduce(Default::default());
+        let events: Vec<&ActivityEvent> = snapshot.activity.iter().collect();
+        assert_eq!(activity_style(&events[0].kind).glyph, "->");
+        assert_eq!(activity_style(&events[1].kind).color, palette::BAD);
+        assert_ne!(clock_label(events[1].timestamp_ms, 0), "--:--:--");
+    }
+}
