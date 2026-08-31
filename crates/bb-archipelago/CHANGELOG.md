@@ -30,6 +30,13 @@
 
 ### Fixed
 
+* **Goal-release item floods are paced instead of hammering Bloodborne's
+  inventory routine.** A live 71-item capture showed stable held delivery at
+  ordinary cadence, then storage routing after more than twenty grants arrived
+  roughly 130–170 ms apart. Successful grants now wait one second before the
+  next item is submitted, trading a short release-drain time for predictable
+  inventory placement.
+
 * **Location checks retry until the server confirms them (clients#455).** A
   socket killed without a detected transport error could accept a local write,
   after which archipelago-rs's optimistic checked-location cache made the
