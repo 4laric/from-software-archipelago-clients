@@ -132,7 +132,7 @@ impl NativeBackend {
         match GemCapture::beside_ledger(ledger) {
             Ok(capture) => {
                 client_eprintln!(
-                    "Blood-gem diagnostics: natural inventory changes stream beside the ledger to blood-gem-capture.jsonl."
+                    "Blood-gem diagnostics: read-only inventory-manager snapshots stream beside the ledger to blood-gem-capture.jsonl."
                 );
                 self.gem_capture = Some(capture);
             }
@@ -322,20 +322,9 @@ impl BloodborneBackend for NativeBackend {
         if let Some(capture) = &mut self.vial_capture {
             capture.observe(entries.clone());
         }
-        let gem_candidate = self
-            .gem_capture
-            .as_mut()
-            .and_then(|capture| capture.observe(entries).into_iter().next());
-        if self.gem_capture.is_some() {
-            let candidate = gem_candidate;
-            if let Some(probe) = self
-                .delivery
-                .runtime_mut()
-                .probe_generated_object(candidate)
-                && let Some(capture) = &mut self.gem_capture
-            {
-                capture.record_generated_object(&probe);
-            }
+        if let Some(capture) = &mut self.gem_capture {
+            let snapshot = self.delivery.runtime_mut().inventory_diagnostic_snapshot();
+            capture.observe(snapshot);
         }
         let result = self.location_context_inner();
         // clients#445: remember what the loop was told, so a grant record can

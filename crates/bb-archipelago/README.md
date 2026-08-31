@@ -233,6 +233,28 @@ arming — still need the probe, because those conditions do not arise on their
 own during play. The passive file answers the question the probe cannot: what
 the distribution looks like across a real session.
 
+### Blood-gem container diagnostic
+
+Native sessions append a bounded, read-only snapshot to
+`blood-gem-capture.jsonl` every five seconds and whenever the sampled structure
+changes. It records the inventory manager's first `0x200` bytes plus up to 24
+distinct guest-memory blocks directly referenced by that manager. Speculative
+pointers that cannot be read are ignored, and the diagnostic never writes to
+the game.
+
+This replaces an invalid classifier that treated runtime ids beginning in
+`0x1...` as ItemLot category 8. Those observed rows were category-1 armor;
+ItemLot category 8 describes how a generated gem is awarded and is not encoded
+as that runtime-id prefix. Natural gems also do not appear in the ordinary
+held-item arrays currently used for delivery, so their separate live container
+must be located before safe insertion can be implemented.
+
+For a focused capture, wait five seconds for a baseline, acquire one natural
+blood gem, wait five seconds, acquire a second natural blood gem, and wait five
+seconds again. Send `blood-gem-capture.jsonl` with `client.log`, naming the two
+gems and their pickup order. Existing gems are fine; changes between snapshots
+are the useful evidence.
+
 ### Zero-Vial diagnostic (bb-archipelago#70)
 
 Native sessions also append read-only samples to `blood-vial-capture.jsonl`

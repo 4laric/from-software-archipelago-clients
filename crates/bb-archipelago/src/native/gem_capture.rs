@@ -1,20 +1,25 @@
-//! Passive natural-award capture for category-8 blood-gem research.
+//! Read-only inventory-manager snapshots for category-8 blood-gem research.
 //!
-//! The game must remain the only writer. This module merely diffs the same
-//! bounded inventory records the delivery verifier already reads and appends
-//! evidence beside the receive ledger.
+//! ItemLot category 8 is a generation recipe, not a runtime descriptor prefix.
+//! The former probe incorrectly classified category-1 armor ids beginning in
+//! `0x1...` as gems and watched only the ordinary held-item arrays. Natural gem
+//! acquisitions proved that view incomplete. Snapshot the owning manager and
+//! its bounded guest-pointer blocks instead, so before/after captures can reveal
+//! the separate generated-gem container without guessing its layout.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::guest::{GeneratedObjectProbe, InventoryEntry};
+use super::guest::InventoryDiagnosticSnapshot;
+
+const HEARTBEAT_MS: u128 = 5_000;
 
 pub struct GemCapture {
     file: File,
-    previous: Option<BTreeMap<u32, InventoryEntry>>,
+    previous: Option<InventoryDiagnosticSnapshot>,
+    last_sample_ms: u128,
     warned: bool,
 }
 
@@ -28,78 +33,37 @@ impl GemCapture {
         Ok(Self {
             file,
             previous: None,
+            last_sample_ms: 0,
             warned: false,
         })
     }
 
-    pub fn observe(&mut self, entries: Option<Vec<InventoryEntry>>) -> Vec<InventoryEntry> {
-        let Some(entries) = entries else {
-            return Vec::new();
-        };
-        let current: BTreeMap<_, _> = entries
-            .into_iter()
-            .map(|entry| (entry.slot, entry))
-            .collect();
-        if self.previous.is_none() {
-            let rows = current.values().map(entry_json).collect::<Vec<_>>();
+    pub fn observe(&mut self, snapshot: Option<InventoryDiagnosticSnapshot>) {
+        let Some(snapshot) = snapshot else { return };
+        let now = now_ms();
+        let changed = self.previous.as_ref() != Some(&snapshot);
+        if changed || now.saturating_sub(self.last_sample_ms) >= HEARTBEAT_MS {
             self.write(json::json!({
-                "event": "baseline", "at_unix_ms": now_ms(),
-                "occupied_slots": current.len(), "entries": rows,
+                "event": if self.previous.is_none() { "manager_baseline" } else if changed { "manager_delta" } else { "manager_heartbeat" },
+                "at_unix_ms": now,
+                "manager_address": format!("0x{:X}", snapshot.manager_address),
+                "manager_bytes": hex(&snapshot.manager_bytes),
+                "pointer_blocks": snapshot.pointer_blocks.iter().map(|block| json::json!({
+                    "manager_offset": format!("0x{:X}", block.manager_offset),
+                    "address": format!("0x{:X}", block.address),
+                    "bytes": hex(&block.bytes),
+                })).collect::<Vec<_>>(),
             }));
-            self.previous = Some(current);
-            return Vec::new();
+            self.last_sample_ms = now;
         }
-        let previous = self.previous.as_ref().unwrap();
-        let slots: BTreeSet<_> = previous.keys().chain(current.keys()).copied().collect();
-        let deltas = slots
-            .into_iter()
-            .filter_map(|slot| {
-                let before = previous.get(&slot);
-                let after = current.get(&slot);
-                (before != after).then(|| {
-                    json::json!({
-                        "slot": slot,
-                        "before": before.map(entry_json),
-                        "after": after.map(entry_json),
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        // Retain the concrete records before mutably borrowing the logger.
-        let generated = current
-            .iter()
-            .filter(|(slot, entry)| {
-                previous.get(slot) != Some(*entry) && entry.word(4) & 0xF000_0000 == 0x1000_0000
-            })
-            .map(|(_, entry)| entry.clone())
-            .collect();
-        if !deltas.is_empty() {
-            self.write(json::json!({
-                "event": "inventory_delta", "at_unix_ms": now_ms(), "deltas": deltas,
-            }));
-        }
-        // Return concrete newly-added category-8-shaped records to the
-        // game-thread resolver probe. Inventory JSON values above are for the
-        // log only; retain the original records here.
-        self.previous = Some(current);
-        generated
-    }
-
-    pub fn record_generated_object(&mut self, probe: &GeneratedObjectProbe) {
-        self.write(json::json!({
-            "event": "generated_object",
-            "at_unix_ms": now_ms(),
-            "entry": entry_json(&probe.entry),
-            "backing_address": format!("0x{:X}", probe.address),
-            "backing_bytes": probe.bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" "),
-        }));
+        self.previous = Some(snapshot);
     }
 
     fn write(&mut self, value: json::Value) {
         if self.warned {
             return;
         }
-        if writeln!(self.file, "{}", value)
+        if writeln!(self.file, "{value}")
             .and_then(|_| self.file.flush())
             .is_err()
         {
@@ -115,35 +79,21 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn entry_json(entry: &InventoryEntry) -> json::Value {
-    json::json!({
-        "slot": entry.slot,
-        "address": format!("0x{:X}", entry.address),
-        "handle_or_word0": format!("0x{:08X}", entry.word(0)),
-        "normalized_id": format!("0x{:08X}", entry.word(4)),
-        "word8": format!("0x{:08X}", entry.word(8)),
-        "word12": format!("0x{:08X}", entry.word(12)),
-        "bytes": entry.bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" "),
-    })
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn entry(slot: u32, id: u32) -> InventoryEntry {
-        let mut bytes = [0u8; 16];
-        bytes[0..4].copy_from_slice(&(0xC080_0000 + slot).to_le_bytes());
-        bytes[4..8].copy_from_slice(&id.to_le_bytes());
-        InventoryEntry {
-            slot,
-            address: 0x9000 + u64::from(slot) * 16,
-            bytes,
-        }
-    }
+    use crate::native::guest::InventoryPointerBlock;
 
     #[test]
-    fn a_natural_inventory_change_is_logged_without_filtering_category_eight() {
+    fn manager_snapshots_never_claim_that_runtime_ids_are_gems() {
         let root = std::env::temp_dir().join(format!(
             "bb-gem-capture-{}-{}",
             std::process::id(),
@@ -152,19 +102,22 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let ledger = root.join("ledger.json");
         let mut capture = GemCapture::beside_ledger(&ledger).unwrap();
-        capture.observe(Some(vec![entry(4, 0x4000_03E8)]));
-        let generated = capture.observe(Some(vec![entry(4, 0x4000_03E8), entry(9, 0x1001_E078)]));
-        assert_eq!(generated.len(), 1);
+        capture.observe(Some(InventoryDiagnosticSnapshot {
+            manager_address: 0x2080_0000,
+            manager_bytes: vec![0x70, 0x82, 0x03, 0x10],
+            pointer_blocks: vec![InventoryPointerBlock {
+                manager_offset: 0x48,
+                address: 0x2080_1000,
+                bytes: vec![1, 2, 3, 4],
+            }],
+        }));
         drop(capture);
 
         let text = std::fs::read_to_string(root.join("blood-gem-capture.jsonl")).unwrap();
-        let rows = text
-            .lines()
-            .map(|line| json::from_str::<json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(rows[0]["event"], "baseline");
-        assert_eq!(rows[1]["event"], "inventory_delta");
-        assert_eq!(rows[1]["deltas"][0]["after"]["normalized_id"], "0x1001E078");
+        assert!(text.contains("\"event\":\"manager_baseline\""), "{text}");
+        assert!(text.contains("\"manager_offset\":\"0x48\""), "{text}");
+        assert!(!text.contains("normalized_id"), "{text}");
+        assert!(!text.contains("generated_object"), "{text}");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
