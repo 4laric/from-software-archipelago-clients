@@ -292,6 +292,14 @@ must not be passed through the generated-instance resolver, whose output is
 meaningful only for weapons and blood gems. The diagnostic never stages or
 grants a Vial.
 
+When a canonical Vial row first appears, the capture emits a
+`canonical_vial_created` record. It names the selected slot, records the last
+occupied slot before and after creation, and preserves a five-slot window
+around the target from both snapshots. Missing pre-creation rows are explicit
+`present: false` entries rather than invented zero bytes. This distinguishes
+append, reuse, and in-place rewrite behavior and supplies the exact neighboring
+bytes needed to design a guarded zero-to-one bootstrap.
+
 For the dedicated capture: begin at zero Vials, leave the client running for
 one heartbeat, buy the first shop Vial, wait for another heartbeat, then obtain
 one Vial from an enemy or world pickup and wait five seconds. Send

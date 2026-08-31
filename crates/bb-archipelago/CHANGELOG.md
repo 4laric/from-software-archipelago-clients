@@ -2,6 +2,12 @@
 
 ### Changed
 
+* **The zero-Vial diagnostic now captures the actual record-creation
+  transition.** On the first canonical Vial row it records the chosen slot,
+  neighboring before/after bytes, and inventory tail movement. Delivery remains
+  fail-closed; this is the read-only evidence needed before implementing an
+  absent-stack bootstrap.
+
 * **Windows launches now include a native standalone Bloodborne status
   window.** Distinct shadPS4, Archipelago, and delivery readiness is fed by the
   nonblocking UI bridge. The translucent, always-on-top shell never touches the

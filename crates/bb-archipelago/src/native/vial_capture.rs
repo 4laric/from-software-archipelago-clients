@@ -18,7 +18,8 @@ const HEARTBEAT_MS: u128 = 5_000;
 
 pub struct VialCapture {
     file: File,
-    previous: Option<Vec<InventoryEntry>>,
+    previous_suspects: Option<Vec<InventoryEntry>>,
+    previous_entries: Option<Vec<InventoryEntry>>,
     last_sample_ms: u128,
     warned: bool,
 }
@@ -31,7 +32,8 @@ impl VialCapture {
             .join("blood-vial-capture.jsonl");
         Ok(Self {
             file: OpenOptions::new().create(true).append(true).open(path)?,
-            previous: None,
+            previous_suspects: None,
+            previous_entries: None,
             last_sample_ms: 0,
             warned: false,
         })
@@ -42,23 +44,50 @@ impl VialCapture {
     pub fn observe(&mut self, entries: Option<Vec<InventoryEntry>>) {
         let Some(entries) = entries else { return };
         let suspects = entries
-            .into_iter()
+            .iter()
             .filter(|entry| {
                 entry.word(0) & 0x00FF_FFFF == VIAL_ID || entry.word(4) & 0x00FF_FFFF == VIAL_ID
             })
+            .cloned()
             .collect::<Vec<_>>();
         let now = now_ms();
-        let changed = self.previous.as_ref() != Some(&suspects);
+        let changed = self.previous_suspects.as_ref() != Some(&suspects);
+        let previous_canonical = self
+            .previous_suspects
+            .as_ref()
+            .is_some_and(|rows| rows.iter().any(|entry| entry.word(4) == CANONICAL_VIAL));
+        let canonical = suspects
+            .iter()
+            .find(|entry| entry.word(4) == CANONICAL_VIAL);
+        let canonical_created = !previous_canonical && canonical.is_some();
         if changed || now.saturating_sub(self.last_sample_ms) >= HEARTBEAT_MS {
-            self.write(json::json!({
-                "event": if self.previous.is_none() { "baseline" } else if changed { "vial_state_change" } else { "heartbeat" },
+            let mut record = json::json!({
+                "event": if self.previous_suspects.is_none() { "baseline" } else if canonical_created { "canonical_vial_created" } else if changed { "vial_state_change" } else { "heartbeat" },
                 "at_unix_ms": now,
-                "canonical_vial_present": suspects.iter().any(|entry| entry.word(4) == CANONICAL_VIAL),
+                "canonical_vial_present": canonical.is_some(),
                 "suspect_rows": suspects.iter().map(entry_json).collect::<Vec<_>>(),
-            }));
+            });
+            if canonical_created {
+                let selected = canonical.expect("canonical row was just established");
+                record["selected_slot"] = json::json!(selected.slot);
+                record["before_window"] = json::json!(slot_window(
+                    self.previous_entries.as_deref().unwrap_or(&[]),
+                    selected.slot
+                ));
+                record["after_window"] = json::json!(slot_window(&entries, selected.slot));
+                record["last_slot_before"] = json::json!(
+                    self.previous_entries
+                        .as_ref()
+                        .and_then(|rows| rows.last())
+                        .map(|row| row.slot)
+                );
+                record["last_slot_after"] = json::json!(entries.last().map(|row| row.slot));
+            }
+            self.write(record);
             self.last_sample_ms = now;
         }
-        self.previous = Some(suspects);
+        self.previous_suspects = Some(suspects);
+        self.previous_entries = Some(entries);
     }
 
     fn write(&mut self, value: json::Value) {
@@ -72,6 +101,20 @@ impl VialCapture {
             self.warned = true;
         }
     }
+}
+
+fn slot_window(entries: &[InventoryEntry], selected_slot: u32) -> Vec<json::Value> {
+    let first = selected_slot.saturating_sub(2);
+    let last = selected_slot.saturating_add(2);
+    (first..=last)
+        .map(|slot| {
+            entries
+                .iter()
+                .find(|entry| entry.slot == slot)
+                .map(entry_json)
+                .unwrap_or_else(|| json::json!({ "slot": slot, "present": false }))
+        })
+        .collect()
 }
 
 fn now_ms() -> u128 {
@@ -125,7 +168,42 @@ mod tests {
         let text = std::fs::read_to_string(root.join("blood-vial-capture.jsonl")).unwrap();
         assert!(text.contains("0x808002C0"));
         assert!(text.contains("\"canonical_vial_present\":true"));
+        assert!(text.contains("\"event\":\"canonical_vial_created\""));
+        assert!(text.contains("\"selected_slot\":14"));
+        assert!(text.contains("\"before_window\""));
+        assert!(text.contains("\"after_window\""));
         assert!(!text.contains("backing_address"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creation_window_keeps_before_bytes_and_marks_an_appended_slot_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "bb-vial-capture-window-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ledger = root.join("ledger.json");
+        let mut capture = VialCapture::beside_ledger(&ledger).unwrap();
+        capture.observe(Some(vec![entry(4, 0xB000_04CE, 0x4000_04CE)]));
+        capture.observe(Some(vec![
+            entry(4, 0xB000_04CE, 0x4000_04CE),
+            entry(5, 0xB000_03E8, CANONICAL_VIAL),
+        ]));
+        drop(capture);
+        let lines = std::fs::read_to_string(root.join("blood-vial-capture.jsonl")).unwrap();
+        let created: json::Value = lines
+            .lines()
+            .map(|line| json::from_str(line).unwrap())
+            .find(|record: &json::Value| record["event"] == "canonical_vial_created")
+            .unwrap();
+        assert_eq!(created["selected_slot"], 5);
+        assert_eq!(created["last_slot_before"], 4);
+        assert_eq!(created["last_slot_after"], 5);
+        assert_eq!(created["before_window"][2]["slot"], 5);
+        assert_eq!(created["before_window"][2]["present"], false);
+        assert_eq!(created["after_window"][2]["word4"], "0x400003E8");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
