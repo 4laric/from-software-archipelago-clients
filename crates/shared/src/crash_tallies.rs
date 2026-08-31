@@ -23,6 +23,8 @@ static LAST_WORLD_EDGE: AtomicU64 = AtomicU64::new(NEVER);
 static LAST_WORLD_EDGE_ENTERED: AtomicBool = AtomicBool::new(false);
 static LAST_SCALING_SWEEP: AtomicU64 = AtomicU64::new(NEVER);
 static LAST_RECONCILE_APPLY: AtomicU64 = AtomicU64::new(NEVER);
+static LAST_ADD_ITEM_ENTRY: AtomicU64 = AtomicU64::new(NEVER);
+static LAST_ADD_ITEM_EXIT: AtomicU64 = AtomicU64::new(NEVER);
 
 /// Rung writes this session (`apply_speffect` on the scaling path).
 static SCALING_WRITES: AtomicU64 = AtomicU64::new(0);
@@ -51,6 +53,15 @@ pub fn record_reconcile_apply() {
     LAST_RECONCILE_APPLY.store(now_ms(), Ordering::Relaxed);
 }
 
+/// Record entry to or return from the game's `AddItemFunc` boundary.
+pub fn record_add_item_boundary(entered: bool) {
+    if entered {
+        LAST_ADD_ITEM_ENTRY.store(now_ms(), Ordering::Relaxed);
+    } else {
+        LAST_ADD_ITEM_EXIT.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
 fn now_ms() -> u64 {
     CLOCK
         .get_or_init(Instant::now)
@@ -76,7 +87,14 @@ pub fn annotate_quiescence() -> String {
     let edge = LAST_WORLD_EDGE.load(Ordering::Relaxed);
     let sweep = LAST_SCALING_SWEEP.load(Ordering::Relaxed);
     let reconcile = LAST_RECONCILE_APPLY.load(Ordering::Relaxed);
-    if edge == NEVER && sweep == NEVER && reconcile == NEVER {
+    let add_item_entry = LAST_ADD_ITEM_ENTRY.load(Ordering::Relaxed);
+    let add_item_exit = LAST_ADD_ITEM_EXIT.load(Ordering::Relaxed);
+    if edge == NEVER
+        && sweep == NEVER
+        && reconcile == NEVER
+        && add_item_entry == NEVER
+        && add_item_exit == NEVER
+    {
         return String::new();
     }
     let now = now_ms();
@@ -86,10 +104,12 @@ pub fn annotate_quiescence() -> String {
         "left"
     };
     format!(
-        "quiescence: world edge {edge_kind} {}; scaling sweep {}; reconcile apply {} [client#463]\n",
+        "quiescence: world edge {edge_kind} {}; scaling sweep {}; reconcile apply {}; AddItem entry {}; AddItem exit {} [client#463]\n",
         age(now, edge),
         age(now, sweep),
         age(now, reconcile),
+        age(now, add_item_entry),
+        age(now, add_item_exit),
     )
 }
 
@@ -128,10 +148,14 @@ mod tests {
 
         record_world_edge(false);
         record_reconcile_apply();
+        record_add_item_boundary(true);
+        record_add_item_boundary(false);
         let activity = annotate_quiescence();
         assert!(activity.contains("world edge left"), "{activity}");
         assert!(activity.contains("scaling sweep"), "{activity}");
         assert!(activity.contains("reconcile apply"), "{activity}");
+        assert!(activity.contains("AddItem entry"), "{activity}");
+        assert!(activity.contains("AddItem exit"), "{activity}");
         assert!(!activity.contains("never"), "{activity}");
         assert!(activity.contains("client#463"), "{activity}");
         assert!(activity.is_ascii(), "repo rule 10: {activity}");
