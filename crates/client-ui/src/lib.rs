@@ -41,6 +41,8 @@ pub enum DeliveryState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActivityKind {
     Message,
+    Command,
+    CommandResult,
     LocationCheck,
     ReceivedItem,
     StorageDelivery,
