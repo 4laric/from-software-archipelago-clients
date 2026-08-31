@@ -5,7 +5,9 @@
 
 pub use client_ui;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WindowOptions {
     pub always_on_top: bool,
     pub click_through: bool,
@@ -62,7 +64,7 @@ impl WindowOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowGeometry {
     pub x: i32,
     pub y: i32,
@@ -93,6 +95,21 @@ pub trait StandaloneHost {
     ) -> Result<(), Self::Error>;
 }
 
+pub const CONTROL_STATUS: usize = 1001;
+pub const CONTROL_EXPORT: usize = 1002;
+pub const CONTROL_SESSION_FOLDER: usize = 1003;
+
+/// Map native controls onto the same bounded action channel used by every future renderer.
+/// This slice intentionally exposes only read-only diagnostics and filesystem navigation.
+pub fn control_action(id: usize) -> Option<client_ui::UiAction> {
+    match id {
+        CONTROL_STATUS => Some(client_ui::UiAction::SubmitCommand("status".into())),
+        CONTROL_EXPORT => Some(client_ui::UiAction::SubmitCommand("export".into())),
+        CONTROL_SESSION_FOLDER => Some(client_ui::UiAction::OpenSessionFolder),
+        _ => None,
+    }
+}
+
 /// Stable text projection used by the first native shell.  Keeping this reducer outside the
 /// Win32 host makes the state presentation testable and gives a later ImGui renderer the same
 /// source of truth.
@@ -110,7 +127,10 @@ pub fn render_snapshot(snapshot: &client_ui::ClientSnapshot) -> String {
             "Items: {} delivered, {} queued, {} storage, {} parked",
             snapshot.ledger.delivered,
             snapshot.ledger.queued,
-            snapshot.ledger.storage_routed,
+            snapshot
+                .ledger
+                .storage_routed
+                .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             snapshot.ledger.parked
         ),
     ];
@@ -141,6 +161,7 @@ pub fn render_snapshot(snapshot: &client_ui::ClientSnapshot) -> String {
 
 #[cfg(windows)]
 mod native {
+    use std::path::PathBuf;
     use std::thread;
     use std::time::Duration;
 
@@ -149,19 +170,25 @@ mod native {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetClientRect, IDC_ARROW, LWA_ALPHA, LoadCursorW, MSG, MoveWindow, PM_REMOVE, PeekMessageW,
-        PostQuitMessage, RegisterClassW, SW_SHOW, SetLayeredWindowAttributes, SetWindowTextW,
-        ShowWindow, TranslateMessage, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_QUIT, WNDCLASSW,
-        WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        GetClientRect, GetWindowRect, IDC_ARROW, LWA_ALPHA, LoadCursorW, MSG, MoveWindow,
+        PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
+        SetLayeredWindowAttributes, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_STYLE,
+        WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW,
+        WS_VISIBLE,
     };
     use windows::core::{HSTRING, Result as WindowsResult, w};
 
-    use super::{StandaloneHost, WindowOptions, client_ui, render_snapshot};
+    use super::{
+        CONTROL_EXPORT, CONTROL_SESSION_FOLDER, CONTROL_STATUS, StandaloneHost, WindowGeometry,
+        WindowOptions, client_ui, control_action, render_snapshot,
+    };
 
     /// Dependency-light native shell. It owns only windowing and rendering; the game client owns
     /// networking, memory access and delivery on its existing worker thread.
     #[derive(Default)]
-    pub struct NativeWindowHost;
+    pub struct NativeWindowHost {
+        state_path: Option<PathBuf>,
+    }
 
     unsafe extern "system" fn window_proc(
         window: HWND,
@@ -193,7 +220,7 @@ mod native {
         fn run(
             self,
             endpoint: client_ui::HostEndpoint,
-            options: WindowOptions,
+            mut options: WindowOptions,
         ) -> Result<(), Self::Error> {
             // SAFETY: the class, windows and message queue are created and consumed on this
             // thread; handles are checked before use and destroyed by WM_CLOSE/process teardown.
@@ -213,6 +240,17 @@ mod native {
                     return Err(windows::core::Error::from_thread());
                 }
 
+                if let Some(path) = self.state_path.as_deref()
+                    && let Ok(bytes) = std::fs::read(path)
+                    && let Ok(saved) = json::from_slice::<WindowOptions>(&bytes)
+                {
+                    options = saved.normalized(WindowGeometry {
+                        x: 0,
+                        y: 0,
+                        width: 3840,
+                        height: 2160,
+                    });
+                }
                 let geometry = options.geometry;
                 let window = CreateWindowExW(
                     options.extended_style(),
@@ -244,6 +282,54 @@ mod native {
                     Some(instance),
                     None,
                 )?;
+                let status = CreateWindowExW(
+                    Default::default(),
+                    w!("BUTTON"),
+                    w!("Status"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    16,
+                    geometry.height - 92,
+                    96,
+                    28,
+                    Some(window),
+                    Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                        CONTROL_STATUS as *mut _,
+                    )),
+                    Some(instance),
+                    None,
+                )?;
+                let export = CreateWindowExW(
+                    Default::default(),
+                    w!("BUTTON"),
+                    w!("Export diagnostics"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    120,
+                    geometry.height - 92,
+                    144,
+                    28,
+                    Some(window),
+                    Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                        CONTROL_EXPORT as *mut _,
+                    )),
+                    Some(instance),
+                    None,
+                )?;
+                let folder = CreateWindowExW(
+                    Default::default(),
+                    w!("BUTTON"),
+                    w!("Open session folder"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    272,
+                    geometry.height - 92,
+                    152,
+                    28,
+                    Some(window),
+                    Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                        CONTROL_SESSION_FOLDER as *mut _,
+                    )),
+                    Some(instance),
+                    None,
+                )?;
                 let _ = ShowWindow(window, SW_SHOW);
                 let _ = UpdateWindow(window);
 
@@ -253,6 +339,11 @@ mod native {
                         if message.message == WM_QUIT {
                             break 'running;
                         }
+                        if message.message == WM_COMMAND
+                            && let Some(action) = control_action(message.wParam.0 & 0xffff)
+                        {
+                            let _ = endpoint.send_action(action);
+                        }
                         let _ = TranslateMessage(&message);
                         DispatchMessageW(&message);
                     }
@@ -261,15 +352,40 @@ mod native {
                     }
                     let mut bounds = RECT::default();
                     GetClientRect(window, &mut bounds)?;
+                    let mut window_bounds = RECT::default();
+                    if GetWindowRect(window, &mut window_bounds).is_ok() {
+                        options.geometry = WindowGeometry {
+                            x: window_bounds.left,
+                            y: window_bounds.top,
+                            width: window_bounds.right - window_bounds.left,
+                            height: window_bounds.bottom - window_bounds.top,
+                        };
+                    }
                     MoveWindow(
                         body,
                         16,
                         16,
                         (bounds.right - 32).max(1),
-                        (bounds.bottom - 32).max(1),
+                        (bounds.bottom - 76).max(1),
                         true,
                     )?;
+                    let button_y = (bounds.bottom - 44).max(1);
+                    MoveWindow(status, 16, button_y, 96, 28, true)?;
+                    MoveWindow(export, 120, button_y, 144, 28, true)?;
+                    MoveWindow(folder, 272, button_y, 152, 28, true)?;
                     thread::sleep(Duration::from_millis(50));
+                }
+                if let Some(path) = self.state_path.as_deref()
+                    && let Ok(bytes) = json::to_vec_pretty(&options)
+                {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let temporary = path.with_extension("tmp");
+                    if std::fs::write(&temporary, bytes).is_ok() {
+                        let _ = std::fs::remove_file(path);
+                        let _ = std::fs::rename(temporary, path);
+                    }
                 }
             }
             let _ = endpoint.send_action(client_ui::UiAction::RequestShutdown);
@@ -281,12 +397,25 @@ mod native {
         endpoint: client_ui::HostEndpoint,
         options: WindowOptions,
     ) -> thread::JoinHandle<WindowsResult<()>> {
-        thread::spawn(move || NativeWindowHost.run(endpoint, options))
+        thread::spawn(move || NativeWindowHost::default().run(endpoint, options))
+    }
+
+    pub fn spawn_persisted(
+        endpoint: client_ui::HostEndpoint,
+        options: WindowOptions,
+        state_path: PathBuf,
+    ) -> thread::JoinHandle<WindowsResult<()>> {
+        thread::spawn(move || {
+            NativeWindowHost {
+                state_path: Some(state_path),
+            }
+            .run(endpoint, options)
+        })
     }
 }
 
 #[cfg(windows)]
-pub use native::{NativeWindowHost, spawn};
+pub use native::{NativeWindowHost, spawn, spawn_persisted};
 
 #[cfg(test)]
 mod tests {
@@ -361,5 +490,22 @@ mod tests {
         assert!(rendered.contains("Game: Attached  |  AP: Authenticated"));
         assert!(rendered.contains("Delivery: Blocked"));
         assert!(rendered.contains("state is stale"));
+    }
+
+    #[test]
+    fn native_controls_expose_only_read_only_actions() {
+        assert!(matches!(
+            control_action(CONTROL_STATUS),
+            Some(client_ui::UiAction::SubmitCommand(command)) if command == "status"
+        ));
+        assert!(matches!(
+            control_action(CONTROL_EXPORT),
+            Some(client_ui::UiAction::SubmitCommand(command)) if command == "export"
+        ));
+        assert!(matches!(
+            control_action(CONTROL_SESSION_FOLDER),
+            Some(client_ui::UiAction::OpenSessionFolder)
+        ));
+        assert!(control_action(9999).is_none());
     }
 }

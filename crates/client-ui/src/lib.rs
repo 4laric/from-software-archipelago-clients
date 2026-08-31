@@ -59,7 +59,9 @@ pub struct ActivityEvent {
 pub struct LedgerTotals {
     pub queued: u32,
     pub delivered: u32,
-    pub storage_routed: u32,
+    /// Confirmed storage routes when a producer has loaded destination diagnostics. `None` means
+    /// unknown, not zero; ordinary ledger acknowledgement cannot prove a native destination.
+    pub storage_routed: Option<u32>,
     pub parked: u32,
 }
 
@@ -77,6 +79,76 @@ pub struct ClientSnapshot {
     pub ledger: LedgerTotals,
     pub activity: VecDeque<ActivityEvent>,
     pub stale: bool,
+}
+
+/// Facts owned by the client worker after one delivery poll.  The UI reducer deliberately
+/// consumes outcomes the delivery machine has already validated; it never probes game memory or
+/// invents readiness from process attachment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryFacts {
+    pub process: ProcessState,
+    pub ap: ApState,
+    pub delivery: DeliveryState,
+    pub server: Option<String>,
+    pub slot: Option<String>,
+    pub seed: Option<String>,
+    pub goal: Option<String>,
+    pub go_mode: Option<bool>,
+    pub ledger: LedgerTotals,
+}
+
+/// Stateful projection from validated worker facts to immutable renderer snapshots.
+/// Activity survives ordinary polling updates and is sequence-numbered and bounded here rather
+/// than in a renderer, so replacing or restarting a renderer cannot reorder delivery history.
+#[derive(Clone, Debug)]
+pub struct SnapshotReducer {
+    snapshot: ClientSnapshot,
+    activity_capacity: usize,
+    next_sequence: u64,
+}
+
+impl SnapshotReducer {
+    pub fn new(activity_capacity: usize) -> Self {
+        Self {
+            snapshot: ClientSnapshot::default(),
+            activity_capacity,
+            next_sequence: 1,
+        }
+    }
+
+    pub fn reduce(&mut self, facts: DeliveryFacts) -> ClientSnapshot {
+        self.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        self.snapshot.process = facts.process;
+        self.snapshot.ap = facts.ap;
+        self.snapshot.delivery = facts.delivery;
+        self.snapshot.server = facts.server;
+        self.snapshot.slot = facts.slot;
+        self.snapshot.seed = facts.seed;
+        self.snapshot.goal = facts.goal;
+        self.snapshot.go_mode = facts.go_mode;
+        self.snapshot.ledger = facts.ledger;
+        self.snapshot.stale = false;
+        self.snapshot.clone()
+    }
+
+    pub fn activity(&mut self, kind: ActivityKind, text: impl Into<String>) {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.snapshot.push_activity(
+            ActivityEvent {
+                sequence,
+                kind,
+                text: text.into(),
+            },
+            self.activity_capacity,
+        );
+    }
+
+    pub fn mark_stale(&mut self) -> ClientSnapshot {
+        self.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        self.snapshot.stale = true;
+        self.snapshot.clone()
+    }
 }
 
 impl ClientSnapshot {
@@ -234,5 +306,34 @@ mod tests {
             host.send_action(UiAction::RequestShutdown),
             Err(TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn reducer_preserves_activity_and_uses_explicit_delivery_facts() {
+        let mut reducer = SnapshotReducer::new(2);
+        reducer.activity(ActivityKind::ReceivedItem, "Saw Cleaver");
+        let first = reducer.reduce(DeliveryFacts {
+            process: ProcessState::Attached,
+            ap: ApState::Authenticated,
+            delivery: DeliveryState::CommandPending,
+            ..Default::default()
+        });
+        let second = reducer.reduce(DeliveryFacts {
+            process: ProcessState::Attached,
+            ap: ApState::Authenticated,
+            delivery: DeliveryState::Ready,
+            ..Default::default()
+        });
+        assert_eq!(first.delivery, DeliveryState::CommandPending);
+        assert_eq!(second.delivery, DeliveryState::Ready);
+        assert_eq!(second.activity.len(), 1);
+        assert_eq!(second.revision, first.revision + 1);
+    }
+
+    #[test]
+    fn reducer_staleness_is_explicit_and_cleared_by_fresh_facts() {
+        let mut reducer = SnapshotReducer::new(4);
+        assert!(reducer.mark_stale().stale);
+        assert!(!reducer.reduce(DeliveryFacts::default()).stale);
     }
 }

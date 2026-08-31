@@ -9,4 +9,5 @@ readme = false
 [dependencies]
 client-ui = { path = "../client-ui" }
 windows.workspace = true
-
+serde.workspace = true
+json.workspace = true
