@@ -95,6 +95,39 @@ pub fn is_ordered_disjoint(spans: &[Span]) -> bool {
     true
 }
 
+/// Shape census for a vanilla FMG group array (clients#35).
+///
+/// FromSoft titles have used a "wide claim" convention where a record's
+/// inclusive `last_id` equals the next record's `first_id`. That gives two
+/// records ownership of one id and makes insertion unsafe until normalized.
+/// Keep this as measurement, not policy: a strict overlap is a different and
+/// more serious shape than an equal boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConventionStats {
+    pub groups: usize,
+    pub ordered_disjoint: bool,
+    pub wide_claims: usize,
+    pub strict_overlaps: usize,
+}
+
+pub fn convention_stats(spans: &[Span]) -> ConventionStats {
+    let mut wide_claims = 0;
+    let mut strict_overlaps = 0;
+    for pair in spans.windows(2) {
+        if pair[0].last_id == pair[1].first_id {
+            wide_claims += 1;
+        } else if pair[0].last_id > pair[1].first_id {
+            strict_overlaps += 1;
+        }
+    }
+    ConventionStats {
+        groups: spans.len(),
+        ordered_disjoint: is_ordered_disjoint(spans),
+        wide_claims,
+        strict_overlaps,
+    }
+}
+
 /// How a batch of override ids splits against the category's EXISTING coverage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Split {
@@ -235,6 +268,38 @@ mod tests {
         ]));
         // last < first
         assert!(!is_ordered_disjoint(&[Span::new(20, 10)]));
+    }
+
+    #[test]
+    fn convention_census_separates_wide_claims_from_strict_overlaps() {
+        let spans = [
+            Span::new(10, 20),
+            Span::new(20, 30),
+            Span::new(25, 40),
+            Span::new(50, 60),
+        ];
+        assert_eq!(
+            convention_stats(&spans),
+            ConventionStats {
+                groups: 4,
+                ordered_disjoint: false,
+                wide_claims: 1,
+                strict_overlaps: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn convention_census_reports_a_clean_array_without_inventing_overlap() {
+        assert_eq!(
+            convention_stats(&[Span::new(1, 2), Span::new(3, 4)]),
+            ConventionStats {
+                groups: 2,
+                ordered_disjoint: true,
+                wide_claims: 0,
+                strict_overlaps: 0,
+            }
+        );
     }
 
     #[test]
