@@ -174,16 +174,34 @@ pub struct SectionRows {
 /// has already been paid out of would inflate a number whose whole job is to say "there is more
 /// here you cannot see yet".
 pub fn section_rows(groups: &[SweepGroupView<'_>]) -> SectionRows {
+    section_rows_with_reveal(groups, false)
+}
+
+/// As [`section_rows`], with the seed's explicit boss-spoiler preference (#1184).
+///
+/// Opting in reveals the boss label for locked groups, but still combines them under one synthetic
+/// `Locked region` bucket and keeps their member counts hidden until fired. Thus the option answers
+/// "which bosses exist?" without also publishing which sealed region or payout size owns each one.
+pub fn section_rows_with_reveal(
+    groups: &[SweepGroupView<'_>],
+    reveal_hidden_boss_names: bool,
+) -> SectionRows {
     let mut out = SectionRows::default();
     for v in groups {
         if is_settled(v) {
             continue;
         }
         if is_withheld(v) {
-            out.withheld += 1;
-            continue;
+            if !reveal_hidden_boss_names {
+                out.withheld += 1;
+                continue;
+            }
         }
-        let region = v.region.map(str::to_string);
+        let region = if is_withheld(v) {
+            Some("Locked region".to_string())
+        } else {
+            v.region.map(str::to_string)
+        };
         let bucket = match out.rows.iter_mut().find(|bucket| bucket.region == region) {
             Some(bucket) => bucket,
             None => {
@@ -437,6 +455,32 @@ mod tests {
             assert!(!rendered.contains(leak), "{leak} survived into {rendered}");
         }
         assert!(rendered.contains("Belurat"), "{rendered}");
+    }
+
+    #[test]
+    fn opt_in_reveals_locked_boss_names_but_not_regions_or_payouts() {
+        let mut rugalea = v(2044470800, Some("Rauh Base"), 38, 0, false);
+        rugalea.boss = Some("Rugalea the Great Red Bear");
+        rugalea.region_open = Some(false);
+
+        let out = section_rows_with_reveal(&[rugalea], true);
+        assert_eq!(out.withheld, 0);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].region.as_deref(), Some("Locked region"));
+        let rendered = format!("{:?}", out.rows);
+        assert!(
+            rendered.contains("Rugalea the Great Red Bear"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Rauh Base"),
+            "locked region leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("38"),
+            "pending payout leaked: {rendered}"
+        );
+        assert!(rendered.contains("checks hidden until fired"), "{rendered}");
     }
 
     #[test]

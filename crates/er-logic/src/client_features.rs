@@ -119,6 +119,9 @@ pub const SUPPORTED: &[&str] = &[
     // resolved to ability unlocks by this build (er-archipelago#980). An older client would leave
     // the abilities locked forever and treat the items as inert, so a progressive seed refuses it.
     "ability_unlock",
+    // revealSweepBossNames -> the F6 sweep view may show boss labels from still-locked regions
+    // while continuing to conceal their region and pending payout (#1184).
+    "reveal_sweep_boss_names",
 ];
 
 /// Feature tags the seed requires that this build does not know.

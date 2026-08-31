@@ -245,6 +245,10 @@ pub struct Core {
     tracker_in_logic_only: bool,
     /// Tracker filter: show only progression-surface checks.
     tracker_surface_only: bool,
+    /// Seed-owned spoiler preference (#1184). False for old seeds and by default: sweep groups in
+    /// locked regions collapse to an anonymous count. True reveals their boss labels while still
+    /// withholding the region name and pending member count.
+    reveal_sweep_boss_names: bool,
     /// slot_data bossLockItems (mode A, SPEC-boss-lock-tracker.md): parsed boss-defeat trophy defs
     /// (flag -> name/region/boss_ap_id, gate=None for v0.2). METADATA + a defeat-flag watch only —
     /// NOT AP items and NOT new checks; the boss's own boss_ap_id location still fires through the
@@ -805,6 +809,7 @@ impl shared::Core for Core {
             lock_hint_intro_done: false,
             tracker_in_logic_only: false,
             tracker_surface_only: false,
+            reveal_sweep_boss_names: false,
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
             sweep_bannered: HashSet::new(),
@@ -2044,7 +2049,14 @@ impl shared::Core for Core {
                     goal_gate_expected,
                 );
 
-                (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, feature_warn, required_features, version_warn)
+                // #1184: top-level contract key, deliberately absent/false for old seeds. This is
+                // presentation-only and never feeds sweep membership, polling, or grants.
+                let reveal_sweep_boss_names = sd
+                    .get("revealSweepBossNames")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, reveal_sweep_boss_names, feature_warn, required_features, version_warn)
             });
             if let Some((
                 map,
@@ -2064,6 +2076,7 @@ impl shared::Core for Core {
                 region_attunement,
                 progression_surface,
                 tracker_tables,
+                reveal_sweep_boss_names,
                 feature_warn,
                 required_features,
                 version_warn,
@@ -2149,6 +2162,7 @@ impl shared::Core for Core {
                 // Assign the progression surface parsed inside the slot_data closure above (where
                 // `sd` was in scope).
                 self.progression_surface = progression_surface;
+                self.reveal_sweep_boss_names = reveal_sweep_boss_names;
                 crate::shop_hints::configure_completion_surface(
                     self.progression_surface
                         .iter()
@@ -5510,7 +5524,10 @@ impl Core {
             // they've paid out") MOVED INTO er-logic with #171, because it now interacts with the
             // withheld rule and that interaction needs a test. The HEADER still counts every
             // group either way, so the section's totals do not silently shrink.
-            let section = er_logic::sweep_view::section_rows(&views);
+            let section = er_logic::sweep_view::section_rows_with_reveal(
+                &views,
+                self.reveal_sweep_boss_names,
+            );
             sweep_rows = section.rows;
             sweep_withheld = section.withheld;
         }
