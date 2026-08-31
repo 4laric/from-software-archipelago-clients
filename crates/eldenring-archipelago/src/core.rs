@@ -349,6 +349,10 @@ pub struct Core {
     /// Tracks the in-world state across ticks so a map-(re)load edge can re-arm the ItemLotParam
     /// blank passes (check_lots / enemy_drops), which otherwise latch DONE and only reset on reconnect.
     was_in_world: bool,
+    /// Two finite follow-up passes after each load edge. The first in-world tick can precede the end
+    /// of ItemLotParam streaming; a clean immediate pass may therefore be reverted underneath its
+    /// DONE latch. This planner stays quiet after 2.5s and is replaced by the next load/warp edge.
+    suppression_rearm: er_logic::suppression_rearm::SuppressionRearm,
 }
 
 impl shared::Core for Core {
@@ -826,6 +830,7 @@ impl shared::Core for Core {
             boss_key_primed: false,
             reconcile_inited: false,
             was_in_world: false,
+            suppression_rearm: er_logic::suppression_rearm::SuppressionRearm::default(),
         })
     }
     fn base(&self) -> &CoreBase<Self::Game, Self::SlotData> {
@@ -4361,6 +4366,8 @@ impl shared::Core for Core {
         // the param repo being up and re-latch after one clean pass, so this costs one re-blank per load.
         let now_in_world = crate::flags::in_world();
         if now_in_world && !self.was_in_world {
+            self.suppression_rearm
+                .arm(self.toast_clock.elapsed().as_millis() as u64);
             // THE ICON OVERRIDE, ONCE. `shop_icon` writes icon cell 92 onto every foreign shop slot
             // whether or not the me3 package that repaints it was ever loaded, so under a non-me3
             // loader the player is shown telescopes and nothing says why. Told here rather than at
@@ -4560,6 +4567,21 @@ impl shared::Core for Core {
         }
         self.was_in_world = now_in_world;
         if crate::flags::in_world() {
+            if let Some(delay_ms) = self
+                .suppression_rearm
+                .poll(self.toast_clock.elapsed().as_millis() as u64)
+            {
+                // clients#435: the edge pass can latch before ItemLotParam finishes streaming and
+                // then be reverted. Re-arm only the three suppression writers on a finite 750ms /
+                // 2500ms schedule. Their runs below are idempotent and provide row-count telemetry;
+                // no vanilla-unowned lot is added to their configured, seed-owned write sets.
+                crate::check_lots::reset();
+                crate::whetblade_lots::reset();
+                crate::enemy_drops::reset();
+                log::info!(
+                    "suppression-rearm: delayed ItemLotParam verification at +{delay_ms}ms after world edge"
+                );
+            }
             let _ = crate::fmg_inject::run();
             let _ = crate::shop_flags::run(&[]);
             // Capital release re-key: Enia's 9116-released Maliketh armor rows -> burn-done

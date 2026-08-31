@@ -107,6 +107,7 @@ pub mod spell_equip;
 pub mod start_backfill;
 pub mod startup_retry;
 pub mod static_lots;
+pub mod suppression_rearm;
 pub mod sweep_boss_names;
 pub mod sweep_clause;
 pub mod sweep_flush;
