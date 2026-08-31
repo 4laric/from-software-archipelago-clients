@@ -2,6 +2,17 @@
 
 ### Changed
 
+* **Routine item acknowledgements no longer flood the player console.** The
+  detailed per-index acknowledgement lines remain in `client.log` for support
+  and replay diagnosis; blocked deliveries, failures, and recovery notices
+  remain visible in the console.
+* **Bloodborne can receive DeathLinks when the seed opts in.** Runtime r9
+  advertises the `DeathLink` tag only for enabled slots, queues incoming links
+  across loads, and kills through a validated current-HP write once the native
+  HP hook has captured a gameplay-ready player. The hook, cave, and mutation
+  all fail closed on an unrecognized image or stale context. Sending remains
+  disabled until the separate live death-signal hunt proves a safe trigger.
+
 * **A read-only shop-enablement diagnostic is ready for the next playtest.**
   Native sessions write `shop-capture.jsonl` beside the ledger, recording exact
   inventory-row transitions and five-second snapshots of the Hunter Chief
@@ -15,10 +26,11 @@
   from a canonical stack, and capture the backing object when a natural world
   pickup creates that stack. The unsafe absent-stack insertion remains refused.
 
-* **The Bloodborne client window is translucent by default.** Its console now
-  starts at 85% opacity so it can remain visible over the game without hiding
-  the action. `--window-opacity 35-100` tunes it; 100 keeps the traditional
-  fully opaque window.
+* **The Bloodborne client window is visibly translucent by default.** Its
+  console now starts at 70% opacity and prints the applied value at startup.
+  If Windows Terminal owns the visible window instead, the client says so
+  rather than silently claiming success. `--window-opacity 35-100` tunes it;
+  100 keeps the traditional fully opaque window.
 
 * **Normal play now captures storage-routing correlations (clients#445).** Each
   delivery diagnostic records its terminal sequence number, the millisecond gap
@@ -36,6 +48,10 @@
   roughly 130–170 ms apart. Successful grants now wait one second before the
   next item is submitted, trading a short release-drain time for predictable
   inventory placement.
+* **Zero-Vial diagnostics no longer report executable code as a backing
+  object.** Blood Vials are ordinary stackable goods, not generated instances;
+  their canonical inventory-row transitions remain captured, while the
+  generated-object resolver is now reserved for blood gems and weapons.
 
 * **Location checks retry until the server confirms them (clients#455).** A
   socket killed without a detected transport error could accept a local write,

@@ -319,28 +319,22 @@ impl BloodborneBackend for NativeBackend {
         if let Some(capture) = &mut self.shop_capture {
             capture.observe(entries.clone());
         }
-        let vial_candidate = self
-            .vial_capture
-            .as_mut()
-            .and_then(|capture| capture.observe(entries.clone()));
+        if let Some(capture) = &mut self.vial_capture {
+            capture.observe(entries.clone());
+        }
         let gem_candidate = self
             .gem_capture
             .as_mut()
             .and_then(|capture| capture.observe(entries).into_iter().next());
-        if self.vial_capture.is_some() || self.gem_capture.is_some() {
-            let candidate = vial_candidate.or(gem_candidate);
+        if self.gem_capture.is_some() {
+            let candidate = gem_candidate;
             if let Some(probe) = self
                 .delivery
                 .runtime_mut()
                 .probe_generated_object(candidate)
+                && let Some(capture) = &mut self.gem_capture
             {
-                if probe.entry.word(4) == 0x4000_03E8 {
-                    if let Some(capture) = &mut self.vial_capture {
-                        capture.record_generated_object(&probe);
-                    }
-                } else if let Some(capture) = &mut self.gem_capture {
-                    capture.record_generated_object(&probe);
-                }
+                capture.record_generated_object(&probe);
             }
         }
         let result = self.location_context_inner();
@@ -354,6 +348,11 @@ impl BloodborneBackend for NativeBackend {
             },
             event_flags_armed: self.event_flags.is_armed(),
         };
+        if !matches!(&result, Ok(Some(context)) if context.gameplay_ready) {
+            // A pointer captured before a load is not permission to kill the
+            // next character. The hook repopulates it on the next live HP read.
+            let _ = self.delivery.runtime_mut().clear_player_status();
+        }
         result
     }
 
@@ -449,6 +448,19 @@ impl BloodborneBackend for NativeBackend {
             request.target,
             request.tag
         )
+    }
+
+    fn death_link_kill(&mut self) -> Result<bool> {
+        // Use the same gameplay/save gate as every other mutation. A stale HP
+        // pointer during a load is never permission to write.
+        if !self
+            .location_context_inner()?
+            .is_some_and(|context| context.gameplay_ready)
+        {
+            let _ = self.delivery.runtime_mut().clear_player_status();
+            return Ok(false);
+        }
+        self.delivery.runtime_mut().death_link_kill()
     }
 
     fn withdraw_unwitnessed_grant(&mut self, _tag: &str) -> Result<bool> {

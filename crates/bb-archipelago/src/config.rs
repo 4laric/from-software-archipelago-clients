@@ -273,6 +273,10 @@ pub struct RuntimeConfig {
     pub auto_upgrade: bool,
     #[serde(default)]
     pub auto_equip: bool,
+    /// Seed-owned opt-in. Bloodborne currently receives DeathLinks only;
+    /// outbound deaths remain disabled until a live death signal is proven.
+    #[serde(default)]
+    pub death_link: bool,
     /// Both live checks and received-item mutation remain disarmed until the
     /// backend proves that it is operating on this explicitly bound save.
     #[serde(default)]
@@ -364,6 +368,11 @@ impl RuntimeConfig {
             self.auto_equip = value
                 .as_bool()
                 .context("slot_data.auto_equip must be a boolean")?;
+        }
+        if let Some(value) = slot_data.get("death_link") {
+            self.death_link = value
+                .as_bool()
+                .context("slot_data.death_link must be a boolean")?;
         }
         if let Some(value) = slot_data.get("suppression") {
             self.suppression =
@@ -585,6 +594,7 @@ mod tests {
             items: HashMap::new(),
             auto_upgrade: false,
             auto_equip: false,
+            death_link: false,
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,
@@ -846,10 +856,15 @@ mod tests {
     #[test]
     fn slot_options_replace_local_policy_toggles() {
         let config = local()
-            .apply_slot_data(&json!({"auto_upgrade": true, "auto_equip": true}))
+            .apply_slot_data(&json!({
+                "auto_upgrade": true,
+                "auto_equip": true,
+                "death_link": true
+            }))
             .unwrap();
         assert!(config.auto_upgrade);
         assert!(config.auto_equip);
+        assert!(config.death_link);
     }
 
     #[test]
