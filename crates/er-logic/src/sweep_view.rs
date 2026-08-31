@@ -191,11 +191,9 @@ pub fn section_rows_with_reveal(
         if is_settled(v) {
             continue;
         }
-        if is_withheld(v) {
-            if !reveal_hidden_boss_names {
-                out.withheld += 1;
-                continue;
-            }
+        if is_withheld(v) && !reveal_hidden_boss_names {
+            out.withheld += 1;
+            continue;
         }
         let region = if is_withheld(v) {
             Some("Locked region".to_string())
