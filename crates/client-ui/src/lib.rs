@@ -68,6 +68,12 @@ pub struct LedgerTotals {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationTotals {
+    pub checked: u32,
+    pub total: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSnapshot {
     pub revision: u64,
     pub process: ProcessState,
@@ -78,6 +84,7 @@ pub struct ClientSnapshot {
     pub seed: Option<String>,
     pub goal: Option<String>,
     pub go_mode: Option<bool>,
+    pub locations: Option<LocationTotals>,
     pub ledger: LedgerTotals,
     pub activity: VecDeque<ActivityEvent>,
     pub stale: bool,
@@ -96,6 +103,7 @@ pub struct DeliveryFacts {
     pub seed: Option<String>,
     pub goal: Option<String>,
     pub go_mode: Option<bool>,
+    pub locations: Option<LocationTotals>,
     pub ledger: LedgerTotals,
 }
 
@@ -128,6 +136,7 @@ impl SnapshotReducer {
         self.snapshot.seed = facts.seed;
         self.snapshot.goal = facts.goal;
         self.snapshot.go_mode = facts.go_mode;
+        self.snapshot.locations = facts.locations;
         self.snapshot.ledger = facts.ledger;
         self.snapshot.stale = false;
         self.snapshot.clone()

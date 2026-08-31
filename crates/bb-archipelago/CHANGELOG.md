@@ -9,6 +9,12 @@
   production-loop regression carries a held Whirligig Saw +7 across families
   to a received Ludwig's Holy Blade.
 
+* **The standalone status window now shows named run progress.** The goal label
+  comes from Archipelago's typed game data rather than exposing a numeric
+  location ID, and the window shows exact checked/total locations from the
+  seed-owned runtime contract. Go Mode remains explicitly unknown until the
+  client has a trustworthy readiness signal.
+
 * **Native-only delivery (clients#526).** Removed the live command-file backend,
   bridge-root configuration, startup probes, and backend selector. Legacy
   `--delivery=ce-bridge` launch plans now stop with an explicit migration error.
