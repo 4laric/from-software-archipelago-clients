@@ -379,10 +379,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         if !context.gameplay_ready {
             return Ok(None);
         }
-        let Some(expected) = self.config.expected_save_identity.as_deref() else {
-            anyhow::bail!("{operation} is disarmed: expected_save_identity is not configured");
-        };
-        if context.save_identity != expected {
+        if let Some(expected) = self.config.expected_save_identity.as_deref()
+            && context.save_identity != expected
+        {
             anyhow::bail!(
                 "{operation} refused save identity {:?}; expected {:?}",
                 context.save_identity,
@@ -405,6 +404,11 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 .slot_mut(&self.seed_name, &self.slot_name)
                 .bound_save_identity = Some(context.save_identity.clone());
             self.ledger.save(&self.ledger_path)?;
+            client_eprintln!(
+                "Bound AP slot {:?} to loaded Bloodborne character {}.",
+                self.slot_name,
+                context.save_identity
+            );
         }
         Ok(Some(context.save_identity))
     }
@@ -2542,6 +2546,44 @@ mod tests {
                 .as_deref(),
             Some("mock-save")
         );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn first_verified_live_slot_is_trusted_once_then_the_ledger_refuses_switches() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.expected_save_identity = None;
+        let mut backend = MockBackend::default();
+        backend.location_context = Some(LocationContext {
+            save_identity: "shad-save-slot:0004".into(),
+            gameplay_ready: true,
+        });
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(_)
+        ));
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .as_deref(),
+            Some("shad-save-slot:0004")
+        );
+
+        client.backend_mut().location_context = Some(LocationContext {
+            save_identity: "shad-save-slot:0005".into(),
+            gameplay_ready: true,
+        });
+        let error = client.poll_locations(&HashSet::new()).unwrap_err();
+        assert!(format!("{error:#}").contains("durably bound"));
         std::fs::remove_file(ledger_path).unwrap();
     }
 
