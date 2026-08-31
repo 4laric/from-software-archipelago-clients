@@ -45,17 +45,37 @@ impl InventoryEntry {
     }
 }
 
-/// Supported player weapon families in CUSA03173 01.09. These are the same
+/// Supported base player weapon families in CUSA03173 01.09. These are the
 /// EquipParamWeapon bases the world exposes for AP delivery. Exact membership
 /// prevents armour/runes that happen to resemble a +N row from influencing
 /// the target. Keep the DLC families here as well: a player's strongest weapon
 /// is allowed to be one they found in the Hunter's Nightmare.
-const WEAPON_FAMILIES: &[u32] = &[
+const BASE_WEAPON_FAMILIES: &[u32] = &[
     2_000_000, 4_000_000, 5_000_000, 5_100_000, 6_000_000, 6_100_000, 7_000_000, 7_100_000,
     8_000_000, 8_100_000, 9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000,
-    14_000_000, 14_200_000, 15_000_000, 19_000_000, 22_000_000, 23_000_000, 24_000_000, 25_000_000,
+    14_000_000, 14_200_000, 15_000_000, 19_100_000, 22_000_000, 23_000_000, 24_000_000, 25_000_000,
     28_000_000, 31_000_000, 34_000_000, 35_000_000,
 ];
+
+/// Trick weapons for which the committed world catalog exposes Uncanny rows.
+/// Those rows are a distinct family at `base + 10_000`; treating only the
+/// vanilla family as a target is how a reinforced randomized starting weapon
+/// can be invisible to the census.
+const UNCANNY_TRICK_WEAPON_BASES: &[u32] = &[
+    2_000_000, 4_000_000, 5_000_000, 5_100_000, 7_000_000, 7_100_000, 8_000_000, 8_100_000,
+    9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000, 22_000_000,
+];
+
+pub(crate) fn weapon_reinforcement_level(id: u32) -> Option<u8> {
+    BASE_WEAPON_FAMILIES
+        .iter()
+        .copied()
+        .chain(UNCANNY_TRICK_WEAPON_BASES.iter().map(|base| base + 10_000))
+        .find_map(|family| {
+            let delta = id.checked_sub(family)?;
+            (delta <= 1_000 && delta % 100 == 0).then_some((delta / 100) as u8)
+        })
+}
 
 /// Which of the two banks holds `slot`. Pure, so it is testable without memory.
 pub fn entry_address(slot: u64, split: u64, primary: u64, secondary: u64, stride: u64) -> u64 {
@@ -151,21 +171,15 @@ impl<P: ProcessMemory> GuestRuntime<P> {
     pub fn target_weapon_level(&self) -> Option<u8> {
         let (_inventory, split, last, primary, secondary) = self.geometry()?;
         let g = self.contract.geometry;
-        let mut highest = 0u8;
+        let mut highest = None;
         for slot in 0..=last {
             let entry = entry_address(slot, split, primary, secondary, g.record_stride);
             let id = self.record(self.memory.read_u32(entry + g.record_id))?;
-            for &family in WEAPON_FAMILIES {
-                let Some(delta) = id.checked_sub(family) else {
-                    continue;
-                };
-                if delta <= 1_000 && delta % 100 == 0 {
-                    highest = highest.max((delta / 100) as u8);
-                    break;
-                }
+            if let Some(level) = weapon_reinforcement_level(id) {
+                highest = Some(highest.map_or(level, |current: u8| current.max(level)));
             }
         }
-        Some(highest)
+        highest
     }
 
     /// Complete non-empty inventory records for passive natural-award
@@ -504,6 +518,32 @@ mod tests {
 
         let guest = GuestRuntime::new(memory, base).unwrap();
         assert_eq!(guest.target_weapon_level(), Some(7));
+    }
+
+    #[test]
+    fn target_level_includes_an_uncanny_randomized_weapon() {
+        let (memory, base, _normalized) = laid_out_inventory();
+        let c = contract();
+        let g = c.geometry;
+        let inventory = memory
+            .read_u64(base + c.state_cell("inventory").unwrap().rva)
+            .unwrap();
+        let primary = memory.read_u64(inventory + g.primary_array).unwrap();
+        let uncanny_ludwig = entry_address(0, 2, primary, 0, g.record_stride);
+        memory.store(
+            uncanny_ludwig + g.record_id,
+            &(8_100_000u32 + 10_000 + 700).to_le_bytes(),
+        );
+
+        let guest = GuestRuntime::new(memory, base).unwrap();
+        assert_eq!(guest.target_weapon_level(), Some(7));
+    }
+
+    #[test]
+    fn target_level_is_unknown_when_no_recognized_weapon_is_visible() {
+        let (memory, base, _normalized) = laid_out_inventory();
+        let guest = GuestRuntime::new(memory, base).unwrap();
+        assert_eq!(guest.target_weapon_level(), None);
     }
 
     #[test]

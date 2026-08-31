@@ -2,6 +2,13 @@
 
 ### Changed
 
+* **Bloodborne auto-upgrade now recognizes randomized Uncanny weapons as the
+  player's upgrade target.** The native census still uses an exact weapon
+  allowlist, but includes the catalog-backed Uncanny families and reports an
+  unrecognized/empty census as unknown rather than a misleading +0. A
+  production-loop regression carries a held Whirligig Saw +7 across families
+  to a received Ludwig's Holy Blade.
+
 * **The standalone command window is keyboard accessible.** Enter submits the
   command field through the same bounded worker channel as the Send button;
   Tab and Shift+Tab traverse every interactive control, and Alt-key mnemonics
