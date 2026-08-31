@@ -6,6 +6,12 @@
   window.** Distinct shadPS4, Archipelago, and delivery readiness is fed by the
   nonblocking UI bridge. The translucent, always-on-top shell never touches the
   emulator process or delivery acknowledgement path.
+  
+* **An opt-in pickup-notification correlation probe is ready for live mapping.**
+  Setting `pickup_notification_probe` in the local runtime config writes a
+  bounded `pickup-notification-capture.jsonl` that joins AP checks and delivery
+  states to native ItemGrant caller RVAs. It is observation-only and leaves
+  banners, item transactions, suppression, and acknowledgement untouched.
 
 * **Randomized fixed pickups now sustain exploration with one Quicksilver
   Bullet.** Their suppressed ItemLot already supplies one Blood Vial; after a
@@ -60,6 +66,13 @@
   unchanged while the hypothesis is still being measured.
 
 ### Fixed
+
+* **Confirmed insert-lane storage deliveries are named consistently.** When
+  ItemGrant completes but the new goods record does not enter held inventory,
+  the console directs the player to the Hunter's Dream storage box and the
+  diagnostic record now says `storage`, matching the player-validated outcome.
+  Delta-lane deficits remain `storage_suspected` because a concurrent spend is
+  arithmetically indistinguishable from overflow.
 
 * **Goal-release item floods are paced instead of hammering Bloodborne's
   inventory routine.** A live 71-item capture showed stable held delivery at

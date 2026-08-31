@@ -222,13 +222,14 @@ destination so release-flood and sticky-overflow hypotheses can be tested from
 an ordinary playthrough. **No extra read of the game is performed for
 it**, and a failure to write the file warns once and never touches a delivery.
 
-One field is an inference and is named as one: `inferred_destination` is
-`held` when the read-back arithmetic accounts for the delta in the held stack,
-`storage_suspected` when the cave provably executed (clients#443's evidence
-predicate) and the held stack still came in under the expected total, and
-`unknown` otherwise. The client cannot read Bloodborne's storage box; a
-concurrent spend and an overflow into storage are indistinguishable to it, so
-`storage_suspected` is a hypothesis consistent with the numbers, never a
+`inferred_destination` is `held` when the read-back arithmetic accounts for the
+grant in the held stack. It is `storage` for the player-validated insert shape:
+ItemGrant completed but the inserted goods never appeared in held inventory,
+and the player confirmed the item in the Hunter's Dream storage box. A delta
+that executes while the held total remains short is still
+`storage_suspected`: the client cannot distinguish capped overflow from a
+concurrent spend. `unknown` covers every other shape. Thus only `storage` is a
+confirmed destination; `storage_suspected` remains a hypothesis, never a
 measurement.
 
 `tools/summarize_delivery_diagnostics.py <file>` groups the records by item,
@@ -261,6 +262,24 @@ ItemGrant probe armed`, acquire one ordinary pickup, then two natural blood gems
 Send `blood-gem-capture.jsonl` with `client.log`, naming the two gems and their
 pickup order. A gem-shaped descriptor proves this boundary owns category-8
 insertion; no call across both clean acquisitions rules it out directly.
+
+### Pickup-notification diagnostic (clients#510)
+
+Set `"pickup_notification_probe": true` in the local `runtime-config.json` to
+create `pickup-notification-capture.jsonl` beside the receive ledger. The probe
+is disabled by default and cannot be enabled by seed slot data. It is strictly
+observation-only: it correlates newly sent AP location IDs and delivery states
+with the already validated native `ItemGrant` boundary, including its stable
+caller RVA. It neither calls a message function nor changes suppression,
+acknowledgement, delivery, or inventory.
+
+For the focused playtest, number the visible actions in a note and perform: one
+ordinary vanilla pickup; one AP-owned pickup whose result is local; one whose
+result is remote; one direct consumable delivery; one weapon delivery; and, if
+convenient, one at-cap delivery routed to storage. Note the exact banner shown
+for each action and send `pickup-notification-capture.jsonl` with `client.log`.
+The capture is bounded to 4096 records and repeated pending states/native-call
+sequences are deduplicated. A write failure is non-fatal.
 
 ### Zero-Vial diagnostic (bb-archipelago#70)
 

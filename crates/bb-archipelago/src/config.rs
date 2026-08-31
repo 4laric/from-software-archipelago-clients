@@ -277,6 +277,10 @@ pub struct RuntimeConfig {
     /// outbound deaths remain disabled until a live death signal is proven.
     #[serde(default)]
     pub death_link: bool,
+    /// Local, observation-only diagnostic for clients#510. This is deliberately
+    /// not read from slot data: a seed cannot turn native instrumentation on.
+    #[serde(default)]
+    pub pickup_notification_probe: bool,
     /// Both live checks and received-item mutation remain disarmed until the
     /// backend proves that it is operating on this explicitly bound save.
     #[serde(default)]
@@ -595,6 +599,7 @@ mod tests {
             auto_upgrade: false,
             auto_equip: false,
             death_link: false,
+            pickup_notification_probe: false,
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,

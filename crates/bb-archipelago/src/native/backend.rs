@@ -40,6 +40,7 @@ use super::flag_gate::FlagGate;
 use super::gem_capture::GemCapture;
 use super::guest::GuestRuntime;
 use super::mem::NativeMemory;
+use super::pickup_notification_capture::PickupNotificationCapture;
 use super::shop_capture::ShopCapture;
 use super::vial_capture::VialCapture;
 
@@ -100,6 +101,7 @@ pub struct NativeBackend {
     gem_capture: Option<GemCapture>,
     shop_capture: Option<ShopCapture>,
     vial_capture: Option<VialCapture>,
+    pickup_notification_capture: Option<PickupNotificationCapture>,
 }
 
 impl NativeBackend {
@@ -121,7 +123,7 @@ impl NativeBackend {
     /// The path is derived from the ledger rather than taken as a new CLI
     /// argument: the launcher already puts `ledger.json`, `client.log` and this
     /// file in one per-session folder, and the ledger path names that folder.
-    pub fn arm_delivery_diagnostics(&mut self, ledger: &std::path::Path) {
+    pub fn arm_delivery_diagnostics(&mut self, ledger: &std::path::Path, pickup_probe: bool) {
         let path = diagnostics_path_for_ledger(ledger);
         client_eprintln!(
             "Delivery diagnostics: one line per delivered item into {} - send it back with client.log if a delivery looks wrong (clients#445).",
@@ -155,6 +157,17 @@ impl NativeBackend {
                 self.shop_capture = Some(capture);
             }
             Err(error) => client_eprintln!("Shop diagnostics unavailable: {error}"),
+        }
+        if pickup_probe {
+            match PickupNotificationCapture::beside_ledger(ledger, self.base) {
+                Ok(capture) => {
+                    client_eprintln!(
+                        "Pickup-notification probe ACTIVE: observation-only correlation records stream beside the ledger to pickup-notification-capture.jsonl (clients#510)."
+                    );
+                    self.pickup_notification_capture = Some(capture);
+                }
+                Err(error) => client_eprintln!("Pickup-notification probe unavailable: {error}"),
+            }
         }
     }
 
@@ -316,11 +329,18 @@ impl NativeBackend {
             gem_capture: None,
             shop_capture: None,
             vial_capture: None,
+            pickup_notification_capture: None,
         })
     }
 }
 
 impl BloodborneBackend for NativeBackend {
+    fn record_location_checks(&mut self, locations: &[i64]) {
+        if let Some(capture) = &mut self.pickup_notification_capture {
+            capture.location_checks(locations);
+        }
+    }
+
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
         let entries = self.delivery.runtime_mut().inventory_entries();
         if let Some(capture) = &mut self.shop_capture {
@@ -332,6 +352,10 @@ impl BloodborneBackend for NativeBackend {
         if let Some(capture) = &mut self.gem_capture {
             let snapshot = self.delivery.runtime_mut().item_grant_probe_snapshot();
             capture.observe(snapshot);
+        }
+        if let Some(capture) = &mut self.pickup_notification_capture {
+            let snapshot = self.delivery.runtime_mut().item_grant_probe_snapshot();
+            capture.observe_native_call(snapshot);
         }
         let result = self.location_context_inner();
         // clients#445: remember what the loop was told, so a grant record can
@@ -395,12 +419,21 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
+        if let Some(capture) = &mut self.pickup_notification_capture {
+            capture.grant_state(grant, "submitted");
+        }
         if grant.item_category == 255 {
             self.arm_event_flags()?;
             let Some(flags) = self.event_flags.armed_mut() else {
+                if let Some(capture) = &mut self.pickup_notification_capture {
+                    capture.grant_state(grant, "pending");
+                }
                 return Ok(OperationProgress::Pending);
             };
             flags.write_resilient(grant.normalized_item_id, true)?;
+            if let Some(capture) = &mut self.pickup_notification_capture {
+                capture.grant_state(grant, "complete");
+            }
             return Ok(OperationProgress::Complete);
         }
         let request = NativeGrantRequest {
@@ -419,8 +452,16 @@ impl BloodborneBackend for NativeBackend {
             .delivery
             .grant_with_warning(request, &mut |line: &str| client_eprintln!("{line}"))?;
         match step {
-            GrantStep::Pending => Ok(OperationProgress::Pending),
+            GrantStep::Pending => {
+                if let Some(capture) = &mut self.pickup_notification_capture {
+                    capture.grant_state(grant, "pending");
+                }
+                Ok(OperationProgress::Pending)
+            }
             GrantStep::Complete => {
+                if let Some(capture) = &mut self.pickup_notification_capture {
+                    capture.grant_state(grant, "complete");
+                }
                 if self.delivery.last_completion_went_to_storage(&grant.tag) {
                     client_eprintln!(
                         "Delivered AP item {} to storage because it did not enter held inventory. Check the storage box in the Hunter's Dream.",
