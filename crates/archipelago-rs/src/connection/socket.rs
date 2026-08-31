@@ -18,7 +18,9 @@ use tungstenite::client::IntoClientRequest;
 #[cfg(any(feature = "rustls", feature = "native-tls"))]
 use tungstenite::error::TlsError;
 use tungstenite::error::UrlError;
+use tungstenite::extensions::{ExtensionsConfig, compression::deflate::DeflateConfig};
 use tungstenite::handshake::client::ClientHandshake;
+use tungstenite::protocol::{Role, WebSocketConfig};
 use tungstenite::stream::{MaybeTlsStream, Mode};
 use tungstenite::{Message, WebSocket};
 
@@ -107,7 +109,8 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
             }
         };
 
-        let mut handshake = ClientHandshake::start(maybe_tls_stream, request, None)?;
+        let mut handshake =
+            ClientHandshake::start(maybe_tls_stream, request, Some(Self::websocket_config()))?;
         loop {
             match handshake.handshake() {
                 Ok((inner, response)) => {
@@ -130,6 +133,24 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
                 Err(WsHandshakeError::Failure(err)) => return Err(err.into()),
             }
         }
+    }
+
+    /// Builds the WebSocket configuration used for every Archipelago
+    /// connection. Archipelago currently advertises an 11-bit window in both
+    /// directions; explicitly bounding both roles here prevents a successful
+    /// negotiation followed by corrupt compressed frames.
+    fn websocket_config() -> WebSocketConfig {
+        let deflate = DeflateConfig::new()
+            .set_max_window_bits(Role::Server, 11)
+            .and_then(|config| config.set_max_window_bits(Role::Client, 11))
+            .expect("11-bit DEFLATE windows are supported by the pinned tungstenite fork");
+
+        let mut extensions = ExtensionsConfig::default();
+        extensions.permessage_deflate = Some(deflate);
+
+        let mut config = WebSocketConfig::default();
+        config.extensions = extensions;
+        config
     }
 
     /// Initializes a new TCP connection to the given [domain] and [port].
@@ -384,5 +405,103 @@ impl<S: DeserializeOwned + 'static> Socket<S> {
             }))?;
         self.inner.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::TcpListener, sync::mpsc, thread};
+
+    use serde_json::Value;
+    use tungstenite::{Message, accept_hdr_with_config};
+
+    use super::Socket;
+    use crate::protocol::ServerMessage;
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn negotiates_archipelago_deflate_windows_and_reads_compressed_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (offer_tx, offer_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept_hdr_with_config(
+                stream,
+                move |request: &tungstenite::handshake::server::Request, response| {
+                    offer_tx
+                        .send(
+                            request
+                                .headers()
+                                .get("sec-websocket-extensions")
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_owned(),
+                        )
+                        .unwrap();
+                    Ok(response)
+                },
+                Some(Socket::<Value>::websocket_config()),
+            )
+            .unwrap();
+
+            let marker = "compressed-archipelago-payload-".repeat(4096);
+            let payload = serde_json::json!([{"cmd": "Print", "text": marker}]).to_string();
+            socket.send(Message::Text(payload.into())).unwrap();
+        });
+
+        let mut client = smol::block_on(Socket::<Value>::connect(
+            format!("ws://{address}"),
+            #[cfg(feature = "rustls")]
+            None,
+        ))
+        .unwrap();
+
+        let offer = offer_rx.recv().unwrap();
+        assert!(offer.contains("permessage-deflate"));
+        assert!(offer.contains("server_max_window_bits=11"));
+        assert!(offer.contains("client_max_window_bits=11"));
+
+        let message = smol::block_on(client.recv_async()).unwrap();
+        let ServerMessage::PlainPrint(print) = message else {
+            panic!("expected compressed Print message");
+        };
+        assert_eq!(print.text, "compressed-archipelago-payload-".repeat(4096));
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn still_connects_when_server_declines_compression() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket =
+                tungstenite::accept_with_config(stream, Some(Default::default())).unwrap();
+            socket
+                .send(Message::Text(
+                    r#"[{"cmd":"Print","text":"uncompressed fallback"}]"#.into(),
+                ))
+                .unwrap();
+        });
+
+        let mut client = smol::block_on(Socket::<Value>::connect(
+            format!("ws://{address}"),
+            #[cfg(feature = "rustls")]
+            None,
+        ))
+        .unwrap();
+
+        let message = smol::block_on(client.recv_async()).unwrap();
+        let ServerMessage::PlainPrint(print) = message else {
+            panic!("expected uncompressed Print message");
+        };
+        assert_eq!(print.text, "uncompressed fallback");
+
+        server.join().unwrap();
     }
 }
