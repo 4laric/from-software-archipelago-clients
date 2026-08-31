@@ -62,6 +62,14 @@ impl PickupNotificationCapture {
         }));
     }
 
+    pub fn marker(&mut self, note: &str) {
+        self.write(json::json!({
+            "event": "operator_marker",
+            "at_unix_ms": now_ms(),
+            "note": note,
+        }));
+    }
+
     pub fn grant_state(&mut self, grant: &ItemGrant, state: &'static str) {
         if let Some(previous) = self.grant_states.get(&grant.tag)
             && grant_state_rank(state) <= grant_state_rank(previous)
@@ -175,9 +183,11 @@ mod tests {
         capture.grant_state(&grant, "pending");
         capture.grant_state(&grant, "pending");
         capture.grant_state(&grant, "submitted");
+        capture.marker("popup");
         drop(capture);
         let text = std::fs::read_to_string(root.join("pickup-notification-capture.jsonl")).unwrap();
-        assert_eq!(text.lines().count(), 3, "{text}");
+        assert_eq!(text.lines().count(), 4, "{text}");
+        assert!(text.contains("\"event\":\"operator_marker\""), "{text}");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

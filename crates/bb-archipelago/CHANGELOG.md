@@ -8,6 +8,13 @@
   without touching check, grant, or acknowledgement semantics. Full mode keeps
   the same information in its activity feed instead of drawing it twice.
 
+* **An opt-in passive research probe pack can capture the remaining beta
+  unknowns without changing game state.** It records reviewed boss-flag flips,
+  changed inventory descriptors for rune research, pickup-presentation markers,
+  and time spent in each client-readiness state. Diagnostics export embeds the
+  bounded capture files. Insight correlation remains disabled until a reviewed
+  offset manifest exists; the client refuses to guess addresses.
+
 * **Bloodborne auto-upgrade now recognizes randomized Uncanny weapons as the
   player's upgrade target.** The native census still uses an exact weapon
   allowlist, but includes the catalog-backed Uncanny families and reports an

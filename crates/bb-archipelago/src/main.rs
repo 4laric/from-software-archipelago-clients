@@ -16,11 +16,12 @@ use bb_archipelago::backend::{
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult, OperatorGrantPoll};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::is_manager_not_initialized;
-use bb_archipelago::health::HealthReporter;
+use bb_archipelago::health::{HealthReporter, ReadinessState};
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
 use bb_archipelago::logging;
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
+use bb_archipelago::native::backend::ProbeOptions;
 use bb_archipelago::toasts;
 use bb_archipelago::{RUNTIME_BUILD, client_version};
 use bb_archipelago::{client_debugln, client_eprintln};
@@ -242,6 +243,12 @@ enum Backend {
 }
 
 impl BloodborneBackend for Backend {
+    fn record_presentation_marker(&mut self, note: &str) -> bool {
+        match self {
+            Self::Mock(backend) => backend.record_presentation_marker(note),
+            Self::Native(backend) => backend.record_presentation_marker(note),
+        }
+    }
     fn record_location_checks(&mut self, locations: &[i64]) {
         match self {
             Self::Mock(backend) => backend.record_location_checks(locations),
@@ -534,6 +541,7 @@ fn attach_native_backend(
     let deadline = Instant::now() + LIVE_ATTACH_TIMEOUT;
     let mut next_report = Instant::now();
     loop {
+        health.readiness(ReadinessState::WaitingForProcess);
         let _ = health.publish(
             false,
             false,
@@ -830,6 +838,10 @@ fn run() -> Result<()> {
         "--mock and --assume-correct-save cannot be combined"
     );
     let mut config = RuntimeConfig::load(&args.config)?;
+    config.apply_probe_env_overrides();
+    if config.readiness_durations {
+        health.enable_readiness_durations();
+    }
     if args.assume_correct_save {
         config.expected_save_identity = Some(ASSUMED_IDENTITY.into());
         client_eprintln!(
@@ -866,7 +878,15 @@ fn run() -> Result<()> {
                 // Armed unconditionally on the native path -- it costs one
                 // appended line per delivered item and it is the only way the
                 // storage-routing question gets answered from ordinary play.
-                backend.arm_delivery_diagnostics(&args.ledger, config.pickup_notification_probe);
+                backend.arm_delivery_diagnostics(
+                    &args.ledger,
+                    ProbeOptions {
+                        pickup_notification: config.pickup_notification_probe,
+                        boss_flags: config.boss_flag_census,
+                        runes: config.rune_capture,
+                        insight: config.insight_probe,
+                    },
+                );
                 client_eprintln!(
                     "Bloodborne AP client {} | CUSA03173 01.09 | native payload installed | eboot 0x{:X} | native delivery armed",
                     client_version(),
@@ -1008,7 +1028,7 @@ fn run() -> Result<()> {
             let command = words.first().map(|word| word.to_ascii_lowercase());
             let result = match command.as_deref() {
                 None | Some("") => continue,
-                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM (contract flags only; sends the check) | give INDEX CONFIRM (contract items only). Unknown/unmapped writes and warps fail closed.".to_owned(),
+                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM (contract flags only; sends the check) | give INDEX CONFIRM (contract items only). Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
                     Some(runtime) => runtime
                         .rescue_status()
@@ -1104,6 +1124,19 @@ fn run() -> Result<()> {
                     _ => "Usage: give ITEM_INDEX CONFIRM (contract items only)".to_owned(),
                 },
                 Some("item" | "warp") => "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes.".to_owned(),
+                Some("mark") => match (runtime.as_mut(), words.get(1..)) {
+                    (Some(runtime), Some(parts)) if !parts.is_empty() => {
+                        let note = parts.join(" ");
+                        if runtime.record_presentation_marker(&note) {
+                            format!("Recorded presentation marker: {note}")
+                        } else {
+                            "Pickup-notification capture is not armed; marker was not recorded."
+                                .to_owned()
+                        }
+                    }
+                    (None, _) => "Runtime contract not loaded yet.".to_owned(),
+                    _ => "Usage: mark popup | mark modal | mark NOTE...".to_owned(),
+                },
                 Some(other) => format!("Unknown rescue command {other:?}; type 'help'."),
             };
             client_eprintln!("{result}");
@@ -1210,6 +1243,21 @@ fn run() -> Result<()> {
         } else {
             "Connecting to AP; delivery backend is armed"
         };
+        let readiness = if runtime.is_none() {
+            ReadinessState::Attaching
+        } else if item_errors.last.is_some() {
+            ReadinessState::Blocked
+        } else if last_location_error
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("no validated gameplay/save identity"))
+        {
+            ReadinessState::SaveUnvalidated
+        } else if !ap_connected {
+            ReadinessState::GameplayGate
+        } else {
+            ReadinessState::DeliveryReady
+        };
+        health.readiness(readiness);
         if let Err(error) = health.publish(ap_connected, delivery_armed, health_detail)
             && !health_write_warning_printed
         {

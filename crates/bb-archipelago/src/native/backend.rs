@@ -35,6 +35,7 @@ use super::gem_capture::GemCapture;
 use super::guest::GuestRuntime;
 use super::mem::NativeMemory;
 use super::pickup_notification_capture::PickupNotificationCapture;
+use super::probe_pack::{BOSS_FLAGS, BossFlagCensus, RuneCapture};
 use super::save_identity::SaveIdentityTracker;
 use super::shop_capture::ShopCapture;
 use super::vial_capture::VialCapture;
@@ -100,6 +101,16 @@ pub struct NativeBackend {
     shop_capture: Option<ShopCapture>,
     vial_capture: Option<VialCapture>,
     pickup_notification_capture: Option<PickupNotificationCapture>,
+    boss_flag_census: Option<BossFlagCensus>,
+    rune_capture: Option<RuneCapture>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeOptions {
+    pub pickup_notification: bool,
+    pub boss_flags: bool,
+    pub runes: bool,
+    pub insight: bool,
 }
 
 impl NativeBackend {
@@ -121,7 +132,7 @@ impl NativeBackend {
     /// The path is derived from the ledger rather than taken as a new CLI
     /// argument: the launcher already puts `ledger.json`, `client.log` and this
     /// file in one per-session folder, and the ledger path names that folder.
-    pub fn arm_delivery_diagnostics(&mut self, ledger: &std::path::Path, pickup_probe: bool) {
+    pub fn arm_delivery_diagnostics(&mut self, ledger: &std::path::Path, probes: ProbeOptions) {
         let path = diagnostics_path_for_ledger(ledger);
         client_eprintln!(
             "Delivery diagnostics: one line per delivered item into {} - send it back with client.log if a delivery looks wrong (clients#445).",
@@ -156,7 +167,7 @@ impl NativeBackend {
             }
             Err(error) => client_eprintln!("Shop diagnostics unavailable: {error}"),
         }
-        if pickup_probe {
+        if probes.pickup_notification {
             match PickupNotificationCapture::beside_ledger(ledger, self.base) {
                 Ok(capture) => {
                     client_eprintln!(
@@ -166,6 +177,23 @@ impl NativeBackend {
                 }
                 Err(error) => client_eprintln!("Pickup-notification probe unavailable: {error}"),
             }
+        }
+        if probes.boss_flags {
+            match BossFlagCensus::beside_ledger(ledger) {
+                Ok(capture) => self.boss_flag_census = Some(capture),
+                Err(error) => client_eprintln!("Boss-flag census unavailable: {error}"),
+            }
+        }
+        if probes.runes {
+            match RuneCapture::beside_ledger(ledger) {
+                Ok(capture) => self.rune_capture = Some(capture),
+                Err(error) => client_eprintln!("Rune capture unavailable: {error}"),
+            }
+        }
+        if probes.insight {
+            client_eprintln!(
+                "Insight probe requested but not armed: the reviewed player-stat candidate manifest is still empty; no addresses were guessed."
+            );
         }
     }
 
@@ -356,6 +384,8 @@ impl NativeBackend {
             shop_capture: None,
             vial_capture: None,
             pickup_notification_capture: None,
+            boss_flag_census: None,
+            rune_capture: None,
         })
     }
 }
@@ -367,12 +397,23 @@ impl BloodborneBackend for NativeBackend {
         }
     }
 
+    fn record_presentation_marker(&mut self, note: &str) -> bool {
+        let Some(capture) = &mut self.pickup_notification_capture else {
+            return false;
+        };
+        capture.marker(note);
+        true
+    }
+
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
         let entries = self.delivery.runtime_mut().inventory_entries();
         if let Some(capture) = &mut self.shop_capture {
             capture.observe(entries.clone());
         }
         if let Some(capture) = &mut self.vial_capture {
+            capture.observe(entries.clone());
+        }
+        if let Some(capture) = &mut self.rune_capture {
             capture.observe(entries.clone());
         }
         if let Some(capture) = &mut self.gem_capture {
@@ -384,6 +425,23 @@ impl BloodborneBackend for NativeBackend {
             capture.observe_native_call(snapshot);
         }
         let result = self.location_context_inner();
+        if let Some(census) = &mut self.boss_flag_census {
+            let (save_identity, gameplay_ready) = match &result {
+                Ok(Some(context)) => (Some(context.save_identity.as_str()), context.gameplay_ready),
+                _ => (None, false),
+            };
+            let values = match self.event_flags.armed_mut() {
+                Some(flags) => BOSS_FLAGS
+                    .iter()
+                    .map(|&(flag, label)| (flag, label, flags.read_resilient(flag).ok()))
+                    .collect::<Vec<_>>(),
+                None => BOSS_FLAGS
+                    .iter()
+                    .map(|&(flag, label)| (flag, label, None))
+                    .collect(),
+            };
+            census.observe(save_identity, gameplay_ready, &values);
+        }
         // clients#445: remember what the loop was told, so a grant record can
         // say what the client's own readiness looked like around it. `None` is
         // "this backend reported no context", never "not ready".

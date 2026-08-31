@@ -207,6 +207,14 @@ const fn default_location_check_debounce() -> u8 {
     3
 }
 
+fn diagnostic_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SuppressionRequirement {
     #[serde(default)]
@@ -280,6 +288,16 @@ pub struct RuntimeConfig {
     /// not read from slot data: a seed cannot turn native instrumentation on.
     #[serde(default)]
     pub pickup_notification_probe: bool,
+    /// Local observation-only beta research captures. These are never read
+    /// from slot data, so a seed cannot arm instrumentation.
+    #[serde(default)]
+    pub boss_flag_census: bool,
+    #[serde(default)]
+    pub rune_capture: bool,
+    #[serde(default)]
+    pub insight_probe: bool,
+    #[serde(default)]
+    pub readiness_durations: bool,
     /// Seed-owned count of qualifying local deaths forgiven before the next
     /// outbound DeathLink. Inert while DeathLink is disabled.
     #[serde(default)]
@@ -313,6 +331,27 @@ impl RuntimeConfig {
             .with_context(|| format!("parsing runtime config {}", path.display()))?;
         config.validate_items()?;
         Ok(config)
+    }
+
+    /// Environment overrides are intended for diagnostic builds and win over
+    /// launcher-authored config when they contain a recognized boolean.
+    pub fn apply_probe_env_overrides(&mut self) {
+        for (name, field) in [
+            (
+                "BB_PICKUP_NOTIFICATION_PROBE",
+                &mut self.pickup_notification_probe,
+            ),
+            ("BB_BOSS_FLAG_CENSUS", &mut self.boss_flag_census),
+            ("BB_RUNE_CAPTURE", &mut self.rune_capture),
+            ("BB_INSIGHT_PROBE", &mut self.insight_probe),
+            ("BB_READINESS_DURATIONS", &mut self.readiness_durations),
+        ] {
+            if let Ok(value) = std::env::var(name)
+                && let Some(value) = diagnostic_bool(&value)
+            {
+                *field = value;
+            }
+        }
     }
 
     pub fn with_test_pebble_location(mut self, ap_location_id: i64) -> Self {
@@ -597,6 +636,10 @@ mod tests {
             auto_equip: false,
             death_link: false,
             pickup_notification_probe: false,
+            boss_flag_census: false,
+            rune_capture: false,
+            insight_probe: false,
+            readiness_durations: false,
             death_link_amnesty: 0,
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
