@@ -1499,6 +1499,7 @@ pub fn tick() {
     }
 
     if !out.applied.is_empty() {
+        shared::crash_tallies::record_reconcile_apply();
         log::info!(
             "[reconcile] applied {} action(s) this tick (converged={})",
             out.applied.len(),
