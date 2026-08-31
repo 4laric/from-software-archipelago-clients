@@ -1258,6 +1258,42 @@ pub fn tier_rates(tier: usize) -> ScalingTier {
     SCALING_TIERS[tier.min(NUM_TIERS - 1)]
 }
 
+/// Infer the native scaling tier represented by a direct rune payout.
+///
+/// This is the same calibrated `getSoul` curve used to derive `NATIVE_TIERS`. Keeping the lookup
+/// here lets runtime reward scaling preserve each row's hand-tuned value instead of replacing it
+/// with a tier-wide constant. Zero is not a payout and remains outside the feature.
+pub fn rune_reward_native_tier(reward: u32) -> Option<usize> {
+    if reward == 0 {
+        return None;
+    }
+    Some(
+        crate::native_tiers::GETSOUL_BANDS
+            .iter()
+            .find(|&&(upper, _)| (reward as f32) < upper)
+            .map(|&(_, tier)| tier)
+            .unwrap_or(crate::native_tiers::TOP_BAND_INDEX) as usize,
+    )
+}
+
+/// Scale a direct enemy/boss rune payout to the effort implied by `target_tier`.
+///
+/// HP is the effort axis: multiplying by the target/native HP ratio keeps runes-per-damage roughly
+/// stable while preserving vanilla differences between individual enemies. The conversion rounds
+/// to the nearest rune, never turns a real payout into zero, and saturates rather than wrapping.
+/// Golden Rune inventory items never pass through this function; they are goods, not `NpcParam`
+/// or `GameAreaParam` direct payouts.
+pub fn scale_rune_reward(reward: u32, target_tier: usize) -> u32 {
+    let Some(native_tier) = rune_reward_native_tier(reward) else {
+        return 0;
+    };
+    let native_hp = tier_rates(native_tier).hp as f64;
+    let target_hp = tier_rates(target_tier).hp as f64;
+    ((reward as f64 * target_hp / native_hp)
+        .round()
+        .clamp(1.0, u32::MAX as f64)) as u32
+}
+
 /// Co-op difficulty offset. `#993`: seamless co-op leaves each fight easier than intended because
 /// Seamless's own knobs raise enemy HP but leave enemy DAMAGE at the host's default (bobler's
 /// `ersc_settings.ini`: `enemy_damage_scaling=0`, `boss_damage_scaling=0`), so a second player halves
@@ -3717,5 +3753,26 @@ mod tests {
             ScaleAction::Apply,
             "an area index below the target is exactly what the area fallback exists to act on"
         );
+    }
+
+    #[test]
+    fn rune_rewards_follow_the_same_native_curve_as_enemy_scaling() {
+        assert_eq!(rune_reward_native_tier(0), None);
+        assert_eq!(rune_reward_native_tier(20), Some(0));
+        assert_eq!(rune_reward_native_tier(100), Some(2));
+        assert_eq!(rune_reward_native_tier(1_000), Some(12));
+        assert_eq!(rune_reward_native_tier(3_000), Some(19));
+    }
+
+    #[test]
+    fn rune_reward_scaling_is_bounded_rounded_and_preserves_zero() {
+        assert_eq!(scale_rune_reward(0, NUM_TIERS - 1), 0);
+        // Same inferred tier means the hand-tuned payout is byte-for-byte unchanged.
+        assert_eq!(scale_rune_reward(100, 2), 100);
+        // Moving upward pays more and moving downward pays less, without erasing the payout.
+        assert!(scale_rune_reward(100, 10) > 100);
+        assert!((1..100).contains(&scale_rune_reward(100, 0)));
+        // The arithmetic saturates instead of wrapping at the top of u32.
+        assert_eq!(scale_rune_reward(u32::MAX, NUM_TIERS - 1), u32::MAX);
     }
 }

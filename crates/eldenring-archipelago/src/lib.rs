@@ -52,6 +52,7 @@ mod radahn_festival;
 mod reconcile_io;
 mod region;
 mod region_sync;
+mod rune_rewards;
 mod runes;
 mod rva_table;
 mod save_backup;

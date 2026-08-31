@@ -79,6 +79,7 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("dlc_blessing_catchup", |_| {
         crate::upgrades::dlc_blessing_catchup_armed()
     }),
+    ("rune_reward_scaling", |_| crate::rune_rewards::armed()),
     // Parsed per connect into RegionConfig. Non-empty = at least one region is gated, which is the
     // only case the apworld declares the tag for.
     ("grace_attunement", |c| {
