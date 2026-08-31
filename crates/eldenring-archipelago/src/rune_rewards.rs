@@ -38,6 +38,15 @@ pub fn configure(sd: &Value) {
     );
 }
 
+/// Re-arm after a map load restreams the parameter tables.
+///
+/// Keep the captured baseline: it represents the regulation (including another randomizer's
+/// changes) that was loaded when this session started. Only the application latch must drop so
+/// the next scaling tick restores our derived values over the freshly streamed rows.
+pub fn reset() {
+    LAST_TIER.store(NO_TIER, Ordering::Relaxed);
+}
+
 pub fn armed() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
