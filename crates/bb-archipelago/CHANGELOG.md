@@ -30,6 +30,11 @@
 
 ### Fixed
 
+* **Zero-Vial diagnostics no longer report executable code as a backing
+  object.** Blood Vials are ordinary stackable goods, not generated instances;
+  their canonical inventory-row transitions remain captured, while the
+  generated-object resolver is now reserved for blood gems and weapons.
+
 * **Location checks retry until the server confirms them (clients#455).** A
   socket killed without a detected transport error could accept a local write,
   after which archipelago-rs's optimistic checked-location cache made the

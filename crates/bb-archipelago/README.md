@@ -239,9 +239,10 @@ Native sessions also append read-only samples to `blood-vial-capture.jsonl`
 beside the ledger. Every five seconds it records whether a canonical
 `0x400003E8` Vial stack exists and includes any inventory row whose low item id
 is 1000. This deliberately includes the known shop-only/HUD collision without
-mistaking it for a stack. When a natural enemy or world pickup creates the
-canonical row, the existing game-thread resolver captures its read-only backing
-object bytes. The diagnostic never stages or grants a Vial.
+mistaking it for a stack. It records the canonical row itself; ordinary goods
+must not be passed through the generated-instance resolver, whose output is
+meaningful only for weapons and blood gems. The diagnostic never stages or
+grants a Vial.
 
 For the dedicated capture: begin at zero Vials, leave the client running for
 one heartbeat, buy the first shop Vial, wait for another heartbeat, then obtain

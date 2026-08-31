@@ -319,28 +319,22 @@ impl BloodborneBackend for NativeBackend {
         if let Some(capture) = &mut self.shop_capture {
             capture.observe(entries.clone());
         }
-        let vial_candidate = self
-            .vial_capture
-            .as_mut()
-            .and_then(|capture| capture.observe(entries.clone()));
+        if let Some(capture) = &mut self.vial_capture {
+            capture.observe(entries.clone());
+        }
         let gem_candidate = self
             .gem_capture
             .as_mut()
             .and_then(|capture| capture.observe(entries).into_iter().next());
-        if self.vial_capture.is_some() || self.gem_capture.is_some() {
-            let candidate = vial_candidate.or(gem_candidate);
+        if self.gem_capture.is_some() {
+            let candidate = gem_candidate;
             if let Some(probe) = self
                 .delivery
                 .runtime_mut()
                 .probe_generated_object(candidate)
+                && let Some(capture) = &mut self.gem_capture
             {
-                if probe.entry.word(4) == 0x4000_03E8 {
-                    if let Some(capture) = &mut self.vial_capture {
-                        capture.record_generated_object(&probe);
-                    }
-                } else if let Some(capture) = &mut self.gem_capture {
-                    capture.record_generated_object(&probe);
-                }
+                capture.record_generated_object(&probe);
             }
         }
         let result = self.location_context_inner();

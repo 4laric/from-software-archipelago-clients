@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::guest::{GeneratedObjectProbe, InventoryEntry};
+use super::guest::InventoryEntry;
 
 const VIAL_ID: u32 = 1000;
 const CANONICAL_VIAL: u32 = 0x4000_03E8;
@@ -37,10 +37,10 @@ impl VialCapture {
         })
     }
 
-    /// Return a newly-created canonical Vial row for the existing read-only
-    /// backing-object resolver. Low-id collisions are logged but never probed.
-    pub fn observe(&mut self, entries: Option<Vec<InventoryEntry>>) -> Option<InventoryEntry> {
-        let entries = entries?;
+    /// Record canonical Vial rows and low-id collisions without passing this
+    /// ordinary stackable good through the generated-instance resolver.
+    pub fn observe(&mut self, entries: Option<Vec<InventoryEntry>>) {
+        let Some(entries) = entries else { return };
         let suspects = entries
             .into_iter()
             .filter(|entry| {
@@ -58,28 +58,7 @@ impl VialCapture {
             }));
             self.last_sample_ms = now;
         }
-        let candidate = suspects
-            .iter()
-            .find(|entry| {
-                entry.word(4) == CANONICAL_VIAL
-                    && self
-                        .previous
-                        .as_ref()
-                        .is_none_or(|previous| !previous.contains(entry))
-            })
-            .cloned();
         self.previous = Some(suspects);
-        candidate
-    }
-
-    pub fn record_generated_object(&mut self, probe: &GeneratedObjectProbe) {
-        self.write(json::json!({
-            "event": "canonical_vial_backing_object",
-            "at_unix_ms": now_ms(),
-            "entry": entry_json(&probe.entry),
-            "backing_address": format!("0x{:X}", probe.address),
-            "backing_bytes": probe.bytes.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(" "),
-        }));
     }
 
     fn write(&mut self, value: json::Value) {
@@ -130,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn collisions_are_logged_but_only_a_canonical_row_is_probed() {
+    fn collisions_and_canonical_rows_are_logged_without_an_object_probe() {
         let root = std::env::temp_dir().join(format!(
             "bb-vial-capture-{}-{}",
             std::process::id(),
@@ -139,20 +118,14 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let ledger = root.join("ledger.json");
         let mut capture = VialCapture::beside_ledger(&ledger).unwrap();
-        assert!(
-            capture
-                .observe(Some(vec![entry(2, 0x8080_02C0, 0x0000_03E8)]))
-                .is_none()
-        );
+        capture.observe(Some(vec![entry(2, 0x8080_02C0, 0x0000_03E8)]));
         let canonical = entry(14, 0xB000_03E8, CANONICAL_VIAL);
-        assert_eq!(
-            capture.observe(Some(vec![canonical.clone()])).unwrap(),
-            canonical
-        );
+        capture.observe(Some(vec![canonical]));
         drop(capture);
         let text = std::fs::read_to_string(root.join("blood-vial-capture.jsonl")).unwrap();
         assert!(text.contains("0x808002C0"));
         assert!(text.contains("\"canonical_vial_present\":true"));
+        assert!(!text.contains("backing_address"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
