@@ -26,6 +26,7 @@ pub mod ledger;
 pub mod logging;
 pub mod names;
 pub mod native;
+pub mod toasts;
 pub mod upgrades;
 
 #[cfg(test)]

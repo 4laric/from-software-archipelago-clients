@@ -21,6 +21,7 @@ use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
 use bb_archipelago::logging;
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
+use bb_archipelago::toasts;
 use bb_archipelago::{RUNTIME_BUILD, client_version};
 use bb_archipelago::{client_debugln, client_eprintln};
 
@@ -704,21 +705,6 @@ fn item_label(game: &archipelago_rs::Game, ap_item_id: i64) -> String {
     bb_archipelago::names::item_label(name.as_ref().map(|name| name.as_str()), ap_item_id)
 }
 
-/// Resolve a batch of location ids into one feed line.
-#[cfg(windows)]
-fn location_check_line(game: &archipelago_rs::Game, locations: &[i64]) -> String {
-    let names = locations
-        .iter()
-        .map(|&id| {
-            game.location(id).map_or_else(
-                || format!("location #{id}"),
-                |location| location.name().to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
-    bb_archipelago::names::location_check_line(&names)
-}
-
 /// Which feed lane a server print belongs in.
 ///
 /// Hints get their own lane because they are the one server print players actively hunt for in a
@@ -924,6 +910,8 @@ fn run() -> Result<()> {
     let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut item_errors = ItemErrorReporter::default();
+    #[cfg(windows)]
+    let mut placement_scouts: Option<toasts::PlacementScouts> = None;
     let mut death_link_tag_advertised = false;
     let mut pending_death_links: VecDeque<(String, Option<String>)> = VecDeque::new();
     let mut last_death_link_error: Option<String> = None;
@@ -1205,6 +1193,10 @@ fn run() -> Result<()> {
                 .iter()
                 .map(|location| location.ap_location_id)
                 .collect();
+            #[cfg(windows)]
+            {
+                placement_scouts = Some(toasts::PlacementScouts::new(location_ids.iter().copied()));
+            }
             let mut new_runtime = ClientLoop::new(
                 backend.take().context("backend was already initialized")?,
                 seed_config,
@@ -1287,6 +1279,10 @@ fn run() -> Result<()> {
         }
 
         if let (Some(runtime), Some(client)) = (runtime.as_mut(), connection.client_mut()) {
+            #[cfg(windows)]
+            if let Some(scouts) = placement_scouts.as_mut() {
+                scouts.pump(client);
+            }
             while let Some(outcome) = runtime.take_watermark_notice() {
                 // docs/SAVE-RECONCILIATION.md §8: every non-resume comparison
                 // prints one line a player can act on, once per transition.
@@ -1333,10 +1329,17 @@ fn run() -> Result<()> {
                     }
                     if !newly_checked.is_empty() {
                         #[cfg(windows)]
-                        ui_reducer.activity(
-                            client_ui::ActivityKind::LocationCheck,
-                            location_check_line(client.this_game(), &newly_checked),
-                        );
+                        for &location_id in &newly_checked {
+                            let fallback = client.this_game().location(location_id).map_or_else(
+                                || format!("location #{location_id}"),
+                                |location| location.name().to_owned(),
+                            );
+                            let line = placement_scouts.as_ref().map_or_else(
+                                || format!("\u{2713} {fallback}"),
+                                |scouts| scouts.sent_line(location_id, &fallback),
+                            );
+                            ui_reducer.activity(client_ui::ActivityKind::LocationCheck, line);
+                        }
                         runtime.record_location_checks(&newly_checked);
                         if !goal_reported
                             && goal_location.is_some_and(|goal| newly_checked.contains(&goal))
@@ -1383,12 +1386,27 @@ fn run() -> Result<()> {
                     #[cfg(windows)]
                     {
                         ui_delivery = client_ui::DeliveryState::Ready;
+                        let (name, sender) = client
+                            .received_items()
+                            .iter()
+                            .find(|received| received.index() as u64 == item.index)
+                            .map_or_else(
+                                || {
+                                    (
+                                        item_label(client.this_game(), item.ap_item_id),
+                                        "Archipelago".to_owned(),
+                                    )
+                                },
+                                |received| {
+                                    (
+                                        received.item().name().to_owned(),
+                                        received.sender().alias().to_owned(),
+                                    )
+                                },
+                            );
                         ui_reducer.activity(
                             client_ui::ActivityKind::ReceivedItem,
-                            format!(
-                                "Received {}",
-                                item_label(client.this_game(), item.ap_item_id)
-                            ),
+                            toasts::received_line(&name, &sender),
                         );
                     }
                     if let Some(line) = item_errors.recovered() {
