@@ -2,6 +2,13 @@
 
 ### Changed
 
+* **Blood-gem diagnostics no longer mislabel armor as gems.** ItemLot category
+  8 is a generation recipe, not a prefix encoded into a runtime inventory id.
+  The replacement diagnostic takes bounded, read-only snapshots of the live
+  inventory manager and its immediate pointer blocks, allowing natural gem
+  pickups to reveal their separate container without guessing or writing to
+  guest memory.
+
 * **Routine item acknowledgements no longer flood the player console.** The
   detailed per-index acknowledgement lines remain in `client.log` for support
   and replay diagnosis; blocked deliveries, failures, and recovery notices
