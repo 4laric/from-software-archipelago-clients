@@ -35,12 +35,12 @@
 //!   outcome now means nothing base-shaped was ever written to the file, so the
 //!   configured `shad_log` is probably the wrong file. The
 //!   message names the configured path and says what to compare it against, and
-//!   deliberately says nothing about the Cheat Engine bridge: the build is not
-//!   the suspect ([`AttachWaitFailure::is_stale_log_evidence`] is what lets
+//!   deliberately says nothing about build support: the build is not the
+//!   suspect ([`AttachWaitFailure::is_stale_log_evidence`] is what lets
 //!   `main.rs` withhold the build guidance);
 //! * [`AttachWaitFailure::ImageRejected`] -- a base *was* confirmed and the
 //!   image behind it did not match the contract. That is a genuinely
-//!   unrecognised build, and `main.rs` appends the CE-bridge guidance to it.
+//!   unrecognised build, and `main.rs` appends native diagnostic guidance.
 //!
 //! The loop is host-tested: time, sleeping and the log contents are all
 //! injected, so a test appends a fresh base line "mid-wait" without a game, a

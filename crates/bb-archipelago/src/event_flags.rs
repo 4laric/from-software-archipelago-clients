@@ -21,8 +21,8 @@ pub struct AttachmentInfo {
 /// It is a distinct error type so callers can tell it apart from a real refusal
 /// (signature mismatch, unknown build) and wait instead of exiting. In
 /// particular `main::native_attach_failure` must never wrap this class in the
-/// unrecognised-build / Cheat Engine bridge guidance: the bridge lane does not
-/// provide flag reads either, so that advice cannot help (clients#416).
+/// unrecognised-build guidance: this is a gameplay initialization state, not
+/// evidence that the image is unsupported (clients#416).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EventFlagManagerNotInitialized;
 

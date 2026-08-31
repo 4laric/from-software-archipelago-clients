@@ -2,6 +2,12 @@
 
 ### Changed
 
+* **Native-only delivery (clients#526).** Removed the live command-file backend,
+  bridge-root configuration, startup probes, and backend selector. Legacy
+  `--delivery=ce-bridge` launch plans now stop with an explicit migration error.
+  Unsupported images continue to fail closed before delivery is armed and now
+  direct players to the session diagnostics bundle instead of external tooling.
+
 * **The zero-Vial diagnostic now captures the actual record-creation
   transition.** On the first canonical Vial row it records the chosen slot,
   neighboring before/after bytes, and inventory tail movement. Delivery remains
