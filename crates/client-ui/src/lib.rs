@@ -253,7 +253,8 @@ pub fn delivery_headline(snapshot: &ClientSnapshot) -> (Severity, String) {
     match snapshot.delivery {
         DeliveryState::NotArmed => (
             Severity::Bad,
-            "Item delivery is not armed - nothing can be granted.".to_owned(),
+            "Item delivery is not armed - open diagnostics and fix setup before playing."
+                .to_owned(),
         ),
         DeliveryState::WaitingForGameplay => (
             Severity::Warn,
@@ -272,6 +273,91 @@ pub fn delivery_headline(snapshot: &ClientSnapshot) -> (Severity, String) {
                 _ => "Delivery blocked - an item could not be granted.".to_owned(),
             },
         ),
+    }
+}
+
+/// How long a changed headline must remain true before replacing the one already on screen.
+pub const GUIDANCE_DEBOUNCE_MS: u64 = 10_000;
+
+/// The highest-priority session fact, phrased as one player-facing action/status sentence.
+///
+/// Delivery failures win over setup, setup wins over connection, and connection wins over healthy
+/// delivery. This order is centralized so renderers cannot disagree when several raw states move
+/// during the same loading screen.
+pub fn guidance_candidate(snapshot: &ClientSnapshot) -> (Severity, String) {
+    if snapshot.delivery == DeliveryState::Blocked {
+        return delivery_headline(snapshot);
+    }
+    if snapshot.delivery == DeliveryState::NotArmed {
+        return delivery_headline(snapshot);
+    }
+    match snapshot.process {
+        ProcessState::Lost => {
+            return (
+                Severity::Bad,
+                "Bloodborne closed or detached - restart the game to resume.".to_owned(),
+            );
+        }
+        ProcessState::Waiting | ProcessState::Attaching => {
+            return (
+                Severity::Warn,
+                "Waiting for Bloodborne - start the game and load your character.".to_owned(),
+            );
+        }
+        ProcessState::Attached => {}
+    }
+    match snapshot.ap {
+        ApState::Disconnected => (
+            Severity::Bad,
+            "Not connected to Archipelago - check the server and slot, then connect.".to_owned(),
+        ),
+        ApState::Connecting => (Severity::Warn, "Connecting to Archipelago...".to_owned()),
+        ApState::Reconnecting => (
+            Severity::Warn,
+            "Connection lost - reconnecting to Archipelago...".to_owned(),
+        ),
+        ApState::Authenticated => delivery_headline(snapshot),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GuidanceLine(Severity, String);
+
+/// Holds transient loading-state changes for [`GUIDANCE_DEBOUNCE_MS`] before publishing them.
+#[derive(Clone, Debug, Default)]
+pub struct GuidanceGate {
+    shown: Option<GuidanceLine>,
+    pending: Option<(GuidanceLine, u64)>,
+}
+
+impl GuidanceGate {
+    pub fn observe(&mut self, snapshot: &ClientSnapshot, now_ms: u64) -> (Severity, String) {
+        let (severity, text) = guidance_candidate(snapshot);
+        let candidate = GuidanceLine(severity, text);
+        let Some(shown) = self.shown.as_ref() else {
+            self.shown = Some(candidate.clone());
+            return (candidate.0, candidate.1);
+        };
+        if shown == &candidate {
+            self.pending = None;
+            return (shown.0, shown.1.clone());
+        }
+
+        match self.pending.as_mut() {
+            Some((pending, since)) if pending == &candidate => {
+                if now_ms.saturating_sub(*since) >= GUIDANCE_DEBOUNCE_MS {
+                    self.shown = Some(candidate.clone());
+                    self.pending = None;
+                    (candidate.0, candidate.1)
+                } else {
+                    (shown.0, shown.1.clone())
+                }
+            }
+            _ => {
+                self.pending = Some((candidate, now_ms));
+                (shown.0, shown.1.clone())
+            }
+        }
     }
 }
 
@@ -457,7 +543,8 @@ mod tests {
             headline(DeliveryState::NotArmed, None),
             (
                 Severity::Bad,
-                "Item delivery is not armed - nothing can be granted.".to_owned()
+                "Item delivery is not armed - open diagnostics and fix setup before playing."
+                    .to_owned()
             )
         );
         assert_eq!(
@@ -509,6 +596,72 @@ mod tests {
             (severity, text.as_str()),
             (Severity::Ok, "Delivering normally.")
         );
+    }
+
+    #[test]
+    fn guidance_priority_is_blocked_then_setup_then_connection_then_delivery() {
+        let snapshot = |process, ap, delivery| ClientSnapshot {
+            process,
+            ap,
+            delivery,
+            ..Default::default()
+        };
+        assert!(
+            guidance_candidate(&snapshot(
+                ProcessState::Lost,
+                ApState::Disconnected,
+                DeliveryState::Blocked
+            ))
+            .1
+            .starts_with("Delivery blocked")
+        );
+        assert!(
+            guidance_candidate(&snapshot(
+                ProcessState::Lost,
+                ApState::Disconnected,
+                DeliveryState::Ready
+            ))
+            .1
+            .starts_with("Bloodborne closed")
+        );
+        assert!(
+            guidance_candidate(&snapshot(
+                ProcessState::Attached,
+                ApState::Disconnected,
+                DeliveryState::Ready
+            ))
+            .1
+            .starts_with("Not connected")
+        );
+        assert_eq!(
+            guidance_candidate(&snapshot(
+                ProcessState::Attached,
+                ApState::Authenticated,
+                DeliveryState::Ready
+            )),
+            (Severity::Ok, "Delivering normally.".to_owned())
+        );
+    }
+
+    #[test]
+    fn guidance_debounces_loading_flaps_and_commits_a_stable_change() {
+        let ready = ClientSnapshot {
+            process: ProcessState::Attached,
+            ap: ApState::Authenticated,
+            delivery: DeliveryState::Ready,
+            ..Default::default()
+        };
+        let loading = ClientSnapshot {
+            process: ProcessState::Attaching,
+            ..ready.clone()
+        };
+        let mut gate = GuidanceGate::default();
+        assert_eq!(gate.observe(&ready, 0).1, "Delivering normally.");
+        assert_eq!(gate.observe(&loading, 1_000).1, "Delivering normally.");
+        assert_eq!(gate.observe(&ready, 5_000).1, "Delivering normally.");
+        assert_eq!(gate.observe(&loading, 6_000).1, "Delivering normally.");
+        assert_eq!(gate.observe(&loading, 15_999).1, "Delivering normally.");
+        assert!(gate.observe(&loading, 16_000).1.starts_with("Waiting for"));
     }
 
     #[test]
