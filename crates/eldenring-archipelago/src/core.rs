@@ -4417,6 +4417,9 @@ impl shared::Core for Core {
             crate::whetblade_lots::reset();
             crate::enemy_drops::reset();
             crate::mine_materials::reset();
+            // NpcParam and GameAreaParam are streamed back in on the same edge. Preserve the
+            // session baseline, but drop the tier latch so rune payouts are re-applied next tick.
+            crate::rune_rewards::reset();
             // THE CTD (2026-07-24, symbolized): the inventory pointer grant_full_id hands to the
             // game's AddItemFunc is captured once and was trusted forever. A load frees that
             // object, so the next grant made the GAME dereference freed memory
