@@ -186,9 +186,10 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
         // re-asserted by whichever surface drew, so unlike #202's flag it cannot outlive its
         // window.
         let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
+        let cursor_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
         let io = ui.io();
         self.input_blocker.block_only(input_flags(
-            io.want_capture_mouse,
+            io.want_capture_mouse || cursor_capture_active,
             io.want_capture_keyboard,
             keyboard_surface_active,
         ));
@@ -213,8 +214,9 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
 
     fn message_filter(&self, io: &Io) -> MessageFilter {
         let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
+        let cursor_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
         window_message_filter(input_flags(
-            io.want_capture_mouse,
+            io.want_capture_mouse || cursor_capture_active,
             io.want_capture_keyboard,
             keyboard_surface_active,
         ))
