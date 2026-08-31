@@ -2049,12 +2049,10 @@ impl shared::Core for Core {
                     goal_gate_expected,
                 );
 
-                // #1184: top-level contract key, deliberately absent/false for old seeds. This is
+                // #1184: options sub-key, deliberately absent/false for old seeds. This is
                 // presentation-only and never feeds sweep membership, polling, or grants.
-                let reveal_sweep_boss_names = sd
-                    .get("revealSweepBossNames")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let reveal_sweep_boss_names =
+                    er_logic::options::parse_bool_option(sd, "reveal_sweep_boss_names");
 
                 (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, reveal_sweep_boss_names, feature_warn, required_features, version_warn)
             });
