@@ -337,6 +337,7 @@ dependencies = [
  "anyhow",
  "archipelago_rs",
  "client-ui",
+ "oneshot",
  "serde",
  "serde_json",
  "sha2",

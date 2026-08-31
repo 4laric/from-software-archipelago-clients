@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use client_ui::{ActivityEvent, ClientSnapshot, HostEndpoint, Severity, UiAction};
 use egui::{Align, Color32, FontId, Layout, RichText, TextStyle, Vec2};
@@ -11,7 +11,7 @@ use standalone_windows::{WindowGeometry, WindowOptions, normalize_command_input}
 use crate::hotkey::{self, Escape};
 use crate::view::{
     self, ActivityStyle, CommandHistory, STORAGE_TOOLTIP, Tone, activity_style, checks_progress,
-    clock_label, goal_line, identity, items_line, pills,
+    clock_label, goal_line, identity, items_line, pills, toast_alpha, toast_events,
 };
 
 /// Heartbeat. The old shell repainted a whole text blob every 50 ms, which is where its flicker
@@ -23,9 +23,6 @@ const HEARTBEAT: Duration = Duration::from_millis(250);
 const MIN_SIZE: [f32; 2] = [360.0, 240.0];
 const DEFAULT_SIZE: [f32; 2] = [420.0, 560.0];
 const COMPACT_SIZE: [f32; 2] = [420.0, 160.0];
-
-/// Activity rows kept on screen in compact mode.
-const COMPACT_ROWS: usize = 3;
 
 fn color(rgb: view::Rgb) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
@@ -376,6 +373,40 @@ impl StandaloneApp {
         });
     }
 
+    fn toast_deck(&self, ui: &mut egui::Ui, snapshot: &ClientSnapshot) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+            });
+        let events = toast_events(snapshot, now_ms);
+        if events.is_empty() {
+            ui.label(
+                RichText::new("Waiting for checks and items...").color(color(view::palette::MUTED)),
+            );
+            return;
+        }
+        for event in events {
+            let alpha = toast_alpha(event.timestamp_ms, now_ms);
+            let style = activity_style(&event.kind);
+            egui::Frame::new()
+                .fill(color(view::palette::PANEL).gamma_multiply(0.92 * alpha))
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    color(style.color).gamma_multiply(alpha),
+                ))
+                .corner_radius(5.0)
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(&event.text)
+                            .color(color(style.color).gamma_multiply(alpha))
+                            .strong(),
+                    );
+                });
+        }
+    }
+
     fn settings(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(240.0);
         let mut percent = (self.options.opacity * 100.0).round();
@@ -503,13 +534,9 @@ impl eframe::App for StandaloneApp {
             )
             .show(ctx, |ui| {
                 if compact {
-                    // Compact keeps the last few rows and nothing else: it is meant to sit over
-                    // the game, where a scrollable feed is unusable anyway.
-                    let events = self.visible_events(&snapshot);
-                    let offset = self.utc_offset_seconds;
-                    for event in events.iter().rev().take(COMPACT_ROWS).rev() {
-                        row(ui, event, offset);
-                    }
+                    // Full mode already has the feed. Compact is the transient pickup surface:
+                    // newest first, bounded and fading, so it can sit over active play.
+                    self.toast_deck(ui, &snapshot);
                 } else {
                     self.feed(ui, &snapshot);
                 }

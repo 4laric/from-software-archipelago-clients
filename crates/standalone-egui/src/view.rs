@@ -8,6 +8,10 @@
 
 use client_ui::{ActivityKind, ApState, ClientSnapshot, DeliveryState, LedgerTotals, ProcessState};
 
+pub const TOAST_LIFETIME_MS: u64 = 4_000;
+pub const TOAST_FADE_MS: u64 = 1_000;
+pub const MAX_VISIBLE_TOASTS: usize = 3;
+
 /// An sRGB colour, as bytes. Deliberately not `egui::Color32`: this module must stay compilable on
 /// a host with no windowing stack at all.
 pub type Rgb = [u8; 3];
@@ -63,6 +67,39 @@ pub fn activity_style(kind: &ActivityKind) -> ActivityStyle {
         ActivityKind::Command => style(palette::MUTED, ">", true),
         ActivityKind::CommandResult => style(palette::MUTED, "", true),
         ActivityKind::Message => style(palette::TEXT, "", false),
+    }
+}
+
+/// Recent pickup events for compact mode. The full window already has the feed,
+/// so it deliberately does not render this second presentation.
+pub fn toast_events(snapshot: &ClientSnapshot, now_ms: u64) -> Vec<&client_ui::ActivityEvent> {
+    snapshot
+        .activity
+        .iter()
+        .rev()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                ActivityKind::LocationCheck
+                    | ActivityKind::ReceivedItem
+                    | ActivityKind::StorageDelivery
+            ) && event.timestamp_ms > 0
+                && now_ms.saturating_sub(event.timestamp_ms) < TOAST_LIFETIME_MS
+        })
+        .take(MAX_VISIBLE_TOASTS)
+        .collect()
+}
+
+pub fn toast_alpha(timestamp_ms: u64, now_ms: u64) -> f32 {
+    let age = now_ms.saturating_sub(timestamp_ms);
+    if age >= TOAST_LIFETIME_MS {
+        return 0.0;
+    }
+    let fade_start = TOAST_LIFETIME_MS - TOAST_FADE_MS;
+    if age <= fade_start {
+        1.0
+    } else {
+        (TOAST_LIFETIME_MS - age) as f32 / TOAST_FADE_MS as f32
     }
 }
 
@@ -293,6 +330,43 @@ impl CommandHistory {
 mod tests {
     use super::*;
     use client_ui::{ActivityEvent, LocationTotals, Severity, SnapshotReducer, delivery_headline};
+
+    #[test]
+    fn toast_deck_is_recent_bounded_and_newest_first() {
+        let mut snapshot = ClientSnapshot::default();
+        for (sequence, kind, timestamp_ms) in [
+            (1, ActivityKind::LocationCheck, 1_000),
+            (2, ActivityKind::Message, 2_000),
+            (3, ActivityKind::ReceivedItem, 3_000),
+            (4, ActivityKind::StorageDelivery, 4_000),
+            (5, ActivityKind::LocationCheck, 5_000),
+        ] {
+            snapshot.push_activity(
+                ActivityEvent {
+                    sequence,
+                    kind,
+                    text: sequence.to_string(),
+                    timestamp_ms,
+                },
+                10,
+            );
+        }
+        assert_eq!(
+            toast_events(&snapshot, 5_500)
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [5, 4, 3]
+        );
+        assert!(toast_events(&snapshot, 9_001).is_empty());
+    }
+
+    #[test]
+    fn toast_is_solid_then_fades_during_its_last_second() {
+        assert_eq!(toast_alpha(1_000, 4_000), 1.0);
+        assert!((toast_alpha(1_000, 4_500) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(toast_alpha(1_000, 5_000), 0.0);
+    }
 
     #[test]
     fn every_activity_kind_has_a_distinct_enough_style() {

@@ -17,6 +17,7 @@ json.workspace = true
 serde.workspace = true
 sha2.workspace = true
 windows.workspace = true
+oneshot = { version = "0.2.1", features = ["async", "std"] }
 client-ui = { path = "../client-ui" }
 standalone-windows = { path = "../standalone-windows" }
 

@@ -2,6 +2,12 @@
 
 ### Changed
 
+* **Compact mode now shows real Archipelago pickup toasts.** Sent checks name
+  the scouted item and recipient; completed deliveries name the item and
+  sender. Up to three cards appear newest-first for four seconds and fade
+  without touching check, grant, or acknowledgement semantics. Full mode keeps
+  the same information in its activity feed instead of drawing it twice.
+
 * **Bloodborne auto-upgrade now recognizes randomized Uncanny weapons as the
   player's upgrade target.** The native census still uses an exact weapon
   allowlist, but includes the catalog-backed Uncanny families and reports an
