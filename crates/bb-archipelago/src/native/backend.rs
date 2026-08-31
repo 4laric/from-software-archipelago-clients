@@ -35,6 +35,7 @@ use super::gem_capture::GemCapture;
 use super::guest::GuestRuntime;
 use super::mem::NativeMemory;
 use super::pickup_notification_capture::PickupNotificationCapture;
+use super::save_identity::SaveIdentityTracker;
 use super::shop_capture::ShopCapture;
 use super::vial_capture::VialCapture;
 
@@ -80,6 +81,9 @@ pub struct NativeBackend {
     /// already confirmed, without re-reading the appended log (clients#418).
     shad_log: std::path::PathBuf,
     assumed_context: Option<AssumedContextGate>,
+    save_identity: SaveIdentityTracker,
+    live_identity_candidate: Option<String>,
+    live_identity_ready_reads: u8,
     base: u64,
     /// clients#427: consecutive polls a stack has read as absent, per
     /// normalized id. An absent reading right after a load can be the
@@ -172,31 +176,55 @@ impl NativeBackend {
         let arming = self.arm_event_flags();
         // Disjoint borrows: the readiness gate and the flag accessor are two
         // different fields of `self`.
-        let Self {
-            event_flags,
-            assumed_context,
-            ..
-        } = self;
-        let Some(gate) = assumed_context.as_mut() else {
-            // Normal live mode stays fail-closed until a real save-identity
-            // accessor exists.
-            return Ok(None);
-        };
         if let Err(error) = arming {
-            gate.observe(false);
+            if let Some(gate) = self.assumed_context.as_mut() {
+                gate.observe(false);
+            }
+            self.save_identity.clear();
+            self.live_identity_candidate = None;
+            self.live_identity_ready_reads = 0;
             return Err(error);
         }
-        let Some(flags) = event_flags.armed_mut() else {
+        let Some(flags) = self.event_flags.armed_mut() else {
             // Waiting for the game to finish loading: not gameplay-ready, which
             // is exactly what the existing send-gate consumes
             // (`require_runtime_context` -> Ok(None) -> no checks, no sends).
-            return Ok(Some(gate.observe(false)));
+            self.save_identity.clear();
+            self.live_identity_candidate = None;
+            self.live_identity_ready_reads = 0;
+            return Ok(self
+                .assumed_context
+                .as_mut()
+                .map(|gate| gate.observe(false)));
         };
         if let Err(error) = flags.probe_manager_resilient() {
-            gate.observe(false);
+            if let Some(gate) = self.assumed_context.as_mut() {
+                gate.observe(false);
+            }
+            self.save_identity.clear();
+            self.live_identity_candidate = None;
+            self.live_identity_ready_reads = 0;
             return Err(error);
         }
-        Ok(Some(gate.observe(true)))
+        if let Some(gate) = self.assumed_context.as_mut() {
+            return Ok(Some(gate.observe(true)));
+        }
+
+        let Some(identity) = self.save_identity.poll()? else {
+            self.live_identity_candidate = None;
+            self.live_identity_ready_reads = 0;
+            return Ok(None);
+        };
+        if self.live_identity_candidate.as_deref() == Some(identity.as_str()) {
+            self.live_identity_ready_reads = self.live_identity_ready_reads.saturating_add(1);
+        } else {
+            self.live_identity_candidate = Some(identity.clone());
+            self.live_identity_ready_reads = 1;
+        }
+        Ok(Some(LocationContext {
+            save_identity: identity,
+            gameplay_ready: self.live_identity_ready_reads >= ASSUMED_CONTEXT_STABLE_READS,
+        }))
     }
 
     /// Retry the pending event-flag attach at the already-confirmed base.
@@ -312,11 +340,15 @@ impl NativeBackend {
         };
         let guest = GuestRuntime::new(memory, base)?;
         let delivery = NativeDelivery::new(guest, contract.descriptor, contract.policy);
+        let save_identity = SaveIdentityTracker::after_current_log(shad_log)?;
         Ok(Self {
             delivery,
             event_flags,
             shad_log: shad_log.to_owned(),
             assumed_context: assumed_identity.map(AssumedContextGate::new),
+            save_identity,
+            live_identity_candidate: None,
+            live_identity_ready_reads: 0,
             base,
             absent_observations: std::collections::HashMap::new(),
             last_context: GrantContext::default(),

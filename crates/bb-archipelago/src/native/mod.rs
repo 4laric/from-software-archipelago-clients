@@ -32,6 +32,7 @@ pub mod install;
 pub mod item_grant_probe;
 pub mod mem;
 pub mod pickup_notification_capture;
+pub mod save_identity;
 pub mod shop_capture;
 pub mod threads;
 pub mod vial_capture;
