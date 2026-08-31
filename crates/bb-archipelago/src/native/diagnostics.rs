@@ -26,10 +26,10 @@
 //!   piece of client state the loop already tracks. There is no probe here.
 //! * **Never a new failure mode.** A write failure is swallowed after one
 //!   warning. Diagnostics that can park a grant are worse than no diagnostics.
-//! * **Inferred is inferred.** [`DeliveryRecord::inferred_destination`] is
-//!   named for what it is. The client cannot read Bloodborne's storage box, so
-//!   `storage_suspected` is a hypothesis consistent with the arithmetic, never
-//!   an observation. Nothing downstream may present it as ground truth.
+//! * **Inferred is inferred except where play validated the exact shape.**
+//!   The client cannot read Bloodborne's storage box, so `storage_suspected`
+//!   remains a hypothesis. `storage` is reserved for the insert deficit that a
+//!   player subsequently confirmed in the storage box (clients#445).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -120,7 +120,10 @@ pub struct DeliveryRecord {
 /// * `"held"` -- the held stack accounts for the delta: the last read-back is
 ///   at least `expected_after`. A surplus is the clients#443 concurrent pickup,
 ///   which is still the held stack absorbing the grant.
-/// * `"storage_suspected"` -- the cave provably executed (clients#443's
+/// * `"storage"` -- an insert completed but never appeared in held inventory.
+///   Oz's clients#445 capture confirmed that exact shape in the Hunter's Dream
+///   storage box, so this one outcome is player-validated rather than inferred.
+/// * `"storage_suspected"` -- a delta cave provably executed (clients#443's
 ///   evidence predicate) and the held stack still came in *under*
 ///   `expected_after`. A capped pouch overflowing into storage produces exactly
 ///   this shape. So does a concurrent spend in the same window; the client
@@ -140,6 +143,8 @@ pub fn infer_destination(is_success: bool, trace: &GrantTrace) -> &'static str {
     };
     if actual >= wanted {
         "held"
+    } else if trace.lane == Some("insert") && trace.execution_evidence {
+        "storage"
     } else if trace.execution_evidence {
         "storage_suspected"
     } else {
@@ -397,9 +402,18 @@ mod tests {
 
     #[test]
     fn an_executed_deficit_is_inferred_storage_suspected() {
-        let trace = trace_with(&[Some(5)], Some(7), true);
+        let mut trace = trace_with(&[Some(5)], Some(7), true);
+        trace.lane = Some("delta");
         assert_eq!(infer_destination(true, &trace), "storage_suspected");
         assert_eq!(trace.readback_surplus(), Some(-2));
+    }
+
+    #[test]
+    fn a_player_confirmed_insert_deficit_is_named_storage() {
+        let mut trace = trace_with(&[Some(0)], Some(1), true);
+        trace.lane = Some("insert");
+        trace.native_result = Some(2);
+        assert_eq!(infer_destination(true, &trace), "storage");
     }
 
     #[test]

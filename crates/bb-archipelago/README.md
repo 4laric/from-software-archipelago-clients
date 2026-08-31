@@ -214,13 +214,14 @@ destination so release-flood and sticky-overflow hypotheses can be tested from
 an ordinary playthrough. **No extra read of the game is performed for
 it**, and a failure to write the file warns once and never touches a delivery.
 
-One field is an inference and is named as one: `inferred_destination` is
-`held` when the read-back arithmetic accounts for the delta in the held stack,
-`storage_suspected` when the cave provably executed (clients#443's evidence
-predicate) and the held stack still came in under the expected total, and
-`unknown` otherwise. The client cannot read Bloodborne's storage box; a
-concurrent spend and an overflow into storage are indistinguishable to it, so
-`storage_suspected` is a hypothesis consistent with the numbers, never a
+`inferred_destination` is `held` when the read-back arithmetic accounts for the
+grant in the held stack. It is `storage` for the player-validated insert shape:
+ItemGrant completed but the inserted goods never appeared in held inventory,
+and the player confirmed the item in the Hunter's Dream storage box. A delta
+that executes while the held total remains short is still
+`storage_suspected`: the client cannot distinguish capped overflow from a
+concurrent spend. `unknown` covers every other shape. Thus only `storage` is a
+confirmed destination; `storage_suspected` remains a hypothesis, never a
 measurement.
 
 `tools/summarize_delivery_diagnostics.py <file>` groups the records by item,
