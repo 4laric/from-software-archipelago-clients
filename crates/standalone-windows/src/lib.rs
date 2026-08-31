@@ -145,6 +145,12 @@ pub fn render_snapshot(snapshot: &client_ui::ClientSnapshot) -> String {
             snapshot.ledger.parked
         ),
     ];
+    if let Some(locations) = &snapshot.locations {
+        lines.push(format!(
+            "Checks: {} / {}",
+            locations.checked, locations.total
+        ));
+    }
     if snapshot.stale {
         lines.push("WARNING: client state is stale".to_owned());
     }
@@ -579,12 +585,17 @@ mod tests {
             delivery: client_ui::DeliveryState::Blocked,
             server: Some("archipelago.gg:12345".into()),
             slot: Some("hunter".into()),
+            locations: Some(client_ui::LocationTotals {
+                checked: 42,
+                total: 166,
+            }),
             stale: true,
             ..Default::default()
         };
         let rendered = render_snapshot(&snapshot);
         assert!(rendered.contains("Game: Attached  |  AP: Authenticated"));
         assert!(rendered.contains("Delivery: Blocked"));
+        assert!(rendered.contains("Checks: 42 / 166"));
         assert!(rendered.contains("state is stale"));
     }
 

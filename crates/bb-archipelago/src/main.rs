@@ -847,6 +847,9 @@ fn run() -> Result<()> {
     // point where `ClientLoop::new` would otherwise infer it.
     let mut runtime: Option<ClientLoop<Backend>> = None;
     let mut goal_location = None;
+    let mut goal_name = None;
+    let mut location_ids = HashSet::new();
+    let mut checked_location_count = 0_u32;
     let mut goal_reported = false;
     let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
@@ -1111,6 +1114,17 @@ fn run() -> Result<()> {
                 client_eprintln!("{notice}");
             }
             goal_location = seed_config.goal_location;
+            goal_name = goal_location.map(|location| {
+                client.this_game().location(location).map_or_else(
+                    || format!("Location {location}"),
+                    |location| location.name().to_string(),
+                )
+            });
+            location_ids = seed_config
+                .locations
+                .iter()
+                .map(|location| location.ap_location_id)
+                .collect();
             let mut new_runtime = ClientLoop::new(
                 backend.take().context("backend was already initialized")?,
                 seed_config,
@@ -1224,6 +1238,7 @@ fn run() -> Result<()> {
                 .server_checked_locations()
                 .map(|location| location.id())
                 .collect::<HashSet<_>>();
+            checked_location_count = checked.intersection(&location_ids).count() as u32;
             if !goal_reported && goal_location.is_some_and(|goal| checked.contains(&goal)) {
                 client.set_status(ClientStatus::Goal)?;
                 goal_reported = true;
@@ -1422,7 +1437,11 @@ fn run() -> Result<()> {
                 server: Some(args.server.clone()),
                 slot: Some(args.slot.clone()),
                 seed,
-                goal: goal_location.map(|location| format!("Location {location}")),
+                goal: goal_name.clone(),
+                locations: (!location_ids.is_empty()).then_some(client_ui::LocationTotals {
+                    checked: checked_location_count,
+                    total: location_ids.len() as u32,
+                }),
                 ledger,
                 ..Default::default()
             }));
