@@ -1,7 +1,7 @@
 {
   "format": "bb-native-grant-contract-v5",
   "harness": "bb-native-grant-v7",
-  "build": "bb-0.1.0-r8",
+  "build": "bb-0.1.0-r9",
   "bridge_protocol": "BBGRANT1",
   "target": {
     "serial": "CUSA03173",
@@ -37,6 +37,14 @@
       "return_rva": 29354121,
       "provenance": "validated",
       "note": "runs every frame; drives a zero-delta update on the Bullet stack so the consume hook fires without player input. Its patch window is the atomicity hazard."
+    },
+    {
+      "name": "hp_capture",
+      "rva": 29345271,
+      "original_bytes": "8B 97 F8 00 00 00",
+      "return_rva": 29345277,
+      "provenance": "published",
+      "note": "captures the validated player status pointer; incoming DeathLink writes current HP at +0xF8"
     }
   ],
   "native_routines": [
@@ -187,6 +195,12 @@
         "name": "descriptor",
         "rva": 84786784,
         "width": 32
+      },
+      {
+        "name": "player_status",
+        "rva": 84786480,
+        "width": 8,
+        "note": "latest RDI observed at the HP hook; current HP is player_status+0xF8"
       }
     ],
     "provenance": "validated"
@@ -217,6 +231,13 @@
       "note": "hook originals are validated; zeroed cave regions are an unused-space claim"
     },
     {
+      "name": "hp_hook",
+      "rva": 29345271,
+      "bytes": "8B 97 F8 00 00 00",
+      "provenance": "published",
+      "note": "instruction observed by the validated HP capture table; install fails closed until it matches the live image"
+    },
+    {
       "name": "consume_cave",
       "rva": 84785664,
       "bytes": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
@@ -229,6 +250,13 @@
       "bytes": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
       "provenance": "observed",
       "note": "hook originals are validated; zeroed cave regions are an unused-space claim"
+    },
+    {
+      "name": "hp_cave",
+      "rva": 84786432,
+      "bytes": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "provenance": "inferred",
+      "note": "spare gap between the heartbeat cave and state region; a mismatch refuses the native install"
     },
     {
       "name": "state_region",
@@ -327,6 +355,15 @@
         "note": "idle-heartbeat detour cave"
       },
       {
+        "name": "hp_cave",
+        "rva": 84786432,
+        "size": 56,
+        "bytes": "48893D290000008B97F8000000E9EB08B2FC0000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "relocations": [],
+        "provenance": "inferred",
+        "note": "capture RDI, replay mov edx,[rdi+F8], return; pointer cell is at cave+0x30"
+      },
+      {
         "name": "consume_detour",
         "rva": 21861749,
         "size": 7,
@@ -343,6 +380,15 @@
         "relocations": [],
         "provenance": "validated",
         "note": "E9 rel32 + NOP pad over the original"
+      },
+      {
+        "name": "hp_detour",
+        "rva": 29345271,
+        "size": 6,
+        "bytes": "E904F74D0390",
+        "relocations": [],
+        "provenance": "inferred",
+        "note": "E9 rel32 + NOP over the HP read"
       }
     ]
   },

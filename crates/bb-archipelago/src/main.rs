@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::BufRead;
@@ -325,6 +325,14 @@ impl BloodborneBackend for Backend {
         }
     }
 
+    fn death_link_kill(&mut self) -> Result<bool> {
+        match self {
+            Self::Live(backend) => backend.death_link_kill(),
+            Self::Mock(backend) => backend.death_link_kill(),
+            Self::Native(backend) => backend.death_link_kill(),
+        }
+    }
+
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress> {
         match self {
             Self::Live(backend) => backend.equip_item(request),
@@ -411,7 +419,7 @@ struct Arguments {
     window_opacity: u8,
 }
 
-const DEFAULT_WINDOW_OPACITY: u8 = 85;
+const DEFAULT_WINDOW_OPACITY: u8 = 70;
 
 fn parse_window_opacity(value: &str) -> Result<u8> {
     let percent: u8 = value
@@ -429,8 +437,8 @@ fn apply_console_opacity(percent: u8) -> Result<()> {
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::System::Console::GetConsoleWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetWindowLongW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongW,
-        WS_EX_LAYERED,
+        GWL_EXSTYLE, GetWindowLongW, IsWindowVisible, LWA_ALPHA, SetLayeredWindowAttributes,
+        SetWindowLongW, WS_EX_LAYERED,
     };
 
     if percent == 100 {
@@ -440,6 +448,10 @@ fn apply_console_opacity(percent: u8) -> Result<()> {
     anyhow::ensure!(
         !window.0.is_null(),
         "this client does not own a console window"
+    );
+    anyhow::ensure!(
+        unsafe { IsWindowVisible(window) }.as_bool(),
+        "the console is hosted by a terminal that controls its own opacity"
     );
     let style = unsafe { GetWindowLongW(window, GWL_EXSTYLE) };
     unsafe { SetWindowLongW(window, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as i32) };
@@ -801,11 +813,16 @@ fn run() -> Result<()> {
         logging::install_log_file(path)
             .with_context(|| format!("could not open the client log {}", path.display()))?;
     }
-    if let Err(error) = apply_console_opacity(args.window_opacity) {
-        client_eprintln!(
+    match apply_console_opacity(args.window_opacity) {
+        Ok(()) if args.window_opacity < 100 => client_eprintln!(
+            "Client console opacity: {}% (use --window-opacity 35-100 to adjust)",
+            args.window_opacity
+        ),
+        Err(error) => client_eprintln!(
             "WARNING: could not make the client window {}% opaque: {error:#}",
             args.window_opacity
-        );
+        ),
+        Ok(()) => {}
     }
     let _ledger_lock = LedgerLock::acquire(&args.ledger)?;
     client_eprintln!(
@@ -929,6 +946,9 @@ fn run() -> Result<()> {
     let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut item_errors = ItemErrorReporter::default();
+    let mut death_link_tag_advertised = false;
+    let mut pending_death_links: VecDeque<(String, Option<String>)> = VecDeque::new();
+    let mut last_death_link_error: Option<String> = None;
 
     // A deliberately small, offline-capable rescue surface. stdin lives on a
     // reader thread so a disconnected AP socket never makes the console hang.
@@ -1022,6 +1042,7 @@ fn run() -> Result<()> {
             match event {
                 Event::Connected => {
                     connected_now = true;
+                    death_link_tag_advertised = false;
                     // The one recovery line, for the first connect and every
                     // reconnect alike (clients#423): `ReconnectPolicy` prints
                     // none of its own, so this is never doubled.
@@ -1031,6 +1052,9 @@ fn run() -> Result<()> {
                 Event::Error(error) => {
                     ap_error_seen = true;
                     client_eprintln!("Archipelago error: {error}");
+                }
+                Event::DeathLink { source, cause, .. } => {
+                    pending_death_links.push_back((source, cause));
                 }
                 _ => {}
             }
@@ -1174,6 +1198,40 @@ fn run() -> Result<()> {
                 Err(error) => eprintln!("Re-queuing parked items failed: {error:#}"),
             }
             runtime = Some(new_runtime);
+        }
+
+        if !death_link_tag_advertised
+            && runtime.as_ref().is_some_and(ClientLoop::death_link_enabled)
+            && let Some(client) = connection.client_mut()
+        {
+            client.update_connection(None, Some(["DeathLink"]))?;
+            death_link_tag_advertised = true;
+            client_eprintln!(
+                "DeathLink receive is enabled; outbound Bloodborne deaths remain disabled pending live signal validation."
+            );
+        }
+
+        if let (Some(runtime), Some((source, cause))) =
+            (runtime.as_mut(), pending_death_links.front())
+        {
+            match runtime.receive_death_link() {
+                Ok(true) => {
+                    client_eprintln!(
+                        "DeathLink received from {source}: {}",
+                        cause.as_deref().unwrap_or("linked death")
+                    );
+                    pending_death_links.pop_front();
+                    last_death_link_error = None;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if last_death_link_error.as_deref() != Some(&message) {
+                        client_eprintln!("DeathLink kill unavailable: {message}");
+                        last_death_link_error = Some(message);
+                    }
+                }
+            }
         }
 
         if let (Some(runtime), Some(client)) = (runtime.as_mut(), connection.client_mut()) {
@@ -1507,7 +1565,7 @@ mod tests {
     #[test]
     fn client_window_is_translucent_by_default() {
         let args = parse_args(base_args(&[]).into_iter()).expect("parse");
-        assert_eq!(args.window_opacity, 85);
+        assert_eq!(args.window_opacity, 70);
     }
 
     #[test]
