@@ -1046,7 +1046,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{LocationContext, MockBackend};
+    use crate::backend::{
+        EquipRequest, ItemGrant, LocationContext, MockBackend, OperationProgress, StackObservation,
+    };
     use crate::config::{
         DescriptorEvidence, FeedEffectBinding, LocationBinding, RuntimeItemBinding,
         TEST_PEBBLE_EVENT_FLAG,
@@ -1097,6 +1099,69 @@ mod tests {
             location_check_debounce: 3,
             mock_set_flags: vec![],
             goal_location: None,
+        }
+    }
+
+    /// Production-loop regression backend for clients#291. Only the target
+    /// census differs from `MockBackend`: it resolves actual Bloodborne
+    /// EquipParamWeapon ids through the same classifier as the native guest.
+    struct InventoryTargetBackend {
+        inner: MockBackend,
+        held_weapon_ids: Vec<u32>,
+    }
+
+    impl BloodborneBackend for InventoryTargetBackend {
+        fn location_context(&mut self) -> Result<Option<LocationContext>> {
+            self.inner.location_context()
+        }
+
+        fn read_event_flag(&mut self, event_flag: u32) -> Result<Option<bool>> {
+            self.inner.read_event_flag(event_flag)
+        }
+
+        fn target_weapon_level(&mut self) -> Result<Option<u8>> {
+            Ok(self
+                .held_weapon_ids
+                .iter()
+                .filter_map(|id| crate::native::guest::weapon_reinforcement_level(*id))
+                .max())
+        }
+
+        fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
+            self.inner.grant_item(grant)
+        }
+
+        fn observe_stack_quantity(
+            &mut self,
+            normalized_item_id: u32,
+            reinforcement_level: Option<u8>,
+        ) -> Result<StackObservation> {
+            self.inner
+                .observe_stack_quantity(normalized_item_id, reinforcement_level)
+        }
+
+        fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
+            self.inner.grant_may_have_applied(tag)
+        }
+
+        fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress> {
+            self.inner.equip_item(request)
+        }
+
+        fn death_link_kill(&mut self) -> Result<bool> {
+            self.inner.death_link_kill()
+        }
+
+        fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
+            self.inner.withdraw_unwitnessed_grant(tag)
+        }
+
+        fn read_save_watermark(&mut self) -> Result<Option<u64>> {
+            self.inner.read_save_watermark()
+        }
+
+        fn write_save_watermark(&mut self, cursor: u64) -> Result<bool> {
+            self.inner.write_save_watermark(cursor)
         }
     }
 
@@ -2483,6 +2548,62 @@ mod tests {
         assert_eq!(client.backend().grants[0].reinforcement_level, Some(6));
         assert_eq!(client.backend().equips[0].reinforcement_level, Some(6));
         assert_eq!(client.backend().equips[0].target, EquipTarget::RightHand(0));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn held_whirligig_plus_seven_raises_a_different_weapon_family() {
+        let ledger_path = path();
+        let mut runtime_config = config();
+        runtime_config.auto_upgrade = true;
+        runtime_config.items.insert(
+            3000,
+            RuntimeItemBinding {
+                // Ludwig's Holy Blade +0: deliberately unrelated to Whirligig.
+                raw_descriptor: 0x807B_98A0,
+                normalized_item_id: 8_100_000,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
+                quantity: 1,
+                reinforcement_level: Some(0),
+                feed_effect: FeedEffectBinding::RightHandWeapon,
+            },
+        );
+        let backend = InventoryTargetBackend {
+            inner: MockBackend::default(),
+            held_weapon_ids: vec![31_000_700], // Whirligig Saw +7
+        };
+        let mut client = ClientLoop::new(
+            backend,
+            runtime_config,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            "seed",
+            "slot",
+        );
+
+        let result = client
+            .poll_items(&[IncomingItem {
+                index: 0,
+                ap_item_id: 3000,
+            }])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            ItemPollResult::Completed(CompletedItem {
+                index: 0,
+                ap_item_id: 3000,
+                received_level: Some(0),
+                target_level: Some(7),
+                delivered_level: Some(7),
+                equip_target: None,
+            })
+        );
+        assert_eq!(
+            client.backend().inner.grants[0].reinforcement_level,
+            Some(7)
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 

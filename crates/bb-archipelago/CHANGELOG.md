@@ -2,6 +2,13 @@
 
 ### Changed
 
+* **Bloodborne auto-upgrade now recognizes randomized Uncanny weapons as the
+  player's upgrade target.** The native census still uses an exact weapon
+  allowlist, but includes the catalog-backed Uncanny families and reports an
+  unrecognized/empty census as unknown rather than a misleading +0. A
+  production-loop regression carries a held Whirligig Saw +7 across families
+  to a received Ludwig's Holy Blade.
+
 * **Native-only delivery (clients#526).** Removed the live command-file backend,
   bridge-root configuration, startup probes, and backend selector. Legacy
   `--delivery=ce-bridge` launch plans now stop with an explicit migration error.
