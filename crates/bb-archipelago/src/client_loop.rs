@@ -155,6 +155,19 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         &mut self.backend
     }
 
+    pub fn death_link_enabled(&self) -> bool {
+        self.config.death_link
+    }
+
+    /// Attempt one queued incoming DeathLink. `false` keeps it queued while
+    /// the player is loading or before the HP capture hook has fired.
+    pub fn receive_death_link(&mut self) -> Result<bool> {
+        if !self.config.death_link {
+            return Ok(false);
+        }
+        self.backend.death_link_kill()
+    }
+
     /// The AP seed this runtime (and every ledger row it touches) is bound to.
     /// clients#423 compares it against a reconnect's slot data: landing on a
     /// regenerated seed must refuse, not continue on stale bindings.
@@ -919,6 +932,7 @@ mod tests {
             items: HashMap::from([(2000, goods())]),
             auto_upgrade: false,
             auto_equip: false,
+            death_link: false,
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,
