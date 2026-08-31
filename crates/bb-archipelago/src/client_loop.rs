@@ -82,6 +82,16 @@ pub enum SustainPollResult {
     Completed(i64),
 }
 
+/// Seed-owned outbound DeathLink policy decision. Detection and broadcast are
+/// intentionally separate from this durable state machine: Bloodborne does
+/// not enable either until its local-death signal is live-validated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeathLinkAmnestyDecision {
+    Disabled,
+    Forgiven { used: u32, allowance: u32 },
+    Send,
+}
+
 pub struct ClientLoop<B> {
     backend: B,
     config: RuntimeConfig,
@@ -170,6 +180,33 @@ impl<B: BloodborneBackend> ClientLoop<B> {
 
     pub fn death_link_enabled(&self) -> bool {
         self.config.death_link
+    }
+
+    pub fn death_link_amnesty(&self) -> u32 {
+        self.config.death_link_amnesty
+    }
+
+    /// Record one qualifying *local* death and persist the decision before it
+    /// can be reported or broadcast. Incoming DeathLinks never call this
+    /// method and therefore cannot consume local amnesty.
+    pub fn record_qualifying_local_death(&mut self) -> Result<DeathLinkAmnestyDecision> {
+        if !self.config.death_link {
+            return Ok(DeathLinkAmnestyDecision::Disabled);
+        }
+        let allowance = self.config.death_link_amnesty;
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        let decision = if slot.death_link_amnesty_used < allowance {
+            slot.death_link_amnesty_used += 1;
+            DeathLinkAmnestyDecision::Forgiven {
+                used: slot.death_link_amnesty_used,
+                allowance,
+            }
+        } else {
+            slot.death_link_amnesty_used = 0;
+            DeathLinkAmnestyDecision::Send
+        };
+        self.ledger.save(&self.ledger_path)?;
+        Ok(decision)
     }
 
     /// Attempt one queued incoming DeathLink. `false` keeps it queued while
@@ -1053,6 +1090,7 @@ mod tests {
             auto_equip: false,
             death_link: false,
             pickup_notification_probe: false,
+            death_link_amnesty: 0,
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,
@@ -3259,5 +3297,134 @@ mod tests {
         ));
         assert_eq!(client.backend().grants[0].expected_before, 20);
         std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn death_link_amnesty_zero_sends_every_qualifying_local_death() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.death_link = true;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Send
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Send
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn death_link_amnesty_cycles_and_survives_a_restart() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.death_link = true;
+        cfg.death_link_amnesty = 2;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg.clone(),
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Forgiven {
+                used: 1,
+                allowance: 2
+            }
+        );
+
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        let mut reloaded = loop_with(MockBackend::default(), persisted, ledger_path.clone(), cfg);
+        assert_eq!(
+            reloaded.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Forgiven {
+                used: 2,
+                allowance: 2
+            }
+        );
+        assert_eq!(
+            reloaded.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Send
+        );
+        assert_eq!(
+            reloaded.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Forgiven {
+                used: 1,
+                allowance: 2
+            }
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn death_link_amnesty_one_forgives_then_sends() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.death_link = true;
+        cfg.death_link_amnesty = 1;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Forgiven {
+                used: 1,
+                allowance: 1
+            }
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Send
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn incoming_death_link_does_not_consume_local_amnesty() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.death_link = true;
+        cfg.death_link_amnesty = 1;
+        let mut ledger = ReceiveLedger::default();
+        ledger.slot_mut("seed", "slot").death_link_amnesty_used = 1;
+        let mut client = loop_with(MockBackend::default(), ledger, ledger_path, cfg);
+        client.receive_death_link().unwrap();
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .death_link_amnesty_used,
+            1
+        );
+    }
+
+    #[test]
+    fn disabled_death_link_never_mutates_or_persists_amnesty() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.death_link_amnesty = 3;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Disabled
+        );
+        assert!(!ledger_path.exists());
     }
 }
