@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "crates/archipelago-rs",
     "crates/bb-archipelago",
+    "crates/client-ui",
     "crates/ds3-archipelago",
     "crates/sdt-archipelago",
     "crates/shared",
+    "crates/standalone-windows",
     # --- Elden Ring (DRAFT) -------------------------------------------------
     # Alaric's Phase-5 ER runtime client + its two pure-logic crates.
     # Not yet converged onto `shared`; see the PR description for the WIP list.
