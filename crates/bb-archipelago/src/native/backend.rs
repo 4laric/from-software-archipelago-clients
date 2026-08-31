@@ -354,6 +354,11 @@ impl BloodborneBackend for NativeBackend {
             },
             event_flags_armed: self.event_flags.is_armed(),
         };
+        if !matches!(&result, Ok(Some(context)) if context.gameplay_ready) {
+            // A pointer captured before a load is not permission to kill the
+            // next character. The hook repopulates it on the next live HP read.
+            let _ = self.delivery.runtime_mut().clear_player_status();
+        }
         result
     }
 
@@ -449,6 +454,19 @@ impl BloodborneBackend for NativeBackend {
             request.target,
             request.tag
         )
+    }
+
+    fn death_link_kill(&mut self) -> Result<bool> {
+        // Use the same gameplay/save gate as every other mutation. A stale HP
+        // pointer during a load is never permission to write.
+        if !self
+            .location_context_inner()?
+            .is_some_and(|context| context.gameplay_ready)
+        {
+            let _ = self.delivery.runtime_mut().clear_player_status();
+            return Ok(false);
+        }
+        self.delivery.runtime_mut().death_link_kill()
     }
 
     fn withdraw_unwitnessed_grant(&mut self, _tag: &str) -> Result<bool> {

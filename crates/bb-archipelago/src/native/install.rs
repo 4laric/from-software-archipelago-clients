@@ -193,6 +193,7 @@ fn detour_hook_name(detour_name: &str) -> &str {
     match detour_name {
         "consume_detour" => "consume_return",
         "heartbeat_detour" => "idle_heartbeat",
+        "hp_detour" => "hp_capture",
         other => other,
     }
 }
