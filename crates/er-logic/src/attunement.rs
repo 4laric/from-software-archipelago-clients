@@ -8,9 +8,8 @@
 //! flag-poll baseline replays keep hitting), NOT from live event flags. The client feeds the member
 //! id set + a `checked` closure over the server set; this module just counts and thresholds.
 //!
-//! Boss payout (the boss's own check + its dungeon-sweep members) is DEFERRED while the region is
-//! un-attuned and burst-released the moment it attunes; [`newly_attuned`] is the once-only edge the
-//! caller latches for the attunement bloom (grace reveal) and the release banner.
+//! Boss payout is deliberately outside this module: #1006 made AP LocationCheck sends immediate.
+//! [`newly_attuned`] is only the once-only edge for the grace bloom and its banner.
 
 use std::collections::HashSet;
 
@@ -25,7 +24,7 @@ pub fn attuned(members: &HashSet<i64>, threshold: u32, checked: impl Fn(i64) -> 
     attuned_count(members, checked) >= threshold
 }
 
-/// Rising-edge detector for the once-only attunement bloom / release: `true` only on the
+/// Rising-edge detector for the once-only attunement bloom: `true` only on the
 /// un-attuned -> attuned transition. Idempotent-safe for reconnect replay -- when `prev` is already
 /// `true` (attuned in a prior session and re-derived from the replayed server set) this is `false`,
 /// so the bloom + banner never re-fire. A `true -> false` drop (not expected from a monotonic

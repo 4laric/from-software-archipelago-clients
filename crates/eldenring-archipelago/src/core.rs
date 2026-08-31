@@ -328,9 +328,6 @@ pub struct Core {
     /// ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker): per-region gate data
     /// {threshold, member_ap_ids, bloom_flags}. Empty => feature off. Parsed once per seed.
     region_attunement: HashMap<String, RegionAttunement>,
-    /// Per-region DEFERRED boss-payout checks: a boss killed while its region is not yet attuned has
-    /// its checks (boss + sweep members) held here, burst-released the poll the region attunes.
-    boss_payout_pending: HashMap<String, HashSet<i64>>,
     /// Regions whose attunement bloom has already fired this save (once-only grace-reveal latch).
     attuned_regions: HashSet<String>,
     /// Bloom baseline primed (first in-world poll): suppresses re-bannering already-attuned regions.
@@ -823,7 +820,6 @@ impl shared::Core for Core {
             icon_override_warned: false,
             save_backup_warned: false,
             region_attunement: HashMap::new(),
-            boss_payout_pending: HashMap::new(),
             attuned_regions: HashSet::new(),
             attunement_primed: false,
             boss_key_pending: HashMap::new(),
@@ -3519,36 +3515,14 @@ impl shared::Core for Core {
                     );
                 }
             }
-            // ATTUNEMENT-RELEASE (attunement_gate, SPEC-gf-boss-lock-tracker "Attunement-release"):
-            // gate the BOSS PAYOUT -- the boss's own check + every dungeon-sweep member -- behind the
-            // region's in-region attunement. Ordinary in-region pickups (which BUILD attunement) are
-            // never gated. `to_check` already holds this poll's candidates; partition out any payout
-            // check whose region is not yet attuned (DEFER into boss_payout_pending), then burst-
-            // release a region's held checks the poll it crosses the threshold. Attunement counts from
-            // the SERVER checked set (valid_locations pre-filter, then is_local_location_checked) so it
-            // survives save-load / reconnect / re-snapshot. Empty regionAttunement => whole block off.
+            // ATTUNEMENT BLOOM (attunement_gate, SPEC-gf-boss-lock-tracker): attunement is
+            // presentation/progression bookkeeping only. It must never delay LocationCheck sends.
+            // In Seamless Co-op, a guest legitimately kills bosses on the host's ground before the
+            // guest slot is attuned; the old payout hold accumulated those checks until a later boss
+            // tipped the threshold, producing the reported flood. `to_check` now remains untouched.
             if !self.region_attunement.is_empty() {
-                // Payout checks = boss's own check (boss_ap_id) + every dungeon-sweep member (both the
-                // location-keyed and the flag-keyed sweep tables). Cheap to rebuild at the 15-tick throttle.
-                let mut payout_locs: HashSet<i64> = HashSet::new();
-                for d in &self.boss_defs {
-                    if d.boss_ap_id != 0 {
-                        payout_locs.insert(d.boss_ap_id);
-                    }
-                }
-                for members in self.dungeon_sweeps.values() {
-                    payout_locs.extend(members.iter().copied());
-                }
-                if let Some(fp) = self.flag_poll.as_ref() {
-                    for locs in fp.sweep_flags.values() {
-                        payout_locs.extend(locs.iter().copied());
-                    }
-                }
-                // Attunement state per region + partition to_check, computed under ONE immutable client
-                // borrow into owned locals (so self can be mutated after the borrow ends).
+                // Attunement state per region, computed under one immutable client borrow.
                 let mut att_state: HashMap<String, (u32, u32, bool)> = HashMap::new(); // region -> (count, threshold, attuned)
-                let mut kept: Vec<i64> = Vec::with_capacity(to_check.len());
-                let mut deferred_new: Vec<(String, i64)> = Vec::new();
                 if let Some(client) = self.client() {
                     let checked = |m: i64| {
                         self.valid_locations.contains(&m) && client.is_local_location_checked(m)
@@ -3560,52 +3534,12 @@ impl shared::Core for Core {
                             (count, att.threshold, count >= att.threshold),
                         );
                     }
-                    for &loc in &to_check {
-                        if payout_locs.contains(&loc)
-                            && let Some(region) = self.region_table.get(&(loc as u64))
-                            && let Some(&(_, _, attuned)) = att_state.get(region)
-                            && !attuned
-                        {
-                            deferred_new.push((region.clone(), loc));
-                            continue;
-                        }
-                        kept.push(loc);
-                    }
                 }
-                to_check = kept;
-
-                // Record newly-deferred payout checks (per-region debt); banner only the growth.
-                let mut newly_sealed: BTreeMap<String, usize> = BTreeMap::new();
-                for (region, loc) in deferred_new {
-                    if self
-                        .boss_payout_pending
-                        .entry(region.clone())
-                        .or_default()
-                        .insert(loc)
-                    {
-                        *newly_sealed.entry(region).or_default() += 1;
-                    }
-                }
-
-                // Burst-release: a region attuned this poll drains its held checks back into to_check
-                // (the existing mark below sends them). Re-evaluation would re-produce them too, but the
-                // explicit drain gives the release banner its count and is robust to a missed re-poll.
                 let attuned_regions_now: Vec<String> = att_state
                     .iter()
                     .filter(|(_, v)| v.2)
                     .map(|(r, _)| r.clone())
                     .collect();
-                let mut released: BTreeMap<String, usize> = BTreeMap::new();
-                for region in &attuned_regions_now {
-                    if let Some(pending) = self.boss_payout_pending.get_mut(region)
-                        && !pending.is_empty()
-                    {
-                        let n = pending.len();
-                        to_check.extend(pending.iter().copied());
-                        pending.clear();
-                        released.insert(region.clone(), n);
-                    }
-                }
 
                 // Attunement bloom: light each newly-attuned region's graces once (latch in
                 // attuned_regions, reset on seed change). Collect flags/banners first (immutable
@@ -3631,23 +3565,9 @@ impl shared::Core for Core {
 
                 // Banners (suppressed until primed so a reconnect's already-known state stays quiet).
                 if self.attunement_primed && crate::flags::in_world() {
-                    for (region, n) in newly_sealed {
-                        let (cur, thr) = att_state
-                            .get(&region)
-                            .map(|&(c, t, _)| (c, t))
-                            .unwrap_or((0, 0));
-                        self.log(ap::Print::message(format!(
-                            "Boss felled -- {n} check(s) sealed; attune {cur}/{thr} {region}"
-                        )));
-                    }
                     for region in &crossed {
                         self.log(ap::Print::message(format!(
                             "Attuned to {region} -- all graces revealed."
-                        )));
-                    }
-                    for (region, n) in released {
-                        self.log(ap::Print::message(format!(
-                            "Attunement reached -- {n} sealed check(s) released in {region}."
                         )));
                     }
                 }
@@ -5172,7 +5092,6 @@ impl Core {
         // ATTUNEMENT-RELEASE: drop the parsed gate + all per-save latches so the new seed re-parses
         // regionAttunement and re-primes / re-blooms from scratch.
         self.region_attunement.clear();
-        self.boss_payout_pending.clear();
         self.attuned_regions.clear();
         self.attunement_primed = false;
         // BOSS KEYS (mode B): drop the deferred own-check latch + its prime flag so the new seed
