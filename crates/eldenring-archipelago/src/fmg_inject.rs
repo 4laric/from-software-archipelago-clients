@@ -64,7 +64,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// FMG repository static slot for the running build. Per-version; see [`crate::rva_table`].
 /// 🛑 The 2.7.0.0 candidate for THIS one is the weakest row in the whole port (2/20 reference-site
@@ -110,6 +110,8 @@ const CHECK_IDS: &[u32] = &[100, 101, 109, 110, 115, 150, 8000, 10100];
 type SearchFn = unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> *const u16;
 
 static DONE: AtomicBool = AtomicBool::new(false);
+// One bit per category; logs the vanilla shape once before any extend-swap.
+static CONVENTION_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 struct Group {
@@ -1091,6 +1093,20 @@ pub fn extend_swap_overrides_tracked(
         .iter()
         .map(|g| er_logic::fmg_groups::Span::new(g.first_id, g.last_id))
         .collect();
+    let category_bit = 1u32.checked_shl(category).unwrap_or(0);
+    if category_bit != 0
+        && CONVENTION_LOGGED.fetch_or(category_bit, Ordering::Relaxed) & category_bit == 0
+    {
+        let stats = er_logic::fmg_groups::convention_stats(&spans);
+        log::info!(
+            "FMG vanilla-group census(cat {category}): groups={} ordered_disjoint={} \
+             wide_claims(last==next.first)={} strict_overlaps(last>next.first)={}",
+            stats.groups,
+            stats.ordered_disjoint,
+            stats.wide_claims,
+            stats.strict_overlaps
+        );
+    }
     let ids: Vec<u32> = overrides.iter().map(|(id, _)| *id).collect();
     let split = er_logic::fmg_groups::split_by_coverage(&spans, &ids);
     let text = |want: u32| -> Vec<u16> {
