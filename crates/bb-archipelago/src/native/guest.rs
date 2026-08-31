@@ -58,14 +58,16 @@ impl InventoryEntry {
     }
 }
 
-/// Base-game player weapon families in CUSA03173 01.09. These are the same
-/// EquipParamWeapon bases the world uses for requirement removal. Exact
-/// membership prevents armour/runes that happen to resemble a +N row from
-/// influencing the target.
+/// Supported player weapon families in CUSA03173 01.09. These are the same
+/// EquipParamWeapon bases the world exposes for AP delivery. Exact membership
+/// prevents armour/runes that happen to resemble a +N row from influencing
+/// the target. Keep the DLC families here as well: a player's strongest weapon
+/// is allowed to be one they found in the Hunter's Nightmare.
 const WEAPON_FAMILIES: &[u32] = &[
     2_000_000, 4_000_000, 5_000_000, 5_100_000, 6_000_000, 6_100_000, 7_000_000, 7_100_000,
     8_000_000, 8_100_000, 9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000,
-    14_000_000, 14_200_000, 15_000_000, 22_000_000,
+    14_000_000, 14_200_000, 15_000_000, 19_000_000, 22_000_000, 23_000_000, 24_000_000, 25_000_000,
+    28_000_000, 31_000_000, 34_000_000, 35_000_000,
 ];
 
 /// Which of the two banks holds `slot`. Pure, so it is testable without memory.
@@ -535,6 +537,22 @@ mod tests {
         memory.store(lookalike + g.record_id, &1_000_900u32.to_le_bytes());
         let guest = GuestRuntime::new(memory, base).unwrap();
         assert_eq!(guest.target_weapon_level(), Some(1));
+    }
+
+    #[test]
+    fn target_level_includes_a_reinforced_dlc_weapon() {
+        let (memory, base, _normalized) = laid_out_inventory();
+        let c = contract();
+        let g = c.geometry;
+        let inventory = memory
+            .read_u64(base + c.state_cell("inventory").unwrap().rva)
+            .unwrap();
+        let primary = memory.read_u64(inventory + g.primary_array).unwrap();
+        let whirligig = entry_address(0, 2, primary, 0, g.record_stride);
+        memory.store(whirligig + g.record_id, &31_000_700u32.to_le_bytes());
+
+        let guest = GuestRuntime::new(memory, base).unwrap();
+        assert_eq!(guest.target_weapon_level(), Some(7));
     }
 
     #[test]
