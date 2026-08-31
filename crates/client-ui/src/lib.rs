@@ -110,6 +110,13 @@ pub struct LocationTotals {
     pub total: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedEntry {
+    pub index: u64,
+    pub item_name: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSnapshot {
     pub revision: u64,
@@ -128,6 +135,14 @@ pub struct ClientSnapshot {
     pub go_mode: Option<bool>,
     pub locations: Option<LocationTotals>,
     pub ledger: LedgerTotals,
+    #[serde(default)]
+    pub blocked: Vec<BlockedEntry>,
+    #[serde(default)]
+    pub save_identity: Option<String>,
+    #[serde(default)]
+    pub gameplay_ready: bool,
+    #[serde(default)]
+    pub receive_cursor: Option<u64>,
     pub activity: VecDeque<ActivityEvent>,
     pub stale: bool,
 }
@@ -148,6 +163,10 @@ pub struct DeliveryFacts {
     pub go_mode: Option<bool>,
     pub locations: Option<LocationTotals>,
     pub ledger: LedgerTotals,
+    pub blocked: Vec<BlockedEntry>,
+    pub save_identity: Option<String>,
+    pub gameplay_ready: bool,
+    pub receive_cursor: Option<u64>,
 }
 
 /// Stateful projection from validated worker facts to immutable renderer snapshots.
@@ -193,6 +212,10 @@ impl SnapshotReducer {
         self.snapshot.go_mode = facts.go_mode;
         self.snapshot.locations = facts.locations;
         self.snapshot.ledger = facts.ledger;
+        self.snapshot.blocked = facts.blocked;
+        self.snapshot.save_identity = facts.save_identity;
+        self.snapshot.gameplay_ready = facts.gameplay_ready;
+        self.snapshot.receive_cursor = facts.receive_cursor;
         self.snapshot.stale = false;
         self.snapshot.clone()
     }
@@ -376,6 +399,9 @@ pub enum UiAction {
     },
     Disconnect,
     SubmitCommand(String),
+    RetryBlocked {
+        index: u64,
+    },
     OpenSessionFolder,
     RequestShutdown,
 }
@@ -526,6 +552,57 @@ mod tests {
         let mut reducer = SnapshotReducer::new(4);
         assert!(reducer.mark_stale().stale);
         assert!(!reducer.reduce(DeliveryFacts::default()).stale);
+    }
+
+    #[test]
+    fn reducer_replaces_structured_blocked_rows_without_spending_activity_capacity() {
+        let mut reducer = SnapshotReducer::new(1);
+        reducer.activity(ActivityKind::Message, "kept");
+        let entry = BlockedEntry {
+            index: 3,
+            item_name: "Fire Paper x2".into(),
+            reason: "quantity mismatch".into(),
+        };
+        let present = reducer.reduce(DeliveryFacts {
+            blocked: vec![entry.clone()],
+            save_identity: Some("slot-1".into()),
+            gameplay_ready: true,
+            receive_cursor: Some(9),
+            ..Default::default()
+        });
+        assert_eq!(present.blocked, vec![entry]);
+        assert_eq!(present.activity.len(), 1);
+        assert_eq!(present.save_identity.as_deref(), Some("slot-1"));
+        assert_eq!(present.receive_cursor, Some(9));
+
+        let absent = reducer.reduce(DeliveryFacts::default());
+        assert!(absent.blocked.is_empty());
+        assert_eq!(absent.activity.len(), 1);
+    }
+
+    #[test]
+    fn full_activity_and_rescue_snapshot_stays_small_enough_to_coalesce() {
+        let mut reducer = SnapshotReducer::default();
+        for index in 0..DEFAULT_ACTIVITY_CAPACITY {
+            reducer.activity(ActivityKind::Message, format!("activity {index}"));
+        }
+        let blocked = (0..100)
+            .map(|index| BlockedEntry {
+                index,
+                item_name: format!("Item {index}"),
+                reason: "bounded terminal delivery reason".into(),
+            })
+            .collect();
+        let snapshot = reducer.reduce(DeliveryFacts {
+            blocked,
+            ..Default::default()
+        });
+        let rendered = format!("{snapshot:?}");
+        assert!(
+            rendered.len() < 128 * 1024,
+            "snapshot grew to {} debug bytes",
+            rendered.len()
+        );
     }
     #[test]
     fn delivery_headline_covers_every_variant_in_player_language() {

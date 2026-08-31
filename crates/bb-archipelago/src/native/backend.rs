@@ -19,7 +19,7 @@
 //! ledger recorded, not the lifetime delivered sum -- a sum that is simply not
 //! the current inventory of anything the player can spend.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::backend::{
     BloodborneBackend, EquipRequest, GrantTerminalFailure, ItemGrant, LocationContext,
@@ -410,6 +410,14 @@ impl BloodborneBackend for NativeBackend {
             Some(flags) => flags.read_resilient(event_flag).map(Some),
             None => Ok(None),
         }
+    }
+
+    fn write_event_flag(&mut self, event_flag: u32, enabled: bool) -> Result<()> {
+        self.arm_event_flags()?;
+        self.event_flags
+            .armed_mut()
+            .context("live event-flag writer is unavailable")?
+            .write_resilient(event_flag, enabled)
     }
 
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {

@@ -5,13 +5,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::backend::{
-    BloodborneBackend, EquipRequest, GrantTerminalFailure, ItemGrant, OperationProgress,
-    StackObservation,
+    BloodborneBackend, EquipRequest, GrantTerminalFailure, ItemGrant, LocationContext,
+    OperationProgress, StackObservation,
 };
 use crate::client_eprintln;
 use crate::config::RuntimeConfig;
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
-use crate::ledger::{AcknowledgedItem, PendingItem, ReceiveLedger, WatermarkOutcome};
+use crate::ledger::{
+    AcknowledgedItem, OperatorAction, PendingItem, ReceiveLedger, WatermarkOutcome,
+};
 use crate::upgrades::{auto_upgrade_level, reinforced_descriptor_pair};
 
 const LOCATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
@@ -24,6 +26,14 @@ const SUSTAIN_PENDING_POLL_LIMIT: u32 = 600;
 const QUICKSILVER_BULLET_GOODS_ID: u32 = 1_100;
 const QUICKSILVER_BULLET_RAW_DESCRIPTOR: u32 = 0xB000_044C;
 const GOODS_NORMALIZED_PREFIX: u32 = 0x4000_0000;
+
+fn rescue_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+        })
+}
 
 #[derive(Clone, Copy, Debug)]
 struct LocationRetry {
@@ -78,6 +88,13 @@ pub enum ItemPollResult {
     /// operator-driven `bb-blocked` tool (clients#399).
     Blocked(BlockedItem),
     Completed(CompletedItem),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperatorGrantPoll {
+    Idle,
+    Pending,
+    Completed(i64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -300,7 +317,8 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     }
 
     pub fn rescue_read_flag(&mut self, event_flag: u32) -> Result<String> {
-        let _ = self.require_runtime_context("rescue flag read")?;
+        self.require_runtime_context("rescue flag read")?
+            .context("rescue flag read is waiting for gameplay")?;
         let mapped = self
             .config
             .locations
@@ -318,6 +336,10 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     }
 
     pub fn rescue_list_blocked(&self) -> String {
+        self.rescue_list_blocked_with_names(|ap_item_id| format!("item #{ap_item_id}"))
+    }
+
+    pub fn rescue_list_blocked_with_names(&self, mut resolve: impl FnMut(i64) -> String) -> String {
         let Some(slot) = self.ledger.slot(&self.seed_name, &self.slot_name) else {
             return "No receive ledger exists for this seed/slot yet.".to_string();
         };
@@ -325,7 +347,8 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .blocked_entries()
             .map(|(index, item)| {
                 format!(
-                    "index={index} ap_item={} reason={}",
+                    "index={index} item={:?} ap_item={} reason={}",
+                    resolve(item.ap_item_id),
                     item.ap_item_id,
                     item.blocked.as_deref().unwrap_or("unknown")
                 )
@@ -338,12 +361,205 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         }
     }
 
+    /// Structured parked rows for UI projection. Name resolution deliberately
+    /// stays in the worker, where the Archipelago datapackage is available.
+    pub fn rescue_blocked_entries(&self) -> Vec<(u64, i64, String)> {
+        self.ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .into_iter()
+            .flat_map(|slot| slot.blocked_entries())
+            .map(|(index, item)| {
+                (
+                    index,
+                    item.ap_item_id,
+                    item.blocked.as_deref().unwrap_or("unknown").to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Safe session facts for the renderer; never exposes process addresses.
+    pub fn rescue_context(&mut self) -> Result<Option<LocationContext>> {
+        self.backend.location_context()
+    }
+
     pub fn rescue_retry_blocked(&mut self, index: u64) -> Result<()> {
-        let _ = self.require_runtime_context("rescue delivery retry")?;
+        self.require_runtime_context("rescue delivery retry")?
+            .context("rescue delivery retry is waiting for gameplay")?;
         self.ledger
             .slot_mut(&self.seed_name, &self.slot_name)
             .requeue_blocked(index)?;
         self.ledger.save(&self.ledger_path)
+    }
+
+    /// Set one seed-owned location flag. No raw or unmapped flag can cross
+    /// this boundary; the caller receives the AP location id for naming.
+    pub fn rescue_location_for_flag(&self, event_flag: u32) -> Result<i64> {
+        self.config
+            .locations
+            .iter()
+            .find(|binding| binding.event_flag == event_flag)
+            .map(|binding| binding.ap_location_id)
+            .with_context(|| format!("event flag {event_flag} is not in this seed contract"))
+    }
+
+    pub fn rescue_set_flag(&mut self, event_flag: u32, location_name: &str) -> Result<i64> {
+        self.require_runtime_context("rescue setflag")?
+            .context("rescue setflag is waiting for gameplay")?;
+        let location = self.rescue_location_for_flag(event_flag)?;
+        self.backend.write_event_flag(event_flag, true)?;
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .operator_actions
+            .push(OperatorAction {
+                timestamp_ms: rescue_timestamp_ms(),
+                command: "setflag".into(),
+                argument: i64::from(event_flag),
+                resolved_name: location_name.into(),
+            });
+        self.ledger.save(&self.ledger_path)?;
+        Ok(location)
+    }
+
+    /// Queue one contract-known item id on an isolated durable lane. It never
+    /// changes the AP receive cursor and a repeated command is a fixed point.
+    pub fn rescue_give(&mut self, ap_item_id: i64, item_name: &str) -> Result<bool> {
+        self.require_runtime_context("rescue give")?
+            .context("rescue give is waiting for gameplay")?;
+        let binding = self
+            .config
+            .items
+            .get(&ap_item_id)
+            .with_context(|| format!("item index {ap_item_id} is not in this seed contract"))?
+            .clone();
+        anyhow::ensure!(
+            binding.descriptor_evidence.is_known(),
+            "item index {ap_item_id} has no proven named mapping"
+        );
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        if slot.operator_grants.contains_key(&ap_item_id)
+            || slot
+                .acknowledged
+                .values()
+                .any(|item| item.ap_item_id == ap_item_id)
+        {
+            return Ok(false);
+        }
+        slot.operator_grants.insert(
+            ap_item_id,
+            PendingItem {
+                index: 0,
+                ap_item_id,
+                raw_descriptor: binding.raw_descriptor,
+                normalized_item_id: binding.normalized_item_id,
+                item_category: binding.item_category,
+                quantity: 1,
+                upgrade_target_level: None,
+                reinforcement_level: binding.reinforcement_level,
+                equip_target: None,
+                grant_complete: false,
+                equip_complete: true,
+                observed_before: None,
+            },
+        );
+        slot.operator_actions.push(OperatorAction {
+            timestamp_ms: rescue_timestamp_ms(),
+            command: "give".into(),
+            argument: ap_item_id,
+            resolved_name: item_name.into(),
+        });
+        self.ledger.save(&self.ledger_path)?;
+        Ok(true)
+    }
+
+    pub fn poll_operator_grant(&mut self) -> Result<OperatorGrantPoll> {
+        let Some((&ap_item_id, mut pending)) = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| {
+                slot.operator_grants
+                    .iter()
+                    .find(|(_, row)| !row.grant_complete)
+            })
+            .map(|(id, row)| (id, row.clone()))
+        else {
+            return Ok(OperatorGrantPoll::Idle);
+        };
+        if self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .is_some_and(|slot| slot.pending.is_some())
+            || self.sustain_command_in_flight()
+        {
+            return Ok(OperatorGrantPoll::Pending);
+        }
+        let tag = format!("operator_grant_{ap_item_id}");
+        match self.require_runtime_context("rescue give") {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if self.backend.withdraw_unwitnessed_grant(&tag)? {
+                    self.ledger
+                        .slot_mut(&self.seed_name, &self.slot_name)
+                        .operator_grants
+                        .get_mut(&ap_item_id)
+                        .expect("operator grant remains durable while polling")
+                        .observed_before = None;
+                    self.ledger.save(&self.ledger_path)?;
+                }
+                return Ok(OperatorGrantPoll::Pending);
+            }
+            Err(error) => {
+                if self.backend.withdraw_unwitnessed_grant(&tag)? {
+                    self.ledger
+                        .slot_mut(&self.seed_name, &self.slot_name)
+                        .operator_grants
+                        .get_mut(&ap_item_id)
+                        .expect("operator grant remains durable while polling")
+                        .observed_before = None;
+                    self.ledger.save(&self.ledger_path)?;
+                }
+                return Err(error);
+            }
+        }
+        let expected_before = match pending.observed_before {
+            Some(value) => value,
+            None => match self
+                .backend
+                .observe_stack_quantity(pending.normalized_item_id, pending.reinforcement_level)?
+            {
+                StackObservation::Quantity(value) => {
+                    pending.observed_before = Some(value);
+                    self.ledger
+                        .slot_mut(&self.seed_name, &self.slot_name)
+                        .operator_grants
+                        .insert(ap_item_id, pending.clone());
+                    self.ledger.save(&self.ledger_path)?;
+                    value
+                }
+                StackObservation::NotReady => return Ok(OperatorGrantPoll::Pending),
+                StackObservation::Unsupported => 0,
+            },
+        };
+        let grant = ItemGrant {
+            raw_descriptor: pending.raw_descriptor,
+            normalized_item_id: pending.normalized_item_id,
+            item_category: pending.item_category,
+            quantity: 1,
+            expected_before,
+            reinforcement_level: pending.reinforcement_level,
+            tag,
+        };
+        if self.backend.grant_item(&grant)? == OperationProgress::Pending {
+            return Ok(OperatorGrantPoll::Pending);
+        }
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .operator_grants
+            .get_mut(&ap_item_id)
+            .expect("operator grant remains durable while polling")
+            .grant_complete = true;
+        self.ledger.save(&self.ledger_path)?;
+        Ok(OperatorGrantPoll::Completed(ap_item_id))
     }
 
     pub fn rescue_export(&self) -> Result<PathBuf> {
@@ -357,6 +573,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             "location_count": self.config.locations.len(),
             "item_count": self.config.items.len(),
             "ledger": slot,
+            "operator_actions": slot.map(|slot| &slot.operator_actions),
         });
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
@@ -735,7 +952,16 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .slot(&self.seed_name, &self.slot_name)
             .and_then(|slot| slot.pending_sustain.keys().next())
             .map(|location| format!("sustain_{location}"));
-        let Some(tag) = item_tag.or(sustain_tag) else {
+        let operator_tag = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| {
+                slot.operator_grants
+                    .iter()
+                    .find(|(_, pending)| !pending.grant_complete)
+            })
+            .map(|(ap_item_id, _)| format!("operator_grant_{ap_item_id}"));
+        let Some(tag) = item_tag.or(sustain_tag).or(operator_tag) else {
             return Ok(false);
         };
         self.backend.withdraw_unwitnessed_grant(&tag)
@@ -1255,6 +1481,147 @@ mod tests {
         config: RuntimeConfig,
     ) -> ClientLoop<MockBackend> {
         ClientLoop::new(backend, config, ledger, ledger_path, "seed", "slot")
+    }
+
+    #[test]
+    fn rescue_setflag_is_context_and_contract_bounded_and_exported() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = true;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        assert!(client.rescue_set_flag(999_999, "bad").is_err());
+        assert_eq!(
+            client
+                .rescue_set_flag(TEST_PEBBLE_EVENT_FLAG, "Pebble")
+                .unwrap(),
+            1000
+        );
+        assert!(client.backend.set_flags.contains(&TEST_PEBBLE_EVENT_FLAG));
+        let export = client.rescue_export().unwrap();
+        let value: json::Value = json::from_slice(&std::fs::read(&export).unwrap()).unwrap();
+        assert_eq!(value["operator_actions"][0]["resolved_name"], "Pebble");
+        std::fs::remove_file(export).unwrap();
+    }
+
+    #[test]
+    fn rescue_mutations_refuse_without_gameplay_context() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = true;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: false,
+        });
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path, config());
+        assert!(
+            client
+                .rescue_set_flag(TEST_PEBBLE_EVENT_FLAG, "Pebble")
+                .unwrap_err()
+                .to_string()
+                .contains("waiting for gameplay")
+        );
+        assert!(client.rescue_give(2000, "Pebble").is_err());
+    }
+
+    #[test]
+    fn operator_give_is_durable_and_never_touches_the_ap_cursor_or_double_grants() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = true;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        assert!(client.rescue_give(2000, "Pebble").unwrap());
+        assert_eq!(
+            client.poll_operator_grant().unwrap(),
+            OperatorGrantPoll::Completed(2000)
+        );
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert_eq!(slot.highest_processed_index, None);
+        assert!(slot.operator_grants[&2000].grant_complete);
+        assert_eq!(client.backend.grants.len(), 1);
+        assert!(!client.rescue_give(2000, "Pebble").unwrap());
+        assert_eq!(
+            client.poll_operator_grant().unwrap(),
+            OperatorGrantPoll::Idle
+        );
+        assert_eq!(client.backend.grants.len(), 1);
+
+        let reloaded = ReceiveLedger::load(&ledger_path).unwrap();
+        assert!(reloaded.slot("seed", "slot").unwrap().operator_grants[&2000].grant_complete);
+        assert_eq!(
+            reloaded.slot("seed", "slot").unwrap().operator_actions[0].command,
+            "give"
+        );
+        assert_eq!(
+            reloaded
+                .slot("seed", "slot")
+                .unwrap()
+                .highest_processed_index,
+            None
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn operator_give_refuses_an_out_of_contract_item() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = true;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path, config());
+        assert!(client.rescue_give(9_999, "bad").is_err());
+    }
+
+    #[test]
+    fn operator_give_does_not_duplicate_an_ap_delivered_item() {
+        let ledger_path = path();
+        let mut ledger = ReceiveLedger::default();
+        ledger.slot_mut("seed", "slot").acknowledged.insert(
+            0,
+            AcknowledgedItem {
+                ap_item_id: 2000,
+                raw_descriptor: goods().raw_descriptor,
+                normalized_item_id: goods().normalized_item_id,
+                item_category: 4,
+                quantity: 1,
+                reinforcement_level: None,
+                equip_target: None,
+                blocked: None,
+            },
+        );
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = true;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        let mut client = loop_with(backend, ledger, ledger_path, config());
+        assert!(!client.rescue_give(2000, "Pebble").unwrap());
+        assert_eq!(
+            client.poll_operator_grant().unwrap(),
+            OperatorGrantPoll::Idle
+        );
+        assert!(client.backend.grants.is_empty());
     }
 
     /// clients#420: while the native flag gate is pending (the game has not
