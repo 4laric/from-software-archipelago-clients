@@ -38,6 +38,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_repr = "0.1.20"
 sha2 = "0.10.9"
 shared = { path = "crates/shared"}
+# Upstream tungstenite does not yet ship RFC 7692 support. Pin the OpenAI
+# compatibility fork to an immutable revision so Archipelago servers can
+# negotiate permessage-deflate without changing our synchronous socket seam.
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", version = "0.27.0", default-features = false, features = ["handshake", "deflate"] }
 
 [workspace.dependencies.windows]
 version = "0.62"
