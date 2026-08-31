@@ -27,7 +27,24 @@
 /// an ARBITRARY PLAYER-CHOSEN SLOT NAME. Anything outside printable ASCII becomes `?`, and the name
 /// is capped, because a 60-character slot name would push the line off the deck. Both are done here,
 /// in the pure half, so they are testable and so no caller can forget.
-pub fn deathlink_line(source: &str) -> String {
+pub fn deathlink_line(source: &str, cause: Option<&str>) -> String {
+    if let Some(cause) = cause {
+        let cause = cause.trim();
+        if !cause.is_empty() {
+            let text: String = cause
+                .chars()
+                .take(72)
+                .map(|c| {
+                    if c.is_ascii_graphic() || c == ' ' {
+                        c
+                    } else {
+                        '?'
+                    }
+                })
+                .collect();
+            return format!("DeathLink: {}", text.trim());
+        }
+    }
     const MAX_NAME: usize = 24;
     // 🛑 THE QUESTION IS "DID ANYTHING PRINTABLE SURVIVE", NOT "IS THE RESULT NON-EMPTY".
     // Every unprintable char is substituted with `?`, so a name made entirely of them comes out
@@ -180,7 +197,7 @@ mod tests {
             "",       // empty
             "a-very-long-slot-name-that-would-run-off-the-toast-deck-entirely",
         ] {
-            let line = deathlink_line(src);
+            let line = deathlink_line(src, None);
             assert!(line.is_ascii(), "non-ASCII line for {src:?}: {line}");
             assert!(line.len() <= 45, "line too long for {src:?}: {line}");
             assert!(line.starts_with("DeathLink: killed by "), "{line}");
@@ -196,7 +213,10 @@ mod tests {
     #[test]
     fn deathlink_line_keeps_an_ordinary_name_verbatim() {
         // The sanitiser must not be so eager that it mangles the common case.
-        assert_eq!(deathlink_line("bobler"), "DeathLink: killed by bobler");
+        assert_eq!(
+            deathlink_line("bobler", None),
+            "DeathLink: killed by bobler"
+        );
     }
 
     #[test]
@@ -205,11 +225,27 @@ mod tests {
         // after it, which reads as our bug rather than as their name.
         for src in ["", "   ", "\u{200b}\u{200b}"] {
             assert_eq!(
-                deathlink_line(src),
+                deathlink_line(src, None),
                 "DeathLink: killed by someone",
                 "src={src:?}"
             );
         }
+    }
+
+    #[test]
+    fn deathlink_line_prefers_the_senders_cause() {
+        assert_eq!(
+            deathlink_line("bobler", Some("bobler was slain by Margit")),
+            "DeathLink: bobler was slain by Margit"
+        );
+    }
+
+    #[test]
+    fn deathlink_line_falls_back_when_cause_is_blank() {
+        assert_eq!(
+            deathlink_line("bobler", Some("   ")),
+            "DeathLink: killed by bobler"
+        );
     }
 
     use super::*;
