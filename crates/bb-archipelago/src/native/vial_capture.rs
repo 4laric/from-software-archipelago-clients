@@ -59,7 +59,10 @@ impl VialCapture {
         let canonical = suspects
             .iter()
             .find(|entry| entry.word(4) == CANONICAL_VIAL);
-        let canonical_created = !previous_canonical && canonical.is_some();
+        // A populated first observation is only a baseline. Without an earlier inventory
+        // snapshot there is no witnessed transition and therefore no valid "before" window.
+        let canonical_created =
+            self.previous_suspects.is_some() && !previous_canonical && canonical.is_some();
         if changed || now.saturating_sub(self.last_sample_ms) >= HEARTBEAT_MS {
             let mut record = json::json!({
                 "event": if self.previous_suspects.is_none() { "baseline" } else if canonical_created { "canonical_vial_created" } else if changed { "vial_state_change" } else { "heartbeat" },
@@ -204,6 +207,28 @@ mod tests {
         assert_eq!(created["before_window"][2]["slot"], 5);
         assert_eq!(created["before_window"][2]["present"], false);
         assert_eq!(created["after_window"][2]["word4"], "0x400003E8");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn populated_first_observation_remains_a_baseline_without_a_fake_before_window() {
+        let root = std::env::temp_dir().join(format!(
+            "bb-vial-capture-baseline-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ledger = root.join("ledger.json");
+        let mut capture = VialCapture::beside_ledger(&ledger).unwrap();
+        capture.observe(Some(vec![entry(14, 0xB000_03E8, CANONICAL_VIAL)]));
+        drop(capture);
+
+        let line = std::fs::read_to_string(root.join("blood-vial-capture.jsonl")).unwrap();
+        let baseline: json::Value = json::from_str(line.trim()).unwrap();
+        assert_eq!(baseline["event"], "baseline");
+        assert!(baseline.get("selected_slot").is_none());
+        assert!(baseline.get("before_window").is_none());
+        assert!(baseline.get("after_window").is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
