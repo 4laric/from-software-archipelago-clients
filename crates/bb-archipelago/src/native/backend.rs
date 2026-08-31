@@ -500,4 +500,8 @@ impl BloodborneBackend for NativeBackend {
         // ledger and re-publishes under a validated context.
         Ok(self.delivery.withdraw_stale())
     }
+
+    fn retire_grant(&mut self, tag: &str, reason: &str) -> Result<bool> {
+        Ok(self.delivery.retire_current(tag, reason))
+    }
 }

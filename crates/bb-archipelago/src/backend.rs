@@ -128,6 +128,14 @@ pub trait BloodborneBackend {
     /// was actually withdrawn; `false` when there was nothing unwitnessed to
     /// withdraw.
     fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool>;
+    /// Terminally retire a best-effort grant and release the single native lane. Unlike ordinary
+    /// context-loss withdrawal, this grant will not be retried. Implementations should emit their
+    /// normal terminal diagnostic with `reason`. The return value says whether an unexecuted
+    /// native request was physically withdrawn before retirement.
+    fn retire_grant(&mut self, tag: &str, reason: &str) -> Result<bool> {
+        let _ = reason;
+        self.withdraw_unwitnessed_grant(tag)
+    }
     /// Read the save-resident receive watermark (bb-archipelago#77). `None`
     /// means no watermark is available: either the backend has no writable
     /// save field yet (the attested-mode status quo) or a previously recorded
@@ -184,6 +192,7 @@ pub struct MockBackend {
     /// next publication re-observes the live stack.
     pub retained_unwitnessed: HashSet<String>,
     grant_delays: HashMap<String, u8>,
+    pending_grants: HashSet<String>,
     equip_delays: HashMap<String, u8>,
     completed_grants: HashSet<String>,
     completed_equips: HashSet<String>,
@@ -210,6 +219,7 @@ impl Default for MockBackend {
             stack_observation_ready: true,
             retained_unwitnessed: HashSet::new(),
             grant_delays: HashMap::new(),
+            pending_grants: HashSet::new(),
             equip_delays: HashMap::new(),
             completed_grants: HashSet::new(),
             completed_equips: HashSet::new(),
@@ -221,6 +231,10 @@ impl Default for MockBackend {
 impl MockBackend {
     pub fn delay_grant(&mut self, tag: impl Into<String>, polls: u8) {
         self.grant_delays.insert(tag.into(), polls);
+    }
+
+    pub fn keep_grant_pending(&mut self, tag: impl Into<String>) {
+        self.pending_grants.insert(tag.into());
     }
 
     /// Simulate the harness latching a terminal failure for a tag (clients#399).
@@ -318,6 +332,9 @@ impl BloodborneBackend for MockBackend {
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
+        if self.pending_grants.contains(&grant.tag) {
+            return Ok(OperationProgress::Pending);
+        }
         if let Some(status) = self.terminal_failures.get(&grant.tag) {
             return Err(GrantTerminalFailure {
                 tag: grant.tag.clone(),
@@ -371,6 +388,12 @@ impl BloodborneBackend for MockBackend {
     }
 
     fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
+        self.withdrawn.push(tag.to_owned());
+        Ok(true)
+    }
+
+    fn retire_grant(&mut self, tag: &str, _reason: &str) -> Result<bool> {
+        self.pending_grants.remove(tag);
         self.withdrawn.push(tag.to_owned());
         Ok(true)
     }

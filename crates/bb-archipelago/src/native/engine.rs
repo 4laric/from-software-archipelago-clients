@@ -282,16 +282,33 @@ impl<R: Runtime> NativeDelivery<R> {
     /// cannot stop a call the cave already ran, and the completion is needed for
     /// the recovery path -- mirroring the file bridge's "unwitnessed" rule.
     pub fn withdraw_stale(&mut self) -> bool {
-        let runtime = self.session.runtime_mut();
-        let pending = runtime.request_pending();
-        let done = runtime.native_done();
-        self.current_tag = None;
-        if pending && !done {
-            runtime.clear_request();
-            true
-        } else {
-            false
+        let withdrawn = self.session.withdraw_unwitnessed();
+        if withdrawn {
+            self.current_tag = None;
         }
+        withdrawn
+    }
+
+    /// Retire a best-effort command regardless of whether it is still unwitnessed. The caller has
+    /// already decided not to retry it, so this both releases the lane and writes the same terminal
+    /// diagnostic ordinary AP grants produce.
+    pub fn retire_current(&mut self, tag: &str, reason: &str) -> bool {
+        if self.current_tag.as_deref() != Some(tag) {
+            return false;
+        }
+        let withdrawn = self.session.withdraw_unwitnessed();
+        self.session
+            .retire(format!("tag={tag} best-effort grant retired: {reason}"));
+        self.emit_diagnostic("sustain_timeout", false, &mut |_: &str| {});
+        self.finished.insert(
+            tag.to_owned(),
+            GrantStep::Failed {
+                status: "sustain_timeout".into(),
+                detail: reason.into(),
+            },
+        );
+        self.current_tag = None;
+        withdrawn
     }
 }
 
@@ -322,6 +339,7 @@ mod tests {
         ready: bool,
         stacks: HashMap<u32, StackView>,
         queued: Option<(u32, u32, u32)>, // normalized id, delta, slot
+        stall_native: bool,
         result: u32,
         writes: usize,
         // clients#443: quantity of the same id the player acquires while the
@@ -387,6 +405,9 @@ mod tests {
             self.queued = Some((d.normalized_id, q, s.unwrap_or(0)));
         }
         fn native_done(&mut self) -> bool {
+            if self.stall_native {
+                return false;
+            }
             if let Some((normalized, delta, slot)) = self.queued.take() {
                 if self.route_insert_to_storage && !self.stacks.contains_key(&normalized) {
                     self.result = 2;
@@ -408,7 +429,9 @@ mod tests {
         fn native_result(&mut self) -> u32 {
             self.result
         }
-        fn clear_request(&mut self) {}
+        fn clear_request(&mut self) {
+            self.queued = None;
+        }
     }
 
     fn goods_request(goods: u32, qty: u32, tag: &str, before: Option<u32>) -> NativeGrantRequest {
@@ -421,6 +444,38 @@ mod tests {
             quantity: qty,
             expected_before: before,
         }
+    }
+
+    #[test]
+    fn withdrawing_an_unwitnessed_request_releases_the_lane_for_the_next_tag() {
+        let mut runtime = stocked(3);
+        runtime.stall_native = true;
+        let (mut engine, lines) = armed_engine(runtime);
+        assert_eq!(
+            engine
+                .grant(goods_request(0x384, 1, "sustain_1000", Some(3)))
+                .unwrap(),
+            GrantStep::Pending
+        );
+        assert!(engine.retire_current("sustain_1000", "native grant timed out"));
+        let record = only_record(&lines);
+        assert_eq!(record.tag, "sustain_1000");
+        assert_eq!(record.terminal_status, "sustain_timeout");
+        assert!(record.terminal_detail.contains("native grant timed out"));
+
+        engine.runtime_mut().stall_native = false;
+        assert_eq!(
+            drain(&mut engine, goods_request(0x384, 1, "ap_0", Some(3))).unwrap(),
+            GrantStep::Complete
+        );
+        assert_eq!(
+            engine
+                .runtime_mut()
+                .stacks
+                .get(&(contract().descriptor.goods_normalized_prefix | 0x384))
+                .map(|stack| stack.quantity),
+            Some(4)
+        );
     }
 
     /// clients#443: a surplus completion is a COMPLETION at the engine seam.

@@ -16,6 +16,11 @@ use crate::upgrades::{auto_upgrade_level, reinforced_descriptor_pair};
 
 const LOCATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const LOCATION_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Sustain is a best-effort anti-farm replacement, never an AP-owned item. Once its native command
+/// has occupied the single delivery lane for this many 50 ms polls, retire it so it cannot starve
+/// the authoritative receive stream. This is deliberately longer than the native hydration verify
+/// budget (240 polls / 12 seconds).
+const SUSTAIN_PENDING_POLL_LIMIT: u32 = 600;
 const QUICKSILVER_BULLET_GOODS_ID: u32 = 1_100;
 const QUICKSILVER_BULLET_RAW_DESCRIPTOR: u32 = 0xB000_044C;
 const GOODS_NORMALIZED_PREFIX: u32 = 0x4000_0000;
@@ -80,6 +85,11 @@ pub enum SustainPollResult {
     Idle,
     Pending,
     Completed(i64),
+    Retired {
+        location: i64,
+        command_withdrawn: bool,
+        reason: &'static str,
+    },
 }
 
 /// Seed-owned outbound DeathLink policy decision. Detection and broadcast are
@@ -104,6 +114,8 @@ pub struct ClientLoop<B> {
     location_retries: HashMap<i64, LocationRetry>,
     last_watermark_outcome: WatermarkOutcome,
     watermark_notice: Option<WatermarkOutcome>,
+    sustain_pending_polls: Option<(i64, u32)>,
+    sustain_notice: Option<SustainPollResult>,
 }
 
 impl<B: BloodborneBackend> ClientLoop<B> {
@@ -130,7 +142,42 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             location_retries: HashMap::new(),
             last_watermark_outcome: WatermarkOutcome::Resume,
             watermark_notice: None,
+            sustain_pending_polls: None,
+            sustain_notice: None,
         }
+    }
+
+    pub fn take_sustain_notice(&mut self) -> Option<SustainPollResult> {
+        self.sustain_notice.take()
+    }
+
+    fn sustain_command_in_flight(&self) -> bool {
+        self.ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.pending_sustain.iter().next())
+            .is_some_and(|(_, baseline)| baseline.is_some())
+    }
+
+    fn retire_sustain(
+        &mut self,
+        location: i64,
+        command_withdrawn: bool,
+        reason: &'static str,
+    ) -> Result<SustainPollResult> {
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        slot.pending_sustain.remove(&location);
+        // Retired bonuses are intentionally not replayed. If the cave ran just before a timeout,
+        // treating this best-effort bullet as still owed could duplicate it after restart.
+        slot.completed_sustain.insert(location);
+        self.ledger.save(&self.ledger_path)?;
+        self.sustain_pending_polls = None;
+        let result = SustainPollResult::Retired {
+            location,
+            command_withdrawn,
+            reason,
+        };
+        self.sustain_notice = Some(result);
+        Ok(result)
     }
 
     /// Outcome transitions of the save-watermark comparison, for the operator
@@ -457,13 +504,34 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             reinforcement_level: None,
             tag,
         };
-        if self.backend.grant_item(&grant)? == OperationProgress::Pending {
-            return Ok(SustainPollResult::Pending);
+        match self.backend.grant_item(&grant) {
+            Ok(OperationProgress::Pending) => {
+                let polls = match self.sustain_pending_polls {
+                    Some((same, polls)) if same == location => polls.saturating_add(1),
+                    _ => 1,
+                };
+                self.sustain_pending_polls = Some((location, polls));
+                if polls < SUSTAIN_PENDING_POLL_LIMIT {
+                    return Ok(SustainPollResult::Pending);
+                }
+                let withdrawn = self
+                    .backend
+                    .retire_grant(&grant.tag, "native grant timed out")?;
+                return self.retire_sustain(location, withdrawn, "native grant timed out");
+            }
+            Ok(OperationProgress::Complete) => {}
+            Err(error) => {
+                if error.downcast_ref::<GrantTerminalFailure>().is_some() {
+                    return self.retire_sustain(location, false, "native grant failed terminally");
+                }
+                return Err(error);
+            }
         }
         let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
         slot.pending_sustain.remove(&location);
         slot.completed_sustain.insert(location);
         self.ledger.save(&self.ledger_path)?;
+        self.sustain_pending_polls = None;
         Ok(SustainPollResult::Completed(location))
     }
 
@@ -704,6 +772,13 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// Processes at most one item, preserving AP index order and durable state
     /// across the grant -> optional upgrade -> optional equip sequence.
     pub fn poll_items(&mut self, received: &[IncomingItem]) -> Result<ItemPollResult> {
+        // A sustain command already published to the single native lane must be advanced before an
+        // AP item tries to use that lane. The old main-loop ordering stopped polling sustain as
+        // soon as an AP item arrived, so each side waited forever for the other. Bounded retirement
+        // in `poll_sustain` means AP waits at most one sustain budget, never indefinitely.
+        if self.sustain_command_in_flight() && self.poll_sustain()? == SustainPollResult::Pending {
+            return Ok(ItemPollResult::Pending);
+        }
         let next = self
             .ledger
             .slot(&self.seed_name, &self.slot_name)
@@ -1154,6 +1229,10 @@ mod tests {
 
         fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
             self.inner.withdraw_unwitnessed_grant(tag)
+        }
+
+        fn retire_grant(&mut self, tag: &str, reason: &str) -> Result<bool> {
+            self.inner.retire_grant(tag, reason)
         }
 
         fn read_save_watermark(&mut self) -> Result<Option<u64>> {
@@ -2079,6 +2158,86 @@ mod tests {
             Some(&8)
         );
         assert_eq!(reloaded.backend().grants.len(), 1);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn wedged_sustain_is_bounded_and_cannot_starve_an_ap_item() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        let mut backend = MockBackend::default();
+        backend.keep_grant_pending("sustain_1000");
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        client.queue_sustain_for_checks(&[1000]).unwrap();
+
+        // First poll records the durable baseline and publishes the sustain command.
+        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Pending);
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        for _ in 1..(SUSTAIN_PENDING_POLL_LIMIT - 1) {
+            assert_eq!(
+                client.poll_items(&received).unwrap(),
+                ItemPollResult::Pending
+            );
+        }
+
+        // The limit retires only the expendable bonus; the authoritative AP item uses the freed
+        // lane in the same poll and is acknowledged normally.
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert!(!slot.pending_sustain.contains_key(&1000));
+        assert!(slot.completed_sustain.contains(&1000));
+        assert_eq!(client.backend().withdrawn, vec!["sustain_1000"]);
+        assert_eq!(client.backend().grants.len(), 1);
+        assert_eq!(client.backend().grants[0].tag, "ap_0");
+        assert_eq!(
+            client.take_sustain_notice(),
+            Some(SustainPollResult::Retired {
+                location: 1000,
+                command_withdrawn: true,
+                reason: "native grant timed out",
+            })
+        );
+        assert_eq!(client.take_sustain_notice(), None);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn terminal_sustain_failure_is_retired_without_blocking_the_next_item() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        let mut backend = MockBackend::default();
+        backend.fail_grant_terminally_with("sustain_1000", "write_error");
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        client.queue_sustain_for_checks(&[1000]).unwrap();
+        assert_eq!(
+            client.poll_sustain().unwrap(),
+            SustainPollResult::Retired {
+                location: 1000,
+                command_withdrawn: false,
+                reason: "native grant failed terminally",
+            }
+        );
+        assert!(matches!(
+            client.take_sustain_notice(),
+            Some(SustainPollResult::Retired { location: 1000, .. })
+        ));
+        assert!(matches!(
+            client
+                .poll_items(&[IncomingItem {
+                    index: 0,
+                    ap_item_id: 2000,
+                }])
+                .unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
         std::fs::remove_file(ledger_path).unwrap();
     }
 

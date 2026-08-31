@@ -333,6 +333,27 @@ impl<R: Runtime> GrantSession<R> {
         &mut self.runtime
     }
 
+    /// Clear a cave request that has provably not completed and make this session reusable. The
+    /// durable caller keeps the grant plan and may safely submit it again after re-observing its
+    /// baseline. A witnessed request is deliberately left intact.
+    pub fn withdraw_unwitnessed(&mut self) -> bool {
+        let pending = self.runtime.request_pending();
+        let done = self.runtime.native_done();
+        if !pending || done {
+            return false;
+        }
+        self.runtime.clear_request();
+        self.active = false;
+        self.command = None;
+        self.expected_before = None;
+        self.finish("withdrawn", "unwitnessed native request cleared".into());
+        true
+    }
+
+    pub fn retire(&mut self, detail: impl Into<String>) {
+        self.finish("failed", detail.into());
+    }
+
     /// The passive delivery trace for the grant currently held (clients#445).
     pub fn trace(&self) -> &GrantTrace {
         &self.trace
