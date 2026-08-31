@@ -431,6 +431,42 @@ pub fn save_file_identity_parts(file_name: &str) -> Option<(String, String)> {
     Some((seed.to_string(), slot.to_string()))
 }
 
+/// The filename-safe identity spelling used by the live `ap_save_<seed>_<slot>.json` writer.
+/// Keeping it here prevents advisory sibling scans from drifting from the path they inspect.
+pub fn safe_file_identity_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Whether this AP slot name has persisted history for a DIFFERENT room.
+///
+/// This is advisory only: a new seed using the same player name is legitimate, so the result must
+/// never gate checks or delivery. It exists to distinguish that normal reroll from the easy support
+/// mistake where a player unknowingly connects to a different room after wiping or replacing the
+/// local save (clients#402). Inputs are the sanitized identity parts returned by
+/// [`save_file_identity_parts`]; the current values are the original server strings and are
+/// normalized here with [`safe_file_identity_part`].
+pub fn has_other_room_for_slot(
+    current_seed: &str,
+    current_slot: &str,
+    siblings: &[(String, String)],
+) -> bool {
+    let current_seed = safe_file_identity_part(current_seed);
+    let current_slot = safe_file_identity_part(current_slot);
+    siblings
+        .iter()
+        .any(|(seed, slot)| slot == &current_slot && seed != &current_seed)
+}
+
+/// One-shot player-facing heads-up for [`has_other_room_for_slot`]. This is deliberately not a
+/// refusal: a reroll is allowed and continues normally.
+pub fn other_room_history_toast() -> String {
+    "Archipelago: this looks like a NEW room, but this slot name has history in another room.              If you did not reroll, check the server address. Play continues normally."
+        .to_string()
+}
+
 /// The room a refused save actually belongs to (clients#337): the sibling `(seed, slot)` whose
 /// [`identity_hash`] IS the save-embedded marker `stored`. `siblings` are the parsed identity
 /// parts of every other `ap_save_*.json` beside the save just armed.
@@ -849,6 +885,28 @@ mod tests {
         // Not a save file at all.
         assert_eq!(save_file_identity_parts("reconcile.json"), None);
         assert_eq!(save_file_identity_parts("ap_save_12345.json"), None);
+    }
+
+    #[test]
+    fn room_history_heads_up_only_for_the_same_slot_in_another_room() {
+        let siblings = vec![
+            ("111".to_string(), "bobler".to_string()),
+            ("222".to_string(), "carla".to_string()),
+            ("333".to_string(), "bobler".to_string()),
+        ];
+        assert!(has_other_room_for_slot("999", "bobler", &siblings));
+        assert!(!has_other_room_for_slot("222", "carla", &siblings));
+        assert!(!has_other_room_for_slot("111", "nobody", &siblings));
+        assert!(has_other_room_for_slot(
+            "999",
+            "bob ler",
+            &[("111".to_string(), "bob_ler".to_string())]
+        ));
+
+        let toast = other_room_history_toast();
+        assert!(toast.contains("NEW room"), "{toast}");
+        assert!(toast.contains("Play continues normally"), "{toast}");
+        assert!(toast.is_ascii(), "{toast}");
     }
 
     #[test]
