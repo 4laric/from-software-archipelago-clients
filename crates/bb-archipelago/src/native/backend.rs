@@ -132,7 +132,7 @@ impl NativeBackend {
         match GemCapture::beside_ledger(ledger) {
             Ok(capture) => {
                 client_eprintln!(
-                    "Blood-gem diagnostics: read-only inventory-manager snapshots stream beside the ledger to blood-gem-capture.jsonl."
+                    "Blood-gem diagnostics: read-only ItemGrant call records stream beside the ledger to blood-gem-capture.jsonl."
                 );
                 self.gem_capture = Some(capture);
             }
@@ -231,6 +231,7 @@ impl NativeBackend {
         use super::attach_wait::{BaseCheck, SystemAttachClock, wait_for_verified_base};
         use super::contract::contract;
         use super::install::{self, InstallConfig};
+        use super::item_grant_probe;
         use super::mem::{require_validated_image, verify_base};
         use super::threads::WindowsThreadController;
 
@@ -278,6 +279,12 @@ impl NativeBackend {
             InstallConfig::default(),
             std::thread::sleep,
         )?;
+        match item_grant_probe::install(&memory, base, &mut threads) {
+            Ok(()) => client_eprintln!("Blood-gem ItemGrant probe armed."),
+            Err(error) => client_eprintln!(
+                "Blood-gem ItemGrant probe inactive (delivery remains available): {error:#}"
+            ),
+        }
 
         // clients#418: hand over the base this attach already confirmed rather
         // than letting the event-flag attach re-read the log and re-run the race.
@@ -323,7 +330,7 @@ impl BloodborneBackend for NativeBackend {
             capture.observe(entries.clone());
         }
         if let Some(capture) = &mut self.gem_capture {
-            let snapshot = self.delivery.runtime_mut().inventory_diagnostic_snapshot();
+            let snapshot = self.delivery.runtime_mut().item_grant_probe_snapshot();
             capture.observe(snapshot);
         }
         let result = self.location_context_inner();

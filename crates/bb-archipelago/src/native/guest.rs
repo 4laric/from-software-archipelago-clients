@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use super::contract::{Contract, contract};
 use super::delivery::{EMPTY_SLOT, Runtime, SlotRecord, StackView};
 use super::descriptor::ItemGrantDescriptor;
+use super::item_grant_probe::{self, ItemGrantCallSnapshot};
 use super::mem::ProcessMemory;
 
 const MAX_SLOTS: u64 = 4096;
@@ -36,20 +37,6 @@ pub struct GeneratedObjectProbe {
     pub entry: InventoryEntry,
     pub address: u64,
     pub bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InventoryPointerBlock {
-    pub manager_offset: usize,
-    pub address: u64,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InventoryDiagnosticSnapshot {
-    pub manager_address: u64,
-    pub manager_bytes: Vec<u8>,
-    pub pointer_blocks: Vec<InventoryPointerBlock>,
 }
 
 impl InventoryEntry {
@@ -204,44 +191,8 @@ impl<P: ProcessMemory> GuestRuntime<P> {
         Some(entries)
     }
 
-    /// Bounded, read-only view of the inventory manager for discovering the
-    /// generated-gem container. Failed candidate-pointer reads are ignored and
-    /// never enter the delivery error lane: they are speculative diagnostics,
-    /// not required inventory geometry.
-    pub fn inventory_diagnostic_snapshot(&self) -> Option<InventoryDiagnosticSnapshot> {
-        use std::collections::BTreeSet;
-
-        const MANAGER_BYTES: usize = 0x200;
-        const POINTER_BYTES: usize = 0x100;
-        const MAX_POINTERS: usize = 24;
-        const GUEST_POINTER_MIN: u64 = 0x1_0000_0000;
-        const GUEST_POINTER_MAX: u64 = 0x10_0000_0000;
-
-        let (manager_address, ..) = self.geometry()?;
-        let manager_bytes = self.memory.read(manager_address, MANAGER_BYTES).ok()?;
-        let mut seen = BTreeSet::new();
-        let mut pointer_blocks = Vec::new();
-        for offset in (0..=manager_bytes.len().saturating_sub(8)).step_by(8) {
-            let address = u64::from_le_bytes(manager_bytes[offset..offset + 8].try_into().unwrap());
-            if !(GUEST_POINTER_MIN..GUEST_POINTER_MAX).contains(&address) || !seen.insert(address) {
-                continue;
-            }
-            if let Ok(bytes) = self.memory.read(address, POINTER_BYTES) {
-                pointer_blocks.push(InventoryPointerBlock {
-                    manager_offset: offset,
-                    address,
-                    bytes,
-                });
-                if pointer_blocks.len() == MAX_POINTERS {
-                    break;
-                }
-            }
-        }
-        Some(InventoryDiagnosticSnapshot {
-            manager_address,
-            manager_bytes,
-            pointer_blocks,
-        })
+    pub fn item_grant_probe_snapshot(&self) -> Option<ItemGrantCallSnapshot> {
+        item_grant_probe::snapshot(&self.memory, self.base)
     }
 
     /// Resolve one naturally-created category instance on the game thread and
