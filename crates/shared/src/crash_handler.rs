@@ -434,6 +434,7 @@ fn report_inner(info: usize, phase: &str) {
     // the "had scaling just written to many UNLOADED chrs?" correlation instead of a human
     // diffing the log around the crash. Empty string when scaling never wrote.
     out.push_str(&crate::crash_tallies::annotate());
+    out.push_str(&crate::crash_tallies::annotate_quiescence());
     out.push_str(&format!("thread {:?}\n", std::thread::current().id()));
 
     // STACK_OVERFLOW runs on the exhausted stack: skip the walk, keep the path minimal.

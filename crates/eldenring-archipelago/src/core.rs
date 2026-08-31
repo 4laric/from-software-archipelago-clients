@@ -4380,6 +4380,7 @@ impl shared::Core for Core {
         // the param repo being up and re-latch after one clean pass, so this costs one re-blank per load.
         let now_in_world = crate::flags::in_world();
         if now_in_world && !self.was_in_world {
+            shared::crash_tallies::record_world_edge(true);
             self.suppression_rearm
                 .arm(self.toast_clock.elapsed().as_millis() as u64);
             // THE ICON OVERRIDE, ONCE. `shop_icon` writes icon cell 92 onto every foreign shop slot
@@ -4557,6 +4558,7 @@ impl shared::Core for Core {
         // a mid-session room change forever (its `Driver` is armed for the old room and `DRIVER` is
         // a `OnceLock`) -- see the 229-check incident in `disarm_if_identity_moved`.
         if !now_in_world && self.was_in_world {
+            shared::crash_tallies::record_world_edge(false);
             // Stamp the active character at the latest observed play time before its game state is
             // torn down, then force the next character load to bind its own cursor. This also
             // supports switching ER characters without disconnecting the AP room.
