@@ -2,6 +2,11 @@
 
 ### Changed
 
+* **Windows launches now include a native standalone Bloodborne status
+  window.** Distinct shadPS4, Archipelago, and delivery readiness is fed by the
+  nonblocking UI bridge. The translucent, always-on-top shell never touches the
+  emulator process or delivery acknowledgement path.
+  
 * **An opt-in pickup-notification correlation probe is ready for live mapping.**
   Setting `pickup_notification_probe` in the local runtime config writes a
   bounded `pickup-notification-capture.jsonl` that joins AP checks and delivery

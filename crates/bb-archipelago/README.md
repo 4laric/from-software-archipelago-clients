@@ -48,6 +48,14 @@ v0.18 memory contract is validated.
 
 ## Standalone client
 
+On Windows the normal client invocation also starts a standalone translucent
+status window. It is hosted by `bb-ap-client` itself and never injects into or
+hooks shadPS4. The game/AP/delivery readiness shown there arrives over a bounded,
+coalescing state bridge, so closing or stalling the window cannot reorder or
+acknowledge an item. Closing the window requests a controlled client shutdown.
+The existing console and session log remain available while the richer activity,
+connection controls, tray and persisted-layout slices are built.
+
 `bb-ap-client` connects as game `Bloodborne`, requests a full item sync, polls
 configured location flags when its safety context is valid, and grants received
 goods strictly by AP index. A seed-and-slot keyed JSON ledger durably binds the
