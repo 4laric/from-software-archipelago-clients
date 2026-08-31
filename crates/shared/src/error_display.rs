@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Error, Result};
-use hudhook::{ImguiRenderLoop, RenderContext};
+use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
 use imgui::*;
 
 use crate::{Core, Game, InputBlocker, InputFlags, overlay::Overlay, utils::PopupModalExt};
@@ -116,6 +116,27 @@ fn input_flags(want_mouse: bool, want_keyboard: bool, keyboard_surface_active: b
     flag
 }
 
+/// Window messages the game must not receive while an imgui surface owns input.
+///
+/// The per-game [`InputBlocker`] remains the primary path for polled input. This is the other half:
+/// menus can consume `WM_KEY*`, mouse, or `WM_INPUT` directly from the window procedure without
+/// touching XInput/DirectInput/GetKeyState. Hudhook has already copied every message into imgui's
+/// queue before applying this filter, so swallowing it here affects only the game behind the
+/// overlay.
+fn window_message_filter(inputs: InputFlags) -> MessageFilter {
+    let mut filter = MessageFilter::empty();
+    if inputs.contains(InputFlags::Keyboard) {
+        filter |= MessageFilter::InputKeyboard | MessageFilter::InputRaw;
+    }
+    if inputs.contains(InputFlags::Mouse) {
+        // Do not add InputRaw for a mere hover. Hudhook cannot distinguish raw keyboard from raw
+        // mouse messages, so doing so would quietly steal movement keys whenever the cursor crossed
+        // the ordinary overlay. A keyboard-owning surface above takes InputRaw deliberately.
+        filter |= MessageFilter::InputMouse;
+    }
+    filter
+}
+
 impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
     fn render(&mut self, ui: &mut Ui) {
         if let Some(core) = &mut self.core {
@@ -188,6 +209,15 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
             // Set the font scale here to match the overlay's logic.
             ctx.io_mut().font_global_scale = 1.8;
         }
+    }
+
+    fn message_filter(&self, io: &Io) -> MessageFilter {
+        let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
+        window_message_filter(input_flags(
+            io.want_capture_mouse,
+            io.want_capture_keyboard,
+            keyboard_surface_active,
+        ))
     }
 }
 
@@ -265,5 +295,32 @@ mod tests {
         assert!(f.contains(InputFlags::Mouse));
         assert!(!f.contains(InputFlags::Keyboard));
         assert!(!f.contains(InputFlags::GamePad));
+    }
+
+    /// The title menu consumes window messages directly, bypassing ER's polled-input hooks. The
+    /// connect modal must therefore swallow keyboard and raw-input messages at the WndProc too.
+    #[test]
+    fn a_keyboard_surface_filters_the_title_menu_message_path() {
+        let f = window_message_filter(input_flags(false, false, true));
+        assert!(f.contains(MessageFilter::InputKeyboard));
+        assert!(f.contains(MessageFilter::InputRaw));
+        assert!(!f.contains(MessageFilter::InputMouse));
+    }
+
+    /// Keep #196's boundary: merely displaying/reading the overlay does not steal the game's
+    /// window messages. Only a real input-owning surface enables the WndProc filter.
+    #[test]
+    fn ordinary_overlay_viewing_filters_no_window_messages() {
+        assert!(window_message_filter(input_flags(false, false, false)).is_empty());
+    }
+
+    /// Hudhook's raw-input filter is all-or-nothing. Hovering the ordinary overlay can take mouse
+    /// messages, but must not take raw input because that may also contain gameplay keyboard data.
+    #[test]
+    fn hovering_does_not_filter_raw_input() {
+        let f = window_message_filter(input_flags(true, false, false));
+        assert!(f.contains(MessageFilter::InputMouse));
+        assert!(!f.contains(MessageFilter::InputRaw));
+        assert!(!f.contains(MessageFilter::InputKeyboard));
     }
 }
