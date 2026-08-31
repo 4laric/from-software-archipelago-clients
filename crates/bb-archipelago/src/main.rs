@@ -17,6 +17,7 @@ use bb_archipelago::bridge::{FileBridge, missing_bridge_state};
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::{LiveEventFlags, is_manager_not_initialized};
+use bb_archipelago::health::HealthReporter;
 use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
 use bb_archipelago::logging;
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
@@ -572,10 +573,15 @@ fn points_at_the_shad_log(error: &anyhow::Error) -> bool {
 
 const LIVE_ATTACH_TIMEOUT: Duration = Duration::from_secs(600);
 
-fn attach_live_event_flags(shad_log: &Path) -> Result<LiveEventFlags> {
+fn attach_live_event_flags(shad_log: &Path, health: &mut HealthReporter) -> Result<LiveEventFlags> {
     let deadline = Instant::now() + LIVE_ATTACH_TIMEOUT;
     let mut next_report = Instant::now();
     loop {
+        let _ = health.publish(
+            false,
+            false,
+            "Waiting for Bloodborne gameplay initialization",
+        );
         match LiveEventFlags::attach(shad_log) {
             Ok(flags) => return Ok(flags),
             Err(error) => {
@@ -605,10 +611,16 @@ fn attach_live_event_flags(shad_log: &Path) -> Result<LiveEventFlags> {
 fn attach_native_backend(
     shad_log: &Path,
     assumed_identity: Option<String>,
+    health: &mut HealthReporter,
 ) -> Result<NativeBackend> {
     let deadline = Instant::now() + LIVE_ATTACH_TIMEOUT;
     let mut next_report = Instant::now();
     loop {
+        let _ = health.publish(
+            false,
+            false,
+            "Waiting for shadPS4; delivery is not armed yet",
+        );
         match NativeBackend::attach(shad_log, assumed_identity.clone()) {
             Ok(backend) => return Ok(backend),
             Err(error) => {
@@ -640,6 +652,7 @@ fn attach_native_backend(
 fn attach_native_backend(
     _shad_log: &Path,
     _assumed_identity: Option<String>,
+    _health: &mut HealthReporter,
 ) -> Result<NativeBackend> {
     bail!("native Bloodborne delivery requires Windows")
 }
@@ -652,7 +665,11 @@ fn attach_native_backend(
 /// native path does NOT call this on failure -- it hard-fails with guidance
 /// rather than silently arming a bridge the player has no CE table loaded for
 /// (clients#413).
-fn attach_live_backend(config: &RuntimeConfig, assume_correct_save: bool) -> Result<Backend> {
+fn attach_live_backend(
+    config: &RuntimeConfig,
+    assume_correct_save: bool,
+    health: &mut HealthReporter,
+) -> Result<Backend> {
     let shad_log = config
         .shad_log
         .as_deref()
@@ -662,7 +679,7 @@ fn attach_live_backend(config: &RuntimeConfig, assume_correct_save: bool) -> Res
     // tolerates shadPS4 starting after the client, and its error now names the
     // setting.
     config.preflight_paths()?;
-    let event_flags = attach_live_event_flags(shad_log)?;
+    let event_flags = attach_live_event_flags(shad_log, health)?;
     let attachment = event_flags.info();
     client_eprintln!(
         "Bloodborne AP client {} | CUSA03173 01.09 | shad PID {} | eboot 0x{:X} | direct flag backend ready",
@@ -836,6 +853,10 @@ fn run() -> Result<()> {
         Ok(()) => {}
     }
     let _ledger_lock = LedgerLock::acquire(&args.ledger)?;
+    let mut health = HealthReporter::beside_ledger(&args.ledger);
+    if let Err(error) = health.publish(false, false, "Starting; delivery is not armed yet") {
+        client_eprintln!("WARNING: could not publish launcher health status: {error}");
+    }
     #[cfg(windows)]
     let ui_client = {
         let (client, host) = client_ui::UiBridge::new(16).split();
@@ -916,7 +937,7 @@ fn run() -> Result<()> {
         let assumed_identity = args
             .assume_correct_save
             .then(|| ASSUMED_IDENTITY.to_string());
-        match attach_native_backend(shad_log, assumed_identity) {
+        match attach_native_backend(shad_log, assumed_identity, &mut health) {
             Ok(mut backend) => {
                 // clients#445: passive per-grant forensics beside the ledger.
                 // Armed unconditionally on the native path -- it costs one
@@ -942,8 +963,24 @@ fn run() -> Result<()> {
             Err(error) => return Err(native_attach_failure(error, args.delivery_explicit)),
         }
     } else {
-        attach_live_backend(&config, args.assume_correct_save)?
+        attach_live_backend(&config, args.assume_correct_save, &mut health)?
     };
+    // Native/mock delivery is armed by successful backend construction. The
+    // legacy CE bridge is external and cannot be proven live from attachment
+    // alone, so its sidecar stays conservatively false rather than presenting
+    // an old bridge state as ready.
+    let delivery_armed = args.mock || args.delivery == DeliveryMode::Native;
+    if let Err(error) = health.publish(
+        false,
+        delivery_armed,
+        if delivery_armed {
+            "Delivery backend attached; connecting to AP"
+        } else {
+            "CE bridge selected; delivery readiness is not proven"
+        },
+    ) {
+        client_eprintln!("WARNING: could not publish launcher health status: {error}");
+    }
     let ledger = ReceiveLedger::load(&args.ledger)
         .with_context(|| format!("loading receive ledger {}", args.ledger.display()))?;
     let mut backend = Some(backend);
@@ -979,6 +1016,7 @@ fn run() -> Result<()> {
     let mut death_link_tag_advertised = false;
     let mut pending_death_links: VecDeque<(String, Option<String>)> = VecDeque::new();
     let mut last_death_link_error: Option<String> = None;
+    let mut health_write_warning_printed = false;
 
     // A deliberately small, offline-capable rescue surface. stdin lives on a
     // reader thread so a disconnected AP socket never makes the console hang.
@@ -1157,6 +1195,25 @@ fn run() -> Result<()> {
                     connection_options(),
                 );
             }
+        }
+
+        let ap_connected = connection.client().is_some();
+        let health_detail = if ap_connected && delivery_armed {
+            "Ready: AP connected and delivery armed"
+        } else if ap_connected {
+            "AP connected; delivery readiness is not proven"
+        } else if connection.is_disconnected() {
+            "AP disconnected; retrying automatically"
+        } else {
+            "Connecting to AP; delivery backend is armed"
+        };
+        if let Err(error) = health.publish(ap_connected, delivery_armed, health_detail)
+            && !health_write_warning_printed
+        {
+            client_eprintln!(
+                "WARNING: could not update launcher health status ({error}); gameplay and delivery are unaffected."
+            );
+            health_write_warning_printed = true;
         }
 
         if runtime.is_none()
