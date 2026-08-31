@@ -59,9 +59,8 @@ impl DeathLinkOptions {
     /// Sets the name of the player who died. Defaults to the current slot's
     /// alias.
     ///
-    /// By default, no cause is provided.
     pub fn source(mut self, source: String) -> Self {
-        self.cause = Some(source);
+        self.source = Some(source);
         self
     }
 
@@ -72,5 +71,20 @@ impl DeathLinkOptions {
     pub fn cause(mut self, cause: String) -> Self {
         self.cause = Some(cause);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeathLinkOptions;
+
+    #[test]
+    fn source_and_cause_populate_independent_fields() {
+        let options = DeathLinkOptions::new()
+            .source("Hunter".to_owned())
+            .cause("Hunter was slain.".to_owned());
+
+        assert_eq!(options.source.as_deref(), Some("Hunter"));
+        assert_eq!(options.cause.as_deref(), Some("Hunter was slain."));
     }
 }
