@@ -131,6 +131,7 @@ pub const OPTIONS_SUBKEYS: &[ContractKey] = &[
     ContractKey { name: "global_scadutree_blessing", shape: Shape::Int, required: true, greenfield: true },
     ContractKey { name: "auto_upgrade", shape: Shape::Int, required: true, greenfield: true },
     ContractKey { name: "auto_equip", shape: Shape::BoolOrInt, required: false, greenfield: true },
+    ContractKey { name: "reveal_sweep_boss_names", shape: Shape::BoolOrInt, required: false, greenfield: true },
     ContractKey { name: "goal_region_unlock_policy", shape: Shape::Int, required: false, greenfield: true },
     ContractKey { name: "no_equip_load", shape: Shape::IntOrBool, required: false, greenfield: true },
     ContractKey { name: "no_fall_damage", shape: Shape::BoolOrInt, required: false, greenfield: true },

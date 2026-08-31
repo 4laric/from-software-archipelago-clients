@@ -60,6 +60,7 @@ pub struct ProbeCtx<'a> {
     pub region: Option<&'a RegionConfig>,
     pub armor_bundles: bool,
     pub region_completion_goal_gate: bool,
+    pub reveal_sweep_boss_names: bool,
 }
 
 /// A tag paired with the read-back that decides whether it is live.
@@ -147,6 +148,9 @@ pub const PROBES: &[(&str, Probe)] = &[
     // non-empty unlock map means this build turned abilityUnlockItems into concrete id->ability
     // bindings. Same shape as armor_bundles -- concrete members to apply, not a bare option flag.
     ("ability_unlock", |_| crate::ability_lock::has_unlock_map()),
+    // Parsed directly from the top-level slot-data contract key into Core; true is the exact
+    // state an opted-in seed declares.
+    ("reveal_sweep_boss_names", |c| c.reveal_sweep_boss_names),
 ];
 
 /// Build the `(tag, live)` table this connect.
@@ -255,6 +259,7 @@ mod tests {
             region: None,
             armor_bundles: false,
             region_completion_goal_gate: false,
+            reveal_sweep_boss_names: false,
         };
         for (_tag, p) in PROBES {
             let _ = p(&ctx);
@@ -276,6 +281,7 @@ mod tests {
                 region: None,
                 armor_bundles: false,
                 region_completion_goal_gate: false,
+                reveal_sweep_boss_names: false,
             }),
             "no config -> not armed"
         );
@@ -286,6 +292,7 @@ mod tests {
                 region: Some(&cfg),
                 armor_bundles: false,
                 region_completion_goal_gate: false,
+                reveal_sweep_boss_names: false,
             }),
             "a seed that gates no region must not report the feature armed"
         );
@@ -298,6 +305,7 @@ mod tests {
                 region: Some(&cfg),
                 armor_bundles: false,
                 region_completion_goal_gate: false,
+                reveal_sweep_boss_names: false,
             }),
             "one gated region is what the apworld declares the tag for"
         );
