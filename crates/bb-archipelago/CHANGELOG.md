@@ -2,6 +2,11 @@
 
 ### Changed
 
+* **Windows launches now include a native standalone Bloodborne status
+  window.** Distinct shadPS4, Archipelago, and delivery readiness is fed by the
+  nonblocking UI bridge. The translucent, always-on-top shell never touches the
+  emulator process or delivery acknowledgement path.
+
 * **Randomized fixed pickups now sustain exploration with one Quicksilver
   Bullet.** Their suppressed ItemLot already supplies one Blood Vial; after a
   new check is sent, the client queues the matching Bullet through the native

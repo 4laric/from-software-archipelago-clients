@@ -829,6 +829,25 @@ fn run() -> Result<()> {
         Ok(()) => {}
     }
     let _ledger_lock = LedgerLock::acquire(&args.ledger)?;
+    #[cfg(windows)]
+    let ui_client = {
+        let (client, host) = client_ui::UiBridge::new(16).split();
+        let options = standalone_windows::WindowOptions {
+            opacity: f32::from(args.window_opacity) / 100.0,
+            ..Default::default()
+        };
+        standalone_windows::spawn(host, options);
+        client.publish(client_ui::ClientSnapshot {
+            revision: 1,
+            process: client_ui::ProcessState::Attaching,
+            ap: client_ui::ApState::Connecting,
+            delivery: client_ui::DeliveryState::NotArmed,
+            server: Some(args.server.clone()),
+            slot: Some(args.slot.clone()),
+            ..Default::default()
+        });
+        client
+    };
     client_eprintln!(
         "Bloodborne AP client {} | runtime build {RUNTIME_BUILD}",
         client_version()
@@ -973,8 +992,24 @@ fn run() -> Result<()> {
         "Developer rescue console ready. Type 'help'. Mutations require an explicit CONFIRM token and reuse the validated delivery pipeline."
     );
 
+    #[cfg(windows)]
+    let mut ui_revision = 1_u64;
     loop {
-        while let Ok(line) = console_rx.try_recv() {
+        let mut command_lines = console_rx.try_iter().collect::<Vec<_>>();
+        #[cfg(windows)]
+        while let Ok(action) = ui_client.try_action() {
+            match action {
+                client_ui::UiAction::SubmitCommand(line) => command_lines.push(line),
+                client_ui::UiAction::RequestShutdown => return Ok(()),
+                // Connection identity is owned by this process invocation. These actions become
+                // active when the connection form lands; silently changing the current seed or
+                // socket here would violate the ledger binding.
+                client_ui::UiAction::Connect { .. }
+                | client_ui::UiAction::Disconnect
+                | client_ui::UiAction::OpenSessionFolder => {}
+            }
+        }
+        for line in command_lines {
             let words = line.split_whitespace().collect::<Vec<_>>();
             let command = words.first().map(|word| word.to_ascii_lowercase());
             match command.as_deref() {
@@ -1385,6 +1420,39 @@ fn run() -> Result<()> {
             }
         }
 
+        #[cfg(windows)]
+        {
+            ui_revision += 1;
+            let ap = if connection.client().is_some() {
+                client_ui::ApState::Authenticated
+            } else if connection.is_disconnected() {
+                client_ui::ApState::Reconnecting
+            } else {
+                client_ui::ApState::Connecting
+            };
+            let attached = runtime.is_some();
+            ui_client.publish(client_ui::ClientSnapshot {
+                revision: ui_revision,
+                process: if attached {
+                    client_ui::ProcessState::Attached
+                } else {
+                    client_ui::ProcessState::Attaching
+                },
+                ap,
+                delivery: if attached {
+                    // Do not infer gameplay readiness from process attachment. A later typed
+                    // runtime reducer will publish Ready/CommandPending/Blocked from the same
+                    // validated context used by delivery; until then this conservative state is
+                    // truthful and cannot make an unsafe client look armed.
+                    client_ui::DeliveryState::WaitingForGameplay
+                } else {
+                    client_ui::DeliveryState::NotArmed
+                },
+                server: Some(args.server.clone()),
+                slot: Some(args.slot.clone()),
+                ..Default::default()
+            });
+        }
         thread::sleep(Duration::from_millis(50));
     }
 }
