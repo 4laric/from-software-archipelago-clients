@@ -837,23 +837,28 @@ fn run() -> Result<()> {
     }
     let _ledger_lock = LedgerLock::acquire(&args.ledger)?;
     #[cfg(windows)]
-    let ui_client = {
+    let (ui_client, mut ui_reducer) = {
         let (client, host) = client_ui::UiBridge::new(16).split();
         let options = standalone_windows::WindowOptions {
             opacity: f32::from(args.window_opacity) / 100.0,
             ..Default::default()
         };
-        standalone_windows::spawn(host, options);
-        client.publish(client_ui::ClientSnapshot {
-            revision: 1,
+        let window_state = args
+            .ledger
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("client-window.json");
+        standalone_windows::spawn_persisted(host, options, window_state);
+        let mut reducer = client_ui::SnapshotReducer::new(100);
+        client.publish(reducer.reduce(client_ui::DeliveryFacts {
             process: client_ui::ProcessState::Attaching,
             ap: client_ui::ApState::Connecting,
             delivery: client_ui::DeliveryState::NotArmed,
             server: Some(args.server.clone()),
             slot: Some(args.slot.clone()),
             ..Default::default()
-        });
-        client
+        }));
+        (client, reducer)
     };
     client_eprintln!(
         "Bloodborne AP client {} | runtime build {RUNTIME_BUILD}",
@@ -999,9 +1004,13 @@ fn run() -> Result<()> {
         "Developer rescue console ready. Type 'help'. Mutations require an explicit CONFIRM token and reuse the validated delivery pipeline."
     );
 
-    #[cfg(windows)]
-    let mut ui_revision = 1_u64;
     loop {
+        #[cfg(windows)]
+        let mut ui_delivery = if runtime.is_some() {
+            client_ui::DeliveryState::WaitingForGameplay
+        } else {
+            client_ui::DeliveryState::NotArmed
+        };
         let mut command_lines = console_rx.try_iter().collect::<Vec<_>>();
         #[cfg(windows)]
         while let Ok(action) = ui_client.try_action() {
@@ -1011,9 +1020,18 @@ fn run() -> Result<()> {
                 // Connection identity is owned by this process invocation. These actions become
                 // active when the connection form lands; silently changing the current seed or
                 // socket here would violate the ledger binding.
-                client_ui::UiAction::Connect { .. }
-                | client_ui::UiAction::Disconnect
-                | client_ui::UiAction::OpenSessionFolder => {}
+                client_ui::UiAction::OpenSessionFolder => {
+                    if let Some(folder) = args.ledger.parent()
+                        && let Err(error) =
+                            std::process::Command::new("explorer").arg(folder).spawn()
+                    {
+                        client_eprintln!(
+                            "Could not open session folder {}: {error}",
+                            folder.display()
+                        );
+                    }
+                }
+                client_ui::UiAction::Connect { .. } | client_ui::UiAction::Disconnect => {}
             }
         }
         for line in command_lines {
@@ -1093,8 +1111,14 @@ fn run() -> Result<()> {
                     // reconnect alike (clients#423): `ReconnectPolicy` prints
                     // none of its own, so this is never doubled.
                     client_eprintln!("{CONNECTED_LINE}");
+                    #[cfg(windows)]
+                    ui_reducer.activity(client_ui::ActivityKind::Message, CONNECTED_LINE);
                 }
-                Event::Print(message) => client_eprintln!("{message}"),
+                Event::Print(message) => {
+                    #[cfg(windows)]
+                    ui_reducer.activity(client_ui::ActivityKind::Message, message.to_string());
+                    client_eprintln!("{message}");
+                }
                 Event::Error(error) => {
                     ap_error_seen = true;
                     client_eprintln!("Archipelago error: {error}");
@@ -1325,6 +1349,11 @@ fn run() -> Result<()> {
                         client_eprintln!("Bloodborne location polling recovered.");
                     }
                     if !newly_checked.is_empty() {
+                        #[cfg(windows)]
+                        ui_reducer.activity(
+                            client_ui::ActivityKind::LocationCheck,
+                            format!("Sent {} location check(s)", newly_checked.len()),
+                        );
                         runtime.record_location_checks(&newly_checked);
                         if !goal_reported
                             && goal_location.is_some_and(|goal| newly_checked.contains(&goal))
@@ -1368,6 +1397,17 @@ fn run() -> Result<()> {
                 .collect::<Vec<_>>();
             let items_idle = match runtime.poll_items(&received) {
                 Ok(ItemPollResult::Completed(item)) => {
+                    #[cfg(windows)]
+                    {
+                        ui_delivery = client_ui::DeliveryState::Ready;
+                        ui_reducer.activity(
+                            client_ui::ActivityKind::ReceivedItem,
+                            format!(
+                                "Received AP item {} (index {})",
+                                item.ap_item_id, item.index
+                            ),
+                        );
+                    }
                     if let Some(line) = item_errors.recovered() {
                         client_eprintln!("{line}");
                     }
@@ -1384,6 +1424,17 @@ fn run() -> Result<()> {
                     false
                 }
                 Ok(ItemPollResult::Blocked(blocked)) => {
+                    #[cfg(windows)]
+                    {
+                        ui_delivery = client_ui::DeliveryState::Blocked;
+                        ui_reducer.activity(
+                            client_ui::ActivityKind::ParkedDelivery,
+                            format!(
+                                "Parked AP item {} (index {})",
+                                blocked.ap_item_id, blocked.index
+                            ),
+                        );
+                    }
                     if let Some(line) = item_errors.recovered() {
                         client_eprintln!("{line}");
                     }
@@ -1401,8 +1452,20 @@ fn run() -> Result<()> {
                     );
                     false
                 }
-                Ok(ItemPollResult::Idle) => true,
-                Ok(ItemPollResult::Pending) => false,
+                Ok(ItemPollResult::Idle) => {
+                    #[cfg(windows)]
+                    {
+                        ui_delivery = client_ui::DeliveryState::Ready;
+                    }
+                    true
+                }
+                Ok(ItemPollResult::Pending) => {
+                    #[cfg(windows)]
+                    {
+                        ui_delivery = client_ui::DeliveryState::CommandPending;
+                    }
+                    false
+                }
                 // Held and Reconciled are surfaced through the watermark
                 // notice channel above, exactly once per transition.
                 Ok(ItemPollResult::Held | ItemPollResult::Reconciled(_)) => false,
@@ -1430,7 +1493,6 @@ fn run() -> Result<()> {
 
         #[cfg(windows)]
         {
-            ui_revision += 1;
             let ap = if connection.client().is_some() {
                 client_ui::ApState::Authenticated
             } else if connection.is_disconnected() {
@@ -1439,27 +1501,43 @@ fn run() -> Result<()> {
                 client_ui::ApState::Connecting
             };
             let attached = runtime.is_some();
-            ui_client.publish(client_ui::ClientSnapshot {
-                revision: ui_revision,
+            let (seed, ledger) = runtime.as_ref().map_or_else(
+                || (None, client_ui::LedgerTotals::default()),
+                |runtime| {
+                    let totals = runtime
+                        .ledger()
+                        .slot(runtime.seed_name(), &args.slot)
+                        .map_or_else(client_ui::LedgerTotals::default, |slot| {
+                            let parked = slot.blocked_entries().count() as u32;
+                            client_ui::LedgerTotals {
+                                queued: u32::from(slot.pending.is_some())
+                                    + slot.redeliver.len() as u32,
+                                delivered: (slot.acknowledged.len() as u32).saturating_sub(parked),
+                                storage_routed: None,
+                                parked,
+                            }
+                        });
+                    (Some(runtime.seed_name().to_owned()), totals)
+                },
+            );
+            if ledger.parked > 0 {
+                ui_delivery = client_ui::DeliveryState::Blocked;
+            }
+            ui_client.publish(ui_reducer.reduce(client_ui::DeliveryFacts {
                 process: if attached {
                     client_ui::ProcessState::Attached
                 } else {
                     client_ui::ProcessState::Attaching
                 },
                 ap,
-                delivery: if attached {
-                    // Do not infer gameplay readiness from process attachment. A later typed
-                    // runtime reducer will publish Ready/CommandPending/Blocked from the same
-                    // validated context used by delivery; until then this conservative state is
-                    // truthful and cannot make an unsafe client look armed.
-                    client_ui::DeliveryState::WaitingForGameplay
-                } else {
-                    client_ui::DeliveryState::NotArmed
-                },
+                delivery: ui_delivery,
                 server: Some(args.server.clone()),
                 slot: Some(args.slot.clone()),
+                seed,
+                goal: goal_location.map(|location| format!("Location {location}")),
+                ledger,
                 ..Default::default()
-            });
+            }));
         }
         thread::sleep(Duration::from_millis(50));
     }
