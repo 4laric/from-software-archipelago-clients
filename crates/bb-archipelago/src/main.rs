@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::env;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::BufRead;
@@ -326,14 +326,6 @@ impl BloodborneBackend for Backend {
             Self::Live(backend) => backend.grant_may_have_applied(tag),
             Self::Mock(backend) => backend.grant_may_have_applied(tag),
             Self::Native(backend) => backend.grant_may_have_applied(tag),
-        }
-    }
-
-    fn death_link_kill(&mut self) -> Result<bool> {
-        match self {
-            Self::Live(backend) => backend.death_link_kill(),
-            Self::Mock(backend) => backend.death_link_kill(),
-            Self::Native(backend) => backend.death_link_kill(),
         }
     }
 
@@ -950,9 +942,6 @@ fn run() -> Result<()> {
     let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut item_errors = ItemErrorReporter::default();
-    let mut death_link_tag_advertised = false;
-    let mut pending_death_links: VecDeque<(String, Option<String>)> = VecDeque::new();
-    let mut last_death_link_error: Option<String> = None;
 
     // A deliberately small, offline-capable rescue surface. stdin lives on a
     // reader thread so a disconnected AP socket never makes the console hang.
@@ -1046,7 +1035,6 @@ fn run() -> Result<()> {
             match event {
                 Event::Connected => {
                     connected_now = true;
-                    death_link_tag_advertised = false;
                     // The one recovery line, for the first connect and every
                     // reconnect alike (clients#423): `ReconnectPolicy` prints
                     // none of its own, so this is never doubled.
@@ -1056,9 +1044,6 @@ fn run() -> Result<()> {
                 Event::Error(error) => {
                     ap_error_seen = true;
                     client_eprintln!("Archipelago error: {error}");
-                }
-                Event::DeathLink { source, cause, .. } => {
-                    pending_death_links.push_back((source, cause));
                 }
                 _ => {}
             }
@@ -1202,40 +1187,6 @@ fn run() -> Result<()> {
                 Err(error) => eprintln!("Re-queuing parked items failed: {error:#}"),
             }
             runtime = Some(new_runtime);
-        }
-
-        if !death_link_tag_advertised
-            && runtime.as_ref().is_some_and(ClientLoop::death_link_enabled)
-            && let Some(client) = connection.client_mut()
-        {
-            client.update_connection(None, Some(["DeathLink"]))?;
-            death_link_tag_advertised = true;
-            client_eprintln!(
-                "DeathLink receive is enabled; outbound Bloodborne deaths remain disabled pending live signal validation."
-            );
-        }
-
-        if let (Some(runtime), Some((source, cause))) =
-            (runtime.as_mut(), pending_death_links.front())
-        {
-            match runtime.receive_death_link() {
-                Ok(true) => {
-                    client_eprintln!(
-                        "DeathLink received from {source}: {}",
-                        cause.as_deref().unwrap_or("linked death")
-                    );
-                    pending_death_links.pop_front();
-                    last_death_link_error = None;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    if last_death_link_error.as_deref() != Some(&message) {
-                        client_eprintln!("DeathLink kill unavailable: {message}");
-                        last_death_link_error = Some(message);
-                    }
-                }
-            }
         }
 
         if let (Some(runtime), Some(client)) = (runtime.as_mut(), connection.client_mut()) {

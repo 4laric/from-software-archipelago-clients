@@ -2,7 +2,7 @@
 
 /// Exact cross-repository runtime contract. The apworld, native client, and
 /// Cheat Engine harness bump this together whenever their shared shape changes.
-pub const RUNTIME_BUILD: &str = "bb-0.1.0-r9";
+pub const RUNTIME_BUILD: &str = "bb-0.1.0-r8";
 
 /// Version that identifies the exact client binary, not merely its Cargo package version.
 ///

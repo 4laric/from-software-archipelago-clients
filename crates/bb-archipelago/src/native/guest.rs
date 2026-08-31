@@ -87,7 +87,6 @@ struct CellAddresses {
     item_quantity_pointer: u64,
     manual_trigger: u64,
     descriptor: u64,
-    player_status: u64,
 }
 
 /// Owns the process-memory accessor so it can be stored inside the delivery
@@ -117,7 +116,6 @@ impl<P: ProcessMemory> GuestRuntime<P> {
             item_quantity_pointer: cell("item_quantity_pointer")?,
             manual_trigger: cell("manual_trigger")?,
             descriptor: cell("descriptor")?,
-            player_status: cell("player_status")?,
         };
         Ok(Self {
             memory,
@@ -135,26 +133,6 @@ impl<P: ProcessMemory> GuestRuntime<P> {
 
     pub fn memory(&self) -> &P {
         &self.memory
-    }
-
-    /// Kill the currently captured player through the live-validated HP cell.
-    /// The HP hook continuously refreshes `player_status`; zero means it has
-    /// not run since launch and must never be treated as an address.
-    pub fn death_link_kill(&self) -> anyhow::Result<bool> {
-        let status = self.memory.read_u64(self.cells.player_status)?;
-        if status == 0 {
-            return Ok(false);
-        }
-        if self.memory.read_u32(status + 0xF8)? == 0 {
-            // Keep later links queued until the player has actually respawned.
-            return Ok(false);
-        }
-        self.memory.write_u32(status + 0xF8, 0)?;
-        Ok(true)
-    }
-
-    pub fn clear_player_status(&self) -> anyhow::Result<()> {
-        self.memory.write_u64(self.cells.player_status, 0)
     }
 
     /// Highest reinforcement level among recognized player weapon records.
@@ -567,29 +545,6 @@ mod tests {
         let mut guest = GuestRuntime::new(memory, base).unwrap();
         assert!(!guest.inventory_ready());
         assert!(guest.take_error().is_some());
-    }
-
-    #[test]
-    fn death_link_kill_requires_a_captured_pointer_then_writes_only_current_hp() {
-        let c = contract();
-        let base = 0x4000_0000;
-        let status = 0x9000_0000u64;
-        let memory = FakeMemory::new();
-        memory.store(
-            base + c.state_cell("player_status").unwrap().rva,
-            &0u64.to_le_bytes(),
-        );
-        let guest = GuestRuntime::new(memory, base).unwrap();
-        assert!(!guest.death_link_kill().unwrap());
-
-        guest.memory().store(
-            base + c.state_cell("player_status").unwrap().rva,
-            &status.to_le_bytes(),
-        );
-        guest.memory().store(status + 0xF8, &777u32.to_le_bytes());
-        assert!(guest.death_link_kill().unwrap());
-        assert_eq!(guest.memory().read_u32(status + 0xF8).unwrap(), 0);
-        assert!(!guest.death_link_kill().unwrap(), "a second link waits for respawn");
     }
 
     /// clients#433: the `request` value IS the lane. Both arguments present

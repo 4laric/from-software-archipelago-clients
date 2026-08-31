@@ -415,7 +415,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("native-grant-state.txt"),
-            "build=bb-0.1.0-r9\nprotocol=BBGRANT1\nharness=bb-native-grant-v7\nstatus=completed\npid=5040\ntag=received_17\ndetail=direct before=2 after=3\n",
+            "build=bb-0.1.0-r8\nprotocol=BBGRANT1\nharness=bb-native-grant-v7\nstatus=completed\npid=5040\ntag=received_17\ndetail=direct before=2 after=3\n",
         )
         .unwrap();
         let state = FileBridge::new(&root).read_state().unwrap();

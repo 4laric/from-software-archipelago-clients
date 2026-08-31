@@ -123,9 +123,6 @@ pub trait BloodborneBackend {
     /// explicitly, the pre-existing freeze-on-first-observe behaviour.
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool>;
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress>;
-    /// Kill the loaded player for an incoming DeathLink. `false` means the
-    /// validated player HP pointer is not captured/gameplay-ready yet.
-    fn death_link_kill(&mut self) -> Result<bool>;
     /// Retract a published-but-unexecuted grant command (clients#296). The
     /// client calls this when the validated context the command was published
     /// under is gone -- a save switch, a non-gameplay transition, or a process
@@ -229,12 +226,6 @@ impl BloodborneBackend for FileBackend {
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {
         // Weapon inventory/reinforcement state has not been resolved on v0.18.
         Ok(None)
-    }
-
-    fn death_link_kill(&mut self) -> Result<bool> {
-        // The legacy file bridge has no HP command. DeathLink is native-only;
-        // fail closed instead of inventing an unversioned side channel.
-        Ok(false)
     }
 
     /// The CE file bridge cannot read inventory, so the caller keeps its
@@ -469,13 +460,6 @@ impl BloodborneBackend for MockBackend {
 
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {
         Ok(self.upgrade_target_level)
-    }
-
-    fn death_link_kill(&mut self) -> Result<bool> {
-        Ok(self
-            .location_context
-            .as_ref()
-            .is_some_and(|context| context.gameplay_ready))
     }
 
     fn observe_stack_quantity(
