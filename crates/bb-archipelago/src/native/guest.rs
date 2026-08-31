@@ -589,10 +589,7 @@ mod tests {
         guest.memory().store(status + 0xF8, &777u32.to_le_bytes());
         assert!(guest.death_link_kill().unwrap());
         assert_eq!(guest.memory().read_u32(status + 0xF8).unwrap(), 0);
-        assert!(
-            !guest.death_link_kill().unwrap(),
-            "a second link waits for respawn"
-        );
+        assert!(!guest.death_link_kill().unwrap(), "a second link waits for respawn");
     }
 
     /// clients#433: the `request` value IS the lane. Both arguments present
