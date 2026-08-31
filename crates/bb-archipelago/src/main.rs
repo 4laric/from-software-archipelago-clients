@@ -411,7 +411,7 @@ struct Arguments {
     window_opacity: u8,
 }
 
-const DEFAULT_WINDOW_OPACITY: u8 = 85;
+const DEFAULT_WINDOW_OPACITY: u8 = 70;
 
 fn parse_window_opacity(value: &str) -> Result<u8> {
     let percent: u8 = value
@@ -429,8 +429,8 @@ fn apply_console_opacity(percent: u8) -> Result<()> {
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::System::Console::GetConsoleWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetWindowLongW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongW,
-        WS_EX_LAYERED,
+        GWL_EXSTYLE, GetWindowLongW, IsWindowVisible, LWA_ALPHA, SetLayeredWindowAttributes,
+        SetWindowLongW, WS_EX_LAYERED,
     };
 
     if percent == 100 {
@@ -440,6 +440,10 @@ fn apply_console_opacity(percent: u8) -> Result<()> {
     anyhow::ensure!(
         !window.0.is_null(),
         "this client does not own a console window"
+    );
+    anyhow::ensure!(
+        unsafe { IsWindowVisible(window) }.as_bool(),
+        "the console is hosted by a terminal that controls its own opacity"
     );
     let style = unsafe { GetWindowLongW(window, GWL_EXSTYLE) };
     unsafe { SetWindowLongW(window, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as i32) };
@@ -801,11 +805,16 @@ fn run() -> Result<()> {
         logging::install_log_file(path)
             .with_context(|| format!("could not open the client log {}", path.display()))?;
     }
-    if let Err(error) = apply_console_opacity(args.window_opacity) {
-        client_eprintln!(
+    match apply_console_opacity(args.window_opacity) {
+        Ok(()) if args.window_opacity < 100 => client_eprintln!(
+            "Client console opacity: {}% (use --window-opacity 35-100 to adjust)",
+            args.window_opacity
+        ),
+        Err(error) => client_eprintln!(
             "WARNING: could not make the client window {}% opaque: {error:#}",
             args.window_opacity
-        );
+        ),
+        Ok(()) => {}
     }
     let _ledger_lock = LedgerLock::acquire(&args.ledger)?;
     client_eprintln!(
@@ -1507,7 +1516,7 @@ mod tests {
     #[test]
     fn client_window_is_translucent_by_default() {
         let args = parse_args(base_args(&[]).into_iter()).expect("parse");
-        assert_eq!(args.window_opacity, 85);
+        assert_eq!(args.window_opacity, 70);
     }
 
     #[test]
