@@ -83,6 +83,17 @@ impl Default for WindowGeometry {
     }
 }
 
+fn work_area_geometry(left: i32, top: i32, right: i32, bottom: i32) -> Option<WindowGeometry> {
+    let width = right.checked_sub(left)?;
+    let height = bottom.checked_sub(top)?;
+    (width > 0 && height > 0).then_some(WindowGeometry {
+        x: left,
+        y: top,
+        width,
+        height,
+    })
+}
+
 /// Platform-neutral contract implemented by the eventual native renderer. Keeping this contract
 /// free of hudhook is the seam that allows external clients to coexist with injected overlays.
 pub trait StandaloneHost {
@@ -184,7 +195,8 @@ mod native {
 
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        COLOR_WINDOW, GetSysColorBrush, InvalidateRect, UpdateWindow,
+        COLOR_WINDOW, GetMonitorInfoW, GetSysColorBrush, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+        MONITORINFO, MonitorFromRect, UpdateWindow,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -200,7 +212,7 @@ mod native {
     use super::{
         CONTROL_COMMAND_INPUT, CONTROL_COMMAND_SEND, CONTROL_EXPORT, CONTROL_SESSION_FOLDER,
         CONTROL_STATUS, StandaloneHost, WindowGeometry, WindowOptions, client_ui, control_action,
-        normalize_command_input, render_snapshot,
+        normalize_command_input, render_snapshot, work_area_geometry,
     };
 
     /// Dependency-light native shell. It owns only windowing and rendering; the game client owns
@@ -208,6 +220,34 @@ mod native {
     #[derive(Default)]
     pub struct NativeWindowHost {
         state_path: Option<PathBuf>,
+    }
+
+    /// Resolve the monitor nearest the saved rectangle and clamp against its usable work area.
+    /// This deliberately happens before window creation: a display-layout change must not strand
+    /// the only client UI where the player cannot reach it to repair the saved geometry.
+    unsafe fn nearest_work_area(geometry: WindowGeometry) -> Option<WindowGeometry> {
+        let saved = RECT {
+            left: geometry.x,
+            top: geometry.y,
+            right: geometry.x.saturating_add(geometry.width.max(1)),
+            bottom: geometry.y.saturating_add(geometry.height.max(1)),
+        };
+        // SAFETY: `saved` is a live RECT and `MONITOR_DEFAULTTONEAREST` guarantees a monitor when
+        // at least one display is available.
+        let monitor = unsafe { MonitorFromRect(&saved, MONITOR_DEFAULTTONEAREST) };
+        if monitor.0.is_null() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `info` has the required size and remains valid for the duration of the call.
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return None;
+        }
+        let work = info.rcWork;
+        work_area_geometry(work.left, work.top, work.right, work.bottom)
     }
 
     unsafe extern "system" fn window_proc(
@@ -291,12 +331,8 @@ mod native {
                     && let Ok(bytes) = std::fs::read(path)
                     && let Ok(saved) = json::from_slice::<WindowOptions>(&bytes)
                 {
-                    options = saved.normalized(WindowGeometry {
-                        x: 0,
-                        y: 0,
-                        width: 3840,
-                        height: 2160,
-                    });
+                    options = nearest_work_area(saved.geometry)
+                        .map_or(saved, |work_area| saved.normalized(work_area));
                 }
                 let geometry = options.geometry;
                 let window = CreateWindowExW(
@@ -573,6 +609,22 @@ mod tests {
             }
         );
         assert_eq!(restored.alpha_byte(), 51);
+    }
+
+    #[test]
+    fn monitor_work_area_preserves_negative_coordinates_and_rejects_bad_bounds() {
+        assert_eq!(
+            work_area_geometry(-1920, 24, 0, 1080),
+            Some(WindowGeometry {
+                x: -1920,
+                y: 24,
+                width: 1920,
+                height: 1056,
+            })
+        );
+        assert_eq!(work_area_geometry(10, 20, 10, 200), None);
+        assert_eq!(work_area_geometry(10, 20, 200, 19), None);
+        assert_eq!(work_area_geometry(i32::MIN, 0, i32::MAX, 100), None);
     }
 
     #[cfg(windows)]
