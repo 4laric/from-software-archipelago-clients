@@ -56,6 +56,13 @@
 
 ### Fixed
 
+* **Confirmed insert-lane storage deliveries are named consistently.** When
+  ItemGrant completes but the new goods record does not enter held inventory,
+  the console directs the player to the Hunter's Dream storage box and the
+  diagnostic record now says `storage`, matching the player-validated outcome.
+  Delta-lane deficits remain `storage_suspected` because a concurrent spend is
+  arithmetically indistinguishable from overflow.
+
 * **Goal-release item floods are paced instead of hammering Bloodborne's
   inventory routine.** A live 71-item capture showed stable held delivery at
   ordinary cadence, then storage routing after more than twenty grants arrived

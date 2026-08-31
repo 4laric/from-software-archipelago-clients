@@ -84,25 +84,33 @@ def main():
             print("  ".join("-" * width for width in widths))
 
     total = len(records)
+    confirmed = sum(
+        count for key, count in groups.items() if key[3] == "storage"
+    )
     suspected = sum(
         count for key, count in groups.items() if key[3] == "storage_suspected"
     )
     print("")
-    print("{} terminal grants; {} inferred storage_suspected ({:.1f}%)".format(
-        total, suspected, 100.0 * suspected / total))
+    print("{} terminal grants; {} confirmed storage ({:.1f}%); "
+          "{} inferred storage_suspected ({:.1f}%)".format(
+              total, confirmed, 100.0 * confirmed / total,
+              suspected, 100.0 * suspected / total))
     if malformed:
         print("{} unparseable line(s) skipped".format(malformed))
-    print("inferred_destination is an INFERENCE from read-back arithmetic, not a "
-          "read of the storage box; storage_suspected and a concurrent spend are "
-          "indistinguishable to the client.")
+    print("storage names the player-validated insert-deficit shape; "
+          "storage_suspected is an inference from read-back arithmetic, where "
+          "overflow and a concurrent spend are indistinguishable to the client.")
 
     candidates = []
     for position, record in enumerate(records):
+        confirmed_storage = record.get("inferred_destination") == "storage"
         suspect = record.get("inferred_destination") == "storage_suspected"
         after_suspect = record.get("previous_inferred_destination") == "storage_suspected"
         insert_to_storage = record.get("lane") == "insert" and record.get("native_result") == 2
-        if suspect or after_suspect or insert_to_storage:
+        if confirmed_storage or suspect or after_suspect or insert_to_storage:
             reasons = []
+            if confirmed_storage:
+                reasons.append("confirmed insert storage shape")
             if suspect:
                 reasons.append("held deficit after executed grant")
             if after_suspect:
