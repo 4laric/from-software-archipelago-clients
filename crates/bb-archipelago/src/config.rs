@@ -281,6 +281,10 @@ pub struct RuntimeConfig {
     /// not read from slot data: a seed cannot turn native instrumentation on.
     #[serde(default)]
     pub pickup_notification_probe: bool,
+    /// Seed-owned count of qualifying local deaths forgiven before the next
+    /// outbound DeathLink. Inert while DeathLink is disabled.
+    #[serde(default)]
+    pub death_link_amnesty: u32,
     /// Both live checks and received-item mutation remain disarmed until the
     /// backend proves that it is operating on this explicitly bound save.
     #[serde(default)]
@@ -377,6 +381,14 @@ impl RuntimeConfig {
             self.death_link = value
                 .as_bool()
                 .context("slot_data.death_link must be a boolean")?;
+        }
+        if let Some(value) = slot_data.get("death_link_amnesty") {
+            let value = value
+                .as_u64()
+                .context("slot_data.death_link_amnesty must be a non-negative integer")?;
+            self.death_link_amnesty = value
+                .try_into()
+                .context("slot_data.death_link_amnesty exceeds the supported range")?;
         }
         if let Some(value) = slot_data.get("suppression") {
             self.suppression =
@@ -600,6 +612,7 @@ mod tests {
             auto_equip: false,
             death_link: false,
             pickup_notification_probe: false,
+            death_link_amnesty: 0,
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,
@@ -864,12 +877,24 @@ mod tests {
             .apply_slot_data(&json!({
                 "auto_upgrade": true,
                 "auto_equip": true,
-                "death_link": true
+                "death_link": true,
+                "death_link_amnesty": 2
             }))
             .unwrap();
         assert!(config.auto_upgrade);
         assert!(config.auto_equip);
         assert!(config.death_link);
+        assert_eq!(config.death_link_amnesty, 2);
+    }
+
+    #[test]
+    fn death_link_amnesty_rejects_negative_or_non_integer_values() {
+        for value in [json!(-1), json!(1.5), json!("two")] {
+            let error = local()
+                .apply_slot_data(&json!({"death_link_amnesty": value}))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("non-negative integer"));
+        }
     }
 
     #[test]

@@ -48,6 +48,15 @@ pub struct SlotLedger {
     /// block or duplicate its randomized AP item.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub completed_sustain: BTreeSet<i64>,
+    /// Qualifying local deaths forgiven in the current DeathLink-amnesty
+    /// cycle. Kept with the seed/slot ledger so reconnecting or relaunching
+    /// cannot silently reset the cadence.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub death_link_amnesty_used: u32,
+}
+
+const fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// The single defined outcome of comparing the save-resident receive

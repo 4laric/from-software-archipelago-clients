@@ -25,6 +25,10 @@
   grant machine. Completion is save-bound and keyed by AP location, so polling,
   reconnects, and interrupted commands cannot create historical or duplicate
   awards, and sustain failure never blocks the randomized item.
+* **Bloodborne now understands the seed-owned DeathLink-amnesty contract.**
+  Its local-death cycle is stored in the per-seed ledger so reconnecting or
+  relaunching cannot reset it. The policy remains dormant while Bloodborne is
+  receive-only, pending validation of the local-death signal.
 
 * **Blood-gem diagnostics no longer mislabel armor as gems.** ItemLot category
   8 is a generation recipe, not a prefix encoded into a runtime inventory id.
