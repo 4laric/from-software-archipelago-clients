@@ -36,6 +36,18 @@ pub struct SlotLedger {
     /// ledgers have no such field and load with it empty.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub redeliver: BTreeSet<u64>,
+    /// Randomized fixed pickups whose one-bullet sustain award has been
+    /// queued but not yet witnessed in game (clients#511). The AP location id
+    /// is the idempotency key; the optional quantity is recorded before the
+    /// native command is published so an interrupted grant can be recovered
+    /// without duplicating it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_sustain: BTreeMap<i64, Option<u32>>,
+    /// Sustain awards whose native grant completed. Kept independently from
+    /// received-item acknowledgement because checking a location must never
+    /// block or duplicate its randomized AP item.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub completed_sustain: BTreeSet<i64>,
 }
 
 /// The single defined outcome of comparing the save-resident receive

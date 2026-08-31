@@ -16,6 +16,9 @@ use crate::upgrades::{auto_upgrade_level, reinforced_descriptor_pair};
 
 const LOCATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const LOCATION_RETRY_MAX: Duration = Duration::from_secs(30);
+const QUICKSILVER_BULLET_GOODS_ID: u32 = 1_100;
+const QUICKSILVER_BULLET_RAW_DESCRIPTOR: u32 = 0xB000_044C;
+const GOODS_NORMALIZED_PREFIX: u32 = 0x4000_0000;
 
 #[derive(Clone, Copy, Debug)]
 struct LocationRetry {
@@ -70,6 +73,13 @@ pub enum ItemPollResult {
     /// operator-driven `bb-blocked` tool (clients#399).
     Blocked(BlockedItem),
     Completed(CompletedItem),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SustainPollResult {
+    Idle,
+    Pending,
+    Completed(i64),
 }
 
 pub struct ClientLoop<B> {
@@ -316,6 +326,107 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         self.location_retries.clear();
     }
 
+    /// Queue the anti-farm bullet for newly sent randomized fixed checks.
+    /// Historical server checks never enter this method: callers pass only
+    /// transitions returned by `poll_locations`. It is persisted before the
+    /// network send, closing the crash window between sending a check and
+    /// recording its bonus; repeated flag polling is harmless because the
+    /// location id is the durable idempotency key.
+    pub fn queue_sustain_for_checks(&mut self, locations: &[i64]) -> Result<Vec<i64>> {
+        let eligible = locations
+            .iter()
+            .copied()
+            .filter(|location| {
+                self.config.locations.iter().any(|binding| {
+                    binding.ap_location_id == *location && binding.vanilla_award_suppressed
+                })
+            })
+            .collect::<Vec<_>>();
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        let mut queued = Vec::new();
+        for location in eligible {
+            if !slot.completed_sustain.contains(&location)
+                && !slot.pending_sustain.contains_key(&location)
+            {
+                slot.pending_sustain.insert(location, None);
+                queued.push(location);
+            }
+        }
+        if !queued.is_empty() {
+            self.ledger.save(&self.ledger_path)?;
+        }
+        Ok(queued)
+    }
+
+    /// Advance at most one replay-safe Quicksilver Bullet bonus. Received AP
+    /// items retain priority: the binary calls this only when their delivery
+    /// machine is idle, and errors here are reported independently.
+    pub fn poll_sustain(&mut self) -> Result<SustainPollResult> {
+        let Some((&location, &recorded_before)) = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.pending_sustain.iter().next())
+        else {
+            return Ok(SustainPollResult::Idle);
+        };
+        let tag = format!("sustain_{location}");
+        match self.require_runtime_context("pickup sustain delivery") {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if self.backend.withdraw_unwitnessed_grant(&tag)? {
+                    self.ledger
+                        .slot_mut(&self.seed_name, &self.slot_name)
+                        .pending_sustain
+                        .insert(location, None);
+                    self.ledger.save(&self.ledger_path)?;
+                }
+                return Ok(SustainPollResult::Pending);
+            }
+            Err(error) => return Err(error),
+        }
+        if self.reconcile_watermark()? == WatermarkOutcome::Hold {
+            return Ok(SustainPollResult::Pending);
+        }
+
+        let normalized = GOODS_NORMALIZED_PREFIX | QUICKSILVER_BULLET_GOODS_ID;
+        let baseline_is_binding = match recorded_before {
+            Some(_) => self.backend.grant_may_have_applied(&tag)?,
+            None => false,
+        };
+        let expected_before = match recorded_before.filter(|_| baseline_is_binding) {
+            Some(value) => value,
+            None => match self.backend.observe_stack_quantity(normalized, None)? {
+                StackObservation::Quantity(value) => {
+                    self.ledger
+                        .slot_mut(&self.seed_name, &self.slot_name)
+                        .pending_sustain
+                        .insert(location, Some(value));
+                    self.ledger.save(&self.ledger_path)?;
+                    value
+                }
+                StackObservation::NotReady => return Ok(SustainPollResult::Pending),
+                StackObservation::Unsupported => 0,
+            },
+        };
+        let grant = ItemGrant {
+            raw_descriptor: QUICKSILVER_BULLET_RAW_DESCRIPTOR,
+            normalized_item_id: normalized,
+            item_category: 4,
+            quantity: 1,
+            expected_before,
+            reinforcement_level: None,
+            tag,
+        };
+        if self.backend.grant_item(&grant)? == OperationProgress::Pending {
+            return Ok(SustainPollResult::Pending);
+        }
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        slot.pending_sustain.remove(&location);
+        slot.completed_sustain.insert(location);
+        self.ledger.save(&self.ledger_path)?;
+        Ok(SustainPollResult::Completed(location))
+    }
+
     pub fn poll_locations(&mut self, server_checked: &HashSet<i64>) -> Result<Vec<i64>> {
         self.poll_locations_at(server_checked, Instant::now())
     }
@@ -501,13 +612,18 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// pending plan is untouched: the next poll under a validated context
     /// re-publishes the command. Returns `true` when a command was withdrawn.
     pub fn reconcile_pending_command(&mut self) -> Result<bool> {
-        let Some(tag) = self
+        let item_tag = self
             .ledger
             .slot(&self.seed_name, &self.slot_name)
             .and_then(|slot| slot.pending.as_ref())
             .filter(|pending| !pending.grant_complete)
-            .map(|pending| grant_tag(pending.index))
-        else {
+            .map(|pending| grant_tag(pending.index));
+        let sustain_tag = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.pending_sustain.keys().next())
+            .map(|location| format!("sustain_{location}"));
+        let Some(tag) = item_tag.or(sustain_tag) else {
             return Ok(false);
         };
         self.backend.withdraw_unwitnessed_grant(&tag)
@@ -1726,6 +1842,137 @@ mod tests {
         });
         let error = client.poll_locations(&HashSet::new()).unwrap_err();
         assert!(format!("{error:#}").contains("refused save identity"));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn sustain_is_queued_once_only_for_suppressed_new_checks() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        cfg.locations.push(LocationBinding {
+            ap_location_id: 2000,
+            event_flag: 200,
+            vanilla_award_suppressed: false,
+        });
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+
+        assert_eq!(
+            client.queue_sustain_for_checks(&[1000, 2000]).unwrap(),
+            vec![1000]
+        );
+        assert!(client.queue_sustain_for_checks(&[1000]).unwrap().is_empty());
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert_eq!(
+            slot.pending_sustain.keys().copied().collect::<Vec<_>>(),
+            vec![1000]
+        );
+        assert!(slot.completed_sustain.is_empty());
+
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        assert!(
+            persisted
+                .slot("seed", "slot")
+                .unwrap()
+                .pending_sustain
+                .contains_key(&1000)
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn sustain_grant_is_witnessed_and_replay_safe() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg.clone(),
+        );
+        client.queue_sustain_for_checks(&[1000]).unwrap();
+
+        assert_eq!(
+            client.poll_sustain().unwrap(),
+            SustainPollResult::Completed(1000)
+        );
+        assert_eq!(client.backend().grants.len(), 1);
+        let grant = &client.backend().grants[0];
+        assert_eq!(grant.raw_descriptor, QUICKSILVER_BULLET_RAW_DESCRIPTOR);
+        assert_eq!(grant.normalized_item_id, 0x4000_044c);
+        assert_eq!(grant.quantity, 1);
+
+        // Server packet replay/repeated flag polling cannot requeue a bonus
+        // whose completion was durably witnessed.
+        assert!(client.queue_sustain_for_checks(&[1000]).unwrap().is_empty());
+        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Idle);
+        assert_eq!(client.backend().grants.len(), 1);
+
+        let backend = client.backend().clone();
+        let mut reloaded = loop_with(
+            backend,
+            ReceiveLedger::load(&ledger_path).unwrap(),
+            ledger_path.clone(),
+            cfg,
+        );
+        assert!(
+            reloaded
+                .queue_sustain_for_checks(&[1000])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reloaded.poll_sustain().unwrap(), SustainPollResult::Idle);
+        assert_eq!(reloaded.backend().grants.len(), 1);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn interrupted_sustain_grant_reuses_its_durable_baseline() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_044c, None), 7);
+        backend.delay_grant("sustain_1000", 1);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg.clone(),
+        );
+        client.queue_sustain_for_checks(&[1000]).unwrap();
+        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Pending);
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending_sustain[&1000],
+            Some(7)
+        );
+
+        let backend = client.backend().clone();
+        let mut reloaded = loop_with(
+            backend,
+            ReceiveLedger::load(&ledger_path).unwrap(),
+            ledger_path.clone(),
+            cfg,
+        );
+        assert_eq!(
+            reloaded.poll_sustain().unwrap(),
+            SustainPollResult::Completed(1000)
+        );
+        assert_eq!(
+            reloaded.backend().inventory.get(&(0x4000_044c, None)),
+            Some(&8)
+        );
+        assert_eq!(reloaded.backend().grants.len(), 1);
         std::fs::remove_file(ledger_path).unwrap();
     }
 
