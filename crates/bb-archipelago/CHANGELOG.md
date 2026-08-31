@@ -2,6 +2,13 @@
 
 ### Changed
 
+* **Randomized fixed pickups now sustain exploration with one Quicksilver
+  Bullet.** Their suppressed ItemLot already supplies one Blood Vial; after a
+  new check is sent, the client queues the matching Bullet through the native
+  grant machine. Completion is save-bound and keyed by AP location, so polling,
+  reconnects, and interrupted commands cannot create historical or duplicate
+  awards, and sustain failure never blocks the randomized item.
+
 * **Blood-gem diagnostics no longer mislabel armor as gems.** ItemLot category
   8 is a generation recipe, not a prefix encoded into a runtime inventory id.
   The replacement diagnostic takes bounded, read-only snapshots of the live

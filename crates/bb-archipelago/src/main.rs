@@ -1295,6 +1295,10 @@ fn run() -> Result<()> {
                                 "Father Gascoigne defeated; sent Bloodborne goal status."
                             );
                         }
+                        let queued = runtime.queue_sustain_for_checks(&newly_checked)?;
+                        if !queued.is_empty() {
+                            client_debugln!("Queued pickup sustain for locations: {queued:?}");
+                        }
                         client.mark_checked(newly_checked.iter().copied())?;
                         client_eprintln!("Sent location checks: {newly_checked:?}");
                     }
@@ -1319,7 +1323,7 @@ fn run() -> Result<()> {
                     ap_item_id: item.item().id(),
                 })
                 .collect::<Vec<_>>();
-            match runtime.poll_items(&received) {
+            let items_idle = match runtime.poll_items(&received) {
                 Ok(ItemPollResult::Completed(item)) => {
                     if let Some(line) = item_errors.recovered() {
                         client_eprintln!("{line}");
@@ -1334,6 +1338,7 @@ fn run() -> Result<()> {
                         item.equip_target
                     );
                     thread::sleep(ITEM_DELIVERY_COOLDOWN);
+                    false
                 }
                 Ok(ItemPollResult::Blocked(blocked)) => {
                     if let Some(line) = item_errors.recovered() {
@@ -1351,15 +1356,31 @@ fn run() -> Result<()> {
                         client.seed_name(),
                         args.slot,
                     );
+                    false
                 }
-                Ok(ItemPollResult::Idle | ItemPollResult::Pending) => {}
+                Ok(ItemPollResult::Idle) => true,
+                Ok(ItemPollResult::Pending) => false,
                 // Held and Reconciled are surfaced through the watermark
                 // notice channel above, exactly once per transition.
-                Ok(ItemPollResult::Held | ItemPollResult::Reconciled(_)) => {}
+                Ok(ItemPollResult::Held | ItemPollResult::Reconciled(_)) => false,
                 Err(error) => {
                     if let Some(line) = item_errors.report(&error, Instant::now()) {
                         client_eprintln!("{line}");
                     }
+                    false
+                }
+            };
+            if items_idle {
+                match runtime.poll_sustain() {
+                    Ok(bb_archipelago::client_loop::SustainPollResult::Completed(location)) => {
+                        client_eprintln!(
+                            "Pickup sustain delivered: 1 Quicksilver Bullet for location {location}."
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => client_eprintln!(
+                        "Pickup sustain pending independently of AP item delivery: {error:#}"
+                    ),
                 }
             }
         }
