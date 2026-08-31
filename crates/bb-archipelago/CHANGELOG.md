@@ -2,6 +2,11 @@
 
 ### Changed
 
+* **Routine item acknowledgements no longer flood the player console.** The
+  detailed per-index acknowledgement lines remain in `client.log` for support
+  and replay diagnosis; blocked deliveries, failures, and recovery notices
+  remain visible in the console.
+
 * **A read-only shop-enablement diagnostic is ready for the next playtest.**
   Native sessions write `shop-capture.jsonl` beside the ledger, recording exact
   inventory-row transitions and five-second snapshots of the Hunter Chief

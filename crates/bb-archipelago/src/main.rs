@@ -14,7 +14,6 @@ use bb_archipelago::backend::{
     OperationProgress, StackObservation,
 };
 use bb_archipelago::bridge::{FileBridge, missing_bridge_state};
-use bb_archipelago::client_eprintln;
 use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::{LiveEventFlags, is_manager_not_initialized};
@@ -23,6 +22,7 @@ use bb_archipelago::logging;
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
 use bb_archipelago::{RUNTIME_BUILD, client_version};
+use bb_archipelago::{client_debugln, client_eprintln};
 
 /// Console reporting policy for item-delivery failures (clients#404).
 ///
@@ -1262,7 +1262,7 @@ fn run() -> Result<()> {
                     if let Some(line) = item_errors.recovered() {
                         client_eprintln!("{line}");
                     }
-                    client_eprintln!(
+                    client_debugln!(
                         "Acknowledged AP item index {} id {} | received level {:?} | target {:?} | delivered {:?} | equip {:?}.",
                         item.index,
                         item.ap_item_id,
