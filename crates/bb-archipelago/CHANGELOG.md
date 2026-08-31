@@ -42,6 +42,12 @@
 
 ### Fixed
 
+* **Goal-release item floods are paced instead of hammering Bloodborne's
+  inventory routine.** A live 71-item capture showed stable held delivery at
+  ordinary cadence, then storage routing after more than twenty grants arrived
+  roughly 130–170 ms apart. Successful grants now wait one second before the
+  next item is submitted, trading a short release-drain time for predictable
+  inventory placement.
 * **Zero-Vial diagnostics no longer report executable code as a backing
   object.** Blood Vials are ordinary stackable goods, not generated instances;
   their canonical inventory-row transitions remain captured, while the

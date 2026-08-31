@@ -46,6 +46,10 @@ struct ItemErrorReporter {
 
 const ITEM_ERROR_DEDUP: Duration = Duration::from_secs(10);
 const ITEM_DELIVERY_RECOVERED: &str = "Bloodborne item delivery recovered.";
+/// Give Bloodborne's inventory routine time to settle between release-flood
+/// grants. A 2026-08-30 live capture stayed healthy for ordinary deliveries
+/// but began routing items to storage after sustained 130-170 ms deltas.
+const ITEM_DELIVERY_COOLDOWN: Duration = Duration::from_secs(1);
 
 impl ItemErrorReporter {
     /// Returns the line to print for `error`, or `None` to stay quiet.
@@ -1329,6 +1333,7 @@ fn run() -> Result<()> {
                         item.delivered_level,
                         item.equip_target
                     );
+                    thread::sleep(ITEM_DELIVERY_COOLDOWN);
                 }
                 Ok(ItemPollResult::Blocked(blocked)) => {
                     if let Some(line) = item_errors.recovered() {
