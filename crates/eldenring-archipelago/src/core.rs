@@ -2192,6 +2192,7 @@ impl shared::Core for Core {
                         armor_bundles: !self.armor_bundles.is_empty(),
                         region_completion_goal_gate:
                             crate::region::goal_gate_uses_region_completion(),
+                        reveal_sweep_boss_names: self.reveal_sweep_boss_names,
                     },
                 );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A
