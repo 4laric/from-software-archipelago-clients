@@ -112,6 +112,10 @@ pub struct Overlay<G: Game> {
     /// window: the surface that wants your keys has to re-assert it on every frame it wants them.
     /// Read through [`Overlay::blocks_keyboard`]. See #202 for why that property is not optional.
     keyboard_surface_active: bool,
+    /// Explicit mouse-navigation mode for games which normally hide their cursor during play.
+    /// Insert toggles it; Escape releases it. Unlike ordinary imgui hover capture, this remains
+    /// active while the player moves the cursor toward the overlay.
+    cursor_capture_active: bool,
 
     /// The text the user typed in the dev console input (separate buffer from `say_input` so both
     /// can exist without sharing state).
@@ -184,6 +188,17 @@ fn next_main_window_visible(current: bool, f5_pressed: bool, disconnected: bool)
         || disconnected
 }
 
+/// Advance the explicit cursor-navigation latch. Insert toggles it, Escape is an unconditional
+/// release, and hiding the client clears it so an invisible overlay can never retain input.
+fn next_cursor_capture(
+    current: bool,
+    insert_pressed: bool,
+    escape_pressed: bool,
+    visible: bool,
+) -> bool {
+    visible && !escape_pressed && (current ^ insert_pressed)
+}
+
 /// Whether the client's own window holds focus **for input-blocking purposes**, as a pure function
 /// for the same reason [`next_main_window_visible`] is one.
 ///
@@ -240,6 +255,7 @@ impl<G: Game> Overlay<G> {
             settings_window_visible: false,
             console_window_visible: false,
             keyboard_surface_active: false,
+            cursor_capture_active: false,
             console_input: Default::default(),
             focus_console_input_next_frame: false,
             was_main_menu: false,
@@ -283,7 +299,12 @@ impl<G: Game> Overlay<G> {
     /// The say input needs no entry here: it is a real imgui text field, so `want_capture_keyboard`
     /// covers it at the call site, and the blocker ORs the two.
     pub fn blocks_keyboard(&self) -> bool {
-        self.keyboard_surface_active
+        self.keyboard_surface_active || self.cursor_capture_active
+    }
+
+    /// Whether the explicit cursor-navigation mode owns mouse input this frame.
+    pub fn blocks_mouse(&self) -> bool {
+        self.cursor_capture_active
     }
 
     pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
@@ -299,6 +320,16 @@ impl<G: Game> Overlay<G> {
                 ui.is_key_pressed(Key::F5),
                 core.base().is_disconnected(),
             );
+
+            self.cursor_capture_active = next_cursor_capture(
+                self.cursor_capture_active,
+                ui.is_key_pressed(Key::Insert),
+                ui.is_key_pressed(Key::Escape),
+                self.main_window_visible,
+            );
+            if self.cursor_capture_active {
+                unsafe { G::force_cursor_visible() };
+            }
 
             if self.main_window_visible {
                 prof!(core.base_mut().profiler(), "main window", {
@@ -584,6 +615,16 @@ impl<G: Game> Overlay<G> {
             // it after hiding the overlay by accident, at which point the mod looks dead.
             if ui.menu_item("Hide (F5)") {
                 self.main_window_visible = false;
+                self.cursor_capture_active = false;
+            }
+
+            let cursor_label = if self.cursor_capture_active {
+                "Release cursor (Esc)"
+            } else {
+                "Capture cursor (Insert)"
+            };
+            if ui.menu_item(cursor_label) {
+                self.cursor_capture_active = !self.cursor_capture_active;
             }
 
             // Game-specific menu items (e.g. the ER item tracker toggle).
@@ -945,7 +986,7 @@ fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_focus, next_main_window_visible};
+    use super::{effective_focus, next_cursor_capture, next_main_window_visible};
 
     #[test]
     fn f5_toggles_while_connected() {
@@ -985,5 +1026,19 @@ mod tests {
     fn a_visible_overlay_still_reports_its_own_focus() {
         assert!(effective_focus(true, true));
         assert!(!effective_focus(true, false));
+    }
+
+    #[test]
+    fn insert_toggles_cursor_capture_and_escape_releases_it() {
+        assert!(next_cursor_capture(false, true, false, true));
+        assert!(!next_cursor_capture(true, true, false, true));
+        assert!(!next_cursor_capture(true, false, true, true));
+        assert!(!next_cursor_capture(false, true, true, true));
+    }
+
+    #[test]
+    fn hidden_overlay_cannot_retain_or_start_cursor_capture() {
+        assert!(!next_cursor_capture(true, false, false, false));
+        assert!(!next_cursor_capture(false, true, false, false));
     }
 }

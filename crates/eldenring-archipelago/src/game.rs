@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use eldenring::cs::{CSTaskGroupIndex, CSTaskImp, WorldChrMan};
+use eldenring::cs::{CSMenuManImp, CSMouseMan, CSTaskGroupIndex, CSTaskImp, WorldChrMan};
 use eldenring::fd4::FD4TaskData;
 use er_logic::startup_retry::{DEFAULT_ATTEMPT_TIMEOUT, Next, RetryPolicy};
 use fromsoftware_shared::{FromStatic, SharedTaskImpExt};
@@ -67,6 +67,15 @@ impl shared::Game for EldenRing {
         match unsafe { WorldChrMan::instance() } {
             Ok(wcm) => wcm.main_player.as_ref().is_none(),
             Err(_) => true,
+        }
+    }
+
+    unsafe fn force_cursor_visible() {
+        if let Ok(menu) = unsafe { CSMenuManImp::instance_mut() } {
+            menu.disable_mouse_cursor = false;
+        }
+        if let Ok(mouse) = unsafe { CSMouseMan::instance_mut() } {
+            mouse.show_cursor = true;
         }
     }
 }
