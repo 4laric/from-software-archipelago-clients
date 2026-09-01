@@ -1,52 +1,59 @@
-//! Observation-only probes for the two vanilla pickup-side `ItemGrant` calls.
-//!
-//! Playtest.32 established that ItemGrant's ordinary client caller is not the
-//! presentation seam. These two call edges were the only vanilla callers in
-//! that capture. Each detour replays the original call and records its six
-//! integer argument registers, stack identity and return value. It never calls
-//! a message routine or changes an argument/result.
-
-use anyhow::{Context, Result, bail};
+//! Observation-only lifecycle probes for Bloodborne's pickup-dialog classes.
 
 use super::install::ThreadController;
 use super::mem::ProcessMemory;
+use anyhow::{Context, Result, bail};
 
-const ITEM_GRANT_RVA: u64 = 0x14D_A0A0;
-const STATE_SIZE: usize = 0x48;
-// The emitted detour is 75 bytes. Keep a little expansion room while fitting
-// every cave and state block inside one page proven both zero and executable.
-const CAVE_CAPACITY: usize = 0x60;
-// Live CUSA03173 01.09 census on playtest.33 found 0x50DB800..0x50DBA00
-// zeroed. A follow-up VirtualQueryEx on the failed build established that this
-// page is PAGE_EXECUTE_READWRITE, whereas 0x50DC000 onward is PAGE_READWRITE
-// mapped data whose protection cannot be changed. Code must never be allocated
-// in the latter merely because its bytes happen to be zero.
-const OBSERVED_EXECUTABLE_ZERO_START: u64 = 0x50D_B800;
-const OBSERVED_EXECUTABLE_ZERO_END: u64 = 0x50D_BA00;
+const STATE_SIZE: usize = 0x20;
+const CAVE_CAPACITY: usize = 0x40;
+const ZERO_START: u64 = 0x50D_B800;
+const ZERO_END: u64 = 0x50D_BA00;
 
 #[derive(Clone, Copy)]
 struct Site {
     name: &'static str,
-    call_rva: u64,
-    return_rva: u64,
+    entry_rva: u64,
+    expected: &'static [u8],
+    resume_rva: u64,
     cave_rva: u64,
     state_rva: u64,
 }
 
-const SITES: [Site; 2] = [
+const PROLOGUE: &[u8] = &[0x55, 0x48, 0x89, 0xE5, 0x41, 0x57];
+const TAIL_JUMP: &[u8] = &[0xE9, 0xCB, 0x90, 0x92, 0xFF];
+const SITES: [Site; 4] = [
     Site {
-        name: "vanilla_pickup_17D93FE",
-        call_rva: 0x17D_93F9,
-        return_rva: 0x17D_93FE,
+        name: "FrpgMenuDlgGetItem",
+        entry_rva: 0x166_1600,
+        expected: PROLOGUE,
+        resume_rva: 0x166_1606,
         cave_rva: 0x50D_B800,
-        state_rva: 0x50D_B860,
+        state_rva: 0x50D_B840,
     },
     Site {
-        name: "vanilla_pickup_14DA9FF",
-        call_rva: 0x14D_A9FA,
-        return_rva: 0x14D_A9FF,
-        cave_rva: 0x50D_B8B0,
-        state_rva: 0x50D_B910,
+        name: "FrpgMenuDlgObjGetItemData",
+        entry_rva: 0x166_CCC0,
+        expected: PROLOGUE,
+        resume_rva: 0x166_CCC6,
+        cave_rva: 0x50D_B860,
+        state_rva: 0x50D_B8A0,
+    },
+    Site {
+        name: "FrpgMenuDlgItemGet",
+        entry_rva: 0x16D_6710,
+        expected: PROLOGUE,
+        resume_rva: 0x16D_6716,
+        cave_rva: 0x50D_B8C0,
+        state_rva: 0x50D_B900,
+    },
+    // This entry is a tail-jump thunk; resume at the original target.
+    Site {
+        name: "FrpgMenuDlgItemGetPlate",
+        entry_rva: 0x16D_8CF0,
+        expected: TAIL_JUMP,
+        resume_rva: 0x100_1DC0,
+        cave_rva: 0x50D_B920,
+        state_rva: 0x50D_B960,
     },
 ];
 
@@ -55,14 +62,10 @@ pub struct PickupPresentationSnapshot {
     pub site: &'static str,
     pub caller_rva: u64,
     pub sequence: u64,
-    /// Guest RSP at the original call edge. This is an opaque per-thread
-    /// correlation token, not an OS thread id.
     pub thread_stack_token: u64,
     pub inventory: u64,
     pub descriptor_address: u64,
     pub quantity: u32,
-    /// Ambient fourth through sixth integer registers. They are intentionally
-    /// preserved as candidates rather than claimed to be message/icon fields.
     pub candidate_message_context: u64,
     pub candidate_icon_context: u64,
     pub candidate_aux_context: u64,
@@ -73,21 +76,14 @@ pub struct PickupPresentationSnapshot {
 fn rel32(target: u64, next: u64) -> Result<[u8; 4]> {
     let displacement = i64::try_from(target)? - i64::try_from(next)?;
     Ok(i32::try_from(displacement)
-        .context("pickup presentation probe displacement exceeds rel32")?
+        .context("pickup lifecycle probe displacement exceeds rel32")?
         .to_le_bytes())
 }
 
-fn direct_call_bytes(site: Site) -> Result<[u8; 5]> {
-    let mut bytes = [0u8; 5];
-    bytes[0] = 0xE8;
-    bytes[1..].copy_from_slice(&rel32(ITEM_GRANT_RVA, site.return_rva)?);
-    Ok(bytes)
-}
-
-fn detour_bytes(site: Site) -> Result<[u8; 5]> {
-    let mut bytes = [0u8; 5];
-    bytes[0] = 0xE9;
-    bytes[1..].copy_from_slice(&rel32(site.cave_rva, site.return_rva)?);
+fn patch_bytes(site: Site) -> Result<Vec<u8>> {
+    let mut bytes = vec![0xE9];
+    bytes.extend_from_slice(&rel32(site.cave_rva, site.entry_rva + 5)?);
+    bytes.resize(site.expected.len(), 0x90);
     Ok(bytes)
 }
 
@@ -100,23 +96,18 @@ fn rip(out: &mut Vec<u8>, site: Site, prefix: &[u8], state_offset: u64) -> Resul
 
 fn cave_bytes(site: Site) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    rip(&mut out, site, &[0x48, 0x89, 0x25], 0x08)?; // rsp token
-    rip(&mut out, site, &[0x48, 0x89, 0x3D], 0x10)?; // rdi
+    rip(&mut out, site, &[0x48, 0x89, 0x25], 0x08)?; // rsp
+    rip(&mut out, site, &[0x48, 0x89, 0x3D], 0x10)?; // rdi / this
     rip(&mut out, site, &[0x48, 0x89, 0x35], 0x18)?; // rsi
-    rip(&mut out, site, &[0x89, 0x15], 0x20)?; // edx
-    rip(&mut out, site, &[0x48, 0x89, 0x0D], 0x28)?; // rcx
-    rip(&mut out, site, &[0x4C, 0x89, 0x05], 0x30)?; // r8
-    rip(&mut out, site, &[0x4C, 0x89, 0x0D], 0x38)?; // r9
-    let next = site.cave_rva + out.len() as u64 + 5;
-    out.push(0xE8); // replay the exact original call
-    out.extend_from_slice(&rel32(ITEM_GRANT_RVA, next)?);
-    rip(&mut out, site, &[0x48, 0x89, 0x05], 0x40)?; // rax result
-    out.push(0x9C); // preserve ItemGrant's return flags while publishing
+    out.push(0x9C);
     rip(&mut out, site, &[0xF0, 0x48, 0xFF, 0x05], 0x00)?;
     out.push(0x9D);
+    if site.expected == PROLOGUE {
+        out.extend_from_slice(site.expected);
+    }
     let next = site.cave_rva + out.len() as u64 + 5;
     out.push(0xE9);
-    out.extend_from_slice(&rel32(site.return_rva, next)?);
+    out.extend_from_slice(&rel32(site.resume_rva, next)?);
     anyhow::ensure!(out.len() <= CAVE_CAPACITY, "{} cave overflow", site.name);
     Ok(out)
 }
@@ -129,23 +120,21 @@ fn validate_layout() -> Result<()> {
     }
     for &(start, end) in &ranges {
         anyhow::ensure!(
-            start >= OBSERVED_EXECUTABLE_ZERO_START && end <= OBSERVED_EXECUTABLE_ZERO_END,
-            "pickup presentation probe allocation leaves the live executable zero census"
+            start >= ZERO_START && end <= ZERO_END,
+            "pickup lifecycle probe allocation leaves the executable zero census"
         );
     }
-    for (index, &(left_start, left_end)) in ranges.iter().enumerate() {
-        for &(right_start, right_end) in &ranges[index + 1..] {
+    for (index, &(a, b)) in ranges.iter().enumerate() {
+        for &(c, d) in &ranges[index + 1..] {
             anyhow::ensure!(
-                left_end <= right_start || right_end <= left_start,
-                "pickup presentation probe allocations overlap"
+                b <= c || d <= a,
+                "pickup lifecycle probe allocations overlap"
             );
         }
     }
     Ok(())
 }
 
-/// Install both optional call-edge probes. Every byte/cave/state preflight is
-/// completed before any write; a mismatch leaves both sites untouched.
 pub fn install(
     memory: &impl ProcessMemory,
     base: u64,
@@ -153,55 +142,52 @@ pub fn install(
 ) -> Result<()> {
     validate_layout()?;
     for site in SITES {
-        let found = memory.read(base + site.call_rva, 5)?;
-        let expected = direct_call_bytes(site)?;
-        if found != expected {
+        let found = memory.read(base + site.entry_rva, site.expected.len())?;
+        if found != site.expected {
             bail!(
-                "{} exact call mismatch: expected {:02X?}, found {:02X?}",
+                "{} exact entry mismatch: expected {:02X?}, found {:02X?}",
                 site.name,
-                expected,
+                site.expected,
                 found
             );
         }
         if memory
             .read(base + site.cave_rva, CAVE_CAPACITY)?
             .iter()
-            .any(|byte| *byte != 0)
+            .any(|b| *b != 0)
         {
             bail!("{} cave is occupied", site.name);
         }
         if memory
             .read(base + site.state_rva, STATE_SIZE)?
             .iter()
-            .any(|byte| *byte != 0)
+            .any(|b| *b != 0)
         {
             bail!("{} state is occupied", site.name);
         }
     }
-
     for site in SITES {
         memory.write(base + site.state_rva, &[0; STATE_SIZE])?;
         memory.write(base + site.cave_rva, &cave_bytes(site)?)?;
     }
-
     threads
         .suspend_all()
-        .context("suspending for pickup presentation probe")?;
+        .context("suspending for pickup lifecycle probe")?;
     let result = (|| {
         let rips = threads.instruction_pointers()?;
         for site in SITES {
-            if rips
-                .iter()
-                .any(|rip| *rip >= base + site.call_rva && *rip < base + site.return_rva)
-            {
+            if rips.iter().any(|rip| {
+                *rip >= base + site.entry_rva
+                    && *rip < base + site.entry_rva + site.expected.len() as u64
+            }) {
                 bail!("a guest thread occupied the {} patch window", site.name);
             }
         }
         let mut patched: Vec<Site> = Vec::new();
         for site in SITES {
-            if let Err(error) = memory.write(base + site.call_rva, &detour_bytes(site)?) {
+            if let Err(error) = memory.write(base + site.entry_rva, &patch_bytes(site)?) {
                 for previous in patched {
-                    let _ = memory.write(base + previous.call_rva, &direct_call_bytes(previous)?);
+                    let _ = memory.write(base + previous.entry_rva, previous.expected);
                 }
                 return Err(error);
             }
@@ -211,7 +197,7 @@ pub fn install(
     })();
     let resumed = threads
         .resume_all()
-        .context("resuming after pickup presentation probe");
+        .context("resuming after pickup lifecycle probe");
     result.and(resumed)
 }
 
@@ -228,33 +214,28 @@ fn snapshot(
     site: Site,
 ) -> Option<PickupPresentationSnapshot> {
     let address = base + site.state_rva;
-    let first = memory.read_u64(address).ok()?;
-    if first == 0 {
+    let sequence = memory.read_u64(address).ok()?;
+    if sequence == 0 {
         return None;
     }
     let bytes = memory.read(address, STATE_SIZE).ok()?;
-    if first != memory.read_u64(address).ok()? {
+    if sequence != memory.read_u64(address).ok()? {
         return None;
     }
-    let u32_at = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
     let u64_at = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-    let descriptor_address = u64_at(0x18);
-    let descriptor = (descriptor_address != 0)
-        .then(|| memory.read(descriptor_address, 24).ok())
-        .flatten();
     Some(PickupPresentationSnapshot {
         site: site.name,
-        caller_rva: site.return_rva,
-        sequence: first,
-        thread_stack_token: u64_at(0x08),
-        inventory: u64_at(0x10),
-        descriptor_address,
-        quantity: u32_at(0x20),
-        candidate_message_context: u64_at(0x28),
-        candidate_icon_context: u64_at(0x30),
-        candidate_aux_context: u64_at(0x38),
-        result: u64_at(0x40),
-        descriptor,
+        caller_rva: site.entry_rva,
+        sequence,
+        thread_stack_token: u64_at(8),
+        inventory: u64_at(16),
+        descriptor_address: u64_at(24),
+        quantity: 0,
+        candidate_message_context: 0,
+        candidate_icon_context: 0,
+        candidate_aux_context: 0,
+        result: 0,
+        descriptor: None,
     })
 }
 
@@ -262,94 +243,63 @@ fn snapshot(
 mod tests {
     use super::super::mem::FakeMemory;
     use super::*;
-
     #[derive(Default)]
     struct FakeThreads {
         suspended: bool,
     }
-
     impl ThreadController for FakeThreads {
         fn suspend_all(&mut self) -> Result<usize> {
             self.suspended = true;
             Ok(1)
         }
-
         fn resume_all(&mut self) -> Result<()> {
             self.suspended = false;
             Ok(())
         }
-
         fn instruction_pointers(&mut self) -> Result<Vec<u64>> {
             assert!(self.suspended);
             Ok(Vec::new())
         }
     }
-
     fn image(base: u64) -> FakeMemory {
-        let memory = FakeMemory::new();
-        for site in SITES {
-            memory.store(base + site.call_rva, &direct_call_bytes(site).unwrap());
-            memory.store(base + site.cave_rva, &[0; CAVE_CAPACITY]);
-            memory.store(base + site.state_rva, &[0; STATE_SIZE]);
+        let m = FakeMemory::new();
+        for s in SITES {
+            m.store(base + s.entry_rva, s.expected);
+            m.store(base + s.cave_rva, &[0; CAVE_CAPACITY]);
+            m.store(base + s.state_rva, &[0; STATE_SIZE]);
         }
-        memory
+        m
     }
-
     #[test]
-    fn observed_return_addresses_encode_direct_calls_to_item_grant() {
-        assert_eq!(
-            direct_call_bytes(SITES[0]).unwrap(),
-            [0xE8, 0xA2, 0x0C, 0xD0, 0xFF]
-        );
-        assert_eq!(
-            direct_call_bytes(SITES[1]).unwrap(),
-            [0xE8, 0xA1, 0xF6, 0xFF, 0xFF]
-        );
-    }
-
-    #[test]
-    fn caves_are_bounded_and_call_item_grant_before_returning() {
-        for site in SITES {
-            let cave = cave_bytes(site).unwrap();
-            assert!(cave.len() <= CAVE_CAPACITY);
-            assert!(cave.contains(&0xE8));
-            assert_eq!(detour_bytes(site).unwrap()[0], 0xE9);
-        }
-    }
-
-    #[test]
-    fn cave_and_state_claims_are_disjoint_and_inside_the_live_executable_zero_census() {
+    fn layout_and_caves_are_bounded() {
         validate_layout().unwrap();
-        assert_eq!(cave_bytes(SITES[0]).unwrap().len(), 75);
-        assert_eq!(cave_bytes(SITES[1]).unwrap().len(), 75);
+        for s in SITES {
+            assert!(cave_bytes(s).unwrap().len() <= CAVE_CAPACITY);
+        }
     }
-
     #[test]
-    fn exact_preflight_installs_both_edges_in_one_suspend_cycle() {
+    fn installs_all_sites() {
         let base = 0x4000_0000;
-        let memory = image(base);
-        let mut threads = FakeThreads::default();
-        install(&memory, base, &mut threads).unwrap();
-        assert!(!threads.suspended);
-        for site in SITES {
+        let m = image(base);
+        let mut t = FakeThreads::default();
+        install(&m, base, &mut t).unwrap();
+        for s in SITES {
             assert_eq!(
-                memory.read(base + site.call_rva, 5).unwrap(),
-                detour_bytes(site).unwrap()
+                m.read(base + s.entry_rva, s.expected.len()).unwrap(),
+                patch_bytes(s).unwrap()
             );
         }
     }
-
     #[test]
-    fn one_bad_call_byte_refuses_before_any_patch() {
+    fn mismatch_refuses_before_patching() {
         let base = 0x4000_0000;
-        let memory = image(base);
-        memory.store(base + SITES[1].call_rva, &[0x90; 5]);
-        let first_original = direct_call_bytes(SITES[0]).unwrap();
-        let error = install(&memory, base, &mut FakeThreads::default()).unwrap_err();
-        assert!(format!("{error:#}").contains("exact call mismatch"));
+        let m = image(base);
+        m.store(base + SITES[3].entry_rva, &[0x90; 5]);
+        assert!(install(&m, base, &mut FakeThreads::default()).is_err());
         assert_eq!(
-            memory.read(base + SITES[0].call_rva, 5).unwrap(),
-            first_original
+            m.read(base + SITES[0].entry_rva, SITES[0].expected.len())
+                .unwrap(),
+            SITES[0].expected
         );
     }
 }

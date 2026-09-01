@@ -505,8 +505,10 @@ mod tests {
         let fallback = host.clone();
         drop(host);
 
-        let mut snapshot = ClientSnapshot::default();
-        snapshot.slot = Some("fallback hunter".into());
+        let snapshot = ClientSnapshot {
+            slot: Some("fallback hunter".into()),
+            ..ClientSnapshot::default()
+        };
         client.publish(snapshot);
         assert_eq!(
             fallback
