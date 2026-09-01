@@ -32,6 +32,7 @@ pub mod palette {
     /// Hints. Distinct from `ITEM` on purpose -- a hint names an item and would otherwise be
     /// indistinguishable from actually receiving one.
     pub const HINT: Rgb = [0xb0, 0x8c, 0xd8];
+    pub const VICTORY: Rgb = [0xd8, 0xb4, 0x63];
     pub const BACKGROUND: Rgb = [0x14, 0x14, 0x16];
     pub const PANEL: Rgb = [0x1c, 0x1c, 0x20];
 }
@@ -236,6 +237,42 @@ pub const STORAGE_TOOLTIP: &str = "storage routing unverified this session";
 pub fn goal_line(snapshot: &ClientSnapshot) -> Option<(String, bool)> {
     let goal = snapshot.goal.as_ref()?;
     Some((format!("Goal: {goal}"), snapshot.go_mode == Some(true)))
+}
+
+fn optional_count(value: Option<u32>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+pub fn victory_lines(summary: &client_ui::VictorySummary) -> [String; 4] {
+    let elapsed = summary.elapsed_seconds.map_or_else(
+        || "unknown".to_owned(),
+        |seconds| {
+            format!(
+                "{:02}:{:02}:{:02}",
+                seconds / 3600,
+                (seconds % 3600) / 60,
+                seconds % 60
+            )
+        },
+    );
+    let checks = match (summary.checks_completed, summary.checks_total) {
+        (Some(done), Some(total)) => format!("{done}/{total}"),
+        _ => "unknown".to_owned(),
+    };
+    [
+        format!("VICTORY - {}", summary.goal),
+        format!("Time {elapsed}  |  Checks {checks}"),
+        format!(
+            "Items received {}  |  sent {}",
+            optional_count(summary.received_items),
+            optional_count(summary.sent_items)
+        ),
+        format!(
+            "Deaths {}  |  DeathLinks {}",
+            optional_count(summary.deaths),
+            optional_count(summary.death_links)
+        ),
+    ]
 }
 
 /// `HH:MM:SS` in the viewer's local time, from a Unix-epoch millisecond stamp.
@@ -524,6 +561,28 @@ mod tests {
             ("Goal: Moon Presence".into(), false)
         );
         assert_eq!(with_goal(None), ("Goal: Moon Presence".into(), false));
+    }
+
+    #[test]
+    fn every_supported_goal_and_missing_counter_renders_truthfully() {
+        for goal in ["Submit to Gehrman", "Refuse Gehrman", "Moon Presence"] {
+            let lines = victory_lines(&client_ui::VictorySummary {
+                goal: goal.into(),
+                completed_at_ms: 1,
+                elapsed_seconds: None,
+                checks_completed: Some(10),
+                checks_total: None,
+                received_items: None,
+                sent_items: Some(10),
+                deaths: None,
+                death_links: None,
+            });
+            assert!(lines[0].contains(goal));
+            assert!(lines[1].contains("Time unknown"));
+            assert!(lines[1].contains("Checks unknown"));
+            assert!(lines[2].contains("received unknown"));
+            assert!(lines[3].contains("Deaths unknown"));
+        }
     }
 
     #[test]

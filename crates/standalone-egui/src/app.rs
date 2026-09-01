@@ -12,7 +12,7 @@ use standalone_windows::{WindowGeometry, WindowOptions, normalize_command_input}
 use crate::hotkey::{self, Escape};
 use crate::view::{
     self, ActivityStyle, CommandHistory, STORAGE_TOOLTIP, Tone, activity_style, checks_progress,
-    clock_label, goal_line, identity, items_line, pills, toast_alpha, toast_events,
+    clock_label, goal_line, identity, items_line, pills, toast_alpha, toast_events, victory_lines,
 };
 
 /// Heartbeat. The old shell repainted a whole text blob every 50 ms, which is where its flicker
@@ -314,6 +314,20 @@ impl StandaloneApp {
     }
 
     fn progress(&mut self, ui: &mut egui::Ui, snapshot: &ClientSnapshot) {
+        if let Some(victory) = &snapshot.victory {
+            egui::Frame::new()
+                .fill(color(view::palette::VICTORY).gamma_multiply(0.12))
+                .stroke(egui::Stroke::new(1.0_f32, color(view::palette::VICTORY)))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    for (index, line) in victory_lines(victory).into_iter().enumerate() {
+                        let text = RichText::new(line).color(color(view::palette::VICTORY));
+                        ui.label(if index == 0 { text.strong() } else { text });
+                    }
+                });
+            ui.add_space(5.0);
+        }
         if let Some((fraction, label)) = checks_progress(snapshot) {
             ui.add(
                 egui::ProgressBar::new(fraction)

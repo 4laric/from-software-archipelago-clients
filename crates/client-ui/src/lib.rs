@@ -111,6 +111,19 @@ pub struct LocationTotals {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VictorySummary {
+    pub goal: String,
+    pub completed_at_ms: u64,
+    pub elapsed_seconds: Option<u64>,
+    pub checks_completed: Option<u32>,
+    pub checks_total: Option<u32>,
+    pub received_items: Option<u32>,
+    pub sent_items: Option<u32>,
+    pub deaths: Option<u32>,
+    pub death_links: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockedEntry {
     pub index: u64,
     pub item_name: String,
@@ -133,6 +146,8 @@ pub struct ClientSnapshot {
     pub seed: Option<String>,
     pub goal: Option<String>,
     pub go_mode: Option<bool>,
+    #[serde(default)]
+    pub victory: Option<VictorySummary>,
     pub locations: Option<LocationTotals>,
     pub ledger: LedgerTotals,
     #[serde(default)]
@@ -161,6 +176,7 @@ pub struct DeliveryFacts {
     pub seed: Option<String>,
     pub goal: Option<String>,
     pub go_mode: Option<bool>,
+    pub victory: Option<VictorySummary>,
     pub locations: Option<LocationTotals>,
     pub ledger: LedgerTotals,
     pub blocked: Vec<BlockedEntry>,
@@ -210,6 +226,7 @@ impl SnapshotReducer {
         self.snapshot.seed = facts.seed;
         self.snapshot.goal = facts.goal;
         self.snapshot.go_mode = facts.go_mode;
+        self.snapshot.victory = facts.victory;
         self.snapshot.locations = facts.locations;
         self.snapshot.ledger = facts.ledger;
         self.snapshot.blocked = facts.blocked;
