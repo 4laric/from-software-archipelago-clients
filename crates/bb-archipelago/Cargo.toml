@@ -5,6 +5,7 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 readme = "README.md"
+build = "build.rs"
 
 [[bin]]
 name = "bb-ap-client"
@@ -20,6 +21,9 @@ windows.workspace = true
 oneshot = { version = "0.2.1", features = ["async", "std"] }
 client-ui = { path = "../client-ui" }
 standalone-windows = { path = "../standalone-windows" }
+
+[build-dependencies]
+winresource = { version = "=0.1.31", default-features = false }
 
 # The egui window is the default renderer and the Win32 shell is the `--legacy-window` fallback.
 # Both are Windows-only, and so is everything that spawns them.
