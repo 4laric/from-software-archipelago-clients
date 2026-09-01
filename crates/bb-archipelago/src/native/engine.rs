@@ -23,7 +23,7 @@ use anyhow::{Result, bail};
 
 use super::contract::{DescriptorFormula, Policy};
 use super::delivery::{DurableState, GrantCommand, GrantSession, Runtime};
-use super::descriptor::{CATEGORY_EQUIPMENT, CATEGORY_GOODS};
+use super::descriptor::{CATEGORY_ARMOR, CATEGORY_EQUIPMENT, CATEGORY_GOODS};
 use super::diagnostics::{DeliveryRecord, DiagnosticSink, GrantContext};
 
 /// The outcome of one `grant` poll.
@@ -70,6 +70,15 @@ impl NativeGrantRequest {
                     && (self.normalized_item_id & 0x0FFF_FFFF)
                         == (self.raw_descriptor & 0x0FFF_FFFF),
                 "grant {} has an invalid category-0 raw/normalized descriptor pair",
+                self.tag
+            ),
+            CATEGORY_ARMOR => anyhow::ensure!(
+                self.normalized_item_id & 0xF000_0000 == 0x1000_0000
+                    && self.raw_descriptor & 0xF000_0000
+                        == formula.persistent_source_marker + 0x1000_0000
+                    && (self.normalized_item_id & 0x0FFF_FFFF)
+                        == (self.raw_descriptor & 0x0FFF_FFFF),
+                "grant {} has an invalid category-1 armor descriptor pair",
                 self.tag
             ),
             category => bail!(
