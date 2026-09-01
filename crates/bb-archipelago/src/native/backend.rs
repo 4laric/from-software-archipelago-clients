@@ -171,7 +171,7 @@ impl NativeBackend {
         if probes.pickup_notification {
             match self.install_pickup_presentation_probe() {
                 Ok(()) => client_eprintln!(
-                    "Pickup-presentation call-edge probe armed at vanilla callers 0x17D93FE and 0x14DA9FF."
+                    "Pickup-dialog lifecycle probe armed for GetItem, ObjGetItemData, ItemGet, and ItemGetPlate."
                 ),
                 Err(error) => client_eprintln!(
                     "Pickup-presentation probe inactive (gameplay and delivery remain available): {error:#}"
