@@ -22,6 +22,7 @@ use super::delivery::{EMPTY_SLOT, Runtime, SlotRecord, StackView};
 use super::descriptor::ItemGrantDescriptor;
 use super::item_grant_probe::{self, ItemGrantCallSnapshot};
 use super::mem::ProcessMemory;
+use super::pickup_presentation_probe::{self, PickupPresentationSnapshot};
 
 const MAX_SLOTS: u64 = 4096;
 
@@ -207,6 +208,10 @@ impl<P: ProcessMemory> GuestRuntime<P> {
 
     pub fn item_grant_probe_snapshot(&self) -> Option<ItemGrantCallSnapshot> {
         item_grant_probe::snapshot(&self.memory, self.base)
+    }
+
+    pub fn pickup_presentation_snapshots(&self) -> Vec<PickupPresentationSnapshot> {
+        pickup_presentation_probe::snapshots(&self.memory, self.base)
     }
 
     /// Resolve one naturally-created category instance on the game thread and

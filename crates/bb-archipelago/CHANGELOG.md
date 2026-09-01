@@ -49,7 +49,13 @@
   window.** Distinct shadPS4, Archipelago, and delivery readiness is fed by the
   nonblocking UI bridge. The translucent, always-on-top shell never touches the
   emulator process or delivery acknowledgement path.
-  
+
+* **The opt-in pickup-notification diagnostic now probes the two vanilla
+  pickup-side call edges found in playtest.32.** Exact-byte guarded,
+  observation-only wrappers at callers `0x17D93FE` and `0x14DA9FF` record
+  entry/return and candidate presentation context without touching the client
+  grant caller, changing item delivery, or synthesizing a message.
+
 * **An opt-in pickup-notification correlation probe is ready for live mapping.**
   Setting `pickup_notification_probe` in the local runtime config writes a
   bounded `pickup-notification-capture.jsonl` that joins AP checks and delivery
