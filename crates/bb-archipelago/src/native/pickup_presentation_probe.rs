@@ -14,6 +14,11 @@ use super::mem::ProcessMemory;
 const ITEM_GRANT_RVA: u64 = 0x14D_A0A0;
 const STATE_SIZE: usize = 0x48;
 const CAVE_CAPACITY: usize = 0xC0;
+// Live CUSA03173 01.09 census on playtest.33 found this entire span zeroed:
+// 0x50DC03C..0x50DC7A8. Keep every probe allocation inside it. The original
+// second cave started at 0x50DBFC0 and crossed 0x50DC000 into executable data.
+const OBSERVED_ZERO_START: u64 = 0x50D_C03C;
+const OBSERVED_ZERO_END: u64 = 0x50D_C7A8;
 
 #[derive(Clone, Copy)]
 struct Site {
@@ -29,15 +34,15 @@ const SITES: [Site; 2] = [
         name: "vanilla_pickup_17D93FE",
         call_rva: 0x17D_93F9,
         return_rva: 0x17D_93FE,
-        cave_rva: 0x50D_BF00,
-        state_rva: 0x50D_C080,
+        cave_rva: 0x50D_C100,
+        state_rva: 0x50D_C280,
     },
     Site {
         name: "vanilla_pickup_14DA9FF",
         call_rva: 0x14D_A9FA,
         return_rva: 0x14D_A9FF,
-        cave_rva: 0x50D_BFC0,
-        state_rva: 0x50D_C100,
+        cave_rva: 0x50D_C1C0,
+        state_rva: 0x50D_C300,
     },
 ];
 
@@ -112,6 +117,29 @@ fn cave_bytes(site: Site) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn validate_layout() -> Result<()> {
+    let mut ranges = Vec::new();
+    for site in SITES {
+        ranges.push((site.cave_rva, site.cave_rva + CAVE_CAPACITY as u64));
+        ranges.push((site.state_rva, site.state_rva + STATE_SIZE as u64));
+    }
+    for &(start, end) in &ranges {
+        anyhow::ensure!(
+            start >= OBSERVED_ZERO_START && end <= OBSERVED_ZERO_END,
+            "pickup presentation probe allocation leaves the live zero census"
+        );
+    }
+    for (index, &(left_start, left_end)) in ranges.iter().enumerate() {
+        for &(right_start, right_end) in &ranges[index + 1..] {
+            anyhow::ensure!(
+                left_end <= right_start || right_end <= left_start,
+                "pickup presentation probe allocations overlap"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Install both optional call-edge probes. Every byte/cave/state preflight is
 /// completed before any write; a mismatch leaves both sites untouched.
 pub fn install(
@@ -119,6 +147,7 @@ pub fn install(
     base: u64,
     threads: &mut impl ThreadController,
 ) -> Result<()> {
+    validate_layout()?;
     for site in SITES {
         let found = memory.read(base + site.call_rva, 5)?;
         let expected = direct_call_bytes(site)?;
@@ -282,6 +311,11 @@ mod tests {
             assert!(cave.contains(&0xE8));
             assert_eq!(detour_bytes(site).unwrap()[0], 0xE9);
         }
+    }
+
+    #[test]
+    fn cave_and_state_claims_are_disjoint_and_inside_the_live_zero_census() {
+        validate_layout().unwrap();
     }
 
     #[test]
