@@ -63,6 +63,26 @@ pub struct SlotLedger {
     pub operator_grants: BTreeMap<i64, PendingItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operator_actions: Vec<OperatorAction>,
+    /// Authoritative goal transition witnessed through this slot's validated
+    /// positioned-save location poll. Historical server checks never create
+    /// this record; retaining it prevents restart/reconnect celebrations and
+    /// duplicate Goal packets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub victory: Option<VictoryRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VictoryRecord {
+    pub goal_location: i64,
+    pub goal_name: String,
+    pub completed_at_ms: u64,
+    pub elapsed_seconds: Option<u64>,
+    pub checks_completed: Option<u32>,
+    pub checks_total: Option<u32>,
+    pub received_items: Option<u32>,
+    pub sent_items: Option<u32>,
+    pub deaths: Option<u32>,
+    pub death_links: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

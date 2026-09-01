@@ -5,7 +5,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use archipelago_rs::{ClientStatus, Connection, ConnectionOptions, Event, ItemHandling};
@@ -17,7 +17,7 @@ use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult, Oper
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::is_manager_not_initialized;
 use bb_archipelago::health::{HealthReporter, ReadinessState};
-use bb_archipelago::ledger::{ReceiveLedger, WatermarkOutcome};
+use bb_archipelago::ledger::{ReceiveLedger, VictoryRecord, WatermarkOutcome};
 use bb_archipelago::logging;
 use bb_archipelago::native::attach_wait::AttachWaitFailure;
 use bb_archipelago::native::backend::NativeBackend;
@@ -86,6 +86,14 @@ enum DisconnectVerdict {
     /// The server (or our own argument handling) rejected this login. Retrying
     /// forever would mask a configuration error, so stop loudly.
     Terminal,
+}
+
+fn should_submit_goal(
+    already_reported: bool,
+    configured_goal: Option<i64>,
+    newly_witnessed: &[i64],
+) -> bool {
+    !already_reported && configured_goal.is_some_and(|goal| newly_witnessed.contains(&goal))
 }
 
 /// Classify the error stored in `ConnectionState::Disconnected`.
@@ -941,6 +949,7 @@ fn run() -> Result<()> {
     let mut location_ids = HashSet::new();
     let mut checked_location_count = 0_u32;
     let mut goal_reported = false;
+    let run_started = Instant::now();
     let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut item_errors = ItemErrorReporter::default();
@@ -1367,6 +1376,22 @@ fn run() -> Result<()> {
                 Err(error) => eprintln!("Re-queuing parked items failed: {error:#}"),
             }
             runtime = Some(new_runtime);
+            // A durable summary is the local acknowledgement latch. Merely
+            // seeing a historical server check on startup must not celebrate
+            // or resubmit a stale/wrong save.
+            goal_reported = runtime.as_ref().is_some_and(|runtime| {
+                runtime
+                    .victory()
+                    .is_some_and(|record| Some(record.goal_location) == goal_location)
+            });
+            if goal_reported
+                && let Some(runtime) = runtime.as_ref()
+                && let Err(error) = runtime.write_victory_summary()
+            {
+                client_eprintln!(
+                    "WARNING: completed goal is restored, but victory summary text could not be written: {error:#}"
+                );
+            }
         }
 
         if !death_link_tag_advertised
@@ -1440,13 +1465,6 @@ fn run() -> Result<()> {
                 .map(|location| location.id())
                 .collect::<HashSet<_>>();
             checked_location_count = checked.intersection(&location_ids).count() as u32;
-            if !goal_reported && goal_location.is_some_and(|goal| checked.contains(&goal)) {
-                client.set_status(ClientStatus::Goal)?;
-                goal_reported = true;
-                client_eprintln!(
-                    "Re-sent Bloodborne goal status from the server-checked goal location."
-                );
-            }
             match runtime.poll_locations(&checked) {
                 Ok(newly_checked) => {
                     if last_location_error.take().is_some() {
@@ -1466,17 +1484,60 @@ fn run() -> Result<()> {
                             ui_reducer.activity(client_ui::ActivityKind::LocationCheck, line);
                         }
                         runtime.record_location_checks(&newly_checked);
-                        if !goal_reported
-                            && goal_location.is_some_and(|goal| newly_checked.contains(&goal))
-                        {
+                        if should_submit_goal(goal_reported, goal_location, &newly_checked) {
                             // Send the irreversible goal status before retiring
                             // the check locally. If this send fails, the next
                             // poll sees the flag as new and retries both.
                             client.set_status(ClientStatus::Goal)?;
                             goal_reported = true;
                             client_eprintln!(
-                                "Father Gascoigne defeated; sent Bloodborne goal status."
+                                "Witnessed configured Bloodborne goal; sent goal status."
                             );
+
+                            let checks_after = checked_location_count.saturating_add(
+                                newly_checked
+                                    .iter()
+                                    .filter(|location| {
+                                        location_ids.contains(location)
+                                            && !checked.contains(location)
+                                    })
+                                    .count() as u32,
+                            );
+                            let record = VictoryRecord {
+                                goal_location: goal_location.expect("new goal check has a goal"),
+                                goal_name: goal_name
+                                    .clone()
+                                    .unwrap_or_else(|| "Bloodborne goal".to_owned()),
+                                completed_at_ms: SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map_or(0, |elapsed| {
+                                        elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+                                    }),
+                                elapsed_seconds: Some(run_started.elapsed().as_secs()),
+                                checks_completed: Some(checks_after),
+                                checks_total: Some(location_ids.len() as u32),
+                                received_items: u32::try_from(client.received_items().len()).ok(),
+                                sent_items: Some(checks_after),
+                                deaths: None,
+                                death_links: None,
+                            };
+                            // Goal submission is authoritative and came first.
+                            // Summary persistence/presentation can fail loudly,
+                            // but can never roll back or block ClientStatus::Goal.
+                            match runtime.record_victory(record) {
+                                Ok(_) => match runtime.write_victory_summary() {
+                                    Ok(path) => client_eprintln!(
+                                        "Victory summary saved to {}.",
+                                        path.display()
+                                    ),
+                                    Err(error) => client_eprintln!(
+                                        "WARNING: goal sent, but victory summary text could not be written: {error:#}"
+                                    ),
+                                },
+                                Err(error) => client_eprintln!(
+                                    "WARNING: goal sent, but victory summary could not be persisted: {error:#}"
+                                ),
+                            }
                         }
                         let queued = runtime.queue_sustain_for_checks(&newly_checked)?;
                         if !queued.is_empty() {
@@ -1735,30 +1796,46 @@ fn run() -> Result<()> {
                     )
                 });
             }
-            ui_client.publish(ui_reducer.reduce(client_ui::DeliveryFacts {
-                process: if attached {
-                    client_ui::ProcessState::Attached
-                } else {
-                    client_ui::ProcessState::Attaching
-                },
-                ap,
-                delivery: ui_delivery,
-                delivery_detail: ui_delivery_detail,
-                server: Some(args.server.clone()),
-                slot: Some(args.slot.clone()),
-                seed,
-                goal: goal_name.clone(),
-                locations: (!location_ids.is_empty()).then_some(client_ui::LocationTotals {
-                    checked: checked_location_count,
-                    total: location_ids.len() as u32,
+            ui_client.publish(
+                ui_reducer.reduce(client_ui::DeliveryFacts {
+                    process: if attached {
+                        client_ui::ProcessState::Attached
+                    } else {
+                        client_ui::ProcessState::Attaching
+                    },
+                    ap,
+                    delivery: ui_delivery,
+                    delivery_detail: ui_delivery_detail,
+                    server: Some(args.server.clone()),
+                    slot: Some(args.slot.clone()),
+                    seed,
+                    goal: goal_name.clone(),
+                    victory: runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.victory())
+                        .map(|record| client_ui::VictorySummary {
+                            goal: record.goal_name.clone(),
+                            completed_at_ms: record.completed_at_ms,
+                            elapsed_seconds: record.elapsed_seconds,
+                            checks_completed: record.checks_completed,
+                            checks_total: record.checks_total,
+                            received_items: record.received_items,
+                            sent_items: record.sent_items,
+                            deaths: record.deaths,
+                            death_links: record.death_links,
+                        }),
+                    locations: (!location_ids.is_empty()).then_some(client_ui::LocationTotals {
+                        checked: checked_location_count,
+                        total: location_ids.len() as u32,
+                    }),
+                    ledger,
+                    blocked,
+                    save_identity,
+                    gameplay_ready,
+                    receive_cursor,
+                    ..Default::default()
                 }),
-                ledger,
-                blocked,
-                save_identity,
-                gameplay_ready,
-                receive_cursor,
-                ..Default::default()
-            }));
+            );
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -1767,6 +1844,17 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_goal_submits_only_on_its_new_positioned_witness() {
+        for goal in [12_259_361, 12_259_362, 12_259_363] {
+            assert!(!should_submit_goal(false, Some(goal), &[]));
+            assert!(!should_submit_goal(false, Some(goal), &[goal + 10]));
+            assert!(should_submit_goal(false, Some(goal), &[goal]));
+            assert!(!should_submit_goal(true, Some(goal), &[goal]));
+        }
+        assert!(!should_submit_goal(false, None, &[12_259_363]));
+    }
 
     /// clients#427 motivating case: the shipped client dispatches through the
     /// `Backend` enum, not through a bare `MockBackend`. Before this fix the

@@ -8,6 +8,12 @@
   retry. Other I/O failures still stop immediately, and an exhausted lock can
   no longer be mistaken for a successful save.
 
+* **Goal completion is now witnessed, durable, and unmistakable.** Only a new
+  configured goal check from the validated positioned-save poll sends
+  `ClientStatus::Goal`. The seed/slot ledger prevents duplicate sends or stale
+  restart celebrations, while the GUI and `victory-summary.txt` retain a
+  restrained victory summary and label unavailable counters as unknown.
+
 * **Compact mode now shows real Archipelago pickup toasts.** Sent checks name
   the scouted item and recipient; completed deliveries name the item and
   sender. Up to three cards appear newest-first for four seconds and fade

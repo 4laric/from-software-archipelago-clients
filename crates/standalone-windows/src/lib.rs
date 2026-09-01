@@ -252,7 +252,33 @@ pub fn render_snapshot(snapshot: &client_ui::ClientSnapshot) -> String {
     if snapshot.stale {
         lines.push("WARNING: client state is stale".to_owned());
     }
-    if let Some(goal) = &snapshot.goal {
+    if let Some(victory) = &snapshot.victory {
+        let count =
+            |value: Option<u32>| value.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+        let elapsed = victory.elapsed_seconds.map_or_else(
+            || "unknown".to_owned(),
+            |seconds| {
+                format!(
+                    "{:02}:{:02}:{:02}",
+                    seconds / 3600,
+                    (seconds % 3600) / 60,
+                    seconds % 60
+                )
+            },
+        );
+        let checks = match (victory.checks_completed, victory.checks_total) {
+            (Some(done), Some(total)) => format!("{done}/{total}"),
+            _ => "unknown".to_owned(),
+        };
+        lines.push(format!("VICTORY - {}", victory.goal));
+        lines.push(format!(
+            "Time {elapsed} | Checks {checks} | Received {} | Sent {} | Deaths {} | DeathLinks {}",
+            count(victory.received_items),
+            count(victory.sent_items),
+            count(victory.deaths),
+            count(victory.death_links)
+        ));
+    } else if let Some(goal) = &snapshot.goal {
         let go_mode = snapshot
             .go_mode
             .map_or("unknown", |value| if value { "yes" } else { "no" });

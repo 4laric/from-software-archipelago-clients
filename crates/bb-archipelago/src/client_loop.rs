@@ -12,7 +12,7 @@ use crate::client_eprintln;
 use crate::config::RuntimeConfig;
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
 use crate::ledger::{
-    AcknowledgedItem, OperatorAction, PendingItem, ReceiveLedger, WatermarkOutcome,
+    AcknowledgedItem, OperatorAction, PendingItem, ReceiveLedger, VictoryRecord, WatermarkOutcome,
 };
 use crate::upgrades::{auto_upgrade_level, reinforced_descriptor_pair};
 
@@ -295,6 +295,40 @@ impl<B: BloodborneBackend> ClientLoop<B> {
 
     pub fn ledger(&self) -> &ReceiveLedger {
         &self.ledger
+    }
+
+    pub fn victory(&self) -> Option<&VictoryRecord> {
+        self.ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.victory.as_ref())
+    }
+
+    /// Persist the first authoritative goal witness for this exact seed/slot.
+    /// A different goal location is refused instead of rewriting history.
+    pub fn record_victory(&mut self, record: VictoryRecord) -> Result<bool> {
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        if let Some(existing) = &slot.victory {
+            anyhow::ensure!(
+                existing.goal_location == record.goal_location,
+                "victory record belongs to goal location {}; refusing replacement with {}",
+                existing.goal_location,
+                record.goal_location
+            );
+            return Ok(false);
+        }
+        slot.victory = Some(record);
+        self.ledger.save(&self.ledger_path)?;
+        Ok(true)
+    }
+
+    /// Best-effort presentation artifact. The caller deliberately invokes
+    /// this only after Goal has been sent and the ledger record persisted.
+    pub fn write_victory_summary(&self) -> Result<PathBuf> {
+        let record = self.victory().context("victory is not recorded")?;
+        let output = self.ledger_path.with_file_name("victory-summary.txt");
+        std::fs::write(&output, crate::victory::summary_text(record))
+            .with_context(|| format!("writing {}", output.display()))?;
+        Ok(output)
     }
 
     /// Human-readable, non-mutating rescue-console status. This intentionally
@@ -4163,5 +4197,66 @@ mod tests {
             DeathLinkAmnestyDecision::Disabled
         );
         assert!(!ledger_path.exists());
+    }
+
+    #[test]
+    fn victory_is_idempotent_and_survives_restart() {
+        let ledger_path = path();
+        let record = VictoryRecord {
+            goal_location: 12_259_363,
+            goal_name: "Moon Presence".into(),
+            completed_at_ms: 123,
+            elapsed_seconds: Some(3_661),
+            checks_completed: Some(166),
+            checks_total: Some(166),
+            received_items: Some(120),
+            sent_items: Some(166),
+            deaths: None,
+            death_links: None,
+        };
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        assert!(client.record_victory(record.clone()).unwrap());
+        assert!(!client.record_victory(record.clone()).unwrap());
+
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        let restarted = loop_with(
+            MockBackend::default(),
+            persisted,
+            ledger_path.clone(),
+            config(),
+        );
+        assert_eq!(restarted.victory(), Some(&record));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn victory_cannot_be_replaced_by_a_different_goal() {
+        let ledger_path = path();
+        let make = |goal_location| VictoryRecord {
+            goal_location,
+            goal_name: format!("goal {goal_location}"),
+            completed_at_ms: 1,
+            elapsed_seconds: None,
+            checks_completed: None,
+            checks_total: None,
+            received_items: None,
+            sent_items: None,
+            deaths: None,
+            death_links: None,
+        };
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        client.record_victory(make(1)).unwrap();
+        assert!(client.record_victory(make(2)).is_err());
+        std::fs::remove_file(ledger_path).unwrap();
     }
 }

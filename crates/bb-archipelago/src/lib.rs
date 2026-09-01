@@ -28,6 +28,7 @@ pub mod names;
 pub mod native;
 pub mod toasts;
 pub mod upgrades;
+pub mod victory;
 
 #[cfg(test)]
 mod tests {
