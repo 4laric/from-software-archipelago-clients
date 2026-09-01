@@ -1360,6 +1360,46 @@ mod replay {
         }
     }
 
+    /// Exact regression for the Rykard trace attached to client#313. Client 0.5.2 emitted one
+    /// three-attempt burst on the initial load and another after each of 18 warps because row 194
+    /// did not satisfy the seed's row 8151 desire. Rebuilding the reconciler models the per-load
+    /// stall-guard reset; every load must instead converge without making even one grant call.
+    #[test]
+    fn rykard_restored_row_survives_repeated_loads_without_regranting() {
+        const RYKARD_BOSS_ROW: GoodsId = 8151;
+        const RYKARD_RESTORED_ROW: GoodsId = 194;
+        const RYKARD_RESTORED_FLAG: FlagId = 194;
+
+        let mut g = PossessionGame::new(PossessionReads {
+            equip_slot: true,
+            storage: true,
+        });
+        g.inner.goods.insert(RYKARD_RESTORED_ROW);
+        g.inner.flags.insert(RYKARD_RESTORED_FLAG, true);
+
+        for load in 0..19 {
+            let mut r = Reconciler::new(great_rune_inputs(
+                "Rykard's Great Rune",
+                RYKARD_BOSS_ROW,
+                RYKARD_RESTORED_FLAG,
+            ));
+            let out = r.tick(&mut g, TickBudget::default());
+
+            assert!(
+                out.converged && out.applied.is_empty(),
+                "load {load}: restored Rykard row must satisfy the boss-row desire"
+            );
+            assert!(
+                g.inner.unique_grant_calls.is_empty(),
+                "load {load}: no grant burst may be armed"
+            );
+            assert!(
+                r.stalled_goods().is_empty(),
+                "load {load}: a held rune must never reach the stall guard"
+            );
+        }
+    }
+
     /// The #316 backfill is DEAD (clients#392): it existed to migrate a legacy boss-row-only save
     /// to the restored row delivery then desired. Delivery desires the boss row again, so a legacy
     /// boss-row save satisfies it outright -- zero grants, nothing parked. (Granting the restored
