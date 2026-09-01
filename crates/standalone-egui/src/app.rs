@@ -25,6 +25,12 @@ const MIN_SIZE: [f32; 2] = [360.0, 240.0];
 const DEFAULT_SIZE: [f32; 2] = [420.0, 560.0];
 const COMPACT_SIZE: [f32; 2] = [420.0, 160.0];
 
+fn activity_scroll_area() -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+}
+
 fn color(rgb: view::Rgb) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
@@ -359,11 +365,15 @@ impl StandaloneApp {
 
         let events = self.visible_events(snapshot);
         let offset = self.utc_offset_seconds;
-        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-        if self.pinned || self.jump_requested {
-            scroll = scroll.vertical_scroll_offset(f32::INFINITY);
-        }
-        self.jump_requested = false;
+        // Let egui's scroll state follow a growing log.  Do not express "the bottom" as an
+        // infinite offset: `ScrollArea` applies an explicit offset before it knows this frame's
+        // content height, which can briefly place interactive children at infinite coordinates.
+        // Their hit rectangles then contain NaNs after clipping; `egui::hit_test_on_close` compares
+        // those rectangles on the next pass and panics because NaN makes a widget unequal to the
+        // copy it just selected (clients#557).  `stick_to_bottom` is the lifecycle-safe API for a
+        // terminal-style feed and automatically releases when the player scrolls away.
+        let scroll = activity_scroll_area();
+        let jump_requested = std::mem::take(&mut self.jump_requested);
         let output = scroll.show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for event in &events {
@@ -371,6 +381,11 @@ impl StandaloneApp {
             }
             if events.is_empty() {
                 ui.label(RichText::new("Nothing here yet.").color(color(view::palette::MUTED)));
+            }
+            if jump_requested {
+                // This targets the finite end cursor after all rows have been laid out. It also
+                // re-arms ScrollArea's native sticky state for subsequent activity.
+                ui.scroll_to_cursor(Some(Align::BOTTOM));
             }
         });
 
@@ -801,6 +816,8 @@ pub fn spawn_persisted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use client_ui::ActivityKind;
+    use egui::{Event, Pos2, RawInput, Rect};
     use standalone_windows::FeedFilters;
 
     #[test]
@@ -816,6 +833,49 @@ mod tests {
     #[test]
     fn filters_start_permissive() {
         assert_eq!(WindowOptions::default().filters, FeedFilters::default());
+    }
+
+    #[test]
+    fn rapidly_replaced_activity_never_creates_non_finite_scroll_geometry() {
+        // Reproduces the lifecycle around clients#557: the pointer remains over a selectable row
+        // while readiness replaces a short startup feed with a long live feed and back again.
+        // An explicit `vertical_scroll_offset(f32::INFINITY)` laid the children out at infinity;
+        // egui's next-pass hit test then compared NaN-bearing WidgetRects and panicked.
+        let ctx = egui::Context::default();
+        let counts = [1, 180, 2, 220, 0, 64, 3];
+
+        for (pass, count) in counts.into_iter().enumerate() {
+            let mut offset = None;
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(420.0, 300.0))),
+                time: Some(pass as f64 / 60.0),
+                events: vec![Event::PointerMoved(Pos2::new(120.0, 120.0))],
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let shown = activity_scroll_area().show(ui, |ui| {
+                        for sequence in 0..count {
+                            row(
+                                ui,
+                                &ActivityEvent {
+                                    sequence,
+                                    kind: ActivityKind::Message,
+                                    text: format!("readiness activity {sequence}"),
+                                    timestamp_ms: sequence,
+                                },
+                                0,
+                            );
+                        }
+                    });
+                    offset = Some(shown.state.offset.y);
+                });
+            });
+            assert!(offset.unwrap().is_finite());
+            // Tessellation walks every generated clip rectangle and catches non-finite geometry
+            // in the same frame instead of leaving it for the native renderer.
+            let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        }
     }
 
     #[test]
