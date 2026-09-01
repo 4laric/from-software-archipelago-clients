@@ -31,6 +31,14 @@ jobs:
   build:
     runs-on: windows-latest
 
+    # The build itself needs repository read access. Provenance signing additionally
+    # uses GitHub's short-lived OIDC identity on trusted push runs; pull requests
+    # still build and test, but never receive a signing identity.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
     # 🛑 DON'T RUN TWICE FOR THE SAME COMMIT. With `push: '**'` above, a branch in THIS repo fires
     # `push`, and opening a PR from it fires `pull_request` for the same sha -- two identical
     # windows-latest jobs, two of everything. Skip the pull_request copy when the PR comes from this
@@ -156,6 +164,31 @@ jobs:
     # release build still produces it.
     - run: cargo build --release
 
+    - name: Hash Bloodborne client artifact
+      shell: pwsh
+      run: |
+        $artifact = "target/release/bb-ap-client.exe"
+        $hash = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  bb-ap-client.exe" | Set-Content "$artifact.sha256" -Encoding ascii
+        @"
+        ## Bloodborne client artifact
+
+        SHA-256: ``$hash`` (``bb-ap-client.exe``)
+
+        Built by [$env:GITHUB_REPOSITORY@$env:GITHUB_SHA]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID).
+        On trusted push runs, verify its signed provenance with:
+
+        ``````text
+        gh attestation verify bb-ap-client.exe --repo $env:GITHUB_REPOSITORY
+        ``````
+        "@ | Add-Content $env:GITHUB_STEP_SUMMARY
+
+    - name: Attest Bloodborne client artifact
+      if: github.event_name == 'push'
+      uses: actions/attest-build-provenance@v2
+      with:
+        subject-path: target/release/bb-ap-client.exe
+
     - uses: actions/upload-artifact@v4
       with:
         name: eldenring_archipelago-${{ github.sha }}
@@ -171,6 +204,8 @@ jobs:
     - uses: actions/upload-artifact@v4
       with:
         name: bloodborne_ap_client-${{ github.sha }}
-        path: target/release/bb-ap-client.exe
+        path: |
+          target/release/bb-ap-client.exe
+          target/release/bb-ap-client.exe.sha256
         if-no-files-found: error
         retention-days: 14

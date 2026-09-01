@@ -3,6 +3,8 @@
 A shared monorepo for [Archipelago] clients for From Software games. The clients
 share infrastructure but ship independently. Three games are supported today:
 
+Build trust and vulnerability-reporting guidance is in [SECURITY.md](SECURITY.md).
+
 * **Dark Souls III** — `crates/ds3-archipelago`. See [the Dark Souls III setup
   guide].
 * **Sekiro** — `crates/sdt-archipelago`.

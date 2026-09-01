@@ -6,6 +6,11 @@ shadPS4 process memory. Item delivery uses the in-process **native** backend
 (see below). Unsupported or mismatched game images fail closed before delivery
 is armed or any Archipelago item is acknowledged.
 
+Downloaded builds include a SHA-256 companion file and trusted push builds are
+signed with GitHub build provenance. See the repository's
+[security and verification guide](../../SECURITY.md) before running a client or
+reporting a suspected vulnerability.
+
 The native grant contract supports received-item grants:
 
 - The client stages one grant only when no command is pending.
