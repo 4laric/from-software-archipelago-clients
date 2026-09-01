@@ -20,6 +20,7 @@ use super::contract::DescriptorFormula;
 /// are validated; nothing else is.
 pub const CATEGORY_GOODS: u8 = 4;
 pub const CATEGORY_EQUIPMENT: u8 = 0;
+pub const CATEGORY_ARMOR: u8 = 1;
 
 /// A staged descriptor pair. `raw_id`/`normalized_id` are the two u32s the cave
 /// reads; the rest of the 32-byte staging area is zero.
@@ -99,6 +100,11 @@ impl ItemGrantDescriptor {
         if raw_prefix == formula.persistent_source_marker && normalized_prefix == 0 {
             return Some(CATEGORY_EQUIPMENT);
         }
+        if raw_prefix == formula.persistent_source_marker + 0x1000_0000
+            && normalized_prefix == 0x1000_0000
+        {
+            return Some(CATEGORY_ARMOR);
+        }
         None
     }
 
@@ -118,7 +124,10 @@ impl ItemGrantDescriptor {
     /// True when the cave takes the `lea rsi,[descriptor]` (persistent,
     /// equipment) branch: `raw & 0xF0000000 == persistent_source_marker`.
     pub fn uses_persistent_source(&self, formula: &DescriptorFormula) -> bool {
-        (self.raw_id & 0xF000_0000) == formula.persistent_source_marker
+        matches!(
+            self.category(formula),
+            Some(CATEGORY_EQUIPMENT) | Some(CATEGORY_ARMOR)
+        )
     }
 }
 
@@ -165,6 +174,15 @@ mod tests {
         // Saw Spear raw 0x806C5660 is the sole validated equipment row.
         let d = ItemGrantDescriptor::new(0x806C_5660, 0x006C_5660);
         assert!(d.uses_persistent_source(&formula()));
+    }
+
+    #[test]
+    fn reviewed_armor_shape_is_persistent_and_non_stackable() {
+        let f = formula();
+        let armor = ItemGrantDescriptor::new(0x9000_2AF8, 0x1000_2AF8);
+        assert_eq!(armor.category(&f), Some(CATEGORY_ARMOR));
+        assert!(armor.uses_persistent_source(&f));
+        assert!(!armor.is_stackable_category(&f));
     }
 
     #[test]

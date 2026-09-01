@@ -177,6 +177,39 @@ impl RuntimeItemBinding {
                     self.feed_effect
                 );
             }
+            1 => {
+                anyhow::ensure!(
+                    matches!(
+                        self.descriptor_evidence,
+                        DescriptorEvidence::LiveGrantInventoryUi
+                            | DescriptorEvidence::ParamIdInferred
+                            | DescriptorEvidence::Unknown(_)
+                    ),
+                    "AP item {ap_item_id} category-1 descriptor lacks reviewed evidence"
+                );
+                anyhow::ensure!(
+                    self.normalized_item_id & 0xF000_0000 == 0x1000_0000
+                        && self.raw_descriptor & 0xF000_0000 == 0x9000_0000
+                        && (self.normalized_item_id & 0x0FFF_FFFF)
+                            == (self.raw_descriptor & 0x0FFF_FFFF),
+                    "AP item {ap_item_id} has an incompatible category-1 armor descriptor pair"
+                );
+                let protector_id = self.normalized_item_id & 0x0FFF_FFFF;
+                let expected_policy = crate::attire::receive_policy(protector_id)
+                    .with_context(|| format!(
+                        "AP item {ap_item_id} category-1 protector {protector_id} is not in the reviewed attire allowlist"
+                    ))?;
+                anyhow::ensure!(
+                    self.quantity == 1 && self.reinforcement_level.is_none(),
+                    "AP item {ap_item_id} category-1 armor must have quantity one and no reinforcement level"
+                );
+                anyhow::ensure!(
+                    self.feed_effect == expected_policy,
+                    "AP item {ap_item_id} category-1 armor has receive policy {:?}, expected {:?}",
+                    self.feed_effect,
+                    expected_policy
+                );
+            }
             255 => {
                 anyhow::ensure!(
                     self.descriptor_evidence == DescriptorEvidence::EventFlagEffect,
@@ -886,6 +919,55 @@ mod tests {
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("AP item 12255243"));
         assert!(diagnostic.contains("raw/normalized"));
+    }
+
+    #[test]
+    fn reviewed_armor_requires_the_exact_slot_policy() {
+        let row = |id: u32, effect: &str| {
+            json!({
+                "runtime_items": {
+                    "12255600": {
+                        "raw_descriptor": 0x9000_0000_u32 | id,
+                        "normalized_item_id": 0x1000_0000_u32 | id,
+                        "item_category": 1,
+                        "descriptor_evidence": "param_id_inferred",
+                        "quantity": 1,
+                        "feed_effect": effect
+                    }
+                }
+            })
+        };
+        let config = local()
+            .apply_slot_data(&row(11_000, "attire_chest"))
+            .unwrap();
+        assert_eq!(
+            config.items[&12_255_600].feed_effect,
+            FeedEffectBinding::AttireChest
+        );
+
+        let error = local()
+            .apply_slot_data(&row(11_000, "attire_head"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expected AttireChest"));
+    }
+
+    #[test]
+    fn arbitrary_category_one_rows_fail_closed() {
+        let error = local()
+            .apply_slot_data(&json!({
+                "runtime_items": {
+                    "12255600": {
+                        "raw_descriptor": 0x9001_5F90_u32,
+                        "normalized_item_id": 0x1001_5F90_u32,
+                        "item_category": 1,
+                        "descriptor_evidence": "param_id_inferred",
+                        "quantity": 1,
+                        "feed_effect": "attire_head"
+                    }
+                }
+            }))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("not in the reviewed attire allowlist"));
     }
 
     #[test]

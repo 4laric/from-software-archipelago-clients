@@ -16,6 +16,7 @@ pub fn client_version() -> String {
     format!("{}+{short}", env!("CARGO_PKG_VERSION"))
 }
 
+pub mod attire;
 pub mod backend;
 pub mod client_loop;
 pub mod config;
