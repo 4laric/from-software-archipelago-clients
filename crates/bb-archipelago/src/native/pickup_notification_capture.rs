@@ -44,13 +44,13 @@ impl PickupNotificationCapture {
             warned: false,
         };
         capture.write(json::json!({
-            "format": "bb-pickup-notification-capture-v2",
+            "format": "bb-pickup-notification-capture-v3",
             "event": "session_start",
             "at_unix_ms": now_ms(),
             "mode": "observation_only",
             "item_grant_rva": "0x14DA0A0",
             "native_notification_queue": "unmapped",
-            "presentation_probe_callers": ["0x17D93FE", "0x14DA9FF"]
+            "presentation_probe_classes": ["FrpgMenuDlgGetItem", "FrpgMenuDlgObjGetItemData", "FrpgMenuDlgItemGet", "FrpgMenuDlgItemGetPlate"]
         }));
         Ok(capture)
     }
@@ -130,9 +130,8 @@ impl PickupNotificationCapture {
             }
             self.presentation_sequences
                 .insert(snapshot.site, snapshot.sequence);
-            let descriptor = snapshot.descriptor.as_deref().map(hex_bytes);
             self.write(json::json!({
-                "event": "vanilla_pickup_call",
+                "event": "pickup_dialog_lifecycle",
                 "at_unix_ms": now_ms(),
                 "site": snapshot.site,
                 "caller_rva": format!("0x{:X}", snapshot.caller_rva),
@@ -140,15 +139,9 @@ impl PickupNotificationCapture {
                 "missed_calls_since_previous_sample": snapshot.sequence.saturating_sub(previous).saturating_sub(1),
                 "thread_stack_token": format!("0x{:X}", snapshot.thread_stack_token),
                 "entry": {
-                    "inventory": format!("0x{:X}", snapshot.inventory),
-                    "descriptor_address": format!("0x{:X}", snapshot.descriptor_address),
-                    "quantity": snapshot.quantity,
-                    "candidate_message_context": format!("0x{:X}", snapshot.candidate_message_context),
-                    "candidate_icon_context": format!("0x{:X}", snapshot.candidate_icon_context),
-                    "candidate_aux_context": format!("0x{:X}", snapshot.candidate_aux_context),
-                    "descriptor_24": descriptor,
+                    "this_rdi": format!("0x{:X}", snapshot.inventory),
+                    "argument_rsi": format!("0x{:X}", snapshot.descriptor_address),
                 },
-                "return": format!("0x{:X}", snapshot.result),
             }));
         }
     }
@@ -166,14 +159,6 @@ impl PickupNotificationCapture {
             self.records += 1;
         }
     }
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn grant_state_rank(state: &str) -> u8 {
