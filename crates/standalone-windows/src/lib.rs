@@ -190,7 +190,13 @@ pub fn normalize_command_input(input: &str) -> Option<String> {
 /// failing a client launch over.
 pub fn load_options(path: &std::path::Path) -> Option<WindowOptions> {
     let bytes = std::fs::read(path).ok()?;
-    json::from_slice::<WindowOptions>(&bytes).ok()
+    let mut options = json::from_slice::<WindowOptions>(&bytes).ok()?;
+    // Click-through is deliberately session-only. It removes the window's mouse controls, so a
+    // persisted `true` would make a restart restore the same apparent lockout the player was
+    // trying to escape. Ctrl+Shift+F10 remains the in-session escape hatch; relaunch is the
+    // unconditional second one. Geometry, opacity, compact mode and filters still round-trip.
+    options.click_through = false;
+    Some(options)
 }
 
 /// Persist window state through a temporary file and a rename.
@@ -932,6 +938,7 @@ mod tests {
         let options = WindowOptions {
             opacity: 0.55,
             compact: true,
+            click_through: true,
             filters: FeedFilters {
                 chat: false,
                 ..FeedFilters::default()
@@ -939,7 +946,14 @@ mod tests {
             ..Default::default()
         };
         store_options(&path, &options).expect("write");
-        assert_eq!(load_options(&path), Some(options));
+        let restored = load_options(&path).expect("stored options");
+        assert_eq!(restored.opacity, options.opacity);
+        assert_eq!(restored.compact, options.compact);
+        assert_eq!(restored.filters, options.filters);
+        assert!(
+            !restored.click_through,
+            "restart must always restore mouse input"
+        );
 
         // A corrupt file is not an error a player should see; it is a return to defaults.
         std::fs::write(&path, b"{ not json").unwrap();
