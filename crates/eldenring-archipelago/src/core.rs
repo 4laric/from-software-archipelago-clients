@@ -84,6 +84,7 @@ console_commands! {
     Check => "!check" => "!check <name substring>",
     UnlockGrace => "!unlockgrace" => "!unlockgrace <unique name substring|flag>",
     MarkerProbe => "!markerprobe" => "!markerprobe [set|verify|clear]",
+    MfgProbe => "!mfgprobe" => "!mfgprobe",
     Give => "!give" => "!give <fullId> [qty]",
     SeamlessProbe => "!seamlessprobe" => "!seamlessprobe [start|stop]",
     Ability => "!ability" => "!ability [lock|unlock <name|all>]",
@@ -630,6 +631,10 @@ impl shared::Core for Core {
                         )));
                     }
                 }
+                true
+            }
+            ConsoleCommand::MfgProbe => {
+                self.log(ap::Print::message(crate::mfg_probe::report()));
                 true
             }
             ConsoleCommand::Give => {
