@@ -2,6 +2,12 @@
 
 ### Changed
 
+* **Receive-ledger rotation now survives brief Windows file locks
+  (clients#560).** Backup removal, rotation, publication, and rollback retry
+  only sharing/lock violations for a bounded 250 ms window and report every
+  retry. Other I/O failures still stop immediately, and an exhausted lock can
+  no longer be mistaken for a successful save.
+
 * **Compact mode now shows real Archipelago pickup toasts.** Sent checks name
   the scouted item and recipient; completed deliveries name the item and
   sender. Up to three cards appear newest-first for four seconds and fade

@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -147,6 +150,51 @@ const fn legacy_goods_category() -> u8 {
     4
 }
 
+const LEDGER_LOCK_ATTEMPTS: usize = 6;
+const LEDGER_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+fn is_windows_sharing_violation(error: &io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+fn retry_sharing_violation<T>(
+    action: &str,
+    operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    retry_io_with(
+        action,
+        operation,
+        is_windows_sharing_violation,
+        thread::sleep,
+    )
+}
+
+/// Retry only a short-lived sharing/lock violation. The injected classifier
+/// and sleeper make the retry contract deterministic in tests without
+/// manufacturing a real Windows file lock.
+fn retry_io_with<T>(
+    action: &str,
+    mut operation: impl FnMut() -> io::Result<T>,
+    should_retry: impl Fn(&io::Error) -> bool,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<T> {
+    for attempt in 1..=LEDGER_LOCK_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if should_retry(&error) && attempt < LEDGER_LOCK_ATTEMPTS => {
+                eprintln!(
+                    "Bloodborne ledger: {action} hit a transient Windows file lock; \
+                     retrying ({attempt}/{LEDGER_LOCK_ATTEMPTS}) in {} ms: {error}",
+                    LEDGER_LOCK_RETRY_DELAY.as_millis()
+                );
+                sleep(LEDGER_LOCK_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the bounded retry loop always returns")
+}
+
 impl ReceiveLedger {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
@@ -165,16 +213,48 @@ impl ReceiveLedger {
         let bytes = json::to_vec_pretty(self)?;
         fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
         if path.exists() {
-            let _ = fs::remove_file(&backup);
-            fs::rename(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
-        }
-        if let Err(error) = fs::rename(&temporary, path) {
             if backup.exists() {
-                let _ = fs::rename(&backup, path);
+                retry_sharing_violation("removing the previous ledger backup", || {
+                    fs::remove_file(&backup)
+                })
+                .with_context(|| format!("removing previous backup {}", backup.display()))?;
+            }
+            retry_sharing_violation("backing up the receive ledger", || {
+                fs::rename(path, &backup)
+            })
+            .with_context(|| format!("backing up {}", path.display()))?;
+        }
+        if let Err(error) = retry_sharing_violation("publishing the receive ledger", || {
+            fs::rename(&temporary, path)
+        }) {
+            if backup.exists()
+                && let Err(restore_error) =
+                    retry_sharing_violation("restoring the receive ledger backup", || {
+                        fs::rename(&backup, path)
+                    })
+            {
+                return Err(anyhow::Error::new(error)).with_context(|| {
+                    format!(
+                        "publishing {}; restoring {} also failed: {restore_error}",
+                        path.display(),
+                        backup.display()
+                    )
+                });
             }
             return Err(error).with_context(|| format!("publishing {}", path.display()));
         }
-        let _ = fs::remove_file(backup);
+        if let Err(error) = retry_sharing_violation("removing the committed ledger backup", || {
+            fs::remove_file(&backup)
+        }) && error.kind() != io::ErrorKind::NotFound
+        {
+            // The new ledger is already durable. Leaving the prior generation
+            // behind is safer than reporting the completed save as failed.
+            eprintln!(
+                "Bloodborne ledger: committed {}, but could not remove {}: {error}",
+                path.display(),
+                backup.display()
+            );
+        }
         Ok(())
     }
 }
@@ -520,6 +600,74 @@ impl SlotLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transient_test_error() -> io::Error {
+        io::Error::other("synthetic sharing violation")
+    }
+
+    #[test]
+    fn transient_file_lock_recovers_within_the_bound() {
+        let mut calls = 0;
+        let mut sleeps = Vec::new();
+        let result = retry_io_with(
+            "testing ledger rotation",
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(transient_test_error())
+                } else {
+                    Ok("published")
+                }
+            },
+            |_| true,
+            |delay| sleeps.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(result, "published");
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps, vec![LEDGER_LOCK_RETRY_DELAY; 2]);
+    }
+
+    #[test]
+    fn persistent_file_lock_stops_at_the_retry_bound() {
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let error = retry_io_with::<()>(
+            "testing ledger rotation",
+            || {
+                calls += 1;
+                Err(transient_test_error())
+            },
+            |_| true,
+            |_| sleeps += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "synthetic sharing violation");
+        assert_eq!(calls, LEDGER_LOCK_ATTEMPTS);
+        assert_eq!(sleeps, LEDGER_LOCK_ATTEMPTS - 1);
+    }
+
+    #[test]
+    fn non_retryable_io_error_fails_immediately() {
+        let mut calls = 0;
+        let mut slept = false;
+        let error = retry_io_with::<()>(
+            "testing ledger rotation",
+            || {
+                calls += 1;
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            },
+            |_| false,
+            |_| slept = true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1);
+        assert!(!slept);
+    }
 
     #[test]
     fn missing_ledger_starts_at_zero() {
