@@ -103,6 +103,7 @@ pub struct NativeBackend {
     pickup_notification_capture: Option<PickupNotificationCapture>,
     boss_flag_census: Option<BossFlagCensus>,
     rune_capture: Option<RuneCapture>,
+    process_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -168,6 +169,14 @@ impl NativeBackend {
             Err(error) => client_eprintln!("Shop diagnostics unavailable: {error}"),
         }
         if probes.pickup_notification {
+            match self.install_pickup_presentation_probe() {
+                Ok(()) => client_eprintln!(
+                    "Pickup-presentation call-edge probe armed at vanilla callers 0x17D93FE and 0x14DA9FF."
+                ),
+                Err(error) => client_eprintln!(
+                    "Pickup-presentation probe inactive (gameplay and delivery remain available): {error:#}"
+                ),
+            }
             match PickupNotificationCapture::beside_ledger(ledger, self.base) {
                 Ok(capture) => {
                     client_eprintln!(
@@ -195,6 +204,24 @@ impl NativeBackend {
                 "Insight probe requested but not armed: the reviewed player-stat candidate manifest is still empty; no addresses were guessed."
             );
         }
+    }
+
+    #[cfg(windows)]
+    fn install_pickup_presentation_probe(&mut self) -> Result<()> {
+        use super::pickup_presentation_probe;
+        use super::threads::WindowsThreadController;
+
+        let mut threads = WindowsThreadController::new(self.process_id);
+        pickup_presentation_probe::install(
+            self.delivery.runtime_mut().memory(),
+            self.base,
+            &mut threads,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn install_pickup_presentation_probe(&mut self) -> Result<()> {
+        bail!("live pickup presentation instrumentation is Windows-only")
     }
 
     /// The live `location_context`, before the diagnostics stamp is taken.
@@ -386,6 +413,7 @@ impl NativeBackend {
             pickup_notification_capture: None,
             boss_flag_census: None,
             rune_capture: None,
+            process_id,
         })
     }
 }
@@ -423,6 +451,8 @@ impl BloodborneBackend for NativeBackend {
         if let Some(capture) = &mut self.pickup_notification_capture {
             let snapshot = self.delivery.runtime_mut().item_grant_probe_snapshot();
             capture.observe_native_call(snapshot);
+            let snapshots = self.delivery.runtime_mut().pickup_presentation_snapshots();
+            capture.observe_presentation_calls(snapshots);
         }
         let result = self.location_context_inner();
         if let Some(census) = &mut self.boss_flag_census {

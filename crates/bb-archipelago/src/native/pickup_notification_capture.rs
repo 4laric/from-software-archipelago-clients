@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::backend::ItemGrant;
 
 use super::item_grant_probe::ItemGrantCallSnapshot;
+use super::pickup_presentation_probe::PickupPresentationSnapshot;
 
 const MAX_RECORDS: usize = 4096;
 
@@ -20,6 +21,7 @@ pub struct PickupNotificationCapture {
     file: File,
     records: usize,
     previous_native_sequence: u64,
+    presentation_sequences: HashMap<&'static str, u64>,
     image_base: u64,
     grant_states: HashMap<String, &'static str>,
     warned: bool,
@@ -36,17 +38,19 @@ impl PickupNotificationCapture {
             file,
             records: 0,
             previous_native_sequence: 0,
+            presentation_sequences: HashMap::new(),
             image_base,
             grant_states: HashMap::new(),
             warned: false,
         };
         capture.write(json::json!({
-            "format": "bb-pickup-notification-capture-v1",
+            "format": "bb-pickup-notification-capture-v2",
             "event": "session_start",
             "at_unix_ms": now_ms(),
             "mode": "observation_only",
             "item_grant_rva": "0x14DA0A0",
-            "native_notification_queue": "unmapped"
+            "native_notification_queue": "unmapped",
+            "presentation_probe_callers": ["0x17D93FE", "0x14DA9FF"]
         }));
         Ok(capture)
     }
@@ -114,6 +118,41 @@ impl PickupNotificationCapture {
         }));
     }
 
+    pub fn observe_presentation_calls(&mut self, snapshots: Vec<PickupPresentationSnapshot>) {
+        for snapshot in snapshots {
+            let previous = self
+                .presentation_sequences
+                .get(snapshot.site)
+                .copied()
+                .unwrap_or(0);
+            if snapshot.sequence == previous {
+                continue;
+            }
+            self.presentation_sequences
+                .insert(snapshot.site, snapshot.sequence);
+            let descriptor = snapshot.descriptor.as_deref().map(hex_bytes);
+            self.write(json::json!({
+                "event": "vanilla_pickup_call",
+                "at_unix_ms": now_ms(),
+                "site": snapshot.site,
+                "caller_rva": format!("0x{:X}", snapshot.caller_rva),
+                "sequence": snapshot.sequence,
+                "missed_calls_since_previous_sample": snapshot.sequence.saturating_sub(previous).saturating_sub(1),
+                "thread_stack_token": format!("0x{:X}", snapshot.thread_stack_token),
+                "entry": {
+                    "inventory": format!("0x{:X}", snapshot.inventory),
+                    "descriptor_address": format!("0x{:X}", snapshot.descriptor_address),
+                    "quantity": snapshot.quantity,
+                    "candidate_message_context": format!("0x{:X}", snapshot.candidate_message_context),
+                    "candidate_icon_context": format!("0x{:X}", snapshot.candidate_icon_context),
+                    "candidate_aux_context": format!("0x{:X}", snapshot.candidate_aux_context),
+                    "descriptor_24": descriptor,
+                },
+                "return": format!("0x{:X}", snapshot.result),
+            }));
+        }
+    }
+
     fn write(&mut self, value: json::Value) {
         if self.warned || self.records >= MAX_RECORDS {
             return;
@@ -127,6 +166,14 @@ impl PickupNotificationCapture {
             self.records += 1;
         }
     }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn grant_state_rank(state: &str) -> u8 {

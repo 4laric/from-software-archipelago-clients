@@ -275,6 +275,24 @@ for each action and send `pickup-notification-capture.jsonl` with `client.log`.
 The capture is bounded to 4096 records and repeated pending states/native-call
 sequences are deduplicated. A write failure is non-fatal.
 
+The v2 probe also wraps only the two vanilla pickup-side direct calls proven by
+playtest.32 (`0x17D93F9 -> ItemGrant`, returning at `0x17D93FE`, and
+`0x14DA9FA -> ItemGrant`, returning at `0x14DA9FF`). Before either is touched,
+both exact five-byte calls and two empty cave/state regions must match the
+supported CUSA03173 01.09 image. Each wrapper makes the original call unchanged
+and records entry registers, an opaque guest-stack thread token, the native
+return value and a best-effort 24-byte descriptor. Ambient `rcx`, `r8`, and `r9`
+are labelled only as candidate message/icon/auxiliary context; the probe does
+not claim their meaning, call a message routine, synthesize a banner, or mutate
+an argument/result. Any mismatch or install/capture failure is non-fatal.
+
+For the next focused capture, leave the probe enabled and collect one ordinary
+lower-corner pickup banner and one centered modal pickup if convenient. Send
+`pickup-notification-capture.jsonl` with `client.log`, noting which visible
+action produced each presentation. `vanilla_pickup_call` records now identify
+the call edge, entry/return values, stack correlation token, and candidate
+presentation contexts without sampling the AP grant caller `0x50DBB44`.
+
 ### Zero-Vial diagnostic (bb-archipelago#70)
 
 Native sessions also append read-only samples to `blood-vial-capture.jsonl`
