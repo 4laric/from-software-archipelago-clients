@@ -175,8 +175,22 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     fn sustain_command_in_flight(&self) -> bool {
         self.ledger
             .slot(&self.seed_name, &self.slot_name)
-            .and_then(|slot| slot.pending_sustain.iter().next())
-            .is_some_and(|(_, baseline)| baseline.is_some())
+            .is_some_and(|slot| slot.pending_sustain.values().any(Option::is_some))
+    }
+
+    fn next_sustain(&self) -> Option<(i64, Option<u32>)> {
+        let pending = &self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)?
+            .pending_sustain;
+        // A recorded baseline means this command may already own the single native lane. New
+        // locations can sort ahead of it by AP id while the player keeps collecting checks; always
+        // finish or retire the published command before considering a merely queued sustain.
+        pending
+            .iter()
+            .find(|(_, baseline)| baseline.is_some())
+            .or_else(|| pending.iter().next())
+            .map(|(&location, &baseline)| (location, baseline))
     }
 
     fn retire_sustain(
@@ -527,8 +541,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .ledger
             .slot(&self.seed_name, &self.slot_name)
             .is_some_and(|slot| slot.pending.is_some())
-            || self.sustain_command_in_flight()
         {
+            return Ok(OperatorGrantPoll::Pending);
+        }
+        // The main loop gives an explicit rescue grant priority over ordinary AP delivery. If a
+        // sustain already owns the native lane, merely reporting the rescue as pending would also
+        // stop the idle-only sustain poll and deadlock both operations. Advance the expendable
+        // sustain here until it completes or reaches its bounded retirement, then rescue.
+        if self.sustain_command_in_flight() && self.poll_sustain()? == SustainPollResult::Pending {
             return Ok(OperatorGrantPoll::Pending);
         }
         let tag = format!("operator_grant_{ap_item_id}");
@@ -710,11 +730,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// items retain priority: the binary calls this only when their delivery
     /// machine is idle, and errors here are reported independently.
     pub fn poll_sustain(&mut self) -> Result<SustainPollResult> {
-        let Some((&location, &recorded_before)) = self
-            .ledger
-            .slot(&self.seed_name, &self.slot_name)
-            .and_then(|slot| slot.pending_sustain.iter().next())
-        else {
+        let Some((location, recorded_before)) = self.next_sustain() else {
             return Ok(SustainPollResult::Idle);
         };
         let tag = format!("sustain_{location}");
@@ -1659,6 +1675,39 @@ mod tests {
                 .highest_processed_index,
             None
         );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn operator_give_advances_and_retires_a_wedged_sustain_before_rescue() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = true;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        backend.keep_grant_pending("sustain_1000");
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        client.queue_sustain_for_checks(&[1000]).unwrap();
+        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Pending);
+        assert!(client.rescue_give(2000, "Pebble").unwrap());
+
+        for _ in 1..(SUSTAIN_PENDING_POLL_LIMIT - 1) {
+            assert_eq!(
+                client.poll_operator_grant().unwrap(),
+                OperatorGrantPoll::Pending
+            );
+        }
+        assert_eq!(
+            client.poll_operator_grant().unwrap(),
+            OperatorGrantPoll::Completed(2000)
+        );
+        assert_eq!(client.backend().withdrawn, vec!["sustain_1000"]);
+        assert_eq!(client.backend().grants.len(), 1);
+        assert_eq!(client.backend().grants[0].tag, "operator_grant_2000");
         std::fs::remove_file(ledger_path).unwrap();
     }
 
@@ -2659,6 +2708,45 @@ mod tests {
             })
         );
         assert_eq!(client.take_sustain_notice(), None);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn published_sustain_keeps_priority_when_a_lower_location_id_is_queued() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        let mut backend = MockBackend::default();
+        backend.keep_grant_pending("sustain_1000");
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        client.queue_sustain_for_checks(&[1000]).unwrap();
+        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Pending);
+
+        // Reproduce oz's session: a later pickup with a lower AP location id sorts ahead of the
+        // command that already owns the native lane. It must not replace the active poll target.
+        client
+            .ledger
+            .slot_mut("seed", "slot")
+            .pending_sustain
+            .insert(500, None);
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        for _ in 1..(SUSTAIN_PENDING_POLL_LIMIT - 1) {
+            assert_eq!(
+                client.poll_items(&received).unwrap(),
+                ItemPollResult::Pending
+            );
+        }
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert!(slot.pending_sustain.contains_key(&500));
+        assert!(slot.completed_sustain.contains(&1000));
+        assert_eq!(client.backend().withdrawn, vec!["sustain_1000"]);
         std::fs::remove_file(ledger_path).unwrap();
     }
 
