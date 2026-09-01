@@ -475,6 +475,7 @@ impl ClientEndpoint {
     }
 }
 
+#[derive(Clone)]
 pub struct HostEndpoint {
     snapshot: Arc<Mutex<Option<ClientSnapshot>>>,
     actions_tx: SyncSender<UiAction>,
@@ -497,6 +498,31 @@ impl HostEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cloned_host_endpoint_can_take_over_the_same_ui_bridge() {
+        let (client, host) = UiBridge::new(2).split();
+        let fallback = host.clone();
+        drop(host);
+
+        let mut snapshot = ClientSnapshot::default();
+        snapshot.slot = Some("fallback hunter".into());
+        client.publish(snapshot);
+        assert_eq!(
+            fallback
+                .latest_snapshot()
+                .and_then(|snapshot| snapshot.slot),
+            Some("fallback hunter".into())
+        );
+
+        fallback
+            .send_action(UiAction::SubmitCommand("still alive".into()))
+            .expect("fallback action");
+        assert_eq!(
+            client.try_action().expect("shared action channel"),
+            UiAction::SubmitCommand("still alive".into())
+        );
+    }
 
     #[test]
     fn activity_is_ordered_and_bounded() {

@@ -752,6 +752,54 @@ fn print_activity_kind(print: &archipelago_rs::Print) -> client_ui::ActivityKind
     }
 }
 
+#[cfg(windows)]
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic payload")
+}
+
+/// Keep the game client alive when the presentation-only egui renderer fails.
+///
+/// The renderer deliberately lives on another thread because the AP worker owns
+/// the process main thread.  Discarding its join handle made a startup error or
+/// panic completely silent: delivery carried on safely, but the player was left
+/// with only the console.  Supervise that handle, tee the reason into the normal
+/// session log, and hand the same renderer-neutral endpoint to the proven Win32
+/// shell.  A normal window close still requests shutdown through `on_exit` and
+/// must not reopen itself.
+#[cfg(windows)]
+fn spawn_supervised_gui(
+    host: client_ui::HostEndpoint,
+    options: standalone_windows::WindowOptions,
+    window_state: PathBuf,
+) {
+    thread::spawn(move || {
+        let egui = standalone_egui::spawn_persisted(host.clone(), options, window_state.clone());
+        let failure = match egui.join() {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => format!("exited with an error: {error}"),
+            Err(payload) => format!("panicked: {}", panic_payload_message(payload.as_ref())),
+        };
+        client_eprintln!(
+            "WARNING: the default Bloodborne client window {failure}. Falling back to the legacy window; item delivery remains armed."
+        );
+
+        match standalone_windows::spawn_persisted(host, options, window_state).join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => client_eprintln!(
+                "WARNING: the fallback Bloodborne client window exited with an error: {error}"
+            ),
+            Err(payload) => client_eprintln!(
+                "WARNING: the fallback Bloodborne client window panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ),
+        }
+    });
+}
+
 fn run() -> Result<()> {
     let args = arguments()?;
     // The tee is armed before ANY other output (clients#425), so the session log
@@ -803,7 +851,7 @@ fn run() -> Result<()> {
             );
             standalone_windows::spawn_persisted(host, options, window_state);
         } else {
-            standalone_egui::spawn_persisted(host, options, window_state);
+            spawn_supervised_gui(host, options, window_state);
         }
         let mut reducer = client_ui::SnapshotReducer::default();
         client.publish(reducer.reduce(client_ui::DeliveryFacts {
@@ -1844,6 +1892,20 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn gui_supervisor_preserves_text_panic_reasons() {
+        let borrowed: Box<dyn std::any::Any + Send> = Box::new("borrowed reason");
+        assert_eq!(panic_payload_message(borrowed.as_ref()), "borrowed reason");
+        let owned: Box<dyn std::any::Any + Send> = Box::new(String::from("owned reason"));
+        assert_eq!(panic_payload_message(owned.as_ref()), "owned reason");
+        let opaque: Box<dyn std::any::Any + Send> = Box::new(7_u8);
+        assert_eq!(
+            panic_payload_message(opaque.as_ref()),
+            "unknown panic payload"
+        );
+    }
 
     #[test]
     fn every_goal_submits_only_on_its_new_positioned_witness() {
