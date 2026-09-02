@@ -19,6 +19,10 @@ pub struct LocationBinding {
     pub event_flag: u32,
     #[serde(default)]
     pub vanilla_award_suppressed: bool,
+    /// Optional display grouping supplied by the world. This is presentation metadata, not a
+    /// client-side reachability rule.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// How the world documented the descriptor it is asking this client to grant.
@@ -392,6 +396,7 @@ impl RuntimeConfig {
             ap_location_id,
             event_flag: TEST_PEBBLE_EVENT_FLAG,
             vanilla_award_suppressed: false,
+            region: None,
         });
         self
     }
@@ -420,6 +425,7 @@ impl RuntimeConfig {
                         .with_context(|| format!("invalid AP location id {raw_id:?}"))?,
                     event_flag: row.event_flag,
                     vanilla_award_suppressed: row.vanilla_award_suppressed,
+                    region: row.region,
                 });
             }
             locations.sort_by_key(|row| row.ap_location_id);
@@ -649,6 +655,8 @@ struct SlotLocationBinding {
     event_flag: u32,
     #[serde(default)]
     vanilla_award_suppressed: bool,
+    #[serde(default)]
+    region: Option<String>,
 }
 
 #[cfg(test)]
@@ -663,6 +671,7 @@ mod tests {
                 ap_location_id: 1,
                 event_flag: 2,
                 vanilla_award_suppressed: false,
+                region: None,
             }],
             items: HashMap::new(),
             auto_upgrade: false,
@@ -689,7 +698,11 @@ mod tests {
         let config = local()
             .apply_slot_data(&json!({
                 "runtime_locations": {
-                    "12259363": {"event_flag": 52410800, "vanilla_award_suppressed": false}
+                    "12259363": {
+                        "event_flag": 52410800,
+                        "vanilla_award_suppressed": false,
+                        "region": "Central Yharnam"
+                    }
                 },
                 "runtime_items": {
                     "12255488": {
@@ -710,6 +723,10 @@ mod tests {
         assert_eq!(config.locations.len(), 1);
         assert_eq!(config.locations[0].ap_location_id, 12_259_363);
         assert_eq!(config.locations[0].event_flag, 52_410_800);
+        assert_eq!(
+            config.locations[0].region.as_deref(),
+            Some("Central Yharnam")
+        );
         assert_eq!(config.items[&12_255_488].normalized_item_id, 0x006C_5660);
         assert_eq!(config.items[&12_255_488].raw_descriptor, 0x806C_5660);
         assert_eq!(config.items[&12_255_488].reinforcement_level, Some(0));
