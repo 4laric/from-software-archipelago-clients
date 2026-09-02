@@ -6,7 +6,7 @@ pub enum Capability {
     NotLoaded,
     ObserveOnly,
     IncompleteApi,
-    ControllableV1,
+    CompleteExportSet,
 }
 
 pub fn classify(
@@ -20,7 +20,7 @@ pub fn classify(
     } else if !has_version && !has_set_state_v1 && !has_clear_v1 {
         Capability::ObserveOnly
     } else if has_version && has_set_state_v1 && has_clear_v1 {
-        Capability::ControllableV1
+        Capability::CompleteExportSet
     } else {
         Capability::IncompleteApi
     }
@@ -41,12 +41,21 @@ mod tests {
     }
 
     #[test]
-    fn partial_contract_is_never_treated_as_safe() {
-        assert_eq!(classify(true, true, true, false), Capability::IncompleteApi);
+    fn every_partial_contract_is_refused() {
+        for mask in 1_u8..7 {
+            assert_eq!(
+                classify(true, mask & 1 != 0, mask & 2 != 0, mask & 4 != 0),
+                Capability::IncompleteApi,
+                "partial export mask {mask:03b} must be refused"
+            );
+        }
     }
 
     #[test]
     fn complete_v1_surface_is_controllable() {
-        assert_eq!(classify(true, true, true, true), Capability::ControllableV1);
+        assert_eq!(
+            classify(true, true, true, true),
+            Capability::CompleteExportSet
+        );
     }
 }
