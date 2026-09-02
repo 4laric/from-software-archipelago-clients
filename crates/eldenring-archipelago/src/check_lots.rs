@@ -243,6 +243,8 @@ pub fn run() -> bool {
     }
 
     let mut n = 0usize;
+    let mut changed = 0usize;
+    let mut already_correct = 0usize;
     let mut missed: Vec<u32> = Vec::new();
 
     // NO FALLBACK, NO GUESSING. Each lot is written to the table the apworld SAID it came from.
@@ -278,6 +280,11 @@ pub fn run() -> bool {
                 "check-lots neutralise pass",
             ) {
                 for &sl in slots {
+                    if slot_matches(row, sl, w.item_id, w.category) {
+                        already_correct += 1;
+                    } else {
+                        changed += 1;
+                    }
                     set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
                 }
@@ -292,6 +299,11 @@ pub fn run() -> bool {
                 "check-lots neutralise pass",
             ) {
                 for &sl in slots {
+                    if slot_matches(row, sl, w.item_id, w.category) {
+                        already_correct += 1;
+                    } else {
+                        changed += 1;
+                    }
                     set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
                 }
@@ -328,6 +340,11 @@ pub fn run() -> bool {
                 "check-lots neutralise pass",
             ) {
                 for &sl in slots {
+                    if slot_matches(row, sl, w.item_id, w.category) {
+                        already_correct += 1;
+                    } else {
+                        changed += 1;
+                    }
                     set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
                 }
@@ -342,6 +359,11 @@ pub fn run() -> bool {
                 "check-lots neutralise pass",
             ) {
                 for &sl in slots {
+                    if slot_matches(row, sl, w.item_id, w.category) {
+                        already_correct += 1;
+                    } else {
+                        changed += 1;
+                    }
                     set_slot_full(row, sl, w.item_id, w.category);
                     n += 1;
                 }
@@ -376,9 +398,11 @@ pub fn run() -> bool {
         missed.len()
     );
     log::info!(
-        "check-lots: neutralised {n} check slot(s) -> goods placeholder {ph}; non-goods slots are \
+        "check-lots: neutralised {n} check slot(s) -> goods placeholder {ph} \
+         (changed {changed}, already-correct {already_correct}, missing rows {}); non-goods slots are \
          REPOINTED (id + category) now that the category travels with the id -- never emptied, \
-         because the pickup IS the check"
+         because the pickup IS the check",
+        missed.len()
     );
     DONE.store(true, Ordering::Relaxed);
     true
@@ -432,6 +456,27 @@ fn set_slot_full(
         8 => row.set_lot_item_category08(cat),
         _ => {}
     }
+}
+
+#[inline]
+fn slot_matches(
+    row: &eldenring::param::ITEMLOT_PARAM_ST,
+    slot: u8,
+    id: i32,
+    category: Option<i32>,
+) -> bool {
+    let (current_id, current_category) = match slot {
+        1 => (row.lot_item_id01(), row.lot_item_category01()),
+        2 => (row.lot_item_id02(), row.lot_item_category02()),
+        3 => (row.lot_item_id03(), row.lot_item_category03()),
+        4 => (row.lot_item_id04(), row.lot_item_category04()),
+        5 => (row.lot_item_id05(), row.lot_item_category05()),
+        6 => (row.lot_item_id06(), row.lot_item_category06()),
+        7 => (row.lot_item_id07(), row.lot_item_category07()),
+        8 => (row.lot_item_id08(), row.lot_item_category08()),
+        _ => return false,
+    };
+    current_id == id && category.is_none_or(|category| current_category == category)
 }
 
 /// Re-arm after a reconnect / new seed.

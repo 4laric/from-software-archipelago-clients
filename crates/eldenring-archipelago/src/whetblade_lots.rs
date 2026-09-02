@@ -62,6 +62,8 @@ pub fn run() -> bool {
         return false;
     }
     let mut n = 0usize;
+    let mut changed = 0usize;
+    let mut already_correct = 0usize;
     let mut missed: Vec<u32> = Vec::new();
     for (lot, flag) in &rewrites {
         if let Some(row) = crate::param_guard::get_mut::<eldenring::cs::ItemLotParam_map>(
@@ -69,6 +71,11 @@ pub fn run() -> bool {
             *lot,
             "whetblade-lots repoint",
         ) {
+            if row.get_item_flag_id() == *flag {
+                already_correct += 1;
+            } else {
+                changed += 1;
+            }
             row.set_get_item_flag_id(*flag);
             n += 1;
         } else {
@@ -85,8 +92,10 @@ pub fn run() -> bool {
         );
     }
     log::info!(
-        "whetblade-lots: repointed getItemFlagId on {n}/{} whetblade check lot(s)",
-        rewrites.len()
+        "whetblade-lots: repointed getItemFlagId on {n}/{} whetblade check lot(s) \
+         (changed {changed}, already-correct {already_correct}, missing rows {})",
+        rewrites.len(),
+        missed.len()
     );
     DONE.store(true, Ordering::Relaxed);
     true

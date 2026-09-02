@@ -80,6 +80,9 @@ pub fn run() -> bool {
     }
 
     let mut n = 0usize;
+    let mut changed = 0usize;
+    let mut already_correct = 0usize;
+    let mut missing_rows = 0usize;
     for (lot, slots) in roll {
         // Param naming, settled by the Windows build 2026-07-11:
         //   table type : eldenring::cs::ItemLotParam_enemy   (snake, not CamelCase)
@@ -91,9 +94,27 @@ pub fn run() -> bool {
             lot,
             "enemy-drops reroll",
         ) else {
+            missing_rows += 1;
             continue;
         };
         for (slot, gid) in slots {
+            let current = match slot {
+                1 => Some(row.lot_item_id01()),
+                2 => Some(row.lot_item_id02()),
+                3 => Some(row.lot_item_id03()),
+                4 => Some(row.lot_item_id04()),
+                5 => Some(row.lot_item_id05()),
+                6 => Some(row.lot_item_id06()),
+                7 => Some(row.lot_item_id07()),
+                8 => Some(row.lot_item_id08()),
+                _ => None,
+            };
+            let Some(current) = current else { continue };
+            if current == gid {
+                already_correct += 1;
+            } else {
+                changed += 1;
+            }
             match slot {
                 1 => row.set_lot_item_id01(gid),
                 2 => row.set_lot_item_id02(gid),
@@ -108,7 +129,11 @@ pub fn run() -> bool {
             n += 1;
         }
     }
-    log::info!("enemy-drops: rerolled {n} farmable goods slot(s) (drop rates untouched)");
+    log::info!(
+        "enemy-drops: rerolled {n} farmable goods slot(s) \
+         (changed {changed}, already-correct {already_correct}, missing rows {missing_rows}; \
+         drop rates untouched)"
+    );
     DONE.store(true, Ordering::Relaxed);
     true
 }
