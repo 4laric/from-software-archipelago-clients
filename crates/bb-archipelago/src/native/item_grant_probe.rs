@@ -9,14 +9,11 @@ const ITEM_GRANT_RVA: u64 = 0x14D_A0A0;
 const ITEM_GRANT_RETURN_RVA: u64 = ITEM_GRANT_RVA + 8;
 const ITEM_GRANT_ORIGINAL: &[u8] = &[0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56];
 const PROBE_CAVE_RVA: u64 = 0x50D_BD40;
-const PROBE_STATE_RVA: u64 = 0x50D_BE80;
 const PROBE_CAVE_CAPACITY: usize = 0x80;
 const RING_CAPACITY: usize = 8;
 const RING_ENTRY_SIZE: usize = 0x40;
-const RING_RVA: u64 = PROBE_STATE_RVA + 0x40;
-const PROBE_STATE_SIZE: usize = 0x40 + RING_CAPACITY * RING_ENTRY_SIZE;
-
-const RESERVATION_SEQUENCE: u64 = PROBE_STATE_RVA;
+const RING_OFFSET: u64 = 0x40;
+pub const PROBE_STATE_SIZE: usize = RING_OFFSET as usize + RING_CAPACITY * RING_ENTRY_SIZE;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemGrantCallSnapshot {
@@ -37,30 +34,21 @@ fn disp32(target: u64, next: u64) -> Result<[u8; 4]> {
         .to_le_bytes())
 }
 
-fn rip(out: &mut Vec<u8>, prefix: &[u8], target: u64) -> Result<()> {
-    let next = PROBE_CAVE_RVA + out.len() as u64 + prefix.len() as u64 + 4;
-    out.extend_from_slice(prefix);
-    out.extend_from_slice(&disp32(target, next)?);
-    Ok(())
-}
-
-fn cave_bytes() -> Result<Vec<u8>> {
+fn cave_bytes(state_address: u64) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.push(0x9C); // preserve flags
     out.push(0x50); // preserve rax
     out.push(0x51); // preserve rcx
     out.extend_from_slice(&[0x41, 0x50]); // preserve r8
     out.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
-    rip(
-        &mut out,
-        &[0xF0, 0x48, 0x0F, 0xC1, 0x05],
-        RESERVATION_SEQUENCE,
-    )?; // lock xadd [sequence], rax
+    out.extend_from_slice(&[0x49, 0xB8]); // mov r8, state_address
+    out.extend_from_slice(&state_address.to_le_bytes());
+    out.extend_from_slice(&[0xF0, 0x49, 0x0F, 0xC1, 0x00]); // lock xadd [r8], rax
     out.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax (published sequence)
     out.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax
     out.extend_from_slice(&[0x83, 0xE1, (RING_CAPACITY - 1) as u8]); // and ecx, mask
     out.extend_from_slice(&[0x48, 0xC1, 0xE1, 6]); // shl rcx, 6
-    rip(&mut out, &[0x4C, 0x8D, 0x05], RING_RVA)?; // lea r8, [ring]
+    out.extend_from_slice(&[0x49, 0x83, 0xC0, RING_OFFSET as u8]); // add r8, ring offset
     out.extend_from_slice(&[0x49, 0x01, 0xC8]); // add r8, rcx
     out.extend_from_slice(&[0x49, 0xC7, 0x00, 0, 0, 0, 0]); // invalidate slot
     out.extend_from_slice(&[0x49, 0x89, 0x78, 0x08]); // inventory
@@ -95,6 +83,7 @@ fn detour_bytes() -> Result<Vec<u8>> {
 pub fn install(
     memory: &impl ProcessMemory,
     base: u64,
+    state_address: u64,
     threads: &mut impl ThreadController,
 ) -> Result<()> {
     let hook = base + ITEM_GRANT_RVA;
@@ -108,15 +97,8 @@ pub fn install(
     {
         bail!("ItemGrant probe cave is occupied");
     }
-    if memory
-        .read(base + PROBE_STATE_RVA, PROBE_STATE_SIZE)?
-        .iter()
-        .any(|b| *b != 0)
-    {
-        bail!("ItemGrant probe state is occupied");
-    }
-    memory.write(base + PROBE_STATE_RVA, &[0; PROBE_STATE_SIZE])?;
-    memory.write(base + PROBE_CAVE_RVA, &cave_bytes()?)?;
+    memory.write(state_address, &[0; PROBE_STATE_SIZE])?;
+    memory.write(base + PROBE_CAVE_RVA, &cave_bytes(state_address)?)?;
 
     threads
         .suspend_all()
@@ -135,10 +117,10 @@ pub fn install(
     result.and(resumed)
 }
 
-pub fn snapshots(memory: &impl ProcessMemory, base: u64) -> Vec<ItemGrantCallSnapshot> {
+pub fn snapshots(memory: &impl ProcessMemory, state_address: u64) -> Vec<ItemGrantCallSnapshot> {
     let mut snapshots = Vec::new();
     for slot in 0..RING_CAPACITY {
-        let address = base + RING_RVA + (slot * RING_ENTRY_SIZE) as u64;
+        let address = state_address + RING_OFFSET + (slot * RING_ENTRY_SIZE) as u64;
         let first = match memory.read_u64(address) {
             Ok(sequence) if sequence != 0 => sequence,
             _ => continue,
@@ -174,7 +156,7 @@ mod tests {
 
     #[test]
     fn cave_is_bounded_and_replays_the_exact_prologue() {
-        let cave = cave_bytes().unwrap();
+        let cave = cave_bytes(0x1234_5678_9ABC_DEF0).unwrap();
         assert!(cave.len() <= PROBE_CAVE_CAPACITY);
         assert!(cave.windows(8).any(|window| window == ITEM_GRANT_ORIGINAL));
         assert_eq!(detour_bytes().unwrap().len(), 8);
