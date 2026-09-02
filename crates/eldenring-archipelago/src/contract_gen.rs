@@ -195,6 +195,13 @@ fn shape_ok(shape: Shape, v: &Value) -> bool {
                 && e.get("potency").is_some_and(is_int))
         }),
         Shape::OptionsDict => v.is_object(),
+        Shape::LockPlacements => v.as_object().is_some_and(|o| o.iter().all(|(name, p)| {
+            !name.is_empty() && p.as_object().is_some_and(|p| {
+                p.len() == 2
+                    && p.get("player").and_then(Value::as_u64).is_some_and(|n| n > 0)
+                    && p.get("location").and_then(Value::as_i64).is_some_and(|n| n > 0)
+            })
+        })),
         Shape::Any => true,
     }
 }
