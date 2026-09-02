@@ -731,6 +731,7 @@ fn add_item_detour_inner(
         }
     }
     let raw_id = unsafe { read_i32(entry, ITEMBUF_ENTRY_ID_OFF) } as u32;
+    crate::check_lots::diagnose_glovewort_leak(raw_id);
 
     // Shop native-sell (SHOP-SYSTEM-HANDOFF.md §5): a rewritten own-world slot sells the REAL reward
     // (a non-synthetic id). Suppress its bag-add while the stock flag is unset so the single copy is
