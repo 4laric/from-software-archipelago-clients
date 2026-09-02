@@ -220,7 +220,8 @@ mod windows_impl {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
     use windows::Win32::System::Memory::{
-        PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, VirtualProtectEx,
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
+        VirtualAllocEx, VirtualProtectEx,
     };
     use windows::Win32::System::ProcessStatus::{EnumProcesses, GetModuleBaseNameW};
     use windows::Win32::System::Threading::{
@@ -295,6 +296,22 @@ mod windows_impl {
 
         pub fn raw_handle(&self) -> HANDLE {
             self.handle
+        }
+
+        /// Allocate private read/write storage in the target process. The
+        /// allocation is released automatically when shadPS4 exits.
+        pub fn allocate(&self, len: usize) -> Result<u64> {
+            let address = unsafe {
+                VirtualAllocEx(
+                    self.handle,
+                    None,
+                    len,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            };
+            ensure!(!address.is_null(), "VirtualAllocEx({len}) returned null");
+            Ok(address as u64)
         }
     }
 

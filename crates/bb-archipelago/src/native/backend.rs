@@ -97,7 +97,7 @@ pub struct NativeBackend {
     /// produced, stamped onto each diagnostic record. Not a guest read -- it is
     /// the value this backend already returned to the loop this iteration.
     last_context: GrantContext,
-    item_grant_probe_armed: bool,
+    item_grant_probe_state: Option<u64>,
     gem_capture: Option<GemCapture>,
     shop_capture: Option<ShopCapture>,
     vial_capture: Option<VialCapture>,
@@ -142,7 +142,7 @@ impl NativeBackend {
         );
         self.delivery
             .arm_diagnostics(DiagnosticSink::new(Box::new(JsonlFile::new(path))));
-        if self.item_grant_probe_armed {
+        if self.item_grant_probe_state.is_some() {
             match GemCapture::beside_ledger(ledger) {
                 Ok(capture) => {
                     client_eprintln!(
@@ -376,16 +376,26 @@ impl NativeBackend {
             InstallConfig::default(),
             std::thread::sleep,
         )?;
-        let item_grant_probe_armed = match item_grant_probe::install(&memory, base, &mut threads) {
-            Ok(()) => {
-                client_eprintln!("Blood-gem ItemGrant probe armed.");
-                true
+        let item_grant_probe_state = match memory.allocate(item_grant_probe::PROBE_STATE_SIZE) {
+            Ok(state_address) => {
+                match item_grant_probe::install(&memory, base, state_address, &mut threads) {
+                    Ok(()) => {
+                        client_eprintln!("Blood-gem ItemGrant probe armed.");
+                        Some(state_address)
+                    }
+                    Err(error) => {
+                        client_eprintln!(
+                            "Blood-gem ItemGrant probe inactive (delivery remains available): {error:#}"
+                        );
+                        None
+                    }
+                }
             }
             Err(error) => {
                 client_eprintln!(
-                    "Blood-gem ItemGrant probe inactive (delivery remains available): {error:#}"
+                    "Blood-gem ItemGrant probe inactive (delivery remains available): allocating capture state: {error:#}"
                 );
-                false
+                None
             }
         };
 
@@ -420,7 +430,7 @@ impl NativeBackend {
             base,
             absent_observations: std::collections::HashMap::new(),
             last_context: GrantContext::default(),
-            item_grant_probe_armed,
+            item_grant_probe_state,
             gem_capture: None,
             shop_capture: None,
             vial_capture: None,
@@ -458,14 +468,22 @@ impl BloodborneBackend for NativeBackend {
         if let Some(capture) = &mut self.rune_capture {
             capture.observe(entries.clone());
         }
-        if let Some(capture) = &mut self.gem_capture {
-            let snapshots = self.delivery.runtime_mut().item_grant_probe_snapshots();
+        if let Some(state_address) = self.item_grant_probe_state
+            && let Some(capture) = &mut self.gem_capture
+        {
+            let snapshots = self
+                .delivery
+                .runtime_mut()
+                .item_grant_probe_snapshots(state_address);
             capture.observe(snapshots);
         }
-        if self.item_grant_probe_armed
+        if let Some(state_address) = self.item_grant_probe_state
             && let Some(capture) = &mut self.pickup_notification_capture
         {
-            let snapshots = self.delivery.runtime_mut().item_grant_probe_snapshots();
+            let snapshots = self
+                .delivery
+                .runtime_mut()
+                .item_grant_probe_snapshots(state_address);
             capture.observe_native_calls(snapshots);
         }
         if let Some(capture) = &mut self.pickup_notification_capture {
