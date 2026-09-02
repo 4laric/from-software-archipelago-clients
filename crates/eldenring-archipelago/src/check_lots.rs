@@ -71,6 +71,14 @@ const GOODS_NAME_CAT: u32 = 10;
 const GOODS_INFO_CAT: u32 = 20;
 const GOODS_CAPTION_CAT: u32 = 24;
 
+// Targeted field diagnostic for the 2026-09-02 Ghost Glovewort [2] vanilla leak. These two
+// ItemLotParam_enemy rows are reported as neutralised, yet both pickups handed out goods row 10911.
+// Read them immediately after our write and again if 10911 reaches AddItemFunc: the two snapshots
+// distinguish a setter/write failure from a later param reload restoring the vanilla row.
+const GLOVEWORT_LEAK_GOOD: u32 = 10_911;
+const GLOVEWORT_LEAK_LOTS: [(u32, u32); 2] =
+    [(402_022_011, 1_035_417_980), (402_022_001, 1_035_417_990)];
+
 static DRESSED: AtomicBool = AtomicBool::new(false);
 
 /// Give the placeholder a FACE.
@@ -305,6 +313,7 @@ pub fn run() -> bool {
                         changed += 1;
                     }
                     set_slot_full(row, sl, w.item_id, w.category);
+                    log_glovewort_row("post-neutralise", *lot, row);
                     n += 1;
                 }
             } else {
@@ -406,6 +415,57 @@ pub fn run() -> bool {
     );
     DONE.store(true, Ordering::Relaxed);
     true
+}
+
+fn log_glovewort_row(phase: &'static str, lot: u32, row: &eldenring::param::ITEMLOT_PARAM_ST) {
+    let Some((_, flag)) = GLOVEWORT_LEAK_LOTS
+        .iter()
+        .find(|(candidate, _)| *candidate == lot)
+    else {
+        return;
+    };
+    log::warn!(
+        "check-lots DIAG {phase}: ItemLotParam_enemy lot {lot}, flag {flag}, slot 1 = id {} category {}; row flag {}",
+        row.lot_item_id01(),
+        row.lot_item_category01(),
+        row.get_item_flag_id(),
+    );
+}
+
+/// Snapshot the two leaking enemy lots if their vanilla ware reaches AddItemFunc.
+///
+/// This is intentionally narrow and temporary: it emits only for Ghost Glovewort [2], the exact
+/// ware observed leaking from both rows, and gives the next playtest log the before/after evidence
+/// needed to locate the restoration boundary.
+pub fn diagnose_glovewort_leak(raw_id: u32) {
+    if raw_id & 0x0FFF_FFFF != GLOVEWORT_LEAK_GOOD {
+        return;
+    }
+    // SAFETY: AddItemFunc runs on the game thread while in-world, like the neutralisation pass.
+    let repo = match unsafe { SoloParamRepository::instance_mut() } {
+        Ok(repo) => repo,
+        Err(_) => {
+            log::warn!(
+                "check-lots DIAG pickup: Ghost Glovewort [2] ({raw_id:#x}) reached AddItemFunc, but the param repository was unavailable"
+            );
+            return;
+        }
+    };
+    log::warn!(
+        "check-lots DIAG pickup: Ghost Glovewort [2] ({raw_id:#x}) reached AddItemFunc; reading suspect enemy lots"
+    );
+    for (lot, _) in GLOVEWORT_LEAK_LOTS {
+        match crate::param_guard::get::<eldenring::cs::ItemLotParam_enemy>(
+            repo,
+            lot,
+            "check-lots glovewort pickup diagnostic",
+        ) {
+            Some(row) => log_glovewort_row("at-pickup", lot, row),
+            None => {
+                log::warn!("check-lots DIAG at-pickup: ItemLotParam_enemy lot {lot} unavailable")
+            }
+        }
+    }
 }
 
 // ItemLotParam_map and ItemLotParam_enemy are two different TABLES that share ONE row struct
