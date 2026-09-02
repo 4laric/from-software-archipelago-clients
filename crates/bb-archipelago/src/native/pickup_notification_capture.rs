@@ -94,11 +94,16 @@ impl PickupNotificationCapture {
         }));
     }
 
-    pub fn observe_native_call(&mut self, snapshot: Option<ItemGrantCallSnapshot>) {
-        let Some(snapshot) = snapshot else { return };
-        if snapshot.sequence == self.previous_native_sequence {
-            return;
+    pub fn observe_native_calls(&mut self, snapshots: Vec<ItemGrantCallSnapshot>) {
+        for snapshot in snapshots {
+            if snapshot.sequence <= self.previous_native_sequence {
+                continue;
+            }
+            self.observe_native_call(snapshot);
         }
+    }
+
+    fn observe_native_call(&mut self, snapshot: ItemGrantCallSnapshot) {
         let missed = snapshot
             .sequence
             .saturating_sub(self.previous_native_sequence)
@@ -201,8 +206,8 @@ mod tests {
             normalized_id: 7,
             caller: 8,
         };
-        capture.observe_native_call(Some(snapshot.clone()));
-        capture.observe_native_call(Some(snapshot));
+        capture.observe_native_calls(vec![snapshot.clone()]);
+        capture.observe_native_calls(vec![snapshot]);
         let grant = ItemGrant {
             raw_descriptor: 1,
             normalized_item_id: 2,

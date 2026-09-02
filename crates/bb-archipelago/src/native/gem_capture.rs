@@ -27,11 +27,16 @@ impl GemCapture {
         })
     }
 
-    pub fn observe(&mut self, snapshot: Option<ItemGrantCallSnapshot>) {
-        let Some(snapshot) = snapshot else { return };
-        if snapshot.sequence == self.previous_sequence {
-            return;
+    pub fn observe(&mut self, snapshots: Vec<ItemGrantCallSnapshot>) {
+        for snapshot in snapshots {
+            if snapshot.sequence <= self.previous_sequence {
+                continue;
+            }
+            self.observe_new(snapshot);
         }
+    }
+
+    fn observe_new(&mut self, snapshot: ItemGrantCallSnapshot) {
         let missed = snapshot
             .sequence
             .saturating_sub(self.previous_sequence)
@@ -96,8 +101,8 @@ mod tests {
             normalized_id: 6,
             caller: 7,
         };
-        capture.observe(Some(call.clone()));
-        capture.observe(Some(call));
+        capture.observe(vec![call.clone()]);
+        capture.observe(vec![call]);
         drop(capture);
         let text = std::fs::read_to_string(root.join("blood-gem-capture.jsonl")).unwrap();
         assert_eq!(text.lines().count(), 1);

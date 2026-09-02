@@ -445,12 +445,12 @@ impl BloodborneBackend for NativeBackend {
             capture.observe(entries.clone());
         }
         if let Some(capture) = &mut self.gem_capture {
-            let snapshot = self.delivery.runtime_mut().item_grant_probe_snapshot();
-            capture.observe(snapshot);
+            let snapshots = self.delivery.runtime_mut().item_grant_probe_snapshots();
+            capture.observe(snapshots);
         }
         if let Some(capture) = &mut self.pickup_notification_capture {
-            let snapshot = self.delivery.runtime_mut().item_grant_probe_snapshot();
-            capture.observe_native_call(snapshot);
+            let snapshots = self.delivery.runtime_mut().item_grant_probe_snapshots();
+            capture.observe_native_calls(snapshots);
             let snapshots = self.delivery.runtime_mut().pickup_presentation_snapshots();
             capture.observe_presentation_calls(snapshots);
         }
