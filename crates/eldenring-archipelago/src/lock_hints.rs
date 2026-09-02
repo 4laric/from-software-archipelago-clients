@@ -26,8 +26,9 @@
 //!    an array is `Appends(Vec<Value>)`. They serialise to the same wire name `"add"`, which makes
 //!    the mistake invisible in the protocol docs — it is a Rust type error waiting on the server.
 
-use ap::{CreateAsHint, DataStorageOperation};
+use ap::{CreateHintsOptions, DataStorageOperation};
 use archipelago_rs as ap;
+use er_logic::lock_hint_economy::HintPlacement;
 use oneshot::TryRecvError;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -41,11 +42,11 @@ fn ledger_key(slot: u32) -> String {
 pub struct LockHints {
     key: Option<String>,
     /// Location ids already paid for. Authoritative once `loaded`.
-    ledger: Vec<i64>,
+    ledger: Vec<HintPlacement>,
     loaded: bool,
     get_rx: Option<oneshot::Receiver<Result<HashMap<String, Value>, ap::Error>>>,
     /// Purchases the UI has requested but we have not committed yet.
-    queue: Vec<i64>,
+    queue: Vec<HintPlacement>,
     /// Re-issued the standing hints for existing ledger entries this session?
     reconciled: bool,
     /// A commit is in flight; the UI disables the button so two clicks cannot double-charge.
@@ -84,16 +85,16 @@ impl LockHints {
 
     /// Locations already paid for, so the caller can treat them as hinted even before the server's
     /// hint broadcast comes back.
-    pub fn bought(&self) -> &[i64] {
+    pub fn bought(&self) -> &[HintPlacement] {
         &self.ledger
     }
 
     /// Request a purchase. Idempotent per location; committed on the next `pump`.
-    pub fn buy(&mut self, location: i64) {
-        if self.ledger.contains(&location) || self.queue.contains(&location) {
+    pub fn buy(&mut self, placement: HintPlacement) {
+        if self.ledger.contains(&placement) || self.queue.contains(&placement) {
             return;
         }
-        self.queue.push(location);
+        self.queue.push(placement);
     }
 
     /// Drop everything on seed change / disconnect. The ledger is re-read from the server, so this
@@ -122,10 +123,28 @@ impl LockHints {
             match rx.try_recv() {
                 Ok(Ok(map)) => {
                     self.get_rx = None;
+                    let local_owner = client.this_player().slot();
                     self.ledger = map
                         .get(&key)
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| {
+                                    // Pre-#581 ledgers stored local location ids as bare integers.
+                                    // Keep them valid while new foreign entries carry their owner.
+                                    if let Some(location) = v.as_i64() {
+                                        return Some(HintPlacement {
+                                            owner: local_owner,
+                                            location,
+                                        });
+                                    }
+                                    Some(HintPlacement {
+                                        owner: u32::try_from(v.get("player")?.as_u64()?).ok()?,
+                                        location: v.get("location")?.as_i64()?,
+                                    })
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
                     self.loaded = true;
                     log::info!(
@@ -161,7 +180,12 @@ impl LockHints {
                     "lock hints: re-asserting {} standing hint(s) from the ledger",
                     self.ledger.len()
                 );
-                let _ = client.scout_locations(self.ledger.clone(), CreateAsHint::New);
+                for placement in self.ledger.iter().copied() {
+                    let _ = client.create_hints_with_options(
+                        [placement.location],
+                        CreateHintsOptions::new().slot(placement.owner),
+                    );
+                }
             }
         }
 
@@ -170,23 +194,37 @@ impl LockHints {
             self.committing = false;
             return;
         }
-        let pending: Vec<i64> = std::mem::take(&mut self.queue);
-        for loc in pending {
+        let pending: Vec<HintPlacement> = std::mem::take(&mut self.queue);
+        for placement in pending {
             self.committing = true;
             match client.change(
                 key.clone(),
                 Value::Array(Vec::new()),
-                [DataStorageOperation::Appends(vec![Value::from(loc)])],
+                [DataStorageOperation::Appends(vec![serde_json::json!({
+                    "player": placement.owner,
+                    "location": placement.location,
+                })])],
                 false,
             ) {
                 Ok(()) => {
-                    self.ledger.push(loc);
-                    let _ = client.scout_locations(vec![loc], CreateAsHint::New);
-                    log::info!("lock hints: bought a hint for location {loc}");
+                    self.ledger.push(placement);
+                    let _ = client.create_hints_with_options(
+                        [placement.location],
+                        CreateHintsOptions::new().slot(placement.owner),
+                    );
+                    log::info!(
+                        "lock hints: bought a hint for player {} location {}",
+                        placement.owner,
+                        placement.location
+                    );
                 }
                 Err(e) => {
                     // Not charged, so not hinted. Re-queue nothing: the player can click again.
-                    log::warn!("lock hints: purchase of {loc} failed ({e}); nothing was charged");
+                    log::warn!(
+                        "lock hints: purchase of player {} location {} failed ({e}); nothing was charged",
+                        placement.owner,
+                        placement.location
+                    );
                 }
             }
         }
@@ -208,14 +246,26 @@ mod tests {
     #[test]
     fn buying_is_idempotent_per_location() {
         let mut lh = LockHints::new();
-        lh.buy(42);
-        lh.buy(42);
-        assert_eq!(lh.queue, vec![42], "a double click must not double-charge");
-        lh.ledger.push(7);
-        lh.buy(7);
+        let first = HintPlacement {
+            owner: 1,
+            location: 42,
+        };
+        lh.buy(first);
+        lh.buy(first);
         assert_eq!(
             lh.queue,
-            vec![42],
+            vec![first],
+            "a double click must not double-charge"
+        );
+        let bought = HintPlacement {
+            owner: 2,
+            location: 7,
+        };
+        lh.ledger.push(bought);
+        lh.buy(bought);
+        assert_eq!(
+            lh.queue,
+            vec![first],
             "an already-bought location is never re-queued"
         );
     }
@@ -237,7 +287,10 @@ mod tests {
     fn reset_forgets_the_previous_seed() {
         let mut lh = LockHints::new();
         lh.loaded = true;
-        lh.ledger.push(99);
+        lh.ledger.push(HintPlacement {
+            owner: 1,
+            location: 99,
+        });
         lh.reset();
         assert!(!lh.is_ready());
         assert_eq!(lh.purchases(), 0);

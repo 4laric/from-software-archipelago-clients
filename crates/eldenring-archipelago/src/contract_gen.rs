@@ -12,6 +12,7 @@ pub enum Shape {
     IntList,
     IntOrBool,
     ListvalIntMap,
+    LockPlacements,
     NestedGrants,
     Number,
     OptionsDict,
@@ -36,6 +37,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "armorBundles", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "locationFlags", shape: Shape::ScalarIntMap, required: true, greenfield: true },
     ContractKey { name: "regionOpenFlags", shape: Shape::ScalarIntMap, required: true, greenfield: true },
+    ContractKey { name: "lockHintPlacements", shape: Shape::LockPlacements, required: false, greenfield: true },
     ContractKey { name: "locationRegions", shape: Shape::ListvalIntMap, required: false, greenfield: true },
     ContractKey { name: "regionCoarseKeys", shape: Shape::StrMap, required: false, greenfield: true },
     ContractKey { name: "options", shape: Shape::OptionsDict, required: true, greenfield: true },
@@ -193,6 +195,13 @@ fn shape_ok(shape: Shape, v: &Value) -> bool {
                 && e.get("potency").is_some_and(is_int))
         }),
         Shape::OptionsDict => v.is_object(),
+        Shape::LockPlacements => v.as_object().is_some_and(|o| o.iter().all(|(name, p)| {
+            !name.is_empty() && p.as_object().is_some_and(|p| {
+                p.len() == 2
+                    && p.get("player").and_then(Value::as_u64).is_some_and(|n| n > 0)
+                    && p.get("location").and_then(Value::as_i64).is_some_and(|n| n > 0)
+            })
+        })),
         Shape::Any => true,
     }
 }
@@ -232,7 +241,7 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "8397a952";
+pub const CONTRACT_HASH: &str = "ffc0f1b5";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.5.6";
 
 #[cfg(test)]
