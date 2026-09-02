@@ -336,6 +336,45 @@ impl StandaloneApp {
                     .text(RichText::new(format!("Checks {label}")).size(11.0)),
             );
         }
+        if !snapshot.unchecked_locations.is_empty() {
+            let groups = client_ui::group_unchecked_locations(&snapshot.unchecked_locations);
+            egui::CollapsingHeader::new(format!(
+                "Unchecked locations ({})",
+                snapshot.unchecked_locations.len()
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "All unchecked locations. Known reachability is not supplied by this seed.",
+                    )
+                    .color(color(view::palette::MUTED))
+                    .size(11.0),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("unchecked-locations")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for group in groups {
+                            egui::CollapsingHeader::new(format!(
+                                "{} ({})",
+                                group.region,
+                                group.locations.len()
+                            ))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for location in group.locations {
+                                    ui.label(
+                                        RichText::new(location)
+                                            .color(color(view::palette::TEXT))
+                                            .size(11.0),
+                                    );
+                                }
+                            });
+                        }
+                    });
+            });
+        }
         let items =
             ui.label(RichText::new(items_line(&snapshot.ledger)).color(color(view::palette::TEXT)));
         if snapshot.ledger.storage_routed.is_none() {

@@ -807,6 +807,54 @@ mod replay {
         );
     }
 
+    /// clients#575: the AP cursor can advance beyond an accepted-but-unobservable unique grant.
+    /// A reconnect may then expose no historical ReceivedItems entry at all. Recovered durable
+    /// debt must restore the desired good independently, and may retire only after possession is
+    /// positively observed.
+    #[test]
+    fn durable_unique_debt_survives_cursor_advance_and_retires_on_observation() {
+        let mut g = MockGame::stable();
+        g.refuse_unique_adds = true;
+        let mut first = Reconciler::new(rune_inputs());
+        let mut debt = Vec::new();
+        for _ in 0..MAX_GRANT_ATTEMPTS + 2 {
+            debt.extend(first.tick(&mut g, TickBudget::default()).newly_stalled);
+        }
+        assert_eq!(debt, vec![195]);
+
+        // Reconnect after the save cursor advanced: the historical packet is absent, so only the
+        // sidecar debt can make the rune desired in this new reconciler instance.
+        let empty = DesiredInputs {
+            seed: SEED.into(),
+            save: SaveIdentity("slot0".into()),
+            received: vec![],
+            slot_data: SlotData::default(),
+        };
+        let mut resumed = Reconciler::from_persisted(empty.clone(), 99);
+        resumed.restore_unique_debt(debt, []);
+        let mut reconnect_inputs = empty.clone();
+        reconnect_inputs.slot_data.reveal_all_maps = true; // force a same-seed desired rebuild
+        resumed.set_inputs(reconnect_inputs);
+        g.refuse_unique_adds = false;
+        let grant = resumed.tick(&mut g, TickBudget::default());
+        assert!(
+            grant
+                .applied
+                .iter()
+                .any(|action| matches!(action, Action::GrantUnique(195, _))),
+            "the cursor-independent debt must issue one safe retry"
+        );
+        let observed = resumed.tick(&mut g, TickBudget::default());
+        assert_eq!(observed.observed_unique_goods, vec![195]);
+
+        // Persistence removes the debt on that witness. A later reconnect with the same advanced
+        // cursor and no restored debt has no desired grant and therefore emits nothing.
+        let mut after_retirement = Reconciler::from_persisted(empty, 99);
+        g.drop_good(195);
+        let out = after_retirement.tick(&mut g, TickBudget::default());
+        assert!(out.applied.is_empty());
+    }
+
     /// The stall is per-load, not permanent: a load screen restores the full allowance, because the
     /// reason for a refusal (full bag, an accessor pointed at the multiplay key list) can stop being
     /// true across a world edge. Worst case is MAX_GRANT_ATTEMPTS popups per load, never a flood.

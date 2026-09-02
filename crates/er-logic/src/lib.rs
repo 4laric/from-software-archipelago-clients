@@ -56,6 +56,7 @@ pub mod grace_flush_replay;
 pub mod grants;
 pub mod great_runes;
 pub mod hint_explain;
+pub mod hint_toasts;
 pub mod hook;
 pub mod icon_seam;
 pub mod id_sample;

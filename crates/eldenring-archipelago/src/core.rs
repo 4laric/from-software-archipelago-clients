@@ -220,6 +220,11 @@ pub struct Core {
     /// this watermark and hints in the popped span are missed. DataStorage `_read_hints` is the
     /// robust follow-up (spec option (b)).
     hint_log_watermark: usize,
+    /// Connection-scoped dedupe/burst state for newly streamed hint notices. The tracker owns the
+    /// complete standing set; this feed owns presentation only.
+    hint_toast_feed: er_logic::hint_toasts::HintToastFeed,
+    /// Runtime overlay preference. Defaults on and deliberately is not a seed/YAML option.
+    hint_toasts_enabled: bool,
     /// AP location id -> FINE region display name. PER SEED, from slot_data `locationRegions`
     /// (er_logic::tracker_tables). Empty until connect, and empty means "not sent", never
     /// "no regions" -- the parse logs which.
@@ -801,6 +806,8 @@ impl shared::Core for Core {
             scaling_here_bucket: None,
             hints: HintSet::new(),
             hint_log_watermark: 0,
+            hint_toast_feed: er_logic::hint_toasts::HintToastFeed::new(),
+            hint_toasts_enabled: true,
             // EMPTY until slot_data arrives. There is no baked table any more: it described the
             // DEFAULT seed's regions and was wrong for every num_regions seed. Filled by the
             // slot_data parse, which logs armed-or-why-not.
@@ -906,6 +913,17 @@ impl shared::Core for Core {
         }
         if ui.menu_item("Tracker (F6)") {
             self.tracker_visible = !self.tracker_visible;
+        }
+        let hint_toast_label = format!(
+            "Hint toasts: {}",
+            if self.hint_toasts_enabled {
+                "ON"
+            } else {
+                "off"
+            }
+        );
+        if ui.menu_item(hint_toast_label) {
+            self.hint_toasts_enabled = !self.hint_toasts_enabled;
         }
         if self.version_warn.is_some() {
             let label = if self.version_warn_acknowledged {
@@ -5118,6 +5136,7 @@ impl Core {
         self.sent_goal = false;
         self.hints = HintSet::new();
         self.hint_log_watermark = 0;
+        self.hint_toast_feed = er_logic::hint_toasts::HintToastFeed::new();
         // Session counter + any undrained notice. The hand-ins themselves are EVENT FLAGS in the
         // player's save and are deliberately NOT undone -- a bell handed in stays handed in, the
         // same as one the player carried to the Maidens.
@@ -5179,6 +5198,7 @@ impl Core {
         // Two-phase (collect, then insert): the log iterator immutably borrows self, so the
         // HintSet inserts have to wait until the scan ends.
         let mut new_hints: Vec<HintEntry> = Vec::new();
+        let mut toast_hints: Vec<er_logic::hint_toasts::HintNotice> = Vec::new();
         let mut explain_serpent_hunter = false;
         for (print, _) in self.base().logs().skip(start) {
             if let ap::Print::Chat {
@@ -5198,6 +5218,18 @@ impl Core {
             };
             let location_id = item.location().id() as u64;
             let for_us = item.sender().name() == our_name;
+            toast_hints.push(er_logic::hint_toasts::HintNotice {
+                identity: er_logic::hint_toasts::HintIdentity {
+                    item_id: item.item().id(),
+                    location_id: item.location().id(),
+                    finding_slot: item.sender().slot() as i32,
+                    receiving_slot: item.receiver().slot() as i32,
+                },
+                item_name: item.item().name().to_string(),
+                location_name: item.location().name().to_string(),
+                finding_player: item.sender().name().to_string(),
+                receiving_player: item.receiver().name().to_string(),
+            });
             if !for_us && !self.region_table.contains_key(&location_id) {
                 continue; // another world's location -- not ours to mark
             }
@@ -5217,6 +5249,17 @@ impl Core {
         self.hint_log_watermark = log_len;
         for entry in new_hints {
             self.hints.insert(entry);
+        }
+        let local_slot = self
+            .client()
+            .map(|client| client.this_player().slot() as i32)
+            .unwrap_or_default();
+        let toast_lines = self.hint_toast_feed.ingest(local_slot, toast_hints);
+        if self.hint_toasts_enabled {
+            let now = self.toast_clock.elapsed().as_millis() as u64;
+            for line in toast_lines {
+                self.toasts.push(line, now);
+            }
         }
         if explain_serpent_hunter && let Some(client) = self.client_mut() {
             let _ = client.say(er_logic::hint_explain::SERPENT_HUNTER_REPLY.to_string());

@@ -1485,6 +1485,7 @@ mod tests {
                 ap_location_id: 1000,
                 event_flag: TEST_PEBBLE_EVENT_FLAG,
                 vanilla_award_suppressed: false,
+                region: None,
             }],
             items: HashMap::from([(2000, goods())]),
             auto_upgrade: false,
@@ -2542,6 +2543,7 @@ mod tests {
             ap_location_id: 2000,
             event_flag: 200,
             vanilla_award_suppressed: false,
+            region: None,
         });
         let mut client = loop_with(
             MockBackend::default(),

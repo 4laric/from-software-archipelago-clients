@@ -820,6 +820,15 @@ pub struct TickOutcome {
     /// the stall set. Emitted exactly ONCE per good per arming window so the client can `warn!` the
     /// forensics once instead of every frame. Empty on almost every tick.
     pub newly_stalled: Vec<GoodsId>,
+    /// Subset of `newly_stalled` whose live action was a protector grant. Persistors need this
+    /// distinction because a reconnect may no longer carry the historical ReceivedItems entry
+    /// from which the item class was originally derived.
+    pub newly_stalled_protectors: Vec<GoodsId>,
+    /// Desired unique goods observed held on this tick. A durable reconnect debt may retire only
+    /// after this positive witness, never merely because a native grant call was accepted.
+    pub observed_unique_goods: Vec<GoodsId>,
+    /// Protector counterpart of `observed_unique_goods`.
+    pub observed_unique_protectors: Vec<GoodsId>,
     /// Flags that reached [`MAX_FLAG_ATTEMPTS`] on THIS tick and have just been parked. Same
     /// once-per-arming-window contract as `newly_stalled`.
     pub newly_stalled_flags: Vec<FlagId>,
@@ -839,6 +848,11 @@ pub struct Reconciler {
     session_seed: String,
     /// Persisted-per-save contiguous frontier for the consumable ledger.
     applied_watermark: ItemIndex,
+    /// Cursor-independent unique delivery debt restored from the character sidecar. It must
+    /// survive same-process `set_inputs` swaps because reconnect can shorten the visible receive
+    /// history after the save cursor has advanced.
+    durable_unique_goods: BTreeSet<GoodsId>,
+    durable_unique_protectors: BTreeSet<GoodsId>,
     /// [`WorldStability::now_ms`] of the most recent tick that LANDED a good/ledger grant, or `None`
     /// if none has landed yet. Drives the [`TickBudget::min_grant_interval_ms`] pacing gate. NOT
     /// persisted (a fresh session re-paces from its first grant); the ledger watermark — not this —
@@ -933,6 +947,8 @@ impl Reconciler {
             desired,
             session_seed,
             applied_watermark: floor,
+            durable_unique_goods: BTreeSet::new(),
+            durable_unique_protectors: BTreeSet::new(),
             last_grant_ms: None,
             grant_attempts: BTreeMap::new(),
             stalled_goods: BTreeSet::new(),
@@ -952,6 +968,8 @@ impl Reconciler {
             desired,
             session_seed,
             applied_watermark,
+            durable_unique_goods: BTreeSet::new(),
+            durable_unique_protectors: BTreeSet::new(),
             last_grant_ms: None,
             grant_attempts: BTreeMap::new(),
             stalled_goods: BTreeSet::new(),
@@ -1072,11 +1090,22 @@ impl Reconciler {
         if inputs == self.inputs {
             return;
         }
-        let desired = DesiredState::build(&inputs);
+        let mut desired = DesiredState::build(&inputs);
         if crate::seed_change::is_seed_change(Some(&self.session_seed), &inputs.seed) {
             // Brand-new seed: reset to the NEW desired's band floor (not a blind 0) so the new seed's
             // own start items are re-owed rather than stranded behind a stale frontier.
             self.applied_watermark = desired.ledger_floor();
+            self.durable_unique_goods.clear();
+            self.durable_unique_protectors.clear();
+        } else {
+            for &good in &self.durable_unique_goods {
+                desired.unique_goods.entry(good).or_insert(UniqueGood {
+                    companion_flags: Vec::new(),
+                });
+            }
+            desired
+                .unique_protectors
+                .extend(self.durable_unique_protectors.iter().copied());
         }
         self.session_seed = inputs.seed.clone();
         self.desired = desired;
@@ -1137,6 +1166,28 @@ impl Reconciler {
     /// never read back in-tick). Reported by the client as `inert because ...`, like goods.
     pub fn stalled_flags(&self) -> &BTreeSet<FlagId> {
         &self.stalled_flags
+    }
+
+    /// Re-introduce unique delivery debt recovered independently of the AP receive cursor.
+    ///
+    /// A reconnect can rebuild a shorter ReceivedItems view once the save cursor has advanced.
+    /// These entries keep accepted-but-unobservable grants desired until possession is actually
+    /// witnessed. Calling this repeatedly is idempotent.
+    pub fn restore_unique_debt(
+        &mut self,
+        goods: impl IntoIterator<Item = GoodsId>,
+        protectors: impl IntoIterator<Item = GoodsId>,
+    ) {
+        for good in goods {
+            self.durable_unique_goods.insert(good);
+            self.desired.unique_goods.entry(good).or_insert(UniqueGood {
+                companion_flags: Vec::new(),
+            });
+        }
+        for protector in protectors {
+            self.durable_unique_protectors.insert(protector);
+            self.desired.unique_protectors.insert(protector);
+        }
     }
 
     /// Drop every parked good and every attempt count, restoring a full retry allowance.
@@ -1224,6 +1275,9 @@ impl Reconciler {
                 skipped_unstable: true,
                 converged: false,
                 newly_stalled: Vec::new(),
+                newly_stalled_protectors: Vec::new(),
+                observed_unique_goods: Vec::new(),
+                observed_unique_protectors: Vec::new(),
                 newly_stalled_flags: Vec::new(),
             };
         }
@@ -1243,16 +1297,20 @@ impl Reconciler {
         };
 
         let observed = self.snapshot(io, settled);
+        let observed_unique_goods = observed.unique_goods.iter().copied().collect();
+        let observed_unique_protectors = observed.unique_protectors.iter().copied().collect();
         // A good we can SEE is a good that landed: forget any attempts against it and un-park it.
         // This is what keeps the save-scum self-heal intact — the healing re-grant lands, is
         // observed, and its counter is gone long before it could reach the cap.
         for g in &observed.unique_goods {
             self.grant_attempts.remove(g);
             self.stalled_goods.remove(g);
+            self.durable_unique_goods.remove(g);
         }
         for p in &observed.unique_protectors {
             self.grant_attempts.remove(p);
             self.stalled_goods.remove(p);
+            self.durable_unique_protectors.remove(p);
         }
         // A flag observed at its DESIRED value has landed: forget attempts and un-park it, so a
         // late-landing write (or a world edge that fixed whatever discarded it) restores service.
@@ -1282,6 +1340,9 @@ impl Reconciler {
                 // Honest: a pre-settle tick has only done the flags half, so it has NOT converged.
                 converged: settled,
                 newly_stalled: Vec::new(),
+                newly_stalled_protectors: Vec::new(),
+                observed_unique_goods,
+                observed_unique_protectors,
                 newly_stalled_flags: Vec::new(),
             };
         }
@@ -1304,6 +1365,7 @@ impl Reconciler {
         let mut deferred = false;
         let mut granted_this_tick = false;
         let mut newly_stalled: Vec<GoodsId> = Vec::new();
+        let mut newly_stalled_protectors: Vec<GoodsId> = Vec::new();
         let mut newly_stalled_flags: Vec<FlagId> = Vec::new();
 
         // Pass 1: flags + unique goods (independent budgets; order = the diff's deterministic order).
@@ -1420,6 +1482,7 @@ impl Reconciler {
                             if *n >= MAX_GRANT_ATTEMPTS {
                                 self.stalled_goods.insert(*p);
                                 newly_stalled.push(*p);
+                                newly_stalled_protectors.push(*p);
                             }
                         }
                     } else {
@@ -1481,6 +1544,9 @@ impl Reconciler {
             skipped_unstable: false,
             converged,
             newly_stalled,
+            newly_stalled_protectors,
+            observed_unique_goods,
+            observed_unique_protectors,
             newly_stalled_flags,
         }
     }
