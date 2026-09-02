@@ -97,6 +97,7 @@ pub struct NativeBackend {
     /// produced, stamped onto each diagnostic record. Not a guest read -- it is
     /// the value this backend already returned to the loop this iteration.
     last_context: GrantContext,
+    item_grant_probe_armed: bool,
     gem_capture: Option<GemCapture>,
     shop_capture: Option<ShopCapture>,
     vial_capture: Option<VialCapture>,
@@ -141,14 +142,20 @@ impl NativeBackend {
         );
         self.delivery
             .arm_diagnostics(DiagnosticSink::new(Box::new(JsonlFile::new(path))));
-        match GemCapture::beside_ledger(ledger) {
-            Ok(capture) => {
-                client_eprintln!(
-                    "Blood-gem diagnostics: read-only ItemGrant call records stream beside the ledger to blood-gem-capture.jsonl."
-                );
-                self.gem_capture = Some(capture);
+        if self.item_grant_probe_armed {
+            match GemCapture::beside_ledger(ledger) {
+                Ok(capture) => {
+                    client_eprintln!(
+                        "Blood-gem diagnostics: read-only ItemGrant call records stream beside the ledger to blood-gem-capture.jsonl."
+                    );
+                    self.gem_capture = Some(capture);
+                }
+                Err(error) => client_eprintln!("Blood-gem diagnostics unavailable: {error}"),
             }
-            Err(error) => client_eprintln!("Blood-gem diagnostics unavailable: {error}"),
+        } else {
+            client_eprintln!(
+                "Blood-gem diagnostics inactive because the ItemGrant probe did not arm."
+            );
         }
         match VialCapture::beside_ledger(ledger) {
             Ok(capture) => {
@@ -369,12 +376,18 @@ impl NativeBackend {
             InstallConfig::default(),
             std::thread::sleep,
         )?;
-        match item_grant_probe::install(&memory, base, &mut threads) {
-            Ok(()) => client_eprintln!("Blood-gem ItemGrant probe armed."),
-            Err(error) => client_eprintln!(
-                "Blood-gem ItemGrant probe inactive (delivery remains available): {error:#}"
-            ),
-        }
+        let item_grant_probe_armed = match item_grant_probe::install(&memory, base, &mut threads) {
+            Ok(()) => {
+                client_eprintln!("Blood-gem ItemGrant probe armed.");
+                true
+            }
+            Err(error) => {
+                client_eprintln!(
+                    "Blood-gem ItemGrant probe inactive (delivery remains available): {error:#}"
+                );
+                false
+            }
+        };
 
         // clients#418: hand over the base this attach already confirmed rather
         // than letting the event-flag attach re-read the log and re-run the race.
@@ -407,6 +420,7 @@ impl NativeBackend {
             base,
             absent_observations: std::collections::HashMap::new(),
             last_context: GrantContext::default(),
+            item_grant_probe_armed,
             gem_capture: None,
             shop_capture: None,
             vial_capture: None,
@@ -448,9 +462,13 @@ impl BloodborneBackend for NativeBackend {
             let snapshots = self.delivery.runtime_mut().item_grant_probe_snapshots();
             capture.observe(snapshots);
         }
-        if let Some(capture) = &mut self.pickup_notification_capture {
+        if self.item_grant_probe_armed
+            && let Some(capture) = &mut self.pickup_notification_capture
+        {
             let snapshots = self.delivery.runtime_mut().item_grant_probe_snapshots();
             capture.observe_native_calls(snapshots);
+        }
+        if let Some(capture) = &mut self.pickup_notification_capture {
             let snapshots = self.delivery.runtime_mut().pickup_presentation_snapshots();
             capture.observe_presentation_calls(snapshots);
         }
