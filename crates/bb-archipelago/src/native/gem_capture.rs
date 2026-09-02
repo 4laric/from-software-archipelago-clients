@@ -10,11 +10,15 @@ use super::item_grant_probe::ItemGrantCallSnapshot;
 pub struct GemCapture {
     file: File,
     previous_sequence: u64,
+    image_base: u64,
     warned: bool,
 }
 
+const AP_GRANT_CAVE_START_RVA: u64 = 0x50D_B800;
+const AP_GRANT_CAVE_END_RVA: u64 = 0x50D_C000;
+
 impl GemCapture {
-    pub fn beside_ledger(ledger: &Path) -> std::io::Result<Self> {
+    pub fn beside_ledger(ledger: &Path, image_base: u64) -> std::io::Result<Self> {
         let path = ledger
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -23,6 +27,7 @@ impl GemCapture {
         Ok(Self {
             file,
             previous_sequence: 0,
+            image_base,
             warned: false,
         })
     }
@@ -37,6 +42,11 @@ impl GemCapture {
     }
 
     fn observe_new(&mut self, snapshot: ItemGrantCallSnapshot) {
+        let caller_rva = snapshot.caller.checked_sub(self.image_base);
+        let origin = match caller_rva {
+            Some(AP_GRANT_CAVE_START_RVA..AP_GRANT_CAVE_END_RVA) => "ap_delivery",
+            _ => "game",
+        };
         let missed = snapshot
             .sequence
             .saturating_sub(self.previous_sequence)
@@ -54,6 +64,9 @@ impl GemCapture {
             "internal_pointer": format!("0x{:X}", snapshot.internal_pointer),
             "normalized_id": format!("0x{:08X}", snapshot.normalized_id),
             "caller": format!("0x{:X}", snapshot.caller),
+            "caller_rva": caller_rva.map(|rva| format!("0x{rva:X}")),
+            "origin": origin,
+            "natural_pickup_candidate": origin == "game",
         }));
     }
 
@@ -90,7 +103,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let ledger = root.join("ledger.json");
-        let mut capture = GemCapture::beside_ledger(&ledger).unwrap();
+        let mut capture = GemCapture::beside_ledger(&ledger, 0).unwrap();
         let call = ItemGrantCallSnapshot {
             sequence: 2,
             inventory: 1,
@@ -99,7 +112,7 @@ mod tests {
             raw_id: 4,
             internal_pointer: 5,
             normalized_id: 6,
-            caller: 7,
+            caller: 0x50D_BB44,
         };
         capture.observe(vec![call.clone()]);
         capture.observe(vec![call]);
@@ -109,6 +122,11 @@ mod tests {
         assert!(text.contains("\"event\":\"item_grant_call\""), "{text}");
         assert!(
             text.contains("\"missed_calls_since_previous_sample\":1"),
+            "{text}"
+        );
+        assert!(text.contains("\"origin\":\"ap_delivery\""), "{text}");
+        assert!(
+            text.contains("\"natural_pickup_candidate\":false"),
             "{text}"
         );
         std::fs::remove_dir_all(root).unwrap();

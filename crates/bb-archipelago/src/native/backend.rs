@@ -143,7 +143,7 @@ impl NativeBackend {
         self.delivery
             .arm_diagnostics(DiagnosticSink::new(Box::new(JsonlFile::new(path))));
         if self.item_grant_probe_state.is_some() {
-            match GemCapture::beside_ledger(ledger) {
+            match GemCapture::beside_ledger(ledger, self.base) {
                 Ok(capture) => {
                     client_eprintln!(
                         "Blood-gem diagnostics: read-only ItemGrant call records stream beside the ledger to blood-gem-capture.jsonl."
