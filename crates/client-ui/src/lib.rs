@@ -4,7 +4,7 @@
 //! the worker. In particular, rendering code never receives a game-process handle. This keeps a
 //! stalled or crashed renderer outside the delivery acknowledgement path.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -110,6 +110,46 @@ pub struct LocationTotals {
     pub total: u32,
 }
 
+/// One unchecked location as advertised by the connected world. `region` is optional because
+/// older seed contracts do not provide grouping metadata; renderers must keep those rows visible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UncheckedLocation {
+    pub name: String,
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocationGroup {
+    pub region: String,
+    pub locations: Vec<String>,
+}
+
+/// Deterministically group unchecked locations without inferring world logic from their names.
+/// Missing and blank region metadata is deliberately retained under `Other`.
+pub fn group_unchecked_locations(locations: &[UncheckedLocation]) -> Vec<LocationGroup> {
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+    for location in locations {
+        let region = location
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|region| !region.is_empty())
+            .unwrap_or("Other");
+        groups
+            .entry(region.to_owned())
+            .or_default()
+            .push(location.name.clone());
+    }
+    groups
+        .into_iter()
+        .map(|(region, mut locations)| {
+            locations.sort();
+            LocationGroup { region, locations }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VictorySummary {
     pub goal: String,
@@ -149,6 +189,8 @@ pub struct ClientSnapshot {
     #[serde(default)]
     pub victory: Option<VictorySummary>,
     pub locations: Option<LocationTotals>,
+    #[serde(default)]
+    pub unchecked_locations: Vec<UncheckedLocation>,
     pub ledger: LedgerTotals,
     #[serde(default)]
     pub blocked: Vec<BlockedEntry>,
@@ -178,6 +220,7 @@ pub struct DeliveryFacts {
     pub go_mode: Option<bool>,
     pub victory: Option<VictorySummary>,
     pub locations: Option<LocationTotals>,
+    pub unchecked_locations: Vec<UncheckedLocation>,
     pub ledger: LedgerTotals,
     pub blocked: Vec<BlockedEntry>,
     pub save_identity: Option<String>,
@@ -228,6 +271,7 @@ impl SnapshotReducer {
         self.snapshot.go_mode = facts.go_mode;
         self.snapshot.victory = facts.victory;
         self.snapshot.locations = facts.locations;
+        self.snapshot.unchecked_locations = facts.unchecked_locations;
         self.snapshot.ledger = facts.ledger;
         self.snapshot.blocked = facts.blocked;
         self.snapshot.save_identity = facts.save_identity;
@@ -826,5 +870,57 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(recovered.delivery_detail, None);
+    }
+
+    #[test]
+    fn unchecked_locations_group_deterministically_and_keep_unknown_rows() {
+        let groups = group_unchecked_locations(&[
+            UncheckedLocation {
+                name: "Old Yharnam second".into(),
+                region: Some("Old Yharnam".into()),
+            },
+            UncheckedLocation {
+                name: "unknown".into(),
+                region: None,
+            },
+            UncheckedLocation {
+                name: "Old Yharnam first".into(),
+                region: Some("Old Yharnam".into()),
+            },
+            UncheckedLocation {
+                name: "blank metadata".into(),
+                region: Some("  ".into()),
+            },
+        ]);
+
+        assert_eq!(
+            groups,
+            vec![
+                LocationGroup {
+                    region: "Old Yharnam".into(),
+                    locations: vec!["Old Yharnam first".into(), "Old Yharnam second".into()],
+                },
+                LocationGroup {
+                    region: "Other".into(),
+                    locations: vec!["blank metadata".into(), "unknown".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reducer_replaces_the_unchecked_location_snapshot_on_reconnect() {
+        let mut reducer = SnapshotReducer::default();
+        let before = reducer.reduce(DeliveryFacts {
+            unchecked_locations: vec![UncheckedLocation {
+                name: "Cleric Beast".into(),
+                region: Some("Central Yharnam".into()),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(before.unchecked_locations.len(), 1);
+
+        let after = reducer.reduce(DeliveryFacts::default());
+        assert!(after.unchecked_locations.is_empty());
     }
 }

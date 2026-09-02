@@ -995,6 +995,7 @@ fn run() -> Result<()> {
     let mut goal_location = None;
     let mut goal_name = None;
     let mut location_ids = HashSet::new();
+    let mut location_regions = HashMap::new();
     let mut checked_location_count = 0_u32;
     let mut goal_reported = false;
     let run_started = Instant::now();
@@ -1374,6 +1375,16 @@ fn run() -> Result<()> {
                 .locations
                 .iter()
                 .map(|location| location.ap_location_id)
+                .collect();
+            location_regions = seed_config
+                .locations
+                .iter()
+                .filter_map(|location| {
+                    location
+                        .region
+                        .as_ref()
+                        .map(|region| (location.ap_location_id, region.clone()))
+                })
                 .collect();
             #[cfg(windows)]
             {
@@ -1777,6 +1788,16 @@ fn run() -> Result<()> {
             };
             let attached = runtime.is_some();
             let game = connection.client().map(|client| client.this_game());
+            let unchecked_locations = connection.client().map_or_else(Vec::new, |client| {
+                client
+                    .unchecked_locations()
+                    .filter(|location| location_ids.contains(&location.id()))
+                    .map(|location| client_ui::UncheckedLocation {
+                        name: location.name().to_string(),
+                        region: location_regions.get(&location.id()).cloned(),
+                    })
+                    .collect()
+            });
             let (seed, ledger, blocked, save_identity, gameplay_ready, receive_cursor) =
                 runtime.as_mut().map_or_else(
                     || {
@@ -1876,6 +1897,7 @@ fn run() -> Result<()> {
                         checked: checked_location_count,
                         total: location_ids.len() as u32,
                     }),
+                    unchecked_locations,
                     ledger,
                     blocked,
                     save_identity,
