@@ -31,6 +31,10 @@ const BLUE: ImColor32 = ImColor32::from_rgb(0x82, 0xA9, 0xD4);
 const MAGENTA: ImColor32 = ImColor32::from_rgb(0xBF, 0x9B, 0xBC);
 const CYAN: ImColor32 = ImColor32::from_rgb(0x34, 0xE2, 0xE2);
 
+fn rgba(rgb: [f32; 3], alpha: f32) -> [f32; 4] {
+    [rgb[0], rgb[1], rgb[2], alpha]
+}
+
 /// The visual overlay that appears on top of the game.
 pub struct Overlay<G: Game> {
     /// The last-known size of the viewport. This is only set once hudhook has
@@ -308,6 +312,46 @@ impl<G: Game> Overlay<G> {
     }
 
     pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
+        // Push at frame scope so the shared windows and game-owned windows (ER tracker and toasts)
+        // consume one palette. Games without a theme push nothing and retain imgui's defaults.
+        let theme = G::OVERLAY_THEME;
+        let _theme_text = theme.map(|t| ui.push_style_color(StyleColor::Text, rgba(t.text, 1.0)));
+        let _theme_muted =
+            theme.map(|t| ui.push_style_color(StyleColor::TextDisabled, rgba(t.muted_text, 1.0)));
+        let _theme_window =
+            theme.map(|t| ui.push_style_color(StyleColor::WindowBg, rgba(t.background, 0.92)));
+        let _theme_popup =
+            theme.map(|t| ui.push_style_color(StyleColor::PopupBg, rgba(t.title_background, 0.97)));
+        let _theme_title =
+            theme.map(|t| ui.push_style_color(StyleColor::TitleBg, rgba(t.title_background, 0.97)));
+        let _theme_title_active = theme
+            .map(|t| ui.push_style_color(StyleColor::TitleBgActive, rgba(t.title_background, 1.0)));
+        let _theme_menu = theme
+            .map(|t| ui.push_style_color(StyleColor::MenuBarBg, rgba(t.title_background, 0.97)));
+        let _theme_border =
+            theme.map(|t| ui.push_style_color(StyleColor::Border, rgba(t.border, 1.0)));
+        let _theme_frame =
+            theme.map(|t| ui.push_style_color(StyleColor::FrameBg, rgba(t.title_background, 0.97)));
+        let _theme_frame_hovered =
+            theme.map(|t| ui.push_style_color(StyleColor::FrameBgHovered, rgba(t.selection, 1.0)));
+        let _theme_header =
+            theme.map(|t| ui.push_style_color(StyleColor::Header, rgba(t.selection, 0.85)));
+        let _theme_header_hovered =
+            theme.map(|t| ui.push_style_color(StyleColor::HeaderHovered, rgba(t.accent, 0.55)));
+        let _theme_header_active =
+            theme.map(|t| ui.push_style_color(StyleColor::HeaderActive, rgba(t.accent, 0.72)));
+        let _theme_button =
+            theme.map(|t| ui.push_style_color(StyleColor::Button, rgba(t.selection, 0.9)));
+        let _theme_button_hovered =
+            theme.map(|t| ui.push_style_color(StyleColor::ButtonHovered, rgba(t.accent, 0.6)));
+        let _theme_button_active =
+            theme.map(|t| ui.push_style_color(StyleColor::ButtonActive, rgba(t.accent, 0.78)));
+        let _theme_check =
+            theme.map(|t| ui.push_style_color(StyleColor::CheckMark, rgba(t.accent, 1.0)));
+        let _theme_slider =
+            theme.map(|t| ui.push_style_color(StyleColor::SliderGrab, rgba(t.accent, 0.8)));
+        let _theme_slider_active =
+            theme.map(|t| ui.push_style_color(StyleColor::SliderGrabActive, rgba(t.accent, 1.0)));
         prof!(core.base_mut().profiler(), "AP overlay", {
             // 🛑 UNCONDITIONAL, and FIRST. Every keyboard surface re-asserts below if it still wants
             // the keys, so a surface that stops being drawn stops blocking on the very next frame.
@@ -416,7 +460,8 @@ impl<G: Game> Overlay<G> {
         } else {
             self.unfocused_window_opacity
         };
-        let mut bg_color = [0.0, 0.0, 0.0, window_opacity];
+        let background = G::OVERLAY_THEME.map_or([0.0, 0.0, 0.0], |theme| theme.background);
+        let mut bg_color = rgba(background, window_opacity);
         let _bg = ui.push_style_color(StyleColor::WindowBg, bg_color);
         let _menu_bg = ui.push_style_color(StyleColor::MenuBarBg, bg_color);
         bg_color[3] = 1.0; // Popup backgrounds should always be fully opaque.
@@ -689,7 +734,10 @@ impl<G: Game> Overlay<G> {
             return;
         }
 
-        let settings_bg_color = [0.0, 0.0, 0.0, 1.0];
+        let settings_bg_color = rgba(
+            G::OVERLAY_THEME.map_or([0.0, 0.0, 0.0], |theme| theme.background),
+            1.0,
+        );
         let _bg = ui.push_style_color(StyleColor::WindowBg, settings_bg_color);
 
         ui.window("Archipelago Overlay Settings")
@@ -749,7 +797,10 @@ impl<G: Game> Overlay<G> {
         let style = ui.clone_style();
 
         let scrollbar_bg_opacity = if self.is_focused() { 1.0 } else { 0.0 };
-        let scrollbar_bg_color = [0.0, 0.0, 0.0, scrollbar_bg_opacity];
+        let scrollbar_bg_color = rgba(
+            G::OVERLAY_THEME.map_or([0.0, 0.0, 0.0], |theme| theme.background),
+            scrollbar_bg_opacity,
+        );
         let _scrollbar_bg = ui.push_style_color(StyleColor::ScrollbarBg, scrollbar_bg_color);
 
         let _item_spacing = ui.push_style_var(StyleVar::ItemSpacing([

@@ -2,6 +2,21 @@ use anyhow::Result;
 
 use crate::{Core, InputBlocker};
 
+/// Semantic colours for a game's in-process overlay.
+///
+/// The shared renderer owns the widget mapping; games only choose a palette. Keeping this free of
+/// `imgui` types makes the contract small and prevents game crates from styling individual widgets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayTheme {
+    pub background: [f32; 3],
+    pub title_background: [f32; 3],
+    pub border: [f32; 3],
+    pub text: [f32; 3],
+    pub muted_text: [f32; 3],
+    pub accent: [f32; 3],
+    pub selection: [f32; 3],
+}
+
 /// A trait that encapsulates specific behavior for each individual game that's
 /// used by the shared library. We try to keep this minimal, with most game
 /// interactions being left in the individual game mod crates.
@@ -27,6 +42,9 @@ pub trait Game: Send + Sync + 'static {
     /// because the version-bump commit and the fix commit both said 0.2.17). Version-conflict
     /// checks keep using CLIENT_VERSION; this const is identity, not compatibility.
     const CLIENT_BUILD: &str = Self::CLIENT_VERSION;
+    /// Optional semantic palette. `None` deliberately leaves imgui's defaults untouched, so games
+    /// which have not opted in cannot change appearance when another game adds a theme.
+    const OVERLAY_THEME: Option<OverlayTheme> = None;
     /// Echo own checks back (items_handling own_world bit); ER overrides to true.
     const OWN_WORLD: bool = false;
 

@@ -47,6 +47,43 @@ impl shared::Game for EldenRing {
     /// version alone cannot: the lockstep-bump commit and the guard-fix commit both report the
     /// same CLIENT_VERSION).
     const CLIENT_BUILD: &str = CLIENT_BUILD_TITLE;
+    const OVERLAY_THEME: Option<shared::OverlayTheme> = Some(shared::OverlayTheme {
+        background: [
+            0x14 as f32 / 255.0,
+            0x11 as f32 / 255.0,
+            0x0c as f32 / 255.0,
+        ],
+        title_background: [
+            0x1e as f32 / 255.0,
+            0x18 as f32 / 255.0,
+            0x12 as f32 / 255.0,
+        ],
+        border: [
+            0x4a as f32 / 255.0,
+            0x3c as f32 / 255.0,
+            0x24 as f32 / 255.0,
+        ],
+        text: [
+            0xe7 as f32 / 255.0,
+            0xdc as f32 / 255.0,
+            0xc3 as f32 / 255.0,
+        ],
+        muted_text: [
+            0x97 as f32 / 255.0,
+            0x90 as f32 / 255.0,
+            0x6f as f32 / 255.0,
+        ],
+        accent: [
+            0xc8 as f32 / 255.0,
+            0xa9 as f32 / 255.0,
+            0x6e as f32 / 255.0,
+        ],
+        selection: [
+            0x4a as f32 / 255.0,
+            0x3c as f32 / 255.0,
+            0x24 as f32 / 255.0,
+        ],
+    });
     /// ER uses the ECHO model: the server sends our own checks back as received items, so self-found
     /// items run the same name-based logic (progressive / region-open / notify) as remote items.
     /// (DS3/Sekiro keep the default `false` inventory-scan-convert model.) Requires the shared change.
