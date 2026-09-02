@@ -66,7 +66,7 @@
 //!
 //! Everything below is straight-line glue; the decisions all live in the pure crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -703,6 +703,13 @@ struct StoreFile {
     entries: BTreeMap<String, StoredLedger>,
     #[serde(default)]
     legacy: BTreeMap<String, i64>,
+    /// Accepted-but-unobservable unique grants are owed independently of the AP receive cursor.
+    /// Split by inventory class because reconnect may no longer expose the historical packet that
+    /// originally supplied that classification.
+    #[serde(default)]
+    unique_goods_debt: BTreeMap<String, Vec<i32>>,
+    #[serde(default)]
+    unique_protector_debt: BTreeMap<String, Vec<i32>>,
 }
 
 /// Per-CHARACTER ledger-watermark persistence (was keyed by AP slot name only, which let a new ER
@@ -727,6 +734,8 @@ impl WatermarkStore {
                         .map(|legacy| StoreFile {
                             entries: BTreeMap::new(),
                             legacy,
+                            unique_goods_debt: BTreeMap::new(),
+                            unique_protector_debt: BTreeMap::new(),
                         })
                 })
             })
@@ -768,6 +777,55 @@ impl WatermarkStore {
         // Best-effort write-through; a failure just means we re-grant-check next boot (idempotent).
         if let Ok(t) = serde_json::to_string(&self.file) {
             let _ = std::fs::write(&self.path, t);
+        }
+    }
+
+    fn unique_debt(&self, slot: &str, save_slot: i32) -> (BTreeSet<i32>, BTreeSet<i32>) {
+        let key = Self::key(slot, save_slot);
+        (
+            self.file
+                .unique_goods_debt
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
+            self.file
+                .unique_protector_debt
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
+        )
+    }
+
+    fn set_unique_debt(
+        &mut self,
+        slot: &str,
+        save_slot: i32,
+        goods: &BTreeSet<i32>,
+        protectors: &BTreeSet<i32>,
+    ) {
+        let key = Self::key(slot, save_slot);
+        if goods.is_empty() {
+            self.file.unique_goods_debt.remove(&key);
+        } else {
+            self.file
+                .unique_goods_debt
+                .insert(key.clone(), goods.iter().copied().collect());
+        }
+        if protectors.is_empty() {
+            self.file.unique_protector_debt.remove(&key);
+        } else {
+            self.file
+                .unique_protector_debt
+                .insert(key, protectors.iter().copied().collect());
+        }
+        // Write the debt in the same tick that first parks it. A crash/reconnect after the native
+        // calls but before another frame must not recreate the exact retirement hole this guards.
+        if let Ok(text) = serde_json::to_string(&self.file) {
+            let _ = std::fs::write(&self.path, text);
         }
     }
 }
@@ -993,6 +1051,8 @@ struct Driver {
     /// watermark key. `save_slot < 0` means it was unreadable at init (never persisted under it).
     slot: String,
     save_slot: i32,
+    unique_goods_debt: BTreeSet<i32>,
+    unique_protector_debt: BTreeSet<i32>,
     /// The marker identity for this session = `hash(room seed, AP slot name)`. Written into the save's
     /// marker band alongside the watermark on every tick commit; the reconnect guard compares it.
     identity: u32,
@@ -1273,7 +1333,7 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
 
     // `fresh_character` governs the reconcile.json play_time re-stamp (reset for a new character,
     // monotonic for a resume). On the marker Resume path the marker is authoritative, so it's false.
-    let (reconciler, fresh_character) = match decision {
+    let (mut reconciler, fresh_character) = match decision {
         marker::InitDecision::Refuse { stored, expected } => {
             // clients#337: name the room the save belongs to, so the refusal is a routing
             // instruction instead of a wall. Pure decision in er_logic::marker; the only I/O is
@@ -1320,6 +1380,18 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
             )
         }
     };
+    let (mut unique_goods_debt, mut unique_protector_debt) = save_slot
+        .map(|ss| store.unique_debt(&slot, ss))
+        .unwrap_or_default();
+    if fresh_character {
+        // A reused save slot must not inherit delivery debt from the deleted character.
+        unique_goods_debt.clear();
+        unique_protector_debt.clear();
+    }
+    reconciler.restore_unique_debt(
+        unique_goods_debt.iter().copied(),
+        unique_protector_debt.iter().copied(),
+    );
     FRESH_CHARACTER_VERDICT.store(if fresh_character { 2 } else { 1 }, Ordering::Relaxed);
     // [reattach] ONE-BLOCK STATE DUMP (2026-08-01). Every reattach incident so far has cost three
     // rounds of theory because the log carried the inputs to the decision but not the decision's
@@ -1357,6 +1429,8 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         store,
         slot,
         save_slot: save_slot.unwrap_or(-1),
+        unique_goods_debt,
+        unique_protector_debt,
         identity,
     };
     let _ = DRIVER.set(Mutex::new(driver));
@@ -1442,6 +1516,24 @@ pub fn tick() {
     let d = &mut *d;
     let out = d.reconciler.tick_with_classes(&mut d.io, budget, classes);
 
+    // A native "accepted" return is not completion evidence. Once a unique grant reaches the
+    // bounded stall guard, retain its debt outside the AP receive cursor; retire it only after the
+    // live inventory positively observes the requested class.
+    let protector_stalls: BTreeSet<_> = out.newly_stalled_protectors.iter().copied().collect();
+    for &good in &out.newly_stalled {
+        if protector_stalls.contains(&good) {
+            d.unique_protector_debt.insert(good);
+        } else {
+            d.unique_goods_debt.insert(good);
+        }
+    }
+    for good in &out.observed_unique_goods {
+        d.unique_goods_debt.remove(good);
+    }
+    for protector in &out.observed_unique_protectors {
+        d.unique_protector_debt.remove(protector);
+    }
+
     // MINIBAKE: commit the (seed, slot) identity + watermark INTO the save's marker band. Idempotent
     // (a no-op when the active cursor already equals the watermark), so this every-tick call is cheap;
     // it writes the marker on a fresh save's first stable tick and keeps the cursor current after. The
@@ -1468,6 +1560,16 @@ pub fn tick() {
                 play_time_ms: stamp_playtime(stored, live, false),
             },
         );
+    }
+    // Debt identity needs the save slot, but unlike the play-time stamp it does not need another
+    // live read. Persist it even if play_time is momentarily unavailable on the stall frame.
+    if d.save_slot >= 0 {
+        let slot = d.slot.clone();
+        let save_slot = d.save_slot;
+        let goods_debt = d.unique_goods_debt.clone();
+        let protector_debt = d.unique_protector_debt.clone();
+        d.store
+            .set_unique_debt(&slot, save_slot, &goods_debt, &protector_debt);
     }
 
     // GRANT STALL — the ONE place a permanently-refused unique good gets announced. Fires once per
