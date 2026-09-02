@@ -215,6 +215,9 @@ pub struct Core {
     /// Standing hint set (SPEC-item-tracker.md option (a)): fed from streamed `Print::Hint`
     /// entries in the overlay log; dedups by location id (connect-replay re-inserts are no-ops).
     hints: HintSet,
+    /// Foreign-world hints for items received by us, keyed by the full AP placement coordinate.
+    /// Kept separate from the location tree because location ids collide across games/slots.
+    foreign_hints: HashSet<er_logic::lock_hint_economy::HintPlacement>,
     /// How many overlay-log entries have already been scanned for hints. v0.1 LIMITATION: the
     /// log is a bounded ring (1000 entries) -- once it fills and rotates, indices shift under
     /// this watermark and hints in the popped span are missed. DataStorage `_read_hints` is the
@@ -236,6 +239,10 @@ pub struct Core {
     progression_surface: HashSet<u64>,
     /// Coarse region name -> its lock item name, `"<coarse> Lock"` (absent = never locked).
     coarse_lock_items: HashMap<String, String>,
+    /// Lock item name -> post-fill placement coordinates. Optional for backwards compatibility;
+    /// this is what makes a Lock placed in another player's world hintable without normal AP
+    /// hint-point spending (#581).
+    lock_hint_placements: HashMap<String, er_logic::lock_hint_economy::HintPlacement>,
     /// Throttled `(balance, price)` for the ALWAYS-VISIBLE menu bar (issue #412). `None` while
     /// the ledger is unread or the price is underivable -- rendering nothing beats rendering a
     /// zero the player would read as "this costs nothing".
@@ -805,6 +812,7 @@ impl shared::Core for Core {
             tracker_visible: false,
             scaling_here_bucket: None,
             hints: HintSet::new(),
+            foreign_hints: HashSet::new(),
             hint_log_watermark: 0,
             hint_toast_feed: er_logic::hint_toasts::HintToastFeed::new(),
             hint_toasts_enabled: true,
@@ -815,6 +823,7 @@ impl shared::Core for Core {
             coarse_table: HashMap::new(),
             progression_surface: HashSet::new(),
             coarse_lock_items: HashMap::new(),
+            lock_hint_placements: HashMap::new(),
             lock_hint_hud: None,
             lock_hint_hud_at: 0,
             lock_hint_affordable_prev: None,
@@ -2078,7 +2087,11 @@ impl shared::Core for Core {
                 let reveal_sweep_boss_names =
                     er_logic::options::parse_bool_option(sd, "reveal_sweep_boss_names");
 
-                (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, reveal_sweep_boss_names, feature_warn, required_features, version_warn)
+                let lock_hint_placements = er_logic::lock_hint_economy::parse_placements(
+                    sd.get("lockHintPlacements"),
+                );
+
+                (map, counts, armor_bundles, region, fogwall, prog_cfg, name, sweeps, start, scout, gate_warn, loc_flags, goal_cfg, boss_defs, region_attunement, progression_surface, tracker_tables, reveal_sweep_boss_names, lock_hint_placements, feature_warn, required_features, version_warn)
             });
             if let Some((
                 map,
@@ -2099,6 +2112,7 @@ impl shared::Core for Core {
                 progression_surface,
                 tracker_tables,
                 reveal_sweep_boss_names,
+                lock_hint_placements,
                 feature_warn,
                 required_features,
                 version_warn,
@@ -2194,6 +2208,7 @@ impl shared::Core for Core {
                 self.region_table = tracker_tables.region;
                 self.coarse_table = tracker_tables.coarse;
                 self.coarse_lock_items = tracker_tables.lock_items;
+                self.lock_hint_placements = lock_hint_placements;
                 self.slot_data_parsed = true;
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
                 // (without an ER reload) is detected above and rebuilds the per-seed state.
@@ -5135,6 +5150,7 @@ impl Core {
         self.goal = None;
         self.sent_goal = false;
         self.hints = HintSet::new();
+        self.foreign_hints = HashSet::new();
         self.hint_log_watermark = 0;
         self.hint_toast_feed = er_logic::hint_toasts::HintToastFeed::new();
         // Session counter + any undrained notice. The hand-ins themselves are EVENT FLAGS in the
@@ -5149,6 +5165,7 @@ impl Core {
         self.region_table = HashMap::new();
         self.coarse_table = HashMap::new();
         self.coarse_lock_items = HashMap::new();
+        self.lock_hint_placements = HashMap::new();
         // The hint ledger is keyed per SLOT, not per seed, so a new seed must not inherit the old
         // seed's purchases -- and its location ids would be meaningless here anyway. Re-read from
         // the server on the next pump.
@@ -5198,6 +5215,7 @@ impl Core {
         // Two-phase (collect, then insert): the log iterator immutably borrows self, so the
         // HintSet inserts have to wait until the scan ends.
         let mut new_hints: Vec<HintEntry> = Vec::new();
+        let mut new_foreign_hints = Vec::new();
         let mut toast_hints: Vec<er_logic::hint_toasts::HintNotice> = Vec::new();
         let mut explain_serpent_hunter = false;
         for (print, _) in self.base().logs().skip(start) {
@@ -5218,6 +5236,12 @@ impl Core {
             };
             let location_id = item.location().id() as u64;
             let for_us = item.sender().name() == our_name;
+            if item.receiver().name() == our_name && !for_us {
+                new_foreign_hints.push(er_logic::lock_hint_economy::HintPlacement {
+                    owner: item.sender().slot(),
+                    location: item.location().id(),
+                });
+            }
             toast_hints.push(er_logic::hint_toasts::HintNotice {
                 identity: er_logic::hint_toasts::HintIdentity {
                     item_id: item.item().id(),
@@ -5250,6 +5274,7 @@ impl Core {
         for entry in new_hints {
             self.hints.insert(entry);
         }
+        self.foreign_hints.extend(new_foreign_hints);
         let local_slot = self
             .client()
             .map(|client| client.this_player().slot() as i32)
@@ -5651,11 +5676,24 @@ impl Core {
         );
         let surface_total_n = self.progression_surface.len() as u64;
         let lock_scout = crate::scout_proof::item_names_by_location();
+        let our_slot = self
+            .client()
+            .map(|client| client.this_player().slot())
+            .unwrap_or_default();
         let mut hinted_locs: HashSet<i64> =
             self.hints.iter().map(|h| h.location_id as i64).collect();
         // Treat a paid-for location as hinted immediately, so the button cannot be clicked twice
         // in the window between the purchase and the server's hint broadcast coming back.
-        hinted_locs.extend(self.lock_hints.bought().iter().copied());
+        hinted_locs.extend(
+            self.lock_hints
+                .bought()
+                .iter()
+                .filter(|placement| placement.owner == our_slot)
+                .map(|placement| placement.location),
+        );
+        let mut hinted_placements = self.foreign_hints.clone();
+        hinted_placements.extend(self.lock_hints.bought().iter().copied());
+        let lock_hint_placements = self.lock_hint_placements.clone();
         let ledger_ready = self.lock_hints.is_ready();
         let purchases_n = self.lock_hints.purchases();
         // The withheld goal lock leaves the frontier BEFORE the picker sees it: it is granted by
@@ -5672,7 +5710,7 @@ impl Core {
         // HashMap<u64, RegionId>. tracker.rs:117 states every location in a tracker region shares
         // one coarse region, so any of the region's location ids resolves it.
         let coarse_of: HashMap<u64, String> = self.coarse_table.clone();
-        let mut buy_clicks: Vec<i64> = Vec::new();
+        let mut buy_clicks: Vec<er_logic::lock_hint_economy::HintPlacement> = Vec::new();
         // "Hint next lock" (#412). The FRONTIER is the one lock whose region is still shut but
         // whose ITEM already sits somewhere open -- the answer to "which lock can I go get now",
         // which is the question a player asking "what is my 2nd lock" is really asking. Resolved
@@ -5896,7 +5934,10 @@ impl Core {
                         Next::Buyable { price, location, .. } => {
                             ui.same_line();
                             if ui.small_button(format!("Hint next lock ({price})###trk-buy-next")) {
-                                buy_clicks.push(*location);
+                                buy_clicks.push(er_logic::lock_hint_economy::HintPlacement {
+                                    owner: our_slot,
+                                    location: *location,
+                                });
                             }
                             if ui.is_item_hovered() {
                                 // 🛑 The region is deliberately NOT named here. Telling the player
@@ -6042,10 +6083,21 @@ impl Core {
                             .and_then(|u| coarse_of.get(&u.location_id))
                             .and_then(|c| lock_item_of.get(c))
                             .map(|s| s.as_str());
-                        Some(er_logic::lock_hint_economy::offer(
+                        let placement = lock_item
+                            .and_then(|item| lock_hint_placements.get(item))
+                            .copied();
+                        let placement_hinted = placement.map(|placement| {
+                            if hinted_placements.contains(&placement) {
+                                HashSet::from([placement.location])
+                            } else {
+                                HashSet::new()
+                            }
+                        });
+                        Some(er_logic::lock_hint_economy::offer_at_placement(
                             lock_item,
                             &lock_scout,
-                            &hinted_locs,
+                            placement.map(|placement| placement.location),
+                            placement_hinted.as_ref().unwrap_or(&hinted_locs),
                             surface_total_n,
                             surface_checked_n,
                             purchases_n,
@@ -6100,7 +6152,20 @@ impl Core {
                                     "hint lock ({price})###trk-buy-{}",
                                     region.region
                                 )) {
-                                    buy_clicks.push(location);
+                                    let lock_item = region
+                                        .unchecked
+                                        .first()
+                                        .and_then(|u| coarse_of.get(&u.location_id))
+                                        .and_then(|coarse| lock_item_of.get(coarse));
+                                    buy_clicks.push(
+                                        lock_item
+                                            .and_then(|item| lock_hint_placements.get(item))
+                                            .copied()
+                                            .unwrap_or(er_logic::lock_hint_economy::HintPlacement {
+                                                owner: our_slot,
+                                                location,
+                                            }),
+                                    );
                                 }
                             }
                             Offer::Insufficient { price, have, .. } => {
@@ -6244,8 +6309,8 @@ impl Core {
                 }
             });
         // Commit outside the closure -- inside it, `self` is not borrowable.
-        for loc in buy_clicks {
-            self.lock_hints.buy(loc);
+        for placement in buy_clicks {
+            self.lock_hints.buy(placement);
         }
         if !open {
             self.tracker_visible = false;

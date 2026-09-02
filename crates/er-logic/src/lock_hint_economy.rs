@@ -60,6 +60,31 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde_json::Value;
+
+/// Concrete coordinates for a Lock item's placement. AP location ids are namespaced by the
+/// location owner's slot, so both fields are required for foreign-world hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HintPlacement {
+    pub owner: u32,
+    pub location: i64,
+}
+
+/// Parse the optional post-fill placement disclosure. Malformed rows are skipped individually so
+/// an older or partly upgraded world degrades to the existing `Spilled -- use !hint` path.
+pub fn parse_placements(value: Option<&Value>) -> HashMap<String, HintPlacement> {
+    value
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|rows| rows.iter())
+        .filter_map(|(name, row)| {
+            let owner = u32::try_from(row.get("player")?.as_u64()?).ok()?;
+            let location = row.get("location")?.as_i64()?;
+            (owner > 0 && location > 0).then(|| (name.clone(), HintPlacement { owner, location }))
+        })
+        .collect()
+}
+
 /// Where a region's Lock item turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockHint {
@@ -204,7 +229,38 @@ pub fn offer(
     points_per_hint: u64,
     total_locations: u64,
 ) -> LockHintOffer {
-    let location = match resolve_lock_location(lock_item, scout) {
+    offer_at_placement(
+        lock_item,
+        scout,
+        None,
+        hinted,
+        surface_total,
+        surface_checked,
+        purchases,
+        points_per_hint,
+        total_locations,
+    )
+}
+
+/// [`offer`] with an authoritative post-fill placement location. This is deliberately a location
+/// only: ownership is transport metadata consumed by the socket ledger, while pricing and reveal
+/// decisions remain identical for local and foreign Locks.
+#[allow(clippy::too_many_arguments)]
+pub fn offer_at_placement(
+    lock_item: Option<&str>,
+    scout: &HashMap<i64, String>,
+    placement: Option<i64>,
+    hinted: &HashSet<i64>,
+    surface_total: u64,
+    surface_checked: u64,
+    purchases: u64,
+    points_per_hint: u64,
+    total_locations: u64,
+) -> LockHintOffer {
+    let location = match placement
+        .map(LockHint::Found)
+        .unwrap_or_else(|| resolve_lock_location(lock_item, scout))
+    {
         LockHint::Found(loc) => loc,
         LockHint::InAnotherWorld => return LockHintOffer::Spilled,
         LockHint::Unknown => return LockHintOffer::Unknown,
@@ -495,6 +551,49 @@ pub fn crossed_into_affordable(prev: Option<bool>, now: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn placement_parser_keeps_owner_and_location_and_skips_bad_rows() {
+        let parsed = parse_placements(Some(&json!({
+            "Stormveil Lock": {"player": 3, "location": 123456},
+            "bad owner": {"player": 0, "location": 8},
+            "bad location": {"player": 2, "location": "eight"}
+        })));
+        assert_eq!(
+            parsed,
+            HashMap::from([(
+                "Stormveil Lock".to_string(),
+                HintPlacement {
+                    owner: 3,
+                    location: 123456
+                }
+            )])
+        );
+        assert!(parse_placements(None).is_empty());
+    }
+
+    #[test]
+    fn authoritative_foreign_location_gets_the_same_offer_as_a_local_one() {
+        let offer = offer_at_placement(
+            Some("Stormveil Lock"),
+            &HashMap::from([(11, "Other item".to_string())]),
+            Some(77),
+            &HashSet::new(),
+            100,
+            20,
+            0,
+            10,
+            100,
+        );
+        assert_eq!(
+            offer,
+            LockHintOffer::Buyable {
+                price: 10,
+                location: 77
+            }
+        );
+    }
 
     // The measured all-region seed: 4879 locations, 158-location progression surface, AP default
     // hint_cost 10% -> points_per_hint 487.
