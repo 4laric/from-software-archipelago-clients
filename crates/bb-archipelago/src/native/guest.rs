@@ -206,8 +206,8 @@ impl<P: ProcessMemory> GuestRuntime<P> {
         Some(entries)
     }
 
-    pub fn item_grant_probe_snapshot(&self) -> Option<ItemGrantCallSnapshot> {
-        item_grant_probe::snapshot(&self.memory, self.base)
+    pub fn item_grant_probe_snapshots(&self) -> Vec<ItemGrantCallSnapshot> {
+        item_grant_probe::snapshots(&self.memory, self.base)
     }
 
     pub fn pickup_presentation_snapshots(&self) -> Vec<PickupPresentationSnapshot> {
