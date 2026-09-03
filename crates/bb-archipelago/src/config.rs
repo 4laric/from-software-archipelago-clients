@@ -111,6 +111,25 @@ pub struct RuntimeItemBinding {
 }
 
 impl RuntimeItemBinding {
+    /// A category-1 row whose protector id is outside this build's reviewed
+    /// attire catalog cannot be delivered by this client, but it must not
+    /// take the whole seed down with it: a world newer than the client can
+    /// publish attire this build has not audited. Downgrade its evidence to
+    /// an unknown label so the receive loop parks that item by name and
+    /// everything else still delivers. Returns the protector id when it did.
+    fn park_unreviewed_attire(&mut self) -> Option<u32> {
+        if self.item_category != 1 || !self.descriptor_evidence.is_known() {
+            return None;
+        }
+        let protector_id = self.normalized_item_id & 0x0FFF_FFFF;
+        if crate::attire::receive_policy(protector_id).is_some() {
+            return None;
+        }
+        self.descriptor_evidence =
+            DescriptorEvidence::Unknown(format!("unreviewed_attire_{protector_id}"));
+        Some(protector_id)
+    }
+
     fn validate(&self, ap_item_id: i64) -> Result<()> {
         anyhow::ensure!(
             (1..=99).contains(&self.quantity),
@@ -198,21 +217,25 @@ impl RuntimeItemBinding {
                             == (self.raw_descriptor & 0x0FFF_FFFF),
                     "AP item {ap_item_id} has an incompatible category-1 armor descriptor pair"
                 );
-                let protector_id = self.normalized_item_id & 0x0FFF_FFFF;
-                let expected_policy = crate::attire::receive_policy(protector_id)
-                    .with_context(|| format!(
-                        "AP item {ap_item_id} category-1 protector {protector_id} is not in the reviewed attire allowlist"
-                    ))?;
                 anyhow::ensure!(
                     self.quantity == 1 && self.reinforcement_level.is_none(),
                     "AP item {ap_item_id} category-1 armor must have quantity one and no reinforcement level"
                 );
-                anyhow::ensure!(
-                    self.feed_effect == expected_policy,
-                    "AP item {ap_item_id} category-1 armor has receive policy {:?}, expected {:?}",
-                    self.feed_effect,
-                    expected_policy
-                );
+                let protector_id = self.normalized_item_id & 0x0FFF_FFFF;
+                match crate::attire::receive_policy(protector_id) {
+                    Some(expected_policy) => anyhow::ensure!(
+                        self.feed_effect == expected_policy,
+                        "AP item {ap_item_id} category-1 armor has receive policy {:?}, expected {:?}",
+                        self.feed_effect,
+                        expected_policy
+                    ),
+                    // Only a row already downgraded by `park_unreviewed_attire`
+                    // may carry an unreviewed protector id.
+                    None => anyhow::ensure!(
+                        !self.descriptor_evidence.is_known(),
+                        "AP item {ap_item_id} category-1 protector {protector_id} is not in the reviewed attire allowlist"
+                    ),
+                }
             }
             255 => {
                 anyhow::ensure!(
@@ -381,7 +404,7 @@ pub struct Category8AwardBinding {
 impl RuntimeConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = read_setting("runtime config", path)?;
-        let config: Self = json::from_slice(&bytes)
+        let mut config: Self = json::from_slice(&bytes)
             .with_context(|| format!("parsing runtime config {}", path.display()))?;
         config.validate_items()?;
         Ok(config)
@@ -452,12 +475,24 @@ impl RuntimeConfig {
             let rows: HashMap<String, RuntimeItemBinding> =
                 json::from_value(value.clone()).context("parsing slot_data.runtime_items")?;
             let mut items = HashMap::with_capacity(rows.len());
-            for (raw_id, row) in rows {
+            let mut unreviewed_attire = Vec::new();
+            for (raw_id, mut row) in rows {
                 let ap_item_id = raw_id
                     .parse()
                     .with_context(|| format!("invalid AP item id {raw_id:?}"))?;
+                if let Some(protector_id) = row.park_unreviewed_attire() {
+                    unreviewed_attire.push(protector_id);
+                }
                 row.validate(ap_item_id)?;
                 items.insert(ap_item_id, row);
+            }
+            if !unreviewed_attire.is_empty() {
+                unreviewed_attire.sort_unstable();
+                crate::client_eprintln!(
+                    "{} attire item(s) in this seed are outside this client's reviewed catalog and will be PARKED if received (update the client to deliver them): protector ids {:?}",
+                    unreviewed_attire.len(),
+                    unreviewed_attire
+                );
             }
             self.items = items;
         }
@@ -584,8 +619,9 @@ impl RuntimeConfig {
         })
     }
 
-    fn validate_items(&self) -> Result<()> {
-        for (&ap_item_id, binding) in &self.items {
+    fn validate_items(&mut self) -> Result<()> {
+        for (&ap_item_id, binding) in &mut self.items {
+            binding.park_unreviewed_attire();
             binding.validate(ap_item_id)?;
         }
         Ok(())
@@ -1109,8 +1145,11 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_category_one_rows_fail_closed() {
-        let error = local()
+    fn unreviewed_category_one_rows_are_parked_not_fatal() {
+        // Protector 90000 is outside the reviewed catalog. A world newer than
+        // this client may publish it; the contract still loads and the row
+        // carries an unknown evidence label so delivery parks it by name.
+        let config = local()
             .apply_slot_data(&json!({
                 "runtime_items": {
                     "12255600": {
@@ -1120,10 +1159,40 @@ mod tests {
                         "descriptor_evidence": "param_id_inferred",
                         "quantity": 1,
                         "feed_effect": "attire_head"
+                    },
+                    "12255601": {
+                        "raw_descriptor": 0x9000_2710_u32,
+                        "normalized_item_id": 0x1000_2710_u32,
+                        "item_category": 1,
+                        "descriptor_evidence": "param_id_inferred",
+                        "quantity": 1,
+                        "feed_effect": "attire_head"
                     }
                 }
             }))
-            .unwrap_err();
+            .unwrap();
+        let parked = &config.items[&12255600];
+        assert!(!parked.descriptor_evidence.is_known());
+        assert_eq!(
+            parked.descriptor_evidence.as_str(),
+            "unreviewed_attire_90000"
+        );
+        // A reviewed row (protector 10000, head) is untouched.
+        assert!(config.items[&12255601].descriptor_evidence.is_known());
+    }
+
+    #[test]
+    fn a_reviewed_evidence_label_on_an_unreviewed_protector_is_still_refused_by_validate() {
+        let row = RuntimeItemBinding {
+            raw_descriptor: 0x9001_5F90,
+            normalized_item_id: 0x1001_5F90,
+            item_category: 1,
+            descriptor_evidence: DescriptorEvidence::ParamIdInferred,
+            quantity: 1,
+            reinforcement_level: None,
+            feed_effect: FeedEffectBinding::AttireHead,
+        };
+        let error = row.validate(1).unwrap_err();
         assert!(format!("{error:#}").contains("not in the reviewed attire allowlist"));
     }
 
