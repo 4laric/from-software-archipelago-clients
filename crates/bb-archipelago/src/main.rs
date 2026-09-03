@@ -1098,7 +1098,7 @@ fn run() -> Result<()> {
             let command = words.first().map(|word| word.to_ascii_lowercase());
             let result = match command.as_deref() {
                 None | Some("") => continue,
-                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM | give INDEX CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list) | rebind CONFIRM (release the bound character while nothing is delivered). Unknown/unmapped writes and warps fail closed.".to_owned(),
+                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM | give INDEX CONFIRM | census CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list) | rebind CONFIRM (release the bound character while nothing is delivered). Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
                     Some(runtime) => runtime
                         .rescue_status()
@@ -1192,6 +1192,24 @@ fn run() -> Result<()> {
                     }
                     (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
                     _ => "Usage: give ITEM_INDEX CONFIRM (contract items only)".to_owned(),
+                },
+                Some("census") => match (runtime.as_mut(), words.get(1)) {
+                    (Some(runtime), Some(confirm)) if confirm.eq_ignore_ascii_case("CONFIRM") => {
+                        let resolve_item = |ap_item_id: i64| {
+                            connection.client().map_or_else(
+                                || bb_archipelago::names::item_label(None, ap_item_id),
+                                |client| item_label(client.this_game(), ap_item_id),
+                            )
+                        };
+                        runtime.rescue_equipment_census(resolve_item).map_or_else(
+                            |error| format!("Equipment census refused: {error:#}"),
+                            |(queued, skipped)| format!(
+                                "AUDIT equipment census: queued {queued} weapon/attire grants through the serial delivery lane; skipped {skipped} already recorded."
+                            ),
+                        )
+                    }
+                    (None, _) => "Runtime contract not loaded yet.".to_owned(),
+                    _ => "Usage: census CONFIRM (queues every contract weapon and attire; throwaway save only)".to_owned(),
                 },
                 Some("rescue") => match (runtime.as_mut(), words.get(1), words.get(2)) {
                     (Some(runtime), Some(name), Some(confirm))
