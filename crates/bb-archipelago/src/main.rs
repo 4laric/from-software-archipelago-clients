@@ -1693,7 +1693,14 @@ fn run() -> Result<()> {
                                 || format!("\u{2713} {fallback}"),
                                 |scouts| scouts.sent_line(location_id, &fallback),
                             );
-                            ui_reducer.activity(client_ui::ActivityKind::LocationCheck, line);
+                            let class = placement_scouts
+                                .as_ref()
+                                .and_then(|scouts| scouts.placed_class(location_id));
+                            ui_reducer.activity_with_class(
+                                client_ui::ActivityKind::LocationCheck,
+                                line,
+                                class,
+                            );
                         }
                         runtime.record_location_checks(&newly_checked);
                         if should_submit_goal(goal_reported, goal_location, &newly_checked) {
@@ -1810,7 +1817,7 @@ fn run() -> Result<()> {
                     #[cfg(windows)]
                     {
                         ui_delivery = client_ui::DeliveryState::Ready;
-                        let (name, sender) = client
+                        let (name, sender, class) = client
                             .received_items()
                             .iter()
                             .find(|received| received.index() as u64 == item.index)
@@ -1819,18 +1826,25 @@ fn run() -> Result<()> {
                                     (
                                         item_label(client.this_game(), item.ap_item_id),
                                         "Archipelago".to_owned(),
+                                        None,
                                     )
                                 },
                                 |received| {
                                     (
                                         received.item().name().to_owned(),
                                         received.sender().alias().to_owned(),
+                                        Some(client_ui::ItemClass::from_flags(
+                                            received.is_progression(),
+                                            received.is_useful(),
+                                            received.is_trap(),
+                                        )),
                                     )
                                 },
                             );
-                        ui_reducer.activity(
+                        ui_reducer.activity_with_class(
                             client_ui::ActivityKind::ReceivedItem,
                             toasts::received_line(&name, &sender),
+                            class,
                         );
                     }
                     if let Some(line) = item_errors.recovered() {

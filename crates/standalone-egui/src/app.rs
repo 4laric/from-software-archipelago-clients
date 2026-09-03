@@ -11,8 +11,8 @@ use standalone_windows::{WindowGeometry, WindowOptions, normalize_command_input}
 
 use crate::hotkey::{self, Escape};
 use crate::view::{
-    self, ActivityStyle, CommandHistory, STORAGE_TOOLTIP, Tone, activity_style, checks_progress,
-    clock_label, goal_line, identity, items_line, pills, toast_alpha, toast_events, victory_lines,
+    self, ActivityStyle, CommandHistory, STORAGE_TOOLTIP, Tone, checks_progress, clock_label,
+    event_style, goal_line, identity, items_line, pills, toast_alpha, toast_events, victory_lines,
 };
 
 /// Heartbeat. The old shell repainted a whole text blob every 50 ms, which is where its flicker
@@ -513,7 +513,7 @@ impl StandaloneApp {
         }
         for event in events {
             let alpha = toast_alpha(event.timestamp_ms, now_ms);
-            let style = activity_style(&event.kind);
+            let style = event_style(event);
             egui::Frame::new()
                 .fill(color(view::palette::PANEL).gamma_multiply(0.92 * alpha))
                 .stroke(egui::Stroke::new(
@@ -678,7 +678,7 @@ fn row(ui: &mut egui::Ui, event: &ActivityEvent, utc_offset_seconds: i64) {
         color: tint,
         glyph,
         monospace,
-    } = activity_style(&event.kind);
+    } = event_style(event);
     let response = ui
         .horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -916,6 +916,7 @@ mod tests {
                                     kind: ActivityKind::Message,
                                     text: format!("readiness activity {sequence}"),
                                     timestamp_ms: sequence,
+                                    item_class: None,
                                 },
                                 0,
                             );

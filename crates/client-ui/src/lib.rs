@@ -57,6 +57,32 @@ pub enum ActivityKind {
     Hint,
 }
 
+/// Archipelago's item classification, as carried on `NetworkItem.flags`. Feed rows that name
+/// an item are coloured by it, in the colours the Archipelago text client and Universal Tracker
+/// use, so a player reads the same meaning here as everywhere else in their multiworld.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ItemClass {
+    Progression,
+    Useful,
+    Trap,
+    Filler,
+}
+
+impl ItemClass {
+    /// From the raw Archipelago flag bits: progression wins over useful, useful over trap.
+    pub fn from_flags(progression: bool, useful: bool, trap: bool) -> Self {
+        if progression {
+            Self::Progression
+        } else if useful {
+            Self::Useful
+        } else if trap {
+            Self::Trap
+        } else {
+            Self::Filler
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityEvent {
     /// Monotonic, source-owned sequence number. Hosts must preserve this order.
@@ -71,6 +97,10 @@ pub struct ActivityEvent {
     /// which a renderer treats as "no time known" rather than as midnight 1970.
     #[serde(default)]
     pub timestamp_ms: u64,
+    /// The Archipelago classification of the item this row names, when it names one. Absent for
+    /// rows that are not about an item and for older serialised feeds.
+    #[serde(default)]
+    pub item_class: Option<ItemClass>,
 }
 
 impl ActivityEvent {
@@ -82,7 +112,13 @@ impl ActivityEvent {
             kind,
             text: text.into(),
             timestamp_ms: unix_millis_now(),
+            item_class: None,
         }
+    }
+
+    pub fn with_item_class(mut self, item_class: Option<ItemClass>) -> Self {
+        self.item_class = item_class;
+        self
     }
 }
 
@@ -282,10 +318,20 @@ impl SnapshotReducer {
     }
 
     pub fn activity(&mut self, kind: ActivityKind, text: impl Into<String>) {
+        self.activity_with_class(kind, text, None);
+    }
+
+    /// An activity row that names an item of a known Archipelago class.
+    pub fn activity_with_class(
+        &mut self,
+        kind: ActivityKind,
+        text: impl Into<String>,
+        item_class: Option<ItemClass>,
+    ) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.snapshot.push_activity(
-            ActivityEvent::now(sequence, kind, text),
+            ActivityEvent::now(sequence, kind, text).with_item_class(item_class),
             self.activity_capacity,
         );
     }

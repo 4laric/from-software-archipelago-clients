@@ -6,7 +6,10 @@
 //! decisions inline inside a Win32 message loop, where the only way to check that `WaitingForGameplay`
 //! reached a player as a debug-formatted enum name was to launch the game.
 
-use client_ui::{ActivityKind, ApState, ClientSnapshot, DeliveryState, LedgerTotals, ProcessState};
+use client_ui::{
+    ActivityEvent, ActivityKind, ApState, ClientSnapshot, DeliveryState, ItemClass, LedgerTotals,
+    ProcessState,
+};
 
 pub const TOAST_LIFETIME_MS: u64 = 4_000;
 pub const TOAST_FADE_MS: u64 = 1_000;
@@ -33,6 +36,13 @@ pub mod palette {
     /// indistinguishable from actually receiving one.
     pub const HINT: Rgb = [0xb0, 0x8c, 0xd8];
     pub const VICTORY: Rgb = [0xd8, 0xb4, 0x63];
+    /// Archipelago's own item colours, as the text client and Universal Tracker draw them:
+    /// plum for progression, slate blue for useful, salmon for traps, cyan for filler. A row
+    /// that names an item takes the item's colour so the window agrees with the tracker.
+    pub const PROGRESSION: Rgb = [0xaf, 0x99, 0xef];
+    pub const USEFUL: Rgb = [0x6d, 0x8b, 0xe8];
+    pub const TRAP: Rgb = [0xfa, 0x80, 0x72];
+    pub const FILLER: Rgb = [0x00, 0xee, 0xee];
     pub const BACKGROUND: Rgb = [0x14, 0x14, 0x16];
     pub const PANEL: Rgb = [0x1c, 0x1c, 0x20];
 }
@@ -69,6 +79,34 @@ pub fn activity_style(kind: &ActivityKind) -> ActivityStyle {
         ActivityKind::CommandResult => style(palette::MUTED, "", true),
         ActivityKind::Message => style(palette::TEXT, "", false),
     }
+}
+
+/// The colour Archipelago gives an item class everywhere else.
+pub fn item_class_color(class: ItemClass) -> Rgb {
+    match class {
+        ItemClass::Progression => palette::PROGRESSION,
+        ItemClass::Useful => palette::USEFUL,
+        ItemClass::Trap => palette::TRAP,
+        ItemClass::Filler => palette::FILLER,
+    }
+}
+
+/// The style for one row: the kind's style, recoloured by the item's Archipelago class when the
+/// row names an item whose class the producer knew. Rows about anything other than an item, and
+/// parked deliveries (whose colour is the warning, not the item), keep the kind colour.
+pub fn event_style(event: &ActivityEvent) -> ActivityStyle {
+    let mut style = activity_style(&event.kind);
+    if let Some(class) = event.item_class
+        && matches!(
+            event.kind,
+            ActivityKind::LocationCheck
+                | ActivityKind::ReceivedItem
+                | ActivityKind::StorageDelivery
+        )
+    {
+        style.color = item_class_color(class);
+    }
+    style
 }
 
 /// Recent pickup events for compact mode. The full window already has the feed,
@@ -369,6 +407,40 @@ mod tests {
     use client_ui::{ActivityEvent, LocationTotals, Severity, SnapshotReducer, delivery_headline};
 
     #[test]
+    fn rows_that_name_an_item_take_archipelagos_class_colour() {
+        let check = ActivityEvent::now(1, ActivityKind::LocationCheck, "Fire Paper x2 -> oz")
+            .with_item_class(Some(ItemClass::Progression));
+        assert_eq!(event_style(&check).color, palette::PROGRESSION);
+        assert_eq!(event_style(&check).glyph, "+");
+        let useful = ActivityEvent::now(2, ActivityKind::ReceivedItem, "Oedon Tomb Key")
+            .with_item_class(Some(ItemClass::Useful));
+        assert_eq!(event_style(&useful).color, palette::USEFUL);
+        let filler = ActivityEvent::now(3, ActivityKind::StorageDelivery, "Blood Vial")
+            .with_item_class(Some(ItemClass::Filler));
+        assert_eq!(event_style(&filler).color, palette::FILLER);
+        let trap = ActivityEvent::now(4, ActivityKind::ReceivedItem, "Frenzy")
+            .with_item_class(Some(ItemClass::Trap));
+        assert_eq!(event_style(&trap).color, palette::TRAP);
+        // No class known: the kind colour, as before.
+        let unknown = ActivityEvent::now(5, ActivityKind::ReceivedItem, "Saw Cleaver");
+        assert_eq!(event_style(&unknown).color, palette::ITEM);
+        // A parked delivery stays a warning whatever the item is.
+        let parked = ActivityEvent::now(6, ActivityKind::ParkedDelivery, "Parked Butcher Gloves")
+            .with_item_class(Some(ItemClass::Progression));
+        assert_eq!(event_style(&parked).color, palette::WARN);
+        assert_eq!(
+            ItemClass::from_flags(true, true, true),
+            ItemClass::Progression
+        );
+        assert_eq!(ItemClass::from_flags(false, true, true), ItemClass::Useful);
+        assert_eq!(ItemClass::from_flags(false, false, true), ItemClass::Trap);
+        assert_eq!(
+            ItemClass::from_flags(false, false, false),
+            ItemClass::Filler
+        );
+    }
+
+    #[test]
     fn toast_deck_is_recent_bounded_and_newest_first() {
         let mut snapshot = ClientSnapshot::default();
         for (sequence, kind, timestamp_ms) in [
@@ -384,6 +456,7 @@ mod tests {
                     kind,
                     text: sequence.to_string(),
                     timestamp_ms,
+                    item_class: None,
                 },
                 10,
             );
