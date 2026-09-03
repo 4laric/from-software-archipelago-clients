@@ -361,6 +361,11 @@ pub struct RuntimeConfig {
     /// AP location whose debounced check completes this bounded world.
     #[serde(default)]
     pub goal_location: Option<i64>,
+    /// Seed-owned descriptor of the single good granted after every location
+    /// check. Older contracts omit it and the client falls back to its
+    /// Quicksilver Bullet constant.
+    #[serde(default)]
+    pub sustain_item: Option<RuntimeItemBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -524,6 +529,21 @@ impl RuntimeConfig {
                     .any(|location| location.ap_location_id == goal),
                 "goal location {goal} is absent from runtime_locations"
             );
+        }
+        if let Some(value) = slot_data.get("sustain_item") {
+            let row: RuntimeItemBinding =
+                json::from_value(value.clone()).context("parsing slot_data.sustain_item")?;
+            anyhow::ensure!(
+                row.item_category == 4
+                    && row.quantity == 1
+                    && row.reinforcement_level.is_none()
+                    && row.descriptor_evidence == DescriptorEvidence::GoodsFormulaObserved
+                    && row.normalized_item_id & 0xF000_0000 == 0x4000_0000
+                    && row.raw_descriptor & 0xF000_0000 == 0xB000_0000
+                    && (row.normalized_item_id & 0x0FFF_FFFF) == (row.raw_descriptor & 0x0FFF_FFFF),
+                "slot_data.sustain_item must be one observed category-4 good"
+            );
+            self.sustain_item = Some(row);
         }
         let claims_suppression = self
             .locations
@@ -730,6 +750,49 @@ mod tests {
             location_check_debounce: 3,
             mock_set_flags: vec![],
             goal_location: None,
+            sustain_item: None,
+        }
+    }
+
+    #[test]
+    fn slot_data_sustain_item_is_parsed_and_must_be_a_single_observed_good() {
+        let config = local()
+            .apply_slot_data(&json!({
+                "sustain_item": {
+                    "normalized_item_id": 0x4000_0384_u32,
+                    "raw_descriptor": 0xB000_0384_u32,
+                    "item_category": 4,
+                    "descriptor_evidence": "goods_formula_observed",
+                    "quantity": 1
+                }
+            }))
+            .unwrap();
+        let sustain = config.sustain_item.expect("sustain item parsed");
+        assert_eq!(sustain.normalized_item_id, 0x4000_0384);
+        assert_eq!(sustain.raw_descriptor, 0xB000_0384);
+
+        // Older contracts omit it entirely.
+        assert!(
+            local()
+                .apply_slot_data(&json!({}))
+                .unwrap()
+                .sustain_item
+                .is_none()
+        );
+
+        for bad in [
+            json!({"normalized_item_id": 0x4000_0384_u32, "raw_descriptor": 0xB000_0384_u32,
+                   "item_category": 4, "descriptor_evidence": "goods_formula_observed", "quantity": 3}),
+            json!({"normalized_item_id": 7100000_u32, "raw_descriptor": 2154583648_u32,
+                   "item_category": 0, "descriptor_evidence": "live_grant_inventory_ui", "quantity": 1}),
+            json!({"normalized_item_id": 0x4000_0384_u32, "raw_descriptor": 0xB000_044C_u32,
+                   "item_category": 4, "descriptor_evidence": "goods_formula_observed", "quantity": 1}),
+        ] {
+            assert!(
+                local()
+                    .apply_slot_data(&json!({"sustain_item": bad}))
+                    .is_err()
+            );
         }
     }
 
