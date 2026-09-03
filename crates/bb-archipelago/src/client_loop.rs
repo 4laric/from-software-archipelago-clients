@@ -16,6 +16,78 @@ use crate::ledger::{
 };
 use crate::upgrades::{auto_upgrade_level, reinforced_descriptor_pair};
 
+/// One step of a rescue recipe. Each variant maps onto exactly one existing
+/// audited primitive; there is no raw flag or descriptor escape hatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RescueStep {
+    /// Set one contract *location* flag. This sends that check.
+    SetLocationFlag(u32),
+    /// Set the flag of the seed's `goal_location`. This sends the goal.
+    SetGoalFlag,
+    /// Queue the contract item whose normalized id and category match, on the
+    /// idempotent operator lane. For category 255 this is an event-flag write.
+    GrantItem {
+        normalized_item_id: u32,
+        item_category: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResolvedRescueStep {
+    Flag { flag: u32, location: i64 },
+    Item { ap_item_id: i64 },
+}
+
+/// A named repair for a failure the beta is expected to hit. `when` is the
+/// symptom a host matches against; `after` is what the player should see.
+#[derive(Clone, Copy, Debug)]
+pub struct RescueRecipe {
+    pub name: &'static str,
+    pub when: &'static str,
+    pub after: &'static str,
+    pub steps: &'static [RescueStep],
+}
+
+/// The shipped recipe table. Ids here are Bloodborne 01.09 event flags and
+/// normalized descriptors owned by the apworld's `runtime_bindings.py`; every
+/// one is re-validated against the live seed contract before use.
+pub const RESCUE_RECIPES: &[RescueRecipe] = &[
+    RescueRecipe {
+        name: "laurence-skull",
+        when: "You inspected Laurence's Skull at the Grand Cathedral altar (after Vicar Amelia), the cutscene played, but no check was sent.",
+        after: "the Grand Cathedral altar check is sent. The Forbidden Woods password is NOT granted by this; it arrives as its own AP item.",
+        steps: &[RescueStep::SetLocationFlag(12_401_898)],
+    },
+    RescueRecipe {
+        name: "forbidden-woods-password",
+        when: "AP shows you received \"Fear the Old Blood\" but the Forbidden Woods gate at the bottom of Cathedral Ward still refuses the password.",
+        after: "the password flag is written again (idempotent); talk to the gate once more.",
+        steps: &[RescueStep::GrantItem {
+            normalized_item_id: 12_401_803,
+            item_category: 255,
+        }],
+    },
+    RescueRecipe {
+        name: "goal",
+        when: "You watched your seed's ending (Mergo's Wet Nurse, Gehrman, or Moon Presence, per your YAML goal) but AP never marked you as finished.",
+        after: "the goal location flag is written; the client sends goal completion on its next poll. Only run this after the ending actually played.",
+        steps: &[RescueStep::SetGoalFlag],
+    },
+];
+
+pub fn rescue_recipe_names() -> Vec<&'static str> {
+    RESCUE_RECIPES.iter().map(|recipe| recipe.name).collect()
+}
+
+/// One line per recipe for `rescue` with no arguments.
+pub fn rescue_recipe_listing() -> String {
+    RESCUE_RECIPES
+        .iter()
+        .map(|recipe| format!("{}: {}", recipe.name, recipe.when))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 const LOCATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const LOCATION_RETRY_MAX: Duration = Duration::from_secs(30);
 /// Sustain is a best-effort anti-farm replacement, never an AP-owned item. Once its native command
@@ -534,6 +606,122 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         });
         self.ledger.save(&self.ledger_path)?;
         Ok(true)
+    }
+
+    /// Apply one named rescue recipe. Every step reuses an audited primitive
+    /// (`rescue_set_flag`, `rescue_give`); the recipe adds a stable name, a
+    /// description of the failure it repairs, and up-front validation so a
+    /// half-applied repair cannot start. Returns one audit line per step.
+    pub fn rescue_recipe(
+        &mut self,
+        name: &str,
+        mut resolve_item: impl FnMut(i64) -> String,
+        mut resolve_location: impl FnMut(i64) -> String,
+    ) -> Result<Vec<String>> {
+        let recipe = RESCUE_RECIPES
+            .iter()
+            .find(|recipe| recipe.name.eq_ignore_ascii_case(name))
+            .with_context(|| {
+                format!(
+                    "unknown rescue recipe {name:?}; known recipes: {}",
+                    rescue_recipe_names().join(", ")
+                )
+            })?;
+        self.require_runtime_context("rescue recipe")?
+            .context("rescue recipe is waiting for gameplay")?;
+
+        // Resolve and validate every step before the first mutation.
+        let mut plan = Vec::with_capacity(recipe.steps.len());
+        for step in recipe.steps {
+            plan.push(match *step {
+                RescueStep::SetLocationFlag(flag) => {
+                    let location = self.rescue_location_for_flag(flag)?;
+                    ResolvedRescueStep::Flag { flag, location }
+                }
+                RescueStep::SetGoalFlag => {
+                    let goal = self
+                        .config
+                        .goal_location
+                        .context("this seed contract carries no goal_location")?;
+                    let flag = self
+                        .config
+                        .locations
+                        .iter()
+                        .find(|binding| binding.ap_location_id == goal)
+                        .map(|binding| binding.event_flag)
+                        .with_context(|| format!("goal location {goal} has no runtime flag"))?;
+                    ResolvedRescueStep::Flag {
+                        flag,
+                        location: goal,
+                    }
+                }
+                RescueStep::GrantItem {
+                    normalized_item_id,
+                    item_category,
+                } => {
+                    let ap_item_id = self
+                        .config
+                        .items
+                        .iter()
+                        .find(|(_, binding)| {
+                            binding.normalized_item_id == normalized_item_id
+                                && binding.item_category == item_category
+                                && binding.descriptor_evidence.is_known()
+                        })
+                        .map(|(id, _)| *id)
+                        .with_context(|| {
+                            format!(
+                                "no contract item with normalized id {normalized_item_id:#x} in category {item_category}"
+                            )
+                        })?;
+                    ResolvedRescueStep::Item { ap_item_id }
+                }
+            });
+        }
+
+        let mut lines = Vec::with_capacity(plan.len() + 1);
+        for step in plan {
+            match step {
+                ResolvedRescueStep::Flag { flag, location } => {
+                    let label = resolve_location(location);
+                    self.rescue_set_flag(flag, &label)?;
+                    lines.push(format!(
+                        "AUDIT rescue {} setflag flag={flag} ({label:?}): written; that check is now sent.",
+                        recipe.name
+                    ));
+                }
+                ResolvedRescueStep::Item { ap_item_id } => {
+                    let label = resolve_item(ap_item_id);
+                    let queued = self.rescue_give(ap_item_id, &label)?;
+                    lines.push(if queued {
+                        format!(
+                            "AUDIT rescue {} give index={ap_item_id} ({label:?}): queued through normal delivery.",
+                            recipe.name
+                        )
+                    } else {
+                        format!(
+                            "AUDIT rescue {} give index={ap_item_id} ({label:?}): already recorded; no second grant queued.",
+                            recipe.name
+                        )
+                    });
+                }
+            }
+        }
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .operator_actions
+            .push(OperatorAction {
+                timestamp_ms: rescue_timestamp_ms(),
+                command: "rescue".into(),
+                argument: 0,
+                resolved_name: recipe.name.into(),
+            });
+        self.ledger.save(&self.ledger_path)?;
+        lines.push(format!(
+            "AUDIT rescue {} complete: {}",
+            recipe.name, recipe.after
+        ));
+        Ok(lines)
     }
 
     pub fn poll_operator_grant(&mut self) -> Result<OperatorGrantPoll> {
@@ -1893,6 +2081,177 @@ mod tests {
             OperatorGrantPoll::Idle
         );
         assert!(client.backend.grants.is_empty());
+    }
+
+    fn recipe_config() -> RuntimeConfig {
+        let mut config = config();
+        config.locations.push(LocationBinding {
+            ap_location_id: 1001,
+            event_flag: 12_401_898,
+            vanilla_award_suppressed: false,
+            region: None,
+        });
+        config.locations.push(LocationBinding {
+            ap_location_id: 1002,
+            event_flag: 12_101_850,
+            vanilla_award_suppressed: false,
+            region: None,
+        });
+        config.goal_location = Some(1002);
+        config.items.insert(
+            2001,
+            RuntimeItemBinding {
+                raw_descriptor: 12_401_803,
+                normalized_item_id: 12_401_803,
+                item_category: 255,
+                descriptor_evidence: DescriptorEvidence::EventFlagEffect,
+                quantity: 1,
+                reinforcement_level: None,
+                feed_effect: FeedEffectBinding::NotEquippable,
+            },
+        );
+        config
+    }
+
+    fn ready_backend() -> MockBackend {
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = true;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        backend
+    }
+
+    #[test]
+    fn rescue_recipes_reuse_the_audited_primitives_and_are_exported() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            ready_backend(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            recipe_config(),
+        );
+        let lines = client
+            .rescue_recipe(
+                "Laurence-Skull",
+                |id| format!("item {id}"),
+                |id| format!("loc {id}"),
+            )
+            .unwrap();
+        assert!(client.backend.set_flags.contains(&12_401_898));
+        assert!(!client.backend.set_flags.contains(&12_401_803));
+        assert!(lines[0].starts_with("AUDIT rescue laurence-skull setflag flag=12401898"));
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with("AUDIT rescue laurence-skull complete")
+        );
+
+        let lines = client
+            .rescue_recipe(
+                "forbidden-woods-password",
+                |id| format!("item {id}"),
+                |id| format!("loc {id}"),
+            )
+            .unwrap();
+        assert!(lines[0].contains("give index=2001"));
+        let slot = client.ledger.slot("seed", "slot").unwrap();
+        assert!(slot.operator_grants.contains_key(&2001));
+        assert_eq!(slot.highest_processed_index, None);
+        // Repeating is a fixed point on the operator lane.
+        let lines = client
+            .rescue_recipe(
+                "forbidden-woods-password",
+                |id| format!("item {id}"),
+                |id| format!("loc {id}"),
+            )
+            .unwrap();
+        assert!(lines[0].contains("already recorded"));
+
+        let lines = client
+            .rescue_recipe("goal", |id| format!("item {id}"), |id| format!("loc {id}"))
+            .unwrap();
+        assert!(lines[0].contains("flag=12101850"));
+        assert!(client.backend.set_flags.contains(&12_101_850));
+
+        let export = client.rescue_export().unwrap();
+        let value: json::Value = json::from_slice(&std::fs::read(&export).unwrap()).unwrap();
+        let commands: Vec<&str> = value["operator_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "setflag", "rescue", "give", "rescue", "rescue", "setflag", "rescue"
+            ]
+        );
+        std::fs::remove_file(export).unwrap();
+        let _ = std::fs::remove_file(ledger_path);
+    }
+
+    #[test]
+    fn rescue_recipe_refuses_unknown_names_and_mutates_nothing_when_a_step_is_off_contract() {
+        let ledger_path = path();
+        // Base config has neither the Laurence witness nor a goal location.
+        let mut client = loop_with(
+            ready_backend(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let error = client
+            .rescue_recipe("nope", |id| format!("{id}"), |id| format!("{id}"))
+            .unwrap_err();
+        assert!(error.to_string().contains("laurence-skull"));
+        assert!(
+            client
+                .rescue_recipe("laurence-skull", |id| format!("{id}"), |id| format!("{id}"))
+                .is_err()
+        );
+        assert!(
+            client
+                .rescue_recipe("goal", |id| format!("{id}"), |id| format!("{id}"))
+                .is_err()
+        );
+        assert!(
+            client
+                .rescue_recipe(
+                    "forbidden-woods-password",
+                    |id| format!("{id}"),
+                    |id| format!("{id}")
+                )
+                .is_err()
+        );
+        assert!(client.backend.set_flags.is_empty());
+        assert!(client.ledger.slot("seed", "slot").is_none_or(|slot| {
+            slot.operator_grants.is_empty() && slot.operator_actions.is_empty()
+        }));
+        let _ = std::fs::remove_file(ledger_path);
+    }
+
+    #[test]
+    fn rescue_recipe_refuses_without_gameplay_context() {
+        let ledger_path = path();
+        let mut backend = ready_backend();
+        backend.location_context = None;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            recipe_config(),
+        );
+        assert!(
+            client
+                .rescue_recipe("laurence-skull", |id| format!("{id}"), |id| format!("{id}"))
+                .is_err()
+        );
+        assert!(client.backend.set_flags.is_empty());
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     /// clients#420: while the native flag gate is pending (the game has not
