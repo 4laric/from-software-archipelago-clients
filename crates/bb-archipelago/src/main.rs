@@ -1833,7 +1833,11 @@ fn run() -> Result<()> {
                                     (
                                         received.item().name().to_owned(),
                                         received.sender().alias().to_owned(),
-                                        Some(toasts::item_class(received)),
+                                        Some(client_ui::ItemClass::from_flags(
+                                            received.is_progression(),
+                                            received.is_useful(),
+                                            received.is_trap(),
+                                        )),
                                     )
                                 },
                             );
