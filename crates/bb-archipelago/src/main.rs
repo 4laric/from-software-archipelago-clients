@@ -1098,7 +1098,7 @@ fn run() -> Result<()> {
             let command = words.first().map(|word| word.to_ascii_lowercase());
             let result = match command.as_deref() {
                 None | Some("") => continue,
-                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM | give INDEX CONFIRM. Unknown/unmapped writes and warps fail closed.".to_owned(),
+                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM | give INDEX CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list). Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
                     Some(runtime) => runtime
                         .rescue_status()
@@ -1192,6 +1192,36 @@ fn run() -> Result<()> {
                     }
                     (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
                     _ => "Usage: give ITEM_INDEX CONFIRM (contract items only)".to_owned(),
+                },
+                Some("rescue") => match (runtime.as_mut(), words.get(1), words.get(2)) {
+                    (Some(runtime), Some(name), Some(confirm))
+                        if confirm.eq_ignore_ascii_case("CONFIRM") =>
+                    {
+                        let resolve_item = |ap_item_id: i64| {
+                            connection.client().map_or_else(
+                                || bb_archipelago::names::item_label(None, ap_item_id),
+                                |client| item_label(client.this_game(), ap_item_id),
+                            )
+                        };
+                        let resolve_location = |location_id: i64| {
+                            connection.client().map_or_else(
+                                || format!("location #{location_id}"),
+                                |client| location_label(client.this_game(), location_id),
+                            )
+                        };
+                        match runtime.rescue_recipe(name, resolve_item, resolve_location) {
+                            Ok(lines) => lines.join("\n"),
+                            Err(error) => format!("Rescue recipe refused: {error:#}"),
+                        }
+                    }
+                    (Some(_), Some(name), _) => format!(
+                        "Usage: rescue {name} CONFIRM (this mutates the save and is audited; run 'rescue' alone to read what each recipe does first)"
+                    ),
+                    (Some(_), None, _) => format!(
+                        "Rescue recipes (run 'rescue NAME CONFIRM'):\n{}",
+                        bb_archipelago::client_loop::rescue_recipe_listing()
+                    ),
+                    (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
                 },
                 Some("item" | "warp") => "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes.".to_owned(),
                 Some("mark") => match (runtime.as_mut(), words.get(1..)) {
