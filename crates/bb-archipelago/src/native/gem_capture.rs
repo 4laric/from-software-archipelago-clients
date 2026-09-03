@@ -46,7 +46,7 @@ impl GemCapture {
         let Some(entries) = entries else { return };
         let current = entries
             .into_iter()
-            .filter(|entry| is_category_eight(entry))
+            .filter(is_category_eight)
             .map(|entry| (entry.slot, entry.bytes))
             .collect::<BTreeMap<_, _>>();
         let Some(previous) = self.previous_category_eight.replace(current.clone()) else {
