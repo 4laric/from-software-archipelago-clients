@@ -1098,7 +1098,7 @@ fn run() -> Result<()> {
             let command = words.first().map(|word| word.to_ascii_lowercase());
             let result = match command.as_deref() {
                 None | Some("") => continue,
-                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM | give INDEX CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list). Unknown/unmapped writes and warps fail closed.".to_owned(),
+                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM | give INDEX CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list) | rebind CONFIRM (release the bound character while nothing is delivered). Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
                     Some(runtime) => runtime
                         .rescue_status()
@@ -1222,6 +1222,16 @@ fn run() -> Result<()> {
                         bb_archipelago::client_loop::rescue_recipe_listing()
                     ),
                     (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
+                },
+                Some("rebind") => match (runtime.as_mut(), words.get(1)) {
+                    (Some(runtime), Some(confirm)) if confirm.eq_ignore_ascii_case("CONFIRM") => {
+                        match runtime.rescue_rebind() {
+                            Ok(message) => format!("AUDIT rescue rebind: {message}"),
+                            Err(error) => format!("Rescue rebind refused: {error:#}"),
+                        }
+                    }
+                    (None, _) => "Runtime contract not loaded yet.".to_owned(),
+                    _ => "Usage: rebind CONFIRM (releases the bound character; only while nothing has been delivered)".to_owned(),
                 },
                 Some("item" | "warp") => "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes.".to_owned(),
                 Some("mark") => match (runtime.as_mut(), words.get(1..)) {
