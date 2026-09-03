@@ -312,7 +312,16 @@ impl NativeBackend {
             return Ok(Some(gate.observe(true)));
         }
 
-        let Some(identity) = self.save_identity.poll()? else {
+        let polled = self.save_identity.poll()?;
+        if let Some(path) = self.save_identity.take_write_denial() {
+            client_eprintln!(
+                "WARNING: shadPS4 could not write the game's save file ({path}): Windows refused the write. \
+                 Nothing you do is being saved; the game will reload its last successful save when you die. \
+                 Close the game, clear the read-only attribute on the files in that folder (or fix its \
+                 permissions), and relaunch. Checks and deliveries still work meanwhile, but they are not persisted."
+            );
+        }
+        let Some(identity) = polled else {
             self.live_identity_candidate = None;
             self.live_identity_ready_reads = 0;
             return Ok(None);
