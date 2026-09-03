@@ -23,6 +23,7 @@ pub struct PlacementScouts {
 struct Placement {
     item: String,
     receiver: String,
+    class: client_ui::ItemClass,
 }
 
 impl PlacementScouts {
@@ -67,6 +68,7 @@ impl PlacementScouts {
                             Placement {
                                 item: placed.item().name().to_owned(),
                                 receiver: placed.receiver().alias().to_owned(),
+                                class: item_class(&placed),
                             },
                         )
                     })
@@ -98,12 +100,22 @@ impl PlacementScouts {
         }
     }
 
+    /// The Archipelago class of the item scouted at `location`, if it was scouted.
+    pub fn placed_class(&self, location: i64) -> Option<client_ui::ItemClass> {
+        self.placements.get(&location).map(|placed| placed.class)
+    }
+
     pub fn sent_line(&self, location: i64, fallback: &str) -> String {
         self.placements.get(&location).map_or_else(
             || format!("\u{2713} {fallback}"),
             |placed| sent_line(&placed.item, &placed.receiver),
         )
     }
+}
+
+/// The Archipelago classification carried on a located item's flags.
+pub fn item_class(item: &LocatedItem) -> client_ui::ItemClass {
+    client_ui::ItemClass::from_flags(item.is_progression(), item.is_useful(), item.is_trap())
 }
 
 pub fn sent_line(item: &str, receiver: &str) -> String {
