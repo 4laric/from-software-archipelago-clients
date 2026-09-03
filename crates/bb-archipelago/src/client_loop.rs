@@ -957,6 +957,19 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(queued)
     }
 
+    /// The per-check bonus good as (raw descriptor, normalized id): the seed's
+    /// published `sustain_item` when the contract carries one, else the
+    /// Quicksilver Bullet constant for older contracts.
+    fn sustain_descriptor(&self) -> (u32, u32) {
+        match &self.config.sustain_item {
+            Some(item) => (item.raw_descriptor, item.normalized_item_id),
+            None => (
+                QUICKSILVER_BULLET_RAW_DESCRIPTOR,
+                GOODS_NORMALIZED_PREFIX | QUICKSILVER_BULLET_GOODS_ID,
+            ),
+        }
+    }
+
     /// Advance at most one replay-safe Quicksilver Bullet bonus. Received AP
     /// items retain priority: the binary calls this only when their delivery
     /// machine is idle, and errors here are reported independently.
@@ -983,7 +996,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             return Ok(SustainPollResult::Pending);
         }
 
-        let normalized = GOODS_NORMALIZED_PREFIX | QUICKSILVER_BULLET_GOODS_ID;
+        let (raw_descriptor, normalized) = self.sustain_descriptor();
         let baseline_is_binding = match recorded_before {
             Some(_) => self.backend.grant_may_have_applied(&tag)?,
             None => false,
@@ -1004,7 +1017,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             },
         };
         let grant = ItemGrant {
-            raw_descriptor: QUICKSILVER_BULLET_RAW_DESCRIPTOR,
+            raw_descriptor,
             normalized_item_id: normalized,
             item_category: 4,
             quantity: 1,
@@ -1765,6 +1778,7 @@ mod tests {
             location_check_debounce: 3,
             mock_set_flags: vec![],
             goal_location: None,
+            sustain_item: None,
         }
     }
 
@@ -3193,6 +3207,30 @@ mod tests {
                 .pending_sustain
                 .contains_key(&1000)
         );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn sustain_grant_uses_the_seed_published_descriptor_when_present() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        cfg.sustain_item = Some(goods());
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+        client.queue_sustain_for_checks(&[1000]).unwrap();
+        assert_eq!(
+            client.poll_sustain().unwrap(),
+            SustainPollResult::Completed(1000)
+        );
+        let grant = &client.backend().grants[0];
+        assert_eq!(grant.raw_descriptor, goods().raw_descriptor);
+        assert_eq!(grant.normalized_item_id, goods().normalized_item_id);
+        assert_eq!(grant.quantity, 1);
         std::fs::remove_file(ledger_path).unwrap();
     }
 
