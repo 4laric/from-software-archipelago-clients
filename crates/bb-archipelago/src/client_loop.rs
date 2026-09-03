@@ -95,8 +95,8 @@ const LOCATION_RETRY_MAX: Duration = Duration::from_secs(30);
 /// the authoritative receive stream. This is deliberately longer than the native hydration verify
 /// budget (240 polls / 12 seconds).
 const SUSTAIN_PENDING_POLL_LIMIT: u32 = 600;
-const QUICKSILVER_BULLET_GOODS_ID: u32 = 1_100;
-const QUICKSILVER_BULLET_RAW_DESCRIPTOR: u32 = 0xB000_044C;
+const QUICKSILVER_BULLET_GOODS_ID: u32 = 900;
+const QUICKSILVER_BULLET_RAW_DESCRIPTOR: u32 = 0xB000_0384;
 const GOODS_NORMALIZED_PREFIX: u32 = 0x4000_0000;
 
 fn rescue_timestamp_ms() -> u64 {
@@ -3216,7 +3216,7 @@ mod tests {
         assert_eq!(client.backend().grants.len(), 1);
         let grant = &client.backend().grants[0];
         assert_eq!(grant.raw_descriptor, QUICKSILVER_BULLET_RAW_DESCRIPTOR);
-        assert_eq!(grant.normalized_item_id, 0x4000_044c);
+        assert_eq!(grant.normalized_item_id, 0x4000_0384);
         assert_eq!(grant.quantity, 1);
 
         // Server packet replay/repeated flag polling cannot requeue a bonus
@@ -3249,7 +3249,7 @@ mod tests {
         let mut cfg = config();
         cfg.locations[0].vanilla_award_suppressed = true;
         let mut backend = MockBackend::default();
-        backend.inventory.insert((0x4000_044c, None), 7);
+        backend.inventory.insert((0x4000_0384, None), 7);
         backend.delay_grant("sustain_1000", 1);
         let mut client = loop_with(
             backend,
@@ -3280,7 +3280,7 @@ mod tests {
             SustainPollResult::Completed(1000)
         );
         assert_eq!(
-            reloaded.backend().inventory.get(&(0x4000_044c, None)),
+            reloaded.backend().inventory.get(&(0x4000_0384, None)),
             Some(&8)
         );
         assert_eq!(reloaded.backend().grants.len(), 1);
