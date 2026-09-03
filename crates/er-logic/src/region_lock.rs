@@ -53,7 +53,8 @@ pub fn leyndell_gate_status(
         "closed"
     };
     Some(format!(
-        "Leyndell gate: {lock_item} {lock}; Great Runes {runes_held}/{runes_required} -- {state}"
+        "Leyndell gate: {lock_item} {lock}; Great Runes {runes_held}/{runes_required} -- {state}; \
+         no grace warp, enter from Altus"
     ))
 }
 
@@ -65,15 +66,21 @@ mod leyndell_gate_status_tests {
     fn names_both_halves_of_the_compound_gate() {
         assert_eq!(
             leyndell_gate_status("Leyndell Lock", false, 4, 4).as_deref(),
-            Some("Leyndell gate: Leyndell Lock missing; Great Runes 4/4 -- closed")
+            Some(
+                "Leyndell gate: Leyndell Lock missing; Great Runes 4/4 -- closed; no grace warp, enter from Altus"
+            )
         );
         assert_eq!(
             leyndell_gate_status("Leyndell Lock", true, 4, 3).as_deref(),
-            Some("Leyndell gate: Leyndell Lock held; Great Runes 3/4 -- closed")
+            Some(
+                "Leyndell gate: Leyndell Lock held; Great Runes 3/4 -- closed; no grace warp, enter from Altus"
+            )
         );
         assert_eq!(
             leyndell_gate_status("Leyndell Lock", true, 4, 4).as_deref(),
-            Some("Leyndell gate: Leyndell Lock held; Great Runes 4/4 -- open")
+            Some(
+                "Leyndell gate: Leyndell Lock held; Great Runes 4/4 -- open; no grace warp, enter from Altus"
+            )
         );
     }
 
