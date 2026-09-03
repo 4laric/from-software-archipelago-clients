@@ -699,6 +699,14 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
 /// reconciliation, park re-queue, location/item polling) print and carry on
 /// without returning `Err` at all.
 fn main() {
+    match contract_check_request(env::args().skip(1)) {
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
+    }
     match version_request(env::args().skip(1)) {
         Ok(Some(version)) => {
             println!("{version}");
@@ -713,6 +721,81 @@ fn main() {
     if let Err(error) = run() {
         client_eprintln!("{}", logging::terminal_error_report(&error));
         std::process::exit(1);
+    }
+}
+
+/// `bb-ap-client --check-contract SLOT_DATA.json`: load a seed contract the
+/// way a live session would and report what this build would do with it.
+/// Exit 0 when every binding is deliverable, 2 when the contract loads but
+/// some items would be parked (a world newer than this client), 1 when it
+/// does not load at all. CI runs it against the contract the built apworld
+/// emits so a world/client skew fails the release, not a player's launch.
+fn contract_check_request<I: Iterator<Item = String>>(mut args: I) -> Result<Option<i32>> {
+    let Some(first) = args.next() else {
+        return Ok(None);
+    };
+    if first != "--check-contract" {
+        return Ok(None);
+    }
+    let path = args
+        .next()
+        .context("--check-contract needs the slot_data JSON path")?;
+    anyhow::ensure!(
+        args.next().is_none(),
+        "--check-contract does not accept any other arguments"
+    );
+    let slot_data: json::Value =
+        json::from_slice(&std::fs::read(&path).with_context(|| format!("reading {path}"))?)
+            .with_context(|| format!("parsing {path}"))?;
+    Ok(Some(check_contract(&slot_data)))
+}
+
+fn check_contract(slot_data: &json::Value) -> i32 {
+    let base: RuntimeConfig = match json::from_value(json::json!({})) {
+        Ok(base) => base,
+        Err(error) => {
+            eprintln!("contract check: cannot build a base config: {error:#}");
+            return 1;
+        }
+    };
+    let config = match base.apply_slot_data(slot_data) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("contract check: REFUSED: {error:#}");
+            return 1;
+        }
+    };
+    let mut parked: Vec<(i64, String)> = config
+        .items
+        .iter()
+        .filter(|(_, binding)| !binding.descriptor_evidence.is_known())
+        .map(|(id, binding)| (*id, binding.descriptor_evidence.as_str().to_owned()))
+        .collect();
+    parked.sort();
+    println!(
+        "contract check: {} locations, {} items, {} category-8 awards, goal {:?}, sustain item {}",
+        config.locations.len(),
+        config.items.len(),
+        config.category8_awards.len(),
+        config.goal_location,
+        if config.sustain_item.is_some() {
+            "published"
+        } else {
+            "client default"
+        }
+    );
+    if parked.is_empty() {
+        println!("contract check: OK, every binding is deliverable by this client");
+        0
+    } else {
+        for (id, evidence) in &parked {
+            println!("contract check: AP item {id} would be PARKED ({evidence})");
+        }
+        eprintln!(
+            "contract check: {} item(s) would be parked: this client is older than the world that emitted the contract",
+            parked.len()
+        );
+        2
     }
 }
 
@@ -2226,6 +2309,48 @@ mod tests {
     fn unknown_delivery_mode_is_rejected() {
         let error = parse_args(base_args(&["--delivery=bogus"]).into_iter()).unwrap_err();
         assert!(format!("{error:#}").contains("unknown --delivery mode"));
+    }
+
+    #[test]
+    fn contract_check_reports_deliverable_parked_and_refused_contracts() {
+        let clean = json::json!({
+            "runtime_locations": {"12259363": {"event_flag": 52410800, "vanilla_award_suppressed": false}},
+            "runtime_items": {"12255488": {"raw_descriptor": 0xB000_03E8_u32, "normalized_item_id": 0x4000_03E8_u32,
+                "item_category": 4, "descriptor_evidence": "goods_formula_observed", "quantity": 1,
+                "feed_effect": "not_equippable"}},
+            "goal_location": 12259363
+        });
+        assert_eq!(check_contract(&clean), 0);
+
+        let skewed = json::json!({
+            "runtime_items": {"12255707": {"raw_descriptor": 0x9000_55F0_u32, "normalized_item_id": 0x1000_55F0_u32,
+                "item_category": 1, "descriptor_evidence": "param_id_inferred", "quantity": 1,
+                "feed_effect": "attire_hands"}}
+        });
+        assert_eq!(check_contract(&skewed), 2);
+
+        let broken = json::json!({"runtime_items": {"not-an-id": {}}});
+        assert_eq!(check_contract(&broken), 1);
+
+        let dir = std::env::temp_dir().join(format!("bb-contract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slot.json");
+        std::fs::write(&path, clean.to_string()).unwrap();
+        let code = contract_check_request(
+            [
+                "--check-contract".to_string(),
+                path.to_string_lossy().into_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(code, Some(0));
+        assert!(
+            contract_check_request(["server".to_string()].into_iter())
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
