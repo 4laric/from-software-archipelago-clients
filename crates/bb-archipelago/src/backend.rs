@@ -76,6 +76,15 @@ impl std::fmt::Display for GrantTerminalFailure {
 impl std::error::Error for GrantTerminalFailure {}
 
 pub trait BloodborneBackend {
+    /// Gated category-8 construction experiment used to close bb-archipelago#214.
+    /// Implementations must run on the validated game-thread lane and must not
+    /// insert the constructed instance into inventory.
+    fn category8_generate(&mut self, _gem_gen_param: u32) -> Result<String> {
+        anyhow::bail!("category-8 construction is unavailable")
+    }
+    fn category8_insert(&mut self, _variant: u8) -> Result<String> {
+        anyhow::bail!("category-8 insertion is unavailable")
+    }
     /// Observation-only seam for clients#510. Backends without the native
     /// diagnostic intentionally ignore it.
     fn record_location_checks(&mut self, _locations: &[i64]) {}

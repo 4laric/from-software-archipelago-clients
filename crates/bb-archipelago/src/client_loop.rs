@@ -387,6 +387,18 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(format!("event flag {event_flag} = {value}"))
     }
 
+    pub fn rescue_category8_generate(&mut self, gem_gen_param: u32) -> Result<String> {
+        self.require_runtime_context("category-8 construction")?
+            .context("category-8 construction is waiting for gameplay")?;
+        self.backend.category8_generate(gem_gen_param)
+    }
+
+    pub fn rescue_category8_insert(&mut self, variant: u8) -> Result<String> {
+        self.require_runtime_context("category-8 insertion")?
+            .context("category-8 insertion is waiting for gameplay")?;
+        self.backend.category8_insert(variant)
+    }
+
     pub fn rescue_list_blocked(&self) -> String {
         self.rescue_list_blocked_with_names(|ap_item_id| format!("item #{ap_item_id}"))
     }
@@ -1192,6 +1204,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             return self.park_terminal_grant(item, &pending, failure);
         }
 
+        let category8_award = self.config.category8_awards.get(&item.ap_item_id).cloned();
         if !pending.grant_complete {
             // clients#427: the delivery precondition.
             //
@@ -1227,7 +1240,13 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     .grant_may_have_applied(&grant_tag(item.index))?,
                 None => false,
             };
-            let expected_before = if pending.item_category == 255 {
+            let expected_before = if pending.item_category == 255 || category8_award.is_some() {
+                // Category-8 bridge goods are reserved synthetic tokens. An
+                // absent token has no inventory record for the ordinary stack
+                // observer to find, so observing it can remain NotReady
+                // forever. The false acknowledgement flag above plus the
+                // durable AP pending row establish the one-shot precondition;
+                // the native goods lane can therefore insert from zero.
                 0
             } else {
                 match recorded_baseline.filter(|_| baseline_is_binding) {
@@ -1285,6 +1304,28 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 .mark_grant_complete()?;
             self.ledger.save(&self.ledger_path)?;
             pending.grant_complete = true;
+        }
+
+        if let Some(award) = &category8_award {
+            // The token's ordinary grant acknowledgement is only the first
+            // half. Completion belongs to the game's event: it consumes the
+            // token, awards the lot, then raises this seed-owned flag.
+            if self.backend.read_event_flag(award.ack_flag)? != Some(true) {
+                return Ok(ItemPollResult::Pending);
+            }
+            match self
+                .backend
+                .observe_stack_quantity(0x4000_0000 | award.token_goods_id, None)?
+            {
+                StackObservation::Quantity(0) => {}
+                StackObservation::NotReady | StackObservation::Unsupported => {
+                    return Ok(ItemPollResult::Pending);
+                }
+                // A true flag can be stale from an earlier seed using this
+                // save. The event clears it after seeing the new token, so do
+                // not turn that short hand-off window into a client failure.
+                StackObservation::Quantity(_) => return Ok(ItemPollResult::Pending),
+            }
         }
 
         if let Some(target) = pending.equip_target
@@ -1450,8 +1491,8 @@ mod tests {
         EquipRequest, ItemGrant, LocationContext, MockBackend, OperationProgress, StackObservation,
     };
     use crate::config::{
-        DescriptorEvidence, FeedEffectBinding, LocationBinding, RuntimeItemBinding,
-        TEST_PEBBLE_EVENT_FLAG,
+        Category8AwardBinding, DescriptorEvidence, FeedEffectBinding, LocationBinding,
+        RuntimeItemBinding, TEST_PEBBLE_EVENT_FLAG,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1488,6 +1529,7 @@ mod tests {
                 region: None,
             }],
             items: HashMap::from([(2000, goods())]),
+            category8_awards: HashMap::new(),
             auto_upgrade: false,
             auto_equip: false,
             death_link: false,
@@ -1505,6 +1547,102 @@ mod tests {
             mock_set_flags: vec![],
             goal_location: None,
         }
+    }
+
+    fn category8_config() -> RuntimeConfig {
+        let mut cfg = config();
+        cfg.items.insert(
+            2900,
+            RuntimeItemBinding {
+                raw_descriptor: 0xB000_2648,
+                normalized_item_id: 0x4000_2648,
+                item_category: 4,
+                descriptor_evidence: DescriptorEvidence::GoodsFormulaObserved,
+                quantity: 1,
+                reinforcement_level: None,
+                feed_effect: FeedEffectBinding::NotEquippable,
+            },
+        );
+        cfg.category8_awards.insert(
+            2900,
+            Category8AwardBinding {
+                item_key: "caryll_rune_communion_1".into(),
+                token_goods_id: 9800,
+                item_lot_id: 98_000_000,
+                gemgen_id: 102_901,
+                ack_flag: 98_001_000,
+                source_lot_id: 2_400_640,
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn category8_delivery_waits_for_event_ack_and_consumed_token() {
+        let ledger_path = path();
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2900,
+        }];
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            category8_config(),
+        );
+
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert_eq!(client.backend().grants.len(), 1);
+        assert_eq!(
+            client.backend().inventory.get(&(0x4000_2648, None)),
+            Some(&1),
+        );
+
+        client
+            .backend_mut()
+            .inventory
+            .insert((0x4000_2648, None), 0);
+        client.backend_mut().set_flags.insert(98_001_000);
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem {
+                index: 0,
+                ap_item_id: 2900,
+                ..
+            })
+        ));
+        assert_eq!(client.backend().grants.len(), 1);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn category8_stale_ack_from_previous_seed_does_not_skip_delivery() {
+        let ledger_path = path();
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2900,
+        }];
+        let mut backend = MockBackend::default();
+        backend.set_flags.insert(98_001_000);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            category8_config(),
+        );
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert_eq!(client.backend().grants.len(), 1);
+        assert_eq!(
+            client.backend().inventory.get(&(0x4000_2648, None)),
+            Some(&1),
+        );
+        std::fs::remove_file(ledger_path).unwrap();
     }
 
     /// Production-loop regression backend for clients#291. Only the target

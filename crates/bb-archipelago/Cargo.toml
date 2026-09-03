@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 archipelago_rs.workspace = true
 json.workspace = true
+dynasmrt = "3.2.1"
 serde.workspace = true
 sha2.workspace = true
 windows.workspace = true

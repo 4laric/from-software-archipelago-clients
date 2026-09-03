@@ -251,6 +251,18 @@ enum Backend {
 }
 
 impl BloodborneBackend for Backend {
+    fn category8_generate(&mut self, gem_gen_param: u32) -> Result<String> {
+        match self {
+            Self::Mock(backend) => backend.category8_generate(gem_gen_param),
+            Self::Native(backend) => backend.category8_generate(gem_gen_param),
+        }
+    }
+    fn category8_insert(&mut self, variant: u8) -> Result<String> {
+        match self {
+            Self::Mock(backend) => backend.category8_insert(variant),
+            Self::Native(backend) => backend.category8_insert(variant),
+        }
+    }
     fn record_presentation_marker(&mut self, note: &str) -> bool {
         match self {
             Self::Mock(backend) => backend.record_presentation_marker(note),
@@ -1086,7 +1098,7 @@ fn run() -> Result<()> {
             let command = words.first().map(|word| word.to_ascii_lowercase());
             let result = match command.as_deref() {
                 None | Some("") => continue,
-                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM (contract flags only; sends the check) | give INDEX CONFIRM (contract items only). Unknown/unmapped writes and warps fail closed.".to_owned(),
+                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM | give INDEX CONFIRM. Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
                     Some(runtime) => runtime
                         .rescue_status()

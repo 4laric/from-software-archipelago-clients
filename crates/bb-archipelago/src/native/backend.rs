@@ -31,9 +31,10 @@ use crate::event_flags::LiveEventFlags;
 use super::diagnostics::{DiagnosticSink, GrantContext, JsonlFile, diagnostics_path_for_ledger};
 use super::engine::{GrantStep, NativeDelivery, NativeGrantRequest};
 use super::flag_gate::FlagGate;
+use super::gem_alloc_probe::{self, AllocCapture};
 use super::gem_capture::GemCapture;
 use super::guest::GuestRuntime;
-use super::mem::NativeMemory;
+use super::mem::{NativeMemory, ProcessMemory};
 use super::pickup_notification_capture::PickupNotificationCapture;
 use super::probe_pack::{BOSS_FLAGS, BossFlagCensus, RuneCapture};
 use super::save_identity::SaveIdentityTracker;
@@ -97,12 +98,19 @@ pub struct NativeBackend {
     /// produced, stamped onto each diagnostic record. Not a guest read -- it is
     /// the value this backend already returned to the loop this iteration.
     last_context: GrantContext,
+    item_grant_probe_state: Option<u64>,
     gem_capture: Option<GemCapture>,
     shop_capture: Option<ShopCapture>,
     vial_capture: Option<VialCapture>,
     pickup_notification_capture: Option<PickupNotificationCapture>,
     boss_flag_census: Option<BossFlagCensus>,
     rune_capture: Option<RuneCapture>,
+    gem_alloc_probe_state: Option<u64>,
+    gem_alloc_capture: Option<AllocCapture>,
+    category8_scratch: Option<u64>,
+    category8_gen_ctx_rsi: Option<u64>,
+    category8_last_generated: Option<(u32, u32)>,
+    category8_inserted: std::collections::HashSet<u32>,
     process_id: u32,
 }
 
@@ -141,14 +149,20 @@ impl NativeBackend {
         );
         self.delivery
             .arm_diagnostics(DiagnosticSink::new(Box::new(JsonlFile::new(path))));
-        match GemCapture::beside_ledger(ledger) {
-            Ok(capture) => {
-                client_eprintln!(
-                    "Blood-gem diagnostics: read-only ItemGrant call records stream beside the ledger to blood-gem-capture.jsonl."
-                );
-                self.gem_capture = Some(capture);
+        if self.item_grant_probe_state.is_some() {
+            match GemCapture::beside_ledger(ledger, self.base) {
+                Ok(capture) => {
+                    client_eprintln!(
+                        "Blood-gem diagnostics: read-only ItemGrant calls and completed category-8 inventory records stream beside the ledger to blood-gem-capture.jsonl."
+                    );
+                    self.gem_capture = Some(capture);
+                }
+                Err(error) => client_eprintln!("Blood-gem diagnostics unavailable: {error}"),
             }
-            Err(error) => client_eprintln!("Blood-gem diagnostics unavailable: {error}"),
+        } else {
+            client_eprintln!(
+                "Blood-gem diagnostics inactive because the ItemGrant probe did not arm."
+            );
         }
         match VialCapture::beside_ledger(ledger) {
             Ok(capture) => {
@@ -198,12 +212,45 @@ impl NativeBackend {
                 Ok(capture) => self.rune_capture = Some(capture),
                 Err(error) => client_eprintln!("Rune capture unavailable: {error}"),
             }
+            match self.install_gem_alloc_probe(ledger) {
+                Ok(()) => client_eprintln!("gem-alloc-probe armed (entry capture / option B)."),
+                Err(error) => {
+                    client_eprintln!("gem-alloc-probe inactive; delivery unaffected: {error:#}")
+                }
+            }
         }
         if probes.insight {
             client_eprintln!(
                 "Insight probe requested but not armed: the reviewed player-stat candidate manifest is still empty; no addresses were guessed."
             );
         }
+    }
+
+    #[cfg(windows)]
+    fn install_gem_alloc_probe(&mut self, ledger: &std::path::Path) -> Result<()> {
+        use super::threads::WindowsThreadController;
+        let state = self
+            .delivery
+            .runtime_mut()
+            .memory()
+            .allocate(gem_alloc_probe::STATE_SIZE)?;
+        let scratch = self.delivery.runtime_mut().memory().allocate(0x300)?;
+        let mut threads = WindowsThreadController::new(self.process_id);
+        let prologue = gem_alloc_probe::install(
+            self.delivery.runtime_mut().memory(),
+            self.base,
+            state,
+            &mut threads,
+        )?;
+        self.gem_alloc_capture = Some(AllocCapture::beside_ledger(ledger, self.base, &prologue)?);
+        self.gem_alloc_probe_state = Some(state);
+        self.category8_scratch = Some(scratch);
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn install_gem_alloc_probe(&mut self, _ledger: &std::path::Path) -> Result<()> {
+        bail!("gem allocator probe is Windows-only")
     }
 
     #[cfg(windows)]
@@ -369,12 +416,28 @@ impl NativeBackend {
             InstallConfig::default(),
             std::thread::sleep,
         )?;
-        match item_grant_probe::install(&memory, base, &mut threads) {
-            Ok(()) => client_eprintln!("Blood-gem ItemGrant probe armed."),
-            Err(error) => client_eprintln!(
-                "Blood-gem ItemGrant probe inactive (delivery remains available): {error:#}"
-            ),
-        }
+        let item_grant_probe_state = match memory.allocate(item_grant_probe::PROBE_STATE_SIZE) {
+            Ok(state_address) => {
+                match item_grant_probe::install(&memory, base, state_address, &mut threads) {
+                    Ok(()) => {
+                        client_eprintln!("Blood-gem ItemGrant probe armed.");
+                        Some(state_address)
+                    }
+                    Err(error) => {
+                        client_eprintln!(
+                            "Blood-gem ItemGrant probe inactive (delivery remains available): {error:#}"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                client_eprintln!(
+                    "Blood-gem ItemGrant probe inactive (delivery remains available): allocating capture state: {error:#}"
+                );
+                None
+            }
+        };
 
         // clients#418: hand over the base this attach already confirmed rather
         // than letting the event-flag attach re-read the log and re-run the race.
@@ -407,18 +470,187 @@ impl NativeBackend {
             base,
             absent_observations: std::collections::HashMap::new(),
             last_context: GrantContext::default(),
+            item_grant_probe_state,
             gem_capture: None,
             shop_capture: None,
             vial_capture: None,
             pickup_notification_capture: None,
             boss_flag_census: None,
             rune_capture: None,
+            gem_alloc_probe_state: None,
+            gem_alloc_capture: None,
+            category8_scratch: None,
+            category8_gen_ctx_rsi: None,
+            category8_last_generated: None,
+            category8_inserted: std::collections::HashSet::new(),
             process_id,
         })
     }
 }
 
 impl BloodborneBackend for NativeBackend {
+    fn category8_generate(&mut self, gem_gen_param: u32) -> Result<String> {
+        anyhow::ensure!(
+            matches!(gem_gen_param, 102_901 | 123_000 | 90_040),
+            "GemGenParam {gem_gen_param} is outside the #214 experiment allowlist"
+        );
+        let scratch = self
+            .category8_scratch
+            .context("category-8 experiment is not armed; enable the research/probe option")?;
+        let rsi = self.category8_gen_ctx_rsi.context(
+            "no live generator context; open the Blood Gem workshop tab once, close it, and retry",
+        )?;
+        anyhow::ensure!(
+            (0x1_0000_0000..0x10_0000_0000).contains(&rsi),
+            "captured generator context is not a canonical guest pointer"
+        );
+        let contract = super::contract::contract();
+        let cell = |name: &str| -> Result<u64> { Ok(self.base + contract.state_cell(name)?.rva) };
+        let request = cell("request")?;
+        let quantity = cell("quantity")?;
+        let result = cell("result")?;
+        let done = cell("done")?;
+        let descriptor = cell("descriptor")?;
+        let scratch_cell = cell("item_quantity_pointer")?;
+        let memory = self.delivery.runtime_mut().memory();
+        anyhow::ensure!(
+            memory.read_u32(request)? == 0,
+            "native game-thread lane is busy"
+        );
+        memory.write(scratch, &[0; 0x300])?;
+        // Every captured fresh-generation frame (enemy and fixed-map rows)
+        // has this same self-relative shape. Zeroed writable memory is not a
+        // valid argument: the generator follows these four pointers.
+        memory.write_u64(scratch, 0xDEAD_BEEF_5432_1ABC)?;
+        memory.write_u64(scratch + 8, 0xDEAD_BEEF_5432_1ABC)?;
+        memory.write_u64(scratch + 0x10, rsi)?;
+        memory.write_u64(scratch + 0x18, scratch + 0xD8)?;
+        memory.write_u64(scratch + 0x20, scratch + 0x50)?;
+        memory.write_u64(scratch + 0x28, scratch + 0x278)?;
+        memory.write_u64(scratch + 0x30, scratch + 0x200)?;
+        memory.write_u64(scratch + 0x38, self.base + 0x1A88_3A1)?;
+        memory.write(descriptor, &[0; 24])?;
+        memory.write_u64(descriptor + 8, rsi)?;
+        memory.write_u64(scratch_cell, scratch)?;
+        memory.write_u32(quantity, gem_gen_param)?;
+        memory.write_u32(result, u32::MAX)?;
+        memory.write_u32(done, 0)?;
+        memory.write_u32(request, 3)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && memory.read_u32(done)? != 1 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        anyhow::ensure!(
+            memory.read_u32(done)? == 1,
+            "category-8 generator timed out"
+        );
+        anyhow::ensure!(
+            memory.read_u32(request)? == 0,
+            "category-8 request was not retired"
+        );
+        let rax = memory.read_u64(descriptor)?;
+        let bytes = memory.read(scratch, 0x300)?;
+        let mut handles = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .filter(|word| word & 0xFFFF_0000 == 0xC080_0000)
+            .collect::<Vec<_>>();
+        for word in [rax as u32, (rax >> 32) as u32] {
+            if word & 0xFFFF_0000 == 0xC080_0000 {
+                handles.push(word);
+            }
+        }
+        handles.sort_unstable();
+        handles.dedup();
+        let words = bytes
+            .chunks_exact(8)
+            .map(|chunk| format!("{:016X}", u64::from_le_bytes(chunk.try_into().unwrap())))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.category8_last_generated = match handles.as_slice() {
+            [handle] => Some((gem_gen_param, *handle)),
+            _ => None,
+        };
+        Ok(format!(
+            "AUDIT gem-gen id={gem_gen_param} rsi=0x{rsi:X} scratch=0x{scratch:X} rax=0x{rax:X} handles={handles:X?} words={words} (constructed only; inventory untouched)"
+        ))
+    }
+
+    fn category8_insert(&mut self, variant: u8) -> Result<String> {
+        anyhow::ensure!(variant <= 2, "variant must be 0, 1, or 2");
+        let (id, handle) = self
+            .category8_last_generated
+            .context("no uniquely decoded B1 instance; run gem-gen first and inspect its result")?;
+        anyhow::ensure!(
+            !self.category8_inserted.contains(&handle),
+            "handle 0x{handle:08X} was already inserted by this client"
+        );
+        let scratch = self
+            .category8_scratch
+            .context("category-8 scratch is unavailable")?;
+        let contract = super::contract::contract();
+        let cell = |name: &str| -> Result<u64> { Ok(self.base + contract.state_cell(name)?.rva) };
+        let request = cell("request")?;
+        let quantity = cell("quantity")?;
+        let result = cell("result")?;
+        let done = cell("done")?;
+        let descriptor = cell("descriptor")?;
+        let memory = self.delivery.runtime_mut().memory();
+        anyhow::ensure!(
+            memory.read_u32(request)? == 0,
+            "native game-thread lane is busy"
+        );
+        let normalized = if variant == 2 { 0 } else { 0x8000_0000 | id };
+        let object = if variant == 0 { scratch } else { 0 };
+        memory.write(descriptor, &[0; 24])?;
+        memory.write_u32(descriptor, handle)?;
+        memory.write_u64(descriptor + 8, object)?;
+        memory.write_u32(descriptor + 16, normalized)?;
+        memory.write_u32(quantity, 1)?;
+        memory.write_u32(result, u32::MAX)?;
+        memory.write_u32(done, 0)?;
+        memory.write_u32(request, 1)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && memory.read_u32(done)? != 1 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        anyhow::ensure!(
+            memory.read_u32(done)? == 1,
+            "category-8 insertion timed out"
+        );
+        anyhow::ensure!(
+            memory.read_u32(request)? == 0,
+            "category-8 insertion request was not retired"
+        );
+        let slot = memory.read_u32(result)?;
+        anyhow::ensure!(
+            slot != u32::MAX,
+            "ItemGrant refused category-8 variant {variant}"
+        );
+        let matched = self
+            .delivery
+            .runtime_mut()
+            .inventory_entries()
+            .context("inventory geometry was unavailable after ItemGrant")?
+            .into_iter()
+            .find(|entry| {
+                entry.word(0) == handle && (normalized == 0 || entry.word(4) == normalized)
+            });
+        let entry = matched.context(
+            "ItemGrant returned a slot but the generated instance was not found in held inventory",
+        )?;
+        let record = entry
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        self.category8_inserted.insert(handle);
+        Ok(format!(
+            "AUDIT gem-insert variant={variant} id={id} handle=0x{handle:08X} object=0x{object:X} normalized=0x{normalized:08X} slot={slot} record={} PASS",
+            record
+        ))
+    }
+
     fn record_location_checks(&mut self, locations: &[i64]) {
         if let Some(capture) = &mut self.pickup_notification_capture {
             capture.location_checks(locations);
@@ -445,12 +677,40 @@ impl BloodborneBackend for NativeBackend {
             capture.observe(entries.clone());
         }
         if let Some(capture) = &mut self.gem_capture {
-            let snapshots = self.delivery.runtime_mut().item_grant_probe_snapshots();
+            capture.observe_inventory(entries.clone());
+        }
+        if let Some(state) = self.gem_alloc_probe_state
+            && let Some(capture) = &mut self.gem_alloc_capture
+        {
+            let rows = gem_alloc_probe::snapshots(self.delivery.runtime_mut().memory(), state);
+            for row in &rows {
+                let rsi = row.registers[2];
+                let rcx = row.registers[4];
+                if rcx != u64::from(u32::MAX) && (0x1_0000_0000..0x10_0000_0000).contains(&rsi) {
+                    self.category8_gen_ctx_rsi = Some(rsi);
+                }
+            }
+            capture.observe(rows);
+        }
+        if let Some(state_address) = self.item_grant_probe_state
+            && let Some(capture) = &mut self.gem_capture
+        {
+            let snapshots = self
+                .delivery
+                .runtime_mut()
+                .item_grant_probe_snapshots(state_address);
             capture.observe(snapshots);
         }
-        if let Some(capture) = &mut self.pickup_notification_capture {
-            let snapshots = self.delivery.runtime_mut().item_grant_probe_snapshots();
+        if let Some(state_address) = self.item_grant_probe_state
+            && let Some(capture) = &mut self.pickup_notification_capture
+        {
+            let snapshots = self
+                .delivery
+                .runtime_mut()
+                .item_grant_probe_snapshots(state_address);
             capture.observe_native_calls(snapshots);
+        }
+        if let Some(capture) = &mut self.pickup_notification_capture {
             let snapshots = self.delivery.runtime_mut().pickup_presentation_snapshots();
             capture.observe_presentation_calls(snapshots);
         }

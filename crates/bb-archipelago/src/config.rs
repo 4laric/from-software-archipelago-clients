@@ -314,6 +314,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub items: HashMap<i64, RuntimeItemBinding>,
     #[serde(default)]
+    pub category8_awards: HashMap<i64, Category8AwardBinding>,
+    #[serde(default)]
     pub auto_upgrade: bool,
     #[serde(default)]
     pub auto_equip: bool,
@@ -359,6 +361,16 @@ pub struct RuntimeConfig {
     /// AP location whose debounced check completes this bounded world.
     #[serde(default)]
     pub goal_location: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Category8AwardBinding {
+    pub item_key: String,
+    pub token_goods_id: u32,
+    pub item_lot_id: u32,
+    pub gemgen_id: u32,
+    pub ack_flag: u32,
+    pub source_lot_id: u32,
 }
 
 impl RuntimeConfig {
@@ -443,6 +455,33 @@ impl RuntimeConfig {
                 items.insert(ap_item_id, row);
             }
             self.items = items;
+        }
+        if let Some(value) = slot_data.get("category8_awards") {
+            let rows: HashMap<String, Category8AwardBinding> =
+                json::from_value(value.clone()).context("parsing slot_data.category8_awards")?;
+            let mut awards = HashMap::with_capacity(rows.len());
+            for (raw_id, row) in rows {
+                let ap_item_id: i64 = raw_id
+                    .parse()
+                    .with_context(|| format!("invalid category-8 AP item id {raw_id:?}"))?;
+                let item = self.items.get(&ap_item_id).with_context(|| {
+                    format!("category-8 bridge names unknown AP item {ap_item_id}")
+                })?;
+                anyhow::ensure!(
+                    item.item_category == 4
+                        && item.quantity == 1
+                        && item.normalized_item_id == (0x4000_0000 | row.token_goods_id)
+                        && item.raw_descriptor == (0xB000_0000 | row.token_goods_id)
+                        && row.item_lot_id >= 98_000_000
+                        // Bloodborne only exposes preallocated event-flag groups.
+                        // 12400900..999 is the audited, vanilla-unused bridge window
+                        // in the already allocated 12400 group.
+                        && (12_400_900..=12_400_999).contains(&row.ack_flag),
+                    "AP item {ap_item_id} has an invalid category-8 bridge"
+                );
+                awards.insert(ap_item_id, row);
+            }
+            self.category8_awards = awards;
         }
         if let Some(value) = slot_data.get("auto_upgrade") {
             self.auto_upgrade = value
@@ -674,6 +713,7 @@ mod tests {
                 region: None,
             }],
             items: HashMap::new(),
+            category8_awards: HashMap::new(),
             auto_upgrade: false,
             auto_equip: false,
             death_link: false,
@@ -753,6 +793,43 @@ mod tests {
             .apply_slot_data(&json!({"runtime_locations": {"not-an-id": {"event_flag": 1}}}))
             .unwrap_err();
         assert!(format!("{error:#}").contains("invalid AP location id"));
+    }
+
+    #[test]
+    fn category8_bridge_accepts_only_the_allocated_ack_window() {
+        let slot_data = |ack_flag| {
+            json!({
+                "runtime_items": {
+                    "12255623": {
+                        "raw_descriptor": 0xB000_2648_u32,
+                        "normalized_item_id": 0x4000_2648_u32,
+                        "item_category": 4,
+                        "descriptor_evidence": "goods_formula_observed",
+                        "quantity": 1
+                    }
+                },
+                "category8_awards": {
+                    "12255623": {
+                        "item_key": "caryll_rune_communion_1",
+                        "token_goods_id": 9800,
+                        "item_lot_id": 98000000,
+                        "gemgen_id": 102901,
+                        "ack_flag": ack_flag,
+                        "source_lot_id": 2400640
+                    }
+                }
+            })
+        };
+
+        for ack_flag in [12_400_900, 12_400_990, 12_400_999] {
+            let config = local().apply_slot_data(&slot_data(ack_flag)).unwrap();
+            assert_eq!(config.category8_awards[&12_255_623].ack_flag, ack_flag);
+        }
+
+        for ack_flag in [12_400_899, 12_401_000, 98_001_000] {
+            let error = local().apply_slot_data(&slot_data(ack_flag)).unwrap_err();
+            assert!(format!("{error:#}").contains("invalid category-8 bridge"));
+        }
     }
 
     fn weapon_row(evidence: &str) -> json::Value {
