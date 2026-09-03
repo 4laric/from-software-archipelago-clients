@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::install::ThreadController;
 use super::mem::ProcessMemory;
 
-pub const ALLOCATOR_RVA: u64 = 0x1A87_590;
+pub const ALLOCATOR_RVA: u64 = 0x01A8_7590;
 const ORIGINAL: &[u8] = &[0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56];
 const RETURN_RVA: u64 = ALLOCATOR_RVA + ORIGINAL.len() as u64;
 const CAVE_RVA: u64 = 0x50D_BE70;
@@ -23,7 +23,7 @@ const RING_OFFSET: u64 = 0x40;
 const RECORD_SIZE: u64 = 0x300;
 const RING_CAPACITY: usize = 16;
 pub const STATE_SIZE: usize = RING_OFFSET as usize + RING_CAPACITY * RECORD_SIZE as usize;
-pub const STATIC_CALLERS: &[u64] = &[0x1A87_1F9, 0x1A87_E60, 0x1A88_A98];
+pub const STATIC_CALLERS: &[u64] = &[0x01A8_71F9, 0x01A8_7E60, 0x01A8_8A98];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllocEntry {
