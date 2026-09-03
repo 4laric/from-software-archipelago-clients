@@ -26,6 +26,7 @@ pub mod descriptor;
 pub mod diagnostics;
 pub mod engine;
 pub mod flag_gate;
+pub mod gem_alloc_probe;
 pub mod gem_capture;
 pub mod guest;
 pub mod install;

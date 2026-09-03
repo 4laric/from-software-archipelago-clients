@@ -1,7 +1,7 @@
 //! Standalone Bloodborne Archipelago client components.
 
 /// Exact cross-repository runtime contract shared by the apworld and native client.
-pub const RUNTIME_BUILD: &str = "bb-0.1.0-r9";
+pub const RUNTIME_BUILD: &str = "bb-0.1.0-r10";
 
 /// Version that identifies the exact client binary, not merely its Cargo package version.
 ///
