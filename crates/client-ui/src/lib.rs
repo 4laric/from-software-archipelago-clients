@@ -36,7 +36,12 @@ pub enum DeliveryState {
     WaitingForGameplay,
     Ready,
     CommandPending,
+    /// The item at the front of the queue has not moved past its budget. Nothing behind it
+    /// delivers until it does; `delivery_detail` says why, in the client's own words.
     Blocked,
+    /// Deliveries are flowing, but one or more earlier items are parked in the ledger for an
+    /// operator to inspect. A park never holds up the queue.
+    Parked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,12 +400,22 @@ pub fn delivery_headline(snapshot: &ClientSnapshot) -> (Severity, String) {
         DeliveryState::Blocked => (
             Severity::Bad,
             match snapshot.delivery_detail.as_deref() {
-                // An empty reason is treated as no reason: "Delivery blocked: " with nothing after
+                // An empty reason is treated as no reason: "Delivery stalled: " with nothing after
                 // the colon reads as a truncated string, which is worse than the bare sentence.
                 Some(reason) if !reason.trim().is_empty() => {
-                    format!("Delivery blocked: {}", reason.trim())
+                    format!("Delivery stalled: {}", reason.trim())
                 }
-                _ => "Delivery blocked - an item could not be granted.".to_owned(),
+                _ => "Delivery stalled - the item at the front of the queue has not moved."
+                    .to_owned(),
+            },
+        ),
+        DeliveryState::Parked => (
+            Severity::Warn,
+            match snapshot.delivery_detail.as_deref() {
+                Some(reason) if !reason.trim().is_empty() => {
+                    format!("Delivering; {}", reason.trim())
+                }
+                _ => "Delivering; some items are parked - type `blocked` to inspect.".to_owned(),
             },
         ),
     }
@@ -778,9 +793,35 @@ mod tests {
             headline(DeliveryState::Blocked, Some("harness refused (no slot)")),
             (
                 Severity::Bad,
-                "Delivery blocked: harness refused (no slot)".to_owned()
+                "Delivery stalled: harness refused (no slot)".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn a_parked_delivery_is_a_warning_that_says_delivery_continues() {
+        let (severity, text) = delivery_headline(&ClientSnapshot {
+            delivery: DeliveryState::Parked,
+            delivery_detail: Some(
+                "1 parked: Butcher Gloves (unreviewed_attire); type `blocked` to inspect".into(),
+            ),
+            ..Default::default()
+        });
+        assert_eq!(severity, Severity::Warn);
+        assert!(text.starts_with("Delivering; 1 parked"), "{text}");
+        let (severity, text) = delivery_headline(&ClientSnapshot {
+            delivery: DeliveryState::Parked,
+            ..Default::default()
+        });
+        assert_eq!(severity, Severity::Warn);
+        assert!(text.contains("type `blocked`"), "{text}");
+        // A park does not outrank connection or setup guidance the way a stall does.
+        let guidance = guidance_candidate(&ClientSnapshot {
+            delivery: DeliveryState::Parked,
+            process: ProcessState::Lost,
+            ..Default::default()
+        });
+        assert!(guidance.1.contains("restart the game"), "{}", guidance.1);
     }
 
     #[test]
@@ -792,7 +833,10 @@ mod tests {
                 ..Default::default()
             });
             assert_eq!(severity, Severity::Bad);
-            assert_eq!(text, "Delivery blocked - an item could not be granted.");
+            assert_eq!(
+                text,
+                "Delivery stalled - the item at the front of the queue has not moved."
+            );
         }
     }
 
@@ -825,7 +869,7 @@ mod tests {
                 DeliveryState::Blocked
             ))
             .1
-            .starts_with("Delivery blocked")
+            .starts_with("Delivery stalled")
         );
         assert!(
             guidance_candidate(&snapshot(

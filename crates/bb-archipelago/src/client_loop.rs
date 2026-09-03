@@ -541,6 +541,69 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         self.ledger.save(&self.ledger_path)
     }
 
+    /// The AP index at the front of the queue, if a durable pending plan exists.
+    pub fn pending_index(&self) -> Option<u64> {
+        self.ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.pending.as_ref().map(|pending| pending.index))
+    }
+
+    /// How many parked (blocked) entries this slot's ledger carries.
+    pub fn parked_count(&self) -> usize {
+        self.ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .map_or(0, |slot| slot.blocked_entries().count())
+    }
+
+    /// Why the item at the front of the queue is not moving, in one sentence a
+    /// player can act on. Read from the ledger and the runtime gate, so it
+    /// names the actual wait rather than a generic "pending".
+    pub fn pending_diagnosis(&mut self) -> Option<String> {
+        let (index, ap_item_id, grant_complete, category8) = {
+            let slot = self.ledger.slot(&self.seed_name, &self.slot_name)?;
+            let pending = slot.pending.as_ref()?;
+            (
+                pending.index,
+                pending.ap_item_id,
+                pending.grant_complete,
+                self.config
+                    .category8_awards
+                    .contains_key(&pending.ap_item_id),
+            )
+        };
+        let head = format!(
+            "AP item index {index} (id {ap_item_id}) is at the front of the queue and has not moved"
+        );
+        match self.require_runtime_context("stall diagnosis") {
+            Err(error) => return Some(format!("{head}: {error:#}")),
+            Ok(None) => {
+                return Some(format!(
+                    "{head}: waiting for gameplay (load your character and leave menus and loading screens)"
+                ));
+            }
+            Ok(Some(_)) => {}
+        }
+        if self.reconcile_watermark().ok()? == WatermarkOutcome::Hold {
+            return Some(format!(
+                "{head}: the save watermark is on hold after a rollback"
+            ));
+        }
+        Some(if category8 && grant_complete {
+            format!(
+                "{head}: its delivery token was granted but the game has not consumed it. \
+                 If a ?GoodsName? item is in the Hunter's Dream storage box, withdraw it; \
+                 otherwise leave menus and wait a few seconds"
+            )
+        } else if !grant_complete {
+            format!(
+                "{head}: the native grant has not completed. Leave menus and loading screens; \
+                 if it stays here, restart the client (the plan is durable and will not double-grant)"
+            )
+        } else {
+            format!("{head}: waiting for its equip or acknowledgement step")
+        })
+    }
+
     /// Release the durable character binding so the next validated gameplay
     /// observation binds afresh. Only permitted while the slot's ledger is
     /// pristine: nothing delivered, nothing pending, no operator grants. Once

@@ -304,8 +304,10 @@ impl StandaloneApp {
             };
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(headline).color(color(tint)));
-                if snapshot.delivery == client_ui::DeliveryState::Blocked
-                    && ui.link("Rescue…").clicked()
+                if matches!(
+                    snapshot.delivery,
+                    client_ui::DeliveryState::Blocked | client_ui::DeliveryState::Parked
+                ) && ui.link("Rescue…").clicked()
                 {
                     self.rescue_open = true;
                 }
