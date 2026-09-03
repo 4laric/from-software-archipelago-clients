@@ -185,16 +185,23 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
     )
 }
 
-/// One audited older wire contract that the current client can consume safely.
+/// Audited older wire contracts that the current client can consume safely.
 ///
 /// v0.5.0 moved the contract hash solely by adding optional `abilityUnlockItems`.
 /// A v0.4.13 seed cannot enable progressive ability locks and therefore omits that
 /// key, which the current parser and generated validator already interpret as the
-/// feature being off. Match both tokens: the hash was shared by other 0.4.x builds,
-/// and compatibility has not been audited for those releases.
+/// feature being off.
+///
+/// v0.5.7 moved the contract from v0.5.5 solely by adding optional
+/// `lockHintPlacements`. Its absence selects the existing `!hint` fallback, so a
+/// v0.5.5 seed is likewise a safe subset of the current contract.
+///
+/// Match version and hash together: hashes can be shared across releases, and
+/// compatibility has not been audited for every release that shared one.
 pub fn is_legacy_contract_compatible(versions: &str) -> bool {
     let has = |wanted: &str| versions.split_whitespace().any(|token| token == wanted);
-    has("apworld/0.4.13") && has("contract/dc0dc687")
+    (has("apworld/0.4.13") && has("contract/dc0dc687"))
+        || (has("apworld/0.5.5") && has("contract/8397a952"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -582,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_audited_v0413_contract_is_legacy_compatible() {
+    fn only_explicitly_audited_version_and_contract_pairs_are_legacy_compatible() {
         assert!(is_legacy_contract_compatible(
             "apworld/0.4.13 contract/dc0dc687 data/old"
         ));
@@ -593,5 +600,14 @@ mod tests {
             "apworld/0.4.13 contract/not-the-audited-contract data/old"
         ));
         assert!(!is_legacy_contract_compatible("apworld/0.4.13"));
+        assert!(is_legacy_contract_compatible(
+            "apworld/0.5.5 contract/8397a952 data/old"
+        ));
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.5.4 contract/8397a952 data/old"
+        ));
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.5.5 contract/ffc0f1b5 data/new"
+        ));
     }
 }

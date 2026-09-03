@@ -1236,15 +1236,14 @@ impl shared::Core for Core {
                     } else if er_logic::client_features::is_legacy_contract_compatible(
                         their_versions,
                     ) {
-                        // Audited one-way bridge for players whose v0.4.13 run outlived the game
-                        // build its matching DLL supported. v0.5.0 added only the optional
-                        // abilityUnlockItems contract key; absence is the off state in this client.
-                        // Do not broaden this to the shared hash alone: other 0.4.x versions have
-                        // not been audited and must retain the persistent mismatch warning.
+                        // Audited one-way bridges for older seeds whose missing contract fields
+                        // already have explicit off/fallback semantics in this client. Match exact
+                        // version/hash pairs in er-logic; a shared hash alone is not evidence.
                         log::warn!(
-                            "VERSION: LEGACY COMPATIBLE -- apworld/0.4.13 contract/dc0dc687 is an \
-                             audited subset of this client's contract/{}; progressive ability \
-                             locks are unavailable because that seed predates them.",
+                            "VERSION: AUDITED COMPATIBLE -- [{}] is a supported older subset of \
+                             this client's contract/{}. Features whose optional seed data is absent \
+                             use their documented off state or fallback.",
+                            their_versions,
                             crate::contract_gen::CONTRACT_HASH
                         );
                     } else {
