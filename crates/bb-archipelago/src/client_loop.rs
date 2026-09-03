@@ -528,6 +528,37 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         self.ledger.save(&self.ledger_path)
     }
 
+    /// Release the durable character binding so the next validated gameplay
+    /// observation binds afresh. Only permitted while the slot's ledger is
+    /// pristine: nothing delivered, nothing pending, no operator grants. Once
+    /// an item has reached a character, that character is the seed's.
+    pub fn rescue_rebind(&mut self) -> Result<String> {
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        let Some(previous) = slot.bound_save_identity.clone() else {
+            return Ok(
+                "No character is bound yet; the next validated gameplay observation binds.".into(),
+            );
+        };
+        anyhow::ensure!(
+            slot.acknowledged.is_empty()
+                && slot.highest_processed_index.is_none()
+                && slot.pending.is_none()
+                && slot.operator_grants.is_empty(),
+            "rebind refused: items have already been delivered to {previous}; a seed follows the character that received its first item"
+        );
+        slot.bound_save_identity = None;
+        slot.operator_actions.push(OperatorAction {
+            timestamp_ms: rescue_timestamp_ms(),
+            command: "rebind".into(),
+            argument: 0,
+            resolved_name: previous.clone(),
+        });
+        self.ledger.save(&self.ledger_path)?;
+        Ok(format!(
+            "released binding to {previous}; load the character you mean to play and the client will bind to it"
+        ))
+    }
+
     /// Set one seed-owned location flag. No raw or unmapped flag can cross
     /// this boundary; the caller receives the AP location id for naming.
     pub fn rescue_location_for_flag(&self, event_flag: u32) -> Result<i64> {
@@ -2231,6 +2262,99 @@ mod tests {
         assert!(client.ledger.slot("seed", "slot").is_none_or(|slot| {
             slot.operator_grants.is_empty() && slot.operator_actions.is_empty()
         }));
+        let _ = std::fs::remove_file(ledger_path);
+    }
+
+    #[test]
+    fn rescue_rebind_releases_a_pristine_binding_and_refuses_after_delivery() {
+        let ledger_path = path();
+        let mut backend = ready_backend();
+        backend.location_context = Some(LocationContext {
+            save_identity: "shad-save-slot:0008".into(),
+            gameplay_ready: true,
+        });
+        let mut config = recipe_config();
+        config.expected_save_identity = None;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config,
+        );
+        // A read binds the first character seen.
+        client.rescue_read_flag(TEST_PEBBLE_EVENT_FLAG).unwrap();
+        assert_eq!(
+            client
+                .ledger
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .as_deref(),
+            Some("shad-save-slot:0008")
+        );
+        // The player loads the character they meant to play.
+        client.backend.location_context = Some(LocationContext {
+            save_identity: "shad-save-slot:0000".into(),
+            gameplay_ready: true,
+        });
+        let refused = client.rescue_read_flag(TEST_PEBBLE_EVENT_FLAG).unwrap_err();
+        assert!(format!("{refused:#}").contains("durably bound"));
+
+        let message = client.rescue_rebind().unwrap();
+        assert!(message.contains("shad-save-slot:0008"));
+        assert!(
+            client
+                .ledger
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .is_none()
+        );
+        client.rescue_read_flag(TEST_PEBBLE_EVENT_FLAG).unwrap();
+        assert_eq!(
+            client
+                .ledger
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .as_deref(),
+            Some("shad-save-slot:0000")
+        );
+        let actions: Vec<&str> = client
+            .ledger
+            .slot("seed", "slot")
+            .unwrap()
+            .operator_actions
+            .iter()
+            .map(|action| action.command.as_str())
+            .collect();
+        assert_eq!(actions, ["rebind"]);
+
+        // Once something has been delivered the binding is final.
+        client.ledger.slot_mut("seed", "slot").acknowledged.insert(
+            0,
+            AcknowledgedItem {
+                ap_item_id: 2000,
+                raw_descriptor: goods().raw_descriptor,
+                normalized_item_id: goods().normalized_item_id,
+                item_category: 4,
+                quantity: 1,
+                reinforcement_level: None,
+                equip_target: None,
+                blocked: None,
+            },
+        );
+        let refused = client.rescue_rebind().unwrap_err();
+        assert!(format!("{refused:#}").contains("already been delivered"));
+        assert_eq!(
+            client
+                .ledger
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .as_deref(),
+            Some("shad-save-slot:0000")
+        );
         let _ = std::fs::remove_file(ledger_path);
     }
 
