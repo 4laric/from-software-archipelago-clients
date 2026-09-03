@@ -489,6 +489,7 @@ impl NativeBackend {
 }
 
 impl BloodborneBackend for NativeBackend {
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn category8_generate(&mut self, gem_gen_param: u32) -> Result<String> {
         anyhow::ensure!(
             matches!(gem_gen_param, 102_901 | 123_000 | 90_040),
@@ -528,7 +529,7 @@ impl BloodborneBackend for NativeBackend {
         memory.write_u64(scratch + 0x20, scratch + 0x50)?;
         memory.write_u64(scratch + 0x28, scratch + 0x278)?;
         memory.write_u64(scratch + 0x30, scratch + 0x200)?;
-        memory.write_u64(scratch + 0x38, self.base + 0x1A88_3A1)?;
+        memory.write_u64(scratch + 0x38, self.base + 0x01A8_83A1)?;
         memory.write(descriptor, &[0; 24])?;
         memory.write_u64(descriptor + 8, rsi)?;
         memory.write_u64(scratch_cell, scratch)?;
