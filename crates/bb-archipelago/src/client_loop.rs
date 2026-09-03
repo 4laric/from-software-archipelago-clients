@@ -649,6 +649,69 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(true)
     }
 
+    /// Queue every contract-known weapon and attire binding on the durable
+    /// operator lane. Polling remains strictly serial: this only removes the
+    /// need to paste roughly ninety `give` commands by hand.
+    pub fn rescue_equipment_census(
+        &mut self,
+        mut resolve_item: impl FnMut(i64) -> String,
+    ) -> Result<(usize, usize)> {
+        self.require_runtime_context("equipment census")?
+            .context("equipment census is waiting for gameplay")?;
+        let mut candidates = self
+            .config
+            .items
+            .iter()
+            .filter(|(_, binding)| {
+                matches!(binding.item_category, 0 | 1) && binding.descriptor_evidence.is_known()
+            })
+            .map(|(&ap_item_id, binding)| (ap_item_id, binding.clone()))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(ap_item_id, _)| *ap_item_id);
+
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        let mut queued = 0;
+        let mut skipped = 0;
+        for (ap_item_id, binding) in candidates {
+            if slot.operator_grants.contains_key(&ap_item_id)
+                || slot
+                    .acknowledged
+                    .values()
+                    .any(|item| item.ap_item_id == ap_item_id)
+            {
+                skipped += 1;
+                continue;
+            }
+            let item_name = resolve_item(ap_item_id);
+            slot.operator_grants.insert(
+                ap_item_id,
+                PendingItem {
+                    index: 0,
+                    ap_item_id,
+                    raw_descriptor: binding.raw_descriptor,
+                    normalized_item_id: binding.normalized_item_id,
+                    item_category: binding.item_category,
+                    quantity: 1,
+                    upgrade_target_level: None,
+                    reinforcement_level: binding.reinforcement_level,
+                    equip_target: None,
+                    grant_complete: false,
+                    equip_complete: true,
+                    observed_before: None,
+                },
+            );
+            slot.operator_actions.push(OperatorAction {
+                timestamp_ms: rescue_timestamp_ms(),
+                command: "census".into(),
+                argument: ap_item_id,
+                resolved_name: item_name,
+            });
+            queued += 1;
+        }
+        self.ledger.save(&self.ledger_path)?;
+        Ok((queued, skipped))
+    }
+
     /// Apply one named rescue recipe. Every step reuses an audited primitive
     /// (`rescue_set_flag`, `rescue_give`); the recipe adds a stable name, a
     /// description of the failure it repairs, and up-front validation so a
@@ -1782,6 +1845,18 @@ mod tests {
         }
     }
 
+    fn equipment(category: u8, normalized_item_id: u32) -> RuntimeItemBinding {
+        RuntimeItemBinding {
+            raw_descriptor: 0x8000_0000 | normalized_item_id,
+            normalized_item_id,
+            item_category: category,
+            descriptor_evidence: DescriptorEvidence::ParamIdInferred,
+            quantity: 1,
+            reinforcement_level: Some(0),
+            feed_effect: FeedEffectBinding::NotEquippable,
+        }
+    }
+
     fn config() -> RuntimeConfig {
         RuntimeConfig {
             shad_log: None,
@@ -2077,6 +2152,54 @@ mod tests {
                 .unwrap()
                 .highest_processed_index,
             None
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn equipment_census_queues_only_known_weapons_and_attire_and_is_idempotent() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.event_flags_armed = true;
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        let mut cfg = config();
+        cfg.items.insert(2001, equipment(0, 7_100_000));
+        cfg.items.insert(2002, equipment(1, 1_000_000));
+        cfg.items.insert(
+            2003,
+            RuntimeItemBinding {
+                descriptor_evidence: DescriptorEvidence::Unknown("unverified".into()),
+                ..equipment(0, 7_200_000)
+            },
+        );
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+
+        assert_eq!(
+            client
+                .rescue_equipment_census(|id| format!("item-{id}"))
+                .unwrap(),
+            (2, 0)
+        );
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert_eq!(slot.operator_grants.len(), 2);
+        assert!(slot.operator_grants.contains_key(&2001));
+        assert!(slot.operator_grants.contains_key(&2002));
+        assert!(!slot.operator_grants.contains_key(&2000));
+        assert!(!slot.operator_grants.contains_key(&2003));
+        assert!(
+            slot.operator_actions
+                .iter()
+                .all(|action| action.command == "census")
+        );
+
+        assert_eq!(
+            client
+                .rescue_equipment_census(|id| format!("item-{id}"))
+                .unwrap(),
+            (0, 2)
         );
         std::fs::remove_file(ledger_path).unwrap();
     }
