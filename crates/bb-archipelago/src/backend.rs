@@ -121,6 +121,22 @@ pub trait BloodborneBackend {
         normalized_item_id: u32,
         reinforcement_level: Option<u8>,
     ) -> Result<StackObservation>;
+    /// The live quantity of a stack sitting in the Hunter's Dream storage box
+    /// (clients#618), independent of held inventory: a completed grant that
+    /// did not fit into held inventory routes there instead, which is what
+    /// lets a delivery token go "missing" from the player's perspective while
+    /// still very much existing. Backends without a storage-box accessor
+    /// answer [`StackObservation::Unsupported`] explicitly -- never "zero" --
+    /// so a caller trying to prove a token absent before a rescue reissue can
+    /// tell "confirmed empty" apart from "cannot check yet". The default
+    /// keeps every backend that has not wired a storage read fail-closed.
+    fn observe_storage_quantity(
+        &mut self,
+        _normalized_item_id: u32,
+        _reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation> {
+        Ok(StackObservation::Unsupported)
+    }
     /// Whether the command published for `tag` may already have applied to the
     /// game (clients#427 follow-up).
     ///
@@ -215,6 +231,14 @@ pub struct MockBackend {
     /// Off models inventory geometry that has not hydrated yet: no baseline,
     /// so no grant this poll.
     pub stack_observation_ready: bool,
+    /// clients#618: the mock's storage-box contents, checked by
+    /// `observe_storage_quantity`. Separate from `inventory` because a token
+    /// can sit in storage while held inventory reads zero.
+    pub storage: HashMap<(u32, Option<u8>), u32>,
+    /// Off models a backend with no storage-box accessor at all (the
+    /// pre-clients#618 status quo, and every backend that has not wired a
+    /// live storage read): `observe_storage_quantity` answers `Unsupported`.
+    pub storage_observation_supported: bool,
     /// clients#427 follow-up: tags whose published command this mock models as
     /// *retained but never handed to the game* -- the native machine sitting in
     /// `awaiting_inventory`. Their recorded baseline is not binding, so the
@@ -250,6 +274,8 @@ impl Default for MockBackend {
             event_flags_armed: true,
             stack_observation_supported: true,
             stack_observation_ready: true,
+            storage: HashMap::new(),
+            storage_observation_supported: false,
             retained_unwitnessed: HashSet::new(),
             storage_routed: HashSet::new(),
             grant_delays: HashMap::new(),
@@ -373,6 +399,22 @@ impl BloodborneBackend for MockBackend {
         }
         Ok(StackObservation::Quantity(
             self.inventory
+                .get(&(normalized_item_id, reinforcement_level))
+                .copied()
+                .unwrap_or(0),
+        ))
+    }
+
+    fn observe_storage_quantity(
+        &mut self,
+        normalized_item_id: u32,
+        reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation> {
+        if !self.storage_observation_supported {
+            return Ok(StackObservation::Unsupported);
+        }
+        Ok(StackObservation::Quantity(
+            self.storage
                 .get(&(normalized_item_id, reinforcement_level))
                 .copied()
                 .unwrap_or(0),
