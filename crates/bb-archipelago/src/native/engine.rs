@@ -182,12 +182,24 @@ impl<R: Runtime> NativeDelivery<R> {
     }
 
     /// Whether the command published for `tag` may already have applied
-    /// (clients#427 follow-up). False only for the statuses that provably
-    /// precede any write -- the command is held in the machine and nothing has
-    /// been queued for the cave or written to the stack -- and for a tag this
-    /// machine has no record of at all. Those are exactly the states in which
-    /// the client's recorded baseline must be re-sampled instead of compared,
-    /// because the only thing that can have moved the stack is the player.
+    /// (clients#427 follow-up). False ONLY for the statuses that provably
+    /// precede any write -- the command is held in this machine and nothing
+    /// has been queued for the cave or written to the stack. Those are exactly
+    /// the states in which the client's recorded baseline must be re-sampled
+    /// instead of compared, because the only thing that can have moved the
+    /// stack is the player.
+    ///
+    /// A tag this machine has no record of answers TRUE, not false (review
+    /// finding C4). This method's memory (`finished`, and the session state)
+    /// is process-local: after a restart it is empty, and the caller only ever
+    /// asks about a tag whose DURABLE ledger row already carries an
+    /// `observed_before`. "I have never heard of this tag" is therefore not
+    /// evidence that nothing ran -- it is the signature of a client that was
+    /// killed mid-grant, possibly after the cave applied the delta on the game
+    /// thread. Answering false there made `poll_items` re-sample the live
+    /// stack, overwrite the durable baseline with the already-incremented
+    /// quantity, and grant the delta a second time (3 vials + 2 = 5, then +2
+    /// again = 7). Only a proof of non-application may unbind the baseline.
     ///
     /// A durable prior restored by [`Self::with_prior`] is classified the same
     /// way, so a restart mid-execution still replays against its baseline.
@@ -197,7 +209,7 @@ impl<R: Runtime> NativeDelivery<R> {
         }
         let state = self.session.state();
         if state.tag != tag {
-            return false;
+            return true;
         }
         !matches!(
             state.status.as_str(),
@@ -653,8 +665,11 @@ mod tests {
             contract().descriptor,
             contract().policy,
         );
-        // Unknown tag: nothing was ever published, so nothing can have applied.
-        assert!(!engine.command_may_have_applied("recv_1"));
+        // Review finding C4: an unknown tag is NOT proof that nothing ran.
+        // A fresh process has an empty `finished` map and a default session
+        // state, which is exactly what a restart mid-grant looks like, so the
+        // machine must not claim non-application it cannot prove.
+        assert!(engine.command_may_have_applied("recv_1"));
 
         // Inventory is not hydrated: the command is retained, not executed.
         assert_eq!(
@@ -692,6 +707,30 @@ mod tests {
             GrantStep::Complete
         );
         assert!(engine.command_may_have_applied("recv_1"));
+    }
+
+    /// Review finding C4: a restart is indistinguishable, from inside this
+    /// machine, from a grant that ran to completion just before the process
+    /// died. The client only asks about tags whose durable ledger row already
+    /// records an `observed_before`, so a rebuilt machine must answer that the
+    /// baseline is still binding; answering otherwise makes the loop re-sample
+    /// the live stack and grant the same delta twice.
+    #[test]
+    fn a_rebuilt_machine_keeps_the_durable_baseline_binding_for_an_unknown_tag() {
+        let engine = NativeDelivery::new(
+            FakeRuntime::default(),
+            contract().descriptor,
+            contract().policy,
+        );
+        assert!(
+            engine.command_may_have_applied("ap_7"),
+            "a machine with no process memory of ap_7 cannot prove the grant never applied"
+        );
+        assert_eq!(
+            engine.state().tag,
+            "",
+            "the restarted machine really does start with no session state"
+        );
     }
 
     // ----------------------------------------------------------------------

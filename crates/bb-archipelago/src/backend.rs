@@ -358,6 +358,12 @@ impl BloodborneBackend for MockBackend {
         ))
     }
 
+    /// Review finding C4: this default (`true` for every tag the test did not
+    /// explicitly mark retained) is the SAME answer the native machine gives
+    /// for a tag it has no record of, which is what a restart looks like.
+    /// While the native side answered `false` there, the restart tests in
+    /// `client_loop` passed against a mock that disagreed with the shipped
+    /// backend; keep the two aligned so those tests stay honest.
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
         Ok(!self.retained_unwitnessed.contains(tag))
     }
