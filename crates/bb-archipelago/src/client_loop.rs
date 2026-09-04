@@ -2295,7 +2295,12 @@ mod tests {
         let ledger_path = path();
         let mut backend = gameplay_backend();
         backend.storage_observation_supported = true;
-        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+        let mut client = loop_with(
+            backend,
+            stuck_pending_ledger(),
+            ledger_path.clone(),
+            config(),
+        );
 
         client.rescue_reissue_pending(0).unwrap();
 
@@ -2323,12 +2328,24 @@ mod tests {
         let mut backend = gameplay_backend();
         backend.storage_observation_supported = true;
         backend.inventory.insert((0x4000_04CE, None), 1);
-        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+        let mut client = loop_with(
+            backend,
+            stuck_pending_ledger(),
+            ledger_path.clone(),
+            config(),
+        );
 
         let error = client.rescue_reissue_pending(0).unwrap_err();
         assert!(error.to_string().contains("held in inventory"), "{error}");
         // Refused: nothing about the stuck plan moved.
-        assert!(client.ledger().slot("seed", "slot").unwrap().pending.is_some());
+        assert!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .is_some()
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 
@@ -2338,11 +2355,23 @@ mod tests {
         let mut backend = gameplay_backend();
         backend.storage_observation_supported = true;
         backend.storage.insert((0x4000_04CE, None), 1);
-        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+        let mut client = loop_with(
+            backend,
+            stuck_pending_ledger(),
+            ledger_path.clone(),
+            config(),
+        );
 
         let error = client.rescue_reissue_pending(0).unwrap_err();
         assert!(error.to_string().contains("storage box"), "{error}");
-        assert!(client.ledger().slot("seed", "slot").unwrap().pending.is_some());
+        assert!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .is_some()
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 
@@ -2353,11 +2382,26 @@ mod tests {
         // absence, or a token quietly sitting in storage gets duplicated.
         let ledger_path = path();
         let backend = gameplay_backend();
-        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+        let mut client = loop_with(
+            backend,
+            stuck_pending_ledger(),
+            ledger_path.clone(),
+            config(),
+        );
 
         let error = client.rescue_reissue_pending(0).unwrap_err();
-        assert!(error.to_string().contains("cannot read the storage box"), "{error}");
-        assert!(client.ledger().slot("seed", "slot").unwrap().pending.is_some());
+        assert!(
+            error.to_string().contains("cannot read the storage box"),
+            "{error}"
+        );
+        assert!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .is_some()
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 
@@ -2387,7 +2431,10 @@ mod tests {
         let mut client = loop_with(backend, ledger, ledger_path.clone(), config());
 
         let error = client.rescue_reissue_pending(0).unwrap_err();
-        assert!(error.to_string().contains("has not completed its grant"), "{error}");
+        assert!(
+            error.to_string().contains("has not completed its grant"),
+            "{error}"
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 
@@ -2399,7 +2446,12 @@ mod tests {
             save_identity: "mock-save".into(),
             gameplay_ready: false,
         });
-        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+        let mut client = loop_with(
+            backend,
+            stuck_pending_ledger(),
+            ledger_path.clone(),
+            config(),
+        );
 
         assert!(
             client
