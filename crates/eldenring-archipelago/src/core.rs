@@ -6128,68 +6128,112 @@ impl Core {
                             region.region, region.done, region.total, lock_tag, region.region
                         )
                     };
-                    // Dim the header text while the region's coarse region is locked. The token
-                    // pops on drop -- released right after the header so the rows keep their
-                    // own colors.
-                    let dim = (!region.accessible)
-                        .then(|| ui.push_style_color(imgui::StyleColor::Text, LOCKED_GRAY));
-                    let expanded = ui.collapsing_header(header, imgui::TreeNodeFlags::empty());
-                    drop(dim);
-                    // ---- "hint lock" button ---------------------------------------------------
-                    // Only on a LOCKED region, and only once the ledger has been read back: a
-                    // balance computed against an unread ledger looks like free money.
-                    if let Some(offer) = row_offer {
-                        // THE PURCHASE IS THE REVEAL (Alaric, 2026-08-09), so the button stays on
-                        // a concealed row. Buying blind is the point: it is what turns "Locked
-                        // region" into a name, and hiding the button until something else revealed
-                        // the region would leave the economy with nothing to sell.
-                        use er_logic::lock_hint_economy::LockHintOffer as Offer;
-                        match offer {
-                            Offer::Buyable { price, location } => {
-                                ui.same_line();
-                                if ui.small_button(format!(
-                                    "hint lock ({price})###trk-buy-{}",
-                                    region.region
-                                )) {
-                                    let lock_item = region
-                                        .unchecked
-                                        .first()
-                                        .and_then(|u| coarse_of.get(&u.location_id))
-                                        .and_then(|coarse| lock_item_of.get(coarse));
-                                    buy_clicks.push(
-                                        lock_item
-                                            .and_then(|item| lock_hint_placements.get(item))
-                                            .copied()
-                                            .unwrap_or(er_logic::lock_hint_economy::HintPlacement {
-                                                owner: our_slot,
-                                                location,
-                                            }),
-                                    );
-                                }
-                            }
-                            Offer::Insufficient { price, have, .. } => {
-                                // DISABLED WITH THE COST, never hidden: a player who cannot see
-                                // the price, or that they are making progress toward it, learns
-                                // nothing from the mechanic. AS A BUTTON (world#1014) --
-                                // `text_disabled` read as "no such control", so the per-region
-                                // button was reported missing too. The id matches the Buyable arm.
-                                ui.same_line();
-                                ui.disabled(true, || {
-                                    ui.small_button(format!(
-                                        "hint lock ({price} -- have {have})###trk-buy-{}",
+                    // Keep the expander and action in separate table cells. A collapsing header's
+                    // hit rectangle spans its available cell; putting a button on the same line
+                    // after it made the two controls visually distinct but interactively overlap
+                    // (#623). At some DPI/window widths, clicking `hint lock` toggled the region
+                    // instead. The fixed action column gives each widget an exclusive hit box.
+                    let action_width = match &row_offer {
+                        Some(er_logic::lock_hint_economy::LockHintOffer::Buyable { price, .. }) => ui
+                            .calc_text_size(format!("hint lock ({price})"))[0]
+                            + style.frame_padding[0] * 2.0,
+                        Some(er_logic::lock_hint_economy::LockHintOffer::Insufficient {
+                            price,
+                            have,
+                            ..
+                        }) => {
+                            ui.calc_text_size(format!("hint lock ({price} -- have {have})"))[0]
+                                + style.frame_padding[0] * 2.0
+                        }
+                        Some(er_logic::lock_hint_economy::LockHintOffer::AlreadyHinted { .. }) => {
+                            ui.calc_text_size("hinted")[0]
+                        }
+                        Some(er_logic::lock_hint_economy::LockHintOffer::Spilled) => {
+                            ui.calc_text_size("lock is in another world -- use !hint")[0]
+                        }
+                        _ => 0.0,
+                    };
+                    let mut expanded = false;
+                    if let Some(_table) = ui.begin_table_with_flags(
+                        format!("trk-region-row-{}", region.region),
+                        2,
+                        imgui::TableFlags::SIZING_STRETCH_PROP
+                            | imgui::TableFlags::NO_PAD_OUTER_X,
+                    ) {
+                        let mut region_column = imgui::TableColumnSetup::new("region");
+                        region_column.flags = imgui::TableColumnFlags::WIDTH_STRETCH;
+                        region_column.init_width_or_weight = 1.0;
+                        let mut action_column = imgui::TableColumnSetup::new("action");
+                        action_column.flags = imgui::TableColumnFlags::WIDTH_FIXED;
+                        action_column.init_width_or_weight = action_width;
+                        ui.table_setup_column_with(region_column);
+                        ui.table_setup_column_with(action_column);
+                        ui.table_next_row();
+                        ui.table_next_column();
+
+                        // Dim the header text while the region's coarse region is locked. The
+                        // token pops immediately so the action and contents keep their own colors.
+                        let dim = (!region.accessible)
+                            .then(|| ui.push_style_color(imgui::StyleColor::Text, LOCKED_GRAY));
+                        expanded =
+                            ui.collapsing_header(header, imgui::TreeNodeFlags::empty());
+                        drop(dim);
+
+                        ui.table_next_column();
+                        // ---- "hint lock" button -----------------------------------------------
+                        // Only on a LOCKED region, and only once the ledger has been read back: a
+                        // balance computed against an unread ledger looks like free money.
+                        if let Some(offer) = row_offer {
+                            // THE PURCHASE IS THE REVEAL (Alaric, 2026-08-09), so the button stays
+                            // on a concealed row. Buying blind is the point: it is what turns
+                            // "Locked region" into a name, and hiding the button until something
+                            // else revealed the region would leave the economy with nothing to sell.
+                            use er_logic::lock_hint_economy::LockHintOffer as Offer;
+                            match offer {
+                                Offer::Buyable { price, location } => {
+                                    if ui.small_button(format!(
+                                        "hint lock ({price})###trk-buy-{}",
                                         region.region
-                                    ));
-                                });
+                                    )) {
+                                        let lock_item = region
+                                            .unchecked
+                                            .first()
+                                            .and_then(|u| coarse_of.get(&u.location_id))
+                                            .and_then(|coarse| lock_item_of.get(coarse));
+                                        buy_clicks.push(
+                                            lock_item
+                                                .and_then(|item| lock_hint_placements.get(item))
+                                                .copied()
+                                                .unwrap_or(
+                                                    er_logic::lock_hint_economy::HintPlacement {
+                                                        owner: our_slot,
+                                                        location,
+                                                    },
+                                                ),
+                                        );
+                                    }
+                                }
+                                Offer::Insufficient { price, have, .. } => {
+                                    // DISABLED WITH THE COST, never hidden: a player who cannot see
+                                    // the price, or that they are making progress toward it, learns
+                                    // nothing from the mechanic. AS A BUTTON (world#1014) --
+                                    // `text_disabled` read as "no such control", so the per-region
+                                    // button was reported missing too. The id matches the Buyable arm.
+                                    ui.disabled(true, || {
+                                        ui.small_button(format!(
+                                            "hint lock ({price} -- have {have})###trk-buy-{}",
+                                            region.region
+                                        ));
+                                    });
+                                }
+                                Offer::AlreadyHinted { .. } => {
+                                    ui.text_colored(HINT_YELLOW, "hinted");
+                                }
+                                Offer::Spilled => {
+                                    ui.text_disabled("lock is in another world -- use !hint");
+                                }
+                                Offer::Unknown => {}
                             }
-                            Offer::AlreadyHinted { .. } => {
-                                ui.same_line();
-                                ui.text_colored(HINT_YELLOW, "hinted");
-                            }
-                            Offer::Spilled => {
-                                ui.same_line();
-                                ui.text_disabled("lock is in another world -- use !hint");
-                            }
-                            Offer::Unknown => {}
                         }
                     }
                     // A CONCEALED ROW HAS NO CONTENTS. The location names leak more than the
