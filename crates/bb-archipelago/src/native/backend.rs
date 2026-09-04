@@ -313,13 +313,28 @@ impl NativeBackend {
         }
 
         let polled = self.save_identity.poll()?;
-        if let Some(path) = self.save_identity.take_write_denial() {
-            client_eprintln!(
-                "WARNING: shadPS4 could not write the game's save file ({path}): Windows refused the write. \
-                 Nothing you do is being saved; the game will reload its last successful save when you die. \
-                 Close the game, clear the read-only attribute on the files in that folder (or fix its \
-                 permissions), and relaunch. Checks and deliveries still work meanwhile, but they are not persisted."
-            );
+        match self.save_identity.take_write_denial() {
+            Some(super::save_identity::WriteDenialReport::Stuck { path, read_only }) => {
+                let remedy = if read_only {
+                    "Close the game, clear the read-only attribute on that file (or fix its \
+                     permissions), and relaunch."
+                } else {
+                    "Close the game, check that folder's permissions, and relaunch."
+                };
+                client_eprintln!(
+                    "WARNING: shadPS4 could not write the game's save file ({path}): Windows refused the \
+                     write, and the save has not changed since. Nothing you do may be saved; the game could \
+                     reload its last successful save when you die. {remedy} Checks and deliveries still work \
+                     meanwhile, but may not be persisted."
+                );
+            }
+            Some(super::save_identity::WriteDenialReport::StillLanding { path }) => {
+                client_eprintln!(
+                    "shadPS4 logged a denied write-open on the save file ({path}), but the save has since \
+                     changed on disk -- it is still landing through another path. No action needed."
+                );
+            }
+            None => {}
         }
         let Some(identity) = polled else {
             self.live_identity_candidate = None;
