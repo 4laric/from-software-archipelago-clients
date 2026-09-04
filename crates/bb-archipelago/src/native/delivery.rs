@@ -217,6 +217,16 @@ pub struct GrantTrace {
     /// The clients#443 evidence predicate: the native call reported done and
     /// the result cell is no longer the pre-arm sentinel, so the routine ran.
     pub execution_evidence: bool,
+    /// Whether the dequeue-time scan found a stack of this id (goods only;
+    /// `None` until a lane is chosen, and re-set on every lane choice). The
+    /// insert lane is taken exactly when this is `Some(false)`, so a verify
+    /// read-back that finds a stack anyway means the scan and the game
+    /// disagreed -- the question clients#613 records this to answer.
+    pub stack_present_at_dequeue: Option<bool>,
+    /// clients#613: the insert was refused (result cell still the sentinel)
+    /// while a stack of the id existed at verify time, and the grant was
+    /// re-planned as a delta against that stack instead of parking.
+    pub replanned_to_delta: bool,
 }
 
 impl GrantTrace {
@@ -287,6 +297,10 @@ pub struct GrantSession<R: Runtime> {
     /// (clients#451). Count read-backs are not a witness for it; see
     /// [`GrantSession::poll_active`].
     instance_insert: bool,
+    /// clients#613: the current command has already been re-planned once
+    /// (insert refused, stack present). A second refusal parks; the re-plan
+    /// is not a retry loop.
+    replanned: bool,
     /// Passive forensics for the current grant (clients#445). Written on every
     /// transition, read by nothing inside this module.
     trace: GrantTrace,
@@ -321,6 +335,7 @@ impl<R: Runtime> GrantSession<R> {
             manual: false,
             delta_lane: false,
             instance_insert: false,
+            replanned: false,
             trace: GrantTrace::default(),
         }
     }
@@ -406,6 +421,7 @@ impl<R: Runtime> GrantSession<R> {
         self.verify_polls = 0;
         self.delta_lane = false;
         self.instance_insert = false;
+        self.replanned = false;
         self.expected_before = command.expected_before;
         let detail = format!("tag={}", command.tag);
         self.trace = GrantTrace::begin(&command);
@@ -476,6 +492,51 @@ impl<R: Runtime> GrantSession<R> {
                 && record.normalized_id == Some(command.normalized_id)
                 && record.quantity.is_some_and(|q| q >= command.quantity));
         if !slot_verified && actual != Some(wanted) {
+            // clients#613: an INSERT the game refused (`done`, result cell
+            // still the sentinel) while a stack of this id exists NOW. Jennifer's
+            // live park, verbatim:
+            //
+            //   failed (tag=ap_43 expected_after=2 actual=Some(10) native_result=4294967295 retry_budget=20)
+            //
+            // The dequeue-time scan saw no Antidote stack, so the insert lane
+            // was chosen with a baseline of zero; by verify time a stack of ten
+            // (the pouch cap) was there and ItemGrant declined to create a
+            // second one. Whether the scan missed the stack or the player
+            // withdrew it from storage in the window, the lane was wrong by the
+            // time the grant ran, and the grant provably did not apply (no
+            // execution evidence). The correct lane for an existing stack is
+            // the delta, and re-planning onto it cannot double-grant. If the
+            // delta then lands but the pouch stays capped, clients#443's
+            // storage-overflow rule completes it. One re-plan only: a second
+            // refusal is a real failure and parks with the full detail.
+            if !self.delta_lane
+                && !self.replanned
+                && native_result == EMPTY_SLOT
+                && let Some(live) = stack
+                && live.exists
+                && live.quantity > 0
+            {
+                self.replanned = true;
+                self.trace.replanned_to_delta = true;
+                // The cave is done; zeroing the arm signal cannot stop
+                // anything, and leaves the lane free for the delta.
+                self.runtime.clear_request();
+                self.active = false;
+                self.delta_lane = false;
+                self.verify_polls = 0;
+                self.absent_polls = 0;
+                self.expected_before = None;
+                if let Some(pending) = self.command.as_mut() {
+                    pending.expected_before = None;
+                }
+                return self.set(
+                    "replanning",
+                    format!(
+                        "tag={} insert refused by the game (native_result={native_result}) while a stack of {} now exists; re-planning as a delta against it",
+                        command.tag, live.quantity
+                    ),
+                );
+            }
             // clients#443: on the delta lane, EXECUTION EVIDENCE outranks the
             // equality, in EITHER direction. `native_done` is already true
             // here, and the result cell is no longer the `EMPTY_SLOT` sentinel
@@ -669,6 +730,7 @@ impl<R: Runtime> GrantSession<R> {
         let delta = stack.exists && stackable;
 
         if stackable {
+            self.trace.stack_present_at_dequeue = Some(stack.exists);
             // Goods, present or absent: the baseline is the live quantity (zero
             // when absent), or the durable prior for a replayed grant.
             self.expected_before = Some(match command.expected_before {
@@ -848,6 +910,11 @@ mod tests {
         // clients#451: report `done` with a result slot whose record is not
         // readable at all (all-`None`), the hydration shape for an insert.
         blank_insert_record: bool,
+        // clients#613: a stack of the granted id that APPEARS between the
+        // dequeue-time scan and the verify read-back, on the
+        // `complete_without_applying` path -- the stack the insert did not
+        // create. Models a scan false-negative or a storage withdrawal.
+        stack_appears: Option<StackView>,
     }
 
     impl FakeRuntime {
@@ -920,6 +987,9 @@ mod tests {
                         && let Some(stack) = self.stacks.get_mut(&descriptor.normalized_id)
                     {
                         stack.quantity += self.concurrent_pickup;
+                    }
+                    if let Some(appears) = self.stack_appears.take() {
+                        self.stacks.insert(descriptor.normalized_id, appears);
                     }
                     self.result = if self.report_no_result {
                         EMPTY_SLOT
@@ -1178,6 +1248,127 @@ mod tests {
         // The short budget, not the hydration one: a live stack is never
         // "not hydrated yet".
         assert!(session.state().detail.contains("retry_budget=20"));
+    }
+
+    /// clients#613, THE motivating case: the dequeue-time scan finds no stack,
+    /// the insert lane is taken with a zero baseline, the game REFUSES the
+    /// insert (`done` with the result cell still the sentinel), and the
+    /// read-back finds a stack of ten -- Jennifer's parked `ap_43`, an
+    /// Antidote pouch at its cap. The grant provably did not apply, and a
+    /// stack exists now, so the only correct lane is the delta: the machine
+    /// re-plans onto it and the item lands.
+    #[test]
+    fn an_insert_refused_while_a_stack_exists_replans_as_a_delta() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x44C;
+        let runtime = FakeRuntime {
+            ready: true,
+            complete_without_applying: true,
+            report_no_result: true,
+            stack_appears: Some(StackView {
+                quantity: 10,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            }),
+            ..FakeRuntime::default()
+        };
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x44C, 2, "ap_43", None), false)
+            .unwrap();
+        // Poll through the absent-stack hydration wait until the lane is chosen.
+        let mut status = session.poll();
+        for _ in 0..contract().policy.min_absent_polls {
+            if status != "awaiting_inventory" {
+                break;
+            }
+            status = session.poll();
+        }
+        assert_eq!(status, "executing", "state: {:?}", session.state());
+        assert!(
+            session
+                .state()
+                .detail
+                .contains("lane=insert source=in_frame expected_after=2")
+        );
+        assert_eq!(session.trace().stack_present_at_dequeue, Some(false));
+
+        // The refusal: done, sentinel result, and a stack of ten now present.
+        assert_eq!(session.poll(), "replanning", "state: {:?}", session.state());
+        let detail = session.state().detail.clone();
+        assert!(detail.contains("native_result=4294967295"), "{detail}");
+        assert!(detail.contains("stack of 10 now exists"), "{detail}");
+        assert!(session.trace().replanned_to_delta);
+        assert!(!session.trace().execution_evidence);
+
+        // The re-planned grant takes the delta lane against the live stack,
+        // with the live quantity as its baseline.
+        session.runtime_mut().complete_without_applying = false;
+        session.runtime_mut().report_no_result = false;
+        assert_eq!(session.poll(), "executing", "state: {:?}", session.state());
+        assert!(
+            session
+                .state()
+                .detail
+                .contains("lane=delta source=in_frame expected_after=12"),
+            "{}",
+            session.state().detail
+        );
+        assert_eq!(session.trace().stack_present_at_dequeue, Some(true));
+        let queued = session.runtime_mut().queued.expect("the delta queues");
+        assert_eq!((queued.1, queued.2, queued.3), (2, Some(3), Some(0x1000)));
+        assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+        assert_eq!(session.runtime_mut().stacks[&normalized].quantity, 12);
+        assert!(
+            session.runtime_mut().writes.is_empty(),
+            "the re-plan must not fall back to an external write"
+        );
+    }
+
+    /// clients#613: the re-plan is not a retry loop. If the delta the re-plan
+    /// chose ALSO comes back without execution evidence and without the
+    /// expected total, the grant parks with the ordinary failure detail.
+    #[test]
+    fn a_refusal_after_the_replan_parks_instead_of_replanning_again() {
+        let runtime = FakeRuntime {
+            ready: true,
+            complete_without_applying: true,
+            report_no_result: true,
+            stack_appears: Some(StackView {
+                quantity: 10,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            }),
+            ..FakeRuntime::default()
+        };
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x44C, 2, "ap_43", None), false)
+            .unwrap();
+        // Poll through the absent-stack hydration wait until the lane is chosen.
+        let mut status = session.poll();
+        for _ in 0..contract().policy.min_absent_polls {
+            if status != "awaiting_inventory" {
+                break;
+            }
+            status = session.poll();
+        }
+        assert_eq!(status, "executing");
+        assert_eq!(session.poll(), "replanning");
+        assert_eq!(session.poll(), "executing");
+        assert!(session.state().detail.contains("lane=delta"));
+        let mut last = String::new();
+        for _ in 0..contract().policy.verify_polls {
+            last = session.poll();
+        }
+        assert_eq!(last, "failed", "state: {:?}", session.state());
+        assert!(
+            session.state().detail.contains("retry_budget=20"),
+            "{}",
+            session.state().detail
+        );
+        assert!(session.trace().replanned_to_delta);
     }
 
     /// clients#443, THE motivating case: the delta lands AND the player loots

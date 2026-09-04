@@ -2,6 +2,21 @@
 
 ### Changed
 
+* **A refused insert re-plans as a delta instead of parking (clients#613).**
+  A playtester's Antidotes parked as `failed (tag=ap_43 expected_after=2
+  actual=Some(10) native_result=4294967295 retry_budget=20)`: the dequeue-time
+  scan saw no stack, the insert lane was taken with a zero baseline, and by
+  verify time a stack of ten (the pouch cap) was there and the game refused
+  to create a second one. The result cell never left the sentinel, so the
+  grant provably did not apply. The machine now re-plans that shape once, as
+  a delta against the stack that exists, and lets clients#443's overflow rule
+  complete it if the pouch is capped. A second refusal parks as before. The
+  delivery diagnostics record two new fields, `stack_present_at_dequeue` and
+  `replanned_to_delta`, so a scan false-negative is distinguishable from a
+  storage withdrawal next time. On startup, a goods-lane `failed` park whose
+  `native_result` is the sentinel re-enters the queue; every other `failed`
+  park still stays put.
+
 * **Receive-ledger rotation now survives brief Windows file locks
   (clients#560).** Backup removal, rotation, publication, and rollback retry
   only sharing/lock violations for a bounded 250 ms window and report every

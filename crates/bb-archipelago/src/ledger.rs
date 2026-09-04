@@ -460,6 +460,13 @@ impl SlotLedger {
     ///   the guest inventory page that shadPS4 intermittently refuses. That
     ///   lane is gone; existing-stack grants run on the game thread now.
     ///
+    /// * `failed` on the goods lane with NO execution evidence
+    ///   (`native_result=4294967295`, clients#613) -- the game refused the
+    ///   call, so nothing was granted and re-delivery cannot duplicate. The
+    ///   refused-insert-with-a-stack-present shape now re-plans as a delta.
+    ///   A `failed` carrying any other `native_result` is execution evidence
+    ///   (clients#443) and stays parked.
+    ///
     /// Every other park stays put for `bb-blocked`, because its cause is not
     /// known to be fixed. In particular `write_error (... quantity pointer
     /// missing)` is NOT requeued: a missing record pointer is a geometry
@@ -470,6 +477,9 @@ impl SlotLedger {
             Some("write_error") => {
                 Self::park_detail(item).is_some_and(|d| d.ends_with("quantity write failed"))
             }
+            Some("failed") => Self::park_detail(item).is_some_and(|d| {
+                d.contains("expected_after=") && d.contains("native_result=4294967295")
+            }),
             _ => false,
         }
     }
@@ -793,6 +803,31 @@ mod tests {
         assert_eq!(slot.requeue_fixed_cause_parks(), vec![0, 3]);
         let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();
         assert_eq!(still_parked, vec![1, 2]);
+    }
+
+    /// clients#613: a goods-lane `failed` with the result cell still the
+    /// sentinel is a call the game refused. Nothing landed, so re-delivery is
+    /// safe, and the refused insert now re-plans as a delta. Jennifer's live
+    /// park is verbatim below. The instance-insert shape (no `expected_after`)
+    /// is not covered: its evidence rules are different (clients#451).
+    #[test]
+    fn a_refused_goods_grant_without_execution_evidence_requeues() {
+        let mut slot = SlotLedger::default();
+        park_with(
+            &mut slot,
+            0,
+            "failed",
+            "tag=ap_43 expected_after=2 actual=Some(10) native_result=4294967295 retry_budget=20",
+        );
+        park_with(
+            &mut slot,
+            1,
+            "failed",
+            "tag=ap_44 instance insert unwitnessed: native_result=4294967295 slot_record=None retry_budget=20",
+        );
+        assert_eq!(slot.requeue_fixed_cause_parks(), vec![0]);
+        let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();
+        assert_eq!(still_parked, vec![1]);
     }
 
     /// clients#443: a park carrying EXECUTION EVIDENCE means the item landed,
