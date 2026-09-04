@@ -589,7 +589,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// player can act on. Read from the ledger and the runtime gate, so it
     /// names the actual wait rather than a generic "pending".
     pub fn pending_diagnosis(&mut self) -> Option<String> {
-        let (index, ap_item_id, grant_complete, category8) = {
+        let (index, ap_item_id, grant_complete, category8_award, token_routed_to_storage) = {
             let slot = self.ledger.slot(&self.seed_name, &self.slot_name)?;
             let pending = slot.pending.as_ref()?;
             (
@@ -598,7 +598,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 pending.grant_complete,
                 self.config
                     .category8_awards
-                    .contains_key(&pending.ap_item_id),
+                    .get(&pending.ap_item_id)
+                    .cloned(),
+                pending.token_routed_to_storage,
             )
         };
         let head = format!(
@@ -618,20 +620,55 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 "{head}: the save watermark is on hold after a rollback"
             ));
         }
-        Some(if category8 && grant_complete {
-            format!(
-                "{head}: its delivery token was granted but the game has not consumed it. \
-                 If a ?GoodsName? item is in the Hunter's Dream storage box, withdraw it; \
-                 otherwise leave menus and wait a few seconds"
-            )
-        } else if !grant_complete {
-            format!(
-                "{head}: the native grant has not completed. Leave menus and loading screens; \
+        // clients#617: a category-8 grant that has completed is not, by
+        // itself, evidence of a stall -- the ack flag and the ledger-recorded
+        // storage-routing evidence must be checked before naming a case,
+        // instead of always repeating the storage-box guess regardless of
+        // whether it is true.
+        Some(
+            if let Some(award) = category8_award.filter(|_| grant_complete) {
+                if token_routed_to_storage {
+                    format!(
+                        "{head}: its delivery token was granted but landed in the Hunter's Dream \
+                     storage box instead of held inventory. Withdraw it from storage so the \
+                     bridge event can consume it"
+                    )
+                } else {
+                    match self.backend.read_event_flag(award.ack_flag) {
+                        Ok(Some(true)) => format!(
+                            "{head}: its acknowledgement flag is already set -- the award landed \
+                         and the client simply has not caught up yet. This should clear on the \
+                         next poll; restart the client if it does not"
+                        ),
+                        Ok(_) => match self
+                            .backend
+                            .observe_stack_quantity(0x4000_0000 | award.token_goods_id, None)
+                        {
+                            Ok(StackObservation::Quantity(0)) => format!(
+                                "{head}: its delivery token is not held and its acknowledgement \
+                             flag is not set -- the token is likely gone (for example, lost to \
+                             a reload onto an older save). Confirm it is absent from storage too, \
+                             then use the pending-delivery reissue rescue command to re-grant it"
+                            ),
+                            _ => format!(
+                                "{head}: its delivery token was granted and is still on hand, but \
+                             the game has not consumed it yet. Leave menus and wait a few seconds"
+                            ),
+                        },
+                        Err(error) => {
+                            format!("{head}: could not read its acknowledgement flag: {error:#}")
+                        }
+                    }
+                }
+            } else if !grant_complete {
+                format!(
+                    "{head}: the native grant has not completed. Leave menus and loading screens; \
                  if it stays here, restart the client (the plan is durable and will not double-grant)"
-            )
-        } else {
-            format!("{head}: waiting for its equip or acknowledgement step")
-        })
+                )
+            } else {
+                format!("{head}: waiting for its equip or acknowledgement step")
+            },
+        )
     }
 
     /// Release the durable character binding so the next validated gameplay
@@ -733,6 +770,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 grant_complete: false,
                 equip_complete: true,
                 observed_before: None,
+                token_routed_to_storage: false,
             },
         );
         slot.operator_actions.push(OperatorAction {
@@ -795,6 +833,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     grant_complete: false,
                     equip_complete: true,
                     observed_before: None,
+                    token_routed_to_storage: false,
                 },
             );
             slot.operator_actions.push(OperatorAction {
@@ -1439,6 +1478,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             grant_complete: false,
             equip_complete: false,
             observed_before: None,
+            token_routed_to_storage: false,
         })
     }
 
@@ -1756,11 +1796,21 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             if progress == OperationProgress::Pending {
                 return Ok(ItemPollResult::Pending);
             }
-            self.ledger
-                .slot_mut(&self.seed_name, &self.slot_name)
-                .mark_grant_complete()?;
+            // clients#617: capture, at the one moment the backend can actually
+            // see it, whether this category-8 grant landed in storage instead
+            // of held inventory. The stall diagnosis below has no independent
+            // way to observe the storage box, so this durable flag is the only
+            // honest source for the "withdraw it from storage" verdict.
+            let routed_to_storage =
+                category8_award.is_some() && self.backend.last_grant_went_to_storage(&grant.tag);
+            let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+            slot.mark_grant_complete()?;
+            if routed_to_storage {
+                slot.mark_token_routed_to_storage()?;
+            }
             self.ledger.save(&self.ledger_path)?;
             pending.grant_complete = true;
+            pending.token_routed_to_storage = routed_to_storage;
         }
 
         if let Some(award) = &category8_award {
@@ -2150,6 +2200,140 @@ mod tests {
         assert_eq!(
             client.backend().inventory.get(&(0x4000_2648, None)),
             Some(&1),
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#617: a category-8 grant that lands in storage must be named
+    /// as such -- and only when the backend actually observed that, never as
+    /// the default guess.
+    #[test]
+    fn category8_stall_diagnosis_names_storage_only_when_observed() {
+        let ledger_path = path();
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2900,
+        }];
+        let mut backend = MockBackend::default();
+        backend.route_grant_to_storage(grant_tag(0));
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            category8_config(),
+        );
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        let diagnosis = client.pending_diagnosis().unwrap();
+        assert!(
+            diagnosis.contains("storage box"),
+            "expected the storage case, got: {diagnosis}"
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// A grant that did NOT land in storage must never be told to withdraw
+    /// from storage -- the false positive this issue exists to close.
+    #[test]
+    fn category8_stall_diagnosis_does_not_claim_storage_when_token_is_held() {
+        let ledger_path = path();
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2900,
+        }];
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            category8_config(),
+        );
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        // Token was granted and is held (clients#617 fixture default);
+        // ack flag is still unset.
+        assert_eq!(
+            client.backend().inventory.get(&(0x4000_2648, None)),
+            Some(&1)
+        );
+        let diagnosis = client.pending_diagnosis().unwrap();
+        assert!(
+            !diagnosis.contains("storage box"),
+            "must not guess storage without evidence, got: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("has not consumed it yet"),
+            "expected the generic waiting case, got: {diagnosis}"
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// The ack flag reading true means the award already landed; the
+    /// diagnosis must say so rather than repeat the generic "not consumed"
+    /// line.
+    #[test]
+    fn category8_stall_diagnosis_recognizes_a_true_ack_flag_as_landed() {
+        let ledger_path = path();
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2900,
+        }];
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            category8_config(),
+        );
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        client.backend_mut().set_flags.insert(98_001_000);
+        let diagnosis = client.pending_diagnosis().unwrap();
+        assert!(
+            diagnosis.contains("award landed"),
+            "expected the ack-on case, got: {diagnosis}"
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// A false negative in the other direction: the token absent AND the ack
+    /// flag off means the token is genuinely gone (e.g. lost to a reload),
+    /// and the diagnosis must point at reissue rather than at storage.
+    #[test]
+    fn category8_stall_diagnosis_reports_a_token_gone_when_absent_and_unacked() {
+        let ledger_path = path();
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2900,
+        }];
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            category8_config(),
+        );
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        // The token disappeared without the game ever raising the ack flag --
+        // clients#617's "reload to an older save" case.
+        client
+            .backend_mut()
+            .inventory
+            .insert((0x4000_2648, None), 0);
+        let diagnosis = client.pending_diagnosis().unwrap();
+        assert!(
+            !diagnosis.contains("storage box"),
+            "must not claim storage for a token that is gone, got: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("reissue"),
+            "expected the token-gone case to point at reissue, got: {diagnosis}"
         );
         std::fs::remove_file(ledger_path).unwrap();
     }

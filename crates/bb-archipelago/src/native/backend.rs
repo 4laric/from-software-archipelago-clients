@@ -810,6 +810,10 @@ impl BloodborneBackend for NativeBackend {
         Ok(self.delivery.command_may_have_applied(tag))
     }
 
+    fn last_grant_went_to_storage(&mut self, tag: &str) -> bool {
+        self.delivery.last_completion_went_to_storage(tag)
+    }
+
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
         if let Some(capture) = &mut self.pickup_notification_capture {
             capture.grant_state(grant, "submitted");

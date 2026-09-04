@@ -165,6 +165,14 @@ pub struct PendingItem {
     pub grant_complete: bool,
     #[serde(default)]
     pub equip_complete: bool,
+    /// Set when the backend observed this pending item's category-8 grant
+    /// landing in the Hunter's Dream storage box rather than held inventory
+    /// (clients#617). Durable so a stall diagnosis after a restart still
+    /// knows the case without re-deriving it from a heuristic that only the
+    /// grant's own completion moment can see. `false` is the default and
+    /// covers both "did not happen" and "this backend cannot tell".
+    #[serde(default)]
+    pub token_routed_to_storage: bool,
     /// The live stack quantity observed at the moment this grant was first
     /// submitted (clients#427). It is the delivery precondition, and it is
     /// durable so that a restart mid-grant compares against the SAME baseline
@@ -421,6 +429,18 @@ impl SlotLedger {
             .as_mut()
             .context("no pending item to mark granted")?;
         pending.grant_complete = true;
+        Ok(())
+    }
+
+    /// Record that this pending item's grant was observed landing in storage
+    /// (clients#617). Durable so the stall diagnosis can name the case
+    /// precisely instead of assuming it on every category-8 grant.
+    pub fn mark_token_routed_to_storage(&mut self) -> Result<()> {
+        let pending = self
+            .pending
+            .as_mut()
+            .context("no pending item to mark storage-routed")?;
+        pending.token_routed_to_storage = true;
         Ok(())
     }
 
@@ -900,6 +920,7 @@ mod tests {
             grant_complete: false,
             equip_complete: false,
             observed_before: None,
+            token_routed_to_storage: false,
         })
         .unwrap();
         slot.acknowledge_blocked(
@@ -933,6 +954,7 @@ mod tests {
             grant_complete: false,
             equip_complete: false,
             observed_before: None,
+            token_routed_to_storage: false,
         }
     }
 
@@ -1162,6 +1184,7 @@ mod tests {
                 grant_complete: true,
                 equip_complete: false,
                 observed_before: Some(0),
+                token_routed_to_storage: false,
             })
             .unwrap();
             slot.acknowledge(
@@ -1206,6 +1229,7 @@ mod tests {
             grant_complete: false,
             equip_complete: false,
             observed_before: None,
+            token_routed_to_storage: false,
         };
         slot.begin(plan.clone()).unwrap();
         slot.record_observed_before(7).unwrap();
@@ -1253,6 +1277,7 @@ mod tests {
                 grant_complete: false,
                 equip_complete: false,
                 observed_before: None,
+                token_routed_to_storage: false,
             })
             .unwrap();
         ledger
@@ -1297,6 +1322,7 @@ mod tests {
             grant_complete: false,
             equip_complete: false,
             observed_before: None,
+            token_routed_to_storage: false,
         };
         slot.begin(pending.clone()).unwrap();
         let bytes = json::to_vec(&ledger).unwrap();
@@ -1340,6 +1366,7 @@ mod tests {
                 grant_complete: false,
                 equip_complete: false,
                 observed_before: None,
+                token_routed_to_storage: false,
             })
             .unwrap();
             slot.mark_grant_complete().unwrap();
@@ -1487,6 +1514,7 @@ mod tests {
             grant_complete: false,
             equip_complete: false,
             observed_before: None,
+            token_routed_to_storage: false,
         })
         .unwrap();
         // The grant never completed: the ordinary acknowledge refuses, the
@@ -1530,6 +1558,7 @@ mod tests {
             grant_complete: false,
             equip_complete: false,
             observed_before: None,
+            token_routed_to_storage: false,
         })
         .unwrap();
         let mut parked = acknowledged(0);
