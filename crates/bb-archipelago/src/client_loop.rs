@@ -565,6 +565,16 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     pub fn rescue_retry_blocked(&mut self, index: u64) -> Result<()> {
         self.require_runtime_context("rescue delivery retry")?
             .context("rescue delivery retry is waiting for gameplay")?;
+        if let Some(pending) = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.pending.as_ref())
+        {
+            anyhow::bail!(
+                "parked index {index} is waiting behind active delivery index {}; resolve the Delivery Stalled guidance first. If this client supports the parked binding now, it will retry automatically as soon as that delivery finishes",
+                pending.index
+            );
+        }
         self.ledger
             .slot_mut(&self.seed_name, &self.slot_name)
             .requeue_blocked(index)?;
@@ -1639,10 +1649,39 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// (review finding C5) -- the caller reports those so the operator knows
     /// why a park it expected to see unparked is still parked.
     pub fn requeue_fixed_cause_parks(&mut self) -> Result<FixedCauseRequeue> {
+        let compatible = self
+            .config
+            .items
+            .iter()
+            .filter(|(_, binding)| binding.descriptor_evidence.is_known())
+            .map(|(ap_item_id, _)| *ap_item_id)
+            .collect::<HashSet<_>>();
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        let mut outcome = slot.requeue_fixed_cause_parks();
+        let upgraded = slot.requeue_now_compatible_parks(|id| compatible.contains(&id));
+        outcome.requeued.extend(upgraded.requeued);
+        outcome.deferred.extend(upgraded.deferred);
+        if !outcome.requeued.is_empty() {
+            self.ledger.save(&self.ledger_path)?;
+        }
+        Ok(outcome)
+    }
+
+    fn requeue_now_compatible_parks(&mut self) -> Result<FixedCauseRequeue> {
+        if self.ledger.slot(&self.seed_name, &self.slot_name).is_none() {
+            return Ok(FixedCauseRequeue::default());
+        }
+        let compatible = self
+            .config
+            .items
+            .iter()
+            .filter(|(_, binding)| binding.descriptor_evidence.is_known())
+            .map(|(ap_item_id, _)| *ap_item_id)
+            .collect::<HashSet<_>>();
         let outcome = self
             .ledger
             .slot_mut(&self.seed_name, &self.slot_name)
-            .requeue_fixed_cause_parks();
+            .requeue_now_compatible_parks(|id| compatible.contains(&id));
         if !outcome.requeued.is_empty() {
             self.ledger.save(&self.ledger_path)?;
         }
@@ -1652,6 +1691,23 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// Processes at most one item, preserving AP index order and durable state
     /// across the grant -> optional upgrade -> optional equip sequence.
     pub fn poll_items(&mut self, received: &[IncomingItem]) -> Result<ItemPollResult> {
+        // A park deferred at startup because another delivery owned the lane
+        // must recover without asking the player to restart or use Rescue.
+        // This is cheap once there is nothing eligible and persists only when
+        // an entry actually moves back into the ordered queue.
+        let recovered = self.requeue_now_compatible_parks()?;
+        if !recovered.requeued.is_empty() {
+            client_eprintln!(
+                "Automatically re-queued {} parked item(s) now supported by this client (indices {}).",
+                recovered.requeued.len(),
+                recovered
+                    .requeued
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         // A sustain command already published to the single native lane must be advanced before an
         // AP item tries to use that lane. The old main-loop ordering stopped polling sustain as
         // soon as an AP item arrived, so each side waited forever for the other. Bounded retirement

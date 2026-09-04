@@ -580,6 +580,41 @@ impl SlotLedger {
         }
     }
 
+    /// Requeue parks created only because the old client did not understand a
+    /// binding which the current runtime contract now validates. The caller
+    /// supplies that compatibility decision; the ledger never guesses from a
+    /// stale error string alone.
+    pub fn requeue_now_compatible_parks(
+        &mut self,
+        mut binding_is_now_compatible: impl FnMut(i64) -> bool,
+    ) -> FixedCauseRequeue {
+        let indices: Vec<u64> = self
+            .acknowledged
+            .iter()
+            .filter(|(_, item)| {
+                matches!(
+                    Self::park_status(item),
+                    Some("unreviewed_attire" | "unknown_descriptor_evidence")
+                ) && binding_is_now_compatible(item.ap_item_id)
+            })
+            .map(|(index, _)| *index)
+            .collect();
+        if self.pending.is_some() {
+            return FixedCauseRequeue {
+                requeued: Vec::new(),
+                deferred: indices,
+            };
+        }
+        for index in &indices {
+            self.acknowledged.remove(index);
+            self.redeliver.insert(*index);
+        }
+        FixedCauseRequeue {
+            requeued: indices,
+            deferred: Vec::new(),
+        }
+    }
+
     /// The parked (blocked) entries, for bb-blocked's listing.
     pub fn blocked_entries(&self) -> impl Iterator<Item = (u64, &AcknowledgedItem)> {
         self.acknowledged
@@ -1081,6 +1116,44 @@ mod tests {
         // Once the in-flight item is acknowledged, the next start unparks it.
         slot.pending = None;
         assert_eq!(slot.requeue_fixed_cause_parks().requeued, vec![0]);
+        assert_eq!(slot.next_index(), 0);
+    }
+
+    #[test]
+    fn an_upgrade_requeues_only_unknown_bindings_the_current_client_supports() {
+        let mut slot = SlotLedger::default();
+        park_with(
+            &mut slot,
+            0,
+            "unknown_descriptor_evidence",
+            "AP item 1 carries descriptor evidence unreviewed_attire_332000",
+        );
+        park_with(&mut slot, 1, "failed", "execution evidence remains unsafe");
+
+        let outcome = slot.requeue_now_compatible_parks(|ap_item_id| ap_item_id == 1);
+
+        assert_eq!(outcome.requeued, vec![0]);
+        assert_eq!(
+            slot.blocked_entries()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn an_upgrade_park_recovers_when_the_active_delivery_finishes() {
+        let mut slot = SlotLedger::default();
+        park_with(&mut slot, 0, "unreviewed_attire", "protector 332000");
+        slot.pending = Some(pending_pebble(1));
+
+        let held = slot.requeue_now_compatible_parks(|_| true);
+        assert_eq!(held.deferred, vec![0]);
+        assert!(held.requeued.is_empty());
+
+        slot.pending = None;
+        let recovered = slot.requeue_now_compatible_parks(|_| true);
+        assert_eq!(recovered.requeued, vec![0]);
         assert_eq!(slot.next_index(), 0);
     }
 
