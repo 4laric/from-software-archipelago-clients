@@ -105,6 +105,13 @@ pub struct DeliveryRecord {
     pub readback_surplus: Option<i64>,
     pub native_result: Option<u32>,
     pub execution_evidence: bool,
+    /// clients#613: what the dequeue-time scan said about a stack of this id
+    /// (goods only). `false` with a later non-zero read-back is a scan the
+    /// game disagreed with.
+    pub stack_present_at_dequeue: Option<bool>,
+    /// clients#613: the grant was re-planned from a refused insert onto the
+    /// delta lane.
+    pub replanned_to_delta: bool,
     pub verify_polls: u32,
     pub terminal_status: String,
     pub terminal_detail: String,
@@ -193,6 +200,8 @@ impl DeliveryRecord {
             readback_surplus: trace.readback_surplus(),
             native_result: trace.native_result,
             execution_evidence: trace.execution_evidence,
+            stack_present_at_dequeue: trace.stack_present_at_dequeue,
+            replanned_to_delta: trace.replanned_to_delta,
             verify_polls: trace.verify_polls,
             terminal_status: status.to_string(),
             terminal_detail: detail.to_string(),
