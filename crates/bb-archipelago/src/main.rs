@@ -369,6 +369,13 @@ impl BloodborneBackend for Backend {
         }
     }
 
+    fn last_grant_went_to_storage(&mut self, tag: &str) -> bool {
+        match self {
+            Self::Mock(backend) => backend.last_grant_went_to_storage(tag),
+            Self::Native(backend) => backend.last_grant_went_to_storage(tag),
+        }
+    }
+
     fn death_link_kill(&mut self) -> Result<bool> {
         match self {
             Self::Mock(backend) => backend.death_link_kill(),

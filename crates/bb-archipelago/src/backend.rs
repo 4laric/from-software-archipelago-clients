@@ -152,6 +152,16 @@ pub trait BloodborneBackend {
     /// default here is invisible to the enum wrapper the binary dispatches
     /// through.
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool>;
+    /// Whether the most recently completed grant for `tag` was observed
+    /// landing in storage rather than held inventory (clients#617). Only
+    /// meaningful for a category-8 token grant that just returned
+    /// `OperationProgress::Complete`. The default is `false`, which is
+    /// correct both when it did not happen and when this backend has no
+    /// per-grant storage evidence to offer -- either way the stall diagnosis
+    /// must not claim a token is in storage without proof.
+    fn last_grant_went_to_storage(&mut self, _tag: &str) -> bool {
+        false
+    }
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress>;
     /// Kill the loaded player for an incoming DeathLink. `false` means the
     /// validated player HP pointer is not captured/gameplay-ready yet.
@@ -234,6 +244,10 @@ pub struct MockBackend {
     /// `awaiting_inventory`. Their recorded baseline is not binding, so the
     /// next publication re-observes the live stack.
     pub retained_unwitnessed: HashSet<String>,
+    /// clients#617: tags whose grant should report as having landed in
+    /// storage, for exercising the stall-diagnosis storage case without a
+    /// live native engine.
+    pub storage_routed: HashSet<String>,
     grant_delays: HashMap<String, u8>,
     pending_grants: HashSet<String>,
     equip_delays: HashMap<String, u8>,
@@ -263,6 +277,7 @@ impl Default for MockBackend {
             storage: HashMap::new(),
             storage_observation_supported: false,
             retained_unwitnessed: HashSet::new(),
+            storage_routed: HashSet::new(),
             grant_delays: HashMap::new(),
             pending_grants: HashSet::new(),
             equip_delays: HashMap::new(),
@@ -299,6 +314,12 @@ impl MockBackend {
 
     pub fn delay_equip(&mut self, tag: impl Into<String>, polls: u8) {
         self.equip_delays.insert(tag.into(), polls);
+    }
+
+    /// Simulate a completed grant that the native engine observed landing in
+    /// storage rather than held inventory (clients#617).
+    pub fn route_grant_to_storage(&mut self, tag: impl Into<String>) {
+        self.storage_routed.insert(tag.into());
     }
 
     /// Simulate a save restore (bb-archipelago#77): the game-side state rewinds
@@ -408,6 +429,10 @@ impl BloodborneBackend for MockBackend {
     /// backend; keep the two aligned so those tests stay honest.
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
         Ok(!self.retained_unwitnessed.contains(tag))
+    }
+
+    fn last_grant_went_to_storage(&mut self, tag: &str) -> bool {
+        self.storage_routed.contains(tag)
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
