@@ -1123,6 +1123,13 @@ fn run() -> Result<()> {
         "Developer rescue console ready. Type 'help'. Mutations require an explicit CONFIRM token and reuse the validated delivery pipeline."
     );
 
+    // A pending item that stays at the front of the queue past this long is
+    // reported once, with its diagnosis, and shown as a stall instead of the
+    // neutral "Working" pill.
+    const STALL_AFTER: Duration = Duration::from_secs(60);
+    let mut pending_since: Option<(u64, Instant)> = None;
+    let mut stall_reported_for: Option<u64> = None;
+
     loop {
         #[cfg(windows)]
         let mut ui_delivery = if runtime.is_some() {
@@ -1865,9 +1872,15 @@ fn run() -> Result<()> {
                 Ok(ItemPollResult::Blocked(blocked)) => {
                     #[cfg(windows)]
                     {
-                        ui_delivery = client_ui::DeliveryState::Blocked;
-                        ui_delivery_detail =
-                            Some(format!("{} ({})", blocked.status, blocked.detail));
+                        // A park never holds up the queue; say so, and keep the
+                        // stall state for an item that actually is not moving.
+                        ui_delivery = client_ui::DeliveryState::Parked;
+                        ui_delivery_detail = Some(format!(
+                            "{} parked, latest {} ({}); type `blocked` to inspect",
+                            runtime.parked_count(),
+                            item_label(client.this_game(), blocked.ap_item_id),
+                            blocked.status
+                        ));
                         ui_reducer.activity(
                             client_ui::ActivityKind::ParkedDelivery,
                             format!(
@@ -1896,6 +1909,8 @@ fn run() -> Result<()> {
                     false
                 }
                 Ok(ItemPollResult::Idle) => {
+                    pending_since = None;
+                    stall_reported_for = None;
                     #[cfg(windows)]
                     {
                         ui_delivery = client_ui::DeliveryState::Ready;
@@ -1903,9 +1918,38 @@ fn run() -> Result<()> {
                     true
                 }
                 Ok(ItemPollResult::Pending) => {
-                    #[cfg(windows)]
-                    {
-                        ui_delivery = client_ui::DeliveryState::CommandPending;
+                    let now = Instant::now();
+                    let stalled = match (runtime.pending_index(), pending_since) {
+                        (Some(index), Some((since_index, since))) if since_index == index => {
+                            now.duration_since(since) >= STALL_AFTER
+                        }
+                        (Some(index), _) => {
+                            pending_since = Some((index, now));
+                            false
+                        }
+                        (None, _) => {
+                            pending_since = None;
+                            false
+                        }
+                    };
+                    if stalled {
+                        let diagnosis = runtime.pending_diagnosis().unwrap_or_else(|| {
+                            "the item at the front of the queue has not moved".to_owned()
+                        });
+                        if stall_reported_for != runtime.pending_index() {
+                            stall_reported_for = runtime.pending_index();
+                            client_eprintln!("STALLED: {diagnosis}");
+                        }
+                        #[cfg(windows)]
+                        {
+                            ui_delivery = client_ui::DeliveryState::Blocked;
+                            ui_delivery_detail = Some(diagnosis);
+                        }
+                    } else {
+                        #[cfg(windows)]
+                        {
+                            ui_delivery = client_ui::DeliveryState::CommandPending;
+                        }
                     }
                     false
                 }

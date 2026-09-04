@@ -200,7 +200,8 @@ pub fn pills(snapshot: &ClientSnapshot) -> [Pill; 3] {
         DeliveryState::WaitingForGameplay => ("Waiting", Tone::Warn),
         DeliveryState::CommandPending => ("Working", Tone::Warn),
         DeliveryState::NotArmed => ("Not armed", Tone::Bad),
-        DeliveryState::Blocked => ("Blocked", Tone::Bad),
+        DeliveryState::Blocked => ("Stalled", Tone::Bad),
+        DeliveryState::Parked => ("Parked", Tone::Warn),
     };
     [
         mute(Pill {
@@ -579,6 +580,7 @@ mod tests {
             DeliveryState::Ready,
             DeliveryState::CommandPending,
             DeliveryState::Blocked,
+            DeliveryState::Parked,
         ] {
             let snapshot = ClientSnapshot {
                 delivery: delivery.clone(),
