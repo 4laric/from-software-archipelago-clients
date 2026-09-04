@@ -587,6 +587,37 @@ impl SlotLedger {
         Ok(())
     }
 
+    /// Reissue the front-of-queue delivery whose grant completed but whose
+    /// physical token has been proven gone (clients#618): the harness's
+    /// native command finished, `grant_complete` is set, yet the item never
+    /// reached the character -- a reload to an older save is the usual
+    /// cause. The caller is responsible for proving the token absent
+    /// everywhere it could be (held inventory and the storage box) before
+    /// calling this; this method only enforces the ledger-side invariants
+    /// and never creates a second grant path. It resets the pending plan and
+    /// marks the index for redelivery, exactly like `requeue_blocked` does
+    /// for a parked entry -- the normal ordered pipeline re-plans the same
+    /// index from the seed contract on its next poll.
+    pub fn reissue_pending(&mut self, index: u64) -> Result<()> {
+        let pending = self
+            .pending
+            .as_ref()
+            .context("no pending delivery to reissue")?;
+        anyhow::ensure!(
+            pending.index == index,
+            "index {index} is not the pending delivery (the front of the queue is index {})",
+            pending.index
+        );
+        anyhow::ensure!(
+            pending.grant_complete,
+            "entry at index {index} has not completed its grant yet; this is not the \
+             lost-token case (wait for the grant, or see 'retry' for a parked delivery)"
+        );
+        self.pending = None;
+        self.redeliver.insert(index);
+        Ok(())
+    }
+
     /// Operator-confirmed resolution of a parked entry (bb-blocked INDEX
     /// --confirm): clears the blocked marker after the operator has verified
     /// the item physically arrived. Returns the detail that was cleared.
@@ -1555,5 +1586,68 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    /// clients#618: a category-8 token whose grant completed but was never
+    /// consumed by the game (a reload to an older save is the usual cause)
+    /// leaves `pending` set forever -- `requeue_blocked` only helps
+    /// `acknowledged` (parked) entries, not this one. `reissue_pending`
+    /// clears the stuck plan and marks the index for redelivery, exactly like
+    /// a park requeue, so the next poll re-plans it from the seed contract.
+    #[test]
+    fn reissue_pending_resets_a_completed_grant_for_redelivery() {
+        let mut slot = SlotLedger::default();
+        let mut pending = pending_pebble(0);
+        pending.grant_complete = true;
+        slot.begin(pending.clone()).unwrap();
+
+        slot.reissue_pending(0).unwrap();
+
+        assert!(slot.pending.is_none());
+        assert!(slot.redeliver.contains(&0));
+        assert_eq!(slot.next_index(), 0);
+
+        // The normal ordered pipeline re-plans identically from the seed
+        // contract; a fresh grant_complete=false plan for the same index is
+        // accepted, and nothing was double-acknowledged.
+        let mut replan = pending_pebble(0);
+        replan.observed_before = None;
+        slot.begin(replan).unwrap();
+        assert_eq!(slot.pending.as_ref().unwrap().index, 0);
+        assert!(!slot.pending.as_ref().unwrap().grant_complete);
+        assert!(slot.acknowledged.is_empty());
+    }
+
+    #[test]
+    fn reissue_pending_refuses_an_index_that_is_not_the_pending_delivery() {
+        let mut slot = SlotLedger::default();
+        let mut pending = pending_pebble(0);
+        pending.grant_complete = true;
+        slot.begin(pending).unwrap();
+
+        slot.reissue_pending(1).unwrap_err();
+        // Nothing changed: the stuck plan is still exactly where it was.
+        assert_eq!(slot.pending.as_ref().unwrap().index, 0);
+        assert!(slot.redeliver.is_empty());
+    }
+
+    #[test]
+    fn reissue_pending_refuses_without_a_completed_grant() {
+        // The ack flag ("grant_complete") reading OFF means the native grant
+        // itself has not finished yet -- this is the ordinary in-flight case,
+        // not the lost-token case, and reissuing here could double-grant once
+        // the original command lands.
+        let mut slot = SlotLedger::default();
+        slot.begin(pending_pebble(0)).unwrap();
+
+        slot.reissue_pending(0).unwrap_err();
+        assert!(slot.pending.is_some());
+        assert!(slot.redeliver.is_empty());
+    }
+
+    #[test]
+    fn reissue_pending_refuses_with_no_pending_delivery_at_all() {
+        let mut slot = SlotLedger::default();
+        slot.reissue_pending(0).unwrap_err();
     }
 }
