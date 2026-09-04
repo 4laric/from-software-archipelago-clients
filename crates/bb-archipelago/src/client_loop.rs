@@ -1739,8 +1739,23 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 target,
                 tag: format!("ap_{}_equip", item.index),
             };
-            if self.backend.equip_item(&request)? == OperationProgress::Pending {
-                return Ok(ItemPollResult::Pending);
+            // Review finding C2: an equip failure must never wedge the stream.
+            // The grant above is already complete and durable, so the item IS
+            // in the player's inventory. Propagating the error with `?` was
+            // fatal in practice because the native backend's `equip_item` is an
+            // unconditional bail and the error is not a `GrantTerminalFailure`,
+            // so it was never parked either: with the world's "Auto Equip
+            // Received Gear" option on, the first weapon or attire piece
+            // blocked every later AP item forever. Equipping is a convenience
+            // on top of a delivery that already happened, so say so once and
+            // acknowledge the item as delivered but not equipped.
+            match self.backend.equip_item(&request) {
+                Ok(OperationProgress::Complete) => {}
+                Ok(OperationProgress::Pending) => return Ok(ItemPollResult::Pending),
+                Err(error) => client_eprintln!(
+                    "Auto Equip Received Gear could not equip AP item {} ({target:?}); it was delivered to your inventory, so equip it yourself: {error:#}",
+                    item.ap_item_id
+                ),
             }
             self.ledger
                 .slot_mut(&self.seed_name, &self.slot_name)
@@ -4521,6 +4536,90 @@ mod tests {
                 EquipTarget::OathRune,
             ]
         );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// Review finding C2: the equip step sits after the grant is complete and
+    /// durable, and the only shipped backend's `equip_item` always errors. The
+    /// error used to propagate out of `poll_items`, was not a
+    /// `GrantTerminalFailure` so it never parked, and the index never advanced:
+    /// one weapon wedged every later item in an auto_equip seed. It must now
+    /// acknowledge the item as delivered but not equipped and carry on.
+    #[test]
+    fn an_equip_failure_after_a_complete_grant_still_acknowledges_and_delivers_the_next_item() {
+        let ledger_path = path();
+        let mut runtime_config = config();
+        runtime_config.auto_equip = true;
+        runtime_config.items.insert(
+            3000,
+            RuntimeItemBinding {
+                raw_descriptor: 0x8012_3400,
+                normalized_item_id: 0x0012_3400,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
+                quantity: 1,
+                reinforcement_level: Some(0),
+                feed_effect: FeedEffectBinding::RightHandWeapon,
+            },
+        );
+        let received = [
+            IncomingItem {
+                index: 0,
+                ap_item_id: 3000,
+            },
+            IncomingItem {
+                index: 1,
+                ap_item_id: 2000,
+            },
+        ];
+        let mut backend = MockBackend::default();
+        // Hold the equip for one poll so the grant is durably complete first,
+        // then make the equip fail the way the native backend always does.
+        backend.delay_equip("ap_0_equip", 1);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            runtime_config,
+        );
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert_eq!(client.backend().grants.len(), 1);
+        client
+            .backend_mut()
+            .inventory
+            .remove(&(0x0012_3400, Some(0)));
+
+        let ItemPollResult::Completed(completed) = client
+            .poll_items(&received)
+            .expect("an equip failure must not fail the poll")
+        else {
+            panic!("the item was not acknowledged after the equip failed");
+        };
+        assert_eq!(completed.index, 0);
+        assert_eq!(completed.ap_item_id, 3000);
+        assert!(
+            client.backend().equips.is_empty(),
+            "the equip failed, so nothing was equipped"
+        );
+        let acknowledged = ReceiveLedger::load(&ledger_path).unwrap();
+        let slot = acknowledged.slot("seed", "slot").unwrap();
+        assert_eq!(
+            slot.acknowledged
+                .get(&0)
+                .and_then(|entry| entry.blocked.clone()),
+            None,
+            "the item is delivered, not parked: it is in the inventory"
+        );
+
+        // The stream continues: the next index delivers.
+        let ItemPollResult::Completed(next) = client.poll_items(&received).unwrap() else {
+            panic!("the item after a failed equip was blocked");
+        };
+        assert_eq!(next.index, 1);
+        assert_eq!(next.ap_item_id, 2000);
         std::fs::remove_file(ledger_path).unwrap();
     }
 

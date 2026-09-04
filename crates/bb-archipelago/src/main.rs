@@ -727,8 +727,9 @@ fn main() {
 /// `bb-ap-client --check-contract SLOT_DATA.json`: load a seed contract the
 /// way a live session would and report what this build would do with it.
 /// Exit 0 when every binding is deliverable, 2 when the contract loads but
-/// some items would be parked (a world newer than this client), 1 when it
-/// does not load at all. CI runs it against the contract the built apworld
+/// some items would be parked (a world newer than this client) or it enables
+/// an option this client cannot honour (`auto_equip`), 1 when it does not
+/// load at all. CI runs it against the contract the built apworld
 /// emits so a world/client skew fails the release, not a player's launch.
 fn contract_check_request<I: Iterator<Item = String>>(mut args: I) -> Result<Option<i32>> {
     let Some(first) = args.next() else {
@@ -784,19 +785,35 @@ fn check_contract(slot_data: &json::Value) -> i32 {
             "client default"
         }
     );
-    if parked.is_empty() {
+    // Review finding C2: `auto_equip` is a seed-owned option and no shipped
+    // backend can act on it -- the native backend's `equip_item` is an
+    // unconditional bail. The delivery itself is safe (the item lands in the
+    // inventory and the client says so per item), but the host should learn
+    // that the option is inert here before anyone plays the seed.
+    if config.auto_equip {
+        println!(
+            "contract check: UNSUPPORTED option auto_equip (\"Auto Equip Received Gear\"): this client delivers the gear but cannot equip it; every weapon and attire piece must be equipped by hand"
+        );
+    }
+    for (id, evidence) in &parked {
+        println!("contract check: AP item {id} would be PARKED ({evidence})");
+    }
+    if parked.is_empty() && !config.auto_equip {
         println!("contract check: OK, every binding is deliverable by this client");
-        0
-    } else {
-        for (id, evidence) in &parked {
-            println!("contract check: AP item {id} would be PARKED ({evidence})");
-        }
+        return 0;
+    }
+    if !parked.is_empty() {
         eprintln!(
             "contract check: {} item(s) would be parked: this client is older than the world that emitted the contract",
             parked.len()
         );
-        2
     }
+    if config.auto_equip {
+        eprintln!(
+            "contract check: auto_equip is enabled in this contract but is not supported by this client"
+        );
+    }
+    2
 }
 
 fn version_request<I: Iterator<Item = String>>(mut args: I) -> Result<Option<String>> {
@@ -2411,6 +2428,27 @@ mod tests {
                 .is_none()
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Review finding C2: no shipped backend can equip anything, so a contract
+    /// that enables the world's "Auto Equip Received Gear" option is reported
+    /// as unsupported (exit 2) rather than passing the check and surprising the
+    /// player mid-session.
+    #[test]
+    fn contract_check_reports_auto_equip_as_an_unsupported_option() {
+        let auto_equip = json::json!({
+            "runtime_locations": {"12259363": {"event_flag": 52410800, "vanilla_award_suppressed": false}},
+            "runtime_items": {"12255488": {"raw_descriptor": 0xB000_03E8_u32, "normalized_item_id": 0x4000_03E8_u32,
+                "item_category": 4, "descriptor_evidence": "goods_formula_observed", "quantity": 1,
+                "feed_effect": "not_equippable"}},
+            "goal_location": 12259363,
+            "auto_equip": true
+        });
+        assert_eq!(check_contract(&auto_equip), 2);
+
+        let mut off = auto_equip.clone();
+        off["auto_equip"] = json::json!(false);
+        assert_eq!(check_contract(&off), 0);
     }
 
     #[test]
