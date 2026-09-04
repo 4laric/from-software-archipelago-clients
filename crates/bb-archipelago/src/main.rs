@@ -2323,7 +2323,9 @@ mod tests {
         assert_eq!(check_contract(&clean), 0);
 
         let skewed = json::json!({
-            "runtime_items": {"12255707": {"raw_descriptor": 0x9000_55F0_u32, "normalized_item_id": 0x1000_55F0_u32,
+            // Protector 292000 has no EquipParamProtector row and is refused by
+            // the reviewed allowlist on purpose, so it stays a parked example.
+            "runtime_items": {"12255740": {"raw_descriptor": 0x9004_7498_u32, "normalized_item_id": 0x1004_7498_u32,
                 "item_category": 1, "descriptor_evidence": "param_id_inferred", "quantity": 1,
                 "feed_effect": "attire_hands"}}
         });
