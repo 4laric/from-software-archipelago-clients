@@ -1,5 +1,29 @@
 ## Unreleased
 
+### Fixed
+
+* **A rescue `give` typed during a delivery no longer freezes the whole
+  receive stream (review finding C1).** Typing `give` or `census CONFIRM`
+  while an Archipelago item was mid-flight stopped every delivery for the
+  rest of the session, and the state was durable, so a restart reproduced it
+  immediately. The operator lane waited for the pending AP plan, and the AP
+  plan was the only thing that could clear itself, so neither side ever moved
+  and the client looked healthy while nothing arrived. The operator lane now
+  reports that it is waiting for items rather than holding the lane, so AP
+  delivery keeps running; the rescue takes the native lane on the first poll
+  after the AP plan completes.
+
+* **A rescue grant that fails terminally is parked instead of wedging the
+  loop and flooding the console (review finding C3).** When the harness
+  latched `quantity_mismatch`, `command_rejected` or `write_error` for a
+  queued `give`, every 50 ms poll re-raised the same verdict: `Rescue give
+  delivery held` printed twenty times a second and no Archipelago item was
+  ever delivered again, with no console command able to clear the row. The
+  grant is now recorded as parked on the ledger with its status and detail,
+  printed once, and listed by `blocked`; the lane releases and AP delivery
+  resumes. A retyped `give` for a parked item stays a fixed point, and a
+  non-terminal rescue error is deduplicated the way delivery errors are.
+
 ### Changed
 
 * **A ledger save can no longer wipe the slot (review finding C6).**
@@ -32,6 +56,16 @@
   now defers those parks, exactly as `bb-blocked --requeue` already refuses
   against a pending delivery, prints which indices it held back, and picks
   them up on the next start.
+* **A failed auto-equip no longer wedges the receive stream (review finding
+  C2).** With the world's "Auto Equip Received Gear" option on, the first
+  weapon or attire piece stopped every later Archipelago item: the grant
+  completed and the item was in the inventory, then the equip step errored
+  (no shipped backend can equip anything yet), and because that error is not
+  a terminal grant failure it was never parked, so the receive cursor never
+  advanced. The item is now acknowledged as delivered but not equipped, with
+  a one-line notice naming the item, and the next item delivers normally.
+  `--check-contract` also reports `auto_equip: true` as an unsupported option
+  and exits 2, so a host sees it before anyone plays the seed.
 
 * **A refused insert re-plans as a delta instead of parking (clients#613).**
   A playtester's Antidotes parked as `failed (tag=ap_43 expected_after=2

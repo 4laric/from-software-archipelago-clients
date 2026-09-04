@@ -61,6 +61,16 @@ pub struct SlotLedger {
     /// repeated command or restart a fixed point.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operator_grants: BTreeMap<i64, PendingItem>,
+    /// Operator grants whose native command came back terminally failed
+    /// (review finding C3). The row leaves `operator_grants` and lands here
+    /// with the harness's `status (detail)`, exactly as `park_terminal_grant`
+    /// records an AP park in `AcknowledgedItem::blocked`. Without this the
+    /// engine re-raises its latched verdict on every 50 ms poll, the operator
+    /// lane never releases, and `poll_items` stops running for the session.
+    /// Never retried automatically: the failed command may have half applied.
+    /// Older ledgers have no such field and load with it empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operator_grant_parks: BTreeMap<i64, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operator_actions: Vec<OperatorAction>,
     /// Authoritative goal transition witnessed through this slot's validated
@@ -1355,6 +1365,47 @@ mod tests {
         );
         slot.save_watermark = None;
         assert_eq!(decoded, slot);
+    }
+
+    /// Review finding C3: the park verdict for a rescue grant has to survive a
+    /// restart, or the operator lane would re-run the failed command; and a
+    /// ledger written before the field existed must still load.
+    #[test]
+    fn a_parked_operator_grant_survives_a_ledger_round_trip() {
+        let mut slot = SlotLedger::default();
+        slot.operator_grant_parks.insert(
+            2000,
+            "quantity_mismatch (mock terminal harness failure)".into(),
+        );
+        let encoded = json::to_vec(&slot).unwrap();
+        let decoded: SlotLedger = json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded.operator_grant_parks.get(&2000).map(String::as_str),
+            Some("quantity_mismatch (mock terminal harness failure)"),
+            "the park verdict must round-trip through the ledger"
+        );
+        assert_eq!(decoded, slot);
+
+        // An older ledger predates the field and loads with it empty.
+        let mut value: json::Value = json::from_slice(&encoded).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("operator_grant_parks");
+        let legacy: SlotLedger = json::from_slice(&json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            legacy.operator_grant_parks.is_empty(),
+            "a pre-C3 ledger must load with no parks, got {:?}",
+            legacy.operator_grant_parks
+        );
+
+        // An empty map is skipped, so unaffected ledgers are byte-identical.
+        let empty = json::to_vec(&SlotLedger::default()).unwrap();
+        let text = String::from_utf8(empty).unwrap();
+        assert!(
+            !text.contains("operator_grant_parks"),
+            "an empty park map must not be serialised, got {text}"
+        );
     }
 
     #[test]

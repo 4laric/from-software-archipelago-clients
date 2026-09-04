@@ -55,6 +55,18 @@ const ITEM_DELIVERY_COOLDOWN: Duration = Duration::from_secs(1);
 impl ItemErrorReporter {
     /// Returns the line to print for `error`, or `None` to stay quiet.
     fn report(&mut self, error: &anyhow::Error, now: Instant) -> Option<String> {
+        self.report_labelled(error, now, "Bloodborne item delivery blocked")
+    }
+
+    /// The same dedup, under a caller-chosen label. The operator lane needs it
+    /// too (review finding C3): a non-terminal rescue error repeats on every
+    /// 50 ms poll, and printing it undeduplicated floods the console.
+    fn report_labelled(
+        &mut self,
+        error: &anyhow::Error,
+        now: Instant,
+        label: &str,
+    ) -> Option<String> {
         let message = format!("{error:#}");
         let report = self.last.as_ref().is_none_or(|(previous, when)| {
             previous != &message || now.duration_since(*when) >= ITEM_ERROR_DEDUP
@@ -63,7 +75,7 @@ impl ItemErrorReporter {
             return None;
         }
         self.last = Some((message.clone(), now));
-        Some(format!("Bloodborne item delivery blocked: {message}"))
+        Some(format!("{label}: {message}"))
     }
 
     /// Returns the recovery line when a failure regime was in effect.
@@ -727,8 +739,9 @@ fn main() {
 /// `bb-ap-client --check-contract SLOT_DATA.json`: load a seed contract the
 /// way a live session would and report what this build would do with it.
 /// Exit 0 when every binding is deliverable, 2 when the contract loads but
-/// some items would be parked (a world newer than this client), 1 when it
-/// does not load at all. CI runs it against the contract the built apworld
+/// some items would be parked (a world newer than this client) or it enables
+/// an option this client cannot honour (`auto_equip`), 1 when it does not
+/// load at all. CI runs it against the contract the built apworld
 /// emits so a world/client skew fails the release, not a player's launch.
 fn contract_check_request<I: Iterator<Item = String>>(mut args: I) -> Result<Option<i32>> {
     let Some(first) = args.next() else {
@@ -784,19 +797,35 @@ fn check_contract(slot_data: &json::Value) -> i32 {
             "client default"
         }
     );
-    if parked.is_empty() {
+    // Review finding C2: `auto_equip` is a seed-owned option and no shipped
+    // backend can act on it -- the native backend's `equip_item` is an
+    // unconditional bail. The delivery itself is safe (the item lands in the
+    // inventory and the client says so per item), but the host should learn
+    // that the option is inert here before anyone plays the seed.
+    if config.auto_equip {
+        println!(
+            "contract check: UNSUPPORTED option auto_equip (\"Auto Equip Received Gear\"): this client delivers the gear but cannot equip it; every weapon and attire piece must be equipped by hand"
+        );
+    }
+    for (id, evidence) in &parked {
+        println!("contract check: AP item {id} would be PARKED ({evidence})");
+    }
+    if parked.is_empty() && !config.auto_equip {
         println!("contract check: OK, every binding is deliverable by this client");
-        0
-    } else {
-        for (id, evidence) in &parked {
-            println!("contract check: AP item {id} would be PARKED ({evidence})");
-        }
+        return 0;
+    }
+    if !parked.is_empty() {
         eprintln!(
             "contract check: {} item(s) would be parked: this client is older than the world that emitted the contract",
             parked.len()
         );
-        2
     }
+    if config.auto_equip {
+        eprintln!(
+            "contract check: auto_equip is enabled in this contract but is not supported by this client"
+        );
+    }
+    2
 }
 
 fn version_request<I: Iterator<Item = String>>(mut args: I) -> Result<Option<String>> {
@@ -1106,6 +1135,9 @@ fn run() -> Result<()> {
     let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut item_errors = ItemErrorReporter::default();
+    // Same dedup, own slot: a rescue-lane error must not silence an item
+    // delivery error, or the other way round (review finding C3).
+    let mut rescue_errors = ItemErrorReporter::default();
     #[cfg(windows)]
     let mut placement_scouts: Option<toasts::PlacementScouts> = None;
     let mut death_link_tag_advertised = false;
@@ -1815,8 +1847,31 @@ fn run() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let operator_busy = match runtime.poll_operator_grant() {
-                Ok(OperatorGrantPoll::Idle) => false,
+                Ok(OperatorGrantPoll::Idle) => {
+                    rescue_errors.last = None;
+                    false
+                }
                 Ok(OperatorGrantPoll::Pending) => true,
+                // review finding C1: the rescue is waiting on the AP plan, and
+                // only `poll_items` retires that plan. Holding the lane here
+                // would deadlock both lanes for the rest of the session.
+                Ok(OperatorGrantPoll::WaitingForItems) => false,
+                Ok(OperatorGrantPoll::Parked {
+                    ap_item_id,
+                    status,
+                    detail,
+                }) => {
+                    let line = format!(
+                        "PARKED rescue give index={ap_item_id} ({:?}): the grant terminally failed \
+                         in the harness ({status}: {detail}). The rescue is recorded as blocked \
+                         (type `blocked` to inspect) and AP delivery keeps running.",
+                        item_label(client.this_game(), ap_item_id)
+                    );
+                    client_eprintln!("{line}");
+                    #[cfg(windows)]
+                    ui_reducer.activity(client_ui::ActivityKind::ParkedDelivery, line);
+                    false
+                }
                 Ok(OperatorGrantPoll::Completed(ap_item_id)) => {
                     let line = format!(
                         "AUDIT rescue give index={ap_item_id} ({:?}): delivered through normal delivery.",
@@ -1828,10 +1883,17 @@ fn run() -> Result<()> {
                     false
                 }
                 Err(error) => {
-                    let line = format!("Rescue give delivery held: {error:#}");
-                    client_eprintln!("{line}");
-                    #[cfg(windows)]
-                    ui_reducer.activity(client_ui::ActivityKind::CommandResult, line);
+                    // review finding C3: this repeats every poll while the
+                    // cause stands, so dedup it like item delivery errors.
+                    if let Some(line) = rescue_errors.report_labelled(
+                        &error,
+                        Instant::now(),
+                        "Rescue give delivery held",
+                    ) {
+                        client_eprintln!("{line}");
+                        #[cfg(windows)]
+                        ui_reducer.activity(client_ui::ActivityKind::CommandResult, line);
+                    }
                     true
                 }
             };
@@ -2432,6 +2494,27 @@ mod tests {
                 .is_none()
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Review finding C2: no shipped backend can equip anything, so a contract
+    /// that enables the world's "Auto Equip Received Gear" option is reported
+    /// as unsupported (exit 2) rather than passing the check and surprising the
+    /// player mid-session.
+    #[test]
+    fn contract_check_reports_auto_equip_as_an_unsupported_option() {
+        let auto_equip = json::json!({
+            "runtime_locations": {"12259363": {"event_flag": 52410800, "vanilla_award_suppressed": false}},
+            "runtime_items": {"12255488": {"raw_descriptor": 0xB000_03E8_u32, "normalized_item_id": 0x4000_03E8_u32,
+                "item_category": 4, "descriptor_evidence": "goods_formula_observed", "quantity": 1,
+                "feed_effect": "not_equippable"}},
+            "goal_location": 12259363,
+            "auto_equip": true
+        });
+        assert_eq!(check_contract(&auto_equip), 2);
+
+        let mut off = auto_equip.clone();
+        off["auto_equip"] = json::json!(false);
+        assert_eq!(check_contract(&off), 0);
     }
 
     #[test]
