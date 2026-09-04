@@ -2,6 +2,17 @@
 
 ### Changed
 
+* **A failed auto-equip no longer wedges the receive stream (review finding
+  C2).** With the world's "Auto Equip Received Gear" option on, the first
+  weapon or attire piece stopped every later Archipelago item: the grant
+  completed and the item was in the inventory, then the equip step errored
+  (no shipped backend can equip anything yet), and because that error is not
+  a terminal grant failure it was never parked, so the receive cursor never
+  advanced. The item is now acknowledged as delivered but not equipped, with
+  a one-line notice naming the item, and the next item delivers normally.
+  `--check-contract` also reports `auto_equip: true` as an unsupported option
+  and exits 2, so a host sees it before anyone plays the seed.
+
 * **A refused insert re-plans as a delta instead of parking (clients#613).**
   A playtester's Antidotes parked as `failed (tag=ap_43 expected_after=2
   actual=Some(10) native_result=4294967295 retry_budget=20)`: the dequeue-time
