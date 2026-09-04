@@ -12,8 +12,8 @@ use crate::client_eprintln;
 use crate::config::RuntimeConfig;
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
 use crate::ledger::{
-    AcknowledgedItem, OperatorAction, PendingItem, ReceiveLedger, SlotLedger, VictoryRecord,
-    WatermarkOutcome,
+    AcknowledgedItem, FixedCauseRequeue, OperatorAction, PendingItem, ReceiveLedger, SlotLedger,
+    VictoryRecord, WatermarkOutcome,
 };
 use crate::upgrades::{auto_upgrade_level, reinforced_descriptor_pair};
 
@@ -1496,16 +1496,19 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// stands in for current inventory) and `write_error` detailed
     /// `quantity write failed` (the external guest-heap write shadPS4 refuses
     /// is gone). They now deliver, or fail for a real reason. Every other park
-    /// stays parked for `bb-blocked`. Returns the requeued indices.
-    pub fn requeue_fixed_cause_parks(&mut self) -> Result<Vec<u64>> {
-        let indices = self
+    /// stays parked for `bb-blocked`. Returns the requeued indices, plus the
+    /// ones deferred because a durable pending plan still owns the cursor
+    /// (review finding C5) -- the caller reports those so the operator knows
+    /// why a park it expected to see unparked is still parked.
+    pub fn requeue_fixed_cause_parks(&mut self) -> Result<FixedCauseRequeue> {
+        let outcome = self
             .ledger
             .slot_mut(&self.seed_name, &self.slot_name)
             .requeue_fixed_cause_parks();
-        if !indices.is_empty() {
+        if !outcome.requeued.is_empty() {
             self.ledger.save(&self.ledger_path)?;
         }
-        Ok(indices)
+        Ok(outcome)
     }
 
     /// Processes at most one item, preserving AP index order and durable state
@@ -3702,7 +3705,10 @@ mod tests {
             ledger_path.clone(),
             config(),
         );
-        assert_eq!(reloaded.requeue_fixed_cause_parks().unwrap(), vec![0]);
+        assert_eq!(
+            reloaded.requeue_fixed_cause_parks().unwrap().requeued,
+            vec![0]
+        );
 
         assert!(matches!(
             reloaded.poll_items(&received).unwrap(),
@@ -5456,6 +5462,71 @@ mod tests {
         std::fs::remove_file(ledger_path).unwrap();
     }
 
+    /// Review finding C4, the paired witness named above: a restart is the
+    /// case where the delivery machine has NO process memory of the tag. The
+    /// baseline lives in the ledger, not in the machine, so the reloaded loop
+    /// must replay against the recorded number and must not re-sample the live
+    /// stack -- the cave may already have applied the delta on the game thread
+    /// before the kill, and re-sampling would grant it a second time.
+    #[test]
+    fn a_restart_mid_grant_replays_against_the_recorded_baseline() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_04CE, None), 3);
+        backend.delay_grant("ap_0", 1);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        assert_eq!(
+            persisted
+                .slot("seed", "slot")
+                .and_then(|slot| slot.pending.as_ref())
+                .and_then(|pending| pending.observed_before),
+            Some(3),
+            "the baseline must be durable before the grant can execute"
+        );
+
+        // The cave applied the delta on the game thread; the client is killed
+        // before it can mark the grant complete. A fresh process has no
+        // `finished` entry and no session state for ap_0.
+        let mut backend = MockBackend::default();
+        backend.inventory.insert((0x4000_04CE, None), 5);
+        let mut client = loop_with(backend, persisted, ledger_path.clone(), config());
+        let error = client.poll_items(&received).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("expected 3, found 5"),
+            "the restart must replay against the recorded 3, not re-sample 5; got: {error:#}"
+        );
+        assert_eq!(
+            client.backend().inventory[&(0x4000_04CE, None)],
+            5,
+            "nothing may be granted a second time on top of the applied delta"
+        );
+        assert_eq!(
+            ReceiveLedger::load(&ledger_path)
+                .unwrap()
+                .slot("seed", "slot")
+                .and_then(|slot| slot.pending.as_ref())
+                .and_then(|pending| pending.observed_before),
+            Some(3),
+            "the durable baseline must not be overwritten by a fresh sample"
+        );
+        std::fs::remove_file(&ledger_path).unwrap();
+        let _ = std::fs::remove_file(ledger_path.with_extension("bak"));
+    }
+
     /// clients#427 follow-up, point 4: entries parked as `quantity_mismatch`
     /// by the clients#428 build itself re-enter the queue on startup. The park
     /// reason is recorded the same way, so the requeue that shipped with
@@ -5488,7 +5559,10 @@ mod tests {
         let mut backend = MockBackend::default();
         backend.inventory.insert((0x4000_04CE, None), 20);
         let mut client = loop_with(backend, persisted, ledger_path.clone(), config());
-        assert_eq!(client.requeue_fixed_cause_parks().unwrap(), vec![0]);
+        assert_eq!(
+            client.requeue_fixed_cause_parks().unwrap().requeued,
+            vec![0]
+        );
         assert!(matches!(
             client.poll_items(&received).unwrap(),
             ItemPollResult::Completed(CompletedItem { index: 0, .. })

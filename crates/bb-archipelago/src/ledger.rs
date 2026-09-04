@@ -226,12 +226,55 @@ fn retry_io_with<T>(
 }
 
 impl ReceiveLedger {
+    /// Load the slot state, falling back to the `.bak` generation when the live
+    /// file is missing or unreadable (review finding C6).
+    ///
+    /// An absent `receipts.json` used to mean "brand new client", full stop.
+    /// That is only true when there is no backup beside it: if `save` was
+    /// interrupted, the previous generation is sitting right there, and
+    /// returning `default()` instead re-delivers every AP item from index 0,
+    /// unbinds the save identity and loses every park, sustain and victory
+    /// record. One generation of staleness is recoverable; an empty ledger is
+    /// not.
     pub fn load(path: &Path) -> Result<Self> {
+        let backup = path.with_extension("bak");
+        let live_error = match Self::read_generation(path) {
+            Ok(Some(ledger)) => return Ok(ledger),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        match Self::read_generation(&backup) {
+            Ok(Some(ledger)) => {
+                eprintln!(
+                    "Bloodborne ledger: {} was {}; recovered the previous generation from {}.",
+                    path.display(),
+                    match &live_error {
+                        Some(error) => format!("unreadable ({error:#})"),
+                        None => "missing".to_string(),
+                    },
+                    backup.display()
+                );
+                Ok(ledger)
+            }
+            // No usable backup: a genuinely unreadable live file is still an
+            // error, and a genuinely absent one is still a new ledger.
+            _ => match live_error {
+                Some(error) => Err(error),
+                None => Ok(Self::default()),
+            },
+        }
+    }
+
+    /// `Ok(None)` when the file does not exist; `Err` when it exists and cannot
+    /// be read or parsed.
+    fn read_generation(path: &Path) -> Result<Option<Self>> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(None);
         }
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+        json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("parsing {}", path.display()))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -242,49 +285,27 @@ impl ReceiveLedger {
         let backup = path.with_extension("bak");
         let bytes = json::to_vec_pretty(self)?;
         fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
+        // Review finding C6: the previous generation is COPIED aside, never
+        // renamed aside. A rename left a window in which nothing existed at
+        // `path` at all, and this save runs on essentially every poll that
+        // changes state -- a kill or a power loss inside that window made the
+        // next `load` see no receipts.json, bind to whatever character loaded
+        // and re-deliver every AP item from index 0. Copy-then-rename means
+        // there is always a complete ledger at `path`: either the old
+        // generation or the new one, never neither. The `.bak` is deliberately
+        // left in place after the commit, because it is what `load` falls back
+        // to if the live file is ever lost or truncated.
         if path.exists() {
-            if backup.exists() {
-                retry_sharing_violation("removing the previous ledger backup", || {
-                    fs::remove_file(&backup)
-                })
-                .with_context(|| format!("removing previous backup {}", backup.display()))?;
-            }
-            retry_sharing_violation("backing up the receive ledger", || {
-                fs::rename(path, &backup)
-            })
-            .with_context(|| format!("backing up {}", path.display()))?;
+            retry_sharing_violation("backing up the receive ledger", || fs::copy(path, &backup))
+                .with_context(|| format!("backing up {}", path.display()))?;
         }
-        if let Err(error) = retry_sharing_violation("publishing the receive ledger", || {
+        // A rename over an existing destination is atomic on both platforms the
+        // client ships for, so nothing has to be removed first. If it fails,
+        // the live file is untouched and still the newest complete generation.
+        retry_sharing_violation("publishing the receive ledger", || {
             fs::rename(&temporary, path)
-        }) {
-            if backup.exists()
-                && let Err(restore_error) =
-                    retry_sharing_violation("restoring the receive ledger backup", || {
-                        fs::rename(&backup, path)
-                    })
-            {
-                return Err(anyhow::Error::new(error)).with_context(|| {
-                    format!(
-                        "publishing {}; restoring {} also failed: {restore_error}",
-                        path.display(),
-                        backup.display()
-                    )
-                });
-            }
-            return Err(error).with_context(|| format!("publishing {}", path.display()));
-        }
-        if let Err(error) = retry_sharing_violation("removing the committed ledger backup", || {
-            fs::remove_file(&backup)
-        }) && error.kind() != io::ErrorKind::NotFound
-        {
-            // The new ledger is already durable. Leaving the prior generation
-            // behind is safer than reporting the completed save as failed.
-            eprintln!(
-                "Bloodborne ledger: committed {}, but could not remove {}: {error}",
-                path.display(),
-                backup.display()
-            );
-        }
+        })
+        .with_context(|| format!("publishing {}", path.display()))?;
         Ok(())
     }
 }
@@ -303,6 +324,15 @@ impl ReceiveLedger {
     pub fn slot(&self, seed_name: &str, slot_name: &str) -> Option<&SlotLedger> {
         self.slots.get(&Self::slot_key(seed_name, slot_name))
     }
+}
+
+/// The outcome of the startup unpark: what actually re-entered the queue, and
+/// what was held back because a durable pending plan owns the cursor
+/// (review finding C5).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FixedCauseRequeue {
+    pub requeued: Vec<u64>,
+    pub deferred: Vec<u64>,
 }
 
 impl SlotLedger {
@@ -495,19 +525,39 @@ impl SlotLedger {
     }
 
     /// Requeue every park whose cause is known to be fixed
-    /// (clients#427, clients#433). Returns the requeued indices in order.
-    pub fn requeue_fixed_cause_parks(&mut self) -> Vec<u64> {
+    /// (clients#427, clients#433).
+    ///
+    /// Review finding C5: this defers to a durable pending plan exactly as
+    /// `requeue_blocked` refuses against one. A requeued index is BELOW the
+    /// cursor, so `next_index()` starts returning it immediately -- while
+    /// `self.pending` still names a higher index that startup reconciliation
+    /// deliberately left in place. `poll_items` then fails its
+    /// `pending_for` plan-match ensure on every single poll and the slot is
+    /// stranded forever (park index 3, cursor 10, pending 11: next is 3, the
+    /// plan says 11, nothing ever lands again). The parks are not lost -- they
+    /// stay acknowledged and are picked up by the next startup once the
+    /// in-flight item has been acknowledged.
+    pub fn requeue_fixed_cause_parks(&mut self) -> FixedCauseRequeue {
         let indices: Vec<u64> = self
             .acknowledged
             .iter()
             .filter(|(_, item)| Self::park_cause_is_fixed(item))
             .map(|(index, _)| *index)
             .collect();
+        if self.pending.is_some() {
+            return FixedCauseRequeue {
+                requeued: Vec::new(),
+                deferred: indices,
+            };
+        }
         for index in &indices {
             self.acknowledged.remove(index);
             self.redeliver.insert(*index);
         }
-        indices
+        FixedCauseRequeue {
+            requeued: indices,
+            deferred: Vec::new(),
+        }
     }
 
     /// The parked (blocked) entries, for bb-blocked's listing.
@@ -723,6 +773,119 @@ mod tests {
         );
     }
 
+    /// A unique scratch ledger path for one file-layout test.
+    fn scratch_ledger(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bb-ledger-{name}-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("bak"));
+        let _ = fs::remove_file(path.with_extension("tmp"));
+        path
+    }
+
+    /// A ledger with one delivered item, so an empty reload is obvious.
+    fn ledger_with_one_delivery(index: u64) -> ReceiveLedger {
+        let mut ledger = ReceiveLedger::default();
+        let slot = ledger.slot_mut("seed", "player");
+        slot.bound_save_identity = Some("save-1".into());
+        slot.highest_processed_index = Some(index);
+        ledger
+    }
+
+    /// Review finding C6: `save` used to rename the live ledger aside before
+    /// publishing the temp file, so a kill in that window left NO file at
+    /// `path` and `load` reported a brand-new ledger -- unbinding the save
+    /// identity and re-delivering every AP item from index 0. `load` now falls
+    /// back to the `.bak` generation that was sitting next to it the whole
+    /// time.
+    #[test]
+    fn load_recovers_the_backup_generation_when_the_live_ledger_is_missing() {
+        let path = scratch_ledger("bak-recovery");
+        ledger_with_one_delivery(7).save(&path).unwrap();
+        // A second save leaves the first generation in the backup.
+        ledger_with_one_delivery(9).save(&path).unwrap();
+        assert!(
+            path.with_extension("bak").exists(),
+            "the committed backup must survive the save so load has something to recover"
+        );
+
+        // The interruption: the live file is gone, the backup is not.
+        fs::remove_file(&path).unwrap();
+        let recovered = ReceiveLedger::load(&path).unwrap();
+        assert_eq!(
+            recovered
+                .slot("seed", "player")
+                .and_then(|slot| slot.highest_processed_index),
+            Some(7),
+            "the previous generation must be recovered instead of resetting the slot"
+        );
+        assert_eq!(
+            recovered
+                .slot("seed", "player")
+                .and_then(|slot| slot.bound_save_identity.clone()),
+            Some("save-1".into()),
+            "the save identity binding must survive an interrupted save"
+        );
+        let _ = fs::remove_file(path.with_extension("bak"));
+    }
+
+    /// Review finding C6: an unparseable live ledger (a truncated write, or a
+    /// half-flushed page after a power loss) is the same loss as a missing one,
+    /// so it takes the same backup fallback rather than failing the client.
+    #[test]
+    fn load_recovers_the_backup_generation_when_the_live_ledger_is_truncated() {
+        let path = scratch_ledger("bak-truncated");
+        ledger_with_one_delivery(7).save(&path).unwrap();
+        ledger_with_one_delivery(9).save(&path).unwrap();
+        fs::write(&path, b"{\"slots\": {\"seed").unwrap();
+
+        let recovered = ReceiveLedger::load(&path).unwrap();
+        assert_eq!(
+            recovered
+                .slot("seed", "player")
+                .and_then(|slot| slot.highest_processed_index),
+            Some(7),
+            "a truncated live ledger must fall back, not reset the slot"
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("bak"));
+    }
+
+    /// Review finding C6: the save publishes by copy-then-rename, so at every
+    /// observable point between two saves there is a complete, parseable
+    /// ledger at `path` -- never the window in which nothing exists there.
+    #[test]
+    fn a_save_never_leaves_the_live_ledger_absent() {
+        let path = scratch_ledger("no-gap");
+        ledger_with_one_delivery(7).save(&path).unwrap();
+        assert!(path.exists(), "the first save must publish a live ledger");
+
+        ledger_with_one_delivery(9).save(&path).unwrap();
+        assert!(
+            path.exists(),
+            "the live ledger must never be moved out of the way to make room"
+        );
+        assert_eq!(
+            ReceiveLedger::load(&path).unwrap(),
+            ledger_with_one_delivery(9),
+            "the live file must hold the newest generation after the save"
+        );
+        // Every generation an interruption could strand is recoverable: the
+        // previous one is in the backup, in full.
+        let backup = path.with_extension("bak");
+        let stranded = ReceiveLedger::load(&backup).unwrap();
+        assert_eq!(
+            stranded,
+            ledger_with_one_delivery(7),
+            "the backup must be the complete previous generation, not a stub"
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&backup);
+    }
+
     fn park(slot: &mut SlotLedger, index: u64, status: &str) {
         slot.begin(PendingItem {
             index,
@@ -810,9 +973,62 @@ mod tests {
             "tag=ap_3 expected_before=5 actual=20",
         );
 
-        assert_eq!(slot.requeue_fixed_cause_parks(), vec![0, 3]);
+        assert_eq!(slot.requeue_fixed_cause_parks().requeued, vec![0, 3]);
         let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();
         assert_eq!(still_parked, vec![1, 2]);
+    }
+
+    /// Review finding C5: a requeued index is BELOW the cursor, so
+    /// `next_index()` returns it immediately. Doing that while a durable
+    /// pending plan names a higher index leaves the two permanently
+    /// disagreeing and every `pending_for` call fails, stranding the slot. The
+    /// unpark therefore defers, exactly as `requeue_blocked` refuses, and
+    /// reports what it held back.
+    #[test]
+    fn the_startup_unpark_defers_while_a_durable_pending_plan_is_in_flight() {
+        let mut slot = SlotLedger::default();
+        park_with(
+            &mut slot,
+            0,
+            "quantity_mismatch",
+            "tag=ap_0 expected_before=5 actual=20",
+        );
+        // Delivery carried on to index 10, and `begin()` wrote the durable
+        // plan for index 11 before the process was killed.
+        slot.highest_processed_index = Some(10);
+        slot.pending = Some(pending_pebble(11));
+
+        let outcome = slot.requeue_fixed_cause_parks();
+        assert_eq!(
+            outcome.requeued,
+            Vec::<u64>::new(),
+            "nothing may re-enter the queue while index 11 is mid-delivery"
+        );
+        assert_eq!(
+            outcome.deferred,
+            vec![0],
+            "the held-back park must be reported so the operator knows why it is still parked"
+        );
+        assert_eq!(
+            slot.next_index(),
+            11,
+            "the queue must still point at the durable pending plan"
+        );
+        assert!(
+            slot.pending_for(11, 1).is_ok(),
+            "the plan-match check must keep passing after the startup unpark"
+        );
+        let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();
+        assert_eq!(
+            still_parked,
+            vec![0],
+            "the deferred park stays acknowledged for the next startup"
+        );
+
+        // Once the in-flight item is acknowledged, the next start unparks it.
+        slot.pending = None;
+        assert_eq!(slot.requeue_fixed_cause_parks().requeued, vec![0]);
+        assert_eq!(slot.next_index(), 0);
     }
 
     /// clients#613: a goods-lane `failed` with the result cell still the
@@ -835,7 +1051,7 @@ mod tests {
             "failed",
             "tag=ap_44 instance insert unwitnessed: native_result=4294967295 slot_record=None retry_budget=20",
         );
-        assert_eq!(slot.requeue_fixed_cause_parks(), vec![0]);
+        assert_eq!(slot.requeue_fixed_cause_parks().requeued, vec![0]);
         let still_parked: Vec<u64> = slot.blocked_entries().map(|(index, _)| index).collect();
         assert_eq!(still_parked, vec![1]);
     }
@@ -863,7 +1079,7 @@ mod tests {
             "tag=ap_1 expected_before=5 actual=20",
         );
         assert_eq!(
-            slot.requeue_fixed_cause_parks(),
+            slot.requeue_fixed_cause_parks().requeued,
             vec![1],
             "a delivered item must not re-enter the delivery queue"
         );
@@ -928,7 +1144,7 @@ mod tests {
         park(&mut slot, 2, "quantity_mismatch");
         assert_eq!(slot.next_index(), 3);
 
-        assert_eq!(slot.requeue_fixed_cause_parks(), vec![0, 2]);
+        assert_eq!(slot.requeue_fixed_cause_parks().requeued, vec![0, 2]);
         assert_eq!(slot.blocked_entries().count(), 1);
         assert_eq!(slot.next_index(), 0);
 
@@ -968,7 +1184,7 @@ mod tests {
         assert_eq!(slot.next_index(), 3);
         assert!(slot.redeliver.is_empty());
         // A second startup finds nothing left to requeue.
-        assert!(slot.requeue_fixed_cause_parks().is_empty());
+        assert!(slot.requeue_fixed_cause_parks().requeued.is_empty());
         assert_eq!(slot.blocked_entries().count(), 1);
     }
 

@@ -847,6 +847,15 @@ fn version_request<I: Iterator<Item = String>>(mut args: I) -> Result<Option<Str
 /// The window's half of this rule is that it never sees an id at all: the renderer receives text.
 /// See [`bb_archipelago::names`] for the formatting policy and its tests.
 #[cfg(windows)]
+/// Render a list of AP indices for one operator-facing console line.
+fn join_indices(indices: &[u64]) -> String {
+    indices
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn item_label(game: &archipelago_rs::Game, ap_item_id: i64) -> String {
     let name = game.item(ap_item_id).map(|item| item.name());
     bb_archipelago::names::item_label(name.as_ref().map(|name| name.as_str()), ap_item_id)
@@ -1613,17 +1622,29 @@ fn run() -> Result<()> {
             // refuses; existing-stack grants run on the game thread now). No
             // other park reason auto-unparks.
             match new_runtime.requeue_fixed_cause_parks() {
-                Ok(indices) if !indices.is_empty() => eprintln!(
-                    "Re-queued {} item(s) whose park cause is fixed (indices {}); \
-                     they deliver against the observed inventory now.",
-                    indices.len(),
-                    indices
-                        .iter()
-                        .map(u64::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                Ok(_) => {}
+                Ok(outcome) => {
+                    if !outcome.requeued.is_empty() {
+                        eprintln!(
+                            "Re-queued {} item(s) whose park cause is fixed (indices {}); \
+                             they deliver against the observed inventory now.",
+                            outcome.requeued.len(),
+                            join_indices(&outcome.requeued)
+                        );
+                    }
+                    // Review finding C5: a requeued index sits BELOW the
+                    // cursor, so unparking while a durable pending plan names
+                    // a higher index would strand the slot on a plan mismatch
+                    // every poll. The parks stay put and the next startup
+                    // picks them up.
+                    if !outcome.deferred.is_empty() {
+                        eprintln!(
+                            "Held {} fixed-cause park(s) (indices {}) because an item is still \
+                             mid-delivery; they re-queue on the next start once it finishes.",
+                            outcome.deferred.len(),
+                            join_indices(&outcome.deferred)
+                        );
+                    }
+                }
                 Err(error) => eprintln!("Re-queuing parked items failed: {error:#}"),
             }
             runtime = Some(new_runtime);

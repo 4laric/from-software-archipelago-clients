@@ -26,6 +26,36 @@
 
 ### Changed
 
+* **A ledger save can no longer wipe the slot (review finding C6).**
+  The save renamed the live `receipts.json` aside before publishing the new
+  one, so there was a window with no ledger file at all -- and it ran on
+  essentially every poll that changed state. A kill or a power loss inside it
+  made the next launch see a brand-new ledger: the save-identity binding was
+  gone, the cursor was back at 0, and every Archipelago item delivered again,
+  along with the loss of every park, sustain record and victory. The save now
+  copies the previous generation aside and renames the new one over the live
+  file, so a complete ledger is always present, and `load` falls back to that
+  `.bak` when the live file is missing or unparseable, saying so on the
+  console.
+
+* **A restart mid-grant no longer double-grants an applied item
+  (review finding C4).**
+  The delivery machine answered "this command cannot have applied" for any
+  grant tag it had no record of -- which is exactly what a restart looks like,
+  because that record lives in process memory. The loop took that as licence
+  to re-sample the live stack and overwrite the durable baseline, so an item
+  whose delta the cave had already applied on the game thread was granted a
+  second time (3 Blood Vials + 2 became 5, then 7). An unknown tag now keeps
+  the durable baseline binding; only a proof of non-execution unbinds it.
+
+* **Startup unpark no longer strands the receive queue (review finding C5).**
+  Re-queuing a fixed-cause park while a durable pending plan was mid-delivery
+  pointed the queue at an index below the cursor while the plan named a higher
+  one. Every later poll failed its plan-match check, so no item ever landed
+  again for that slot and the only sign was rate-limited log noise. The unpark
+  now defers those parks, exactly as `bb-blocked --requeue` already refuses
+  against a pending delivery, prints which indices it held back, and picks
+  them up on the next start.
 * **A failed auto-equip no longer wedges the receive stream (review finding
   C2).** With the world's "Auto Equip Received Gear" option on, the first
   weapon or attire piece stopped every later Archipelago item: the grant
