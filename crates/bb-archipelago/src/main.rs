@@ -343,6 +343,25 @@ impl BloodborneBackend for Backend {
         }
     }
 
+    // clients#618: forwarded for the same reason as `observe_stack_quantity`
+    // above -- the rescue reissue command's safety check calls this directly,
+    // and a default here would silently answer `Unsupported` for the native
+    // backend even after it grows a real storage-box accessor.
+    fn observe_storage_quantity(
+        &mut self,
+        normalized_item_id: u32,
+        reinforcement_level: Option<u8>,
+    ) -> Result<StackObservation> {
+        match self {
+            Self::Mock(backend) => {
+                backend.observe_storage_quantity(normalized_item_id, reinforcement_level)
+            }
+            Self::Native(backend) => {
+                backend.observe_storage_quantity(normalized_item_id, reinforcement_level)
+            }
+        }
+    }
+
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
         match self {
             Self::Mock(backend) => backend.grant_may_have_applied(tag),
@@ -1229,7 +1248,7 @@ fn run() -> Result<()> {
             let command = words.first().map(|word| word.to_ascii_lowercase());
             let result = match command.as_deref() {
                 None | Some("") => continue,
-                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | export | setflag FLAG CONFIRM | give INDEX CONFIRM | census CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list) | rebind CONFIRM (release the bound character while nothing is delivered). Unknown/unmapped writes and warps fail closed.".to_owned(),
+                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | reissue INDEX CONFIRM (re-grant a pending delivery whose token is confirmed gone) | export | setflag FLAG CONFIRM | give INDEX CONFIRM | census CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list) | rebind CONFIRM (release the bound character while nothing is delivered). Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
                     Some(runtime) => runtime
                         .rescue_status()
@@ -1271,6 +1290,21 @@ fn run() -> Result<()> {
                     }
                     (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
                     _ => "Usage: retry INDEX CONFIRM (inspect 'blocked' first; this is audited)".to_owned(),
+                },
+                Some("reissue") => match (runtime.as_mut(), words.get(1), words.get(2)) {
+                    (Some(runtime), Some(raw), Some(confirm))
+                        if confirm.eq_ignore_ascii_case("CONFIRM") =>
+                    {
+                        match raw.parse::<u64>() {
+                            Ok(index) => runtime.rescue_reissue_pending(index).map_or_else(
+                                |error| format!("Rescue reissue refused: {error:#}"),
+                                |()| format!("AUDIT rescue reissue index={index}: pending plan reset; the normal ordered delivery pipeline will re-grant it."),
+                            ),
+                            Err(_) => "Usage: reissue INDEX CONFIRM".to_owned(),
+                        }
+                    }
+                    (None, _, _) => "Runtime contract not loaded yet.".to_owned(),
+                    _ => "Usage: reissue INDEX CONFIRM (confirm the token is absent from BOTH held inventory and storage first; this is audited)".to_owned(),
                 },
                 Some("export") => match runtime.as_ref() {
                     Some(runtime) => runtime.rescue_export().map_or_else(

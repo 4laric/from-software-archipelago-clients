@@ -571,6 +571,102 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         self.ledger.save(&self.ledger_path)
     }
 
+    /// Reissue the pending delivery at `index` whose token has been proven
+    /// gone (clients#618): the grant completed (`grant_complete: true`) but
+    /// the physical item never reached the character -- typically a reload
+    /// to an older save. `retry`/`requeue_blocked` refuse this case ("a
+    /// delivery is already pending" -- `pending`, not `acknowledged`), and
+    /// until now nothing else in the console could clear it; the only
+    /// recourse was hand-editing `ledger.json`.
+    ///
+    /// This requires gameplay context like `retry`, refuses unless `index`
+    /// names the current pending entry with its ack flag off (a completed
+    /// acknowledgement would mean the item is not actually stuck), and
+    /// refuses if the token is present ANYWHERE -- held inventory or the
+    /// storage box. A token sitting in storage is exactly the case this must
+    /// not reissue over: the bridge only awards once more, so a second token
+    /// would strand the first one behind it forever. Only once both reads
+    /// come back proven-zero does it reset the pending plan so the normal
+    /// ordered pipeline re-grants the same index from the seed contract.
+    pub fn rescue_reissue_pending(&mut self, index: u64) -> Result<()> {
+        self.require_runtime_context("rescue delivery reissue")?
+            .context("rescue delivery reissue is waiting for gameplay")?;
+        let (ap_item_id, normalized_item_id, reinforcement_level, grant_complete) = {
+            let slot = self
+                .ledger
+                .slot(&self.seed_name, &self.slot_name)
+                .context("no receive ledger exists for this seed/slot yet")?;
+            let pending = slot
+                .pending
+                .as_ref()
+                .context("no pending delivery to reissue")?;
+            anyhow::ensure!(
+                pending.index == index,
+                "index {index} is not the pending delivery (the front of the queue is index {})",
+                pending.index
+            );
+            (
+                pending.ap_item_id,
+                pending.normalized_item_id,
+                pending.reinforcement_level,
+                pending.grant_complete,
+            )
+        };
+        anyhow::ensure!(
+            grant_complete,
+            "entry at index {index} has not completed its grant yet; this is not the \
+             lost-token case (leave menus and wait, or restart the client)"
+        );
+        match self
+            .backend
+            .observe_stack_quantity(normalized_item_id, reinforcement_level)?
+        {
+            StackObservation::Quantity(0) => {}
+            StackObservation::Quantity(held) => anyhow::bail!(
+                "refused: the token is held in inventory ({held}); it is not lost, so \
+                 reissuing would grant a duplicate"
+            ),
+            StackObservation::NotReady => {
+                anyhow::bail!("refused: held inventory has not hydrated yet; try again shortly")
+            }
+            StackObservation::Unsupported => anyhow::bail!(
+                "refused: this backend cannot read held inventory, so the token's absence \
+                 cannot be confirmed"
+            ),
+        }
+        match self
+            .backend
+            .observe_storage_quantity(normalized_item_id, reinforcement_level)?
+        {
+            StackObservation::Quantity(0) => {}
+            StackObservation::Quantity(stored) => anyhow::bail!(
+                "refused: the token is in the Hunter's Dream storage box ({stored}); withdraw \
+                 it instead of reissuing, or a second token would leave one stranded there"
+            ),
+            StackObservation::NotReady => {
+                anyhow::bail!("refused: the storage box has not hydrated yet; try again shortly")
+            }
+            StackObservation::Unsupported => anyhow::bail!(
+                "refused: this backend cannot read the storage box, so the token's absence \
+                 cannot be confirmed there; withdraw/inspect it manually before trying again \
+                 once a storage read is available"
+            ),
+        }
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .reissue_pending(index)?;
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .operator_actions
+            .push(OperatorAction {
+                timestamp_ms: rescue_timestamp_ms(),
+                command: "reissue".into(),
+                argument: ap_item_id,
+                resolved_name: format!("index {index}"),
+            });
+        self.ledger.save(&self.ledger_path)
+    }
+
     /// The AP index at the front of the queue, if a durable pending plan exists.
     pub fn pending_index(&self) -> Option<u64> {
         self.ledger
@@ -622,7 +718,11 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             format!(
                 "{head}: its delivery token was granted but the game has not consumed it. \
                  If a ?GoodsName? item is in the Hunter's Dream storage box, withdraw it; \
-                 otherwise leave menus and wait a few seconds"
+                 otherwise leave menus and wait a few seconds. If you have confirmed the \
+                 token is absent from BOTH held inventory and the storage box (for example \
+                 after reloading to an older save), run 'reissue {index} CONFIRM' to \
+                 re-grant it -- only once you have confirmed it is truly gone, since a \
+                 second token would strand the first one if it is still sitting in storage"
             )
         } else if !grant_complete {
             format!(
@@ -2152,6 +2252,164 @@ mod tests {
             Some(&1),
         );
         std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#618: a category-8 token whose native grant completed but was
+    /// never consumed (a reload to an older save is the usual cause) leaves
+    /// the ledger's `pending` set forever. Once the operator has proven the
+    /// token absent from BOTH held inventory and the storage box, `reissue`
+    /// resets the stuck plan so the ordinary ordered pipeline re-grants it --
+    /// and never leaves a second token behind.
+    fn stuck_pending_ledger() -> ReceiveLedger {
+        let mut ledger = ReceiveLedger::default();
+        let slot = ledger.slot_mut("seed", "slot");
+        slot.begin(PendingItem {
+            index: 0,
+            ap_item_id: 2000,
+            raw_descriptor: 0xB000_04CE,
+            normalized_item_id: 0x4000_04CE,
+            item_category: 4,
+            quantity: 1,
+            reinforcement_level: None,
+            equip_target: None,
+            upgrade_target_level: None,
+            grant_complete: true,
+            equip_complete: false,
+            observed_before: Some(0),
+        })
+        .unwrap();
+        ledger
+    }
+
+    fn gameplay_backend() -> MockBackend {
+        let mut backend = MockBackend::default();
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: true,
+        });
+        backend
+    }
+
+    #[test]
+    fn rescue_reissue_pending_resets_a_lost_token_confirmed_absent_everywhere() {
+        let ledger_path = path();
+        let mut backend = gameplay_backend();
+        backend.storage_observation_supported = true;
+        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+
+        client.rescue_reissue_pending(0).unwrap();
+
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert!(slot.pending.is_none());
+        assert!(slot.redeliver.contains(&0));
+        assert_eq!(slot.operator_actions.last().unwrap().command, "reissue");
+        assert_eq!(slot.operator_actions.last().unwrap().argument, 2000);
+
+        let reloaded = ReceiveLedger::load(&ledger_path).unwrap();
+        assert!(reloaded.slot("seed", "slot").unwrap().pending.is_none());
+        assert!(
+            reloaded
+                .slot("seed", "slot")
+                .unwrap()
+                .redeliver
+                .contains(&0)
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn rescue_reissue_pending_refuses_when_the_token_is_held() {
+        let ledger_path = path();
+        let mut backend = gameplay_backend();
+        backend.storage_observation_supported = true;
+        backend.inventory.insert((0x4000_04CE, None), 1);
+        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+
+        let error = client.rescue_reissue_pending(0).unwrap_err();
+        assert!(error.to_string().contains("held in inventory"), "{error}");
+        // Refused: nothing about the stuck plan moved.
+        assert!(client.ledger().slot("seed", "slot").unwrap().pending.is_some());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn rescue_reissue_pending_refuses_when_the_token_is_in_storage() {
+        let ledger_path = path();
+        let mut backend = gameplay_backend();
+        backend.storage_observation_supported = true;
+        backend.storage.insert((0x4000_04CE, None), 1);
+        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+
+        let error = client.rescue_reissue_pending(0).unwrap_err();
+        assert!(error.to_string().contains("storage box"), "{error}");
+        assert!(client.ledger().slot("seed", "slot").unwrap().pending.is_some());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn rescue_reissue_pending_refuses_when_storage_cannot_be_confirmed() {
+        // No native storage-box accessor is wired yet (the pre-clients#618
+        // status quo): `Unsupported` must fail closed rather than assume
+        // absence, or a token quietly sitting in storage gets duplicated.
+        let ledger_path = path();
+        let backend = gameplay_backend();
+        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+
+        let error = client.rescue_reissue_pending(0).unwrap_err();
+        assert!(error.to_string().contains("cannot read the storage box"), "{error}");
+        assert!(client.ledger().slot("seed", "slot").unwrap().pending.is_some());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn rescue_reissue_pending_refuses_before_the_grant_completes() {
+        let ledger_path = path();
+        let mut backend = gameplay_backend();
+        backend.storage_observation_supported = true;
+        let mut ledger = ReceiveLedger::default();
+        ledger
+            .slot_mut("seed", "slot")
+            .begin(PendingItem {
+                index: 0,
+                ap_item_id: 2000,
+                raw_descriptor: 0xB000_04CE,
+                normalized_item_id: 0x4000_04CE,
+                item_category: 4,
+                quantity: 1,
+                reinforcement_level: None,
+                equip_target: None,
+                upgrade_target_level: None,
+                grant_complete: false,
+                equip_complete: false,
+                observed_before: None,
+            })
+            .unwrap();
+        let mut client = loop_with(backend, ledger, ledger_path.clone(), config());
+
+        let error = client.rescue_reissue_pending(0).unwrap_err();
+        assert!(error.to_string().contains("has not completed its grant"), "{error}");
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn rescue_reissue_pending_refuses_without_gameplay_context() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.location_context = Some(LocationContext {
+            save_identity: "mock-save".into(),
+            gameplay_ready: false,
+        });
+        let mut client = loop_with(backend, stuck_pending_ledger(), ledger_path.clone(), config());
+
+        assert!(
+            client
+                .rescue_reissue_pending(0)
+                .unwrap_err()
+                .to_string()
+                .contains("waiting for gameplay")
+        );
+        // No successful save ever happened here, so the file may not exist.
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     /// Production-loop regression backend for clients#291. Only the target
