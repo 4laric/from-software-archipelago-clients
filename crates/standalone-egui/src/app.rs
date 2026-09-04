@@ -259,6 +259,13 @@ impl StandaloneApp {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.menu_button("\u{2699}", |ui| self.settings(ui));
+                if let Some(version) = &snapshot.version {
+                    ui.label(
+                        RichText::new(version)
+                            .color(color(view::palette::MUTED))
+                            .size(10.0),
+                    );
+                }
             });
         });
 

@@ -225,6 +225,9 @@ pub struct ClientSnapshot {
     pub server: Option<String>,
     pub slot: Option<String>,
     pub seed: Option<String>,
+    /// Human-readable binary/runtime identity shown persistently by renderers.
+    #[serde(default)]
+    pub version: Option<String>,
     pub goal: Option<String>,
     pub go_mode: Option<bool>,
     #[serde(default)]
@@ -257,6 +260,7 @@ pub struct DeliveryFacts {
     pub server: Option<String>,
     pub slot: Option<String>,
     pub seed: Option<String>,
+    pub version: Option<String>,
     pub goal: Option<String>,
     pub go_mode: Option<bool>,
     pub victory: Option<VictorySummary>,
@@ -308,6 +312,7 @@ impl SnapshotReducer {
         self.snapshot.server = facts.server;
         self.snapshot.slot = facts.slot;
         self.snapshot.seed = facts.seed;
+        self.snapshot.version = facts.version;
         self.snapshot.goal = facts.goal;
         self.snapshot.go_mode = facts.go_mode;
         self.snapshot.victory = facts.victory;

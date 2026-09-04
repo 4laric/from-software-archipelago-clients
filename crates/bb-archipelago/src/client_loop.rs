@@ -513,7 +513,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     "index={index} item={:?} ap_item={} reason={}",
                     resolve(item.ap_item_id),
                     item.ap_item_id,
-                    item.blocked.as_deref().unwrap_or("unknown")
+                    self.displayed_park_reason(item)
                 )
             })
             .collect::<Vec<_>>();
@@ -547,14 +547,29 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .slot(&self.seed_name, &self.slot_name)
             .into_iter()
             .flat_map(|slot| slot.blocked_entries())
-            .map(|(index, item)| {
-                (
-                    index,
-                    item.ap_item_id,
-                    item.blocked.as_deref().unwrap_or("unknown").to_owned(),
-                )
-            })
+            .map(|(index, item)| (index, item.ap_item_id, self.displayed_park_reason(item)))
             .collect()
+    }
+
+    fn displayed_park_reason(&self, item: &AcknowledgedItem) -> String {
+        let historical = item.blocked.as_deref().unwrap_or("unknown");
+        let was_unknown = historical.starts_with("unreviewed_attire ")
+            || historical.starts_with("unknown_descriptor_evidence ");
+        if !was_unknown
+            || !self
+                .config
+                .items
+                .get(&item.ap_item_id)
+                .is_some_and(|binding| binding.descriptor_evidence.is_known())
+        {
+            return historical.to_owned();
+        }
+        self.pending_index().map_or_else(
+            || "now_supported (this client now supports the binding; automatic retry is queued)".to_owned(),
+            |pending| format!(
+                "now_supported (this client now supports the binding; automatic retry is waiting behind active delivery index {pending})"
+            ),
+        )
     }
 
     /// Safe session facts for the renderer; never exposes process addresses.
