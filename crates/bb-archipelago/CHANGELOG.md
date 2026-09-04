@@ -1,5 +1,29 @@
 ## Unreleased
 
+### Fixed
+
+* **A rescue `give` typed during a delivery no longer freezes the whole
+  receive stream (review finding C1).** Typing `give` or `census CONFIRM`
+  while an Archipelago item was mid-flight stopped every delivery for the
+  rest of the session, and the state was durable, so a restart reproduced it
+  immediately. The operator lane waited for the pending AP plan, and the AP
+  plan was the only thing that could clear itself, so neither side ever moved
+  and the client looked healthy while nothing arrived. The operator lane now
+  reports that it is waiting for items rather than holding the lane, so AP
+  delivery keeps running; the rescue takes the native lane on the first poll
+  after the AP plan completes.
+
+* **A rescue grant that fails terminally is parked instead of wedging the
+  loop and flooding the console (review finding C3).** When the harness
+  latched `quantity_mismatch`, `command_rejected` or `write_error` for a
+  queued `give`, every 50 ms poll re-raised the same verdict: `Rescue give
+  delivery held` printed twenty times a second and no Archipelago item was
+  ever delivered again, with no console command able to clear the row. The
+  grant is now recorded as parked on the ledger with its status and detail,
+  printed once, and listed by `blocked`; the lane releases and AP delivery
+  resumes. A retyped `give` for a parked item stays a fixed point, and a
+  non-terminal rescue error is deduplicated the way delivery errors are.
+
 ### Changed
 
 * **A failed auto-equip no longer wedges the receive stream (review finding

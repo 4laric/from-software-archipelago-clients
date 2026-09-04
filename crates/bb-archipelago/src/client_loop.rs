@@ -175,11 +175,25 @@ pub enum ItemPollResult {
     Completed(CompletedItem),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperatorGrantPoll {
     Idle,
     Pending,
+    /// An operator grant is queued but the AP lane owns a durable pending plan
+    /// (review finding C1). The rescue cannot start until that plan retires,
+    /// and only `poll_items` retires it, so this is explicitly NOT `Pending`:
+    /// the caller must keep polling items. The rescue regains priority on the
+    /// first poll after `slot.pending` clears.
+    WaitingForItems,
     Completed(i64),
+    /// The harness latched a terminal verdict for this rescue grant (review
+    /// finding C3). The row is parked durably, the lane is released, and the
+    /// caller reports it once instead of re-raising it twenty times a second.
+    Parked {
+        ap_item_id: i64,
+        status: String,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,6 +517,22 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 )
             })
             .collect::<Vec<_>>();
+        // review finding C3: a parked rescue grant has no AP index, so it is
+        // not in `acknowledged`. List it here anyway, or the operator's only
+        // evidence would be a single console line they may have scrolled past.
+        let rows = rows
+            .into_iter()
+            .chain(
+                slot.operator_grant_parks
+                    .iter()
+                    .map(|(ap_item_id, reason)| {
+                        format!(
+                            "index=rescue item={:?} ap_item={ap_item_id} reason={reason}",
+                            resolve(*ap_item_id)
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
         if rows.is_empty() {
             "No parked deliveries.".to_string()
         } else {
@@ -678,6 +708,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         );
         let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
         if slot.operator_grants.contains_key(&ap_item_id)
+            // review finding C3: a parked rescue stays recorded, so a retyped
+            // `give` does not re-run a command that may have half applied.
+            || slot.operator_grant_parks.contains_key(&ap_item_id)
             || slot
                 .acknowledged
                 .values()
@@ -737,6 +770,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         let mut skipped = 0;
         for (ap_item_id, binding) in candidates {
             if slot.operator_grants.contains_key(&ap_item_id)
+                || slot.operator_grant_parks.contains_key(&ap_item_id)
                 || slot
                     .acknowledged
                     .values()
@@ -904,12 +938,19 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         else {
             return Ok(OperatorGrantPoll::Idle);
         };
+        // review finding C1: an AP plan owns the native lane, and only
+        // `poll_items` ever clears `slot.pending`. Reporting `Pending` here
+        // made the caller skip `poll_items`, so the AP plan could never
+        // retire and the rescue could never start -- durably, because both
+        // rows survive a restart. Say "waiting for items" instead, so the AP
+        // lane keeps advancing; the rescue takes the lane on the next poll
+        // after the plan completes.
         if self
             .ledger
             .slot(&self.seed_name, &self.slot_name)
             .is_some_and(|slot| slot.pending.is_some())
         {
-            return Ok(OperatorGrantPoll::Pending);
+            return Ok(OperatorGrantPoll::WaitingForItems);
         }
         // The main loop gives an explicit rescue grant priority over ordinary AP delivery. If a
         // sustain already owns the native lane, merely reporting the rescue as pending would also
@@ -974,7 +1015,18 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             reinforcement_level: pending.reinforcement_level,
             tag,
         };
-        if self.backend.grant_item(&grant)? == OperationProgress::Pending {
+        // review finding C3: the harness latches a terminal verdict for the
+        // tag, so propagating it would re-raise the same error on every 50 ms
+        // poll, hold the lane, and stop `poll_items` for the rest of the
+        // session. Park it the way `park_terminal_grant` parks an AP item.
+        let progress = match self.backend.grant_item(&grant) {
+            Ok(progress) => progress,
+            Err(error) => {
+                let failure = error.downcast::<GrantTerminalFailure>()?;
+                return self.park_operator_grant(ap_item_id, failure);
+            }
+        };
+        if progress == OperationProgress::Pending {
             return Ok(OperatorGrantPoll::Pending);
         }
         self.ledger
@@ -1817,6 +1869,30 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// stream continues with the next index and the parked entry waits for
     /// the operator's `bb-blocked` tool. Never retried automatically:
     /// re-issuing an already-delivered item duplicates it (clients#399).
+    /// Park a terminally failed operator grant (review finding C3). The row
+    /// leaves the active lane so `poll_operator_grant` reports `Idle` on the
+    /// next poll and AP delivery resumes; the harness verdict is kept durably
+    /// so `blocked` can show it and a repeated `give` stays a fixed point. It
+    /// is never retried automatically: the failed command may have applied.
+    fn park_operator_grant(
+        &mut self,
+        ap_item_id: i64,
+        failure: GrantTerminalFailure,
+    ) -> Result<OperatorGrantPoll> {
+        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+        slot.operator_grants.remove(&ap_item_id);
+        slot.operator_grant_parks.insert(
+            ap_item_id,
+            format!("{} ({})", failure.status, failure.detail),
+        );
+        self.ledger.save(&self.ledger_path)?;
+        Ok(OperatorGrantPoll::Parked {
+            ap_item_id,
+            status: failure.status,
+            detail: failure.detail,
+        })
+    }
+
     fn park_terminal_grant(
         &mut self,
         item: IncomingItem,
@@ -2325,6 +2401,150 @@ mod tests {
         assert_eq!(client.backend().withdrawn, vec!["sustain_1000"]);
         assert_eq!(client.backend().grants.len(), 1);
         assert_eq!(client.backend().grants[0].tag, "operator_grant_2000");
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// Review finding C1: the operator lane used to report `Pending` while an
+    /// AP plan was durable, which made the caller skip `poll_items` -- the only
+    /// code that ever clears that plan. Both lanes then waited on each other
+    /// forever, across restarts. Now the AP lane keeps advancing and the
+    /// rescue takes the native lane on the next poll after the plan retires.
+    #[test]
+    fn an_operator_grant_queued_while_an_ap_item_is_pending_lets_both_complete() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.items.insert(
+            2001,
+            RuntimeItemBinding {
+                raw_descriptor: 0xB000_04D2,
+                normalized_item_id: 0x4000_04D2,
+                ..goods()
+            },
+        );
+        let mut backend = MockBackend::default();
+        // The AP grant spans two polls, exactly as a native delivery does.
+        backend.delay_grant("ap_0", 1);
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        assert!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .is_some(),
+            "the AP plan must be durable for this regression to bite"
+        );
+        assert!(client.rescue_give(2001, "Pebble").unwrap());
+
+        // The rescue defers to the in-flight AP plan without holding the lane.
+        assert_eq!(
+            client.poll_operator_grant().unwrap(),
+            OperatorGrantPoll::WaitingForItems
+        );
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+        assert!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .pending
+                .is_none()
+        );
+
+        // With the plan retired the rescue takes priority immediately.
+        assert_eq!(
+            client.poll_operator_grant().unwrap(),
+            OperatorGrantPoll::Completed(2001)
+        );
+        let tags = client
+            .backend()
+            .grants
+            .iter()
+            .map(|grant| grant.tag.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(tags, vec!["ap_0".to_string(), "operator_grant_2001".into()]);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// Review finding C3: the harness latches its terminal verdict, so
+    /// propagating it re-raised the same error on every 50 ms poll, held the
+    /// operator lane, and stopped AP delivery for the session while flooding
+    /// the console. The grant is parked durably instead.
+    #[test]
+    fn a_terminally_failed_operator_grant_parks_and_the_next_ap_item_delivers() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.items.insert(
+            2001,
+            RuntimeItemBinding {
+                raw_descriptor: 0xB000_04D2,
+                normalized_item_id: 0x4000_04D2,
+                ..goods()
+            },
+        );
+        let mut backend = MockBackend::default();
+        backend.fail_grant_terminally_with("operator_grant_2001", "quantity_mismatch");
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        assert!(client.rescue_give(2001, "Pebble").unwrap());
+
+        let parked = client.poll_operator_grant().unwrap();
+        let OperatorGrantPoll::Parked {
+            ap_item_id,
+            status,
+            detail,
+        } = parked
+        else {
+            panic!("expected the terminal failure to park, got {parked:?}");
+        };
+        assert_eq!(ap_item_id, 2001);
+        assert_eq!(status, "quantity_mismatch");
+        assert_eq!(detail, "mock terminal harness failure");
+
+        // The lane is released: the very next poll is idle, not another raise.
+        assert_eq!(
+            client.poll_operator_grant().unwrap(),
+            OperatorGrantPoll::Idle
+        );
+        assert!(
+            client.rescue_list_blocked().contains("quantity_mismatch"),
+            "the operator must be able to see the park: {}",
+            client.rescue_list_blocked()
+        );
+        // A retyped give is a fixed point: the failed command may have applied.
+        assert!(!client.rescue_give(2001, "Pebble").unwrap());
+
+        // AP delivery keeps running behind the parked rescue.
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem { index: 0, .. })
+        ));
+
+        let reloaded = ReceiveLedger::load(&ledger_path).unwrap();
+        let slot = reloaded.slot("seed", "slot").unwrap();
+        assert!(
+            !slot.operator_grants.contains_key(&2001),
+            "the parked row must leave the active lane"
+        );
+        assert_eq!(
+            slot.operator_grant_parks.get(&2001).map(String::as_str),
+            Some("quantity_mismatch (mock terminal harness failure)")
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 

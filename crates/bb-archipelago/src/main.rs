@@ -55,6 +55,18 @@ const ITEM_DELIVERY_COOLDOWN: Duration = Duration::from_secs(1);
 impl ItemErrorReporter {
     /// Returns the line to print for `error`, or `None` to stay quiet.
     fn report(&mut self, error: &anyhow::Error, now: Instant) -> Option<String> {
+        self.report_labelled(error, now, "Bloodborne item delivery blocked")
+    }
+
+    /// The same dedup, under a caller-chosen label. The operator lane needs it
+    /// too (review finding C3): a non-terminal rescue error repeats on every
+    /// 50 ms poll, and printing it undeduplicated floods the console.
+    fn report_labelled(
+        &mut self,
+        error: &anyhow::Error,
+        now: Instant,
+        label: &str,
+    ) -> Option<String> {
         let message = format!("{error:#}");
         let report = self.last.as_ref().is_none_or(|(previous, when)| {
             previous != &message || now.duration_since(*when) >= ITEM_ERROR_DEDUP
@@ -63,7 +75,7 @@ impl ItemErrorReporter {
             return None;
         }
         self.last = Some((message.clone(), now));
-        Some(format!("Bloodborne item delivery blocked: {message}"))
+        Some(format!("{label}: {message}"))
     }
 
     /// Returns the recovery line when a failure regime was in effect.
@@ -1114,6 +1126,9 @@ fn run() -> Result<()> {
     let mut ap_detail_printed = false;
     let mut last_location_error: Option<(String, Instant)> = None;
     let mut item_errors = ItemErrorReporter::default();
+    // Same dedup, own slot: a rescue-lane error must not silence an item
+    // delivery error, or the other way round (review finding C3).
+    let mut rescue_errors = ItemErrorReporter::default();
     #[cfg(windows)]
     let mut placement_scouts: Option<toasts::PlacementScouts> = None;
     let mut death_link_tag_advertised = false;
@@ -1811,8 +1826,31 @@ fn run() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let operator_busy = match runtime.poll_operator_grant() {
-                Ok(OperatorGrantPoll::Idle) => false,
+                Ok(OperatorGrantPoll::Idle) => {
+                    rescue_errors.last = None;
+                    false
+                }
                 Ok(OperatorGrantPoll::Pending) => true,
+                // review finding C1: the rescue is waiting on the AP plan, and
+                // only `poll_items` retires that plan. Holding the lane here
+                // would deadlock both lanes for the rest of the session.
+                Ok(OperatorGrantPoll::WaitingForItems) => false,
+                Ok(OperatorGrantPoll::Parked {
+                    ap_item_id,
+                    status,
+                    detail,
+                }) => {
+                    let line = format!(
+                        "PARKED rescue give index={ap_item_id} ({:?}): the grant terminally failed \
+                         in the harness ({status}: {detail}). The rescue is recorded as blocked \
+                         (type `blocked` to inspect) and AP delivery keeps running.",
+                        item_label(client.this_game(), ap_item_id)
+                    );
+                    client_eprintln!("{line}");
+                    #[cfg(windows)]
+                    ui_reducer.activity(client_ui::ActivityKind::ParkedDelivery, line);
+                    false
+                }
                 Ok(OperatorGrantPoll::Completed(ap_item_id)) => {
                     let line = format!(
                         "AUDIT rescue give index={ap_item_id} ({:?}): delivered through normal delivery.",
@@ -1824,10 +1862,17 @@ fn run() -> Result<()> {
                     false
                 }
                 Err(error) => {
-                    let line = format!("Rescue give delivery held: {error:#}");
-                    client_eprintln!("{line}");
-                    #[cfg(windows)]
-                    ui_reducer.activity(client_ui::ActivityKind::CommandResult, line);
+                    // review finding C3: this repeats every poll while the
+                    // cause stands, so dedup it like item delivery errors.
+                    if let Some(line) = rescue_errors.report_labelled(
+                        &error,
+                        Instant::now(),
+                        "Rescue give delivery held",
+                    ) {
+                        client_eprintln!("{line}");
+                        #[cfg(windows)]
+                        ui_reducer.activity(client_ui::ActivityKind::CommandResult, line);
+                    }
                     true
                 }
             };
