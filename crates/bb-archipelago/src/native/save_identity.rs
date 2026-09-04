@@ -130,15 +130,16 @@ impl SaveIdentityTracker {
                 if let Some(identity) = identity_from_write_line(line) {
                     self.current = Some(identity);
                 }
-                if let Some(path) = denied_save_write(line) {
-                    if self.pending_denial.is_none() && self.settled_denial.is_none() {
-                        let mtime_at_denial = file_mtime(Path::new(&path));
-                        self.pending_denial = Some(PendingDenial {
-                            path,
-                            mtime_at_denial,
-                            polls_waited: 0,
-                        });
-                    }
+                if let Some(path) = denied_save_write(line)
+                    && self.pending_denial.is_none()
+                    && self.settled_denial.is_none()
+                {
+                    let mtime_at_denial = file_mtime(Path::new(&path));
+                    self.pending_denial = Some(PendingDenial {
+                        path,
+                        mtime_at_denial,
+                        polls_waited: 0,
+                    });
                 }
             }
         }
@@ -338,8 +339,11 @@ mod tests {
             other => panic!("expected Stuck, got {other:?}"),
         }
 
-        // Clean up: clear read-only before removing the tree.
+        // Clean up: clear read-only before removing the tree. This is a
+        // Windows-only test helper resetting a local temp file's attribute,
+        // not a Unix permission grant.
         let mut permissions = std::fs::metadata(&save).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         std::fs::set_permissions(&save, permissions).unwrap();
         let _ = std::fs::remove_dir_all(root);
