@@ -1,5 +1,7 @@
 //! Explicit read-only diagnostic. No automatic loading or offset probing.
-use er_logic::mfg_bridge::{ABI_VERSION, Bridge, Capture, CaptureTick, Hover, Info, negotiate};
+use er_logic::mfg_bridge::{
+    ABI_VERSION, Bridge, Capture, CaptureTick, Hover, Info, RecordedHover, negotiate,
+};
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleExA, GetProcAddress};
 use windows::core::s;
@@ -99,6 +101,11 @@ impl HoverCapture {
     pub fn arm(&mut self, now_ms: u64) {
         self.reset();
         self.capture.arm(now_ms);
+    }
+
+    /// Historical copied sample; never exposes a live engine selection.
+    pub fn recorded(&self) -> Option<RecordedHover> {
+        self.capture.recorded
     }
 
     pub fn active(&self) -> bool {
