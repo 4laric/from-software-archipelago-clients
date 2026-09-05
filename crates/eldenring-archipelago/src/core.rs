@@ -258,6 +258,8 @@ pub struct Core {
     tracker_in_logic_only: bool,
     /// Tracker filter: show only progression-surface checks.
     tracker_surface_only: bool,
+    // Session-only opt-in; never changes the seed or sends reports automatically.
+    tracker_player_review: bool,
     /// Seed-owned spoiler preference (#1184). False for old seeds and by default: sweep groups in
     /// locked regions collapse to an anonymous count. True reveals their boss labels while still
     /// withholding the region name and pending member count.
@@ -830,6 +832,7 @@ impl shared::Core for Core {
             lock_hint_intro_done: false,
             tracker_in_logic_only: false,
             tracker_surface_only: false,
+            tracker_player_review: false,
             reveal_sweep_boss_names: false,
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
@@ -5746,6 +5749,21 @@ impl Core {
         // Filter state as locals (the closure stays self-free); written back to self after.
         let mut in_logic_only = self.tracker_in_logic_only;
         let mut surface_only = self.tracker_surface_only;
+        let mut player_review = self.tracker_player_review;
+        let mut review_url = None;
+        let review_buttons = |id: u64, target: &mut Option<String>| {
+            // Use the server name, not the spoiler-trimmed display label, for identity.
+            if let Some(name) = loc_names.get(&id) {
+                ui.same_line();
+                if ui.small_button(format!("Review###review-{id}")) {
+                    *target = Some(er_logic::player_review::url(id, name.as_str(), false));
+                }
+                ui.same_line();
+                if ui.small_button(format!("Map###review-map-{id}")) {
+                    *target = Some(er_logic::player_review::url(id, name.as_str(), true));
+                }
+            }
+        };
         let mismatch_warning = self.version_warn.clone();
         let mut mismatch_acknowledged = self.version_warn_acknowledged;
         // bobler, 2026-08-10: "you forgot to resize the box though i have to drag it out to read".
@@ -5880,6 +5898,19 @@ impl Core {
                     ui.separator();
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
+                ui.checkbox("Help verify locations (this session)", &mut player_review);
+                if player_review {
+                    ui.text_wrapped("Review and Map open the player review page in your browser. Nothing is submitted automatically. The map includes locations outside your seed and may reveal unexplored places.");
+                    if ui.collapsing_header("Review completed locations", imgui::TreeNodeFlags::empty()) {
+                        ui.text_wrapped("Completed does not necessarily mean visited: boss rewards can complete nearby pickups. Report only what you actually observed.");
+                        let mut completed = checked.clone();
+                        completed.sort_unstable();
+                        for id in completed {
+                            ui.text(display_loc(id));
+                            review_buttons(id, &mut review_url);
+                        }
+                    }
+                }
                 if ui.collapsing_header(
                     &region_roster_header,
                     imgui::TreeNodeFlags::empty(),
@@ -6219,6 +6250,9 @@ impl Core {
                             } else {
                                 ui.text(line);
                             }
+                            if player_review {
+                                review_buttons(u.location_id, &mut review_url);
+                            }
                         }
                     }
                 }
@@ -6316,6 +6350,15 @@ impl Core {
         }
         self.tracker_in_logic_only = in_logic_only;
         self.tracker_surface_only = surface_only;
+        self.tracker_player_review = player_review;
+        if let Some(url) = review_url {
+            // An explicit button click, fixed HTTPS origin, escaped fragment; no shell.
+            if let Err(error) = std::process::Command::new("explorer.exe").arg(&url).spawn() {
+                self.log(ap::Print::message(format!(
+                    "Could not open player review: {error}. Link: {url}"
+                )));
+            }
+        }
         if mismatch_acknowledged && !self.version_warn_acknowledged {
             self.version_warn_acknowledged = true;
             if let Some(warning) = &self.version_warn {
