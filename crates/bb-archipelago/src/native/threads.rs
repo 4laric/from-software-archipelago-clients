@@ -24,6 +24,11 @@ mod windows_impl {
     /// `CONTEXT_CONTROL` for amd64: enough of the register file to read RIP.
     const CONTEXT_CONTROL_AMD64: u32 = 0x0010_0001;
 
+    // WinNT.h requires 16-byte alignment for the AMD64 context. The generated
+    // windows bindings do not guarantee that alignment for a stack CONTEXT.
+    #[repr(C, align(16))]
+    struct AlignedContext(CONTEXT);
+
     /// A live thread controller scoped to one process id.
     pub struct WindowsThreadController {
         process_id: u32,
@@ -104,16 +109,57 @@ mod windows_impl {
         fn instruction_pointers(&mut self) -> Result<Vec<u64>> {
             let mut rips = Vec::with_capacity(self.suspended.len());
             for handle in &self.suspended {
-                // CONTEXT is 16-byte aligned and contains a union; zero it
-                // rather than depend on a Default impl, then request only the
-                // control registers so RIP is populated.
-                let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-                context.ContextFlags = CONTEXT_FLAGS(CONTEXT_CONTROL_AMD64);
-                unsafe { GetThreadContext(*handle, &mut context) }
+                let mut context = AlignedContext(unsafe { std::mem::zeroed() });
+                context.0.ContextFlags = CONTEXT_FLAGS(CONTEXT_CONTROL_AMD64);
+                unsafe { GetThreadContext(*handle, &mut context.0) }
                     .context("GetThreadContext while sampling RIP")?;
-                rips.push(context.Rip);
+                rips.push(context.0.Rip);
             }
             Ok(rips)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        #[test]
+        fn samples_a_real_suspended_windows_thread_without_a_game() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let (send, recv) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                send.send(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() })
+                    .unwrap();
+                while !worker_stop.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            });
+            let id = recv.recv().unwrap();
+            let result = (|| -> Result<Vec<u64>> {
+                let handle =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, false, id) }?;
+                if unsafe { SuspendThread(handle) } == u32::MAX {
+                    let _ = unsafe { CloseHandle(handle) };
+                    bail!("could not suspend test worker");
+                }
+                let mut controller = WindowsThreadController {
+                    process_id: 0,
+                    suspended: vec![handle],
+                };
+                // Drop resumes and closes even if sampling fails.
+                controller.instruction_pointers()
+            })();
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            let rips = result.unwrap();
+            assert_eq!(rips.len(), 1);
+            assert_ne!(rips[0], 0);
         }
     }
 }
