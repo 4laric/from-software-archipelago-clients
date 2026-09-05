@@ -5769,6 +5769,24 @@ impl Core {
         let mut player_review = self.tracker_player_review;
         let capture_active = self.mfg_capture.active();
         let capture_text = self.mfg_capture.text().to_string();
+        let recorded_pin = self.mfg_capture.recorded();
+        let pin_match = recorded_pin.map(|recorded| {
+            let pin = recorded.selection;
+            er_logic::mfg_match::resolve(pin.original_flag, pin.lot_table, pin.lot_row, |id| {
+                u64::try_from(id).is_ok_and(|id| loc_names.contains_key(&id))
+            })
+        });
+        // Fail closed for the whole candidate group if a seed reuses a catalog ID
+        // for a different location. No fuzzy names or partial sibling selection.
+        let pin_catalog_mismatch = pin_match.as_ref().is_some_and(|matched| {
+            matched.seed_candidates.iter().any(|candidate| {
+                let server_name = u64::try_from(candidate.ap_id)
+                    .ok()
+                    .and_then(|id| loc_names.get(&id))
+                    .map(|name| name.as_str());
+                server_name != er_logic::mfg_match::catalog_name(candidate.ap_id)
+            })
+        });
         let mut capture_start = false;
         let mut capture_clear = false;
         let mut review_url = None;
@@ -5920,7 +5938,54 @@ impl Core {
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 if ui.collapsing_header("Map pin test (optional)", imgui::TreeNodeFlags::empty()) {
-                    ui.text_wrapped(&capture_text);
+                    if let (Some(recorded), Some(matched)) = (recorded_pin, &pin_match) {
+                        ui.text_wrapped(format!(
+                            "Recorded pin at {} seconds into this client session. This is a saved observation, not your current hover.",
+                            recorded.received_ms / 1_000
+                        ));
+                        use er_logic::mfg_match::MatchStatus;
+                        ui.text_wrapped(if pin_catalog_mismatch {
+                            "The location catalog differs from your seed. No match selected; update the client and world together."
+                        } else { match matched.status {
+                            MatchStatus::SingleCandidate => "Possible matching location in your seed:",
+                            MatchStatus::AmbiguousCandidates => "This pin may represent several locations. We cannot tell which one from the pin alone:",
+                            MatchStatus::OutOfSeed => "This pin has no matching location in your current seed.",
+                            MatchStatus::UnknownIdentity => "This pin does not provide enough information to identify a location.",
+                            MatchStatus::InvalidIdentity => "This pin returned conflicting or unsupported information. No location selected.",
+                            MatchStatus::Unmatched => "We do not have a matching location for this pin yet.",
+                        } });
+                        // Distinct IDs from the regular tracker rows, even when expanded together.
+                        let _pin_scope = ui.push_id("recorded-map-pin");
+                        for candidate in matched.seed_candidates.iter().filter(|_| !pin_catalog_mismatch) {
+                            let Ok(id) = u64::try_from(candidate.ap_id) else { continue };
+                            if loc_names.contains_key(&id) {
+                                let status = if checked_set.contains(&id) {
+                                    "Completed in Archipelago"
+                                } else {
+                                    "Not yet completed in Archipelago"
+                                };
+                                ui.text_wrapped(er_logic::player_review::pin_label(&display_loc(id)));
+                                ui.text_disabled(status);
+                                if player_review {
+                                    review_buttons(id, &mut review_url);
+                                }
+                            }
+                        }
+                        if !pin_catalog_mismatch && !matched.seed_candidates.is_empty() {
+                            if matched.catalog_candidates.len() > matched.seed_candidates.len() {
+                                ui.text_wrapped("This pin also has possible matches outside your seed. Only your seed's locations are listed.");
+                            }
+                            ui.text_wrapped("A completed check may have been awarded by a boss. Report only what you saw at this location.");
+                            if !player_review {
+                                ui.text_wrapped("Enable Help verify locations below to open Review or Map for a candidate.");
+                            }
+                        }
+                        if ui.collapsing_header("Technical recording details", imgui::TreeNodeFlags::empty()) {
+                            ui.text_wrapped(&capture_text);
+                        }
+                    } else {
+                        ui.text_wrapped(&capture_text);
+                    }
                     if ui.small_button(if capture_active { "Restart 30-second recording" } else { "Record a map pin for 30 seconds" }) {
                         capture_start = true;
                     }

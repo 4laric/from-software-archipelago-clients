@@ -68,6 +68,7 @@ pub mod marker_replay;
 pub mod merchant_bell_table;
 pub mod merchant_bells;
 pub mod mfg_bridge;
+pub mod mfg_match;
 pub mod mfg_probe;
 pub mod morgott_progression;
 pub mod name_override;
