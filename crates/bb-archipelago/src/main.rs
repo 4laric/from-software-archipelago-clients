@@ -1019,6 +1019,7 @@ fn run() -> Result<()> {
             delivery: client_ui::DeliveryState::NotArmed,
             server: Some(args.server.clone()),
             slot: Some(args.slot.clone()),
+            version: Some(format!("{} · {RUNTIME_BUILD}", client_version())),
             ..Default::default()
         }));
         (client, reducer)
@@ -2213,6 +2214,7 @@ fn run() -> Result<()> {
                     server: Some(args.server.clone()),
                     slot: Some(args.slot.clone()),
                     seed,
+                    version: Some(format!("{} · {RUNTIME_BUILD}", client_version())),
                     goal: goal_name.clone(),
                     victory: runtime
                         .as_ref()
