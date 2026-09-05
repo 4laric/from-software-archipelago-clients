@@ -107,6 +107,74 @@ pub fn resolve(
     result
 }
 
+/// Presentation only: eligibility is not the actual randomized item class.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LotStyleKind {
+    ProgressionSurface = 1,
+    Hint = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LotStyle {
+    pub lot_table: u32,
+    pub lot_row: u32,
+    pub style: LotStyleKind,
+}
+
+/// Emit a deterministic full replacement snapshot. Checked candidates remain in
+/// agreement as neutral, rather than making a sibling appear uniquely actionable.
+pub fn color_styles(
+    seed_names: &std::collections::HashMap<i64, String>,
+    checked: &std::collections::HashSet<i64>,
+    hinted: &std::collections::HashSet<i64>,
+    progression_surface: &std::collections::HashSet<i64>,
+) -> Vec<LotStyle> {
+    let mut output = Vec::new();
+    let mut previous = None;
+    for &(table, row, _, _) in data::LOTS {
+        if previous == Some((table, row)) {
+            continue;
+        }
+        previous = Some((table, row));
+        let matched = resolve(0, table, row, |id| seed_names.contains_key(&id));
+        if matched.seed_candidates.is_empty()
+            || matched.seed_candidates.iter().any(|candidate| {
+                catalog_name(candidate.ap_id)
+                    != seed_names.get(&candidate.ap_id).map(String::as_str)
+            })
+        {
+            continue;
+        }
+        let style_for = |candidate: &Candidate| {
+            if checked.contains(&candidate.ap_id) {
+                None
+            } else if hinted.contains(&candidate.ap_id) {
+                Some(LotStyleKind::Hint)
+            } else if progression_surface.contains(&candidate.ap_id) {
+                Some(LotStyleKind::ProgressionSurface)
+            } else {
+                None
+            }
+        };
+        let Some(style) = style_for(&matched.seed_candidates[0]) else {
+            continue;
+        };
+        if matched
+            .seed_candidates
+            .iter()
+            .all(|candidate| style_for(candidate) == Some(style))
+        {
+            output.push(LotStyle {
+                lot_table: table,
+                lot_row: row,
+                style,
+            });
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +257,78 @@ mod tests {
             assert!(catalog_name(id).is_some());
             assert!(data::FLAGS.binary_search(&(flag, id)).is_ok());
         }
+    }
+    #[test]
+    fn colors_use_eligibility_hint_priority_and_exact_seed_names() {
+        use std::collections::{HashMap, HashSet};
+        let id = 7772821;
+        let mut names = HashMap::from([(id, catalog_name(id).unwrap().to_string())]);
+        let none = HashSet::new();
+        let surface = HashSet::from([id]);
+        let style = |entries: Vec<LotStyle>| {
+            entries
+                .into_iter()
+                .find(|entry| (entry.lot_table, entry.lot_row) == (1, 942370060))
+                .map(|entry| entry.style)
+        };
+        assert_eq!(
+            style(color_styles(&names, &none, &none, &surface)),
+            Some(LotStyleKind::ProgressionSurface)
+        );
+        assert_eq!(
+            style(color_styles(&names, &none, &surface, &surface)),
+            Some(LotStyleKind::Hint)
+        );
+        assert_eq!(
+            style(color_styles(&names, &surface, &surface, &surface)),
+            None
+        );
+        assert_eq!(style(color_styles(&names, &none, &none, &none)), None);
+        names.insert(id, "different catalog".to_string());
+        assert_eq!(style(color_styles(&names, &none, &surface, &surface)), None);
+        assert!(color_styles(&HashMap::new(), &none, &surface, &surface).is_empty());
+    }
+
+    #[test]
+    fn shared_pin_requires_unanimous_seed_candidate_colors() {
+        use std::collections::{HashMap, HashSet};
+        let ids: Vec<_> = resolve(197, 1, 10180, |_| true)
+            .seed_candidates
+            .into_iter()
+            .map(|candidate| candidate.ap_id)
+            .collect();
+        assert!(ids.len() > 1);
+        let mut names: HashMap<_, _> = ids
+            .iter()
+            .map(|&id| (id, catalog_name(id).unwrap().to_string()))
+            .collect();
+        let all: HashSet<_> = ids.iter().copied().collect();
+        let one = HashSet::from([ids[0]]);
+        let none = HashSet::new();
+        let style = |entries: Vec<LotStyle>| {
+            entries
+                .into_iter()
+                .find(|entry| (entry.lot_table, entry.lot_row) == (1, 10180))
+                .map(|entry| entry.style)
+        };
+        assert_eq!(
+            style(color_styles(&names, &none, &none, &all)),
+            Some(LotStyleKind::ProgressionSurface)
+        );
+        assert_eq!(style(color_styles(&names, &none, &one, &all)), None);
+        assert_eq!(style(color_styles(&names, &one, &none, &all)), None);
+        assert_eq!(style(color_styles(&names, &none, &none, &one)), None);
+        assert_eq!(
+            style(color_styles(&names, &none, &all, &all)),
+            Some(LotStyleKind::Hint)
+        );
+        names.insert(ids[0], "mismatched sibling".to_string());
+        assert_eq!(style(color_styles(&names, &none, &all, &all)), None);
+        // Only actual seed candidates participate; foreign catalog siblings do not.
+        names = HashMap::from([(ids[0], catalog_name(ids[0]).unwrap().to_string())]);
+        assert_eq!(
+            style(color_styles(&names, &none, &one, &all)),
+            Some(LotStyleKind::Hint)
+        );
     }
 }
