@@ -132,6 +132,120 @@ pub struct Capture {
     pub recorded: Option<RecordedHover>,
 }
 
+/// Session-only, opt-in polling for the newest copied map pin. This retains a
+/// historical observation; it never represents a current hover or game state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FollowStatus {
+    #[default]
+    Disabled,
+    Waiting,
+    InputPaused,
+    EngineUnavailable,
+}
+
+#[derive(Default)]
+pub struct Follow {
+    bridge: Bridge,
+    enabled: bool,
+    connected: Option<bool>,
+    next_poll_ms: u64,
+    latest: Option<FollowedHover>,
+    status: FollowStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FollowedHover {
+    pub selection: Selection,
+    pub received_ms: u64,
+    pub source_age_ms: u32,
+}
+
+impl Follow {
+    pub const POLL_MS: u64 = 100;
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.clear();
+        }
+    }
+
+    /// Disconnects are a session boundary for a seed-specific candidate list.
+    pub fn sync_connection(&mut self, connected: bool) {
+        if self.connected.is_some_and(|previous| previous != connected) {
+            self.clear();
+        }
+        self.connected = Some(connected);
+    }
+
+    /// Seed replacement, world transition, and an explicit disable discard the
+    /// historical pin. The opt-in setting itself remains owned by the UI.
+    pub fn clear(&mut self) {
+        self.bridge.reset(self.enabled);
+        self.next_poll_ms = 0;
+        self.latest = None;
+        self.status = if self.enabled {
+            FollowStatus::Waiting
+        } else {
+            FollowStatus::Disabled
+        };
+    }
+
+    /// A transport failure may indicate engine replacement. Keep the historical
+    /// observation but discard generation state before a later fresh sample.
+    pub fn unavailable(&mut self) {
+        self.bridge.reset(self.enabled);
+        self.status = FollowStatus::EngineUnavailable;
+    }
+
+    pub fn status(&self) -> FollowStatus {
+        self.status
+    }
+
+    pub fn latest(&self) -> Option<FollowedHover> {
+        self.latest
+    }
+
+    /// Bounded polling is suspended while any client UI owns input. A resumed
+    /// follow session samples once, then no more often than ten times/second.
+    pub fn tick(&mut self, now_ms: u64, input_released: bool) -> bool {
+        if !self.enabled {
+            self.status = FollowStatus::Disabled;
+            return false;
+        }
+        if !input_released {
+            if self.status != FollowStatus::EngineUnavailable {
+                self.status = FollowStatus::InputPaused;
+            }
+            return false;
+        }
+        if now_ms < self.next_poll_ms {
+            return false;
+        }
+        self.status = FollowStatus::Waiting;
+        self.next_poll_ms = now_ms.saturating_add(Self::POLL_MS);
+        true
+    }
+
+    pub fn accept(&mut self, now_ms: u64, hover: Hover) -> Result<Option<FollowedHover>, Refusal> {
+        if !self.enabled {
+            self.status = FollowStatus::Disabled;
+            return Err(Refusal::Disabled);
+        }
+        self.status = FollowStatus::Waiting;
+        let Some(selection) = self.bridge.accept(hover)? else {
+            return Ok(None);
+        };
+        let followed = FollowedHover {
+            selection,
+            received_ms: now_ms,
+            source_age_ms: hover.age_ms,
+        };
+        self.latest = Some(followed);
+        Ok(Some(followed))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordedHover {
     pub selection: Selection,
@@ -457,5 +571,53 @@ mod tests {
             let _ = bridge.accept(invalid);
             assert!(!bridge.is_current(old));
         }
+    }
+
+    #[test]
+    fn follow_is_opt_in_bounded_and_pauses_for_client_input() {
+        let mut follow = Follow::default();
+        assert!(!follow.tick(0, true));
+        follow.set_enabled(true);
+        assert_eq!(follow.status(), FollowStatus::Waiting);
+        assert!(follow.tick(100, true));
+        assert!(!follow.tick(150, true));
+        assert!(!follow.tick(200, false));
+        assert_eq!(follow.status(), FollowStatus::InputPaused);
+        assert!(follow.tick(200, true));
+        assert!(!follow.tick(201, true));
+    }
+
+    #[test]
+    fn follow_keeps_only_a_fresh_historical_pin_and_clears_at_boundaries() {
+        let mut follow = Follow::default();
+        follow.set_enabled(true);
+        let first = follow.accept(100, hover(1)).unwrap().unwrap();
+        assert_eq!(first.received_ms, 100);
+        assert_eq!(first.source_age_ms, 0);
+        assert_eq!(follow.latest(), Some(first));
+        assert_eq!(
+            follow.accept(
+                200,
+                Hover {
+                    age_ms: 301,
+                    ..hover(2)
+                }
+            ),
+            Err(Refusal::StaleSnapshot)
+        );
+        assert_eq!(follow.latest(), Some(first));
+        follow.unavailable();
+        assert_eq!(follow.status(), FollowStatus::EngineUnavailable);
+        assert_eq!(follow.latest(), Some(first));
+        assert!(!follow.tick(250, false));
+        assert_eq!(follow.status(), FollowStatus::EngineUnavailable);
+        follow.sync_connection(true);
+        follow.sync_connection(false);
+        assert_eq!(follow.latest(), None);
+        follow.accept(300, hover(1)).unwrap();
+        follow.clear();
+        assert_eq!(follow.latest(), None);
+        follow.set_enabled(false);
+        assert_eq!(follow.accept(400, hover(1)), Err(Refusal::Disabled));
     }
 }
