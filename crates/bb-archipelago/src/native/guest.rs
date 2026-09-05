@@ -287,6 +287,14 @@ impl<P: ProcessMemory> GuestRuntime<P> {
         if inventory == 0 {
             return None;
         }
+        let mode = self.record(self.memory.read(inventory + g.storage_mode, 1))?;
+        if mode.as_slice() != [0] {
+            *self.error.borrow_mut() = Some(
+                "cached inventory is storage, not held; waiting for a held-inventory consumption"
+                    .into(),
+            );
+            return None;
+        }
         let split = self.record(self.memory.read_u32(inventory + g.split))? as u64;
         let last = self.record(self.memory.read_u32(inventory + g.last))? as u64;
         let primary = self.record(self.memory.read_u64(inventory + g.primary_array))?;
@@ -313,8 +321,7 @@ impl<P: ProcessMemory> Runtime for GuestRuntime<P> {
     }
 
     fn inventory_ready(&mut self) -> bool {
-        self.record(self.memory.read_u64(self.cells.inventory))
-            .is_some_and(|inventory| inventory != 0)
+        self.geometry().is_some()
     }
 
     fn find_stack(&mut self, normalized_id: u32) -> Option<StackView> {
@@ -460,6 +467,7 @@ mod tests {
             &inventory.to_le_bytes(),
         );
         memory.store(inventory + g.split, &2u32.to_le_bytes());
+        memory.store(inventory + g.storage_mode, &[0]);
         memory.store(inventory + g.last, &3u32.to_le_bytes());
         memory.store(inventory + g.primary_array, &primary.to_le_bytes());
         memory.store(inventory + g.secondary_array, &secondary.to_le_bytes());
@@ -489,6 +497,29 @@ mod tests {
             entry_address(1, 2, 0x9100_0000, 0x9200_0000, g.record_stride) + g.record_quantity;
         assert_eq!(stack.quantity_address, Some(expected));
         assert!(guest.take_error().is_none());
+    }
+
+    #[test]
+    fn repository_inventory_with_valid_geometry_is_never_held() {
+        let (memory, base, normalized) = laid_out_inventory();
+        let c = contract();
+        let inventory = memory
+            .read_u64(base + c.state_cell("inventory").unwrap().rva)
+            .unwrap();
+        let mut guest = GuestRuntime::new(memory, base).unwrap();
+        assert!(guest.inventory_ready());
+        assert_eq!(guest.find_stack(normalized).unwrap().quantity, 12);
+        guest
+            .memory()
+            .store(inventory + c.geometry.storage_mode, &[1]);
+        assert!(!guest.inventory_ready());
+        assert!(guest.find_stack(normalized).is_none());
+        assert!(guest.take_error().unwrap().contains("storage, not held"));
+        guest
+            .memory()
+            .store(inventory + c.geometry.storage_mode, &[0]);
+        assert!(guest.inventory_ready());
+        assert_eq!(guest.find_stack(normalized).unwrap().quantity, 12);
     }
 
     #[test]

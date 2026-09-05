@@ -114,6 +114,7 @@ struct RawCell {
 
 #[derive(Debug, Deserialize)]
 struct RawGeometry {
+    storage_mode: u64,
     split: u64,
     last: u64,
     primary_array: u64,
@@ -269,6 +270,7 @@ pub struct StateCell {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InventoryGeometry {
+    pub storage_mode: u64,
     pub split: u64,
     pub last: u64,
     pub primary_array: u64,
@@ -407,6 +409,7 @@ impl Contract {
             state_region_size: raw.state_cells.region_size,
             state_cells,
             geometry: InventoryGeometry {
+                storage_mode: raw.inventory_geometry.storage_mode,
                 split: raw.inventory_geometry.split,
                 last: raw.inventory_geometry.last,
                 primary_array: raw.inventory_geometry.primary_array,
