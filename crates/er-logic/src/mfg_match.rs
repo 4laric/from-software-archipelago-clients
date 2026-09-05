@@ -52,7 +52,7 @@ pub fn resolve(
     };
     let known_lot = match (lot_table, lot_row) {
         (0, 0) => false,
-        (1 | 2, _) => true,
+        (1 | 2, 1..) => true,
         _ => {
             result.status = MatchStatus::InvalidIdentity;
             return result;
@@ -152,7 +152,7 @@ mod tests {
             resolve(0, 0, 0, |_| true).status,
             MatchStatus::UnknownIdentity
         );
-        for (table, row) in [(0, 123), (3, 123)] {
+        for (table, row) in [(0, 123), (1, 0), (2, 0), (3, 123)] {
             assert_eq!(
                 resolve(0, table, row, |_| true).status,
                 MatchStatus::InvalidIdentity
