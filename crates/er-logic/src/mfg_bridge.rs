@@ -1,0 +1,623 @@
+//! Read-only, copied-snapshot boundary for the source-built optional map engine.
+//! No completion, visibility, or game-memory mutation is inferred from a hover.
+
+pub const ABI_VERSION: u32 = 1;
+pub const CAP_HOVER: u32 = 1;
+pub const MAX_HOVER_AGE_MS: u32 = 300;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Info {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub capabilities: u32,
+    pub hover_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Hover {
+    pub struct_size: u32,
+    pub status: u32,
+    pub generation: u64,
+    pub handle: u64,
+    pub original_flag: u32,
+    pub lot_table: u32,
+    pub lot_row: u32,
+    pub age_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Refusal {
+    UnsupportedAbi,
+    UnsupportedLayout,
+    MissingCapability,
+    Disabled,
+    MalformedSnapshot,
+    StaleSnapshot,
+}
+
+pub fn negotiate(info: Info) -> Result<(), Refusal> {
+    if info.abi_version != ABI_VERSION {
+        return Err(Refusal::UnsupportedAbi);
+    }
+    if info.struct_size != size_of::<Info>() as u32 || info.hover_size != size_of::<Hover>() as u32
+    {
+        return Err(Refusal::UnsupportedLayout);
+    }
+    if info.capabilities & CAP_HOVER == 0 {
+        return Err(Refusal::MissingCapability);
+    }
+    Ok(())
+}
+
+/// A handle only has meaning in this client session and engine generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selection {
+    session: u64,
+    pub generation: u64,
+    pub handle: u64,
+    pub original_flag: u32,
+    pub lot_table: u32,
+    pub lot_row: u32,
+}
+
+#[derive(Default)]
+pub struct Bridge {
+    session: u64,
+    enabled: bool,
+    generation: Option<u64>,
+    selected: Option<Selection>,
+}
+
+impl Bridge {
+    /// Call on opt-in change, disconnect, seed change, or engine replacement.
+    /// Existing selections become invalid even if the new engine reuses handles.
+    pub fn reset(&mut self, enabled: bool) {
+        self.session = self.session.wrapping_add(1);
+        self.enabled = enabled;
+        self.generation = None;
+        self.selected = None;
+    }
+
+    pub fn accept(&mut self, hover: Hover) -> Result<Option<Selection>, Refusal> {
+        // Errors and no-hover must clear the previous selection, never retain a ghost pin.
+        self.selected = None;
+        if !self.enabled {
+            return Err(Refusal::Disabled);
+        }
+        if hover.struct_size != size_of::<Hover>() as u32 || hover.status > 1 {
+            return Err(Refusal::MalformedSnapshot);
+        }
+        if hover.generation == 0 {
+            return Err(Refusal::MalformedSnapshot);
+        }
+        if self.generation.is_some_and(|g| hover.generation < g) {
+            return Err(Refusal::StaleSnapshot);
+        }
+        self.generation = Some(hover.generation);
+        if hover.status == 0 {
+            return Ok(None);
+        }
+        if hover.age_ms > MAX_HOVER_AGE_MS {
+            return Err(Refusal::StaleSnapshot);
+        }
+        if hover.handle == 0 || hover.lot_table > 2 {
+            return Err(Refusal::MalformedSnapshot);
+        }
+        let selected = Selection {
+            session: self.session,
+            generation: hover.generation,
+            handle: hover.handle,
+            original_flag: hover.original_flag,
+            lot_table: hover.lot_table,
+            lot_row: hover.lot_row,
+        };
+        self.selected = Some(selected);
+        Ok(self.selected)
+    }
+
+    pub fn is_current(&self, selection: Selection) -> bool {
+        self.enabled && self.selected == Some(selection)
+    }
+}
+
+/// An explicitly armed, finite observation window. Historical results never become
+/// a live selection, and accepting a sample still uses the 300 ms bridge guard.
+#[derive(Default)]
+pub struct Capture {
+    bridge: Bridge,
+    started_ms: Option<u64>,
+    next_poll_ms: u64,
+    pub recorded: Option<RecordedHover>,
+}
+
+/// Session-only, opt-in polling for the newest copied map pin. This retains a
+/// historical observation; it never represents a current hover or game state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FollowStatus {
+    #[default]
+    Disabled,
+    Waiting,
+    InputPaused,
+    EngineUnavailable,
+}
+
+#[derive(Default)]
+pub struct Follow {
+    bridge: Bridge,
+    enabled: bool,
+    connected: Option<bool>,
+    next_poll_ms: u64,
+    latest: Option<FollowedHover>,
+    status: FollowStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FollowedHover {
+    pub selection: Selection,
+    pub received_ms: u64,
+    pub source_age_ms: u32,
+}
+
+impl Follow {
+    pub const POLL_MS: u64 = 100;
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.clear();
+        }
+    }
+
+    /// Disconnects are a session boundary for a seed-specific candidate list.
+    pub fn sync_connection(&mut self, connected: bool) {
+        if self.connected.is_some_and(|previous| previous != connected) {
+            self.clear();
+        }
+        self.connected = Some(connected);
+    }
+
+    /// Seed replacement, world transition, and an explicit disable discard the
+    /// historical pin. The opt-in setting itself remains owned by the UI.
+    pub fn clear(&mut self) {
+        self.bridge.reset(self.enabled);
+        self.next_poll_ms = 0;
+        self.latest = None;
+        self.status = if self.enabled {
+            FollowStatus::Waiting
+        } else {
+            FollowStatus::Disabled
+        };
+    }
+
+    /// A transport failure may indicate engine replacement. Keep the historical
+    /// observation but discard generation state before a later fresh sample.
+    pub fn unavailable(&mut self) {
+        self.bridge.reset(self.enabled);
+        self.status = FollowStatus::EngineUnavailable;
+    }
+
+    pub fn status(&self) -> FollowStatus {
+        self.status
+    }
+
+    pub fn latest(&self) -> Option<FollowedHover> {
+        self.latest
+    }
+
+    /// Bounded polling is suspended while any client UI owns input. A resumed
+    /// follow session samples once, then no more often than ten times/second.
+    pub fn tick(&mut self, now_ms: u64, input_released: bool) -> bool {
+        if !self.enabled {
+            self.status = FollowStatus::Disabled;
+            return false;
+        }
+        if !input_released {
+            if self.status != FollowStatus::EngineUnavailable {
+                self.status = FollowStatus::InputPaused;
+            }
+            return false;
+        }
+        if now_ms < self.next_poll_ms {
+            return false;
+        }
+        self.status = FollowStatus::Waiting;
+        self.next_poll_ms = now_ms.saturating_add(Self::POLL_MS);
+        true
+    }
+
+    pub fn accept(&mut self, now_ms: u64, hover: Hover) -> Result<Option<FollowedHover>, Refusal> {
+        if !self.enabled {
+            self.status = FollowStatus::Disabled;
+            return Err(Refusal::Disabled);
+        }
+        self.status = FollowStatus::Waiting;
+        let Some(selection) = self.bridge.accept(hover)? else {
+            return Ok(None);
+        };
+        let followed = FollowedHover {
+            selection,
+            received_ms: now_ms,
+            source_age_ms: hover.age_ms,
+        };
+        self.latest = Some(followed);
+        Ok(Some(followed))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedHover {
+    pub selection: Selection,
+    pub received_ms: u64,
+    pub elapsed_ms: u64,
+    pub source_age_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureTick {
+    Idle,
+    Poll,
+    TimedOut,
+}
+
+impl Capture {
+    pub const WINDOW_MS: u64 = 30_000;
+    pub const POLL_MS: u64 = 100;
+    pub const SETTLE_MS: u64 = 3_000;
+
+    pub fn arm(&mut self, now_ms: u64) {
+        self.reset();
+        self.bridge.reset(true);
+        self.started_ms = Some(now_ms);
+        self.next_poll_ms = now_ms.saturating_add(Self::SETTLE_MS);
+    }
+
+    pub fn reset(&mut self) {
+        self.bridge.reset(false);
+        self.started_ms = None;
+        self.recorded = None;
+    }
+
+    pub fn active(&self) -> bool {
+        self.started_ms.is_some()
+    }
+
+    /// A transport failure may mean the engine was replaced. Keep the finite
+    /// recording window, but invalidate any prior engine generation.
+    pub fn unavailable(&mut self) {
+        self.bridge.reset(self.active());
+    }
+
+    pub fn tick(&mut self, now_ms: u64, input_released: bool) -> CaptureTick {
+        let Some(started) = self.started_ms else {
+            return CaptureTick::Idle;
+        };
+        if now_ms < started || now_ms - started >= Self::WINDOW_MS {
+            self.started_ms = None;
+            self.bridge.reset(false);
+            return CaptureTick::TimedOut;
+        }
+        if !input_released {
+            self.next_poll_ms = now_ms.saturating_add(Self::SETTLE_MS);
+            return CaptureTick::Idle;
+        }
+        if now_ms < self.next_poll_ms {
+            return CaptureTick::Idle;
+        }
+        // No catch-up burst after a slow frame.
+        self.next_poll_ms = now_ms.saturating_add(Self::POLL_MS);
+        CaptureTick::Poll
+    }
+
+    pub fn accept(&mut self, now_ms: u64, hover: Hover) -> Result<Option<RecordedHover>, Refusal> {
+        let Some(started) = self.started_ms else {
+            return Err(Refusal::Disabled);
+        };
+        if now_ms < started || now_ms - started >= Self::WINDOW_MS {
+            self.started_ms = None;
+            self.bridge.reset(false);
+            return Err(Refusal::StaleSnapshot);
+        }
+        let Some(selection) = self.bridge.accept(hover)? else {
+            return Ok(None);
+        };
+        let recorded = RecordedHover {
+            selection,
+            received_ms: now_ms,
+            elapsed_ms: now_ms - started,
+            source_age_ms: hover.age_ms,
+        };
+        self.recorded = Some(recorded);
+        self.started_ms = None;
+        self.bridge.reset(false);
+        Ok(Some(recorded))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info() -> Info {
+        Info {
+            abi_version: 1,
+            struct_size: 16,
+            capabilities: CAP_HOVER,
+            hover_size: 40,
+        }
+    }
+
+    fn hover(generation: u64) -> Hover {
+        Hover {
+            struct_size: 40,
+            status: 1,
+            generation,
+            handle: 7,
+            original_flag: 123,
+            lot_table: 1,
+            lot_row: 456,
+            age_ms: 0,
+        }
+    }
+
+    #[test]
+    fn transport_failure_drops_generation_without_extending_window() {
+        let mut capture = Capture::default();
+        capture.arm(0);
+        assert_eq!(
+            capture.accept(
+                3_000,
+                Hover {
+                    status: 0,
+                    ..hover(8)
+                }
+            ),
+            Ok(None)
+        );
+        capture.unavailable();
+        assert!(capture.accept(3_100, hover(1)).unwrap().is_some());
+        capture.arm(5_000);
+        capture.unavailable();
+        assert_eq!(capture.tick(35_000, true), CaptureTick::TimedOut);
+    }
+
+    #[test]
+    fn capture_is_opt_in_bounded_and_never_catches_up() {
+        let mut capture = Capture::default();
+        assert_eq!(capture.tick(0, true), CaptureTick::Idle);
+        capture.arm(10);
+        assert_eq!(capture.tick(10, false), CaptureTick::Idle);
+        assert_eq!(capture.tick(20, true), CaptureTick::Idle);
+        assert_eq!(capture.tick(3_010, true), CaptureTick::Poll);
+        assert_eq!(capture.tick(3_109, true), CaptureTick::Idle);
+        assert_eq!(capture.tick(5_000, true), CaptureTick::Poll);
+        assert_eq!(capture.tick(5_000, true), CaptureTick::Idle);
+        assert_eq!(capture.tick(30_010, false), CaptureTick::TimedOut);
+        assert_eq!(capture.tick(30_011, true), CaptureTick::Idle);
+        assert_eq!(capture.accept(30_011, hover(1)), Err(Refusal::Disabled));
+    }
+
+    #[test]
+    fn returning_to_client_restarts_grace_without_extending_deadline() {
+        let mut capture = Capture::default();
+        capture.arm(0);
+        assert_eq!(capture.tick(10_000, false), CaptureTick::Idle);
+        assert_eq!(capture.tick(12_999, true), CaptureTick::Idle);
+        assert_eq!(capture.tick(13_000, true), CaptureTick::Poll);
+        assert_eq!(capture.tick(29_000, false), CaptureTick::Idle);
+        assert_eq!(capture.tick(30_000, true), CaptureTick::TimedOut);
+    }
+
+    #[test]
+    fn capture_rejects_stale_then_records_once_and_rearm_clears_history() {
+        let mut capture = Capture::default();
+        capture.arm(100);
+        assert_eq!(
+            capture.accept(
+                3_200,
+                Hover {
+                    age_ms: 301,
+                    ..hover(1)
+                }
+            ),
+            Err(Refusal::StaleSnapshot)
+        );
+        assert!(capture.active());
+        assert_eq!(
+            capture.accept(
+                3_250,
+                Hover {
+                    status: 0,
+                    ..hover(1)
+                }
+            ),
+            Ok(None)
+        );
+        let recorded = capture
+            .accept(
+                3_400,
+                Hover {
+                    age_ms: 50,
+                    ..hover(1)
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.received_ms, 3_400);
+        assert_eq!(recorded.elapsed_ms, 3_300);
+        assert_eq!(recorded.source_age_ms, 50);
+        assert!(!capture.bridge.is_current(recorded.selection));
+        assert!(!capture.active());
+        assert_eq!(capture.accept(3_500, hover(2)), Err(Refusal::Disabled));
+        assert_eq!(capture.recorded, Some(recorded));
+        capture.arm(3_600);
+        assert_eq!(capture.recorded, None);
+        capture.reset();
+        assert!(!capture.active());
+        assert_eq!(capture.recorded, None);
+    }
+
+    #[test]
+    fn capture_deadline_and_backwards_clock_reject_samples() {
+        let mut capture = Capture::default();
+        for now in [99, 30_100] {
+            capture.arm(100);
+            assert_eq!(capture.accept(now, hover(1)), Err(Refusal::StaleSnapshot));
+            assert_eq!(capture.recorded, None);
+            assert!(!capture.active());
+        }
+    }
+
+    #[test]
+    fn wire_layout_and_negotiation() {
+        assert_eq!(size_of::<Info>(), 16);
+        assert_eq!(size_of::<Hover>(), 40);
+        assert_eq!(std::mem::offset_of!(Hover, generation), 8);
+        assert_eq!(std::mem::offset_of!(Hover, original_flag), 24);
+        assert_eq!(negotiate(info()), Ok(()));
+        assert_eq!(
+            negotiate(Info {
+                abi_version: 2,
+                ..info()
+            }),
+            Err(Refusal::UnsupportedAbi)
+        );
+        assert_eq!(
+            negotiate(Info {
+                hover_size: 48,
+                ..info()
+            }),
+            Err(Refusal::UnsupportedLayout)
+        );
+        assert_eq!(
+            negotiate(Info {
+                capabilities: 0,
+                ..info()
+            }),
+            Err(Refusal::MissingCapability)
+        );
+    }
+
+    #[test]
+    fn opt_in_and_session_replacement_invalidate_handles() {
+        let mut bridge = Bridge::default();
+        assert_eq!(bridge.accept(hover(1)), Err(Refusal::Disabled));
+        bridge.reset(true);
+        let old = bridge.accept(hover(1)).unwrap().unwrap();
+        assert!(bridge.is_current(old));
+        bridge.reset(true);
+        let new = bridge.accept(hover(1)).unwrap().unwrap();
+        assert!(!bridge.is_current(old));
+        assert!(bridge.is_current(new));
+        bridge.reset(false);
+        assert!(!bridge.is_current(new));
+    }
+
+    #[test]
+    fn partial_identity_is_preserved_without_claiming_binding() {
+        let mut bridge = Bridge::default();
+        bridge.reset(true);
+        let selected = bridge
+            .accept(Hover {
+                original_flag: 0,
+                ..hover(1)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.original_flag, 0);
+        assert_eq!(selected.lot_table, 1);
+        assert_eq!(selected.lot_row, 456);
+    }
+
+    #[test]
+    fn rebuild_and_delayed_snapshot_do_not_reselect_old_pin() {
+        let mut bridge = Bridge::default();
+        bridge.reset(true);
+        let old = bridge.accept(hover(1)).unwrap().unwrap();
+        bridge.accept(hover(2)).unwrap();
+        assert!(!bridge.is_current(old));
+        assert_eq!(bridge.accept(hover(1)), Err(Refusal::StaleSnapshot));
+        assert!(!bridge.is_current(old));
+    }
+
+    #[test]
+    fn closed_map_stale_or_malformed_hover_clear_selection() {
+        let mut bridge = Bridge::default();
+        bridge.reset(true);
+        for invalid in [
+            Hover {
+                status: 0,
+                ..hover(1)
+            },
+            Hover {
+                age_ms: 301,
+                ..hover(1)
+            },
+            Hover {
+                handle: 0,
+                ..hover(1)
+            },
+            Hover {
+                status: 2,
+                ..hover(1)
+            },
+            Hover {
+                lot_table: 3,
+                ..hover(1)
+            },
+        ] {
+            let old = bridge.accept(hover(1)).unwrap().unwrap();
+            let _ = bridge.accept(invalid);
+            assert!(!bridge.is_current(old));
+        }
+    }
+
+    #[test]
+    fn follow_is_opt_in_bounded_and_pauses_for_client_input() {
+        let mut follow = Follow::default();
+        assert!(!follow.tick(0, true));
+        follow.set_enabled(true);
+        assert_eq!(follow.status(), FollowStatus::Waiting);
+        assert!(follow.tick(100, true));
+        assert!(!follow.tick(150, true));
+        assert!(!follow.tick(200, false));
+        assert_eq!(follow.status(), FollowStatus::InputPaused);
+        assert!(follow.tick(200, true));
+        assert!(!follow.tick(201, true));
+    }
+
+    #[test]
+    fn follow_keeps_only_a_fresh_historical_pin_and_clears_at_boundaries() {
+        let mut follow = Follow::default();
+        follow.set_enabled(true);
+        let first = follow.accept(100, hover(1)).unwrap().unwrap();
+        assert_eq!(first.received_ms, 100);
+        assert_eq!(first.source_age_ms, 0);
+        assert_eq!(follow.latest(), Some(first));
+        assert_eq!(
+            follow.accept(
+                200,
+                Hover {
+                    age_ms: 301,
+                    ..hover(2)
+                }
+            ),
+            Err(Refusal::StaleSnapshot)
+        );
+        assert_eq!(follow.latest(), Some(first));
+        follow.unavailable();
+        assert_eq!(follow.status(), FollowStatus::EngineUnavailable);
+        assert_eq!(follow.latest(), Some(first));
+        assert!(!follow.tick(250, false));
+        assert_eq!(follow.status(), FollowStatus::EngineUnavailable);
+        follow.sync_connection(true);
+        follow.sync_connection(false);
+        assert_eq!(follow.latest(), None);
+        follow.accept(300, hover(1)).unwrap();
+        follow.clear();
+        assert_eq!(follow.latest(), None);
+        follow.set_enabled(false);
+        assert_eq!(follow.accept(400, hover(1)), Err(Refusal::Disabled));
+    }
+}

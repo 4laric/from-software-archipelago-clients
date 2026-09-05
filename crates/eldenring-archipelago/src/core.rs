@@ -260,6 +260,10 @@ pub struct Core {
     tracker_surface_only: bool,
     // Session-only opt-in; never changes the seed or sends reports automatically.
     tracker_player_review: bool,
+    // Session-only opt-in; follows copied hover history while F6 is closed.
+    tracker_follow_map_pins: bool,
+    mfg_capture: crate::mfg_probe::HoverCapture,
+    mfg_follow: er_logic::mfg_bridge::Follow,
     /// Seed-owned spoiler preference (#1184). False for old seeds and by default: sweep groups in
     /// locked regions collapse to an anonymous count. True reveals their boss labels while still
     /// withholding the region name and pending member count.
@@ -833,6 +837,9 @@ impl shared::Core for Core {
             tracker_in_logic_only: false,
             tracker_surface_only: false,
             tracker_player_review: false,
+            tracker_follow_map_pins: false,
+            mfg_capture: Default::default(),
+            mfg_follow: Default::default(),
             reveal_sweep_boss_names: false,
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
@@ -977,6 +984,26 @@ impl shared::Core for Core {
         // F6 toggles the tracker (deliberately NOT a plain letter -- those fight the say input).
         if ui.is_key_pressed(imgui::Key::F6) {
             self.tracker_visible = !self.tracker_visible;
+        }
+
+        // Poll even with the tracker and main client windows hidden. Explicit
+        // capture and follow opt-ins bound all API work; idle clients do not sample.
+        let connected = self.client().is_some();
+        self.mfg_capture.sync_connection(connected);
+        self.mfg_follow.sync_connection(connected);
+        let capture_now = self.toast_clock.elapsed().as_millis() as u64;
+        let capture_input_free =
+            !self.tracker_visible && !ui.io().want_capture_mouse && !ui.io().want_capture_keyboard;
+        if let Some(line) = self.mfg_capture.tick(capture_now, capture_input_free) {
+            self.log(ap::Print::message(line));
+        }
+        if connected && self.mfg_follow.tick(capture_now, capture_input_free) {
+            match crate::mfg_probe::sample() {
+                Ok(hover) => {
+                    let _ = self.mfg_follow.accept(capture_now, hover);
+                }
+                Err(_) => self.mfg_follow.unavailable(),
+            }
         }
 
         // Deliver a queued TRAP ITEM, at most one per frame. Unlike the F7/F8 probe below this is
@@ -4419,6 +4446,10 @@ impl shared::Core for Core {
         // re-applies the blanks against the freshly-loaded params. Idempotent: the passes self-gate on
         // the param repo being up and re-latch after one clean pass, so this costs one re-blank per load.
         let now_in_world = crate::flags::in_world();
+        if now_in_world != self.was_in_world {
+            self.mfg_capture.reset();
+            self.mfg_follow.clear();
+        }
         if now_in_world && !self.was_in_world {
             shared::crash_tallies::record_world_edge(true);
             self.suppression_rearm
@@ -5098,6 +5129,8 @@ impl Core {
     /// and install-once globals (detour_installed) are left intact.
     /// Recovered after commit 4bb3c95 accidentally dropped the body while leaving the call sites.
     fn reset_for_new_seed(&mut self) {
+        self.mfg_capture.reset();
+        self.mfg_follow.clear();
         self.base.set_death_link_override(None);
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
         // flags the new seed never earned.
@@ -5750,6 +5783,39 @@ impl Core {
         let mut in_logic_only = self.tracker_in_logic_only;
         let mut surface_only = self.tracker_surface_only;
         let mut player_review = self.tracker_player_review;
+        let mut follow_map_pins = self.tracker_follow_map_pins;
+        let capture_active = self.mfg_capture.active();
+        let capture_text = self.mfg_capture.text().to_string();
+        let followed_pin = self.mfg_follow.latest();
+        let follow_status = self.mfg_follow.status();
+        let recorded_pin = self.mfg_capture.recorded();
+        let selected_followed = followed_pin.is_some_and(|followed| match recorded_pin {
+            None => true,
+            Some(recorded) => followed.received_ms >= recorded.received_ms,
+        });
+        let selected_pin = if selected_followed {
+            followed_pin.map(|followed| followed.selection)
+        } else {
+            recorded_pin.map(|recorded| recorded.selection)
+        };
+        let pin_match = selected_pin.map(|pin| {
+            er_logic::mfg_match::resolve(pin.original_flag, pin.lot_table, pin.lot_row, |id| {
+                u64::try_from(id).is_ok_and(|id| loc_names.contains_key(&id))
+            })
+        });
+        // Fail closed for the whole candidate group if a seed reuses a catalog ID
+        // for a different location. No fuzzy names or partial sibling selection.
+        let pin_catalog_mismatch = pin_match.as_ref().is_some_and(|matched| {
+            matched.seed_candidates.iter().any(|candidate| {
+                let server_name = u64::try_from(candidate.ap_id)
+                    .ok()
+                    .and_then(|id| loc_names.get(&id))
+                    .map(|name| name.as_str());
+                server_name != er_logic::mfg_match::catalog_name(candidate.ap_id)
+            })
+        });
+        let mut capture_start = false;
+        let mut capture_clear = false;
         let mut review_url = None;
         let review_buttons = |id: u64, target: &mut Option<String>| {
             // Use the server name, not the spoiler-trimmed display label, for identity.
@@ -5898,6 +5964,83 @@ impl Core {
                     ui.separator();
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
+                if ui.collapsing_header("Map pin test (optional)", imgui::TreeNodeFlags::empty()) {
+                    ui.checkbox("Follow map pins (this session)", &mut follow_map_pins);
+                    ui.text_wrapped("With F6 closed and client input released, remembers the latest fresh map pin. It does not track a live hover or change anything.");
+                    if follow_map_pins {
+                        use er_logic::mfg_bridge::FollowStatus;
+                        ui.text_disabled(match follow_status {
+                            FollowStatus::Waiting => "Following map pins: waiting for a fresh pin.",
+                            FollowStatus::InputPaused => "Following map pins pauses while the client is using input.",
+                            FollowStatus::EngineUnavailable => "Map pins are unavailable. Use the source-built map engine with tracker support.",
+                            FollowStatus::Disabled => "Following map pins will start when this window closes.",
+                        });
+                    }
+                    if let Some(matched) = &pin_match {
+                        ui.text_wrapped(if selected_followed {
+                            "Latest followed map pin. This is a saved observation, not your current hover."
+                        } else {
+                            "Recorded map pin. This is a saved observation, not your current hover."
+                        });
+                        use er_logic::mfg_match::MatchStatus;
+                        ui.text_wrapped(if pin_catalog_mismatch {
+                            "The location catalog differs from your seed. No match selected; update the client and world together."
+                        } else { match matched.status {
+                            MatchStatus::SingleCandidate => "Possible matching location in your seed:",
+                            MatchStatus::AmbiguousCandidates => "This pin may represent several locations. We cannot tell which one from the pin alone:",
+                            MatchStatus::OutOfSeed => "This pin has no matching location in your current seed.",
+                            MatchStatus::UnknownIdentity => "This pin does not provide enough information to identify a location.",
+                            MatchStatus::InvalidIdentity => "This pin returned conflicting or unsupported information. No location selected.",
+                            MatchStatus::Unmatched => "We do not have a matching location for this pin yet.",
+                        } });
+                        // Distinct IDs from the regular tracker rows, even when expanded together.
+                        let _pin_scope = ui.push_id("recorded-map-pin");
+                        for candidate in matched.seed_candidates.iter().filter(|_| !pin_catalog_mismatch) {
+                            let Ok(id) = u64::try_from(candidate.ap_id) else { continue };
+                            if loc_names.contains_key(&id) {
+                                let status = if checked_set.contains(&id) {
+                                    "Completed in Archipelago"
+                                } else {
+                                    "Not yet completed in Archipelago"
+                                };
+                                ui.text_wrapped(er_logic::player_review::pin_label(&display_loc(id)));
+                                ui.text_disabled(status);
+                                if player_review {
+                                    review_buttons(id, &mut review_url);
+                                }
+                            }
+                        }
+                        if !pin_catalog_mismatch && !matched.seed_candidates.is_empty() {
+                            if matched.catalog_candidates.len() > matched.seed_candidates.len() {
+                                ui.text_wrapped("This pin also has possible matches outside your seed. Only your seed's locations are listed.");
+                            }
+                            ui.text_wrapped("A completed check may have been awarded by a boss. Report only what you saw at this location.");
+                            if !player_review {
+                                ui.text_wrapped("Enable Help verify locations below to open Review or Map for a candidate.");
+                            }
+                        }
+                        if ui.collapsing_header("Technical pin details", imgui::TreeNodeFlags::empty()) {
+                            if let Some(followed) = followed_pin.filter(|_| selected_followed) {
+                                ui.text_wrapped(format!(
+                                    "Latest pin received at client +{} ms; source snapshot age {} ms.",
+                                    followed.received_ms, followed.source_age_ms
+                                ));
+                            } else {
+                                ui.text_wrapped(&capture_text);
+                            }
+                        }
+                    } else {
+                        ui.text_wrapped(&capture_text);
+                    }
+                    if ui.small_button(if capture_active { "Restart 30-second recording" } else { "Record a map pin for 30 seconds" }) {
+                        capture_start = true;
+                    }
+                    ui.same_line();
+                    if ui.small_button("Clear recorded / followed pin") {
+                        capture_clear = true;
+                    }
+                    ui.text_wrapped("Close F6 and hide the client with F5 if open; Escape releases its cursor if needed. After 3 seconds without client input capture, the first fresh pin is recorded. Results remain here until cleared or your session changes.");
+                }
                 ui.checkbox("Help verify locations (this session)", &mut player_review);
                 if player_review {
                     ui.text_wrapped("Review and Map open the player review page in your browser. Nothing is submitted automatically. The map includes locations outside your seed and may reveal unexplored places.");
@@ -6351,6 +6494,15 @@ impl Core {
         self.tracker_in_logic_only = in_logic_only;
         self.tracker_surface_only = surface_only;
         self.tracker_player_review = player_review;
+        self.tracker_follow_map_pins = follow_map_pins;
+        self.mfg_follow.set_enabled(follow_map_pins);
+        if capture_clear {
+            self.mfg_capture.reset();
+            self.mfg_follow.clear();
+        } else if capture_start {
+            self.mfg_capture
+                .arm(self.toast_clock.elapsed().as_millis() as u64);
+        }
         if let Some(url) = review_url {
             // An explicit button click, fixed HTTPS origin, escaped fragment; no shell.
             if let Err(error) = std::process::Command::new("explorer.exe").arg(&url).spawn() {

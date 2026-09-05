@@ -50,6 +50,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Test map registry generator
+      run: python tools/test_export_mfg_match_table.py
+
     # 🛑 ASK FOR THE TOOLCHAIN THE REPO PINS. `rust-toolchain.toml` says `nightly`, so every cargo
     # invocation below resolves through rustup to nightly regardless of what this step installs --
     # this used to say `@stable`, which meant the job installed one toolchain and built with another,
