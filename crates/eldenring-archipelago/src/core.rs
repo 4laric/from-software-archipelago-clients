@@ -260,6 +260,7 @@ pub struct Core {
     tracker_surface_only: bool,
     // Session-only opt-in; never changes the seed or sends reports automatically.
     tracker_player_review: bool,
+    mfg_capture: crate::mfg_probe::HoverCapture,
     /// Seed-owned spoiler preference (#1184). False for old seeds and by default: sweep groups in
     /// locked regions collapse to an anonymous count. True reveals their boss labels while still
     /// withholding the region name and pending member count.
@@ -833,6 +834,7 @@ impl shared::Core for Core {
             tracker_in_logic_only: false,
             tracker_surface_only: false,
             tracker_player_review: false,
+            mfg_capture: Default::default(),
             reveal_sweep_boss_names: false,
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
@@ -977,6 +979,17 @@ impl shared::Core for Core {
         // F6 toggles the tracker (deliberately NOT a plain letter -- those fight the say input).
         if ui.is_key_pressed(imgui::Key::F6) {
             self.tracker_visible = !self.tracker_visible;
+        }
+
+        // Poll even with the tracker and main client windows hidden. The explicit
+        // capture window bounds all API work; no hover calls occur while idle.
+        let connected = self.client().is_some();
+        self.mfg_capture.sync_connection(connected);
+        let capture_now = self.toast_clock.elapsed().as_millis() as u64;
+        let capture_input_free =
+            !self.tracker_visible && !ui.io().want_capture_mouse && !ui.io().want_capture_keyboard;
+        if let Some(line) = self.mfg_capture.tick(capture_now, capture_input_free) {
+            self.log(ap::Print::message(line));
         }
 
         // Deliver a queued TRAP ITEM, at most one per frame. Unlike the F7/F8 probe below this is
@@ -4419,6 +4432,9 @@ impl shared::Core for Core {
         // re-applies the blanks against the freshly-loaded params. Idempotent: the passes self-gate on
         // the param repo being up and re-latch after one clean pass, so this costs one re-blank per load.
         let now_in_world = crate::flags::in_world();
+        if now_in_world != self.was_in_world {
+            self.mfg_capture.reset();
+        }
         if now_in_world && !self.was_in_world {
             shared::crash_tallies::record_world_edge(true);
             self.suppression_rearm
@@ -5098,6 +5114,7 @@ impl Core {
     /// and install-once globals (detour_installed) are left intact.
     /// Recovered after commit 4bb3c95 accidentally dropped the body while leaving the call sites.
     fn reset_for_new_seed(&mut self) {
+        self.mfg_capture.reset();
         self.base.set_death_link_override(None);
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
         // flags the new seed never earned.
@@ -5750,6 +5767,10 @@ impl Core {
         let mut in_logic_only = self.tracker_in_logic_only;
         let mut surface_only = self.tracker_surface_only;
         let mut player_review = self.tracker_player_review;
+        let capture_active = self.mfg_capture.active();
+        let capture_text = self.mfg_capture.text().to_string();
+        let mut capture_start = false;
+        let mut capture_clear = false;
         let mut review_url = None;
         let review_buttons = |id: u64, target: &mut Option<String>| {
             // Use the server name, not the spoiler-trimmed display label, for identity.
@@ -5898,6 +5919,17 @@ impl Core {
                     ui.separator();
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
+                if ui.collapsing_header("Map pin test (optional)", imgui::TreeNodeFlags::empty()) {
+                    ui.text_wrapped(&capture_text);
+                    if ui.small_button(if capture_active { "Restart 30-second recording" } else { "Record a map pin for 30 seconds" }) {
+                        capture_start = true;
+                    }
+                    ui.same_line();
+                    if ui.small_button("Cancel / clear recording") {
+                        capture_clear = true;
+                    }
+                    ui.text_wrapped("Close F6 and hide the client with F5 if open; Escape releases its cursor if needed. After 3 seconds without client input capture, the first fresh pin is recorded. Results remain here until cleared or your session changes.");
+                }
                 ui.checkbox("Help verify locations (this session)", &mut player_review);
                 if player_review {
                     ui.text_wrapped("Review and Map open the player review page in your browser. Nothing is submitted automatically. The map includes locations outside your seed and may reveal unexplored places.");
@@ -6351,6 +6383,12 @@ impl Core {
         self.tracker_in_logic_only = in_logic_only;
         self.tracker_surface_only = surface_only;
         self.tracker_player_review = player_review;
+        if capture_clear {
+            self.mfg_capture.reset();
+        } else if capture_start {
+            self.mfg_capture
+                .arm(self.toast_clock.elapsed().as_millis() as u64);
+        }
         if let Some(url) = review_url {
             // An explicit button click, fixed HTTPS origin, escaped fragment; no shell.
             if let Err(error) = std::process::Command::new("explorer.exe").arg(&url).spawn() {
