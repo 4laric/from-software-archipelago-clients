@@ -28,7 +28,7 @@
 //! **F9 Nightfall** -- `WorldAreaTime::request_time(0,0,0)`. Instantaneous; time flows on from
 //! there and a grace rest resets it, so there is nothing to restore.
 //!
-//! **F10 Stamina Halved** -- halves `CSChrDataModule::max_stamina` for 30s. Current stamina is
+//! **Stamina Halved (no hotkey; F10 is reserved for map settings)** -- halves `CSChrDataModule::max_stamina` for 30s. Current stamina is
 //! capped once when the effect lands and is never replenished by the probe; ordinary drain and
 //! regeneration continue inside the smaller maximum. The original maximum is restored afterward.
 //!
@@ -93,8 +93,8 @@ fn announce_once(on: bool) {
     }
     if on {
         log::info!(
-            "trap-feel probe: ON (default). F9 = nightfall (instant midnight), F10 = half stamina \
-             for 30s, F11 = blackout for 2s. All three wear off on their own and none of them \
+            "trap-feel probe: ON (default). F9 = nightfall (instant midnight), \
+             F11 = blackout for 2s. Both wear off on their own and none of them \
              touches your save. If F11 does nothing visible, SAY SO -- that is a fade-plate \
              reading, not a broken timer. Set ER_TRAP_FEEL_PROBE=0, or \"probes\": \
              {{\"trap_feel\": false}} in apconfig.json, to silence it"

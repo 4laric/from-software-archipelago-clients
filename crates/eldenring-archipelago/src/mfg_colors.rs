@@ -106,7 +106,7 @@ impl Colors {
             Ok(()) => {
                 self.published = !entries.is_empty();
                 self.status =
-                    Some("Map colors active. Yellow: hinted; orange: progression-eligible.");
+                    Some("Map colors active. Yellow: hinted; orange: progression targets.");
             }
             Err(status) => self.status = Some(status),
         }
