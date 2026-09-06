@@ -1583,10 +1583,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .with_context(|| format!("AP item {} has no Bloodborne binding", item.ap_item_id))?
             .clone();
         let target_level = if self.config.auto_upgrade && binding.reinforcement_level.is_some() {
-            if is_non_upgradable_shield(
-                binding.normalized_item_id,
-                binding.reinforcement_level,
-            ) {
+            if is_non_upgradable_shield(binding.normalized_item_id, binding.reinforcement_level) {
                 Some(0)
             } else {
                 self.backend.target_weapon_level()?
@@ -1860,10 +1857,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         };
 
         if pending.reinforcement_level.is_some_and(|level| level > 0)
-            && is_non_upgradable_shield(
-                pending.normalized_item_id,
-                pending.reinforcement_level,
-            )
+            && is_non_upgradable_shield(pending.normalized_item_id, pending.reinforcement_level)
         {
             // A plan persisted by an older client that auto-upgraded a shield
             // to a row the binder does not have. Park it, by index, so the
@@ -5255,7 +5249,13 @@ mod tests {
         assert_eq!(slot.next_index(), 1);
         let parked = slot.acknowledged.get(&0).unwrap();
         assert_eq!(parked.normalized_item_id, 19_100_700);
-        assert!(parked.blocked.as_deref().unwrap().starts_with("invalid_shield_plan"));
+        assert!(
+            parked
+                .blocked
+                .as_deref()
+                .unwrap()
+                .starts_with("invalid_shield_plan")
+        );
     }
 
     #[test]
