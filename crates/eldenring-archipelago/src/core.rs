@@ -258,6 +258,16 @@ pub struct Core {
     tracker_in_logic_only: bool,
     /// Tracker filter: show only progression-surface checks.
     tracker_surface_only: bool,
+    // Session-only opt-in; never changes the seed or sends reports automatically.
+    tracker_player_review: bool,
+    // Session-only opt-in; follows copied hover history while F6 is closed.
+    tracker_follow_map_pins: bool,
+    tracker_map_colors: bool,
+    mfg_colors: crate::mfg_colors::Colors,
+    tracker_map_filters: bool,
+    mfg_states: crate::mfg_states::States,
+    mfg_capture: crate::mfg_probe::HoverCapture,
+    mfg_follow: er_logic::mfg_bridge::Follow,
     /// Seed-owned spoiler preference (#1184). False for old seeds and by default: sweep groups in
     /// locked regions collapse to an anonymous count. True reveals their boss labels while still
     /// withholding the region name and pending member count.
@@ -284,6 +294,10 @@ pub struct Core {
     /// imgui present thread, which must not. The poll already computes exactly this for
     /// `sweep_watch`, so the row costs no extra read.
     sweep_flag_state: HashMap<u32, bool>,
+    log_seed_epoch: std::time::Instant,
+    log_sweep_members: HashSet<i64>,
+    log_sweep_submitted: HashSet<i64>,
+    log_sweep_acknowledged: HashSet<i64>,
     /// Sweep-trigger flag watcher (diagnostic, 2026-08-07). Reports the group census once and then
     /// only CHANGES, so a trigger flag flipping is timestamped in the log instead of being
     /// inferred from the sweep that follows it. See `er_logic::sweep_watch` for the motivating
@@ -375,6 +389,50 @@ pub struct Core {
 impl shared::Core for Core {
     type SlotData = Value;
     type Game = crate::game::EldenRing;
+
+    fn log_part_text(&self, part: &ap::RichText, emitted: std::time::Instant) -> String {
+        let ap::RichText::Location { location, player } = part else {
+            return part.to_string();
+        };
+        let Some(client) = self.client() else {
+            return part.to_string();
+        };
+        if player.team() != client.this_player().team()
+            || player.slot() != client.this_player().slot()
+            || player.game() != client.this_player().game()
+        {
+            return part.to_string();
+        }
+        // Logs survive reconnects/seed changes; never apply new-seed facts to old rows.
+        if emitted < self.log_seed_epoch {
+            return er_logic::log_location::compact(location.name().as_str(), false, None, false);
+        }
+        let id = location.id();
+        if !self.valid_locations.contains(&id)
+            || client
+                .this_game()
+                .location(id)
+                .is_none_or(|known| known.name() != location.name())
+        {
+            return part.to_string();
+        }
+        let eligible = self
+            .flag_poll
+            .as_ref()
+            .map(|_| self.log_sweep_members.contains(&id));
+        er_logic::log_location::compact(
+            location.name().as_str(),
+            self.progression_surface.contains(&(id as u64)),
+            eligible,
+            self.log_sweep_acknowledged.contains(&id),
+        )
+    }
+
+    fn log_presentation_legend(&self) -> Option<&'static str> {
+        Some(
+            "[P] progression surface  [S] sweep grant this session; sweep: boss that grants the check",
+        )
+    }
 
     /// Debug console commands, typed into the overlay's say input (2026-07-01, playtest tooling).
     /// Unrecognized "!" commands fall through to server chat.
@@ -830,11 +888,23 @@ impl shared::Core for Core {
             lock_hint_intro_done: false,
             tracker_in_logic_only: false,
             tracker_surface_only: false,
+            tracker_player_review: false,
+            tracker_follow_map_pins: false,
+            tracker_map_colors: false,
+            mfg_colors: Default::default(),
+            tracker_map_filters: false,
+            mfg_states: Default::default(),
+            mfg_capture: Default::default(),
+            mfg_follow: Default::default(),
             reveal_sweep_boss_names: false,
             boss_defs: Vec::new(),
             boss_flag_prev: HashSet::new(),
             sweep_bannered: HashSet::new(),
             sweep_flag_state: HashMap::new(),
+            log_seed_epoch: std::time::Instant::now(),
+            log_sweep_members: HashSet::new(),
+            log_sweep_submitted: HashSet::new(),
+            log_sweep_acknowledged: HashSet::new(),
             sweep_watch: er_logic::sweep_watch::SweepWatch::new(),
             sweep_flag_pending: Vec::new(),
             sweep_flush_burst: None,
@@ -976,6 +1046,41 @@ impl shared::Core for Core {
             self.tracker_visible = !self.tracker_visible;
         }
 
+        // Poll even with the tracker and main client windows hidden. Explicit
+        // capture and follow opt-ins bound all API work; idle clients do not sample.
+        // Once per frame, not a server-set scan for every displayed log location.
+        self.log_sweep_acknowledged = self
+            .client()
+            .map(|client| {
+                client
+                    .server_checked_locations()
+                    .map(|loc| loc.id())
+                    .filter(|id| self.log_sweep_submitted.contains(id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let connected = self.client().is_some();
+        self.mfg_capture.sync_connection(connected);
+        self.mfg_follow.sync_connection(connected);
+        if !connected {
+            self.mfg_colors.clear();
+            self.mfg_states.clear();
+        }
+        let capture_now = self.toast_clock.elapsed().as_millis() as u64;
+        let capture_input_free =
+            !self.tracker_visible && !ui.io().want_capture_mouse && !ui.io().want_capture_keyboard;
+        if let Some(line) = self.mfg_capture.tick(capture_now, capture_input_free) {
+            self.log(ap::Print::message(line));
+        }
+        if connected && self.mfg_follow.tick(capture_now, capture_input_free) {
+            match crate::mfg_probe::sample() {
+                Ok(hover) => {
+                    let _ = self.mfg_follow.accept(capture_now, hover);
+                }
+                Err(_) => self.mfg_follow.unavailable(),
+            }
+        }
+
         // Deliver a queued TRAP ITEM, at most one per frame. Unlike the F7/F8 probe below this is
         // NOT gated on the probe flag: a trap that arrived as a real AP item must fire whether or
         // not anyone turned a diagnostic on.
@@ -1048,6 +1153,8 @@ impl shared::Core for Core {
         }
 
         self.accumulate_hints_from_log();
+        self.refresh_map_colors();
+        self.refresh_map_check_states();
         self.refresh_lock_hint_hud();
 
         if self.tracker_visible {
@@ -2166,6 +2273,7 @@ impl shared::Core for Core {
                     fp.location_flags.len(),
                     fp.sweep_flags.len()
                 );
+                self.log_sweep_members = fp.sweep_flags.values().flatten().copied().collect();
                 self.flag_poll = Some(fp);
                 self.start = Some(start);
                 self.scout = Some(scout);
@@ -3367,6 +3475,7 @@ impl shared::Core for Core {
             // (location, detection flag) for every member this poll actually granted -- the input
             // to the sweep flag flush below (er_logic::sweep_flush::flags_to_assert).
             let mut swept_members: Vec<(i64, u32)> = Vec::new();
+            let mut direct_this_poll = HashSet::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
                 // Refresh the vanilla-suppressor's collected-flag set: the acquisition flags of every
                 // location already in the server checked-set (loc->flag via locationFlags). A location
@@ -3399,6 +3508,7 @@ impl shared::Core for Core {
                         to_check.push(loc);
                     }
                 }
+                direct_this_poll.extend(to_check.iter().copied());
                 for (trigger, members) in &self.dungeon_sweeps {
                     // Draft B: the location-keyed dungeon_sweeps groups carry NO gate today --
                     // sweepLockGates is flag-keyed and applied in the sweep_flags loop below. A
@@ -3485,22 +3595,11 @@ impl shared::Core for Core {
                         .to_string()
                 });
                 let region = self.region_table.get(&(sample_loc as u64)).cloned();
-                // 🛑 THE FLAG IS APPENDED UNCONDITIONALLY. The old chain degraded to the
-                // PRETTIEST remaining label rather than the most IDENTIFYING one: with
-                // `0 boss-lock def(s)` the boss name can never resolve, so every sweep fell to
-                // `Boss sweep ({region})` and dropped the flag -- while the arm one line below it
-                // was the one that printed it. bobler's 49-check sweep could not be mapped back to
-                // a trigger at all (2026-08-07), and slot_data's own `dungeonSweepFlags` echo is
-                // truncated in the log, so this was the last copy of that fact.
-                let label = match (boss, region) {
-                    (Some(b), Some(r)) => format!("Boss sweep ({r}): {b}"),
-                    (Some(b), None) => format!("Boss sweep: {b}"),
-                    (None, Some(r)) => format!("Boss sweep ({r})"),
-                    (None, None) => "Boss sweep".to_string(),
-                };
-                let label = format!("{label} [trigger flag {flag}]");
+                let label = boss.or(region).unwrap_or_else(|| "Boss sweep".to_owned());
+                // Keep raw trigger identity in the diagnostic log, not F5 presentation.
+                log::info!("Sweep: {label} [trigger flag {flag}] -- {granted} check(s) granted.");
                 self.log(ap::Print::message(format!(
-                    "{label} -- {granted} check(s) granted."
+                    "Sweep: {label} -- {granted} checks granted."
                 )));
             }
             // SWEEP FLAG FLUSH (2026-07-24, "chests are still broken"): granting the check told
@@ -3741,6 +3840,16 @@ impl shared::Core for Core {
             if !to_check.is_empty() && !crate::reconcile_io::is_refused() {
                 to_check.sort_unstable();
                 to_check.dedup();
+                // Session provenance: these exact members entered the sweep-report batch.
+                // Rendering additionally waits for the server checked acknowledgement.
+                self.log_sweep_submitted
+                    .extend(swept_members.iter().map(|&(id, _)| id).filter(|id| {
+                        er_logic::log_location::sweep_report_evidence(
+                            *id,
+                            &direct_this_poll,
+                            &to_check,
+                        )
+                    }));
                 log::info!("flag-poll: {} new check(s)", to_check.len());
                 self.stage_check_reports(to_check);
                 self.flush_check_reports();
@@ -4416,6 +4525,12 @@ impl shared::Core for Core {
         // re-applies the blanks against the freshly-loaded params. Idempotent: the passes self-gate on
         // the param repo being up and re-latch after one clean pass, so this costs one re-blank per load.
         let now_in_world = crate::flags::in_world();
+        if now_in_world != self.was_in_world {
+            self.mfg_capture.reset();
+            self.mfg_follow.clear();
+            self.mfg_colors.clear();
+            self.mfg_states.clear();
+        }
         if now_in_world && !self.was_in_world {
             shared::crash_tallies::record_world_edge(true);
             self.suppression_rearm
@@ -5095,6 +5210,10 @@ impl Core {
     /// and install-once globals (detour_installed) are left intact.
     /// Recovered after commit 4bb3c95 accidentally dropped the body while leaving the call sites.
     fn reset_for_new_seed(&mut self) {
+        self.mfg_capture.reset();
+        self.mfg_follow.clear();
+        self.mfg_colors.clear();
+        self.mfg_states.clear();
         self.base.set_death_link_override(None);
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
         // flags the new seed never earned.
@@ -5134,6 +5253,8 @@ impl Core {
         self.valid_locations.clear();
         self.locations_loaded = false;
         self.flag_poll = None;
+        self.log_seed_epoch = std::time::Instant::now();
+        self.log_sweep_members.clear();
         self.dungeon_sweeps.clear();
         self.sweep_lock_gates.clear();
         self.poll_counter = 0;
@@ -5184,6 +5305,8 @@ impl Core {
         self.boss_flag_prev.clear();
         // SWEEP VISIBILITY: re-arm the per-group sweep banner for the new seed.
         self.sweep_bannered.clear();
+        self.log_sweep_submitted.clear();
+        self.log_sweep_acknowledged.clear();
         self.sweep_watch.reset();
         // ATTUNEMENT-RELEASE: drop the parsed gate + all per-save latches so the new seed re-parses
         // regionAttunement and re-primes / re-blooms from scratch.
@@ -5439,6 +5562,77 @@ impl Core {
                     ui.text_colored([1.0, 0.85, 0.35, a], t.text.as_str());
                 }
             });
+    }
+
+    /// Publish only seed eligibility and already-known hints, never randomized item contents.
+    /// The map owner renders a leased presentation snapshot; no game writes occur here.
+    fn refresh_map_colors(&mut self) {
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        if !self.was_in_world || self.client().is_none() || !self.mfg_colors.due(now) {
+            return;
+        }
+        let mut names = HashMap::new();
+        let mut checked = HashSet::new();
+        if let Some(client) = self.client() {
+            for loc in client.checked_locations() {
+                names.insert(loc.id(), loc.name().to_string());
+                checked.insert(loc.id());
+            }
+            for loc in client.unchecked_locations() {
+                names.insert(loc.id(), loc.name().to_string());
+            }
+        }
+        // HintSet also retains legacy fallback entries; require the actual finding
+        // world to be ours so another world's identical location ID cannot tint this map.
+        let hinted = self
+            .hints
+            .iter()
+            .filter(|hint| hint.for_us && !hint.found)
+            .map(|hint| hint.location_id as i64)
+            .collect();
+        let surface = self
+            .progression_surface
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+        let entries = er_logic::mfg_match::color_styles(&names, &checked, &hinted, &surface)
+            .into_iter()
+            .map(|entry| crate::mfg_colors::LotStyle {
+                lot_table: entry.lot_table,
+                lot_row: entry.lot_row,
+                style: entry.style as u32,
+            })
+            .collect::<Vec<_>>();
+        self.mfg_colors.send(&entries);
+    }
+
+    fn refresh_map_check_states(&mut self) {
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        if !self.was_in_world || self.client().is_none() || !self.mfg_states.due(now) {
+            return;
+        }
+        let mut names = HashMap::new();
+        if let Some(client) = self.client() {
+            for loc in client.checked_locations() {
+                names.insert(loc.id(), loc.name().to_string());
+            }
+            for loc in client.unchecked_locations() {
+                names.insert(loc.id(), loc.name().to_string());
+            }
+        }
+        let open = self.open_coarse_regions();
+        let in_logic = names
+            .keys()
+            .copied()
+            .filter(|&id| er_logic::mfg_match::known_in_logic(id as u64, &self.coarse_table, &open))
+            .collect();
+        let surface = self
+            .progression_surface
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+        let states = er_logic::mfg_match::check_states(&names, &surface, &in_logic);
+        self.mfg_states.send(&states);
     }
 
     /// Build the per-frame tracker snapshot and draw the window (SPEC-item-tracker.md Phase 1).
@@ -5746,6 +5940,58 @@ impl Core {
         // Filter state as locals (the closure stays self-free); written back to self after.
         let mut in_logic_only = self.tracker_in_logic_only;
         let mut surface_only = self.tracker_surface_only;
+        let mut player_review = self.tracker_player_review;
+        let mut follow_map_pins = self.tracker_follow_map_pins;
+        let mut map_colors = self.tracker_map_colors;
+        let mut map_filters = self.tracker_map_filters;
+        let map_filter_status = self.mfg_states.status();
+        let map_color_status = self.mfg_colors.status();
+        let capture_active = self.mfg_capture.active();
+        let capture_text = self.mfg_capture.text().to_string();
+        let followed_pin = self.mfg_follow.latest();
+        let follow_status = self.mfg_follow.status();
+        let recorded_pin = self.mfg_capture.recorded();
+        let selected_followed = followed_pin.is_some_and(|followed| match recorded_pin {
+            None => true,
+            Some(recorded) => followed.received_ms >= recorded.received_ms,
+        });
+        let selected_pin = if selected_followed {
+            followed_pin.map(|followed| followed.selection)
+        } else {
+            recorded_pin.map(|recorded| recorded.selection)
+        };
+        let pin_match = selected_pin.map(|pin| {
+            er_logic::mfg_match::resolve(pin.original_flag, pin.lot_table, pin.lot_row, |id| {
+                u64::try_from(id).is_ok_and(|id| loc_names.contains_key(&id))
+            })
+        });
+        // Fail closed for the whole candidate group if a seed reuses a catalog ID
+        // for a different location. No fuzzy names or partial sibling selection.
+        let pin_catalog_mismatch = pin_match.as_ref().is_some_and(|matched| {
+            matched.seed_candidates.iter().any(|candidate| {
+                let server_name = u64::try_from(candidate.ap_id)
+                    .ok()
+                    .and_then(|id| loc_names.get(&id))
+                    .map(|name| name.as_str());
+                server_name != er_logic::mfg_match::catalog_name(candidate.ap_id)
+            })
+        });
+        let mut capture_start = false;
+        let mut capture_clear = false;
+        let mut review_url = None;
+        let review_buttons = |id: u64, target: &mut Option<String>| {
+            // Use the server name, not the spoiler-trimmed display label, for identity.
+            if let Some(name) = loc_names.get(&id) {
+                ui.same_line();
+                if ui.small_button(format!("Review###review-{id}")) {
+                    *target = Some(er_logic::player_review::url(id, name.as_str(), false));
+                }
+                ui.same_line();
+                if ui.small_button(format!("Map###review-map-{id}")) {
+                    *target = Some(er_logic::player_review::url(id, name.as_str(), true));
+                }
+            }
+        };
         let mismatch_warning = self.version_warn.clone();
         let mut mismatch_acknowledged = self.version_warn_acknowledged;
         // bobler, 2026-08-10: "you forgot to resize the box though i have to drag it out to read".
@@ -5880,6 +6126,104 @@ impl Core {
                     ui.separator();
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
+                if ui.collapsing_header("Map pin test (optional)", imgui::TreeNodeFlags::empty()) {
+                    ui.checkbox("Enable map filters (this session)", &mut map_filters);
+                    ui.text_wrapped("Also enabled by map colors or follow-pins. Uses tracker region access; extra quest/puzzle conditions are not evaluated. Unknown regions are excluded.");
+                    if map_filters || map_colors || follow_map_pins { ui.text_wrapped(map_filter_status); }
+                    ui.checkbox("Color map pins (this session)", &mut map_colors);
+                    ui.text_wrapped("Yellow rings: known hints. Orange rings: checks eligible to hold progression in this seed. Colors do not reveal what an unhinted check contains.");
+                    if map_colors {
+                        ui.text_wrapped(map_color_status);
+                    }
+                    ui.checkbox("Follow map pins (this session)", &mut follow_map_pins);
+                    ui.text_wrapped("With F6 closed and client input released, remembers the latest fresh map pin. It does not track a live hover or change anything.");
+                    if follow_map_pins {
+                        use er_logic::mfg_bridge::FollowStatus;
+                        ui.text_disabled(match follow_status {
+                            FollowStatus::Waiting => "Following map pins: waiting for a fresh pin.",
+                            FollowStatus::InputPaused => "Following map pins pauses while the client is using input.",
+                            FollowStatus::EngineUnavailable => "Map pins are unavailable. Use the source-built map engine with tracker support.",
+                            FollowStatus::Disabled => "Following map pins will start when this window closes.",
+                        });
+                    }
+                    if let Some(matched) = &pin_match {
+                        ui.text_wrapped(if selected_followed {
+                            "Latest followed map pin. This is a saved observation, not your current hover."
+                        } else {
+                            "Recorded map pin. This is a saved observation, not your current hover."
+                        });
+                        use er_logic::mfg_match::MatchStatus;
+                        ui.text_wrapped(if pin_catalog_mismatch {
+                            "The location catalog differs from your seed. No match selected; update the client and world together."
+                        } else { match matched.status {
+                            MatchStatus::SingleCandidate => "Possible matching location in your seed:",
+                            MatchStatus::AmbiguousCandidates => "This pin may represent several locations. We cannot tell which one from the pin alone:",
+                            MatchStatus::OutOfSeed => "This pin has no matching location in your current seed.",
+                            MatchStatus::UnknownIdentity => "This pin does not provide enough information to identify a location.",
+                            MatchStatus::InvalidIdentity => "This pin returned conflicting or unsupported information. No location selected.",
+                            MatchStatus::Unmatched => "We do not have a matching location for this pin yet.",
+                        } });
+                        // Distinct IDs from the regular tracker rows, even when expanded together.
+                        let _pin_scope = ui.push_id("recorded-map-pin");
+                        for candidate in matched.seed_candidates.iter().filter(|_| !pin_catalog_mismatch) {
+                            let Ok(id) = u64::try_from(candidate.ap_id) else { continue };
+                            if loc_names.contains_key(&id) {
+                                let status = if checked_set.contains(&id) {
+                                    "Completed in Archipelago"
+                                } else {
+                                    "Not yet completed in Archipelago"
+                                };
+                                ui.text_wrapped(er_logic::player_review::pin_label(&display_loc(id)));
+                                ui.text_disabled(status);
+                                if player_review {
+                                    review_buttons(id, &mut review_url);
+                                }
+                            }
+                        }
+                        if !pin_catalog_mismatch && !matched.seed_candidates.is_empty() {
+                            if matched.catalog_candidates.len() > matched.seed_candidates.len() {
+                                ui.text_wrapped("This pin also has possible matches outside your seed. Only your seed's locations are listed.");
+                            }
+                            ui.text_wrapped("A completed check may have been awarded by a boss. Report only what you saw at this location.");
+                            if !player_review {
+                                ui.text_wrapped("Enable Help verify locations below to open Review or Map for a candidate.");
+                            }
+                        }
+                        if ui.collapsing_header("Technical pin details", imgui::TreeNodeFlags::empty()) {
+                            if let Some(followed) = followed_pin.filter(|_| selected_followed) {
+                                ui.text_wrapped(format!(
+                                    "Latest pin received at client +{} ms; source snapshot age {} ms.",
+                                    followed.received_ms, followed.source_age_ms
+                                ));
+                            } else {
+                                ui.text_wrapped(&capture_text);
+                            }
+                        }
+                    } else {
+                        ui.text_wrapped(&capture_text);
+                    }
+                    if ui.small_button(if capture_active { "Restart 30-second recording" } else { "Record a map pin for 30 seconds" }) {
+                        capture_start = true;
+                    }
+                    ui.same_line();
+                    if ui.small_button("Clear recorded / followed pin") {
+                        capture_clear = true;
+                    }
+                    ui.text_wrapped("Close F6 and hide the client with F5 if open; Escape releases its cursor if needed. After 3 seconds without client input capture, the first fresh pin is recorded. Results remain here until cleared or your session changes.");
+                }
+                ui.checkbox("Help verify locations (this session)", &mut player_review);
+                if player_review {
+                    ui.text_wrapped("Review and Map open the player review page in your browser. Nothing is submitted automatically. The map includes locations outside your seed and may reveal unexplored places.");
+                    if ui.collapsing_header("Review completed locations", imgui::TreeNodeFlags::empty()) {
+                        ui.text_wrapped("Completed does not necessarily mean visited: boss rewards can complete nearby pickups. Report only what you actually observed.");
+                        let mut completed = checked.clone();
+                        completed.sort_unstable();
+                        for id in completed {
+                            ui.text(display_loc(id));
+                            review_buttons(id, &mut review_url);
+                        }
+                    }
+                }
                 if ui.collapsing_header(
                     &region_roster_header,
                     imgui::TreeNodeFlags::empty(),
@@ -6263,6 +6607,9 @@ impl Core {
                             } else {
                                 ui.text(line);
                             }
+                            if player_review {
+                                review_buttons(u.location_id, &mut review_url);
+                            }
                         }
                     }
                 }
@@ -6360,6 +6707,29 @@ impl Core {
         }
         self.tracker_in_logic_only = in_logic_only;
         self.tracker_surface_only = surface_only;
+        self.tracker_player_review = player_review;
+        self.tracker_map_filters = map_filters;
+        self.mfg_states
+            .set_enabled(map_filters || map_colors || follow_map_pins);
+        self.tracker_map_colors = map_colors;
+        self.mfg_colors.set_enabled(map_colors);
+        self.tracker_follow_map_pins = follow_map_pins;
+        self.mfg_follow.set_enabled(follow_map_pins);
+        if capture_clear {
+            self.mfg_capture.reset();
+            self.mfg_follow.clear();
+        } else if capture_start {
+            self.mfg_capture
+                .arm(self.toast_clock.elapsed().as_millis() as u64);
+        }
+        if let Some(url) = review_url {
+            // An explicit button click, fixed HTTPS origin, escaped fragment; no shell.
+            if let Err(error) = std::process::Command::new("explorer.exe").arg(&url).spawn() {
+                self.log(ap::Print::message(format!(
+                    "Could not open player review: {error}. Link: {url}"
+                )));
+            }
+        }
         if mismatch_acknowledged && !self.version_warn_acknowledged {
             self.version_warn_acknowledged = true;
             if let Some(warning) = &self.version_warn {

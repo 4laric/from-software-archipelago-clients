@@ -20,16 +20,10 @@ use text_input_history::TextInputHistory;
 #[cfg(feature = "profile")]
 const TIME_PER_FRAME_PRINT: Duration = Duration::from_secs(10);
 
-const GREEN: ImColor32 = ImColor32::from_rgb(0x8A, 0xE2, 0x43);
-const RED: ImColor32 = ImColor32::from_rgb(0xFF, 0x44, 0x44);
 const WHITE: ImColor32 = ImColor32::from_rgb(0xFF, 0xFF, 0xFF);
 // This is the darkest gray that still meets WCAG guidelines for contrast with
 // the black background of the overlay.
 const BLACK: ImColor32 = ImColor32::from_rgb(0x9C, 0x9C, 0x9C);
-const YELLOW: ImColor32 = ImColor32::from_rgb(0xFC, 0xE9, 0x4F);
-const BLUE: ImColor32 = ImColor32::from_rgb(0x82, 0xA9, 0xD4);
-const MAGENTA: ImColor32 = ImColor32::from_rgb(0xBF, 0x9B, 0xBC);
-const CYAN: ImColor32 = ImColor32::from_rgb(0x34, 0xE2, 0xE2);
 
 fn rgba(rgb: [f32; 3], alpha: f32) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], alpha]
@@ -815,6 +809,9 @@ impl<G: Game> Overlay<G> {
             0.0
         };
 
+        if let Some(legend) = core.log_presentation_legend() {
+            ui.text_wrapped(legend);
+        }
         ui.child_window("#log")
             .size([0.0, -input_height.ceil()])
             .draw_background(false)
@@ -836,7 +833,7 @@ impl<G: Game> Overlay<G> {
                 // of lines. That broken assumption made scroll_max_y unstable,
                 // so the bottom check below almost never held and auto-scroll
                 // silently stopped keeping the newest text in view.
-                for (message, _) in core.base().logs() {
+                for (message, emitted) in core.base().logs() {
                     use ap::Print::*;
                     write_message_data(
                         ui,
@@ -857,6 +854,8 @@ impl<G: Game> Overlay<G> {
                             }
                             _ => 0xAA,
                         },
+                        core,
+                        *emitted,
                     );
                 }
 
@@ -964,6 +963,18 @@ impl ImColor32Ext for ImColor32 {
     }
 }
 
+fn item_text_rgb(progression: bool, useful: bool, trap: bool) -> [u8; 3] {
+    if progression {
+        [0xaf, 0x99, 0xef]
+    } else if useful {
+        [0x6d, 0x8b, 0xe8]
+    } else if trap {
+        [0xfa, 0x80, 0x72]
+    } else {
+        [0x00, 0xee, 0xee]
+    }
+}
+
 /// Writes the text in [parts] to [ui], wrapping onto new lines when a message
 /// is wider than the available space in the log window.
 ///
@@ -972,7 +983,7 @@ impl ImColor32Ext for ImColor32 {
 /// out with `same_line`. So we wrap manually: we split each part into words and
 /// track the running width of the current line, breaking to a new line whenever
 /// the next word wouldn't fit.
-fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
+fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8, core: &impl Core, emitted: Instant) {
     // Width to wrap at: the space from the current cursor to the right edge of
     // the content region (which already excludes the vertical scrollbar).
     let wrap_width = ui.content_region_avail()[0].max(1.0);
@@ -990,21 +1001,38 @@ fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
         // background colors.
         use RichText::*;
         use TextColor::*;
+        // Universal Tracker's JSON text palette (NetUtils.py / kvui.py).
+        // Item classification is independent of the location's progression-surface marker.
         let color = match part {
-            Player { .. } | PlayerName { .. } | Color { color: Blue, .. } => BLUE,
-            Item { .. } | Color { color: Magenta, .. } => MAGENTA,
-            Location { .. } | EntranceName { .. } | Color { color: Cyan, .. } => CYAN,
+            Player(player) if core.base().config().slot() == player.name() => {
+                ImColor32::from_rgb(0xee, 0x00, 0xee)
+            }
+            Player(_) | PlayerName(_) => ImColor32::from_rgb(0xfa, 0xfa, 0xd2),
+            Item {
+                progression,
+                useful,
+                trap,
+                ..
+            } => {
+                let [r, g, b] = item_text_rgb(*progression, *useful, *trap);
+                ImColor32::from_rgb(r, g, b)
+            }
+            Location { .. } => ImColor32::from_rgb(0x00, 0xff, 0x7f),
+            EntranceName(_) => ImColor32::from_rgb(0x64, 0x95, 0xed),
+            Color { color: Blue, .. } => ImColor32::from_rgb(0x64, 0x95, 0xed),
+            Color { color: Magenta, .. } => ImColor32::from_rgb(0xee, 0x00, 0xee),
+            Color { color: Cyan, .. } => ImColor32::from_rgb(0x00, 0xee, 0xee),
             Color { color: Black, .. } => BLACK,
-            Color { color: Red, .. } => RED,
-            Color { color: Green, .. } => GREEN,
-            Color { color: Yellow, .. } => YELLOW,
+            Color { color: Red, .. } => ImColor32::from_rgb(0xee, 0x00, 0x00),
+            Color { color: Green, .. } => ImColor32::from_rgb(0x00, 0xff, 0x7f),
+            Color { color: Yellow, .. } => ImColor32::from_rgb(0xfa, 0xfa, 0xd2),
             _ => WHITE,
         };
         let rgba = color.with_alpha(alpha).to_rgba_f32s();
 
         // `split(' ')` yields empty strings for consecutive/leading/trailing
         // spaces; skipping them collapses runs of whitespace to a single gap.
-        for word in part.to_string().split(' ') {
+        for word in core.log_part_text(part, emitted).split(' ') {
             if word.is_empty() {
                 continue;
             }
@@ -1038,6 +1066,22 @@ fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
 #[cfg(test)]
 mod tests {
     use super::{effective_focus, next_cursor_capture, next_main_window_visible};
+
+    #[test]
+    fn item_text_uses_ut_classification_including_combined_flags() {
+        for bits in 0..8 {
+            let expected = match bits {
+                1 | 3 | 5 | 7 => [0xaf, 0x99, 0xef],
+                2 | 6 => [0x6d, 0x8b, 0xe8],
+                4 => [0xfa, 0x80, 0x72],
+                _ => [0x00, 0xee, 0xee],
+            };
+            assert_eq!(
+                super::item_text_rgb(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn f5_toggles_while_connected() {

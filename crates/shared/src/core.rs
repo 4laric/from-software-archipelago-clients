@@ -478,6 +478,15 @@ pub trait Core: Send + Sized {
     /// Returns the mutable base struct.
     fn base_mut(&mut self) -> &mut CoreBase<Self::Game, Self::SlotData>;
 
+    /// Presentation only; retain rich-text metadata and stored protocol names.
+    fn log_part_text(&self, part: &ap::RichText, _emitted: Instant) -> String {
+        part.to_string()
+    }
+
+    fn log_presentation_legend(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Updates the game logic and checks for common errors. This is only run if
     /// we're currently connected to the Archipelago server and the mod has not
     /// encountered a fatal error.
