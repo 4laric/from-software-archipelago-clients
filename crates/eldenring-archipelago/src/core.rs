@@ -237,6 +237,8 @@ pub struct Core {
     coarse_table: HashMap<u64, String>,
     /// The PROGRESSION SURFACE: location ids this world's own progression may occupy (starred).
     progression_surface: HashSet<u64>,
+    map_progression_targets: HashSet<i64>,
+    map_boss_checks: HashMap<u32, Vec<i64>>,
     /// Coarse region name -> its lock item name, `"<coarse> Lock"` (absent = never locked).
     coarse_lock_items: HashMap<String, String>,
     /// Lock item name -> post-fill placement coordinates. Optional for backwards compatibility;
@@ -880,6 +882,8 @@ impl shared::Core for Core {
             region_table: HashMap::new(),
             coarse_table: HashMap::new(),
             progression_surface: HashSet::new(),
+            map_progression_targets: HashSet::new(),
+            map_boss_checks: HashMap::new(),
             coarse_lock_items: HashMap::new(),
             lock_hint_placements: HashMap::new(),
             lock_hint_hud: None,
@@ -1120,7 +1124,7 @@ impl shared::Core for Core {
         }
 
         // TRAP FEEL PROBE (trap_feel_probe.rs) -- ON by default, unlike the F7/F8 block above.
-        // F9 nightfall, F10 half stamina for 30s, F11 blackout. All three are non-destructive and
+        // F9 nightfall, F11 blackout. F10 is reserved for map settings. Both probes are non-destructive and
         // self-restoring, which is the whole argument for defaulting them on; it is written out in
         // the module note. Function keys for the same reason F6 and F7 are: a letter fights the say
         // input.
@@ -1132,10 +1136,6 @@ impl shared::Core for Core {
         if crate::trap_feel_probe::enabled() {
             for (key, effect) in [
                 (imgui::Key::F9, er_logic::trap_probe::FeelEffect::Nightfall),
-                (
-                    imgui::Key::F10,
-                    er_logic::trap_probe::FeelEffect::StaminaHalved,
-                ),
                 (imgui::Key::F11, er_logic::trap_probe::FeelEffect::Blackout),
             ] {
                 if !ui.is_key_pressed(key) {
@@ -2469,6 +2469,7 @@ impl shared::Core for Core {
                 .unwrap_or_default();
             if !v.is_empty() {
                 self.valid_locations = v;
+                self.refresh_map_progression_targets();
                 self.locations_loaded = true;
             }
         }
@@ -5282,6 +5283,8 @@ impl Core {
         // and shows nothing -- see the deleted-fallback note there). Under num_regions two seeds
         // routinely disagree about which regions EXIST, so inheriting is not a cosmetic bug.
         self.progression_surface = HashSet::new();
+        self.map_progression_targets.clear();
+        self.map_boss_checks.clear();
         self.region_table = HashMap::new();
         self.coarse_table = HashMap::new();
         self.coarse_lock_items = HashMap::new();
@@ -5564,6 +5567,60 @@ impl Core {
             });
     }
 
+    fn refresh_map_progression_targets(&mut self) {
+        use er_logic::mfg_targets::SweepTargetGroup;
+        let mut groups = Vec::new();
+        self.map_boss_checks = self
+            .flag_poll
+            .as_ref()
+            .map(|fp| {
+                er_logic::mfg_targets::seed_boss_map(&fp.location_flags, &self.valid_locations)
+            })
+            .unwrap_or_default();
+        for boss in &self.boss_defs {
+            if self.valid_locations.contains(&boss.boss_ap_id)
+                && let Some(defeat) = er_logic::mfg_targets::native_boss_flag(boss.flag)
+            {
+                let ids = self.map_boss_checks.entry(defeat).or_default();
+                if !ids.contains(&boss.boss_ap_id) {
+                    ids.push(boss.boss_ap_id);
+                }
+            }
+        }
+        if let Some(fp) = &self.flag_poll {
+            for (&flag, members) in &fp.sweep_flags {
+                let bosses = er_logic::mfg_targets::native_boss_flag(flag)
+                    .and_then(|defeat| self.map_boss_checks.get(&defeat))
+                    .cloned()
+                    .unwrap_or_default();
+                groups.push(SweepTargetGroup {
+                    bosses,
+                    members: members.clone(),
+                });
+            }
+        }
+        for (&trigger, members) in &self.dungeon_sweeps {
+            groups.push(SweepTargetGroup {
+                bosses: vec![trigger],
+                members: members.clone(),
+            });
+        }
+        let surface = self
+            .progression_surface
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+        let result =
+            er_logic::mfg_targets::progression_targets(&surface, &self.valid_locations, &groups);
+        self.map_progression_targets = result.locations;
+        if result.unresolved_groups > 0 {
+            log::warn!(
+                "Map progression targets: {} enabled surface sweep group(s) have no identified current-seed boss check; member pins are excluded without inventing a replacement.",
+                result.unresolved_groups
+            );
+        }
+    }
+
     /// Publish only seed eligibility and already-known hints, never randomized item contents.
     /// The map owner renders a leased presentation snapshot; no game writes occur here.
     fn refresh_map_colors(&mut self) {
@@ -5590,12 +5647,8 @@ impl Core {
             .filter(|hint| hint.for_us && !hint.found)
             .map(|hint| hint.location_id as i64)
             .collect();
-        let surface = self
-            .progression_surface
-            .iter()
-            .map(|&id| id as i64)
-            .collect();
-        let entries = er_logic::mfg_match::color_styles(&names, &checked, &hinted, &surface)
+        let surface = &self.map_progression_targets;
+        let entries = er_logic::mfg_match::color_styles(&names, &checked, &hinted, surface)
             .into_iter()
             .map(|entry| crate::mfg_colors::LotStyle {
                 lot_table: entry.lot_table,
@@ -5626,12 +5679,14 @@ impl Core {
             .copied()
             .filter(|&id| er_logic::mfg_match::known_in_logic(id as u64, &self.coarse_table, &open))
             .collect();
-        let surface = self
-            .progression_surface
-            .iter()
-            .map(|&id| id as i64)
-            .collect();
-        let states = er_logic::mfg_match::check_states(&names, &surface, &in_logic);
+        let surface = &self.map_progression_targets;
+        let mut states = er_logic::mfg_match::check_states(&names, surface, &in_logic);
+        states.extend(er_logic::mfg_targets::boss_check_states(
+            &self.map_boss_checks,
+            &names,
+            surface,
+            &in_logic,
+        ));
         self.mfg_states.send(&states);
     }
 
@@ -6131,7 +6186,7 @@ impl Core {
                     ui.text_wrapped("Also enabled by map colors or follow-pins. Uses tracker region access; extra quest/puzzle conditions are not evaluated. Unknown regions are excluded.");
                     if map_filters || map_colors || follow_map_pins { ui.text_wrapped(map_filter_status); }
                     ui.checkbox("Color map pins (this session)", &mut map_colors);
-                    ui.text_wrapped("Yellow rings: known hints. Orange rings: checks eligible to hold progression in this seed. Colors do not reveal what an unhinted check contains.");
+                    ui.text_wrapped("Yellow rings: known hints. Orange rings: progression targets; active sweep bosses replace their member pickups. Colors do not reveal what an unhinted check contains.");
                     if map_colors {
                         ui.text_wrapped(map_color_status);
                     }
