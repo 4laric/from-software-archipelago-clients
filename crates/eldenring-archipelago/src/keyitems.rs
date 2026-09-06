@@ -9,11 +9,19 @@
 //! reconciled from AP receipts below. All idempotent: flags are save-persisted.
 //!
 //! The AP catalog maps each great rune to the boss-drop goods row (8148-8153), and delivery keeps
-//! those rows exactly as the seed sends them (clients#392: the restored rows 191-196 CANNOT be
-//! granted -- AddItem accepts them and materialises them nowhere, which was Corni's re-grant loop;
-//! boss-drop row + this module's restore flag is the empirically working end state). This module
-//! supplies the matching restore flag and disarms the Divine-Tower award event; it does not issue
-//! a second goods grant.
+//! those rows exactly as the seed sends them (clients#392). #392 also concluded that the restored
+//! rows 191-196 CANNOT be granted -- AddItem accepts them and materialises them nowhere, Corni's
+//! re-grant loop. That reading came through the client's own LEN-BOUNDED key-list walk, which
+//! Tako's 2026-09-05/06 logs showed cannot see the newest key items after an NPC hand-in
+//! (`er_logic::key_list_window`); whether a restored row lands is UNSETTLED and is the probe that
+//! gates any delivery change (client #316). What IS settled: the grace's "Great Runes" menu entry
+//! is gated on holding a goodsType-15 good (t000001000.py `PlayerHasTool(15)`), which the boss row
+//! is not, so boss row + restore flag is NOT an equippable end state. This module supplies the
+//! matching restore flag and disarms the Divine-Tower award event; it does not issue a second
+//! goods grant.
+//!
+//! The pre-arm below also makes common_func event 90005110 exit on its first line for every rune,
+//! so a Divine Tower shows no prompt for an AP rune by construction (#316's "no prompt").
 
 use crate::flags;
 use std::collections::HashSet;

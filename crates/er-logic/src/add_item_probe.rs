@@ -31,6 +31,34 @@
 
 use std::collections::HashMap;
 
+/// The game's OWN verdict on the last add, as the pinned crate models
+/// `EquipGameData.last_add_item_result` (`LastAddItemResult`: Success = 0,
+/// UniqueItemDuplicate = 2, InventoryFull = 4). Read before and after every dispatched grant since
+/// 2026-09-06, because a refused re-add of a held maxNum=1 row (Tako's Great Runes) is invisible
+/// in the `u64` return and was scored as accepted for a month.
+///
+/// UNVERIFIED-FIELD RULE: the hooked function's `this` is not `pgd.equipment`, so whether this
+/// field is written on our call path is an open question until a grant is SEEN to move it. Until
+/// then [`describe`] labels every reading `UNVERIFIED-FIELD`; a constant `0` must never be read
+/// as `Success`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastAddItemCode {
+    Success,
+    UniqueItemDuplicate,
+    InventoryFull,
+    Unknown(u32),
+}
+
+/// Map the raw field to the crate's three named values; anything else stays loud.
+pub fn decode(raw: u32) -> LastAddItemCode {
+    match raw {
+        0 => LastAddItemCode::Success,
+        2 => LastAddItemCode::UniqueItemDuplicate,
+        4 => LastAddItemCode::InventoryFull,
+        other => LastAddItemCode::Unknown(other),
+    }
+}
+
 /// One dispatched `AddItemFunc` call and what it returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddItemCall {
@@ -41,6 +69,10 @@ pub struct AddItemCall {
     /// Monotonic dispatch counter, so the reader can tell a fresh record from a stale one and
     /// order two goods' calls without a clock.
     pub seq: u64,
+    /// `EquipGameData.last_add_item_result` read immediately BEFORE the call (`None` = unreadable).
+    pub egd_before: Option<u32>,
+    /// The same field read immediately AFTER the call.
+    pub egd_after: Option<u32>,
 }
 
 /// Per-good record of the most recent dispatched `AddItemFunc` call.
@@ -53,6 +85,9 @@ pub struct AddItemCall {
 pub struct AddItemProbe {
     calls: HashMap<i32, AddItemCall>,
     seq: u64,
+    /// Set the first time a dispatched call is seen to MOVE `last_add_item_result`. That is the
+    /// positive control: until it happens, the field's readings are labelled UNVERIFIED-FIELD.
+    field_verified: bool,
 }
 
 impl AddItemProbe {
@@ -63,14 +98,39 @@ impl AddItemProbe {
     /// Record a DISPATCHED call's raw return. Overwrites any earlier record for the same good --
     /// the stall cares about the most recent attempt, not the first.
     pub fn record(&mut self, full_id: i32, ret: u64) -> AddItemCall {
+        self.record_with_egd(full_id, ret, None, None)
+    }
+
+    /// [`record`](Self::record) plus the game's own add-result field, read before and after the
+    /// call. A before/after pair that differs proves the field is on this call path and flips
+    /// [`field_verified`](Self::field_verified) for the rest of the session.
+    pub fn record_with_egd(
+        &mut self,
+        full_id: i32,
+        ret: u64,
+        egd_before: Option<u32>,
+        egd_after: Option<u32>,
+    ) -> AddItemCall {
         self.seq += 1;
+        if let (Some(b), Some(a)) = (egd_before, egd_after) {
+            if b != a {
+                self.field_verified = true;
+            }
+        }
         let call = AddItemCall {
             full_id,
             ret,
             seq: self.seq,
+            egd_before,
+            egd_after,
         };
         self.calls.insert(full_id, call);
         call
+    }
+
+    /// Whether any dispatched call this session has been seen to move `last_add_item_result`.
+    pub fn field_verified(&self) -> bool {
+        self.field_verified
     }
 
     /// The last dispatched call FOR THIS GOOD, or `None` if we never dispatched one.
@@ -91,7 +151,8 @@ impl AddItemProbe {
     }
 
     /// Drop every record. Called on a world edge alongside `rearm_grant_stalls`, so a stall on the
-    /// far side of a load never quotes a return value from before it.
+    /// far side of a load never quotes a return value from before it. The positive-control latch
+    /// is session-scoped and survives.
     pub fn clear(&mut self) {
         self.calls.clear();
     }
@@ -99,9 +160,33 @@ impl AddItemProbe {
 
 /// Render one good's probe state for the stall log. Kept here (not in the client) so the exact
 /// wording is covered by the tests below and cannot drift into implying more than we know.
+///
+/// The `egd_result` suffix reports the game's own add-result field before and after the call:
+/// `MOVED` when the call changed it, `UNCHANGED` when it did not but the field has been seen to
+/// move this session, `UNVERIFIED-FIELD` while no call has ever moved it (a constant reading is
+/// not evidence of success), and `unreadable` when the field could not be read at all.
 pub fn describe(probe: &AddItemProbe, full_id: i32) -> String {
     match probe.last_for(full_id) {
-        Some(c) => format!("add_item_ret={:#x} (seq {})", c.ret, c.seq),
+        Some(c) => {
+            let egd = match (c.egd_before, c.egd_after) {
+                (Some(b), Some(a)) => {
+                    let verdict = if b != a {
+                        "MOVED"
+                    } else if probe.field_verified() {
+                        "UNCHANGED"
+                    } else {
+                        "UNVERIFIED-FIELD"
+                    };
+                    format!(
+                        " egd_result before={b} after={a} ({:?}) [{verdict}]",
+                        decode(a)
+                    )
+                }
+                (None, None) => String::new(),
+                _ => " egd_result partially unreadable".to_string(),
+            };
+            format!("add_item_ret={:#x} (seq {}){egd}", c.ret, c.seq)
+        }
         None => "add_item_ret=NEVER DISPATCHED".to_string(),
     }
 }
@@ -166,6 +251,54 @@ mod tests {
         assert_eq!(
             c.seq, 3,
             "seq counts DISPATCHES, including repeats of one good"
+        );
+    }
+
+    #[test]
+    fn decode_maps_the_three_crate_codes_and_keeps_unknowns_loud() {
+        assert_eq!(decode(0), LastAddItemCode::Success);
+        assert_eq!(decode(2), LastAddItemCode::UniqueItemDuplicate);
+        assert_eq!(decode(4), LastAddItemCode::InventoryFull);
+        assert_eq!(decode(7), LastAddItemCode::Unknown(7));
+    }
+
+    /// A constant reading is not evidence: until some call has been SEEN to move the field, the
+    /// log says UNVERIFIED-FIELD, never `Success`.
+    #[test]
+    fn describe_says_unverified_field_until_the_field_has_moved_once() {
+        let mut p = AddItemProbe::new();
+        p.record_with_egd(WHETBLADE, 0x1, Some(0), Some(0));
+        assert!(!p.field_verified());
+        assert_eq!(
+            describe(&p, WHETBLADE),
+            "add_item_ret=0x1 (seq 1) egd_result before=0 after=0 (Success) [UNVERIFIED-FIELD]"
+        );
+        // A landing grant elsewhere moves the field: the positive control.
+        p.record_with_egd(OTHER, 0x1, Some(2), Some(0));
+        assert!(p.field_verified());
+        p.record_with_egd(WHETBLADE, 0x1, Some(0), Some(0));
+        assert_eq!(
+            describe(&p, WHETBLADE),
+            "add_item_ret=0x1 (seq 3) egd_result before=0 after=0 (Success) [UNCHANGED]"
+        );
+        p.clear();
+        assert!(p.field_verified(), "the positive control is session-scoped");
+    }
+
+    /// THE MOTIVATING CASE (Tako 2026-09-06): a re-add of a held maxNum=1 Great Rune row. The u64
+    /// return is the same constant it always is; the game's own field says UniqueItemDuplicate.
+    #[test]
+    fn describe_reports_moved_vs_unchanged_for_a_refused_readd() {
+        let mut p = AddItemProbe::new();
+        p.record_with_egd(0x4000_1FD6, 0x23ab6fd268, Some(0), Some(2));
+        assert_eq!(
+            describe(&p, 0x4000_1FD6),
+            "add_item_ret=0x23ab6fd268 (seq 1) egd_result before=0 after=2 (UniqueItemDuplicate) [MOVED]"
+        );
+        p.record_with_egd(0x4000_1FD6, 0x23ab6fd268, None, Some(2));
+        assert_eq!(
+            describe(&p, 0x4000_1FD6),
+            "add_item_ret=0x23ab6fd268 (seq 2) egd_result partially unreadable"
         );
     }
 

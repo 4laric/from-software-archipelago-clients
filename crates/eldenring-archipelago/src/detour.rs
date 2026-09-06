@@ -61,8 +61,9 @@ fn recover_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Remember a DISPATCHED call's raw return. Never called for a grant that did not reach the game.
-fn record_add_item_return(full_id: i32, ret: u64) {
+/// Remember a DISPATCHED call's raw return, plus the game's own `last_add_item_result` field read
+/// immediately before and after the call. Never called for a grant that did not reach the game.
+fn record_add_item_return(full_id: i32, ret: u64, egd_before: Option<u32>, egd_after: Option<u32>) {
     let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
     let Ok(mut guard) = ADD_ITEM_PROBE.lock() else {
         return;
@@ -71,7 +72,29 @@ fn record_add_item_return(full_id: i32, ret: u64) {
     if ADD_ITEM_PROBE_EPOCH.swap(epoch, Ordering::Relaxed) != epoch {
         probe.clear();
     }
-    probe.record(full_id, ret);
+    probe.record_with_egd(full_id, ret, egd_before, egd_after);
+}
+
+/// `EquipGameData.last_add_item_result` as the pinned crate models it (`LastAddItemResult`:
+/// Success = 0, UniqueItemDuplicate = 2, InventoryFull = 4), read as a raw `u32` so an
+/// out-of-range value is reported rather than made into an invalid enum.
+///
+/// UNVERIFIED-FIELD (2026-09-06): the hooked function's `this` is NOT `pgd.equipment` (the
+/// inventory-ptr MISMATCH line at first pickup), so whether this field is written on our call path
+/// is exactly what the before/after pair in the stall log is for. `er_logic::add_item_probe`
+/// labels every reading UNVERIFIED-FIELD until one dispatched grant is seen to move it.
+fn read_last_add_item_result() -> Option<u32> {
+    use eldenring::cs::GameDataMan;
+    use fromsoftware_shared::FromStatic;
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    let field = &gdm
+        .main_player_game_data
+        .as_ref()
+        .equipment
+        .last_add_item_result;
+    // SAFETY: `last_add_item_result` is a `#[repr(u32)]` enum at a fixed offset in a live game
+    // object; reading its storage as the underlying `u32` cannot produce an invalid value.
+    Some(unsafe { std::ptr::read_unaligned(field as *const _ as *const u32) })
 }
 
 /// What `AddItemFunc` last returned for `full_id`, rendered for the stall log. `NEVER DISPATCHED`
@@ -645,8 +668,10 @@ pub fn grant_full_id_outcome(full_id: i32, qty: i32) -> er_logic::start_backfill
         // prime_inventory_if_needed re-seeds within a tick or two of the world coming back.
         return GrantOutcome::NotReady;
     }
+    let egd_before = read_last_add_item_result();
     if let Some(ret) = grant_item(inv as *mut c_void, full_id, qty) {
-        record_add_item_return(requested_full_id, ret);
+        let egd_after = read_last_add_item_result();
+        record_add_item_return(requested_full_id, ret, egd_before, egd_after);
     }
     // STILL `Placed`, deliberately. Nobody has RE'd what the return value means, so turning it
     // into a `Refused` outcome would bake an unverified root cause into the reconciler. This

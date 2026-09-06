@@ -52,6 +52,19 @@
 //!   constructor trusts — is now exercised orders of magnitude more often than it was.
 //!   NOTE(windows-verify): watch for a first-load CTD/hang that the equip-slot commit did not have.
 //!
+//! ## ...and no longer LEN-bounded either (2026-09-06)
+//!
+//! Every walk in this file used the pinned crate's `key_entries()`, a slice of `key_items_len`
+//! entries. Tako's two client logs (2026-09-05/06) show that field is an OCCUPANCY COUNT, not a
+//! high-water mark: an NPC hand-in (a bell bearing at the Twin Maiden Husks, a prayerbook at
+//! Miriel) clears a lower slot and decrements it, and the newest key item -- a just-received Great
+//! Rune -- ends up at an index `>= len`, held by the game and invisible to us. We then re-granted a
+//! row the game already had, the game refused the duplicate, and the stall guard parked it after
+//! every load for two days. The model, the arithmetic and the replay live in
+//! `er_logic::key_list_window`; here every key-list walk goes through [`key_entries_by_capacity`],
+//! which walks `[0, key_items_capacity)` exactly as the crate already walks the normal list, and
+//! a hit beyond `len` is logged once per (good, world epoch) so the next report names it.
+//!
 //! ## Build / wiring status
 //!
 //! * This module compiles ONLY on Windows (it depends on `eldenring` / `fromsoftware-shared`), same
@@ -71,11 +84,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use er_logic::esd_probe::{GateEdge, GateEdgeTracker};
+use er_logic::key_list_window::{self, BeyondLenEntry, WalkBound};
 use er_logic::marker::{self, FlagBand};
 use er_logic::ownership::{Class, OwnerState, Suspended};
 use er_logic::reconcile::{
-    ApplyClasses, CharLedger, DesiredInputs, GameIo, Reconciler, TickBudget, WorldStability,
-    legacy_adopt, seed_trust, stamp_playtime,
+    Action, ApplyClasses, CharLedger, DesiredInputs, GameIo, ItemSemantics, Reconciler, TickBudget,
+    WorldStability, legacy_adopt, seed_trust, stamp_playtime,
 };
 use serde::{Deserialize, Serialize};
 
@@ -172,6 +187,231 @@ impl Default for LiveGame {
     }
 }
 
+/// Said once per session when the capacity read fails sanity and the walk falls back to `len`.
+static KEY_WALK_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// `(goods, world epoch)` pairs for which the beyond-len INFO line has already been printed.
+static BEYOND_LEN_SEEN: Mutex<BTreeSet<(i32, u64)>> = Mutex::new(BTreeSet::new());
+
+/// The KEY-ITEM list walked to CAPACITY -- every allocated slot -- not to `key_items_len`.
+///
+/// `key_items_len` counts live entries (Tako 2026-09-05/06; `er_logic::key_list_window`), so a
+/// len-bounded slice stops short of the newest key items after any NPC hand-in. The bound comes
+/// from the pure `walk_bound`: the crate's `key_items_capacity` when sane, else the old `len`
+/// with a once-per-session warning that the blind spot is back for this session.
+pub fn key_entries_by_capacity(
+    inv: &eldenring::cs::InventoryItemsData,
+) -> &[fromsoftware_shared::MaybeEmpty<eldenring::cs::EquipInventoryDataListEntry>] {
+    let bound = key_list_window::walk_bound(inv.key_items_len, inv.key_items_capacity);
+    if let WalkBound::LenFallback { len, capacity } = bound
+        && !KEY_WALK_FALLBACK_WARNED.swap(true, Ordering::Relaxed)
+    {
+        log::warn!(
+            "[reconcile] key-list walk: capacity {capacity} vs len {len} fails sanity -- \
+             len-bounded walk in force; entries beyond len are INVISIBLE this session"
+        );
+    }
+    // SAFETY: the same head pointer and element type the crate's own `key_entries()` slices. The
+    // bound is either `key_items_capacity` -- the allocation size, exactly what the crate's
+    // `normal_entries()` uses for the normal list and what the game's own `entry_at_slot`
+    // arithmetic spans -- or the crate's previous `key_items_len`. Never more than the capacity.
+    unsafe { std::slice::from_raw_parts(inv.key_items_head.as_ptr(), bound.slots()) }
+}
+
+/// Say, once per (good, world epoch), that a good was found at a key-list index the len-bounded
+/// walk would never have reached. This is the sentence that settles the model on a live save.
+fn note_beyond_len_hit(goods: i32, row: i32, index: usize, len: u32, cap: u32, qty: u32) {
+    let epoch = crate::detour::world_epoch();
+    let fresh = match BEYOND_LEN_SEEN.lock() {
+        Ok(mut seen) => seen.insert((goods, epoch)),
+        Err(_) => true,
+    };
+    if fresh {
+        log::info!(
+            "[reconcile] goods {:#010x} (row {row}) observed at key-list index {index} >= \
+             key_items_len {len} (cap {cap}, qty {qty}) -- present but hidden from the \
+             len-bounded walk; treating as HELD, no re-grant",
+            goods as u32
+        );
+    }
+}
+
+/// One walk of the key list to capacity: `(non_empty_in_len, entries beyond len)`.
+fn key_window(inv: &eldenring::cs::InventoryItemsData) -> (u32, Vec<BeyondLenEntry>) {
+    let len = inv.key_items_len as usize;
+    let mut in_len = 0u32;
+    let mut beyond = Vec::new();
+    for (i, slot) in key_entries_by_capacity(inv).iter().enumerate() {
+        let Some(entry) = slot.as_option() else {
+            continue;
+        };
+        if i < len {
+            in_len += 1;
+        } else {
+            beyond.push(BeyondLenEntry {
+                index: i,
+                row: entry.item_id.param_id() as i32,
+                category_nibble: (entry.item_id.category() as u32 & 0xF) as u8,
+                quantity: entry.quantity,
+            });
+        }
+    }
+    (in_len, beyond)
+}
+
+/// `(key_items_len, non_empty_in_len)` for the talk-window delta line, or `None` off-world.
+fn key_list_sample() -> Option<(u32, u32)> {
+    use eldenring::cs::GameDataMan;
+    use fromsoftware_shared::FromStatic;
+    if !crate::flags::in_world() {
+        return None;
+    }
+    let gdm = unsafe { GameDataMan::instance() }.ok()?;
+    let inv = &gdm
+        .main_player_game_data
+        .as_ref()
+        .equipment
+        .equip_inventory_data
+        .items_data;
+    Some((inv.key_items_len, key_window(inv).0))
+}
+
+/// The per-epoch key-list line body: every len/cap pair plus what sits beyond the key len.
+fn key_list_report() -> String {
+    use eldenring::cs::GameDataMan;
+    use fromsoftware_shared::FromStatic;
+    let Ok(gdm) = (unsafe { GameDataMan::instance() }) else {
+        return "inventory unreadable (no GameDataMan)".to_string();
+    };
+    let inv = &gdm
+        .main_player_game_data
+        .as_ref()
+        .equipment
+        .equip_inventory_data
+        .items_data;
+    let (in_len, beyond) = key_window(inv);
+    format!(
+        "key len={} cap={} non_empty_in_len={} hidden_model={} rows_beyond={} | normal len={} \
+         cap={} | multiplay_key len={} cap={}",
+        inv.key_items_len,
+        inv.key_items_capacity,
+        in_len,
+        key_list_window::hidden_beyond_len(inv.key_items_len, in_len),
+        key_list_window::format_beyond_len(&beyond, 16),
+        inv.normal_items_len,
+        inv.normal_items_capacity,
+        inv.multiplay_key_items_len,
+        inv.multiplay_key_items_capacity,
+    )
+}
+
+/// Where the key list holds `row` (either Great Rune family alias applies): `(index, beyond len)`.
+fn key_index_of_row(inv: &eldenring::cs::InventoryItemsData, row: i32) -> Option<(usize, bool)> {
+    use eldenring::cs::ItemCategory;
+    let len = inv.key_items_len as usize;
+    key_entries_by_capacity(inv)
+        .iter()
+        .enumerate()
+        .find_map(|(i, slot)| {
+            let e = slot.as_option()?;
+            (e.item_id.category() == ItemCategory::Goods && e.item_id.param_id() as i32 == row)
+                .then_some((i, i >= len))
+        })
+}
+
+/// Everything the `!give` reply and the `[reattach] great rune` line need to say about where a
+/// goods row is right now, read from the same stores the possession predicate reads.
+pub fn possession_report(goods: i32) -> String {
+    use eldenring::cs::{GameDataMan, ItemCategory};
+    use fromsoftware_shared::{FromStatic, NonEmptyIteratorExt};
+    let Ok(gdm) = (unsafe { GameDataMan::instance() }) else {
+        return "observed: inventory unreadable".to_string();
+    };
+    let pgd = gdm.main_player_game_data.as_ref();
+    let inv = &pgd.equipment.equip_inventory_data.items_data;
+    let row = (goods as u32 & 0x0FFF_FFFF) as i32;
+    let mut places: Vec<String> = Vec::new();
+    if let Some((i, beyond)) = key_index_of_row(inv, row) {
+        places.push(format!(
+            "key[{i}]{}",
+            if beyond { " (beyond len)" } else { "" }
+        ));
+    }
+    if inv
+        .normal_entries()
+        .iter()
+        .non_empty()
+        .any(|e| e.item_id.category() == ItemCategory::Goods && e.item_id.param_id() as i32 == row)
+    {
+        places.push("normal".to_string());
+    }
+    if inv
+        .multiplay_key_entries()
+        .iter()
+        .non_empty()
+        .any(|e| e.item_id.category() == ItemCategory::Goods && e.item_id.param_id() as i32 == row)
+    {
+        places.push("multiplay_key".to_string());
+    }
+    if great_rune_slot_row(pgd.equipment.equip_item_data.great_rune.gaitem_handle) == Some(row) {
+        places.push("equip-slot".to_string());
+    }
+    if storage_has_goods_row(pgd, row) == Some(true) {
+        places.push("storage".to_string());
+    }
+    if places.is_empty() {
+        "observed: ABSENT (normal+key(to capacity)+multiplay_key+equip-slot+storage)".to_string()
+    } else {
+        format!("observed: {}", places.join(", "))
+    }
+}
+
+/// The `[reattach] great rune` line: both row families, the equip slot, and the altar's two flags
+/// (client #316 asked for exactly these four facts on every report).
+fn great_rune_state_line(name: &str, goods: i32) -> String {
+    use eldenring::cs::GameDataMan;
+    use fromsoftware_shared::FromStatic;
+    let row = (goods as u32 & 0x0FFF_FFFF) as i32;
+    let Some(gate) = er_logic::great_runes::tower_gate_for(row) else {
+        return format!("[reattach] great rune {name:?}: row {row} has no altar gate");
+    };
+    let boss_row = er_logic::great_runes::BOSS_DROP_FIRST
+        + (gate.restore_flag as i32 - er_logic::great_runes::RESTORED_FIRST);
+    let restored_row = gate.restore_flag as i32;
+    let (boss_at, restored_at, equip) = match unsafe { GameDataMan::instance() } {
+        Ok(gdm) => {
+            let pgd = gdm.main_player_game_data.as_ref();
+            let inv = &pgd.equipment.equip_inventory_data.items_data;
+            let fmt = |hit: Option<(usize, bool)>| match hit {
+                Some((i, true)) => format!("key[{i}] (beyond len)"),
+                Some((i, false)) => format!("key[{i}]"),
+                None => "absent".to_string(),
+            };
+            (
+                fmt(key_index_of_row(inv, boss_row)),
+                fmt(key_index_of_row(inv, restored_row)),
+                great_rune_slot_row(pgd.equipment.equip_item_data.great_rune.gaitem_handle)
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "empty".to_string()),
+            )
+        }
+        Err(_) => (
+            "unreadable".into(),
+            "unreadable".into(),
+            "unreadable".into(),
+        ),
+    };
+    format!(
+        "[reattach] great rune {name:?}: boss row {boss_row}@{boss_at} restored row \
+         {restored_row}@{restored_at} equip_slot={equip} flag{}={} boss_flag{}={} (altar: exits \
+         when the restore flag is set or the boss flag is clear)",
+        gate.restore_flag,
+        crate::flags::get_event_flag(gate.restore_flag),
+        gate.boss_flag,
+        crate::flags::get_event_flag(gate.boss_flag),
+    )
+}
+
 /// Walk the player's held goods and report whether a specific goods FullID is present.
 ///
 /// MULTIPLAYER KEY-ITEM-LIST SWITCH (fix 2026-07-19; the Morgott's-Great-Rune re-grant loop CTD).
@@ -244,12 +484,12 @@ fn inventory_has_goods(goods: i32) -> bool {
     let inv = &pgd.equipment.equip_inventory_data.items_data;
     let want_row = (goods as u32 & 0x0FFF_FFFF) as i32;
     // Scan all three backing lists (NOT items(), which follows the accessor and goes blind to the
-    // single-player key items — Great Runes — in an online session). key_entries() is the always-SP
-    // key list; multiplay_key_entries() is the online pots/tears list; normal_entries() is the rest.
+    // single-player key items — Great Runes — in an online session). The always-SP key list is
+    // walked to CAPACITY (see `key_entries_by_capacity`); multiplay_key_entries() is the online
+    // pots/tears list; normal_entries() is the rest.
     for entry in inv
         .normal_entries()
         .iter()
-        .chain(inv.key_entries().iter())
         .chain(inv.multiplay_key_entries().iter())
         .non_empty()
     {
@@ -267,6 +507,37 @@ fn inventory_has_goods(goods: i32) -> bool {
         // returns the full category-tagged id). Keep BOTH until confirmed on Windows; do not delete
         // the compare above without a set->readback proving this one is the correct form:
         //   if (entry.item_id.param_id() as i32 & 0x0FFF_FFFF) == want_row { return true; }
+    }
+    // The key list, enumerated, so a hit at an index >= key_items_len can be NAMED: that is the
+    // entry the len-bounded walk lost after an NPC hand-in (Tako 2026-09-05/06). Beyond len the
+    // quantity must be positive as well -- a cleared-but-not-blanked tail slot must not read as
+    // held.
+    let key_len = inv.key_items_len as usize;
+    for (i, slot) in key_entries_by_capacity(inv).iter().enumerate() {
+        let Some(entry) = slot.as_option() else {
+            continue;
+        };
+        if entry.item_id.category() != ItemCategory::Goods {
+            continue;
+        }
+        let row = entry.item_id.param_id() as i32;
+        if !er_logic::great_runes::possession_row_satisfies(want_row, row) {
+            continue;
+        }
+        if i >= key_len {
+            if entry.quantity == 0 {
+                continue;
+            }
+            note_beyond_len_hit(
+                goods,
+                row,
+                i,
+                inv.key_items_len,
+                inv.key_items_capacity,
+                entry.quantity,
+            );
+        }
+        return true;
     }
     // Not in any bag list. Before declaring the good ABSENT — which is what re-emits `GrantUnique`
     // every tick — check the two other places the game keeps a good the player owns.
@@ -301,13 +572,7 @@ fn inventory_has_protector(full_id: i32) -> bool {
         .items_data
         .normal_entries()
         .iter()
-        .chain(
-            pgd.equipment
-                .equip_inventory_data
-                .items_data
-                .key_entries()
-                .iter(),
-        )
+        .chain(key_entries_by_capacity(&pgd.equipment.equip_inventory_data.items_data).iter())
         .chain(
             pgd.equipment
                 .equip_inventory_data
@@ -330,7 +595,7 @@ fn inventory_has_protector(full_id: i32) -> bool {
         .items_data
         .normal_entries()
         .iter()
-        .chain(storage.items_data.key_entries().iter())
+        .chain(key_entries_by_capacity(&storage.items_data).iter())
         .non_empty()
         .any(|e| {
             e.item_id.category() == ItemCategory::Protector
@@ -363,7 +628,7 @@ fn storage_has_goods_row(pgd: &eldenring::cs::PlayerGameData, want_row: i32) -> 
             .items_data
             .normal_entries()
             .iter()
-            .chain(storage.items_data.key_entries().iter())
+            .chain(key_entries_by_capacity(&storage.items_data).iter())
             .non_empty()
             .any(|e| {
                 e.item_id.category() == ItemCategory::Goods
@@ -496,10 +761,14 @@ fn inventory_forensics(goods: i32) -> String {
         // `Goods` is exactly the case `inventory_has_goods` drops on the floor, so excluding it
         // here would hide the one finding this term was added for. Reports rows only -- nothing in
         // the possession path reads it and it never decides anything.
-        use fromsoftware_shared::NonEmptyIteratorExt;
+        // The key list is walked to CAPACITY here too, with entries at an index >= len marked, so
+        // the line can show the wanted row sitting exactly where the old walk stopped looking.
+        // `non_empty[key=N]` keeps its meaning (live entries INSIDE [0, len)); the beyond-len
+        // count is in `key_window[..]`.
+        let key_len = inv.key_items_len as usize;
         let lists = [
             ("normal", inv.normal_entries()),
-            ("key", inv.key_entries()),
+            ("key", key_entries_by_capacity(inv)),
             ("multiplay_key", inv.multiplay_key_entries()),
         ];
         let mut counts: Vec<String> = Vec::new();
@@ -507,8 +776,14 @@ fn inventory_forensics(goods: i32) -> String {
         let mut extra = 0usize;
         for (name, entries) in lists {
             let mut filled = 0usize;
-            for entry in entries.iter().non_empty() {
-                filled += 1;
+            for (idx, slot) in entries.iter().enumerate() {
+                let Some(entry) = slot.as_option() else {
+                    continue;
+                };
+                let beyond = name == "key" && idx >= key_len;
+                if !beyond {
+                    filled += 1;
+                }
                 let row = entry.item_id.param_id() as i32;
                 if (row - want_row).abs() > CANDIDATE_ROW_WINDOW {
                     continue;
@@ -518,10 +793,15 @@ fn inventory_forensics(goods: i32) -> String {
                     continue;
                 }
                 hits.push(format!(
-                    "{name}[row={row} delta={} category={:?} id={:?}]",
+                    "{name}[row={row} delta={} category={:?} id={:?}{}]",
                     row - want_row,
                     entry.item_id.category(),
                     entry.item_id,
+                    if beyond {
+                        format!(" idx={idx}>=len")
+                    } else {
+                        String::new()
+                    },
                 ));
             }
             counts.push(format!("{name}={filled}"));
@@ -541,9 +821,25 @@ fn inventory_forensics(goods: i32) -> String {
         format!("non_empty[{}] | {listed}{overflow}", counts.join(" "))
     };
 
+    // KEY WINDOW (2026-09-06). len vs capacity, the live count inside the len window, the hidden
+    // count the occupancy model predicts (len - non_empty_in_len) and the rows actually found at
+    // an index >= len. When the wanted row is listed in `beyond_len`, the stall is the walk's,
+    // not the game's -- and with the capacity walk in force it should never stall at all.
+    let key_window = {
+        let (in_len, beyond) = key_window(inv);
+        format!(
+            "key_window[len={} cap={} non_empty_in_len={} hidden_model={} beyond_len={}]",
+            inv.key_items_len,
+            inv.key_items_capacity,
+            in_len,
+            key_list_window::hidden_beyond_len(inv.key_items_len, in_len),
+            key_list_window::format_beyond_len(&beyond, 16),
+        )
+    };
+
     format!(
         "normal {}/{}{} | key {}/{}{} | multiplay_key {}/{}{} | global_cap {} | \
-         key_accessor={} | in_storage={} | great_rune_slot[{}] | \
+         key_accessor={} | in_storage={} | great_rune_slot[{}] | {} | \
          want[full_id={:#010x} category_nibble={:#x} row={}] | {}",
         inv.normal_items_len,
         inv.normal_items_capacity,
@@ -570,6 +866,7 @@ fn inventory_forensics(goods: i32) -> String {
         },
         in_storage,
         great_rune_slot,
+        key_window,
         goods as u32,
         (goods as u32) >> 28,
         want_row,
@@ -1056,6 +1353,12 @@ struct Driver {
     /// The marker identity for this session = `hash(room seed, AP slot name)`. Written into the save's
     /// marker band alongside the watermark on every tick commit; the reconnect guard compares it.
     identity: u32,
+    /// OBSERVATION ONLY (2026-09-06): the world epoch whose `[reconcile] key-list @epoch` line has
+    /// been printed, the goods-gate transition tracker, and the key-list sample taken when the
+    /// gate closed (so a `len` decrement during a talk can be dated to the ESD command).
+    last_keylist_epoch: Option<u64>,
+    gate: GateEdgeTracker,
+    talk_sample: Option<(u32, u32)>,
 }
 
 /// A PROCESS-monotonic clock in ms that — unlike the per-world dwell clock — never resets on a load
@@ -1298,6 +1601,22 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         b.min_grant_interval_ms
     );
     let slot = inputs.save.0.clone();
+    // The shardbearer Great Runes this character has received, for the `[reattach] great rune`
+    // lines below (client #316: "is 8149 or 192 observable, flags 172/192" were the missing
+    // facts on every report). Collected here because `inputs` moves into the reconciler.
+    let rune_receipts: BTreeMap<String, i32> = inputs
+        .received
+        .iter()
+        .filter_map(|ri| match &ri.semantics {
+            ItemSemantics::KeyItem { goods, .. }
+                if er_logic::great_runes::tower_gate_for((*goods as u32 & 0x0FFF_FFFF) as i32)
+                    .is_some() =>
+            {
+                Some((ri.name.clone(), *goods))
+            }
+            _ => None,
+        })
+        .collect();
     // Scan before `persist_path` moves into WatermarkStore. This is advisory and I/O failures are
     // false, so it cannot disturb init even if the directory is unavailable.
     let other_room_history = has_other_room_history(&persist_path, &inputs.seed, &slot);
@@ -1407,6 +1726,9 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         crate::detour::has_inventory(),
         MARKER_BAND.base
     );
+    for (name, goods) in &rune_receipts {
+        log::info!("{}", great_rune_state_line(name, *goods));
+    }
     // Re-stamp the ledger NOW with the correctly-read seed-time play_time. The tick-tail persist
     // (below) can run when `read_play_time_ms()` momentarily reads 0, freezing the stamp and
     // silently disabling the save-slot-reuse guard in `seed_trust` (observed 2026-07-20:
@@ -1432,6 +1754,9 @@ pub fn init(inputs: DesiredInputs, persist_path: std::path::PathBuf, received_th
         unique_goods_debt,
         unique_protector_debt,
         identity,
+        last_keylist_epoch: None,
+        gate: GateEdgeTracker::new(),
+        talk_sample: None,
     };
     let _ = DRIVER.set(Mutex::new(driver));
     log::info!(
@@ -1514,6 +1839,76 @@ pub fn tick() {
     // Reborrow the MutexGuard once to a plain &mut State so `reconciler` and `io`
     // split-borrow as disjoint fields (field access through DerefMut cannot).
     let d = &mut *d;
+
+    // OBSERVATION ONLY (2026-09-06, Tako). Three lines the two logs did not have and every reader
+    // needed: when the goods gate closes and re-opens (an unexplained silence was argued both
+    // ways), the key list's shape once per world epoch (len vs capacity vs live-in-len, and the
+    // rows sitting beyond len), and any key-list movement WHILE a talk is open, stamped with the
+    // last ESD command -- which names the hand-in that shrinks `len`. Nothing here decides.
+    {
+        let stab = d.io.stability();
+        let now = crate::esd_probe::talk_clock_now_ms();
+        let dispatches = crate::esd_probe::dispatch_count();
+        match d.gate.observe(now, stab.inventory_safe, dispatches) {
+            Some(GateEdge::Closed) => {
+                let (talk_id, cmd, args) =
+                    crate::esd_probe::last_dispatch().unwrap_or((0, 0, [0; 4]));
+                log::info!(
+                    "[reconcile] goods gate CLOSED (ESD talk {talk_id} cmd {cmd} args {args:?})"
+                );
+                d.talk_sample = key_list_sample();
+            }
+            Some(GateEdge::Open {
+                closed_ms,
+                dispatches,
+            }) => {
+                log::info!(
+                    "[reconcile] goods gate OPEN after {closed_ms} ms quiet ({dispatches} dispatch(es))"
+                );
+                if let (Some(prev), Some(now_s)) = (d.talk_sample.take(), key_list_sample())
+                    && let Some(delta) = key_list_window::key_list_delta(prev, now_s)
+                {
+                    let (h0, h1) = delta.hidden();
+                    log::info!(
+                        "[reconcile] key-list len {}->{} non_empty_in_len {}->{} (hidden_model \
+                         {h0}->{h1}) across the talk session that just closed",
+                        delta.len_before,
+                        delta.len_after,
+                        delta.non_empty_before,
+                        delta.non_empty_after,
+                    );
+                }
+            }
+            None => {}
+        }
+        if d.gate.is_closed()
+            && let (Some(prev), Some(now_s)) = (d.talk_sample, key_list_sample())
+            && let Some(delta) = key_list_window::key_list_delta(prev, now_s)
+        {
+            let (talk_id, cmd, args) = crate::esd_probe::last_dispatch().unwrap_or((0, 0, [0; 4]));
+            let (h0, h1) = delta.hidden();
+            log::info!(
+                "[reconcile] key-list len {}->{} non_empty_in_len {}->{} (hidden_model {h0}->{h1}) \
+                 while talk gate closed; last ESD talk {talk_id} cmd {cmd} args {args:?}",
+                delta.len_before,
+                delta.len_after,
+                delta.non_empty_before,
+                delta.non_empty_after,
+            );
+            d.talk_sample = Some(now_s);
+        }
+        if stab.stable()
+            && key_list_window::should_log_epoch(d.last_keylist_epoch, stab.world_epoch)
+        {
+            d.last_keylist_epoch = Some(stab.world_epoch);
+            log::info!(
+                "[reconcile] key-list @epoch {}: {}",
+                stab.world_epoch,
+                key_list_report()
+            );
+        }
+    }
+
     let out = d.reconciler.tick_with_classes(&mut d.io, budget, classes);
 
     // A native "accepted" return is not completion evidence. Once a unique grant reaches the
@@ -1582,8 +1977,9 @@ pub fn tick() {
     // leaving us to theorise about it (three rounds of plausible theories is the house failure mode).
     for g in &out.newly_stalled {
         log::warn!(
-            "[reconcile] INERT: goods {g:#x} accepted {} grant(s) and was never observable -- \
-             no longer re-granting until the next load. {} | {}",
+            "[reconcile] INERT: goods {g:#x} accepted {} grant(s) and was never observable in \
+             normal+key(to capacity)+multiplay_key+equip-slot+storage -- no longer re-granting \
+             until the next load. {} | {}",
             er_logic::reconcile::MAX_GRANT_ATTEMPTS,
             inventory_forensics(*g),
             crate::detour::add_item_return_for(*g)
@@ -1603,9 +1999,10 @@ pub fn tick() {
     if !out.applied.is_empty() {
         shared::crash_tallies::record_reconcile_apply();
         log::info!(
-            "[reconcile] applied {} action(s) this tick (converged={})",
+            "[reconcile] applied {} action(s) this tick (converged={}) [{}]",
             out.applied.len(),
-            out.converged
+            out.converged,
+            Action::labels(&out.applied, 6)
         );
     }
 }

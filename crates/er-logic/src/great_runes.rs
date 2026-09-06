@@ -21,16 +21,60 @@ pub fn canonical_restored_row(row: i32) -> Option<i32> {
     })
 }
 
+/// The vanilla Divine-Tower altar for one shardbearer rune: common_func event 90005110's two
+/// flag gates, pinned to the six `InitializeCommonEvent` sites in `m34_10/12/13/14/15`.
+///
+/// The event is `EndIf(EventFlag(restore_flag)); EndIf(!EventFlag(boss_flag)); ...` -- so a rune
+/// whose restore flag is already set (the client sets all six every session, #731) or whose
+/// shardbearer is still alive shows NO altar prompt. That is client issue #316's "no prompt at the
+/// Divine Tower of Caelid", by construction, and the `[reattach] great rune` line prints both
+/// halves so a report carries them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TowerGate {
+    /// `eventFlagId`: the restore flag the altar sets and exits on (191..=196).
+    pub restore_flag: u32,
+    /// `eventFlagId2`: the shardbearer's defeat flag the altar requires.
+    pub boss_flag: u32,
+    /// The lot the altar awards (goods 191..=196 with `AwardItemsIncludingClients`).
+    pub restore_lot: u32,
+}
+
+/// The altar gates for a boss-drop OR restored row; `None` for anything else (the Great Rune of
+/// the Unborn has no altar).
+pub fn tower_gate_for(row: i32) -> Option<TowerGate> {
+    let restored = canonical_restored_row(row)?;
+    let (boss_flag, restore_lot) = match restored {
+        191 => (9101, 34100500), // Godrick, m34_10
+        192 => (9130, 34130050), // Radahn, m34_13
+        193 => (9104, 34140700), // Morgott, m34_14
+        194 => (9122, 34120500), // Rykard, m34_12
+        195 => (9112, 34140710), // Mohg, m34_14
+        196 => (9120, 34150000), // Malenia, m34_15
+        _ => return None,
+    };
+    Some(TowerGate {
+        restore_flag: restored as u32,
+        boss_flag,
+        restore_lot,
+    })
+}
+
 /// Whether an observed goods row satisfies the desired Great Rune row.
 ///
 /// Great Runes have two equivalent row families: boss-drop (`8148..=8153`) and restored/usable
 /// (`191..=196`), and EITHER family satisfies a desire for the other, in both directions
-/// (clients#392). Delivery desires the boss-drop row exactly as the seed sends it: the restored
-/// row cannot be granted at all -- AddItem accepts it and materialises it nowhere (Corni probe,
-/// 2026-08-22: `!give 0x400000c4` / row 196 INERT on every load; `!give 0x40001fd9` / row 8153
-/// works). Conversely, a restored row observed in the wild (a vanilla Divine-Tower visit on a
-/// hybrid save, or a pre-AP save) means the player already has the rune and no boss-row grant is
-/// owed. Non-rune goods retain exact-row identity.
+/// (clients#392). Delivery desires the boss-drop row exactly as the seed sends it. Conversely, a
+/// restored row observed in the wild (a vanilla Divine-Tower visit on a hybrid save, or a pre-AP
+/// save) means the player already has the rune and no boss-row grant is owed. Non-rune goods
+/// retain exact-row identity.
+///
+/// ON "THE RESTORED ROW CANNOT BE GRANTED" (2026-09-06). #392 concluded from Corni's probe
+/// (`!give 0x400000c4` / row 196 INERT on every load; `!give 0x40001fd9` / row 8153 works) that
+/// AddItem accepts 191..=196 and materialises them nowhere. That conclusion was read through the
+/// client's own LEN-BOUNDED key-list walk, which Tako's 2026-09-05/06 logs show cannot see the
+/// newest key items after an NPC hand-in (`crate::key_list_window`). Earlier in-play notes (world
+/// #682, 2026-08-14) saw client-delivered 191/192 list and equip. So whether a goodsType-15 row
+/// lands is UNSETTLED, not refuted; it is the probe gating any delivery change (client #316).
 ///
 /// HISTORY: this used to be asymmetric -- a restored row satisfied a boss-row desire (client #313)
 /// but not the inverse, because delivery rewrote the map to desire the restored row (#316) and a
@@ -93,6 +137,35 @@ mod tests {
         assert!(possession_row_satisfies(9000, 9000));
         assert!(!possession_row_satisfies(9000, 191));
         assert!(!possession_row_satisfies(191, 9000));
+    }
+
+    /// The six `InitializeCommonEvent(0, 90005110, ...)` sites in the m34 EMEVD, pinned: restore
+    /// flag, boss flag (`eventFlagId2`), restore lot -- and the same answer for either row family.
+    #[test]
+    fn tower_gates_match_the_six_m34_initializers() {
+        let expect = [
+            (8148, 191, 9101, 34100500),
+            (8149, 192, 9130, 34130050),
+            (8150, 193, 9104, 34140700),
+            (8151, 194, 9122, 34120500),
+            (8152, 195, 9112, 34140710),
+            (8153, 196, 9120, 34150000),
+        ];
+        for (boss_row, restored, boss_flag, lot) in expect {
+            let want = TowerGate {
+                restore_flag: restored,
+                boss_flag,
+                restore_lot: lot,
+            };
+            assert_eq!(tower_gate_for(boss_row), Some(want), "boss row {boss_row}");
+            assert_eq!(
+                tower_gate_for(restored as i32),
+                Some(want),
+                "restored row {restored}"
+            );
+        }
+        assert_eq!(tower_gate_for(10080), None, "the Unborn rune has no altar");
+        assert_eq!(tower_gate_for(8147), None);
     }
 
     #[test]

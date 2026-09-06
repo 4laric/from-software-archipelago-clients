@@ -104,15 +104,18 @@ pub fn tick(ready: bool) {
     let mut present: HashSet<u32> = HashSet::new();
     // Per-list counts, logged with every scan: when a scan reads implausibly small (the 17-id
     // incident) this says WHICH list came up short, instead of leaving it to be guessed.
+    // The key list is walked to CAPACITY (2026-09-06, `reconcile_io::key_entries_by_capacity`):
+    // `key_items_len` is an occupancy count and a start-item flask hidden beyond it would be
+    // re-granted once per launch, the same blind spot that stalled the Great Runes.
     let counts = (
         inv.normal_entries().len(),
-        inv.key_entries().len(),
+        format!("{}/{}", inv.key_items_len, inv.key_items_capacity),
         inv.multiplay_key_entries().len(),
     );
     for entry in inv
         .normal_entries()
         .iter()
-        .chain(inv.key_entries().iter())
+        .chain(crate::reconcile_io::key_entries_by_capacity(inv).iter())
         .chain(inv.multiplay_key_entries().iter())
         .non_empty()
     {

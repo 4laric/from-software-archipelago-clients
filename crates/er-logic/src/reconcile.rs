@@ -586,6 +586,43 @@ pub enum Action {
     SkipLedgered { index: ItemIndex },
 }
 
+impl Action {
+    /// A short, stable name for the log: `GrantUnique 0x40001fd5`, `SetFlag 192`,
+    /// `Ledger#123 0x400000c8 x1`, `Skip#124`, `GrantProtector 0x1...`.
+    ///
+    /// Two days of Tako's logs (2026-09-05/06) could not say whether an `applied 1 action(s)`
+    /// tick was a Great Rune re-grant or an unrelated flag write; every reader had to infer it from
+    /// the surrounding lines. The name is the datum, so it is rendered here and pinned by a test.
+    pub fn label(&self) -> String {
+        match self {
+            Action::SetFlag(f) => format!("SetFlag {f}"),
+            Action::ClearFlag(f) => format!("ClearFlag {f}"),
+            Action::GrantUnique(g, _) => format!("GrantUnique {:#x}", *g as u32),
+            Action::GrantUniqueProtector(p) => format!("GrantProtector {:#x}", *p as u32),
+            Action::GrantLedgered {
+                index,
+                full_id,
+                qty,
+            } => format!("Ledger#{index} {:#x} x{qty}", *full_id as u32),
+            Action::SkipLedgered { index } => format!("Skip#{index}"),
+        }
+    }
+
+    /// The first `cap` labels joined by `, `, then ` +N more`. Empty input renders as `-`.
+    pub fn labels(actions: &[Action], cap: usize) -> String {
+        if actions.is_empty() {
+            return "-".to_string();
+        }
+        let shown: Vec<String> = actions.iter().take(cap).map(Action::label).collect();
+        let extra = actions.len().saturating_sub(cap);
+        if extra > 0 {
+            format!("{} +{extra} more", shown.join(", "))
+        } else {
+            shown.join(", ")
+        }
+    }
+}
+
 /// The pure DIFF: the minimal, deterministically-ordered set of actions to move `observed` toward
 /// `desired`. Flags first (BTree order), then unique goods (BTree order), then ledger (index order).
 ///
@@ -1600,6 +1637,14 @@ pub struct MockGame {
     pub refuse_unique_adds: bool,
     /// Every `grant_good` call the mock ACCEPTED, refused or not. The unbounded-loop detector.
     pub unique_grant_calls: Vec<GoodsId>,
+    /// Goods the GAME holds at a key-list index `>= key_items_len` (Tako 2026-09-06, see
+    /// `crate::key_list_window`): a len-bounded walk reads them absent, a capacity-bounded walk
+    /// reads them present, and the game refuses a re-add of either as a duplicate of a maxNum=1
+    /// row. Moved here from `goods` by [`MockGame::hide_good`].
+    pub hidden_goods: BTreeSet<GoodsId>,
+    /// The walk policy under test: `true` is the capacity-bounded walk the client ships as of
+    /// 2026-09-06, `false` the len-bounded walk it shipped before. Only `hidden_goods` is affected.
+    pub walk_by_capacity: bool,
     /// Model the SILENTLY-DISCARDED flag write: `set_flag` still returns `true` (the holder
     /// resolved), but the value never changes — the live `VirtualMemoryFlag::set_flag` finds no
     /// block descriptor for the id and returns nothing either way, so the client cannot tell.
@@ -1622,6 +1667,8 @@ impl Default for MockGame {
             inventory_ready: true,
             refuse_unique_adds: false,
             unique_grant_calls: Vec::new(),
+            hidden_goods: BTreeSet::new(),
+            walk_by_capacity: true,
             discard_flag_writes: false,
             flag_set_calls: Vec::new(),
             stability: WorldStability {
@@ -1764,6 +1811,29 @@ impl MockGame {
     pub fn drop_good(&mut self, goods: GoodsId) {
         self.goods.remove(&goods);
     }
+
+    /// The NPC hand-in shape (Tako 2026-09-06): a lower-index key item is consumed, `key_items_len`
+    /// drops by one, and this good -- the newest key item -- now sits at an index the len-bounded
+    /// walk never reaches. The game still holds it. Nothing is granted, nothing is lost.
+    pub fn hide_good(&mut self, goods: GoodsId) {
+        if self.goods.remove(&goods) {
+            self.hidden_goods.insert(goods);
+        }
+    }
+
+    /// The regrowth shape: enough key items were added to lift `len` past this good's index, so
+    /// even the len-bounded walk sees it again. Still no grant involved.
+    pub fn reveal_good(&mut self, goods: GoodsId) {
+        if self.hidden_goods.remove(&goods) {
+            self.goods.insert(goods);
+        }
+    }
+
+    /// Whether the game holds `goods` anywhere, visible or not. This is the truth the engine's
+    /// maxNum=1 duplicate check reads; the walk policy decides what the CLIENT sees.
+    pub fn game_holds(&self, goods: GoodsId) -> bool {
+        self.goods.contains(&goods) || self.hidden_goods.contains(&goods)
+    }
 }
 
 impl GameIo for MockGame {
@@ -1788,7 +1858,7 @@ impl GameIo for MockGame {
         true
     }
     fn has_good(&self, goods: GoodsId) -> bool {
-        self.goods.contains(&goods)
+        self.goods.contains(&goods) || (self.walk_by_capacity && self.hidden_goods.contains(&goods))
     }
     fn grant_good(&mut self, goods: GoodsId, companion_flags: &[FlagId]) -> bool {
         if !self.inventory_ready {
@@ -1798,6 +1868,12 @@ impl GameIo for MockGame {
         if self.refuse_unique_adds {
             // Dispatched and "accepted", but the item never lands. The live client cannot
             // distinguish this from success, so neither may the mock: it returns `true`.
+            return true;
+        }
+        if self.hidden_goods.contains(&goods) {
+            // The game already holds this maxNum=1 row (at an index the client may not see), so
+            // the add is refused as a duplicate. `AddItemFunc` still returns, so the client scores
+            // it as accepted -- exactly what the len-bounded walk turned into a stall every load.
             return true;
         }
         self.goods.insert(goods);
@@ -1829,6 +1905,39 @@ impl GameIo for MockGame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `[reconcile] applied N action(s)` line names what it applied. Exact strings, because
+    /// the next log reader greps for them; capped, because a 40-item burst is not a log line.
+    #[test]
+    fn action_labels_are_stable_and_capped() {
+        let actions = vec![
+            Action::GrantUnique(0x4000_1FD5, vec![192]),
+            Action::SetFlag(192),
+            Action::ClearFlag(71100),
+            Action::GrantLedgered {
+                index: 123,
+                full_id: 0x4000_00C8,
+                qty: 1,
+            },
+            Action::SkipLedgered { index: 124 },
+            Action::GrantUniqueProtector(0x1000_0000),
+        ];
+        assert_eq!(actions[0].label(), "GrantUnique 0x40001fd5");
+        assert_eq!(actions[1].label(), "SetFlag 192");
+        assert_eq!(actions[2].label(), "ClearFlag 71100");
+        assert_eq!(actions[3].label(), "Ledger#123 0x400000c8 x1");
+        assert_eq!(actions[4].label(), "Skip#124");
+        assert_eq!(actions[5].label(), "GrantProtector 0x10000000");
+        assert_eq!(
+            Action::labels(&actions, 2),
+            "GrantUnique 0x40001fd5, SetFlag 192 +4 more"
+        );
+        assert_eq!(
+            Action::labels(&actions[..2], 6),
+            "GrantUnique 0x40001fd5, SetFlag 192"
+        );
+        assert_eq!(Action::labels(&[], 6), "-");
+    }
 
     // ---- item builders -------------------------------------------------------------------
 
