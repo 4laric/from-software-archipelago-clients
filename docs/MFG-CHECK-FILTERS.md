@@ -17,3 +17,5 @@ Map progression targets now exclude enabled sweep members from the original prog
 
 
 Native boss icons use immutable defeat-flag identity because they carry no item lot. New capability MFG_AP_CAP_BOSS_CHECK_STATES_V1 (8) permits kind MFG_AP_BOSS_DEFEAT_FLAG (3) in the check-state entry lot_table field, with lot_row holding the exact event flag. Hover and old style exports retain MAP/ENEMY only. The client publishes all identified current-seed boss checks (not only progression targets); flags retain same-check conjunction. Older engines receive ordinary lot states and a visible update notice instead of unsupported kind 3 entries. Boss states use authoritative seed identity, not a guessed item or display name.
+
+Enabled native sweep triggers with no individual boss AP check represent their remaining seed-valid member checks. Their progression and region-access bits use member witnesses, with the conjunction requiring the same member. Once every member is checked, that trigger state disappears. A trigger can only highlight an existing native map marker; the actual Scarab fixture uses flag 34100800, which is absent from the current vanilla native pin reference.

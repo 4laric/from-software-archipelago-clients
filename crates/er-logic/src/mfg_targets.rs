@@ -301,7 +301,7 @@ mod real_seed_identity_tests {
         assert!(seed_boss_map(&input, &HashSet::new()).is_empty());
     }
     #[test]
-    fn scarab_surface_redirects_to_real_native_tree_sentinel_identity() {
+    fn illustrative_surface_redirect_uses_real_tree_sentinel_identity() {
         let valid = [7770692, 7772308].into_iter().collect();
         let mapping = seed_boss_map(
             &[(7770692, 530100), (7772308, 34107110)]
@@ -339,5 +339,130 @@ mod real_seed_identity_tests {
             .all(|w| w[0].0 < w[1].0));
         assert_eq!(native_boss_flag(1042360800), Some(1042360800));
         assert_eq!(native_boss_flag(0), None);
+    }
+}
+
+/// Add native sweep targets that have no individual boss check in this seed.
+/// Each exact enabled defeat flag represents its remaining valid member checks.
+/// Separate witnesses never manufacture the progression-and-in-logic conjunction.
+pub fn append_sweep_trigger_states(
+    states: &mut Vec<crate::mfg_match::LotCheckState>,
+    groups: &std::collections::HashMap<u32, Vec<i64>>,
+    bosses: &std::collections::HashMap<u32, Vec<i64>>,
+    remaining: &HashSet<i64>,
+    surface: &HashSet<i64>,
+    in_logic: &HashSet<i64>,
+) {
+    use crate::mfg_match::{LotCheckState, CHECK, IN_LOGIC, PROGRESSION, PROGRESSION_IN_LOGIC};
+    for (&flag, members) in groups {
+        if flag == 0 || bosses.get(&flag).is_some_and(|ids| !ids.is_empty()) {
+            continue;
+        }
+        let mut flags = 0;
+        for id in members.iter().filter(|id| remaining.contains(id)) {
+            flags |= CHECK;
+            let progression = surface.contains(id);
+            let reachable = in_logic.contains(id);
+            if progression {
+                flags |= PROGRESSION;
+            }
+            if reachable {
+                flags |= IN_LOGIC;
+            }
+            if progression && reachable {
+                flags |= PROGRESSION_IN_LOGIC;
+            }
+        }
+        if flags != 0 {
+            states.push(LotCheckState {
+                lot_table: 3,
+                lot_row: flag,
+                flags,
+            });
+        }
+    }
+    states.sort_unstable_by_key(|state| (state.lot_table, state.lot_row));
+}
+
+#[cfg(test)]
+mod sweep_trigger_tests {
+    use super::*;
+    use std::collections::HashMap;
+    #[test]
+    fn actual_native_trigger_without_boss_check_is_highlighted_until_checked() {
+        // Actual AP_14089154938208861744: native trigger 1043370800 has
+        // surface member 7772824 but no boss reward check in locationFlags.
+        let groups = [(1043370800, vec![7772824])].into_iter().collect();
+        let remaining = [7772824].into_iter().collect();
+        let mut states = Vec::new();
+        append_sweep_trigger_states(
+            &mut states,
+            &groups,
+            &HashMap::new(),
+            &remaining,
+            &remaining,
+            &remaining,
+        );
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            (states[0].lot_table, states[0].lot_row, states[0].flags),
+            (3, 1043370800, 15)
+        );
+        states.clear();
+        append_sweep_trigger_states(
+            &mut states,
+            &groups,
+            &HashMap::new(),
+            &HashSet::new(),
+            &remaining,
+            &remaining,
+        );
+        assert!(states.is_empty());
+    }
+    #[test]
+    fn actual_scarab_phantom_trigger_never_fabricates_a_boss_ap_check() {
+        let remaining = [7772308].into_iter().collect();
+        let bosses = seed_boss_map(&[(7772308, 34107110)].into_iter().collect(), &remaining);
+        assert!(bosses.is_empty());
+        let mut states = Vec::new();
+        append_sweep_trigger_states(
+            &mut states,
+            &[(34100800, vec![7772308])].into_iter().collect(),
+            &bosses,
+            &remaining,
+            &remaining,
+            &remaining,
+        );
+        assert_eq!(states[0].lot_row, 34100800);
+        // No native marker exists for this phantom trigger: publishing its exact
+        // identity cannot redirect to an unrelated boss or manufacture a pin.
+        assert_eq!(states[0].lot_table, 3);
+    }
+    #[test]
+    fn split_witnesses_do_not_claim_reachable_progression_and_unknown_members_are_excluded() {
+        let groups = [(34100800, vec![1, 2, 3])].into_iter().collect();
+        let mut states = Vec::new();
+        append_sweep_trigger_states(
+            &mut states,
+            &groups,
+            &HashMap::new(),
+            &[1, 2].into_iter().collect(),
+            &[1, 3].into_iter().collect(),
+            &[2, 3].into_iter().collect(),
+        );
+        assert_eq!(states[0].flags, 7);
+        states.clear();
+        append_sweep_trigger_states(
+            &mut states,
+            &groups,
+            &[(34100800, vec![4])].into_iter().collect(),
+            &[1, 2].into_iter().collect(),
+            &[1].into_iter().collect(),
+            &[1].into_iter().collect(),
+        );
+        assert!(
+            states.is_empty(),
+            "existing boss states must not be duplicated"
+        );
     }
 }

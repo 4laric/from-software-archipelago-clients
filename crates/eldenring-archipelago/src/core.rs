@@ -5614,8 +5614,8 @@ impl Core {
             er_logic::mfg_targets::progression_targets(&surface, &self.valid_locations, &groups);
         self.map_progression_targets = result.locations;
         if result.unresolved_groups > 0 {
-            log::warn!(
-                "Map progression targets: {} enabled surface sweep group(s) have no identified current-seed boss check; member pins are excluded without inventing a replacement.",
+            log::debug!(
+                "Map progression targets: {} surface sweep group(s) have no individual boss check; native markers use exact enabled sweep flags where available.",
                 result.unresolved_groups
             );
         }
@@ -5665,11 +5665,15 @@ impl Core {
             return;
         }
         let mut names = HashMap::new();
+        let mut remaining = HashSet::new();
         if let Some(client) = self.client() {
             for loc in client.checked_locations() {
                 names.insert(loc.id(), loc.name().to_string());
             }
             for loc in client.unchecked_locations() {
+                if self.valid_locations.contains(&loc.id()) {
+                    remaining.insert(loc.id());
+                }
                 names.insert(loc.id(), loc.name().to_string());
             }
         }
@@ -5687,6 +5691,21 @@ impl Core {
             surface,
             &in_logic,
         ));
+        if let Some(fp) = &self.flag_poll {
+            let raw_surface = self
+                .progression_surface
+                .iter()
+                .map(|&id| id as i64)
+                .collect();
+            er_logic::mfg_targets::append_sweep_trigger_states(
+                &mut states,
+                &fp.sweep_flags,
+                &self.map_boss_checks,
+                &remaining,
+                &raw_surface,
+                &in_logic,
+            );
+        }
         self.mfg_states.send(&states);
     }
 
