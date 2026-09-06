@@ -32,6 +32,46 @@ seed the previous release accepted unless it is loudly flagged as not.
   example an upgrade-level census now sees more weapons), say so in the
   changelog even when nothing breaks.
 
+## Version numbers: V.R.M.F
+
+Every game client in this workspace that pairs with an apworld uses a
+four-part version, **Version.Release.Modification.Fixpack**, and the rule is
+one sentence: **a client is compatible with every seed generated on the same
+V.R.M; only the fixpack differs between them.**
+
+- **V.R.M** is the seed-compatibility line. Apworld and client share it. Any
+  change to V, R, or M is a paired apworld-and-client release and may change
+  the seed contract, persisted state, or delivery behavior; it is announced
+  as described in the next section.
+- **F, the fixpack**, is the client-only lane. A fixpack release changes the
+  client binary and nothing else. It must accept every seed and every ledger
+  the F-1 release accepted, with no player action beyond replacing the
+  binary. Everything in the compatibility section above applies without
+  exception.
+
+How the four parts map onto what the code already checks:
+
+| game | V.R.M lives in | F lives in | what the seed gate compares |
+| --- | --- | --- | --- |
+| Elden Ring | `crates/eldenring-archipelago/Cargo.toml` `major.minor.patch` | Cargo build metadata, `0.5.8+f1` | the apworld's `versions` band via `er-semver`, which strips `+metadata`, so a fixpack never crosses a band boundary |
+| Bloodborne | `crates/bb-archipelago/Cargo.toml` `major.minor.patch` and the apworld's `RUNTIME_BUILD` | Cargo build metadata, `0.1.0+f1` | `RUNTIME_BUILD`, exact match; a fixpack never touches it |
+
+Rules that follow:
+
+1. A pull request that only bumps F may not change `RUNTIME_BUILD`, the ER
+   contract hash, `contract_gen.rs`, or any persisted schema. If it needs to,
+   it is an M bump, not a fixpack.
+2. Release tags and changelog headings use the full `V.R.M.F` string
+   (`bb-0.1.0.1`, `er-0.5.8.1`), so players can read whether an update is a
+   drop-in binary swap (same V.R.M) or a paired upgrade.
+3. The first release under this policy is `.0`; existing releases are read as
+   fixpack 0 of their V.R.M. Bloodborne's current `bb-0.1.0-r10` runtime
+   build stays exactly as is until the next deliberate break, when it moves to
+   the `bb-V.R.M` form.
+4. Dark Souls III and Sekiro clients are not under this policy until they
+   pair with an apworld that publishes a matching V.R.M; note that in the
+   PR when they do.
+
 ## When breaking compatibility is the right call
 
 Sometimes it is. Then it must be loud, in all of these places:
@@ -43,8 +83,7 @@ Sometimes it is. Then it must be loud, in all of these places:
 2. Put a **Breaking** section at the top of the crate changelog that says
    what stops working and what players mid-run should do.
 3. Title the pull request with the break and reference the release it lands
-   in. A release that carries a break is a major (or, pre-1.0, a minor)
-   version bump, never a patch.
+   in. A release that carries a break changes V, R, or M, never only F.
 
 If you are not sure whether a change is breaking, treat it as breaking and
 ask in the pull request before merging.
