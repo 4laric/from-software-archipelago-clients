@@ -740,8 +740,13 @@ impl shared::Core for Core {
                         } else {
                             "NOT READY (hook down or deferred) -- retry"
                         };
+                        // 2026-09-06: the reply carries the engine's own add verdict and where the
+                        // row was found by the same read the reconciler uses -- the two facts
+                        // every Great Rune probe (#316, #392) had to guess at.
                         self.log(ap::Print::message(format!(
-                            "give {f} (category 0x{cat:08X}, row {raw}) x{qty} -> {status}"
+                            "give {f} (category 0x{cat:08X}, row {raw}) x{qty} -> {status} | {} | {}",
+                            crate::detour::add_item_return_for(f),
+                            crate::reconcile_io::possession_report(f)
                         )));
                     }
                     _ => self.log(ap::Print::message(
@@ -3018,7 +3023,9 @@ impl shared::Core for Core {
                             if dispatch.hook.grant_full_id(full_id, qty) {
                                 // Great Rune FullIDs stay the boss-drop rows exactly as the seed
                                 // sends them (clients#392); keyitems::set_acquire_flags supplies
-                                // the matching restored flag without a second goods grant.
+                                // the matching restored flag without a second goods grant. Whether
+                                // the restored rows 191-196 can be granted is UNSETTLED as of
+                                // 2026-09-06 (er_logic::great_runes doc; client #316).
                             } else {
                                 // H3: the grant did NOT place — hold received_through at this item
                                 // and stop so the tail replays in order next tick (never advance the
@@ -5181,10 +5188,11 @@ impl Core {
             return ItemSemantics::FlagOnlyKeyItem(acq);
         }
         // 5. Key item / great rune: the base grant gives the goods row exactly as the seed's map
-        //    sends it (for great runes: the boss-drop row 8148-8153 -- the restored rows 191-196
-        //    cannot be AddItem'd, clients#392), plus vanilla obtained/restored companion flags from
-        //    the keyitems table. Both classes are a unique good + set-only companion flags, so both
-        //    map to KeyItem.
+        //    sends it (for great runes: the boss-drop row 8148-8153, clients#392 -- the belief that
+        //    the restored rows 191-196 "cannot be AddItem'd" rested on the len-bounded key walk
+        //    fixed 2026-09-06 and is UNSETTLED; see er_logic::great_runes and client #316), plus
+        //    vanilla obtained/restored companion flags from the keyitems table. Both classes are a
+        //    unique good + set-only companion flags, so both map to KeyItem.
         let full_id = self.item_map.as_ref().and_then(|m| m.get(&ap_id)).copied();
         if !acq.is_empty()
             && let Some(fid) = full_id

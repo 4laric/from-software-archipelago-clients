@@ -61,6 +61,7 @@ pub mod hook;
 pub mod icon_seam;
 pub mod id_sample;
 pub mod inv_ptr;
+pub mod key_list_window;
 pub mod lock_hint_economy;
 pub mod map_reveal_replay;
 pub mod marker;

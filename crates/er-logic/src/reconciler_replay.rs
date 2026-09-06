@@ -1591,4 +1591,148 @@ mod replay {
             }
         }
     }
+
+    // ---- the len-bounded key-item walk: Tako 2026-09-05/06 ---------------------------------
+
+    /// THE MOTIVATING CASE (client, 2026-09-06; Tako LOG1 05:11..05:57, LOG2 14:27..16:34).
+    ///
+    /// Morgott's Great Rune lands (boss row 8150 + flag 193), converges, and is then HIDDEN from
+    /// the client's len-bounded key-list walk by an NPC hand-in at the Twin Maiden Husks -- the
+    /// game still holds it at an index `>= key_items_len` (`crate::key_list_window`). From then
+    /// on the reconciler reads it absent, re-grants it, the game refuses the duplicate of a
+    /// maxNum=1 row while `AddItemFunc` still returns, the read-back stays absent, and after
+    /// `MAX_GRANT_ATTEMPTS` the good is parked -- until the next world edge re-arms it. Thirteen
+    /// loads: thirteen parks, thirty-nine refused adds, a rune the player already has.
+    ///
+    /// Under the capacity-bounded walk the same thirteen loads issue ZERO grants and ZERO parks,
+    /// because the walk sees what the game holds. The recovery LOG2 recorded at 16:34:21 (the rune
+    /// back in the candidates list after three unrelated key-item receipts, with no grant) is a
+    /// REVEAL, not a landing: the last block pins that the len-walk stops parking the moment
+    /// `len` regrows past the rune, with no grant having been made.
+    #[test]
+    fn wild_20260906_tako_held_but_len_hidden_rune_is_refused_on_every_load_replay() {
+        const MORGOTT: GoodsId = 0x4000_1FD6; // goods row 8150, the id the log prints
+        const RESTORE_FLAG: FlagId = 193;
+        const LOADS: usize = 13; // LOG1 05:11 -> 05:57: one park after almost every world edge
+
+        fn inputs() -> DesiredInputs {
+            DesiredInputs {
+                seed: SEED.into(),
+                save: SaveIdentity("slot0".into()),
+                received: vec![ReceivedItem {
+                    index: 0,
+                    name: "Morgott's Great Rune".into(),
+                    semantics: ItemSemantics::KeyItem {
+                        goods: MORGOTT,
+                        obtained_flags: vec![RESTORE_FLAG],
+                    },
+                }],
+                slot_data: SlotData::default(),
+            }
+        }
+
+        // Drive `LOADS` world edges of ordinary play after the hand-in; return (grant calls made
+        // after the hand-in, parks, the game).
+        fn drive(walk_by_capacity: bool) -> (usize, usize, MockGame) {
+            let mut g = MockGame::stable();
+            g.walk_by_capacity = walk_by_capacity;
+            let mut r = Reconciler::new(inputs());
+
+            // 05:01:21 -- the rune lands and is observed; the run converges.
+            r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+            assert!(
+                g.goods.contains(&MORGOTT) && g.get_flag(RESTORE_FLAG),
+                "precondition: delivered and observed"
+            );
+            let calls_before = g.unique_grant_calls.len();
+            assert_eq!(calls_before, 1, "one grant delivered it");
+
+            // 05:08 -- the Twin Maiden Husks hand-in: a lower-index key item is consumed, `len`
+            // drops, and the newest key item (the rune) sits beyond the len window. Held, unseen.
+            g.hide_good(MORGOTT);
+            assert!(g.game_holds(MORGOTT));
+
+            let mut parks = 0usize;
+            for _ in 0..LOADS {
+                // The world edge (a grace warp): re-arms the stall guard.
+                g.set_stable(false);
+                r.tick(&mut g, TickBudget::default());
+                g.set_stable(true);
+                // A stretch of settled play in the new epoch.
+                for _ in 0..40 {
+                    let out = r.tick(&mut g, TickBudget::default());
+                    parks += out.newly_stalled.len();
+                }
+            }
+            (g.unique_grant_calls.len() - calls_before, parks, g)
+        }
+
+        // ---- PRE-FIX: the len-bounded walk, the cadence the two logs recorded ----
+        let (calls, parks, g) = drive(false);
+        assert_eq!(
+            parks, LOADS,
+            "PRE-FIX: one park per load -- the `INERT 1-2 s after every world edge` cadence"
+        );
+        assert_eq!(
+            calls,
+            LOADS * MAX_GRANT_ATTEMPTS as usize,
+            "PRE-FIX: three refused adds per load of a rune the game already holds"
+        );
+        assert!(
+            g.game_holds(MORGOTT) && !g.goods.contains(&MORGOTT),
+            "the rune never left the game's inventory; only the walk lost it"
+        );
+
+        // ---- FIX: the capacity-bounded walk ----
+        let (calls, parks, mut g) = drive(true);
+        assert_eq!(parks, 0, "FIX: nothing is parked across {LOADS} loads");
+        assert_eq!(
+            calls, 0,
+            "FIX: nothing is re-granted -- the walk sees the held entry"
+        );
+        let last = {
+            let mut r = Reconciler::new(inputs());
+            r.run_to_fixpoint(&mut g, TickBudget::default(), 4);
+            r.tick(&mut g, TickBudget::default())
+        };
+        assert!(
+            last.converged && last.applied.is_empty(),
+            "FIX: a fresh reconciler over the same save sits converged with nothing to do"
+        );
+
+        // ---- LOG2 16:34:21: the REVEAL under the old walk. Three key-item receipts lift `len`
+        // past the rune's index; the len-walk sees it again and stops parking. No grant. ----
+        let mut g = MockGame::stable();
+        g.walk_by_capacity = false;
+        let mut r = Reconciler::new(inputs());
+        r.run_to_fixpoint(&mut g, TickBudget::default(), 8);
+        g.hide_good(MORGOTT);
+        g.set_stable(false);
+        r.tick(&mut g, TickBudget::default());
+        g.set_stable(true);
+        for _ in 0..10 {
+            r.tick(&mut g, TickBudget::default());
+        }
+        assert!(r.stalled_goods().contains(&MORGOTT), "parked in this epoch");
+        let calls_at_park = g.unique_grant_calls.len();
+        g.reveal_good(MORGOTT); // `len` regrew: index < len again
+        let mut converged_after_reveal = false;
+        for _ in 0..10 {
+            let out = r.tick(&mut g, TickBudget::default());
+            converged_after_reveal = out.converged && out.applied.is_empty();
+        }
+        assert!(
+            converged_after_reveal,
+            "the reveal converges the parked good with NO grant"
+        );
+        assert_eq!(
+            g.unique_grant_calls.len(),
+            calls_at_park,
+            "recoveries in the log are reveals, not landings: zero grants between park and converge"
+        );
+        assert!(
+            !r.stalled_goods().contains(&MORGOTT),
+            "an observed good is un-parked by the snapshot, as before"
+        );
+    }
 }

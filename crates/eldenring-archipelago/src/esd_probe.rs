@@ -112,6 +112,15 @@ static PROBE_VERBOSE: AtomicBool = AtomicBool::new(false);
 static TALK_CLOCK: OnceLock<Instant> = OnceLock::new();
 static LAST_TALK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Every valid talk dispatch this session, counted (the goods-gate OPEN line prints how many a
+/// closed stretch spanned).
+static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The most recent dispatch's `(talk_id, command, first four args)`, copied cheaply on the game
+/// thread so a key-list change observed while the gate is closed can be dated to a command
+/// (2026-09-06: the Twin Maiden Husks hand-in that shrinks `key_items_len`).
+static LAST_DISPATCH: Mutex<Option<(i32, i32, [i32; 4])>> = Mutex::new(None);
+
 /// ESD invokes many times a second while a conversation is active, so the window slides until the
 /// script is actually quiet rather than assuming a particular bell-bearing command id.
 const INVENTORY_QUIET_MS: u64 = 2_000;
@@ -123,6 +132,21 @@ fn talk_clock_ms() -> u64 {
         .as_millis()
         .min(u64::MAX as u128) as u64
         + 1 // zero is the "no talk observed" sentinel
+}
+
+/// The talk clock's reading now, on the same scale `LAST_TALK_ACTIVITY_MS` uses.
+pub fn talk_clock_now_ms() -> u64 {
+    talk_clock_ms()
+}
+
+/// Valid talk dispatches seen this session.
+pub fn dispatch_count() -> u64 {
+    DISPATCH_COUNT.load(Ordering::Relaxed)
+}
+
+/// The last dispatch's `(talk_id, command, args[0..4])`, if any.
+pub fn last_dispatch() -> Option<(i32, i32, [i32; 4])> {
+    LAST_DISPATCH.lock().ok().and_then(|g| *g)
 }
 
 /// Whether received-item inventory work is safe this frame. Flags deliberately do not use this:
@@ -262,6 +286,21 @@ unsafe extern "C" fn esd_invoke_detour(this: *mut c_void, event: *const EzStateE
             (talk_id, &*event)
         };
         let event_id = event_ref.id();
+        // Remember it (2026-09-06): the reconciler's key-list delta line names this command.
+        // Bounded on `args.len()`, never on `arg()`'s own answer (see the shop-hints note below).
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut args = [0i32; 4];
+            let n = event_ref.args.len().min(4);
+            for (i, slot) in args.iter_mut().enumerate().take(n) {
+                if let Some(v) = event_ref.arg(i as u32) {
+                    *slot = i32::from(v);
+                }
+            }
+            if let Ok(mut g) = LAST_DISPATCH.lock() {
+                *g = Some((talk_id, event_id, args));
+            }
+        }
 
         // ---- PHASE 2: THE FEATURE ----------------------------------------------------------
         // Runs whether or not the enumeration is on -- the hint is the point; the probe flag only

@@ -64,6 +64,57 @@ pub fn inventory_quiet(now_ms: u64, last_activity_ms: u64, quiet_ms: u64) -> boo
 /// even by [`DISTINCT_PAIR_CAP`].
 pub const WATCHED: [i32; 2] = [OPEN_REGULAR_SHOP, OPEN_SELL_SHOP];
 
+/// One transition of the inventory-grant gate that [`inventory_quiet`] drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateEdge {
+    /// The gate just closed: a talk dispatch arrived after a quiet stretch.
+    Closed,
+    /// The gate just re-opened after `closed_ms` of closure spanning `dispatches` talk dispatches.
+    Open { closed_ms: u64, dispatches: u64 },
+}
+
+/// Turns the per-tick `inventory_quiet` answer into ONE line per transition.
+///
+/// Two days of Tako's logs (2026-09-05/06) never said when the goods gate flipped, so a stretch
+/// with no reconciler lines could be read as "the rune was observed" or as "the gate was shut" --
+/// and both readings were argued. The tracker settles it: `[reconcile] goods gate CLOSED` /
+/// `OPEN after N ms` bracket every talk session in the log.
+#[derive(Debug, Default)]
+pub struct GateEdgeTracker {
+    closed_since_ms: Option<u64>,
+    dispatches_seen_at_close: u64,
+}
+
+impl GateEdgeTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed this tick's `(now_ms, quiet, total_dispatches)`; `Some` on a transition.
+    pub fn observe(&mut self, now_ms: u64, quiet: bool, total_dispatches: u64) -> Option<GateEdge> {
+        match (self.closed_since_ms, quiet) {
+            (None, false) => {
+                self.closed_since_ms = Some(now_ms);
+                self.dispatches_seen_at_close = total_dispatches;
+                Some(GateEdge::Closed)
+            }
+            (Some(since), true) => {
+                self.closed_since_ms = None;
+                Some(GateEdge::Open {
+                    closed_ms: now_ms.saturating_sub(since),
+                    dispatches: total_dispatches.saturating_sub(self.dispatches_seen_at_close),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the gate is currently closed as far as this tracker has been told.
+    pub fn is_closed(&self) -> bool {
+        self.closed_since_ms.is_some()
+    }
+}
+
 /// Ceiling on distinct `(talk_id, event_id)` pairs the ledger will remember and announce.
 ///
 /// This bounds both the log and the memory a session can accrue on a hot path. It is a blast
@@ -142,6 +193,32 @@ impl EsdProbeLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One CLOSED line when the first dispatch lands, one OPEN line when the quiet window elapses,
+    /// and nothing in between however many dispatches arrive -- the Husks session shape.
+    #[test]
+    fn gate_edges_fire_once_per_transition_with_duration() {
+        let mut t = GateEdgeTracker::new();
+        assert_eq!(t.observe(0, true, 0), None, "quiet from the start: no edge");
+        assert_eq!(t.observe(1_000, false, 1), Some(GateEdge::Closed));
+        assert!(t.is_closed());
+        assert_eq!(
+            t.observe(1_500, false, 7),
+            None,
+            "still closed: no repeat line"
+        );
+        assert_eq!(t.observe(9_000, false, 40), None);
+        assert_eq!(
+            t.observe(11_000, true, 40),
+            Some(GateEdge::Open {
+                closed_ms: 10_000,
+                dispatches: 39
+            })
+        );
+        assert!(!t.is_closed());
+        assert_eq!(t.observe(12_000, true, 40), None);
+        assert_eq!(t.observe(12_500, false, 41), Some(GateEdge::Closed));
+    }
 
     /// THE MOTIVATING CASE (er-archipelago#455): Alaric opens Kale, and command 22 reaches the log.
     #[test]
