@@ -12,6 +12,7 @@
 #define MFG_AP_CAP_HOVER_V1 1u
 #define MFG_AP_CAP_LOT_STYLE_OVERLAY_V1 2u
 #define MFG_AP_CAP_CHECK_STATES_V1 4u
+#define MFG_AP_CAP_BOSS_CHECK_STATES_V1 8u
 #define MFG_AP_CHECK 1u
 #define MFG_AP_PROGRESSION 2u
 #define MFG_AP_IN_LOGIC 4u
@@ -25,6 +26,8 @@
 #define MFG_AP_LOT_UNKNOWN 0u
 #define MFG_AP_LOT_MAP 1u
 #define MFG_AP_LOT_ENEMY 2u
+/* CHECK_STATES only; requires CAP_BOSS_CHECK_STATES_V1. */
+#define MFG_AP_BOSS_DEFEAT_FLAG 3u
 #define MFG_AP_STYLE_NORMAL 0u
 #define MFG_AP_STYLE_ORANGE 1u
 #define MFG_AP_STYLE_YELLOW 2u
@@ -52,6 +55,8 @@ typedef struct MFG_AP_LotStyleV1 {
  * Unknown/unmatched locations are not certified non-checks. Filters only cover
  * markers included in this client's current seed-to-lot match.
  */
+/* lot_table is MAP/ENEMY, or BOSS_DEFEAT_FLAG with lot_row=exact defeat flag.
+ * Kind 3 is not accepted by hover or the older lot-style API. */
 typedef struct MFG_AP_CheckStateV1 {
     uint32_t lot_table, lot_row, flags;
 } MFG_AP_CheckStateV1;

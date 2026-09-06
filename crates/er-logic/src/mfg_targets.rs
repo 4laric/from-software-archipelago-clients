@@ -142,3 +142,110 @@ mod multiple_rewards {
         assert_eq!(result.locations, [2, 3].into_iter().collect());
     }
 }
+
+/// Exact seed boss-event identities; kind 3 is negotiated separately from lot kinds.
+pub fn boss_check_states(
+    bosses: &std::collections::HashMap<u32, Vec<i64>>,
+    seed_names: &std::collections::HashMap<i64, String>,
+    targets: &HashSet<i64>,
+    in_logic: &HashSet<i64>,
+) -> Vec<crate::mfg_match::LotCheckState> {
+    use crate::mfg_match::{LotCheckState, CHECK, IN_LOGIC, PROGRESSION, PROGRESSION_IN_LOGIC};
+    let mut result = Vec::new();
+    for (&flag, ids) in bosses {
+        if flag == 0 {
+            continue;
+        }
+        let mut flags = 0;
+        for id in ids.iter().filter(|id| seed_names.contains_key(id)) {
+            flags |= CHECK;
+            let progression = targets.contains(id);
+            let reachable = in_logic.contains(id);
+            if progression {
+                flags |= PROGRESSION;
+            }
+            if reachable {
+                flags |= IN_LOGIC;
+            }
+            if progression && reachable {
+                flags |= PROGRESSION_IN_LOGIC;
+            }
+        }
+        if flags != 0 {
+            result.push(LotCheckState {
+                lot_table: 3,
+                lot_row: flag,
+                flags,
+            });
+        }
+    }
+    result.sort_unstable_by_key(|s| s.lot_row);
+    result
+}
+
+#[cfg(test)]
+mod boss_state_tests {
+    use super::*;
+    use crate::mfg_match::*;
+    #[test]
+    fn tree_sentinel_and_godrick_use_exact_seed_event_identity() {
+        let mapping = [(1042360800, vec![1]), (10000800, vec![2])]
+            .into_iter()
+            .collect();
+        let names = [
+            (1, "seed boss one".to_owned()),
+            (2, "seed boss two".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let states = boss_check_states(
+            &mapping,
+            &names,
+            &[1].into_iter().collect(),
+            &[1, 2].into_iter().collect(),
+        );
+        assert_eq!(
+            states,
+            vec![
+                LotCheckState {
+                    lot_table: 3,
+                    lot_row: 10000800,
+                    flags: CHECK | IN_LOGIC
+                },
+                LotCheckState {
+                    lot_table: 3,
+                    lot_row: 1042360800,
+                    flags: CHECK | PROGRESSION | IN_LOGIC | PROGRESSION_IN_LOGIC
+                }
+            ]
+        );
+    }
+    #[test]
+    fn missing_seed_mapping_and_cross_witness_conjunction_are_not_invented() {
+        let mapping = [(1, vec![10, 11]), (2, vec![12])].into_iter().collect();
+        let names = [(10, "a".to_owned()), (11, "b".to_owned())]
+            .into_iter()
+            .collect();
+        let states = boss_check_states(
+            &mapping,
+            &names,
+            &[10].into_iter().collect(),
+            &[11].into_iter().collect(),
+        );
+        assert_eq!(
+            states,
+            vec![LotCheckState {
+                lot_table: 3,
+                lot_row: 1,
+                flags: CHECK | PROGRESSION | IN_LOGIC
+            }]
+        );
+        assert!(boss_check_states(
+            &std::collections::HashMap::new(),
+            &names,
+            &HashSet::new(),
+            &HashSet::new()
+        )
+        .is_empty());
+    }
+}

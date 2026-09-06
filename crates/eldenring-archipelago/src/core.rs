@@ -238,6 +238,7 @@ pub struct Core {
     /// The PROGRESSION SURFACE: location ids this world's own progression may occupy (starred).
     progression_surface: HashSet<u64>,
     map_progression_targets: HashSet<i64>,
+    map_boss_checks: HashMap<u32, Vec<i64>>,
     /// Coarse region name -> its lock item name, `"<coarse> Lock"` (absent = never locked).
     coarse_lock_items: HashMap<String, String>,
     /// Lock item name -> post-fill placement coordinates. Optional for backwards compatibility;
@@ -882,6 +883,7 @@ impl shared::Core for Core {
             coarse_table: HashMap::new(),
             progression_surface: HashSet::new(),
             map_progression_targets: HashSet::new(),
+            map_boss_checks: HashMap::new(),
             coarse_lock_items: HashMap::new(),
             lock_hint_placements: HashMap::new(),
             lock_hint_hud: None,
@@ -5282,6 +5284,7 @@ impl Core {
         // routinely disagree about which regions EXIST, so inheriting is not a cosmetic bug.
         self.progression_surface = HashSet::new();
         self.map_progression_targets.clear();
+        self.map_boss_checks.clear();
         self.region_table = HashMap::new();
         self.coarse_table = HashMap::new();
         self.coarse_lock_items = HashMap::new();
@@ -5581,36 +5584,50 @@ impl Core {
                         .collect()
                 })
         });
+        let mut boss_map: HashMap<u32, HashSet<i64>> = HashMap::new();
+        for boss in &self.boss_defs {
+            if boss.flag > 0 && self.valid_locations.contains(&boss.boss_ap_id) {
+                boss_map
+                    .entry(boss.flag)
+                    .or_default()
+                    .insert(boss.boss_ap_id);
+            }
+        }
         if let Some(fp) = &self.flag_poll {
+            if let Some(boss_ids) = &seed_bosses {
+                for (&id, &flag) in &fp.location_flags {
+                    if flag > 0 && boss_ids.contains(&id) && self.valid_locations.contains(&id) {
+                        boss_map.entry(flag).or_default().insert(id);
+                    }
+                }
+            }
             for (&flag, members) in &fp.sweep_flags {
-                let mut candidates: HashSet<i64> = self
-                    .boss_defs
-                    .iter()
-                    .filter(|boss| {
-                        boss.flag == flag && self.valid_locations.contains(&boss.boss_ap_id)
-                    })
-                    .map(|boss| boss.boss_ap_id)
-                    .collect();
-                let direct: HashSet<i64> = fp
-                    .location_flags
-                    .iter()
-                    .filter(|(id, own_flag)| {
-                        **own_flag == flag && self.valid_locations.contains(id)
-                    })
-                    .map(|(&id, _)| id)
-                    .collect();
-                if let Some(boss_ids) = &seed_bosses {
-                    candidates.extend(direct.intersection(boss_ids).copied());
-                } else if candidates.is_empty() && direct.len() == 1 {
-                    // Legacy seeds without bossLocations can still name one exact trigger check.
-                    candidates.extend(direct);
+                if seed_bosses.is_none() && !boss_map.contains_key(&flag) {
+                    let direct: Vec<_> = fp
+                        .location_flags
+                        .iter()
+                        .filter(|(id, own_flag)| {
+                            **own_flag == flag && self.valid_locations.contains(id)
+                        })
+                        .map(|(&id, _)| id)
+                        .collect();
+                    if direct.len() == 1 {
+                        boss_map.insert(flag, direct.into_iter().collect());
+                    }
                 }
                 groups.push(SweepTargetGroup {
-                    bosses: candidates.into_iter().collect(),
+                    bosses: boss_map
+                        .get(&flag)
+                        .map(|ids| ids.iter().copied().collect())
+                        .unwrap_or_default(),
                     members: members.clone(),
                 });
             }
         }
+        self.map_boss_checks = boss_map
+            .into_iter()
+            .map(|(flag, ids)| (flag, ids.into_iter().collect()))
+            .collect();
         for (&trigger, members) in &self.dungeon_sweeps {
             groups.push(SweepTargetGroup {
                 bosses: vec![trigger],
@@ -5692,7 +5709,13 @@ impl Core {
             .filter(|&id| er_logic::mfg_match::known_in_logic(id as u64, &self.coarse_table, &open))
             .collect();
         let surface = &self.map_progression_targets;
-        let states = er_logic::mfg_match::check_states(&names, surface, &in_logic);
+        let mut states = er_logic::mfg_match::check_states(&names, surface, &in_logic);
+        states.extend(er_logic::mfg_targets::boss_check_states(
+            &self.map_boss_checks,
+            &names,
+            surface,
+            &in_logic,
+        ));
         self.mfg_states.send(&states);
     }
 

@@ -5,6 +5,7 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleExA, GetProcAddress};
 use windows::core::s;
 
 const CAP_CHECK_STATES: u32 = 4;
+const CAP_BOSS_CHECK_STATES: u32 = 8;
 const LEASE_MS: u32 = 3_000;
 const REFRESH_MS: u64 = 1_000;
 
@@ -21,7 +22,7 @@ impl Drop for LoadedModule {
     }
 }
 
-fn publish(entries: &[LotCheckState], active: bool) -> Result<(), &'static str> {
+fn publish(entries: &[LotCheckState], active: bool) -> Result<bool, &'static str> {
     if entries.len() > 8192 {
         return Err("Too many check states; nothing was sent.");
     }
@@ -47,6 +48,13 @@ fn publish(entries: &[LotCheckState], active: bool) -> Result<(), &'static str> 
     {
         return Err("Map check filters are waiting for the supported map engine.");
     }
+    let supports_boss = info.capabilities & CAP_BOSS_CHECK_STATES != 0;
+    let filtered: Vec<_> = entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.lot_table != 3 || supports_boss)
+        .collect();
+    let entries = filtered.as_slice();
     let ptr = if entries.is_empty() {
         std::ptr::null()
     } else {
@@ -57,7 +65,7 @@ fn publish(entries: &[LotCheckState], active: bool) -> Result<(), &'static str> 
     if result != 0 {
         return Err("The map engine could not accept these check states.");
     }
-    Ok(())
+    Ok(supports_boss)
 }
 
 #[derive(Default)]
@@ -97,11 +105,13 @@ impl States {
 
     pub fn send(&mut self, entries: &[LotCheckState]) {
         match publish(entries, true) {
-            Ok(()) => {
+            Ok(supports_boss) => {
                 self.published = true;
-                self.status = Some(
-                    "Check data is available to the map filters. Uses tracker region access; additional quest requirements are not evaluated.",
-                );
+                self.status = Some(if supports_boss {
+                    "Check data is available to map filters. Uses tracker region access, not extra quest conditions."
+                } else {
+                    "Item-pin filters active. Update the map engine to enable boss filters and highlights."
+                });
             }
             Err(status) => self.status = Some(status),
         }
