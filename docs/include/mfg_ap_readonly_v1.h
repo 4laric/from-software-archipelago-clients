@@ -11,6 +11,11 @@
 #define MFG_AP_ABI_V1 1u
 #define MFG_AP_CAP_HOVER_V1 1u
 #define MFG_AP_CAP_LOT_STYLE_OVERLAY_V1 2u
+#define MFG_AP_CAP_CHECK_STATES_V1 4u
+#define MFG_AP_CHECK 1u
+#define MFG_AP_PROGRESSION 2u
+#define MFG_AP_IN_LOGIC 4u
+#define MFG_AP_PROGRESSION_IN_LOGIC 8u
 #define MFG_AP_OK 0u
 #define MFG_AP_UNAVAILABLE 1u
 #define MFG_AP_BAD_ARGUMENT 2u
@@ -41,6 +46,25 @@ typedef struct MFG_AP_HoverV1 {
 typedef struct MFG_AP_LotStyleV1 {
     uint32_t lot_table, lot_row, style;
 } MFG_AP_LotStyleV1;
+/* Complete matched-check membership, independent of the optional style snapshot.
+ * Bit 8 means at least ONE SAME check is both progression and in logic; OR-ing
+ * bits 2 and 4 across separate checks must not manufacture that conjunction.
+ * Unknown/unmatched locations are not certified non-checks. Filters only cover
+ * markers included in this client's current seed-to-lot match.
+ */
+typedef struct MFG_AP_CheckStateV1 {
+    uint32_t lot_table, lot_row, flags;
+} MFG_AP_CheckStateV1;
+typedef uint32_t (__cdecl *MFG_AP_SetCheckStatesV1)(uint32_t requested_abi,
+    const MFG_AP_CheckStateV1 *entries, uint32_t count, uint32_t lease_ms);
+/* MFG_AP_SET_CHECK_STATES_V1 copies a complete leased snapshot (max 8192).
+ * Lease 250..10000ms; count=0 with positive lease is an ACTIVE EMPTY snapshot.
+ * count=0, entries=null, lease=0 clears. Duplicate lots and unknown flag bits
+ * are rejected atomically. Every entry requires CHECK; bit8 requires bits2&4.
+ * Expiry, map-row retirement, or disabled injection restores native visibility.
+ * Client calls never inspect or mutate game memory. Filtering is owner-thread
+ * only, intersects native visibility, and applies equally in focus mode.
+ */
 /* Generation starts at 1 and increases at every row rebuild. Reset on DLL
  * replacement requires host session invalidation. A handle is never a pointer.
  * original_flag is baked acquisition identity, not a rewritten live flag.

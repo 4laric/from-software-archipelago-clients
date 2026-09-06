@@ -175,9 +175,137 @@ pub fn color_styles(
     output
 }
 
+/// State flags describe check eligibility, never randomized item contents.
+pub const CHECK: u32 = 1;
+pub const PROGRESSION: u32 = 2;
+pub const IN_LOGIC: u32 = 4;
+pub const PROGRESSION_IN_LOGIC: u32 = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LotCheckState {
+    pub lot_table: u32,
+    pub lot_row: u32,
+    pub flags: u32,
+}
+
+/// Complete current-seed snapshot, including neutral and checked checks. Shared
+/// lots union membership but conjunction requires a single check as witness.
+pub fn check_states(
+    seed_names: &std::collections::HashMap<i64, String>,
+    progression_surface: &std::collections::HashSet<i64>,
+    in_logic: &std::collections::HashSet<i64>,
+) -> Vec<LotCheckState> {
+    let mut output = Vec::new();
+    let mut previous = None;
+    for &(table, row, _, _) in data::LOTS {
+        if previous == Some((table, row)) {
+            continue;
+        }
+        previous = Some((table, row));
+        let matched = resolve(0, table, row, |id| seed_names.contains_key(&id));
+        if matched.seed_candidates.is_empty()
+            || matched
+                .seed_candidates
+                .iter()
+                .any(|c| catalog_name(c.ap_id) != seed_names.get(&c.ap_id).map(String::as_str))
+        {
+            continue;
+        }
+        let mut flags = CHECK;
+        for candidate in matched.seed_candidates {
+            let progression = progression_surface.contains(&candidate.ap_id);
+            let reachable = in_logic.contains(&candidate.ap_id);
+            if progression {
+                flags |= PROGRESSION;
+            }
+            if reachable {
+                flags |= IN_LOGIC;
+            }
+            if progression && reachable {
+                flags |= PROGRESSION_IN_LOGIC;
+            }
+        }
+        output.push(LotCheckState {
+            lot_table: table,
+            lot_row: row,
+            flags,
+        });
+    }
+    output
+}
+
+/// The local tracker uses coarse region access. Missing mapping is unknown for
+/// map filtering, not an affirmative reachable claim. Empty means known ungated.
+pub fn known_in_logic(
+    id: u64,
+    coarse: &std::collections::HashMap<u64, String>,
+    open: &std::collections::HashSet<String>,
+) -> bool {
+    coarse
+        .get(&id)
+        .is_some_and(|region| region.is_empty() || open.contains(region))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_state_shared_lot_conjunction_needs_same_witness() {
+        let ids = [7770007, 7900004];
+        let names = ids
+            .into_iter()
+            .map(|id| (id, catalog_name(id).unwrap().to_owned()))
+            .collect();
+        let prog = [ids[0]].into_iter().collect();
+        let reachable = [ids[1]].into_iter().collect();
+        let states = check_states(&names, &prog, &reachable);
+        let state = states
+            .iter()
+            .find(|s| s.lot_table == 1 && s.lot_row == 10180)
+            .unwrap();
+        assert_eq!(state.flags, CHECK | PROGRESSION | IN_LOGIC);
+        let both = check_states(&names, &prog, &prog);
+        assert_eq!(
+            both.iter()
+                .find(|s| s.lot_table == 1 && s.lot_row == 10180)
+                .unwrap()
+                .flags,
+            CHECK | PROGRESSION | IN_LOGIC | PROGRESSION_IN_LOGIC
+        );
+    }
+
+    #[test]
+    fn neutral_checks_included_and_stale_names_refused() {
+        let mut names = [(7772256, catalog_name(7772256).unwrap().to_owned())]
+            .into_iter()
+            .collect();
+        let empty = std::collections::HashSet::new();
+        let states = check_states(&names, &empty, &empty);
+        assert!(states
+            .iter()
+            .any(|s| s.lot_row == 32010040 && s.flags == CHECK));
+        names.insert(7772256, "old seed name".to_owned());
+        assert!(check_states(&names, &empty, &empty).is_empty());
+        assert!(check_states(&std::collections::HashMap::new(), &empty, &empty).is_empty());
+    }
+
+    #[test]
+    fn missing_region_is_not_reachable_but_known_ungated_is() {
+        let coarse = [(1, "".to_owned()), (2, "Limgrave".to_owned())]
+            .into_iter()
+            .collect();
+        let empty = std::collections::HashSet::new();
+        assert!(known_in_logic(1, &coarse, &empty));
+        assert!(!known_in_logic(2, &coarse, &empty));
+        assert!(!known_in_logic(3, &coarse, &empty));
+        assert!(known_in_logic(
+            2,
+            &coarse,
+            &["Limgrave".to_owned()].into_iter().collect()
+        ));
+    }
 
     #[test]
     fn observed_and_source_reference_lots_identify_expected_checks() {

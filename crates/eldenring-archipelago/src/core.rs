@@ -264,6 +264,8 @@ pub struct Core {
     tracker_follow_map_pins: bool,
     tracker_map_colors: bool,
     mfg_colors: crate::mfg_colors::Colors,
+    tracker_map_filters: bool,
+    mfg_states: crate::mfg_states::States,
     mfg_capture: crate::mfg_probe::HoverCapture,
     mfg_follow: er_logic::mfg_bridge::Follow,
     /// Seed-owned spoiler preference (#1184). False for old seeds and by default: sweep groups in
@@ -842,6 +844,8 @@ impl shared::Core for Core {
             tracker_follow_map_pins: false,
             tracker_map_colors: false,
             mfg_colors: Default::default(),
+            tracker_map_filters: false,
+            mfg_states: Default::default(),
             mfg_capture: Default::default(),
             mfg_follow: Default::default(),
             reveal_sweep_boss_names: false,
@@ -997,6 +1001,7 @@ impl shared::Core for Core {
         self.mfg_follow.sync_connection(connected);
         if !connected {
             self.mfg_colors.clear();
+            self.mfg_states.clear();
         }
         let capture_now = self.toast_clock.elapsed().as_millis() as u64;
         let capture_input_free =
@@ -1086,6 +1091,7 @@ impl shared::Core for Core {
 
         self.accumulate_hints_from_log();
         self.refresh_map_colors();
+        self.refresh_map_check_states();
         self.refresh_lock_hint_hud();
 
         if self.tracker_visible {
@@ -4458,6 +4464,7 @@ impl shared::Core for Core {
             self.mfg_capture.reset();
             self.mfg_follow.clear();
             self.mfg_colors.clear();
+            self.mfg_states.clear();
         }
         if now_in_world && !self.was_in_world {
             shared::crash_tallies::record_world_edge(true);
@@ -5141,6 +5148,7 @@ impl Core {
         self.mfg_capture.reset();
         self.mfg_follow.clear();
         self.mfg_colors.clear();
+        self.mfg_states.clear();
         self.base.set_death_link_override(None);
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
         // flags the new seed never earned.
@@ -5529,6 +5537,35 @@ impl Core {
         self.mfg_colors.send(&entries);
     }
 
+    fn refresh_map_check_states(&mut self) {
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        if !self.was_in_world || self.client().is_none() || !self.mfg_states.due(now) {
+            return;
+        }
+        let mut names = HashMap::new();
+        if let Some(client) = self.client() {
+            for loc in client.checked_locations() {
+                names.insert(loc.id(), loc.name().to_string());
+            }
+            for loc in client.unchecked_locations() {
+                names.insert(loc.id(), loc.name().to_string());
+            }
+        }
+        let open = self.open_coarse_regions();
+        let in_logic = names
+            .keys()
+            .copied()
+            .filter(|&id| er_logic::mfg_match::known_in_logic(id as u64, &self.coarse_table, &open))
+            .collect();
+        let surface = self
+            .progression_surface
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+        let states = er_logic::mfg_match::check_states(&names, &surface, &in_logic);
+        self.mfg_states.send(&states);
+    }
+
     /// Build the per-frame tracker snapshot and draw the window (SPEC-item-tracker.md Phase 1).
     /// Everything the imgui closure touches is a local snapshot -- `self` stays out of it so the
     /// window's close button can just write a local.
@@ -5837,6 +5874,8 @@ impl Core {
         let mut player_review = self.tracker_player_review;
         let mut follow_map_pins = self.tracker_follow_map_pins;
         let mut map_colors = self.tracker_map_colors;
+        let mut map_filters = self.tracker_map_filters;
+        let map_filter_status = self.mfg_states.status();
         let map_color_status = self.mfg_colors.status();
         let capture_active = self.mfg_capture.active();
         let capture_text = self.mfg_capture.text().to_string();
@@ -6019,6 +6058,9 @@ impl Core {
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 if ui.collapsing_header("Map pin test (optional)", imgui::TreeNodeFlags::empty()) {
+                    ui.checkbox("Share check states with map filters (this session)", &mut map_filters);
+                    ui.text_wrapped("Uses tracker region access; does not evaluate extra quest/puzzle conditions. Unknown regions are excluded.");
+                    if map_filters { ui.text_wrapped(map_filter_status); }
                     ui.checkbox("Color map pins (this session)", &mut map_colors);
                     ui.text_wrapped("Yellow rings: known hints. Orange rings: checks eligible to hold progression in this seed. Colors do not reveal what an unhinted check contains.");
                     if map_colors {
@@ -6597,6 +6639,9 @@ impl Core {
         self.tracker_in_logic_only = in_logic_only;
         self.tracker_surface_only = surface_only;
         self.tracker_player_review = player_review;
+        self.tracker_map_filters = map_filters;
+        self.mfg_states
+            .set_enabled(map_filters || map_colors || follow_map_pins);
         self.tracker_map_colors = map_colors;
         self.mfg_colors.set_enabled(map_colors);
         self.tracker_follow_map_pins = follow_map_pins;
