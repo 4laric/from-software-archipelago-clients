@@ -135,3 +135,5 @@ pub mod vanilla_suppress;
 pub mod vanilla_suppress_replay;
 pub mod version;
 pub mod whetblade;
+
+pub mod log_location;

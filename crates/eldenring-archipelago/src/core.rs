@@ -294,6 +294,10 @@ pub struct Core {
     /// imgui present thread, which must not. The poll already computes exactly this for
     /// `sweep_watch`, so the row costs no extra read.
     sweep_flag_state: HashMap<u32, bool>,
+    log_seed_epoch: std::time::Instant,
+    log_sweep_members: HashSet<i64>,
+    log_sweep_submitted: HashSet<i64>,
+    log_sweep_acknowledged: HashSet<i64>,
     /// Sweep-trigger flag watcher (diagnostic, 2026-08-07). Reports the group census once and then
     /// only CHANGES, so a trigger flag flipping is timestamped in the log instead of being
     /// inferred from the sweep that follows it. See `er_logic::sweep_watch` for the motivating
@@ -385,6 +389,50 @@ pub struct Core {
 impl shared::Core for Core {
     type SlotData = Value;
     type Game = crate::game::EldenRing;
+
+    fn log_part_text(&self, part: &ap::RichText, emitted: std::time::Instant) -> String {
+        let ap::RichText::Location { location, player } = part else {
+            return part.to_string();
+        };
+        let Some(client) = self.client() else {
+            return part.to_string();
+        };
+        if player.team() != client.this_player().team()
+            || player.slot() != client.this_player().slot()
+            || player.game() != client.this_player().game()
+        {
+            return part.to_string();
+        }
+        // Logs survive reconnects/seed changes; never apply new-seed facts to old rows.
+        if emitted < self.log_seed_epoch {
+            return er_logic::log_location::compact(location.name().as_str(), false, None, false);
+        }
+        let id = location.id();
+        if !self.valid_locations.contains(&id)
+            || client
+                .this_game()
+                .location(id)
+                .is_none_or(|known| known.name() != location.name())
+        {
+            return part.to_string();
+        }
+        let eligible = self
+            .flag_poll
+            .as_ref()
+            .map(|_| self.log_sweep_members.contains(&id));
+        er_logic::log_location::compact(
+            location.name().as_str(),
+            self.progression_surface.contains(&(id as u64)),
+            eligible,
+            self.log_sweep_acknowledged.contains(&id),
+        )
+    }
+
+    fn log_presentation_legend(&self) -> Option<&'static str> {
+        Some(
+            "[P] progression surface  [S] sweep grant this session; sweep: boss that grants the check",
+        )
+    }
 
     /// Debug console commands, typed into the overlay's say input (2026-07-01, playtest tooling).
     /// Unrecognized "!" commands fall through to server chat.
@@ -853,6 +901,10 @@ impl shared::Core for Core {
             boss_flag_prev: HashSet::new(),
             sweep_bannered: HashSet::new(),
             sweep_flag_state: HashMap::new(),
+            log_seed_epoch: std::time::Instant::now(),
+            log_sweep_members: HashSet::new(),
+            log_sweep_submitted: HashSet::new(),
+            log_sweep_acknowledged: HashSet::new(),
             sweep_watch: er_logic::sweep_watch::SweepWatch::new(),
             sweep_flag_pending: Vec::new(),
             sweep_flush_burst: None,
@@ -996,6 +1048,17 @@ impl shared::Core for Core {
 
         // Poll even with the tracker and main client windows hidden. Explicit
         // capture and follow opt-ins bound all API work; idle clients do not sample.
+        // Once per frame, not a server-set scan for every displayed log location.
+        self.log_sweep_acknowledged = self
+            .client()
+            .map(|client| {
+                client
+                    .server_checked_locations()
+                    .map(|loc| loc.id())
+                    .filter(|id| self.log_sweep_submitted.contains(id))
+                    .collect()
+            })
+            .unwrap_or_default();
         let connected = self.client().is_some();
         self.mfg_capture.sync_connection(connected);
         self.mfg_follow.sync_connection(connected);
@@ -2210,6 +2273,7 @@ impl shared::Core for Core {
                     fp.location_flags.len(),
                     fp.sweep_flags.len()
                 );
+                self.log_sweep_members = fp.sweep_flags.values().flatten().copied().collect();
                 self.flag_poll = Some(fp);
                 self.start = Some(start);
                 self.scout = Some(scout);
@@ -3411,6 +3475,7 @@ impl shared::Core for Core {
             // (location, detection flag) for every member this poll actually granted -- the input
             // to the sweep flag flush below (er_logic::sweep_flush::flags_to_assert).
             let mut swept_members: Vec<(i64, u32)> = Vec::new();
+            let mut direct_this_poll = HashSet::new();
             if let (Some(fp), Some(client)) = (self.flag_poll.as_ref(), self.client()) {
                 // Refresh the vanilla-suppressor's collected-flag set: the acquisition flags of every
                 // location already in the server checked-set (loc->flag via locationFlags). A location
@@ -3443,6 +3508,7 @@ impl shared::Core for Core {
                         to_check.push(loc);
                     }
                 }
+                direct_this_poll.extend(to_check.iter().copied());
                 for (trigger, members) in &self.dungeon_sweeps {
                     // Draft B: the location-keyed dungeon_sweeps groups carry NO gate today --
                     // sweepLockGates is flag-keyed and applied in the sweep_flags loop below. A
@@ -3529,22 +3595,11 @@ impl shared::Core for Core {
                         .to_string()
                 });
                 let region = self.region_table.get(&(sample_loc as u64)).cloned();
-                // 🛑 THE FLAG IS APPENDED UNCONDITIONALLY. The old chain degraded to the
-                // PRETTIEST remaining label rather than the most IDENTIFYING one: with
-                // `0 boss-lock def(s)` the boss name can never resolve, so every sweep fell to
-                // `Boss sweep ({region})` and dropped the flag -- while the arm one line below it
-                // was the one that printed it. bobler's 49-check sweep could not be mapped back to
-                // a trigger at all (2026-08-07), and slot_data's own `dungeonSweepFlags` echo is
-                // truncated in the log, so this was the last copy of that fact.
-                let label = match (boss, region) {
-                    (Some(b), Some(r)) => format!("Boss sweep ({r}): {b}"),
-                    (Some(b), None) => format!("Boss sweep: {b}"),
-                    (None, Some(r)) => format!("Boss sweep ({r})"),
-                    (None, None) => "Boss sweep".to_string(),
-                };
-                let label = format!("{label} [trigger flag {flag}]");
+                let label = boss.or(region).unwrap_or_else(|| "Boss sweep".to_owned());
+                // Keep raw trigger identity in the diagnostic log, not F5 presentation.
+                log::info!("Sweep: {label} [trigger flag {flag}] -- {granted} check(s) granted.");
                 self.log(ap::Print::message(format!(
-                    "{label} -- {granted} check(s) granted."
+                    "Sweep: {label} -- {granted} checks granted."
                 )));
             }
             // SWEEP FLAG FLUSH (2026-07-24, "chests are still broken"): granting the check told
@@ -3785,6 +3840,16 @@ impl shared::Core for Core {
             if !to_check.is_empty() && !crate::reconcile_io::is_refused() {
                 to_check.sort_unstable();
                 to_check.dedup();
+                // Session provenance: these exact members entered the sweep-report batch.
+                // Rendering additionally waits for the server checked acknowledgement.
+                self.log_sweep_submitted
+                    .extend(swept_members.iter().map(|&(id, _)| id).filter(|id| {
+                        er_logic::log_location::sweep_report_evidence(
+                            *id,
+                            &direct_this_poll,
+                            &to_check,
+                        )
+                    }));
                 log::info!("flag-poll: {} new check(s)", to_check.len());
                 self.stage_check_reports(to_check);
                 self.flush_check_reports();
@@ -5188,6 +5253,8 @@ impl Core {
         self.valid_locations.clear();
         self.locations_loaded = false;
         self.flag_poll = None;
+        self.log_seed_epoch = std::time::Instant::now();
+        self.log_sweep_members.clear();
         self.dungeon_sweeps.clear();
         self.sweep_lock_gates.clear();
         self.poll_counter = 0;
@@ -5238,6 +5305,8 @@ impl Core {
         self.boss_flag_prev.clear();
         // SWEEP VISIBILITY: re-arm the per-group sweep banner for the new seed.
         self.sweep_bannered.clear();
+        self.log_sweep_submitted.clear();
+        self.log_sweep_acknowledged.clear();
         self.sweep_watch.reset();
         // ATTUNEMENT-RELEASE: drop the parsed gate + all per-save latches so the new seed re-parses
         // regionAttunement and re-primes / re-blooms from scratch.
