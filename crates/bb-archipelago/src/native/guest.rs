@@ -55,7 +55,8 @@ const BASE_WEAPON_FAMILIES: &[u32] = &[
     2_000_000, 4_000_000, 5_000_000, 5_100_000, 6_000_000, 6_100_000, 7_000_000, 7_100_000,
     8_000_000, 8_100_000, 9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000,
     14_000_000, 14_200_000, 15_000_000, 19_100_000, 22_000_000, 23_000_000, 24_000_000, 25_000_000,
-    28_000_000, 31_000_000, 34_000_000, 35_000_000,
+    26_000_000, 27_000_000, 28_000_000, 29_000_000, 30_000_000, 31_000_000, 32_000_000, 33_000_000,
+    34_000_000, 35_000_000, 36_000_000, 38_000_000,
 ];
 
 /// Trick weapons for which the committed world catalog exposes Uncanny rows.
@@ -64,7 +65,9 @@ const BASE_WEAPON_FAMILIES: &[u32] = &[
 /// can be invisible to the census.
 const UNCANNY_TRICK_WEAPON_BASES: &[u32] = &[
     2_000_000, 4_000_000, 5_000_000, 5_100_000, 7_000_000, 7_100_000, 8_000_000, 8_100_000,
-    9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000, 22_000_000,
+    9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000, 22_000_000, 23_000_000,
+    24_000_000, 25_000_000, 26_000_000, 27_000_000, 28_000_000, 29_000_000, 30_000_000, 31_000_000,
+    32_000_000, 38_000_000,
 ];
 
 pub(crate) fn weapon_reinforcement_level(id: u32) -> Option<u8> {
@@ -554,6 +557,49 @@ mod tests {
 
         let guest = GuestRuntime::new(memory, base).unwrap();
         assert_eq!(guest.target_weapon_level(), Some(7));
+    }
+
+    #[test]
+    fn target_level_includes_both_holy_moonlight_sword_variants() {
+        let (memory, base, _normalized) = laid_out_inventory();
+        let c = contract();
+        let g = c.geometry;
+        let inventory = memory
+            .read_u64(base + c.state_cell("inventory").unwrap().rva)
+            .unwrap();
+        let primary = memory.read_u64(inventory + g.primary_array).unwrap();
+        let secondary = memory.read_u64(inventory + g.secondary_array).unwrap();
+        let normal = entry_address(0, 2, primary, secondary, g.record_stride);
+        let uncanny = entry_address(2, 2, primary, secondary, g.record_stride);
+        memory.store(normal + g.record_id, &26_000_100u32.to_le_bytes());
+        let guest = GuestRuntime::new(memory, base).unwrap();
+        assert_eq!(guest.target_weapon_level(), Some(1));
+
+        guest
+            .memory()
+            .store(normal + g.record_id, &0xDEADu32.to_le_bytes());
+        guest
+            .memory()
+            .store(uncanny + g.record_id, &26_010_700u32.to_le_bytes());
+        assert_eq!(guest.target_weapon_level(), Some(7));
+    }
+
+    #[test]
+    fn reinforcement_census_covers_the_complete_dlc_weapon_catalog() {
+        const DLC_TRICK_WEAPONS: &[u32] = &[
+            23_000_000, 24_000_000, 25_000_000, 26_000_000, 27_000_000, 28_000_000, 29_000_000,
+            30_000_000, 31_000_000, 32_000_000, 38_000_000,
+        ];
+        const DLC_LEFT_HAND_WEAPONS: &[u32] =
+            &[19_100_000, 33_000_000, 34_000_000, 35_000_000, 36_000_000];
+
+        for &base in DLC_TRICK_WEAPONS {
+            assert_eq!(weapon_reinforcement_level(base + 900), Some(9));
+            assert_eq!(weapon_reinforcement_level(base + 10_000 + 900), Some(9));
+        }
+        for &base in DLC_LEFT_HAND_WEAPONS {
+            assert_eq!(weapon_reinforcement_level(base + 900), Some(9));
+        }
     }
 
     #[test]

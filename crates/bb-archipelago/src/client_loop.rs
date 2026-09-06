@@ -5117,59 +5117,71 @@ mod tests {
     }
 
     #[test]
-    fn held_whirligig_plus_seven_raises_a_different_weapon_family() {
-        let ledger_path = path();
-        let mut runtime_config = config();
-        runtime_config.auto_upgrade = true;
-        runtime_config.items.insert(
-            3000,
-            RuntimeItemBinding {
-                // Ludwig's Holy Blade +0: deliberately unrelated to Whirligig.
-                raw_descriptor: 0x807B_98A0,
-                normalized_item_id: 8_100_000,
-                item_category: 0,
-                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
-                quantity: 1,
-                reinforcement_level: Some(0),
-                feed_effect: FeedEffectBinding::RightHandWeapon,
-            },
-        );
-        let backend = InventoryTargetBackend {
-            inner: MockBackend::default(),
-            held_weapon_ids: vec![31_000_700], // Whirligig Saw +7
-        };
-        let mut client = ClientLoop::new(
-            backend,
-            runtime_config,
-            ReceiveLedger::default(),
-            ledger_path.clone(),
-            "seed",
-            "slot",
-        );
+    fn held_dlc_weapons_raise_an_incoming_different_weapon_family() {
+        for (held_weapon_id, target_level) in [
+            (31_000_700, 7), // Whirligig Saw +7
+            (26_000_100, 1), // Holy Moonlight Sword +1
+            (26_010_700, 7), // Uncanny Holy Moonlight Sword +7
+        ] {
+            let ledger_path = path();
+            let mut runtime_config = config();
+            runtime_config.auto_upgrade = true;
+            runtime_config.items.insert(
+                3000,
+                RuntimeItemBinding {
+                    // Ludwig's Holy Blade +0: deliberately unrelated to the held weapon.
+                    raw_descriptor: 0x807B_98A0,
+                    normalized_item_id: 8_100_000,
+                    item_category: 0,
+                    descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
+                    quantity: 1,
+                    reinforcement_level: Some(0),
+                    feed_effect: FeedEffectBinding::RightHandWeapon,
+                },
+            );
+            let backend = InventoryTargetBackend {
+                inner: MockBackend::default(),
+                held_weapon_ids: vec![held_weapon_id],
+            };
+            let mut client = ClientLoop::new(
+                backend,
+                runtime_config,
+                ReceiveLedger::default(),
+                ledger_path.clone(),
+                "seed",
+                "slot",
+            );
 
-        let result = client
-            .poll_items(&[IncomingItem {
-                index: 0,
-                ap_item_id: 3000,
-            }])
-            .unwrap();
+            let result = client
+                .poll_items(&[IncomingItem {
+                    index: 0,
+                    ap_item_id: 3000,
+                }])
+                .unwrap();
 
-        assert_eq!(
-            result,
-            ItemPollResult::Completed(CompletedItem {
-                index: 0,
-                ap_item_id: 3000,
-                received_level: Some(0),
-                target_level: Some(7),
-                delivered_level: Some(7),
-                equip_target: None,
-            })
-        );
-        assert_eq!(
-            client.backend().inner.grants[0].reinforcement_level,
-            Some(7)
-        );
-        std::fs::remove_file(ledger_path).unwrap();
+            assert_eq!(
+                result,
+                ItemPollResult::Completed(CompletedItem {
+                    index: 0,
+                    ap_item_id: 3000,
+                    received_level: Some(0),
+                    target_level: Some(target_level),
+                    delivered_level: Some(target_level),
+                    equip_target: None,
+                })
+            );
+            let grant = &client.backend().inner.grants[0];
+            assert_eq!(grant.reinforcement_level, Some(target_level));
+            assert_eq!(
+                grant.raw_descriptor,
+                0x807B_98A0 + u32::from(target_level) * 100
+            );
+            assert_eq!(
+                grant.normalized_item_id,
+                8_100_000 + u32::from(target_level) * 100
+            );
+            std::fs::remove_file(ledger_path).unwrap();
+        }
     }
 
     #[test]
