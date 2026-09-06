@@ -139,6 +139,19 @@ fn grant_tag(index: u64) -> String {
     format!("ap_{index}")
 }
 
+/// Bloodborne's two shields have only their base EquipParamWeapon row. They
+/// still carry reinforcement level zero in the receive contract because they
+/// are category-0 equipment, but synthesizing a higher row would make the
+/// native grant payload dereference a missing parameter row.
+fn is_non_upgradable_shield(normalized_item_id: u32, reinforcement_level: Option<u8>) -> bool {
+    let Some(level) = reinforcement_level else {
+        return false;
+    };
+    normalized_item_id
+        .checked_sub(u32::from(level) * 100)
+        .is_some_and(|base| matches!(base, 19_000_000 | 19_100_000))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletedItem {
     pub index: u64,
@@ -1570,7 +1583,11 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .with_context(|| format!("AP item {} has no Bloodborne binding", item.ap_item_id))?
             .clone();
         let target_level = if self.config.auto_upgrade && binding.reinforcement_level.is_some() {
-            self.backend.target_weapon_level()?
+            if is_non_upgradable_shield(binding.normalized_item_id, binding.reinforcement_level) {
+                Some(0)
+            } else {
+                self.backend.target_weapon_level()?
+            }
         } else {
             None
         };
@@ -1838,6 +1855,29 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 planned
             }
         };
+
+        if pending.reinforcement_level.is_some_and(|level| level > 0)
+            && is_non_upgradable_shield(pending.normalized_item_id, pending.reinforcement_level)
+        {
+            // A plan persisted by an older client that auto-upgraded a shield
+            // to a row the binder does not have. Park it, by index, so the
+            // stream advances past it: a bare error here re-raised on every
+            // poll and blocked every later item with no console command able
+            // to clear it. `blocked` lists the park and `retry INDEX CONFIRM`
+            // re-plans it, which the clamp above now pins to the base row.
+            let failure = GrantTerminalFailure {
+                tag: grant_tag(item.index),
+                status: "invalid_shield_plan".to_string(),
+                detail: format!(
+                    "pending plan at AP index {} names EquipParamWeapon row {} (+{}), which does not exist; verify that the earlier grant command did not execute, then `retry {} CONFIRM` to re-plan it at the base shield row",
+                    pending.index,
+                    pending.normalized_item_id,
+                    pending.reinforcement_level.unwrap_or_default(),
+                    pending.index,
+                ),
+            };
+            return self.park_terminal_grant(item, &pending, failure);
+        }
 
         // Fail closed on a provenance this build has never heard of: refuse
         // THIS item, by name, and keep the session alive. The seed was
@@ -5114,6 +5154,108 @@ mod tests {
         assert_eq!(client.backend().equips[0].reinforcement_level, Some(6));
         assert_eq!(client.backend().equips[0].target, EquipTarget::RightHand(0));
         std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn auto_upgrade_keeps_non_upgradable_shields_at_their_base_rows() {
+        for normalized_item_id in [19_000_000, 19_100_000] {
+            let ledger_path = path();
+            let mut runtime_config = config();
+            runtime_config.auto_upgrade = true;
+            runtime_config.items.insert(
+                3000,
+                RuntimeItemBinding {
+                    raw_descriptor: 0x8000_0000 | normalized_item_id,
+                    normalized_item_id,
+                    item_category: 0,
+                    descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
+                    quantity: 1,
+                    reinforcement_level: Some(0),
+                    feed_effect: FeedEffectBinding::LeftHandWeapon,
+                },
+            );
+            let mut backend = MockBackend::default();
+            backend.upgrade_target_level = Some(7);
+            let mut client = loop_with(
+                backend,
+                ReceiveLedger::default(),
+                ledger_path.clone(),
+                runtime_config,
+            );
+
+            let result = client
+                .poll_items(&[IncomingItem {
+                    index: 0,
+                    ap_item_id: 3000,
+                }])
+                .unwrap();
+            let ItemPollResult::Completed(completed) = result else {
+                panic!("shield did not complete: {result:?}");
+            };
+            assert_eq!(completed.target_level, Some(0));
+            assert_eq!(completed.delivered_level, Some(0));
+            let grant = &client.backend().grants[0];
+            assert_eq!(grant.normalized_item_id, normalized_item_id);
+            assert_eq!(grant.raw_descriptor, 0x8000_0000 | normalized_item_id);
+            assert_eq!(grant.reinforcement_level, Some(0));
+            std::fs::remove_file(ledger_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_reinforced_shield_pending_plan_is_parked_without_a_grant() {
+        let ledger_path = path();
+        let mut ledger = ReceiveLedger::default();
+        ledger
+            .slot_mut("seed", "slot")
+            .begin(PendingItem {
+                index: 0,
+                ap_item_id: 3000,
+                raw_descriptor: 0x8123_741C,
+                normalized_item_id: 19_100_700,
+                item_category: 0,
+                quantity: 1,
+                upgrade_target_level: Some(7),
+                reinforcement_level: Some(7),
+                equip_target: None,
+                grant_complete: false,
+                equip_complete: false,
+                observed_before: None,
+                token_routed_to_storage: false,
+            })
+            .unwrap();
+        let mut client = loop_with(MockBackend::default(), ledger, ledger_path, config());
+
+        let result = client
+            .poll_items(&[IncomingItem {
+                index: 0,
+                ap_item_id: 3000,
+            }])
+            .unwrap();
+
+        // Parked, not wedged: no grant was submitted, the entry is
+        // acknowledged as blocked with the invalid row named, and the
+        // pending plan is cleared so the next index can deliver.
+        let ItemPollResult::Blocked(blocked) = result else {
+            panic!("expected the invalid shield plan to be parked, got {result:?}");
+        };
+        assert_eq!(blocked.index, 0);
+        assert_eq!(blocked.status, "invalid_shield_plan");
+        assert!(blocked.detail.contains("19100700"));
+        assert!(blocked.detail.contains("retry 0 CONFIRM"));
+        assert!(client.backend().grants.is_empty());
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert!(slot.pending.is_none());
+        assert_eq!(slot.next_index(), 1);
+        let parked = slot.acknowledged.get(&0).unwrap();
+        assert_eq!(parked.normalized_item_id, 19_100_700);
+        assert!(
+            parked
+                .blocked
+                .as_deref()
+                .unwrap()
+                .starts_with("invalid_shield_plan")
+        );
     }
 
     #[test]

@@ -2,6 +2,15 @@
 
 ### Fixed
 
+* **A reinforced Loch Shield or Wooden Shield plan left by an older client
+  no longer stalls every later item.** Earlier builds auto-upgraded both
+  shields to rows the binder does not have (only `+0` exists), and the plan
+  was durable, so a run interrupted mid-delivery carried it into the next
+  session. The client now refuses that row without granting, parks the index
+  as `invalid_shield_plan`, and advances; `blocked` lists it and
+  `retry INDEX CONFIRM` re-plans it at the base shield row, which is where
+  incoming shields are now always planned. No ledger edit is needed.
+
 * **A rescue `give` typed during a delivery no longer freezes the whole
   receive stream (review finding C1).** Typing `give` or `census CONFIRM`
   while an Archipelago item was mid-flight stopped every delivery for the

@@ -54,9 +54,9 @@ impl InventoryEntry {
 const BASE_WEAPON_FAMILIES: &[u32] = &[
     2_000_000, 4_000_000, 5_000_000, 5_100_000, 6_000_000, 6_100_000, 7_000_000, 7_100_000,
     8_000_000, 8_100_000, 9_000_000, 10_000_000, 10_100_000, 11_000_000, 12_000_000, 13_000_000,
-    14_000_000, 14_200_000, 15_000_000, 19_100_000, 22_000_000, 23_000_000, 24_000_000, 25_000_000,
-    26_000_000, 27_000_000, 28_000_000, 29_000_000, 30_000_000, 31_000_000, 32_000_000, 33_000_000,
-    34_000_000, 35_000_000, 36_000_000, 38_000_000,
+    14_000_000, 14_200_000, 15_000_000, 22_000_000, 23_000_000, 24_000_000, 25_000_000, 26_000_000,
+    27_000_000, 28_000_000, 29_000_000, 30_000_000, 31_000_000, 32_000_000, 33_000_000, 34_000_000,
+    35_000_000, 36_000_000, 38_000_000,
 ];
 
 /// Trick weapons for which the committed world catalog exposes Uncanny rows.
@@ -71,6 +71,12 @@ const UNCANNY_TRICK_WEAPON_BASES: &[u32] = &[
 ];
 
 pub(crate) fn weapon_reinforcement_level(id: u32) -> Option<u8> {
+    // Loch Shield has a category-0 base row but no reinforced parameter rows.
+    // Recognize the real inventory id without allowing a malformed synthetic
+    // `19100N00` id to inflate the global auto-upgrade target.
+    if id == 19_100_000 {
+        return Some(0);
+    }
     BASE_WEAPON_FAMILIES
         .iter()
         .copied()
@@ -590,8 +596,7 @@ mod tests {
             23_000_000, 24_000_000, 25_000_000, 26_000_000, 27_000_000, 28_000_000, 29_000_000,
             30_000_000, 31_000_000, 32_000_000, 38_000_000,
         ];
-        const DLC_LEFT_HAND_WEAPONS: &[u32] =
-            &[19_100_000, 33_000_000, 34_000_000, 35_000_000, 36_000_000];
+        const DLC_LEFT_HAND_WEAPONS: &[u32] = &[33_000_000, 34_000_000, 35_000_000, 36_000_000];
 
         for &base in DLC_TRICK_WEAPONS {
             assert_eq!(weapon_reinforcement_level(base + 900), Some(9));
@@ -600,6 +605,8 @@ mod tests {
         for &base in DLC_LEFT_HAND_WEAPONS {
             assert_eq!(weapon_reinforcement_level(base + 900), Some(9));
         }
+        assert_eq!(weapon_reinforcement_level(19_100_000), Some(0));
+        assert_eq!(weapon_reinforcement_level(19_100_700), None);
     }
 
     #[test]
