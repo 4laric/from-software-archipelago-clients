@@ -100,7 +100,7 @@ impl States {
             Ok(()) => {
                 self.published = true;
                 self.status = Some(
-                    "Map check filters active. Local region access; additional quest requirements are not evaluated.",
+                    "Check data is available to the map filters. Uses tracker region access; additional quest requirements are not evaluated.",
                 );
             }
             Err(status) => self.status = Some(status),

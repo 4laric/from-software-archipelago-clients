@@ -6058,9 +6058,9 @@ impl Core {
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 if ui.collapsing_header("Map pin test (optional)", imgui::TreeNodeFlags::empty()) {
-                    ui.checkbox("Share check states with map filters (this session)", &mut map_filters);
-                    ui.text_wrapped("Uses tracker region access; does not evaluate extra quest/puzzle conditions. Unknown regions are excluded.");
-                    if map_filters { ui.text_wrapped(map_filter_status); }
+                    ui.checkbox("Enable map filters (this session)", &mut map_filters);
+                    ui.text_wrapped("Also enabled by map colors or follow-pins. Uses tracker region access; extra quest/puzzle conditions are not evaluated. Unknown regions are excluded.");
+                    if map_filters || map_colors || follow_map_pins { ui.text_wrapped(map_filter_status); }
                     ui.checkbox("Color map pins (this session)", &mut map_colors);
                     ui.text_wrapped("Yellow rings: known hints. Orange rings: checks eligible to hold progression in this seed. Colors do not reveal what an unhinted check contains.");
                     if map_colors {
