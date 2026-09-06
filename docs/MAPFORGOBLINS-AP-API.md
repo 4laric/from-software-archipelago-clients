@@ -1,7 +1,6 @@
 # Proposed MapForGoblins marker API for Archipelago
 
-Status: proposal only. No released MapForGoblins build exports this interface, and the
-Archipelago client must remain observation-only until both projects agree on the ABI.
+Status: the paired Archipelago Map for Goblins fork implements the versioned bridge. Check sharing and pin coloring start automatically without opening F6; follow-pins remains optional. F10 controls optional map filters, and F6 → Map integration contains session opt-outs. See [current check-state contract](MFG-CHECK-FILTERS.md) and [ABI header](include/mfg_ap_readonly_v1.h). The original proposal evidence below records the design background.
 
 ## Evidence and scope
 

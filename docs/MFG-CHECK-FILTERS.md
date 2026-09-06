@@ -1,5 +1,7 @@
 # Map check filters
 
+Check sharing and pin colors are enabled automatically each session, without opening F6. F10 opens Map for Goblins settings for optional filters. Advanced session opt-outs are under F6 → Map integration: Share check states and Color map pins. Check sharing remains active while colors or Follow map pins are enabled; turn all three off to stop sharing. Follow map pins stays off by default, as do review and capture tools.
+
 The source-built map engine owns the check-only, progression-only and in-logic-only filters. The client shares a complete leased snapshot when any session map workflow is enabled: follow pins, color pins, or the separate check-state sharing checkbox. Color selection is not required.
 
 The complete snapshot contains every qualified map/enemy lot belonging to current-seed checks with exact server names matching the pinned catalog. Neutral and checked checks are included. No hidden item content is read or scouted. Progression means this seed's progression surface, not the class of its actual randomized item.
