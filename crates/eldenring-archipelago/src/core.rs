@@ -262,6 +262,8 @@ pub struct Core {
     tracker_player_review: bool,
     // Session-only opt-in; follows copied hover history while F6 is closed.
     tracker_follow_map_pins: bool,
+    tracker_map_colors: bool,
+    mfg_colors: crate::mfg_colors::Colors,
     mfg_capture: crate::mfg_probe::HoverCapture,
     mfg_follow: er_logic::mfg_bridge::Follow,
     /// Seed-owned spoiler preference (#1184). False for old seeds and by default: sweep groups in
@@ -838,6 +840,8 @@ impl shared::Core for Core {
             tracker_surface_only: false,
             tracker_player_review: false,
             tracker_follow_map_pins: false,
+            tracker_map_colors: false,
+            mfg_colors: Default::default(),
             mfg_capture: Default::default(),
             mfg_follow: Default::default(),
             reveal_sweep_boss_names: false,
@@ -991,6 +995,9 @@ impl shared::Core for Core {
         let connected = self.client().is_some();
         self.mfg_capture.sync_connection(connected);
         self.mfg_follow.sync_connection(connected);
+        if !connected {
+            self.mfg_colors.clear();
+        }
         let capture_now = self.toast_clock.elapsed().as_millis() as u64;
         let capture_input_free =
             !self.tracker_visible && !ui.io().want_capture_mouse && !ui.io().want_capture_keyboard;
@@ -1078,6 +1085,7 @@ impl shared::Core for Core {
         }
 
         self.accumulate_hints_from_log();
+        self.refresh_map_colors();
         self.refresh_lock_hint_hud();
 
         if self.tracker_visible {
@@ -4449,6 +4457,7 @@ impl shared::Core for Core {
         if now_in_world != self.was_in_world {
             self.mfg_capture.reset();
             self.mfg_follow.clear();
+            self.mfg_colors.clear();
         }
         if now_in_world && !self.was_in_world {
             shared::crash_tallies::record_world_edge(true);
@@ -5131,6 +5140,7 @@ impl Core {
     fn reset_for_new_seed(&mut self) {
         self.mfg_capture.reset();
         self.mfg_follow.clear();
+        self.mfg_colors.clear();
         self.base.set_death_link_override(None);
         // Owed sweep flags belong to the OLD seed's location ids; carrying them across would write
         // flags the new seed never earned.
@@ -5477,6 +5487,48 @@ impl Core {
             });
     }
 
+    /// Publish only seed eligibility and already-known hints, never randomized item contents.
+    /// The map owner renders a leased presentation snapshot; no game writes occur here.
+    fn refresh_map_colors(&mut self) {
+        let now = self.toast_clock.elapsed().as_millis() as u64;
+        if !self.was_in_world || self.client().is_none() || !self.mfg_colors.due(now) {
+            return;
+        }
+        let mut names = HashMap::new();
+        let mut checked = HashSet::new();
+        if let Some(client) = self.client() {
+            for loc in client.checked_locations() {
+                names.insert(loc.id(), loc.name().to_string());
+                checked.insert(loc.id());
+            }
+            for loc in client.unchecked_locations() {
+                names.insert(loc.id(), loc.name().to_string());
+            }
+        }
+        // HintSet also retains legacy fallback entries; require the actual finding
+        // world to be ours so another world's identical location ID cannot tint this map.
+        let hinted = self
+            .hints
+            .iter()
+            .filter(|hint| hint.for_us && !hint.found)
+            .map(|hint| hint.location_id as i64)
+            .collect();
+        let surface = self
+            .progression_surface
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+        let entries = er_logic::mfg_match::color_styles(&names, &checked, &hinted, &surface)
+            .into_iter()
+            .map(|entry| crate::mfg_colors::LotStyle {
+                lot_table: entry.lot_table,
+                lot_row: entry.lot_row,
+                style: entry.style as u32,
+            })
+            .collect::<Vec<_>>();
+        self.mfg_colors.send(&entries);
+    }
+
     /// Build the per-frame tracker snapshot and draw the window (SPEC-item-tracker.md Phase 1).
     /// Everything the imgui closure touches is a local snapshot -- `self` stays out of it so the
     /// window's close button can just write a local.
@@ -5784,6 +5836,8 @@ impl Core {
         let mut surface_only = self.tracker_surface_only;
         let mut player_review = self.tracker_player_review;
         let mut follow_map_pins = self.tracker_follow_map_pins;
+        let mut map_colors = self.tracker_map_colors;
+        let map_color_status = self.mfg_colors.status();
         let capture_active = self.mfg_capture.active();
         let capture_text = self.mfg_capture.text().to_string();
         let followed_pin = self.mfg_follow.latest();
@@ -5965,6 +6019,11 @@ impl Core {
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 if ui.collapsing_header("Map pin test (optional)", imgui::TreeNodeFlags::empty()) {
+                    ui.checkbox("Color map pins (this session)", &mut map_colors);
+                    ui.text_wrapped("Yellow rings: known hints. Orange rings: checks eligible to hold progression in this seed. Colors do not reveal what an unhinted check contains.");
+                    if map_colors {
+                        ui.text_wrapped(map_color_status);
+                    }
                     ui.checkbox("Follow map pins (this session)", &mut follow_map_pins);
                     ui.text_wrapped("With F6 closed and client input released, remembers the latest fresh map pin. It does not track a live hover or change anything.");
                     if follow_map_pins {
@@ -6494,6 +6553,8 @@ impl Core {
         self.tracker_in_logic_only = in_logic_only;
         self.tracker_surface_only = surface_only;
         self.tracker_player_review = player_review;
+        self.tracker_map_colors = map_colors;
+        self.mfg_colors.set_enabled(map_colors);
         self.tracker_follow_map_pins = follow_map_pins;
         self.mfg_follow.set_enabled(follow_map_pins);
         if capture_clear {

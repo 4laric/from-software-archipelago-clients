@@ -38,6 +38,7 @@ mod key_resolver;
 mod keyitems;
 mod lock_hints;
 mod merchant_bells;
+mod mfg_colors;
 mod mfg_probe;
 mod mine_materials;
 mod minibaker;
