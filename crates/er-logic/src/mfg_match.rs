@@ -308,6 +308,52 @@ mod tests {
     }
 
     #[test]
+    fn recovered_rewards_match_the_live_lot_and_active_seed() {
+        for (table, lot, flag, ap_id) in [
+            (1, 101621, 400162, 7774254),
+            (1, 2046400001, 2046407001, 7774636),
+            (1, 2046400002, 2046407002, 7774637),
+            (1, 2046400003, 2046407003, 7774638),
+            (1, 2046400004, 2046407004, 7774639),
+            (1, 2047440901, 2047447901, 7774640),
+            (2, 438100012, 1038457500, 7774641),
+            (1, 30861, 530861, 7774642),
+            (1, 40424, 540424, 7774643),
+            (1, 40428, 540428, 7774644),
+            (1, 40912, 540912, 7774645),
+            (1, 40914, 540914, 7774646),
+            (1, 40920, 540920, 7774647),
+            (1, 40922, 540922, 7774648),
+            (1, 102926, 400295, 7774649),
+            (1, 30200900, 30207900, 7774650),
+            (1, 104512, 400452, 7774651),
+        ] {
+            let result = resolve(flag, table, lot, |id| id == ap_id);
+            assert_eq!(result.status, MatchStatus::SingleCandidate);
+            assert_eq!(
+                result.seed_candidates,
+                vec![Candidate {
+                    ap_id,
+                    original_flag: flag
+                }]
+            );
+            assert_eq!(
+                resolve(flag, table, lot, |_| false).status,
+                MatchStatus::OutOfSeed
+            );
+        }
+        assert_eq!(
+            resolve(1039527700, 1, 1039520700, |_| true).status,
+            MatchStatus::Unmatched
+        );
+        // An enemy actor can award a map lot. Do not accept a conflicting namespace.
+        assert_eq!(
+            resolve(400452, 2, 104512, |_| true).status,
+            MatchStatus::Unmatched
+        );
+    }
+
+    #[test]
     fn observed_and_source_reference_lots_identify_expected_checks() {
         for (lot, ap_id) in [
             (32010040, 7772256),
@@ -377,7 +423,7 @@ mod tests {
         assert!(catalog_name(7772821).unwrap().contains("Flail"));
         assert!(catalog_name(7772256).unwrap().contains("Glintstone Scrap"));
         assert_eq!(catalog_name(-1), None);
-        assert_eq!(data::FLAGS.len(), 4925);
+        assert_eq!(data::FLAGS.len(), 4941);
         assert!(data::LOTS.windows(2).all(|w| w[0] < w[1]));
         assert!(data::FLAGS.windows(2).all(|w| w[0] < w[1]));
         for &(table, _, flag, id) in data::LOTS {
