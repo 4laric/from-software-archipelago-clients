@@ -249,3 +249,95 @@ mod boss_state_tests {
         .is_empty());
     }
 }
+
+#[path = "mfg_boss_flags_data.rs"]
+mod boss_flags;
+
+/// Distinct acquisition and defeat identities are joined only through datamined records.
+pub fn native_boss_flag(flag: u32) -> Option<u32> {
+    let rows = boss_flags::ACQUISITION_DEFEAT;
+    if let Ok(index) = rows.binary_search_by_key(&flag, |&(acquisition, _)| acquisition) {
+        return Some(rows[index].1);
+    }
+    rows.iter()
+        .any(|&(_, defeat)| defeat == flag)
+        .then_some(flag)
+}
+
+pub fn seed_boss_map(
+    locations: &std::collections::HashMap<i64, u32>,
+    valid: &HashSet<i64>,
+) -> std::collections::HashMap<u32, Vec<i64>> {
+    let mut output: std::collections::HashMap<u32, Vec<i64>> = std::collections::HashMap::new();
+    for (&id, &acquisition) in locations {
+        if !valid.contains(&id) {
+            continue;
+        }
+        if let Some(defeat) = native_boss_flag(acquisition) {
+            output.entry(defeat).or_default().push(id);
+        }
+    }
+    for ids in output.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    output
+}
+
+#[cfg(test)]
+mod real_seed_identity_tests {
+    use super::*;
+    #[test]
+    fn real_acquisition_flags_resolve_godrick_and_tree_sentinel() {
+        let input = [(7770653, 510010), (7770692, 530100), (7772308, 34107110)]
+            .into_iter()
+            .collect();
+        let mapping = seed_boss_map(&input, &[7770653, 7770692, 7772308].into_iter().collect());
+        assert_eq!(mapping.get(&10000800), Some(&vec![7770653]));
+        assert_eq!(mapping.get(&1042360800), Some(&vec![7770692]));
+        assert!(!mapping.contains_key(&510010));
+        assert!(!mapping.contains_key(&530100));
+        assert!(!mapping.values().flatten().any(|&id| id == 7772308));
+        assert!(seed_boss_map(&input, &HashSet::new()).is_empty());
+    }
+    #[test]
+    fn scarab_surface_redirects_to_real_native_tree_sentinel_identity() {
+        let valid = [7770692, 7772308].into_iter().collect();
+        let mapping = seed_boss_map(
+            &[(7770692, 530100), (7772308, 34107110)]
+                .into_iter()
+                .collect(),
+            &valid,
+        );
+        let defeat = native_boss_flag(530100).unwrap();
+        let targets = progression_targets(
+            &[7772308].into_iter().collect(),
+            &valid,
+            &[SweepTargetGroup {
+                bosses: mapping[&defeat].clone(),
+                members: vec![7772308],
+            }],
+        );
+        assert_eq!(targets.locations, [7770692].into_iter().collect());
+        let states = boss_check_states(
+            &mapping,
+            &[(7770692, "Golden Halberd".to_owned())]
+                .into_iter()
+                .collect(),
+            &targets.locations,
+            &[7770692].into_iter().collect(),
+        );
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].lot_table, 3);
+        assert_eq!(states[0].lot_row, 1042360800);
+        assert_eq!(states[0].flags, 15);
+    }
+    #[test]
+    fn lookup_sorted_unique_and_unknown_flag_fails_closed() {
+        assert!(boss_flags::ACQUISITION_DEFEAT
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0));
+        assert_eq!(native_boss_flag(1042360800), Some(1042360800));
+        assert_eq!(native_boss_flag(0), None);
+    }
+}

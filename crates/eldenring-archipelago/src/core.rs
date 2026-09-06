@@ -5570,64 +5570,35 @@ impl Core {
     fn refresh_map_progression_targets(&mut self) {
         use er_logic::mfg_targets::SweepTargetGroup;
         let mut groups = Vec::new();
-        let seed_bosses: Option<HashSet<i64>> = self.client().and_then(|client| {
-            client
-                .slot_data()
-                .get("bossLocations")
-                .and_then(Value::as_object)
-                .map(|regions| {
-                    regions
-                        .values()
-                        .filter_map(Value::as_array)
-                        .flatten()
-                        .filter_map(Value::as_i64)
-                        .collect()
-                })
-        });
-        let mut boss_map: HashMap<u32, HashSet<i64>> = HashMap::new();
+        self.map_boss_checks = self
+            .flag_poll
+            .as_ref()
+            .map(|fp| {
+                er_logic::mfg_targets::seed_boss_map(&fp.location_flags, &self.valid_locations)
+            })
+            .unwrap_or_default();
         for boss in &self.boss_defs {
-            if boss.flag > 0 && self.valid_locations.contains(&boss.boss_ap_id) {
-                boss_map
-                    .entry(boss.flag)
-                    .or_default()
-                    .insert(boss.boss_ap_id);
+            if self.valid_locations.contains(&boss.boss_ap_id)
+                && let Some(defeat) = er_logic::mfg_targets::native_boss_flag(boss.flag)
+            {
+                let ids = self.map_boss_checks.entry(defeat).or_default();
+                if !ids.contains(&boss.boss_ap_id) {
+                    ids.push(boss.boss_ap_id);
+                }
             }
         }
         if let Some(fp) = &self.flag_poll {
-            if let Some(boss_ids) = &seed_bosses {
-                for (&id, &flag) in &fp.location_flags {
-                    if flag > 0 && boss_ids.contains(&id) && self.valid_locations.contains(&id) {
-                        boss_map.entry(flag).or_default().insert(id);
-                    }
-                }
-            }
             for (&flag, members) in &fp.sweep_flags {
-                if seed_bosses.is_none() && !boss_map.contains_key(&flag) {
-                    let direct: Vec<_> = fp
-                        .location_flags
-                        .iter()
-                        .filter(|(id, own_flag)| {
-                            **own_flag == flag && self.valid_locations.contains(id)
-                        })
-                        .map(|(&id, _)| id)
-                        .collect();
-                    if direct.len() == 1 {
-                        boss_map.insert(flag, direct.into_iter().collect());
-                    }
-                }
+                let bosses = er_logic::mfg_targets::native_boss_flag(flag)
+                    .and_then(|defeat| self.map_boss_checks.get(&defeat))
+                    .cloned()
+                    .unwrap_or_default();
                 groups.push(SweepTargetGroup {
-                    bosses: boss_map
-                        .get(&flag)
-                        .map(|ids| ids.iter().copied().collect())
-                        .unwrap_or_default(),
+                    bosses,
                     members: members.clone(),
                 });
             }
         }
-        self.map_boss_checks = boss_map
-            .into_iter()
-            .map(|(flag, ids)| (flag, ids.into_iter().collect()))
-            .collect();
         for (&trigger, members) in &self.dungeon_sweeps {
             groups.push(SweepTargetGroup {
                 bosses: vec![trigger],
