@@ -68,12 +68,22 @@ fn publish(entries: &[LotCheckState], active: bool) -> Result<bool, &'static str
     Ok(supports_boss)
 }
 
-#[derive(Default)]
 pub struct States {
     enabled: bool,
     next_ms: u64,
     published: bool,
     status: Option<&'static str>,
+}
+
+impl Default for States {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            next_ms: 0,
+            published: false,
+            status: None,
+        }
+    }
 }
 
 impl States {
@@ -120,5 +130,20 @@ impl States {
     pub fn status(&self) -> &'static str {
         self.status
             .unwrap_or("Map check filters will start when connected and in the world.")
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn publishes_before_tracker_opens_and_respects_session_opt_out() {
+        let mut publisher = States::default();
+        assert!(publisher.due(0));
+        assert!(!publisher.due(1));
+        publisher.set_enabled(false);
+        assert!(!publisher.due(10_000));
+        publisher.set_enabled(true);
+        assert!(publisher.due(10_000));
     }
 }

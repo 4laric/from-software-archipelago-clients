@@ -66,12 +66,22 @@ fn publish(entries: &[LotStyle]) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[derive(Default)]
 pub struct Colors {
     enabled: bool,
     next_ms: u64,
     published: bool,
     status: Option<&'static str>,
+}
+
+impl Default for Colors {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            next_ms: 0,
+            published: false,
+            status: None,
+        }
+    }
 }
 
 impl Colors {
@@ -115,5 +125,20 @@ impl Colors {
     pub fn status(&self) -> &'static str {
         self.status
             .unwrap_or("Map colors will start when connected and in the world.")
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn publishes_before_tracker_opens_and_respects_session_opt_out() {
+        let mut publisher = Colors::default();
+        assert!(publisher.due(0));
+        assert!(!publisher.due(1));
+        publisher.set_enabled(false);
+        assert!(!publisher.due(10_000));
+        publisher.set_enabled(true);
+        assert!(publisher.due(10_000));
     }
 }

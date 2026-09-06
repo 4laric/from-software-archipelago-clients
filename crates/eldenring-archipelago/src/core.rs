@@ -894,9 +894,9 @@ impl shared::Core for Core {
             tracker_surface_only: false,
             tracker_player_review: false,
             tracker_follow_map_pins: false,
-            tracker_map_colors: false,
+            tracker_map_colors: true,
             mfg_colors: Default::default(),
-            tracker_map_filters: false,
+            tracker_map_filters: true,
             mfg_states: Default::default(),
             mfg_capture: Default::default(),
             mfg_follow: Default::default(),
@@ -1152,6 +1152,12 @@ impl shared::Core for Core {
             }
         }
 
+        // Map sharing starts without ever opening the tracker. Keep session opt-outs
+        // synchronized before publishing; set_enabled clears any previous lease.
+        self.mfg_colors.set_enabled(self.tracker_map_colors);
+        self.mfg_states.set_enabled(
+            self.tracker_map_filters || self.tracker_map_colors || self.tracker_follow_map_pins,
+        );
         self.accumulate_hints_from_log();
         self.refresh_map_colors();
         self.refresh_map_check_states();
@@ -5614,8 +5620,8 @@ impl Core {
             er_logic::mfg_targets::progression_targets(&surface, &self.valid_locations, &groups);
         self.map_progression_targets = result.locations;
         if result.unresolved_groups > 0 {
-            log::warn!(
-                "Map progression targets: {} enabled surface sweep group(s) have no identified current-seed boss check; member pins are excluded without inventing a replacement.",
+            log::debug!(
+                "Map progression targets: {} surface sweep group(s) have no individual boss check; native markers use exact enabled sweep flags where available.",
                 result.unresolved_groups
             );
         }
@@ -5665,11 +5671,15 @@ impl Core {
             return;
         }
         let mut names = HashMap::new();
+        let mut remaining = HashSet::new();
         if let Some(client) = self.client() {
             for loc in client.checked_locations() {
                 names.insert(loc.id(), loc.name().to_string());
             }
             for loc in client.unchecked_locations() {
+                if self.valid_locations.contains(&loc.id()) {
+                    remaining.insert(loc.id());
+                }
                 names.insert(loc.id(), loc.name().to_string());
             }
         }
@@ -5687,6 +5697,21 @@ impl Core {
             surface,
             &in_logic,
         ));
+        if let Some(fp) = &self.flag_poll {
+            let raw_surface = self
+                .progression_surface
+                .iter()
+                .map(|&id| id as i64)
+                .collect();
+            er_logic::mfg_targets::append_sweep_trigger_states(
+                &mut states,
+                &fp.sweep_flags,
+                &self.map_boss_checks,
+                &remaining,
+                &raw_surface,
+                &in_logic,
+            );
+        }
         self.mfg_states.send(&states);
     }
 
@@ -6181,9 +6206,9 @@ impl Core {
                     ui.separator();
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
-                if ui.collapsing_header("Map pin test (optional)", imgui::TreeNodeFlags::empty()) {
-                    ui.checkbox("Enable map filters (this session)", &mut map_filters);
-                    ui.text_wrapped("Also enabled by map colors or follow-pins. Uses tracker region access; extra quest/puzzle conditions are not evaluated. Unknown regions are excluded.");
+                if ui.collapsing_header("Map integration", imgui::TreeNodeFlags::empty()) {
+                    ui.checkbox("Share check states (this session)", &mut map_filters);
+                    ui.text_wrapped("Check sharing and colors start automatically. Press F10 for optional map filters. Sharing also stays active while colors or follow-pins are enabled. In-logic filtering uses tracker region access; extra quest/puzzle conditions are not evaluated. Unknown regions are excluded.");
                     if map_filters || map_colors || follow_map_pins { ui.text_wrapped(map_filter_status); }
                     ui.checkbox("Color map pins (this session)", &mut map_colors);
                     ui.text_wrapped("Yellow rings: known hints. Orange rings: progression targets; active sweep bosses replace their member pickups. Colors do not reveal what an unhinted check contains.");

@@ -1,5 +1,7 @@
 # Map check filters
 
+Check sharing and pin colors are enabled automatically each session, without opening F6. F10 opens Map for Goblins settings for optional filters. Advanced session opt-outs are under F6 → Map integration: Share check states and Color map pins. Check sharing remains active while colors or Follow map pins are enabled; turn all three off to stop sharing. Follow map pins stays off by default, as do review and capture tools.
+
 The source-built map engine owns the check-only, progression-only and in-logic-only filters. The client shares a complete leased snapshot when any session map workflow is enabled: follow pins, color pins, or the separate check-state sharing checkbox. Color selection is not required.
 
 The complete snapshot contains every qualified map/enemy lot belonging to current-seed checks with exact server names matching the pinned catalog. Neutral and checked checks are included. No hidden item content is read or scouted. Progression means this seed's progression surface, not the class of its actual randomized item.
@@ -17,3 +19,5 @@ Map progression targets now exclude enabled sweep members from the original prog
 
 
 Native boss icons use immutable defeat-flag identity because they carry no item lot. New capability MFG_AP_CAP_BOSS_CHECK_STATES_V1 (8) permits kind MFG_AP_BOSS_DEFEAT_FLAG (3) in the check-state entry lot_table field, with lot_row holding the exact event flag. Hover and old style exports retain MAP/ENEMY only. The client publishes all identified current-seed boss checks (not only progression targets); flags retain same-check conjunction. Older engines receive ordinary lot states and a visible update notice instead of unsupported kind 3 entries. Boss states use authoritative seed identity, not a guessed item or display name.
+
+Enabled native sweep triggers with no individual boss AP check represent their remaining seed-valid member checks. Their progression and region-access bits use member witnesses, with the conjunction requiring the same member. Once every member is checked, that trigger state disappears. A trigger can only highlight an existing native map marker; the actual Scarab fixture uses flag 34100800, which is absent from the current vanilla native pin reference.
