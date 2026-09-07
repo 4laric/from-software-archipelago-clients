@@ -2801,7 +2801,10 @@ mod tests {
         // 833 HP became 5726, 1216 became 8360, attack 3.64x, on a base the randomizer had already
         // retuned. Same fight, two answers, and one of them a wall.
         for id in [523610066, 523290066] {
-            assert!(!area_may_vouch_for(id), "{id} is an arena row of a named human");
+            assert!(
+                !area_may_vouch_for(id),
+                "{id} is an arena row of a named human"
+            );
             assert_eq!(presumed_native_tier(id, Some(14)), None);
             assert_eq!(
                 scale_action(false, false, id, 15, Some(14)),
@@ -2821,7 +2824,10 @@ mod tests {
         // family that is nameless and reward-less in every row (player clones, spirit-ash bodies)
         // says nothing about itself and stays reachable by the area, exactly as before.
         for id in [500000000, 520000000, 506200070] {
-            assert!(area_may_vouch_for(id), "{id} has no named or rewarded sibling");
+            assert!(
+                area_may_vouch_for(id),
+                "{id} has no named or rewarded sibling"
+            );
         }
     }
 
