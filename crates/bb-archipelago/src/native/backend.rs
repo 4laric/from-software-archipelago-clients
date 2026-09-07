@@ -915,6 +915,21 @@ impl BloodborneBackend for NativeBackend {
         self.delivery.runtime_mut().death_link_kill()
     }
 
+    fn observe_player_hp(&mut self) -> Result<Option<u32>> {
+        // The same gate as every other player read. A pointer captured before
+        // a load is not a live observation, and answering `None` here is what
+        // makes the detector treat a load or a quit-to-title as "forget what
+        // you knew" instead of as a death.
+        if !self
+            .location_context_inner()?
+            .is_some_and(|context| context.gameplay_ready)
+        {
+            let _ = self.delivery.runtime_mut().clear_player_status();
+            return Ok(None);
+        }
+        self.delivery.runtime_mut().player_current_hp()
+    }
+
     fn withdraw_unwitnessed_grant(&mut self, _tag: &str) -> Result<bool> {
         // The native request cell lives in guest memory; a leftover arm from a
         // previous process is cleared best-effort. The durable plan stays in the
