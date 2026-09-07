@@ -10,6 +10,7 @@ use serde_json::Value;
 ///  - `None`        — no `versions` key in slot_data (older seed): gate inert, connect proceeds.
 ///  - `Some(true)`  — range accepts our version.
 ///  - `Some(false)` — range rejects our version: `net.rs` logs the "update one side" warning (it does NOT disconnect).
+
 /// This crate's Cargo version in the apworld's spelling: `0.6.0+f1` -> `0.6.0.1`, `0.6.0` ->
 /// `0.6.0`. The one place the two spellings of a V.R.M.F meet (AGENTS.md "Version numbers");
 /// the client's lockstep test compares this against the generated `APWORLD_VERSION_EXPECTED`.
