@@ -217,14 +217,16 @@ an ordinary playthrough. **No extra read of the game is performed for
 it**, and a failure to write the file warns once and never touches a delivery.
 
 `inferred_destination` is `held` when the read-back arithmetic accounts for the
-grant in the held stack. It is `storage` for the player-validated insert shape:
-ItemGrant completed but the inserted goods never appeared in held inventory,
-and the player confirmed the item in the Hunter's Dream storage box. A delta
-that executes while the held total remains short is still
-`storage_suspected`: the client cannot distinguish capped overflow from a
-concurrent spend. `unknown` covers every other shape. Thus only `storage` is a
-confirmed destination; `storage_suspected` remains a hypothesis, never a
-measurement.
+grant in the held stack, `storage` for the player-validated insert shape
+(ItemGrant completed but the inserted goods never appeared in held inventory,
+and the player confirmed the item in the Hunter's Dream storage box), or
+`unknown` for everything else. A delta that provably executes while the held
+total remains short is no longer completed at all: a short read-back after an
+executed delta is not proof of delivery (a capped stack can execute-and-discard
+it, as a real Umbilical Cord case showed), so the grant parks as `failed`
+instead, and its `inferred_destination` reads `unknown`. `retry INDEX CONFIRM`
+re-queues a parked grant once the stack has room. Thus only `storage` is a
+confirmed destination; nothing here is a guess dressed up as a measurement.
 
 `tools/summarize_delivery_diagnostics.py <file>` groups the records by item,
 status and inferred destination, then prints a short player-verification list
