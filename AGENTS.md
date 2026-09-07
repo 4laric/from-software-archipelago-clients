@@ -108,3 +108,26 @@ ask in the pull request before merging.
   one logging test is flaky under parallel execution.
 - Add or update a test that loads state written by the previous release's
   shape whenever you touch persistence.
+
+## The Bedrock-profile fixture
+
+Elden Ring's client is dual-path: `key_resolver.rs`, the foreign `goal` key in
+`goal.rs`, and the baked region-lock fallback reached from `region.rs` /
+`core.rs` exist to serve Bedrock's apworld (fswap/Archipelago branch `er`),
+not ours. That path is pinned by a RECORDED seed --
+`crates/er-logic/tests/fixtures/slot_data_bedrock.json` and its two companion
+files -- driven by `crates/er-logic/tests/slot_data_bedrock.rs` and
+`crates/eldenring-archipelago/src/bedrock_fixture_test.rs`.
+
+Rules:
+
+- The asserted counts are EXACT and measured, not guessed. Do not relax an
+  assertion to green a build. A drop in resolved locations, or in DISTINCT shop
+  stock flags, is a parser regression -- that collapse is the exact bug the
+  targets-first shop resolution was written to fix.
+- His world moves independently of our releases (Tarnished Pack locations
+  2026-08-29, DLC shop targets 2026-08-31, shard option 2026-09-06). When it
+  does, RE-RECORD the fixture rather than editing it, following the step-by-step
+  in `crates/er-logic/tests/fixtures/README.md`, and put the measured delta in
+  the pull request body.
+- The fixture is public data and is committed whole. Strip nothing.
