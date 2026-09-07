@@ -1,5 +1,36 @@
 ## Unreleased
 
+### Added
+
+* **Outbound DeathLink, gated off by default and NOT validated live**
+  (bb-archipelago#78). The client now watches for a local death and, when the
+  seed sets the new slot-data key `death_link_send`, runs it through the
+  existing amnesty machine and broadcasts it. The signal is *inferred*: it is
+  an alive->dead edge on the player HP cell the incoming-DeathLink kill
+  already writes through (`docs/SESSION-death-signal.md` candidate class 1),
+  debounced two polls in each direction, blind to loads, menus and
+  out-of-world moments, and deliberately deaf to the client's own kill so a
+  received DeathLink cannot echo back out. Nobody has yet watched it against a
+  real death in a real session, which is why sending is a separate key rather
+  than something `death_link` turns on: every existing seed keeps the exact
+  receive-only behaviour it had. A seed with `death_link` on but
+  `death_link_send` off still *reports* every observed death on the console
+  (`DeathLink probe:` lines) without sending or persisting anything, which is
+  how the signal gets validated; the new `deathlink` console command prints
+  the current state, and `docs/DEATHLINK-SEND-PROBE.md` in the apworld repo is
+  the runbook.
+
+* **First-death grace** (bb-archipelago#383). New slot-data key
+  `death_link_first_death_grace` forgives a slot's very first qualifying local
+  death outright, before the amnesty cycle is consulted; a graced death
+  neither increments nor resets amnesty, so the player's amnesty cadence
+  starts intact at their second death. It is spent at most once per seed+slot
+  and is persisted as `death_link_first_death_graced` in the ledger, so a
+  reconnect or relaunch cannot hand out a second "first" death. Incoming
+  DeathLinks never touch it. Off unless the seed asks for it, and inert while
+  outbound send is off. Ledgers written by earlier clients load with the field
+  absent and the grace unspent.
+
 ### Fixed
 
 * **A delta delivery whose read-back stays short is no longer acknowledged as

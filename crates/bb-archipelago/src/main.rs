@@ -13,7 +13,10 @@ use bb_archipelago::backend::{
     BloodborneBackend, EquipRequest, ItemGrant, LocationContext, MockBackend, OperationProgress,
     StackObservation,
 };
-use bb_archipelago::client_loop::{ClientLoop, IncomingItem, ItemPollResult, OperatorGrantPoll};
+use bb_archipelago::client_loop::{
+    ClientLoop, DeathLinkAmnestyDecision, IncomingItem, ItemPollResult, LocalDeathPoll,
+    OperatorGrantPoll,
+};
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::is_manager_not_initialized;
 use bb_archipelago::health::{HealthReporter, ReadinessState};
@@ -380,6 +383,13 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Mock(backend) => backend.death_link_kill(),
             Self::Native(backend) => backend.death_link_kill(),
+        }
+    }
+
+    fn observe_player_hp(&mut self) -> Result<Option<u32>> {
+        match self {
+            Self::Mock(backend) => backend.observe_player_hp(),
+            Self::Native(backend) => backend.observe_player_hp(),
         }
     }
 
@@ -1170,6 +1180,10 @@ fn run() -> Result<()> {
     let mut death_link_tag_advertised = false;
     let mut pending_death_links: VecDeque<(String, Option<String>)> = VecDeque::new();
     let mut last_death_link_error: Option<String> = None;
+    let mut last_death_observe_error: Option<String> = None;
+    // A qualifying local death whose policy decision was `Send` and which is
+    // waiting only for a live connection to broadcast on.
+    let mut pending_outgoing_death = false;
     let mut health_write_warning_printed = false;
 
     // A deliberately small, offline-capable rescue surface. stdin lives on a
@@ -1256,7 +1270,7 @@ fn run() -> Result<()> {
             let command = words.first().map(|word| word.to_ascii_lowercase());
             let result = match command.as_deref() {
                 None | Some("") => continue,
-                Some("help") => "Rescue commands: help | status | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | reissue INDEX CONFIRM (re-grant a pending delivery whose token is confirmed gone) | export | setflag FLAG CONFIRM | give INDEX CONFIRM | census CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list) | rebind CONFIRM (release the bound character while nothing is delivered). Unknown/unmapped writes and warps fail closed.".to_owned(),
+                Some("help") => "Rescue commands: help | status | deathlink | flag EVENT_FLAG | mark popup|modal|NOTE... | blocked | retry INDEX CONFIRM | reissue INDEX CONFIRM (re-grant a pending delivery whose token is confirmed gone) | export | setflag FLAG CONFIRM | give INDEX CONFIRM | census CONFIRM | rescue [NAME CONFIRM] (named repairs; run bare to list) | rebind CONFIRM (release the bound character while nothing is delivered). Unknown/unmapped writes and warps fail closed.".to_owned(),
                 Some("status") => match runtime.as_mut() {
                     Some(runtime) => runtime
                         .rescue_status()
@@ -1425,6 +1439,21 @@ fn run() -> Result<()> {
                     _ => "Usage: rebind CONFIRM (releases the bound character; only while nothing has been delivered)".to_owned(),
                 },
                 Some("item" | "warp") => "That mutation is unavailable: this build has no proven named mapping for it. Refusing instead of exposing arbitrary memory writes.".to_owned(),
+                Some("deathlink") => match runtime.as_ref() {
+                    Some(runtime) if !runtime.death_link_enabled() => {
+                        "DeathLink is off for this seed.".to_owned()
+                    }
+                    Some(runtime) => format!(
+                        "DeathLink receive: on. Outbound send: {} (slot data death_link_send). \
+                         First-death grace: {} ({}). Amnesty allowance: {}. \
+                         The local-death signal is inferred from player HP and is NOT validated live.",
+                        if runtime.death_link_send_enabled() { "ON (experimental)" } else { "off" },
+                        if runtime.death_link_first_death_grace_enabled() { "on" } else { "off" },
+                        if runtime.death_link_first_death_graced() { "already spent" } else { "unspent" },
+                        runtime.death_link_amnesty(),
+                    ),
+                    None => "Runtime contract not loaded yet.".to_owned(),
+                },
                 Some("mark") => match (runtime.as_mut(), words.get(1..)) {
                     (Some(runtime), Some(parts)) if !parts.is_empty() => {
                         let note = parts.join(" ");
@@ -1714,9 +1743,29 @@ fn run() -> Result<()> {
         {
             client.update_connection(None, Some(["DeathLink"]))?;
             death_link_tag_advertised = true;
-            client_eprintln!(
-                "DeathLink receive is enabled; outbound Bloodborne deaths remain disabled pending live signal validation."
-            );
+            // Say what is actually armed, not what the last release armed.
+            // The tag is advertised either way; only the outbound half moves.
+            let send_enabled = runtime
+                .as_ref()
+                .is_some_and(ClientLoop::death_link_send_enabled);
+            if send_enabled {
+                let grace = runtime
+                    .as_ref()
+                    .is_some_and(ClientLoop::death_link_first_death_grace_enabled);
+                client_eprintln!(
+                    "DeathLink receive is enabled, and this seed also enabled EXPERIMENTAL outbound sending \
+                     (slot data death_link_send). The local-death signal is inferred from player HP and has \
+                     not been validated live: amnesty {}, first-death grace {}. Watch for 'DeathLink probe:' \
+                     lines and see docs/DEATHLINK-SEND-PROBE.md.",
+                    runtime.as_ref().map_or(0, ClientLoop::death_link_amnesty),
+                    if grace { "on" } else { "off" }
+                );
+            } else {
+                client_eprintln!(
+                    "DeathLink receive is enabled; outbound Bloodborne deaths are not sent because this seed \
+                     left death_link_send off."
+                );
+            }
         }
 
         if let (Some(runtime), Some((source, cause))) =
@@ -1738,6 +1787,65 @@ fn run() -> Result<()> {
                         client_eprintln!("DeathLink kill unavailable: {message}");
                         last_death_link_error = Some(message);
                     }
+                }
+            }
+        }
+
+        // bb-archipelago#78. The detector runs whenever DeathLink is on, even
+        // with sending gated off, so a live tester can validate the signal
+        // from these lines before any seed broadcasts on it. The vocabulary
+        // (`death_observed`, `graced`, `amnesty n/N`, `sent`,
+        // `suppressed_echo`) is what docs/DEATHLINK-SEND-PROBE.md predicts
+        // against; do not reword it without updating the runbook.
+        if let Some(runtime) = runtime.as_mut() {
+            match runtime.poll_local_death() {
+                Ok(LocalDeathPoll::Idle) => {}
+                Ok(LocalDeathPoll::SuppressedEcho) => {
+                    client_eprintln!(
+                        "DeathLink probe: death_observed suppressed_echo (this client's own incoming-DeathLink kill; not sent, no amnesty change)"
+                    );
+                }
+                Ok(LocalDeathPoll::ObservedSendDisabled) => {
+                    client_eprintln!(
+                        "DeathLink probe: death_observed send_disabled (outbound is gated off by slot data death_link_send; nothing sent, no amnesty change)"
+                    );
+                }
+                Ok(LocalDeathPoll::Decided(decision)) => match decision {
+                    // Unreachable while `death_link` is on, but a match arm is
+                    // cheaper than a surprise.
+                    DeathLinkAmnestyDecision::Disabled => {}
+                    DeathLinkAmnestyDecision::Graced => client_eprintln!(
+                        "DeathLink probe: death_observed graced (first-death grace spent; not sent, amnesty untouched)"
+                    ),
+                    DeathLinkAmnestyDecision::Forgiven { used, allowance } => client_eprintln!(
+                        "DeathLink probe: death_observed amnesty {used}/{allowance} (forgiven; not sent)"
+                    ),
+                    DeathLinkAmnestyDecision::Send => {
+                        pending_outgoing_death = true;
+                    }
+                },
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if last_death_observe_error.as_deref() != Some(&message) {
+                        client_eprintln!("DeathLink probe: observation unavailable: {message}");
+                        last_death_observe_error = Some(message);
+                    }
+                }
+            }
+        }
+
+        if pending_outgoing_death && let Some(client) = connection.client_mut() {
+            // The decision is already persisted, so a failed broadcast is not
+            // retried: re-sending a death minutes late is worse than dropping
+            // it, and the amnesty cycle has already moved.
+            pending_outgoing_death = false;
+            let cause = "A Hunter died in Yharnam.".to_owned();
+            match client.death_link(archipelago_rs::DeathLinkOptions::default().cause(cause)) {
+                Ok(()) => client_eprintln!(
+                    "DeathLink probe: death_observed sent (broadcast to the multiworld)"
+                ),
+                Err(error) => {
+                    client_eprintln!("DeathLink probe: death_observed send_failed: {error}");
                 }
             }
         }

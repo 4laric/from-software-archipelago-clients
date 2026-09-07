@@ -26,6 +26,10 @@ use super::pickup_presentation_probe::{self, PickupPresentationSnapshot};
 
 const MAX_SLOTS: u64 = 4096;
 
+/// Offset of current HP within the player-status record the HP hook captures.
+/// Live-validated as a *write* target: the incoming-DeathLink kill zeroes it.
+const PLAYER_CURRENT_HP: u64 = 0xF8;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InventoryEntry {
     pub slot: u32,
@@ -164,12 +168,30 @@ impl<P: ProcessMemory> GuestRuntime<P> {
         if status == 0 {
             return Ok(false);
         }
-        if self.memory.read_u32(status + 0xF8)? == 0 {
+        if self.memory.read_u32(status + PLAYER_CURRENT_HP)? == 0 {
             // Keep later links queued until the player has actually respawned.
             return Ok(false);
         }
-        self.memory.write_u32(status + 0xF8, 0)?;
+        self.memory.write_u32(status + PLAYER_CURRENT_HP, 0)?;
         Ok(true)
+    }
+
+    /// The player's current HP, or `None` when the HP hook has not published a
+    /// pointer since launch or the last load. Read-only, and deliberately the
+    /// exact cell [`Self::death_link_kill`] writes: the outbound local-death
+    /// detector (bb-archipelago#78) is built on the one player-state read this
+    /// client has already exercised in game rather than on a new resolver.
+    ///
+    /// INFERRED: that HP reaching zero *is* a death is candidate class 1 of
+    /// `docs/SESSION-death-signal.md` and has not been validated live. The
+    /// caller owns the debounce, the load/menu handling and the incoming-kill
+    /// echo suppression; this returns the raw number and nothing else.
+    pub fn player_current_hp(&self) -> anyhow::Result<Option<u32>> {
+        let status = self.memory.read_u64(self.cells.player_status)?;
+        if status == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.memory.read_u32(status + PLAYER_CURRENT_HP)?))
     }
 
     pub fn clear_player_status(&self) -> anyhow::Result<()> {
@@ -690,6 +712,35 @@ mod tests {
         assert!(
             !guest.death_link_kill().unwrap(),
             "a second link waits for respawn"
+        );
+    }
+
+    #[test]
+    fn player_current_hp_reads_the_same_cell_and_answers_none_without_a_pointer() {
+        let c = contract();
+        let base = 0x4000_0000;
+        let status = 0x9000_0000u64;
+        let memory = FakeMemory::new();
+        memory.store(
+            base + c.state_cell("player_status").unwrap().rva,
+            &0u64.to_le_bytes(),
+        );
+        let guest = GuestRuntime::new(memory, base).unwrap();
+        // No captured pointer is "cannot observe", never "zero HP" -- the
+        // distinction the local-death detector is built on.
+        assert_eq!(guest.player_current_hp().unwrap(), None);
+
+        guest.memory().store(
+            base + c.state_cell("player_status").unwrap().rva,
+            &status.to_le_bytes(),
+        );
+        guest.memory().store(status + 0xF8, &777u32.to_le_bytes());
+        assert_eq!(guest.player_current_hp().unwrap(), Some(777));
+        assert!(guest.death_link_kill().unwrap());
+        assert_eq!(
+            guest.player_current_hp().unwrap(),
+            Some(0),
+            "the kill and the observation are the same cell"
         );
     }
 

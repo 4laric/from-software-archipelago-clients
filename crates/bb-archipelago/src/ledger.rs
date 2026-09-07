@@ -56,6 +56,15 @@ pub struct SlotLedger {
     /// cannot silently reset the cadence.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub death_link_amnesty_used: u32,
+    /// Whether this slot's one free death has already been spent
+    /// (bb-archipelago#383). Only consulted when the seed asked for the
+    /// first-death grace; a graced death neither increments nor resets the
+    /// amnesty cycle, and an incoming DeathLink never touches it. Persisted
+    /// beside the amnesty counter so a reconnect or relaunch cannot hand the
+    /// player a second "first" death. Older ledgers have no such field and
+    /// load with it false, which is the pre-#383 behaviour exactly.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub death_link_first_death_graced: bool,
     /// Console rescue grants, isolated from the AP receive cursor. The map key
     /// is a seed-contract AP item id; retaining the completed plan makes a
     /// repeated command or restart a fixed point.
@@ -101,6 +110,10 @@ pub struct OperatorAction {
     pub command: String,
     pub argument: i64,
     pub resolved_name: String,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 const fn is_zero(value: &u32) -> bool {

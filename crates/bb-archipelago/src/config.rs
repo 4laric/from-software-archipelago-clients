@@ -342,10 +342,25 @@ pub struct RuntimeConfig {
     pub auto_upgrade: bool,
     #[serde(default)]
     pub auto_equip: bool,
-    /// Seed-owned opt-in. Bloodborne currently receives DeathLinks only;
-    /// outbound deaths remain disabled until a live death signal is proven.
+    /// Seed-owned opt-in. On its own this enables the *receive* half only:
+    /// outbound deaths additionally require [`Self::death_link_send`].
     #[serde(default)]
     pub death_link: bool,
+    /// Seed-owned opt-in for the *outbound* half (bb-archipelago#78).
+    /// Default false, and false whenever an older seed omits the key, so a
+    /// seed rolled before this client existed keeps its receive-only
+    /// behaviour byte for byte. INFERRED SIGNAL: the local-death detector
+    /// behind this gate reads current HP and fires on an alive->dead edge
+    /// (docs/SESSION-death-signal.md candidate class 1). That signal has not
+    /// been live-validated, which is exactly why sending is a separate key
+    /// rather than a consequence of `death_link`.
+    #[serde(default)]
+    pub death_link_send: bool,
+    /// Seed-owned opt-in: forgive this slot's very first qualifying local
+    /// death outright (bb-archipelago#383), before the amnesty cycle is
+    /// consulted. Inert unless outbound send is on.
+    #[serde(default)]
+    pub death_link_first_death_grace: bool,
     /// Local, observation-only diagnostic for clients#510. This is deliberately
     /// not read from slot data: a seed cannot turn native instrumentation on.
     #[serde(default)]
@@ -537,6 +552,18 @@ impl RuntimeConfig {
             self.death_link = value
                 .as_bool()
                 .context("slot_data.death_link must be a boolean")?;
+        }
+        // Absent keys leave the client's defaults alone, which is what makes
+        // a pre-#78 seed keep its receive-only behaviour.
+        if let Some(value) = slot_data.get("death_link_send") {
+            self.death_link_send = value
+                .as_bool()
+                .context("slot_data.death_link_send must be a boolean")?;
+        }
+        if let Some(value) = slot_data.get("death_link_first_death_grace") {
+            self.death_link_first_death_grace = value
+                .as_bool()
+                .context("slot_data.death_link_first_death_grace must be a boolean")?;
         }
         if let Some(value) = slot_data.get("death_link_amnesty") {
             let value = value
@@ -773,6 +800,8 @@ mod tests {
             auto_upgrade: false,
             auto_equip: false,
             death_link: false,
+            death_link_send: false,
+            death_link_first_death_grace: false,
             pickup_notification_probe: false,
             boss_flag_census: false,
             rune_capture: false,
@@ -1221,6 +1250,32 @@ mod tests {
         assert!(config.auto_equip);
         assert!(config.death_link);
         assert_eq!(config.death_link_amnesty, 2);
+        // bb-archipelago#78/#383: a seed that predates these keys omits them,
+        // and both halves stay off.
+        assert!(!config.death_link_send);
+        assert!(!config.death_link_first_death_grace);
+    }
+
+    #[test]
+    fn death_link_send_and_first_death_grace_are_read_when_the_seed_sets_them() {
+        let config = local()
+            .apply_slot_data(&json!({
+                "death_link": true,
+                "death_link_send": true,
+                "death_link_first_death_grace": true
+            }))
+            .unwrap();
+        assert!(config.death_link_send);
+        assert!(config.death_link_first_death_grace);
+    }
+
+    #[test]
+    fn death_link_send_rejects_a_non_boolean() {
+        assert!(
+            local()
+                .apply_slot_data(&json!({"death_link_send": 1}))
+                .is_err()
+        );
     }
 
     #[test]
