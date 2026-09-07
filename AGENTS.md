@@ -43,11 +43,21 @@ V.R.M; only the fixpack differs between them.**
   change to V, R, or M is a paired apworld-and-client release and may change
   the seed contract, persisted state, or delivery behavior; it is announced
   as described in the next section.
-- **F, the fixpack**, is the client-only lane. A fixpack release changes the
-  client binary and nothing else. It must accept every seed and every ledger
-  the F-1 release accepted, with no player action beyond replacing the
-  binary. Everything in the compatibility section above applies without
-  exception.
+- **F, the fixpack.** The bar is one question: *can a player swap to the
+  V.R.M.F client on a seed that was generated with any apworld on the same
+  V.R.M?* Either side may change in a fixpack so long as the answer is yes --
+  an apworld change that alters NEW seeds (a scaling recalibration, say) is
+  fixpack-eligible, because a seed already rolled is untouched and the new
+  client still plays it. What a fixpack must never do is strand a running
+  seed: every seed and every ledger the F-1 client accepted, the F client
+  accepts, with no player action beyond replacing the binary. Everything in
+  the compatibility section above applies without exception.
+- The apworld side spells the same number `0.6.0.1` (its `APWORLD_VERSION`,
+  the seed's `versions` string, its changelog and ledger); this crate spells
+  it `0.6.0+f1` because Cargo needs a semver core. `er_semver` parses both
+  and `er_logic::version::release_form` maps the Cargo spelling to the
+  apworld one. The apworld's `archipelago.json` carries only `0.6.0`:
+  Archipelago unpacks `world_version` into a three-field tuple.
 
 How the four parts map onto what the code already checks:
 
@@ -58,9 +68,12 @@ How the four parts map onto what the code already checks:
 
 Rules that follow:
 
-1. A pull request that only bumps F may not change `RUNTIME_BUILD`, the ER
-   contract hash, `contract_gen.rs`, or any persisted schema. If it needs to,
-   it is an M bump, not a fixpack.
+1. A pull request that bumps only F may not change `RUNTIME_BUILD` or any
+   persisted schema. The ER contract hash MAY move on a fixpack **only** when
+   the same PR teaches the client to accept the previous contract of that
+   V.R.M line (`er_logic::client_features::is_legacy_contract_compatible`
+   lists the audited pair) -- a `0.6.0.x` client must play every `0.6.0`
+   seed. If it cannot, it is an M bump, not a fixpack.
 2. Release tags and changelog headings use the full `V.R.M.F` string
    (`bb-0.1.0.1`, `er-0.5.8.1`), so players can read whether an update is a
    drop-in binary swap (same V.R.M) or a paired upgrade.
