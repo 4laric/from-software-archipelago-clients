@@ -3,14 +3,16 @@
 // Regenerate, never hand-merge. A conflict in this file is resolved by re-running the
 // script, not by picking a side; CI asserts the emitted bytes match a re-derivation.
 //
-// source:      NpcParam.csv  sha256 ac47ff47c26b3ed05a48354c0ca33196e997ff75c0655f3ecb75a1e4a01a985a
+// source:      NpcParam.csv  sha256 0af6b0d83a24fc2875dd0ad284b921bd35cee2ab462026fbf12168ffa3f72a68
 // game build:  1.16.2 (Steam depot 1245621)
-// population:  7039 rows -- 2353 runged (calibration set),
-//              385 unrunged with a rune reward (emitted below),
-//              2440 unrunged without one (ABSENT on purpose = never touched),
-//              411 rows across 137 NAMED characters are excluded
-//              from the AREA fallback (below) -- a set that CROSSES the split above,
-//              since a carved character's rewarded rows go with its reward-less ones.
+// population:  7045 rows -- 2353 runged (calibration set),
+//              386 unrunged with a rune reward (emitted below),
+//              2445 unrunged without one (ABSENT on purpose = never touched),
+//              438 rows are excluded from the AREA fallback (below):
+//              140 NAMED characters, plus 23 rows joined through
+//              their c0000 character prefix (122 families) -- a set
+//              that CROSSES the split above, since a carved character's rewarded rows
+//              go with its reward-less ones.
 
 //! Native scaling tiers for enemies vanilla ships WITHOUT a ladder rung (issue #346).
 //!
@@ -406,6 +408,7 @@ pub const NATIVE_TIERS: &[(i32, u8)] = &[
     (524280000, 19), // getSoul 3000
     (524290000, 19), // getSoul 3000
     (524310000, 19), // getSoul 3000
+    (524700000, 9), // getSoul 500
     (526000000, 19), // getSoul 3000
     (526050000, 16), // getSoul 2000
     (526060000, 16), // getSoul 2000
@@ -434,9 +437,12 @@ pub const GETSOUL_BANDS: &[(f32, u8)] = &[
 /// Index taken by any reward above the last band.
 pub const TOP_BAND_INDEX: u8 = 19;
 
-/// Rows the AREA fallback may not speak for, keyed PER CHARACTER (`nameId`).
+/// Rows the AREA fallback may not speak for, keyed PER CHARACTER.
 ///
-/// A named character with ANY unrunged, reward-less row has ALL of its unrunged rows here.
+/// A named character (`nameId`) with ANY unrunged, reward-less row has ALL of its unrunged
+/// rows here. So does a c0000 human-NPC family (id prefix `5CCCC`) whose reward-less row
+/// sits beside a named or rewarded sibling: the boss-ARENA variant of a named human is
+/// nameless on its own row (Fia's Champion 523610066, Lionel 523290066 -- clients#649).
 /// 🛑 Their bases already assume a late encounter, so an area-derived delta multiplies on top
 /// of endgame tuning -- measured in play 2026-08-05, when a Vyke row and Vyke's Finger Maiden
 /// were area-placed at tier 11 in a Liurnia whose ground reads index 5.
@@ -554,8 +560,13 @@ pub const AREA_EXCLUDED: &[i32] = &[
     523090310,
     523090410,
     523100000,
+    523100010,
     523100012,
+    523100020,
+    523100035,
     523100112,
+    523100120,
+    523100220,
     523110000,
     523110012,
     523110020,
@@ -574,7 +585,9 @@ pub const AREA_EXCLUDED: &[i32] = &[
     523140020,
     523140038,
     523140079,
+    523140120,
     523140179,
+    523140220,
     523160000,
     523160010,
     523160012,
@@ -585,6 +598,7 @@ pub const AREA_EXCLUDED: &[i32] = &[
     523180010,
     523180020,
     523180030,
+    523180050,
     523180079,
     523180110,
     523180130,
@@ -593,6 +607,8 @@ pub const AREA_EXCLUDED: &[i32] = &[
     523180330,
     523190000,
     523190010,
+    523190065,
+    523190066,
     523190079,
     523190110,
     523190179,
@@ -630,6 +646,9 @@ pub const AREA_EXCLUDED: &[i32] = &[
     523270000,
     523270030,
     523270130,
+    523290000,
+    523290040,
+    523290066,
     523310000,
     523310020,
     523310033,
@@ -689,9 +708,11 @@ pub const AREA_EXCLUDED: &[i32] = &[
     523490240,
     523490340,
     523510000,
+    523510030,
     523510034,
     523510050,
     523510070,
+    523510079,
     523510130,
     523510170,
     523530000,
@@ -701,8 +722,12 @@ pub const AREA_EXCLUDED: &[i32] = &[
     523550000,
     523550040,
     523550050,
+    523560000,
+    523560020,
     523600000,
     523600034,
+    523610000,
+    523610066,
     523630000,
     523630020,
     523630040,
@@ -754,6 +779,10 @@ pub const AREA_EXCLUDED: &[i32] = &[
     524250000,
     524250001,
     524250002,
+    524700000,
+    526100000,
+    526100052,
+    526100965,
     533030100,
     533040100,
     533090000,
@@ -787,6 +816,7 @@ pub const AREA_EXCLUDED: &[i32] = &[
     533260034,
     533260072,
     533290000,
+    533290040,
     533310000,
     533310026,
     533340000,
@@ -833,6 +863,7 @@ pub const AREA_EXCLUDED: &[i32] = &[
     534200000,
     534250000,
     534260000,
+    534700000,
     543030200,
     543110000,
     543110020,
@@ -859,5 +890,7 @@ pub const AREA_EXCLUDED: &[i32] = &[
     544180000,
     544190000,
     544250000,
+    544700000,
+    544710000,
     599999999,
 ];

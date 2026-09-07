@@ -206,8 +206,48 @@ def main() -> int:
         for name_id, rs in by_name.items()
         if any(as_int(r, "getSoul") <= 0 for r in rs)
     }
+    # THE SECOND KEY: the c0000 HUMAN-NPC id space, keyed by CHARACTER PREFIX (clients#649).
+    #
+    # A c0000 row id is `5` + a four-digit character number + a four-digit variant, and the
+    # `nameId` on it is a per-ROW field, not a per-character one. The boss-ARENA variant of a
+    # named human carries `nameId 0`: the arena's healthbar names the fight, so the row does not.
+    # Fia's Champion is the case from play (2026-09-06): 523610000 is "Fia's Champion" (136100),
+    # and its Deeproot arena variant 523610066 is nameless and reward-less. The host enemy
+    # randomizer put that fight in the Ashen Capital boss slot, the nameId carve-out above did not
+    # know 523610066 was the same character, and the area placed it at index 14 under a tier-15
+    # target: 6.88x HP / 3.64x atk on top of a boss-slot base -- the Vyke bug, one key over.
+    #
+    # Lionel the Lionhearted is the same fight and has NO named row at all (523290000 / 523290040
+    # carry a 1000 reward, 523290066 carries nothing), so a named sibling is not the only signal.
+    # A c0000 family with a reward-less row beside a NAMED or a REWARDED sibling is one character
+    # whose reward-less row is a hand-tuned variant of it, and it is carved out whole -- the same
+    # per-character rule as above, keyed on the id instead of the name. Families that are nameless
+    # and reward-less in EVERY row (player clones, spirit-ash bodies) carry no signal and are left
+    # exactly as before.
+    def c0000_family(row: dict) -> int | None:
+        npc_id = as_int(row, "ID")
+        return npc_id // 10000 if 500_000_000 <= npc_id < 600_000_000 else None
+
+    by_family: dict[int, list[dict]] = defaultdict(list)
+    for row in unrunged:
+        fam = c0000_family(row)
+        if fam is not None:
+            by_family[fam].append(row)
+    carved_families = {
+        fam
+        for fam, rs in by_family.items()
+        if any(as_int(r, "getSoul") <= 0 for r in rs)
+        and any(as_int(r, "nameId") or as_int(r, "getSoul") > 0 for r in rs)
+    }
     area_excluded = sorted(
-        as_int(r, "ID") for r in unrunged if as_int(r, "nameId") in carved_names
+        as_int(r, "ID")
+        for r in unrunged
+        if as_int(r, "nameId") in carved_names or c0000_family(r) in carved_families
+    )
+    n_family_only = sum(
+        1
+        for r in unrunged
+        if as_int(r, "nameId") not in carved_names and c0000_family(r) in carved_families
     )
 
     n_zero = sum(1 for r in unrunged if as_int(r, "getSoul") <= 0)
@@ -225,9 +265,11 @@ def main() -> int:
         w(f"// population:  {len(rows)} rows -- {n_runged} runged (calibration set),\n")
         w(f"//              {len(derived)} unrunged with a rune reward (emitted below),\n")
         w(f"//              {n_zero} unrunged without one (ABSENT on purpose = never touched),\n")
-        w(f"//              {len(area_excluded)} rows across {len(carved_names)} NAMED characters are excluded\n")
-        w("//              from the AREA fallback (below) -- a set that CROSSES the split above,\n")
-        w("//              since a carved character's rewarded rows go with its reward-less ones.\n")
+        w(f"//              {len(area_excluded)} rows are excluded from the AREA fallback (below):\n")
+        w(f"//              {len(carved_names)} NAMED characters, plus {n_family_only} rows joined through\n")
+        w(f"//              their c0000 character prefix ({len(carved_families)} families) -- a set\n")
+        w("//              that CROSSES the split above, since a carved character's rewarded rows\n")
+        w("//              go with its reward-less ones.\n")
         w("\n")
         w("//! Native scaling tiers for enemies vanilla ships WITHOUT a ladder rung (issue #346).\n")
         w("//!\n")
@@ -253,9 +295,12 @@ def main() -> int:
         w("];\n\n")
         w(f"/// Index taken by any reward above the last band.\npub const TOP_BAND_INDEX: u8 = {top_index};\n")
         w("\n")
-        w("/// Rows the AREA fallback may not speak for, keyed PER CHARACTER (`nameId`).\n")
+        w("/// Rows the AREA fallback may not speak for, keyed PER CHARACTER.\n")
         w("///\n")
-        w("/// A named character with ANY unrunged, reward-less row has ALL of its unrunged rows here.\n")
+        w("/// A named character (`nameId`) with ANY unrunged, reward-less row has ALL of its unrunged\n")
+        w("/// rows here. So does a c0000 human-NPC family (id prefix `5CCCC`) whose reward-less row\n")
+        w("/// sits beside a named or rewarded sibling: the boss-ARENA variant of a named human is\n")
+        w("/// nameless on its own row (Fia's Champion 523610066, Lionel 523290066 -- clients#649).\n")
         w("/// 🛑 Their bases already assume a late encounter, so an area-derived delta multiplies on top\n")
         w("/// of endgame tuning -- measured in play 2026-08-05, when a Vyke row and Vyke's Finger Maiden\n")
         w("/// were area-placed at tier 11 in a Liurnia whose ground reads index 5.\n")
