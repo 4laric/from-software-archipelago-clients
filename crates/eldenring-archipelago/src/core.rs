@@ -833,7 +833,12 @@ impl shared::Core for Core {
 
     fn new() -> Result<Self> {
         Ok(Self {
-            base: CoreBase::new("Elden Ring")?,
+            // THE AP GAME NAME IS THE WORLD'S, NOT OURS (world#1465). This is the name the
+            // handshake announces and the key the server looks the slot up under, so a copy
+            // typed here could drift from the apworld and connect to a game the server does
+            // not have. `contract_gen::GAME` is generated from greenfield/eldenring/gamename.py
+            // by greenfield/gen_contract.py, alongside the contract hash we already mirror.
+            base: CoreBase::new(crate::contract_gen::GAME)?,
             detour_installed: false,
             received_through: 0,
             dispatched_through: 0,
@@ -3132,7 +3137,7 @@ impl shared::Core for Core {
             let source = self
                 .my_name
                 .clone()
-                .unwrap_or_else(|| "Elden Ring".to_string());
+                .unwrap_or_else(|| crate::contract_gen::GAME.to_string());
             let data = serde_json::json!({
                 "time": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3206,7 +3211,7 @@ impl shared::Core for Core {
             let source = self
                 .my_name
                 .clone()
-                .unwrap_or_else(|| "Elden Ring".to_string());
+                .unwrap_or_else(|| crate::contract_gen::GAME.to_string());
             let time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0.0, |d| d.as_secs_f64());
