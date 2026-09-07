@@ -5,12 +5,6 @@
 
 use serde_json::Value;
 
-/// Decide whether the slot_data `versions` range accepts `our_version`.
-///
-///  - `None`        — no `versions` key in slot_data (older seed): gate inert, connect proceeds.
-///  - `Some(true)`  — range accepts our version.
-///  - `Some(false)` — range rejects our version: `net.rs` logs the "update one side" warning (it does NOT disconnect).
-
 /// This crate's Cargo version in the apworld's spelling: `0.6.0+f1` -> `0.6.0.1`, `0.6.0` ->
 /// `0.6.0`. The one place the two spellings of a V.R.M.F meet (AGENTS.md "Version numbers");
 /// the client's lockstep test compares this against the generated `APWORLD_VERSION_EXPECTED`.
@@ -18,6 +12,11 @@ pub fn release_form(cargo_version: &str) -> String {
     er_semver::release_form(cargo_version).unwrap_or_else(|_| cargo_version.to_string())
 }
 
+/// Decide whether the slot_data `versions` range accepts `our_version`.
+///
+///  - `None`        — no `versions` key in slot_data (older seed): gate inert, connect proceeds.
+///  - `Some(true)`  — range accepts our version.
+///  - `Some(false)` — range rejects our version: `net.rs` logs the "update one side" warning (it does NOT disconnect).
 pub fn version_gate(slot_data: &Value, our_version: &str) -> Option<bool> {
     slot_data
         .get("versions")
