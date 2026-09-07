@@ -2,6 +2,12 @@
 // The apworld<->client slot_data contract, mirrored so the client validates the same shapes.
 use serde_json::Value;
 
+/// The AP game name, mirrored from the apworld (greenfield/eldenring/gamename.py).
+/// The client must NOT type this string: it is the key Archipelago hands out the data
+/// package under and the name the handshake announces, so a client-side copy that
+/// drifted from the world would connect to a game the server does not have. #1465.
+pub const GAME: &str = "Elden Ring";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
     Any,
