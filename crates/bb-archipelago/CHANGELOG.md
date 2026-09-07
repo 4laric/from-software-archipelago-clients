@@ -2,6 +2,28 @@
 
 ### Added
 
+* **`rescue moon-presence CONFIRM`, a client-side repair for the shared
+  umbilical cord** (bb-archipelago "distinct umbilical cords"). Every seed
+  shipped so far binds all four "Third Umbilical Cord #N" AP items to the same
+  goods 4323, and Bloodborne counts cord consumption per distinct SpEffect
+  (common.emevd event 9905 has one slot each for SpEffects 4685-4688, each
+  firing once). On those seeds the counter never passes one, event flag 9900
+  never turns on, and m21 routes Gehrman's death to the normal ending. The
+  apworld fix only reaches NEW seeds, so the client now carries a named
+  recipe: it writes event flag 9900 -- the game's own "three cords consumed"
+  decision flag -- after checking that the seed's goal is Moon Presence and
+  that at least three distinct cord items have actually been delivered to this
+  slot, and refuses with a plain reason otherwise. Run it before defeating
+  Gehrman; if he is already dead on the save, `rescue goal CONFIRM` is still
+  the right command. This is the first recipe step that writes a raw event
+  flag rather than a contract location flag (`RescueStep::SetRawEventFlag`);
+  it is audited like every other rescue (`setrawflag` in the operator action
+  log and the diagnostic export), sends no check, and is reachable only from
+  this recipe -- the console `setflag` command remains restricted to contract
+  location flags and still refuses 9900. Seeds generated before slot data
+  carried the `goal` key are recognised by their goal location's event flag,
+  so the recipe works on every existing run.
+
 * **Outbound DeathLink, gated off by default and NOT validated live**
   (bb-archipelago#78). The client now watches for a local death and, when the
   seed sets the new slot-data key `death_link_send`, runs it through the

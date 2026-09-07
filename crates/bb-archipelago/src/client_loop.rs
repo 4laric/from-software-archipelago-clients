@@ -29,12 +29,18 @@ fn slot_is_pristine(slot: &SlotLedger) -> bool {
         && slot.completed_sustain.is_empty()
 }
 
-/// One step of a rescue recipe. Each variant maps onto exactly one existing
-/// audited primitive; there is no raw flag or descriptor escape hatch.
+/// One step of a rescue recipe. Every variant maps onto exactly one audited
+/// primitive; `SetRawEventFlag` is reachable only from a recipe in this table,
+/// never from the console, which stays restricted to contract location flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RescueStep {
     /// Set one contract *location* flag. This sends that check.
     SetLocationFlag(u32),
+    /// Set one raw game event flag that is not a contract location: a decision
+    /// flag the game's own scripts own. No check is sent. Only the recipes in
+    /// `RESCUE_RECIPES` may name one, and each such recipe carries the
+    /// precondition that proves the write is the repair it claims to be.
+    SetRawEventFlag(u32),
     /// Set the flag of the seed's `goal_location`. This sends the goal.
     SetGoalFlag,
     /// Queue the contract item whose normalized id and category match, on the
@@ -48,7 +54,18 @@ pub enum RescueStep {
 #[derive(Clone, Copy, Debug)]
 enum ResolvedRescueStep {
     Flag { flag: u32, location: i64 },
+    RawFlag { flag: u32 },
     Item { ap_item_id: i64 },
+}
+
+/// A check a recipe must pass before any of its steps run. Preconditions are
+/// evaluated together with step resolution, so a refusal leaves nothing
+/// half-applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RescuePrecondition {
+    /// The seed's goal is Moon Presence and the ledger shows at least three
+    /// distinct Third Umbilical Cord items already delivered.
+    MoonPresenceCordsReceived,
 }
 
 /// A named repair for a failure the beta is expected to hit. `when` is the
@@ -59,6 +76,8 @@ pub struct RescueRecipe {
     pub when: &'static str,
     pub after: &'static str,
     pub steps: &'static [RescueStep],
+    /// Checks that must all pass before the first step runs.
+    pub preconditions: &'static [RescuePrecondition],
 }
 
 /// The shipped recipe table. Ids here are Bloodborne 01.09 event flags and
@@ -70,6 +89,7 @@ pub const RESCUE_RECIPES: &[RescueRecipe] = &[
         when: "You inspected Laurence's Skull at the Grand Cathedral altar (after Vicar Amelia), the cutscene played, but no check was sent.",
         after: "the Grand Cathedral altar check is sent. The Forbidden Woods password is NOT granted by this; it arrives as its own AP item.",
         steps: &[RescueStep::SetLocationFlag(12_401_898)],
+        preconditions: &[],
     },
     RescueRecipe {
         name: "forbidden-woods-password",
@@ -79,12 +99,21 @@ pub const RESCUE_RECIPES: &[RescueRecipe] = &[
             normalized_item_id: 12_401_803,
             item_category: 255,
         }],
+        preconditions: &[],
     },
     RescueRecipe {
         name: "goal",
         when: "You watched your seed's ending (Mergo's Wet Nurse, Gehrman, or Moon Presence, per your YAML goal) but AP never marked you as finished.",
         after: "the goal location flag is written; the client sends goal completion on its next poll. Only run this after the ending actually played.",
         steps: &[RescueStep::SetGoalFlag],
+        preconditions: &[],
+    },
+    RescueRecipe {
+        name: "moon-presence",
+        when: "Your seed's goal is Moon Presence, you have received at least three Third Umbilical Cord items, but eating them did not unlock the Moon Presence fight (all cords in seeds before the fix are the same goods, so the game only counts one). Run this BEFORE defeating Gehrman.",
+        after: "event flag 9900 (the game's 'three cords consumed' decision flag) is written; Gehrman's defeat now leads to Moon Presence. If Gehrman is already dead on this save, use `rescue goal CONFIRM` instead.",
+        steps: &[RescueStep::SetRawEventFlag(MOON_PRESENCE_DECISION_FLAG)],
+        preconditions: &[RescuePrecondition::MoonPresenceCordsReceived],
     },
 ];
 
@@ -111,6 +140,22 @@ const SUSTAIN_PENDING_POLL_LIMIT: u32 = 600;
 const QUICKSILVER_BULLET_GOODS_ID: u32 = 900;
 const QUICKSILVER_BULLET_RAW_DESCRIPTOR: u32 = 0xB000_0384;
 const GOODS_NORMALIZED_PREFIX: u32 = 0x4000_0000;
+/// common.emevd event 9909 sets this flag once the four-bit counter at 9901
+/// reaches three consumed cords; m21 reads it on arena entry and at Gehrman's
+/// death to decide between the normal ending and the Moon Presence fight.
+const MOON_PRESENCE_DECISION_FLAG: u32 = 9900;
+/// Goods 4320-4323, the four "Third Umbilical Cord" pieces, normalized.
+const CORD_NORMALIZED_FIRST: u32 = 0x4000_10E0;
+const CORD_NORMALIZED_LAST: u32 = 0x4000_10E3;
+const MOON_PRESENCE_CORDS_REQUIRED: usize = 3;
+/// Moon Presence's kill flag, the goal location of a `moon_presence` seed.
+/// Only used to recognise that goal on a contract written before slot data
+/// carried the `goal` key.
+const MOON_PRESENCE_BOSS_FLAG: u32 = 12_101_850;
+
+fn is_umbilical_cord(normalized_item_id: u32) -> bool {
+    (CORD_NORMALIZED_FIRST..=CORD_NORMALIZED_LAST).contains(&normalized_item_id)
+}
 
 fn rescue_timestamp_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1107,6 +1152,79 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(location)
     }
 
+    /// Write one raw game event flag that is NOT a contract location: a
+    /// decision flag owned by the game's own event scripts. No check is sent
+    /// and no AP state moves. Private on purpose -- the console `setflag`
+    /// command stays restricted to contract location flags, and the only way
+    /// here is a recipe in `RESCUE_RECIPES` whose precondition has passed.
+    fn rescue_set_raw_flag(&mut self, event_flag: u32, reason: &str) -> Result<()> {
+        self.require_runtime_context("rescue setrawflag")?
+            .context("rescue setrawflag is waiting for gameplay")?;
+        self.backend.write_event_flag(event_flag, true)?;
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .operator_actions
+            .push(OperatorAction {
+                timestamp_ms: rescue_timestamp_ms(),
+                command: "setrawflag".into(),
+                argument: i64::from(event_flag),
+                resolved_name: reason.into(),
+            });
+        self.ledger.save(&self.ledger_path)?;
+        Ok(())
+    }
+
+    /// Distinct AP items already delivered to this slot whose binding is one
+    /// of the four Third Umbilical Cord goods. Parked (blocked) acknowledgements
+    /// never reached the character, so they do not count.
+    fn received_cord_count(&self) -> usize {
+        self.ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .map(|slot| {
+                slot.acknowledged
+                    .values()
+                    .filter(|item| {
+                        item.blocked.is_none() && is_umbilical_cord(item.normalized_item_id)
+                    })
+                    .map(|item| item.ap_item_id)
+                    .collect::<HashSet<_>>()
+                    .len()
+            })
+            .unwrap_or_default()
+    }
+
+    /// True when this seed's goal is the Moon Presence ending. Seeds generated
+    /// before slot data carried `goal` are recognised by their goal location's
+    /// event flag instead.
+    fn goal_is_moon_presence(&self) -> bool {
+        match self.config.goal.as_deref() {
+            Some(goal) => goal.eq_ignore_ascii_case("moon_presence"),
+            None => self.config.goal_location.is_some_and(|goal| {
+                self.config.locations.iter().any(|binding| {
+                    binding.ap_location_id == goal && binding.event_flag == MOON_PRESENCE_BOSS_FLAG
+                })
+            }),
+        }
+    }
+
+    /// Returns the cord count on success so the caller can name it in audit.
+    fn check_moon_presence_cords(&self) -> Result<usize> {
+        anyhow::ensure!(
+            self.goal_is_moon_presence(),
+            "this seed's goal is not Moon Presence{}; the three-cord unlock is not part of its ending",
+            self.config
+                .goal
+                .as_deref()
+                .map_or_else(String::new, |goal| format!(" (goal {goal:?})"))
+        );
+        let cords = self.received_cord_count();
+        anyhow::ensure!(
+            cords >= MOON_PRESENCE_CORDS_REQUIRED,
+            "only {cords} Third Umbilical Cord item(s) have been delivered to this slot; the ending needs {MOON_PRESENCE_CORDS_REQUIRED}. Find and eat the rest first."
+        );
+        Ok(cords)
+    }
+
     /// Queue one contract-known item id on an isolated durable lane. It never
     /// changes the AP receive cursor and a repeated command is a fixed point.
     pub fn rescue_give(&mut self, ap_item_id: i64, item_name: &str) -> Result<bool> {
@@ -1249,7 +1367,19 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         self.require_runtime_context("rescue recipe")?
             .context("rescue recipe is waiting for gameplay")?;
 
-        // Resolve and validate every step before the first mutation.
+        // Validate every precondition and resolve every step before the first
+        // mutation, so a refusal leaves nothing half-applied.
+        let mut cord_count = None;
+        for precondition in recipe.preconditions {
+            match precondition {
+                RescuePrecondition::MoonPresenceCordsReceived => {
+                    cord_count = Some(
+                        self.check_moon_presence_cords()
+                            .with_context(|| format!("rescue {} refused", recipe.name))?,
+                    );
+                }
+            }
+        }
         let mut plan = Vec::with_capacity(recipe.steps.len());
         for step in recipe.steps {
             plan.push(match *step {
@@ -1257,6 +1387,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     let location = self.rescue_location_for_flag(flag)?;
                     ResolvedRescueStep::Flag { flag, location }
                 }
+                RescueStep::SetRawEventFlag(flag) => ResolvedRescueStep::RawFlag { flag },
                 RescueStep::SetGoalFlag => {
                     let goal = self
                         .config
@@ -1306,6 +1437,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     self.rescue_set_flag(flag, &label)?;
                     lines.push(format!(
                         "AUDIT rescue {} setflag flag={flag} ({label:?}): written; that check is now sent.",
+                        recipe.name
+                    ));
+                }
+                ResolvedRescueStep::RawFlag { flag } => {
+                    let cords = cord_count.unwrap_or_default();
+                    self.rescue_set_raw_flag(flag, recipe.name)?;
+                    lines.push(format!(
+                        "AUDIT rescue {} setrawflag flag={flag}: written ON after {cords} Third Umbilical Cord item(s) received; Gehrman's defeat now leads to Moon Presence.",
                         recipe.name
                     ));
                 }
@@ -2646,6 +2785,7 @@ mod tests {
             location_check_debounce: 3,
             mock_set_flags: vec![],
             goal_location: None,
+            goal: None,
             sustain_item: None,
         }
     }
@@ -3650,6 +3790,140 @@ mod tests {
             ]
         );
         std::fs::remove_file(export).unwrap();
+        let _ = std::fs::remove_file(ledger_path);
+    }
+
+    fn cord_ledger(count: usize) -> ReceiveLedger {
+        let mut ledger = ReceiveLedger::default();
+        let slot = ledger.slot_mut("seed", "slot");
+        for offset in 0..count {
+            let index = offset as u64;
+            slot.acknowledged.insert(
+                index,
+                AcknowledgedItem {
+                    ap_item_id: 3000 + index as i64,
+                    raw_descriptor: 0xB000_10E3,
+                    normalized_item_id: CORD_NORMALIZED_FIRST + offset as u32,
+                    item_category: 4,
+                    quantity: 1,
+                    reinforcement_level: None,
+                    equip_target: None,
+                    blocked: None,
+                },
+            );
+        }
+        ledger
+    }
+
+    #[test]
+    fn moon_presence_rescue_writes_the_decision_flag_only_for_a_three_cord_moon_presence_seed() {
+        // Not a Moon Presence seed: refused before anything is written.
+        let ledger_path = path();
+        let mut config = recipe_config();
+        config.goal = Some("refuse_gehrman".into());
+        let mut client = loop_with(ready_backend(), cord_ledger(3), ledger_path.clone(), config);
+        let error = client
+            .rescue_recipe("moon-presence", |id| format!("{id}"), |id| format!("{id}"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("goal is not Moon Presence"));
+        assert!(client.backend.set_flags.is_empty());
+        let _ = std::fs::remove_file(ledger_path);
+
+        // Moon Presence seed, but only two cords have been delivered.
+        let ledger_path = path();
+        let mut config = recipe_config();
+        config.goal = Some("moon_presence".into());
+        let mut client = loop_with(
+            ready_backend(),
+            cord_ledger(2),
+            ledger_path.clone(),
+            config.clone(),
+        );
+        let error = client
+            .rescue_recipe("moon-presence", |id| format!("{id}"), |id| format!("{id}"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("only 2 Third Umbilical Cord"));
+        assert!(client.backend.set_flags.is_empty());
+        let _ = std::fs::remove_file(ledger_path);
+
+        // Three cords: exactly flag 9900 is written, and nothing else.
+        let ledger_path = path();
+        let mut client = loop_with(ready_backend(), cord_ledger(3), ledger_path.clone(), config);
+        let lines = client
+            .rescue_recipe("moon-presence", |id| format!("{id}"), |id| format!("{id}"))
+            .unwrap();
+        assert_eq!(
+            client.backend.set_flags.iter().copied().collect::<Vec<_>>(),
+            vec![MOON_PRESENCE_DECISION_FLAG]
+        );
+        assert!(lines[0].contains("AUDIT rescue moon-presence setrawflag flag=9900"));
+        assert!(lines[0].contains("3 Third Umbilical Cord item(s) received"));
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with("AUDIT rescue moon-presence complete")
+        );
+        let slot = client.ledger.slot("seed", "slot").unwrap();
+        let commands: Vec<&str> = slot
+            .operator_actions
+            .iter()
+            .map(|action| action.command.as_str())
+            .collect();
+        assert_eq!(commands, ["setrawflag", "rescue"]);
+        // No check was sent and no grant was queued by a raw flag write.
+        assert!(slot.operator_grants.is_empty());
+        let _ = std::fs::remove_file(ledger_path);
+    }
+
+    #[test]
+    fn a_seed_without_the_goal_key_is_recognised_by_its_goal_location_flag() {
+        let ledger_path = path();
+        // recipe_config()'s goal location is Moon Presence's kill flag and the
+        // contract predates slot_data.goal.
+        let mut client = loop_with(
+            ready_backend(),
+            cord_ledger(4),
+            ledger_path.clone(),
+            recipe_config(),
+        );
+        assert!(client.config.goal.is_none());
+        assert!(
+            client
+                .rescue_recipe("moon-presence", |id| format!("{id}"), |id| format!("{id}"))
+                .is_ok()
+        );
+        assert!(
+            client
+                .backend
+                .set_flags
+                .contains(&MOON_PRESENCE_DECISION_FLAG)
+        );
+        let _ = std::fs::remove_file(ledger_path);
+    }
+
+    #[test]
+    fn the_console_setflag_command_still_refuses_the_moon_presence_decision_flag() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            ready_backend(),
+            cord_ledger(3),
+            ledger_path.clone(),
+            recipe_config(),
+        );
+        // `rescue_location_for_flag` is the console command's only door, and
+        // 9900 is not a contract location.
+        assert!(
+            client
+                .rescue_location_for_flag(MOON_PRESENCE_DECISION_FLAG)
+                .is_err()
+        );
+        assert!(
+            client
+                .rescue_set_flag(MOON_PRESENCE_DECISION_FLAG, "Moon Presence unlock")
+                .is_err()
+        );
+        assert!(client.backend.set_flags.is_empty());
         let _ = std::fs::remove_file(ledger_path);
     }
 
