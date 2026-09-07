@@ -413,6 +413,43 @@ impl SlotLedger {
         Ok(Some(pending))
     }
 
+    /// Raise a durable pending plan to a higher auto-upgrade level
+    /// (clients#654). Only legal before the grant command for it has been
+    /// published -- the caller owns that predicate -- and only upward: a plan
+    /// is never re-priced down, so an item already promised at +5 cannot
+    /// arrive at +2 because a census ran while the weapon was in storage.
+    ///
+    /// No schema change: it rewrites fields the row already carries.
+    pub fn raise_pending_upgrade(
+        &mut self,
+        target_level: Option<u8>,
+        raw_descriptor: u32,
+        normalized_item_id: u32,
+        reinforcement_level: u8,
+    ) -> Result<()> {
+        let pending = self
+            .pending
+            .as_mut()
+            .context("no pending item to raise the upgrade level of")?;
+        anyhow::ensure!(
+            !pending.grant_complete,
+            "pending item {} is already granted",
+            pending.index
+        );
+        anyhow::ensure!(
+            pending
+                .reinforcement_level
+                .is_none_or(|current| reinforcement_level > current),
+            "pending item {} cannot be re-planned downward",
+            pending.index
+        );
+        pending.upgrade_target_level = target_level;
+        pending.raw_descriptor = raw_descriptor;
+        pending.normalized_item_id = normalized_item_id;
+        pending.reinforcement_level = Some(reinforcement_level);
+        Ok(())
+    }
+
     /// Record the live baseline this grant was submitted against (clients#427).
     /// Written durably BEFORE the grant can execute, so a restart replays the
     /// interrupted command against the same number.

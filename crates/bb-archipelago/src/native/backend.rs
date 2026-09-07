@@ -797,6 +797,10 @@ impl BloodborneBackend for NativeBackend {
         Ok(self.delivery.target_weapon_level())
     }
 
+    fn upgrade_scan_ready(&mut self) -> Result<bool> {
+        Ok(self.delivery.inventory_ready())
+    }
+
     fn observe_stack_quantity(
         &mut self,
         normalized_item_id: u32,

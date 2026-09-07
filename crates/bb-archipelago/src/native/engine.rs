@@ -181,6 +181,13 @@ impl<R: Runtime> NativeDelivery<R> {
         self.session.runtime_mut().target_weapon_level()
     }
 
+    /// Whether the inventory geometry the upgrade census walks is hydrated
+    /// (clients#654). Without it `target_weapon_level` returns `None` because
+    /// it could not look, not because the player owns nothing.
+    pub fn inventory_ready(&mut self) -> bool {
+        self.session.runtime_mut().inventory_ready()
+    }
+
     /// Whether the command published for `tag` may already have applied
     /// (clients#427 follow-up). False ONLY for the statuses that provably
     /// precede any write -- the command is held in this machine and nothing
