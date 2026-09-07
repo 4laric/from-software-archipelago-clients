@@ -30,6 +30,14 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
+/// Obtained/restored flags THIS SESSION'S client actually flipped unset -> set, i.e. the writes
+/// the flag poll must not read back as pickups (`er_logic::keyitem_poll`). Only the two writers
+/// below feed it, and only when the flag read UNSET first -- a flag the player had already earned
+/// is never recorded, so their genuine check still reports. Session-scoped: an earlier session's
+/// receive is covered by `core::flag_poll_baseline` instead.
+static CLIENT_WRITTEN_FLAGS: Mutex<er_logic::keyitem_poll::ClientWrites> =
+    Mutex::new(er_logic::keyitem_poll::ClientWrites::empty());
+
 /// Restore flags for Great Runes that exist in THIS seed's item map. These are armed at slot-data
 /// parse time, before receipt: event 90005110 does not check possession of the boss-drop rune before
 /// awarding its vanilla restored copy, so receipt-only reconciliation loses when the altar is used
@@ -54,8 +62,16 @@ static SEED_GREAT_RUNE_FLAGS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 ///
 /// Bell/Knife/Kit are DIFFERENT: 60110/60130/60120 are set by ESD/EMEVD scripts and read directly
 /// by vanilla events -- there is no lot getItemFlagId to repoint -- so they must stay even though
-/// they are also check flags (locs 7770012/7770014/7770013); that residual false-collect is a
-/// known, separate issue (needs flagpoll-side suppression, not a lot rewrite).
+/// they are also check flags (locs 7770012/7770014/7770013). The false collect they used to cause
+/// is FIXED (2026-09-07), flagpoll-side as predicted, but not by suppressing those locations
+/// outright: with no lot and no native shop rewrite, the vanilla flag is the ONLY signal a genuine
+/// acquisition makes, so a blanket suppression would lose the real check. Instead the client
+/// records the flags IT flipped unset -> set ([`client_written_flags`], fed by the two writers
+/// below, both of which write only when the flag reads unset) and `er_logic::keyitem_poll` tells
+/// the poll to ignore exactly those. A flag the PLAYER set first is never recorded, so their check
+/// still reports; an earlier session's receive is held by `core::flag_poll_baseline`. Same guard
+/// covers Rold 400001 (the reported case, loc 7770556), Drawing-Room 400072 and any restore flag
+/// 191-196 a seed happens to poll.
 ///
 /// The Kit's coupling is the vanilla grant itself: the extracted common event gives it as
 /// `DirectlyGivePlayerItem(ItemType.Goods, 8500, 60120, 1)`, and the Crafting menu reads 60120, not
@@ -236,6 +252,9 @@ pub fn configure_seed_great_runes(names: &[String]) {
 pub fn reset_seed_great_runes() {
     SEED_GREAT_RUNE_FLAGS.lock().unwrap().clear();
     LEYNDELL_GATE_WARNED.store(0, Ordering::Relaxed);
+    // The poll guard is seed-scoped too: a different room has a different locationFlags table, and
+    // the collision set core.rs holds is rebuilt at its configure.
+    CLIENT_WRITTEN_FLAGS.lock().unwrap().clear();
 }
 
 /// Disarm vanilla's altar awards before the matching AP rune arrives. The event flag is the latch;
@@ -276,6 +295,16 @@ pub fn all_acquire_flags() -> impl Iterator<Item = u32> {
     entries().flat_map(|(_, fs)| fs.iter().copied())
 }
 
+/// Obtained/restored flags the client itself has flipped unset -> set THIS SESSION.
+///
+/// Read by the flag poll through `er_logic::keyitem_poll::poll_suppressed`: a check whose poll flag
+/// is in here was set by a RECEIVE, not by the player, so reporting it would be the 2026-09-07
+/// Rold-Medallion false collect. A flag the player earned first is absent by construction (both
+/// writers record only a write that found the flag unset), so genuine checks still report.
+pub fn client_written_flags() -> std::collections::BTreeSet<u32> {
+    CLIENT_WRITTEN_FLAGS.lock().unwrap().flags().clone()
+}
+
 /// Fast-path one-shot: set the vanilla obtained/restored flag(s) for a received item name, if any.
 /// Idempotent, but BEST-EFFORT -- writes at menu/load are silently discarded (R3, SWEEP), so this
 /// no longer logs success; `tick_keyitem_flags` (the reconcile tick) re-applies and owns the log.
@@ -283,7 +312,13 @@ pub fn set_acquire_flags(name: &str) {
     for (n, fs) in entries() {
         if n == name {
             for &f in fs {
+                // Record the write only when the flag read UNSET: that is exactly the case the
+                // CLIENT caused, and the poll guard suppresses nothing else (keyitem_poll).
+                let ours = !flags::get_event_flag(f);
                 flags::set_event_flag(f, true);
+                if ours {
+                    CLIENT_WRITTEN_FLAGS.lock().unwrap().record(f);
+                }
             }
         }
     }
@@ -303,6 +338,9 @@ pub fn tick_keyitem_flags(received: &std::collections::HashSet<String>) {
         for &f in fs {
             if !flags::get_event_flag(f) && flags::try_set_event_flag(f, true) {
                 applied += 1;
+                // Same latch, same record: this write is ours, so the poll must not read it back
+                // as a pickup of the check that shares the flag (keyitem_poll).
+                CLIENT_WRITTEN_FLAGS.lock().unwrap().record(f);
             }
         }
         if applied > 0 {
@@ -440,6 +478,36 @@ mod tests {
     #[test]
     fn crafting_kit_receive_sets_60120() {
         assert_eq!(acquire_flags("Crafting Kit"), vec![60120]);
+    }
+
+    /// The seam between THESE tables and the poll guard, the same way
+    /// `no_receive_set_flag_survives_the_poll_repoint_as_a_check` chains the whetblade split:
+    /// build a seed poll table holding the four double-booked checks plus an ordinary one, hand
+    /// `all_acquire_flags()` to `er_logic::keyitem_poll`, and pin that it names exactly the four.
+    /// If a future table entry adds another collision, this test makes it visible instead of
+    /// letting it become a silent false collect.
+    #[test]
+    fn poll_guard_names_every_double_booked_check_from_these_tables() {
+        let poll = std::collections::HashMap::from([
+            (7770556i64, 400001u32), // Leyndell :: Rold Medallion (the 2026-09-07 report)
+            (7770012, 60110),        // Limgrave :: Spirit Calling Bell
+            (7770014, 60130),        // Limgrave :: Whetstone Knife
+            (7770013, 60120),        // Limgrave :: Crafting Kit
+            (7770099, 510800),       // an ordinary check -- must never be guarded
+        ]);
+        let collisions = er_logic::keyitem_poll::colliding_checks(
+            &poll,
+            &all_acquire_flags().collect::<HashSet<u32>>(),
+        );
+        assert_eq!(
+            collisions,
+            vec![
+                (7770012, 60110),
+                (7770013, 60120),
+                (7770014, 60130),
+                (7770556, 400001),
+            ]
+        );
     }
 
     /// Acceptance (client#335): no duplicate check or item grant. 60120 keys TWO shop rows
