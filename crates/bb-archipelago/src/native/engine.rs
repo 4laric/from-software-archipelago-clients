@@ -929,32 +929,37 @@ mod tests {
         );
     }
 
-    /// clients#443's DEFICIT direction, which is the case clients#445 exists
-    /// for: the cave provably executed and the held stack came in under
-    /// `expected_after`. That is the shape a capped pouch overflowing into
-    /// storage produces -- and a concurrent spend produces it too, which is why
-    /// the field is `inferred_destination` and the value is `storage_suspected`
-    /// rather than `storage`.
+    /// clients#443's DEFICIT direction, which is now the case a Third
+    /// Umbilical Cord (max held 1) exposed: the cave provably executed and the
+    /// held stack came in under `expected_after`. A short read-back after an
+    /// executed delta is not proof of delivery -- it is exactly the shape the
+    /// game produces when it executes-and-discards a delta against a capped
+    /// stack, which used to be reported "completed" and silently dropped the
+    /// item. It now parks as `failed`, and `inferred_destination` is
+    /// `unknown` rather than a guess about where the item went.
     #[test]
-    fn an_executed_deficit_completion_records_the_deficit_and_suspects_storage() {
+    fn an_executed_deficit_completion_records_the_deficit_and_parks_as_failed() {
         let mut runtime = stocked(3);
         runtime.concurrent_spend = 2;
         let (mut engine, lines) = armed_engine(runtime);
-        assert_eq!(
-            drain(&mut engine, goods_request(0x384, 2, "ap_1", Some(3))).unwrap(),
-            GrantStep::Complete
+        assert!(
+            matches!(
+                drain(&mut engine, goods_request(0x384, 2, "ap_1", Some(3))).unwrap(),
+                GrantStep::Failed { .. }
+            ),
+            "a delta deficit must park, not complete"
         );
         let record = only_record(&lines);
-        assert_eq!(record.terminal_status, "completed");
+        assert_eq!(record.terminal_status, "failed");
         assert_eq!(record.expected_after, Some(5));
         assert_eq!(record.readbacks.last().copied().flatten(), Some(3));
         assert_eq!(record.readback_surplus, Some(-2));
         assert!(record.execution_evidence);
-        assert_eq!(record.inferred_destination, "storage_suspected");
+        assert_eq!(record.inferred_destination, "unknown");
         assert!(
             record
                 .terminal_detail
-                .contains("concurrent spend or storage overflow"),
+                .contains("delta executed but the held stack stayed short"),
             "{}",
             record.terminal_detail
         );

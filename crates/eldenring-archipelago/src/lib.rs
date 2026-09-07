@@ -9,6 +9,8 @@ use windows::Win32::{Foundation::HINSTANCE, System::SystemServices::DLL_PROCESS_
 mod ability_lock;
 mod ability_probe;
 mod auto_equip;
+#[cfg(test)]
+mod bedrock_fixture_test;
 mod boss_fight_probe;
 mod check_lots;
 mod config_watch;
@@ -51,6 +53,7 @@ mod notif_ticker;
 mod param_guard;
 mod params;
 mod physick_probe;
+mod profile;
 mod radahn_festival;
 mod reconcile_io;
 mod region;

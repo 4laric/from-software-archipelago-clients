@@ -2792,6 +2792,46 @@ mod tests {
     }
 
     #[test]
+    fn a_nameless_arena_variant_of_a_named_human_is_carved_out_with_its_character() {
+        // 🛑 FIA'S CHAMPIONS IN THE ASHEN CAPITAL, from play (2026-09-06, clients#652). The host
+        // enemy randomizer put the Deeproot fight in the tier-15 boss slot. Rogier (523250066,
+        // named) was left vanilla, but the two Fia's Champion bodies (523610066) and Lionel
+        // (523290066) carry `nameId 0` on their ARENA rows -- the arena names the fight, not the
+        // row -- so the nameId key did not know them, and the area placed them at index 14:
+        // 833 HP became 5726, 1216 became 8360, attack 3.64x, on a base the randomizer had already
+        // retuned. Same fight, two answers, and one of them a wall.
+        for id in [523610066, 523290066] {
+            assert!(
+                !area_may_vouch_for(id),
+                "{id} is an arena row of a named human"
+            );
+            assert_eq!(presumed_native_tier(id, Some(14)), None);
+            assert_eq!(
+                scale_action(false, false, id, 15, Some(14)),
+                ScaleAction::NoTouch
+            );
+        }
+        // The named sibling that DID mark the character, and Lionel's rewarded rows, go with
+        // them -- per character, as with Gideon above.
+        for id in [523610000, 523290000, 523290040] {
+            assert!(!area_may_vouch_for(id), "{id} shares the character prefix");
+        }
+        // Same shape, other fights: Adan's arena body and Bernahl's Farum Azula duel row.
+        for id in [523560020, 533290040] {
+            assert!(!area_may_vouch_for(id), "{id} is a nameless arena row");
+        }
+        // ⭐ The key is the c0000 CHARACTER PREFIX, and only where a sibling carries a signal. A
+        // family that is nameless and reward-less in every row (player clones, spirit-ash bodies)
+        // says nothing about itself and stays reachable by the area, exactly as before.
+        for id in [500000000, 520000000, 506200070] {
+            assert!(
+                area_may_vouch_for(id),
+                "{id} has no named or rewarded sibling"
+            );
+        }
+    }
+
+    #[test]
     fn the_carve_out_does_not_swallow_ordinary_enemies() {
         // ⭐ THE WHOLE POINT of keying on nameId: ordinary enemies are NAMELESS (6323 of 7039 rows
         // have nameId 0), so this excludes 275 rows and not the class. A gate that kept only NAMED

@@ -21,6 +21,11 @@ pub struct SemVer {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
+    /// V.R.M.F (AGENTS.md "Version numbers"): the FIXPACK, 0 for a release with none. Read from
+    /// a fourth dotted part (`0.6.0.1`, the apworld's spelling) or from `+f<N>` build metadata
+    /// (`0.6.0+f1`, this workspace's Cargo spelling, since Cargo needs a semver core). Any other
+    /// build metadata is still stripped and ignored, as semver says.
+    pub fixpack: u64,
     /// dot-separated ids; empty => release
     pub prerelease: Vec<String>,
 }
@@ -31,6 +36,29 @@ impl SemVer {
     }
     pub fn same_core(&self, o: &SemVer) -> bool {
         self.major == o.major && self.minor == o.minor && self.patch == o.patch
+    }
+    /// The apworld's spelling of this version: `0.6.0`, or `0.6.0.1` when a fixpack is set.
+    /// Pre-release ids are not carried; the apworld never spells them.
+    pub fn release_form(&self) -> String {
+        if self.fixpack == 0 {
+            format!("{}.{}.{}", self.major, self.minor, self.patch)
+        } else {
+            format!(
+                "{}.{}.{}.{}",
+                self.major, self.minor, self.patch, self.fixpack
+            )
+        }
+    }
+    /// This workspace's Cargo spelling: `0.6.0`, or `0.6.0+f1` when a fixpack is set.
+    pub fn cargo_form(&self) -> String {
+        if self.fixpack == 0 {
+            format!("{}.{}.{}", self.major, self.minor, self.patch)
+        } else {
+            format!(
+                "{}.{}.{}+f{}",
+                self.major, self.minor, self.patch, self.fixpack
+            )
+        }
     }
 }
 
@@ -53,27 +81,53 @@ fn is_numeric_id(s: &str) -> bool {
 }
 
 pub fn parse_semver(input: &str) -> Result<SemVer, ParseError> {
-    // strip build metadata
-    let s = input.split('+').next().unwrap_or(input);
+    // strip build metadata -- but read a `+f<N>` fixpack out of it first (Cargo spelling)
+    let (s, meta) = match input.split_once('+') {
+        Some((s, meta)) => (s, Some(meta)),
+        None => (input, None),
+    };
+    let meta_fixpack = meta
+        .and_then(|m| m.strip_prefix('f'))
+        .filter(|n| is_numeric_id(n))
+        .map(|n| n.parse::<u64>().unwrap_or(0));
 
     let (core, pre) = match s.split_once('-') {
         Some((core, pre)) => (core, Some(pre)),
         None => (s, None),
     };
     let parts: Vec<&str> = core.split('.').collect();
-    if parts.len() != 3 {
+    // three parts is semver; four is V.R.M.F, the apworld's spelling of a fixpack
+    if parts.len() != 3 && parts.len() != 4 {
         return Err(ParseError(format!("bad semver core: {input}")));
     }
     let parse_num = |p: &str| -> Result<u64, ParseError> {
         p.parse::<u64>()
             .map_err(|_| ParseError(format!("bad semver core: {input}")))
     };
+    let dotted_fixpack = if parts.len() == 4 {
+        Some(parse_num(parts[3])?)
+    } else {
+        None
+    };
+    if let (Some(a), Some(b)) = (dotted_fixpack, meta_fixpack) {
+        if a != b {
+            return Err(ParseError(format!(
+                "fixpack spelled twice and differently: {input}"
+            )));
+        }
+    }
     Ok(SemVer {
         major: parse_num(parts[0])?,
         minor: parse_num(parts[1])?,
         patch: parse_num(parts[2])?,
+        fixpack: dotted_fixpack.or(meta_fixpack).unwrap_or(0),
         prerelease: pre.map(split_dots).unwrap_or_default(),
     })
+}
+
+/// `0.6.0+f1` (Cargo) or `0.6.0.1` (apworld) -> `0.6.0.1`; `0.6.0` -> `0.6.0`.
+pub fn release_form(version: &str) -> Result<String, ParseError> {
+    Ok(parse_semver(version)?.release_form())
 }
 
 /// pre-release precedence (port of `comparePre`).
@@ -111,10 +165,13 @@ fn compare_pre(a: &[String], b: &[String]) -> Ordering {
 }
 
 pub fn compare_semver(a: &SemVer, b: &SemVer) -> Ordering {
+    // The fixpack orders AFTER the core and BEFORE the pre-release ids: 0.6.0 < 0.6.0.1 < 0.6.1,
+    // and a pre-release of a fixpack still sorts under that fixpack's release.
     a.major
         .cmp(&b.major)
         .then_with(|| a.minor.cmp(&b.minor))
         .then_with(|| a.patch.cmp(&b.patch))
+        .then_with(|| a.fixpack.cmp(&b.fixpack))
         .then_with(|| compare_pre(&a.prerelease, &b.prerelease))
 }
 
@@ -245,6 +302,30 @@ mod tests {
         assert!(!sat("0.1.0-beta.1", band));
         assert!(!sat("0.1.0-beta.3", band));
         assert!(!sat("0.1.0", band));
+    }
+
+    #[test]
+    fn a_fixpack_parses_from_both_spellings_and_orders_between_patches() {
+        // V.R.M.F (AGENTS.md): the apworld spells 0.6.0.1, this workspace's Cargo spells 0.6.0+f1.
+        let dotted = parse_semver("0.6.0.1").unwrap();
+        let cargo = parse_semver("0.6.0+f1").unwrap();
+        assert_eq!(dotted, cargo);
+        assert_eq!(dotted.fixpack, 1);
+        assert_eq!(dotted.release_form(), "0.6.0.1");
+        assert_eq!(dotted.cargo_form(), "0.6.0+f1");
+        assert_eq!(parse_semver("0.6.0").unwrap().release_form(), "0.6.0");
+        assert_eq!(release_form("0.6.0+f1").unwrap(), "0.6.0.1");
+        let base = parse_semver("0.6.0").unwrap();
+        let next = parse_semver("0.6.1").unwrap();
+        assert_eq!(compare_semver(&base, &dotted), Ordering::Less);
+        assert_eq!(compare_semver(&dotted, &next), Ordering::Less);
+        // same core, so a 0.6.0.x client is on the 0.6.0 seed line
+        assert!(dotted.same_core(&base));
+        // other build metadata is still just stripped
+        assert_eq!(parse_semver("0.6.0+build.5").unwrap().fixpack, 0);
+        // spelled twice and differently is a refusal, not a guess
+        assert!(parse_semver("0.6.0.2+f1").is_err());
+        assert!(parse_semver("0.6.0.1.1").is_err());
     }
 
     #[test]

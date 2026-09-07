@@ -1583,10 +1583,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .with_context(|| format!("AP item {} has no Bloodborne binding", item.ap_item_id))?
             .clone();
         let target_level = if self.config.auto_upgrade && binding.reinforcement_level.is_some() {
-            if is_non_upgradable_shield(
-                binding.normalized_item_id,
-                binding.reinforcement_level,
-            ) {
+            if is_non_upgradable_shield(binding.normalized_item_id, binding.reinforcement_level) {
                 Some(0)
             } else {
                 self.backend.target_weapon_level()?
@@ -1860,17 +1857,26 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         };
 
         if pending.reinforcement_level.is_some_and(|level| level > 0)
-            && is_non_upgradable_shield(
-                pending.normalized_item_id,
-                pending.reinforcement_level,
-            )
+            && is_non_upgradable_shield(pending.normalized_item_id, pending.reinforcement_level)
         {
-            anyhow::bail!(
-                "refusing invalid pending shield grant at AP index {}: normalized EquipParamWeapon row {} (+{}) does not exist; verify that the earlier grant command did not execute, then repair the durable pending plan to the base shield row before retrying",
-                pending.index,
-                pending.normalized_item_id,
-                pending.reinforcement_level.unwrap_or_default(),
-            );
+            // A plan persisted by an older client that auto-upgraded a shield
+            // to a row the binder does not have. Park it, by index, so the
+            // stream advances past it: a bare error here re-raised on every
+            // poll and blocked every later item with no console command able
+            // to clear it. `blocked` lists the park and `retry INDEX CONFIRM`
+            // re-plans it, which the clamp above now pins to the base row.
+            let failure = GrantTerminalFailure {
+                tag: grant_tag(item.index),
+                status: "invalid_shield_plan".to_string(),
+                detail: format!(
+                    "pending plan at AP index {} names EquipParamWeapon row {} (+{}), which does not exist; verify that the earlier grant command did not execute, then `retry {} CONFIRM` to re-plan it at the base shield row",
+                    pending.index,
+                    pending.normalized_item_id,
+                    pending.reinforcement_level.unwrap_or_default(),
+                    pending.index,
+                ),
+            };
+            return self.park_terminal_grant(item, &pending, failure);
         }
 
         // Fail closed on a provenance this build has never heard of: refuse
@@ -5197,7 +5203,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_reinforced_shield_pending_plan_is_refused_without_a_grant() {
+    fn legacy_reinforced_shield_pending_plan_is_parked_without_a_grant() {
         let ledger_path = path();
         let mut ledger = ReceiveLedger::default();
         ledger
@@ -5220,22 +5226,35 @@ mod tests {
             .unwrap();
         let mut client = loop_with(MockBackend::default(), ledger, ledger_path, config());
 
-        let error = client
+        let result = client
             .poll_items(&[IncomingItem {
                 index: 0,
                 ap_item_id: 3000,
             }])
-            .unwrap_err();
+            .unwrap();
 
-        assert!(error.to_string().contains("refusing invalid pending shield grant"));
+        // Parked, not wedged: no grant was submitted, the entry is
+        // acknowledged as blocked with the invalid row named, and the
+        // pending plan is cleared so the next index can deliver.
+        let ItemPollResult::Blocked(blocked) = result else {
+            panic!("expected the invalid shield plan to be parked, got {result:?}");
+        };
+        assert_eq!(blocked.index, 0);
+        assert_eq!(blocked.status, "invalid_shield_plan");
+        assert!(blocked.detail.contains("19100700"));
+        assert!(blocked.detail.contains("retry 0 CONFIRM"));
         assert!(client.backend().grants.is_empty());
-        assert_eq!(
-            client
-                .ledger()
-                .slot("seed", "slot")
-                .and_then(|slot| slot.pending.as_ref())
-                .map(|pending| pending.normalized_item_id),
-            Some(19_100_700),
+        let slot = client.ledger().slot("seed", "slot").unwrap();
+        assert!(slot.pending.is_none());
+        assert_eq!(slot.next_index(), 1);
+        let parked = slot.acknowledged.get(&0).unwrap();
+        assert_eq!(parked.normalized_item_id, 19_100_700);
+        assert!(
+            parked
+                .blocked
+                .as_deref()
+                .unwrap()
+                .starts_with("invalid_shield_plan")
         );
     }
 
