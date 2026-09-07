@@ -372,6 +372,15 @@ impl BloodborneBackend for Backend {
         }
     }
 
+    // Forwarded for the same reason as the two observers above: a default
+    // here would answer "readable" for the native backend forever.
+    fn inventory_readable(&mut self, normalized_item_id: u32) -> bool {
+        match self {
+            Self::Mock(backend) => backend.inventory_readable(normalized_item_id),
+            Self::Native(backend) => backend.inventory_readable(normalized_item_id),
+        }
+    }
+
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
         match self {
             Self::Mock(backend) => backend.grant_may_have_applied(tag),

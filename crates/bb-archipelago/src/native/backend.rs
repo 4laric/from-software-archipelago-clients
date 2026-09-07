@@ -825,6 +825,13 @@ impl BloodborneBackend for NativeBackend {
         Ok(StackObservation::Quantity(stack.quantity))
     }
 
+    fn inventory_readable(&mut self, normalized_item_id: u32) -> bool {
+        // Deliberately `observe_stack` and nothing else: this is the same
+        // hydration gate `observe_stack_quantity` opens with, minus the
+        // absent-poll bookkeeping that follows it.
+        self.delivery.observe_stack(normalized_item_id).is_some()
+    }
+
     fn grant_may_have_applied(&mut self, tag: &str) -> Result<bool> {
         Ok(self.delivery.command_may_have_applied(tag))
     }
