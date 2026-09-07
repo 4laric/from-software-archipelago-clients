@@ -2793,7 +2793,7 @@ mod tests {
 
     #[test]
     fn a_nameless_arena_variant_of_a_named_human_is_carved_out_with_its_character() {
-        // 🛑 FIA'S CHAMPIONS IN THE ASHEN CAPITAL, from play (2026-09-06, clients#649). The host
+        // 🛑 FIA'S CHAMPIONS IN THE ASHEN CAPITAL, from play (2026-09-06, clients#652). The host
         // enemy randomizer put the Deeproot fight in the tier-15 boss slot. Rogier (523250066,
         // named) was left vanilla, but the two Fia's Champion bodies (523610066) and Lionel
         // (523290066) carry `nameId 0` on their ARENA rows -- the arena names the fight, not the

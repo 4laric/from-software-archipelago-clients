@@ -442,7 +442,7 @@ pub const TOP_BAND_INDEX: u8 = 19;
 /// A named character (`nameId`) with ANY unrunged, reward-less row has ALL of its unrunged
 /// rows here. So does a c0000 human-NPC family (id prefix `5CCCC`) whose reward-less row
 /// sits beside a named or rewarded sibling: the boss-ARENA variant of a named human is
-/// nameless on its own row (Fia's Champion 523610066, Lionel 523290066 -- clients#649).
+/// nameless on its own row (Fia's Champion 523610066, Lionel 523290066 -- clients#652).
 /// 🛑 Their bases already assume a late encounter, so an area-derived delta multiplies on top
 /// of endgame tuning -- measured in play 2026-08-05, when a Vyke row and Vyke's Finger Maiden
 /// were area-placed at tier 11 in a Liurnia whose ground reads index 5.

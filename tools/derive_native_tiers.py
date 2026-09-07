@@ -206,7 +206,7 @@ def main() -> int:
         for name_id, rs in by_name.items()
         if any(as_int(r, "getSoul") <= 0 for r in rs)
     }
-    # THE SECOND KEY: the c0000 HUMAN-NPC id space, keyed by CHARACTER PREFIX (clients#649).
+    # THE SECOND KEY: the c0000 HUMAN-NPC id space, keyed by CHARACTER PREFIX (clients#652).
     #
     # A c0000 row id is `5` + a four-digit character number + a four-digit variant, and the
     # `nameId` on it is a per-ROW field, not a per-character one. The boss-ARENA variant of a
@@ -300,7 +300,7 @@ def main() -> int:
         w("/// A named character (`nameId`) with ANY unrunged, reward-less row has ALL of its unrunged\n")
         w("/// rows here. So does a c0000 human-NPC family (id prefix `5CCCC`) whose reward-less row\n")
         w("/// sits beside a named or rewarded sibling: the boss-ARENA variant of a named human is\n")
-        w("/// nameless on its own row (Fia's Champion 523610066, Lionel 523290066 -- clients#649).\n")
+        w("/// nameless on its own row (Fia's Champion 523610066, Lionel 523290066 -- clients#652).\n")
         w("/// 🛑 Their bases already assume a late encounter, so an area-derived delta multiplies on top\n")
         w("/// of endgame tuning -- measured in play 2026-08-05, when a Vyke row and Vyke's Finger Maiden\n")
         w("/// were area-placed at tier 11 in a Liurnia whose ground reads index 5.\n")
