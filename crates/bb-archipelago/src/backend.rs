@@ -149,6 +149,19 @@ pub trait BloodborneBackend {
     ) -> Result<StackObservation> {
         Ok(StackObservation::Unsupported)
     }
+    /// Whether the game has exposed the inventory geometry this stack lives
+    /// in (clients#427 follow-up). Read-only and side-effect free, unlike
+    /// [`Backend::observe_stack_quantity`], which advances an absent-poll
+    /// counter for a stack that is hydrated but absent -- so the stall
+    /// diagnosis can ask "is inventory readable at all?" without perturbing
+    /// the delivery path it is diagnosing.
+    ///
+    /// The default answers `true`: a backend that has not wired a real check
+    /// must never let the diagnosis blame an un-hydrated inventory it cannot
+    /// actually see.
+    fn inventory_readable(&mut self, _normalized_item_id: u32) -> bool {
+        true
+    }
     /// Whether the command published for `tag` may already have applied to the
     /// game (clients#427 follow-up).
     ///
@@ -472,6 +485,10 @@ impl BloodborneBackend for MockBackend {
                 .copied()
                 .unwrap_or(0),
         ))
+    }
+
+    fn inventory_readable(&mut self, _normalized_item_id: u32) -> bool {
+        !self.stack_observation_supported || self.stack_observation_ready
     }
 
     fn observe_storage_quantity(

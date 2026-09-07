@@ -941,7 +941,15 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// player can act on. Read from the ledger and the runtime gate, so it
     /// names the actual wait rather than a generic "pending".
     pub fn pending_diagnosis(&mut self) -> Option<String> {
-        let (index, ap_item_id, grant_complete, category8_award, token_routed_to_storage) = {
+        let (
+            index,
+            ap_item_id,
+            grant_complete,
+            category8_award,
+            token_routed_to_storage,
+            normalized_item_id,
+            has_baseline,
+        ) = {
             let slot = self.ledger.slot(&self.seed_name, &self.slot_name)?;
             let pending = slot.pending.as_ref()?;
             (
@@ -953,6 +961,8 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     .get(&pending.ap_item_id)
                     .cloned(),
                 pending.token_routed_to_storage,
+                pending.normalized_item_id,
+                pending.observed_before.is_some(),
             )
         };
         let head = format!(
@@ -1014,6 +1024,21 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                         }
                     }
                 }
+            } else if !grant_complete
+                && !has_baseline
+                && !self.backend.inventory_readable(normalized_item_id)
+            {
+                // clients#427 follow-up: the fresh-grant baseline never
+                // resolved, so no command was ever submitted -- the native
+                // contract caches the inventory cell only on the first
+                // consumable use after launch. "Restart the client" is exactly
+                // the wrong advice here; restarting re-enters the same wait.
+                format!(
+                    "{head}: the game has not exposed its inventory to the client yet (it is \
+                 cached the first time a consumable is used after launch). Use one Blood Vial \
+                 or fire one Quicksilver Bullet and delivery resumes on its own; restarting \
+                 the client will not help"
+                )
             } else if !grant_complete {
                 format!(
                     "{head}: the native grant has not completed. Leave menus and loading screens; \
@@ -4528,6 +4553,60 @@ mod tests {
             client.poll_items(&received).unwrap(),
             ItemPollResult::Completed(CompletedItem { index: 0, .. })
         ));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// clients#427 follow-up: the stall that this state produces must be named
+    /// for what it is. Nothing was ever submitted, so "the native grant has not
+    /// completed ... restart the client" is actively wrong -- a restart re-enters
+    /// the same wait, which is exactly what the player who reported this did.
+    #[test]
+    fn stall_diagnosis_names_an_unhydrated_inventory_instead_of_blaming_the_grant() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.stack_observation_ready = false;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 2000,
+        }];
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+
+        let diagnosis = client.pending_diagnosis().unwrap();
+        assert!(
+            diagnosis.contains("has not exposed its inventory"),
+            "expected the unhydrated-inventory case, got: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("Quicksilver Bullet"),
+            "expected the actionable remedy, got: {diagnosis}"
+        );
+        assert!(
+            !diagnosis.contains("the native grant has not completed"),
+            "must not blame the grant when none was submitted, got: {diagnosis}"
+        );
+
+        // Once inventory hydrates, a genuinely incomplete grant still gets the
+        // original wording -- the new branch must not swallow that case.
+        client.backend_mut().stack_observation_ready = true;
+        client.backend_mut().delay_grant(grant_tag(0), 5);
+        assert_eq!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Pending
+        );
+        let diagnosis = client.pending_diagnosis().unwrap();
+        assert!(
+            diagnosis.contains("the native grant has not completed"),
+            "expected the incomplete-grant case once inventory is readable, got: {diagnosis}"
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 
