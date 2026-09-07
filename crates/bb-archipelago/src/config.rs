@@ -399,6 +399,11 @@ pub struct RuntimeConfig {
     /// AP location whose debounced check completes this bounded world.
     #[serde(default)]
     pub goal_location: Option<i64>,
+    /// The seed's YAML goal key (`submit_to_gehrman`, `refuse_gehrman`,
+    /// `moon_presence`). Informational only: nothing in delivery reads it, and
+    /// contracts written before it existed load with `None`.
+    #[serde(default)]
+    pub goal: Option<String>,
     /// Seed-owned descriptor of the single good granted after every location
     /// check. Older contracts omit it and the client falls back to its
     /// Quicksilver Bullet constant.
@@ -582,6 +587,16 @@ impl RuntimeConfig {
                 value
                     .as_i64()
                     .context("slot_data.goal_location must be a signed 64-bit integer")?,
+            );
+        }
+        if let Some(value) = slot_data.get("goal")
+            && !value.is_null()
+        {
+            self.goal = Some(
+                value
+                    .as_str()
+                    .context("slot_data.goal must be a string")?
+                    .to_owned(),
             );
         }
         if let Some(goal) = self.goal_location {
@@ -815,6 +830,7 @@ mod tests {
             location_check_debounce: 3,
             mock_set_flags: vec![],
             goal_location: None,
+            goal: None,
             sustain_item: None,
         }
     }
@@ -885,7 +901,8 @@ mod tests {
                 },
                 "auto_upgrade": true,
                 "auto_equip": true,
-                "goal_location": 12259363
+                "goal_location": 12259363,
+                "goal": "moon_presence"
             }))
             .unwrap();
         assert_eq!(config.locations.len(), 1);
@@ -905,6 +922,15 @@ mod tests {
         assert!(config.auto_upgrade);
         assert!(config.auto_equip);
         assert_eq!(config.goal_location, Some(12_259_363));
+        assert_eq!(config.goal.as_deref(), Some("moon_presence"));
+        // A contract written before the key existed simply has no goal name.
+        assert!(
+            local()
+                .apply_slot_data(&json!({"version": 1}))
+                .unwrap()
+                .goal
+                .is_none()
+        );
     }
 
     #[test]
