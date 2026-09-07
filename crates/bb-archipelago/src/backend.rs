@@ -166,6 +166,29 @@ pub trait BloodborneBackend {
     /// Kill the loaded player for an incoming DeathLink. `false` means the
     /// validated player HP pointer is not captured/gameplay-ready yet.
     fn death_link_kill(&mut self) -> Result<bool>;
+    /// The player's current HP right now, for the outbound local-death
+    /// detector (bb-archipelago#78).
+    ///
+    /// `None` is "not observable", never "zero": no captured player pointer,
+    /// a load or menu transition, a save that is not the bound one, or a
+    /// backend with no HP read at all. The caller's edge machine treats
+    /// `None` as "forget what you knew", which is what keeps a load or a
+    /// quit-to-title from looking like a death.
+    ///
+    /// INFERRED, and unvalidated live. `docs/SESSION-death-signal.md` fixes
+    /// three candidate classes for Bloodborne's death signal and rules out an
+    /// event flag entirely; this is candidate class 1, "HP at zero", chosen
+    /// because the cell it reads is the same one `death_link_kill` already
+    /// writes through and is therefore the only player-state read this client
+    /// has ever exercised in game. Whether an alive->dead HP edge is exactly
+    /// "the player died" -- as opposed to a fake-death SpEffect window, a
+    /// cutscene, or a torn read -- is what the probe runbook exists to
+    /// settle. Required rather than defaulted for the same reason as
+    /// [`Self::observe_stack_quantity`]: the shipped binary dispatches
+    /// through a `Backend` enum, and a default here would be silently
+    /// swallowed by an enum arm that forgot to forward it. A backend without
+    /// the read answers `Ok(None)` explicitly.
+    fn observe_player_hp(&mut self) -> Result<Option<u32>>;
     /// Retract a published-but-unexecuted grant command (clients#296). The
     /// client calls this when the validated context the command was published
     /// under is gone -- a save switch, a non-gameplay transition, or a process
@@ -248,6 +271,11 @@ pub struct MockBackend {
     /// storage, for exercising the stall-diagnosis storage case without a
     /// live native engine.
     pub storage_routed: HashSet<String>,
+    /// bb-archipelago#78: what `observe_player_hp` answers. `None` models a
+    /// backend that cannot see the player right now -- a load, a menu, an
+    /// uncaptured pointer -- and is the default, so every fixture written
+    /// before the local-death detector existed observes nothing at all.
+    pub player_hp: Option<u32>,
     grant_delays: HashMap<String, u8>,
     pending_grants: HashSet<String>,
     equip_delays: HashMap<String, u8>,
@@ -278,6 +306,7 @@ impl Default for MockBackend {
             storage_observation_supported: false,
             retained_unwitnessed: HashSet::new(),
             storage_routed: HashSet::new(),
+            player_hp: None,
             grant_delays: HashMap::new(),
             pending_grants: HashSet::new(),
             equip_delays: HashMap::new(),
@@ -380,10 +409,28 @@ impl BloodborneBackend for MockBackend {
     }
 
     fn death_link_kill(&mut self) -> Result<bool> {
-        Ok(self
+        let killed = self
             .location_context
             .as_ref()
-            .is_some_and(|context| context.gameplay_ready))
+            .is_some_and(|context| context.gameplay_ready);
+        if killed {
+            // Mirror the native write: the HP cell the detector polls is the
+            // same one the kill zeroes, so a mocked incoming DeathLink
+            // produces the same alive->dead edge a real one would.
+            self.player_hp = Some(0);
+        }
+        Ok(killed)
+    }
+
+    fn observe_player_hp(&mut self) -> Result<Option<u32>> {
+        if !self
+            .location_context
+            .as_ref()
+            .is_some_and(|context| context.gameplay_ready)
+        {
+            return Ok(None);
+        }
+        Ok(self.player_hp)
     }
 
     fn observe_stack_quantity(

@@ -221,14 +221,154 @@ pub enum SustainPollResult {
     },
 }
 
-/// Seed-owned outbound DeathLink policy decision. Detection and broadcast are
-/// intentionally separate from this durable state machine: Bloodborne does
-/// not enable either until its local-death signal is live-validated.
+/// Seed-owned outbound DeathLink policy decision. Detection stays separate
+/// from this durable state machine: the machine is exact and unit-tested, the
+/// detector below it is inferred and gated off by default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeathLinkAmnestyDecision {
     Disabled,
-    Forgiven { used: u32, allowance: u32 },
+    /// This slot's one free death (bb-archipelago#383). Spent at most once per
+    /// seed+slot, before the amnesty cycle is consulted, and it neither
+    /// increments nor resets that cycle -- the player's first amnesty-counted
+    /// death is still their first after being graced.
+    Graced,
+    Forgiven {
+        used: u32,
+        allowance: u32,
+    },
     Send,
+}
+
+/// Consecutive polls a reading must survive before the detector believes it.
+/// A torn read across a load is the failure this defends against: guest I/O
+/// can hand back a stale or half-written record, and a single spurious zero
+/// must not broadcast a death to the whole multiworld.
+const DEATH_CONFIRM_POLLS: u8 = 2;
+const ALIVE_ARM_POLLS: u8 = 2;
+
+/// How many observable polls an armed echo suppression survives before it is
+/// dropped as stale. The kill zeroes HP directly, so the edge it explains lands
+/// within a poll or two; a latch that outlived its kill would swallow a real
+/// death instead, which is the worse failure of the two. At the loop's cadence
+/// this is comfortably under a second.
+const ECHO_SUPPRESSION_POLLS: u8 = 20;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum VitalPhase {
+    /// Nothing is known: startup, or the observation went unavailable. The
+    /// detector never fires out of this phase, which is what makes a load, a
+    /// menu, a quit-to-title and an out-of-world moment all non-events.
+    #[default]
+    Unknown,
+    Alive,
+    Dead,
+}
+
+/// One believed alive->dead transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalDeathEdge {
+    /// A death this client did not cause.
+    Local,
+    /// A death this client itself inflicted for an incoming DeathLink. Never
+    /// reported outbound, and never charged against grace or amnesty:
+    /// re-broadcasting it is the classic DeathLink echo loop.
+    IncomingEcho,
+}
+
+/// Edge detector over the backend's HP observation (bb-archipelago#78).
+///
+/// Deliberately pure and infallible: it takes `Option<u32>` and answers with
+/// an edge or nothing, so the whole policy surface is testable without a game.
+/// `None` -- not observable -- always returns to [`VitalPhase::Unknown`]
+/// rather than inventing a value.
+#[derive(Debug, Default)]
+pub struct LocalDeathObserver {
+    phase: VitalPhase,
+    streak: u8,
+    /// Polls remaining in which a believed death is attributed to this
+    /// client's own kill write rather than to the player. Set by
+    /// [`Self::expect_incoming_kill`]; spent by the edge it explains, by the
+    /// player coming back alive, or by simply running out.
+    echo_budget: u8,
+}
+
+impl LocalDeathObserver {
+    /// Arm echo suppression: the next believed death is ours, not the
+    /// player's.
+    pub fn expect_incoming_kill(&mut self) {
+        self.echo_budget = ECHO_SUPPRESSION_POLLS;
+    }
+
+    pub fn observe(&mut self, hp: Option<u32>) -> Option<LocalDeathEdge> {
+        let Some(hp) = hp else {
+            // Not observable. Forget the phase; keep the echo latch, because
+            // an incoming kill followed by a load is still our kill.
+            self.phase = VitalPhase::Unknown;
+            self.streak = 0;
+            return None;
+        };
+        // Only observable polls age the latch: a kill followed by a load is
+        // still our kill, however long the load takes.
+        self.echo_budget = self.echo_budget.saturating_sub(1);
+        let target = if hp == 0 {
+            VitalPhase::Dead
+        } else {
+            VitalPhase::Alive
+        };
+        if target == self.phase {
+            self.streak = 0;
+            return None;
+        }
+        self.streak = self.streak.saturating_add(1);
+        let required = if target == VitalPhase::Dead {
+            DEATH_CONFIRM_POLLS
+        } else {
+            ALIVE_ARM_POLLS
+        };
+        if self.streak < required {
+            return None;
+        }
+        let previous = std::mem::replace(&mut self.phase, target);
+        self.streak = 0;
+        match target {
+            VitalPhase::Alive => {
+                // Back on their feet: any unexplained latch is stale, and a
+                // stale latch would swallow a real death later.
+                self.echo_budget = 0;
+                None
+            }
+            // Only Alive -> Dead is a death. Unknown -> Dead is loading into a
+            // save that is already on the death screen, or a first observation
+            // taken mid-death, and is silently absorbed.
+            VitalPhase::Dead if previous == VitalPhase::Alive => {
+                Some(if std::mem::take(&mut self.echo_budget) > 0 {
+                    LocalDeathEdge::IncomingEcho
+                } else {
+                    LocalDeathEdge::Local
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What one [`ClientLoop::poll_local_death`] saw. Every variant except
+/// [`Self::Idle`] is a line the operator surface prints, so a live tester can
+/// read the detector's behaviour without a broadcast happening at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalDeathPoll {
+    /// No believed transition this poll. The overwhelmingly common answer.
+    Idle,
+    /// A death this client caused for an incoming DeathLink. Nothing is
+    /// persisted and nothing is sent.
+    SuppressedEcho,
+    /// A local death observed while outbound send is gated off. Reported for
+    /// the probe and otherwise inert: the durable grace/amnesty state is NOT
+    /// touched, so validating the signal cannot silently spend a player's
+    /// first-death grace.
+    ObservedSendDisabled,
+    /// A local death that ran through the durable policy machine.
+    Decided(DeathLinkAmnestyDecision),
 }
 
 pub struct ClientLoop<B> {
@@ -245,6 +385,7 @@ pub struct ClientLoop<B> {
     watermark_notice: Option<WatermarkOutcome>,
     sustain_pending_polls: Option<(i64, u32)>,
     sustain_notice: Option<SustainPollResult>,
+    death_observer: LocalDeathObserver,
 }
 
 impl<B: BloodborneBackend> ClientLoop<B> {
@@ -277,6 +418,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             watermark_notice: None,
             sustain_pending_polls: None,
             sustain_notice: None,
+            death_observer: LocalDeathObserver::default(),
         }
     }
 
@@ -380,6 +522,48 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         self.config.death_link_amnesty
     }
 
+    /// Whether this seed asked for the outbound half (bb-archipelago#78). Two
+    /// keys, both default-false, and both must be on: `death_link` alone keeps
+    /// the receive-only behaviour every existing seed has.
+    pub fn death_link_send_enabled(&self) -> bool {
+        self.config.death_link && self.config.death_link_send
+    }
+
+    pub fn death_link_first_death_grace_enabled(&self) -> bool {
+        self.config.death_link_first_death_grace
+    }
+
+    /// Whether this slot's first-death grace has already been spent.
+    pub fn death_link_first_death_graced(&self) -> bool {
+        self.ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .is_some_and(|slot| slot.death_link_first_death_graced)
+    }
+
+    /// Poll the inferred local-death signal once (bb-archipelago#78).
+    ///
+    /// Runs only while DeathLink is on at all, so a session without it never
+    /// pays for a read and never changes behaviour. When DeathLink is on but
+    /// outbound send is gated off, the detector still runs and still reports
+    /// -- that is the whole point of the probe -- but touches no durable
+    /// state.
+    pub fn poll_local_death(&mut self) -> Result<LocalDeathPoll> {
+        if !self.config.death_link {
+            return Ok(LocalDeathPoll::Idle);
+        }
+        let hp = self.backend.observe_player_hp()?;
+        match self.death_observer.observe(hp) {
+            None => Ok(LocalDeathPoll::Idle),
+            Some(LocalDeathEdge::IncomingEcho) => Ok(LocalDeathPoll::SuppressedEcho),
+            Some(LocalDeathEdge::Local) if !self.config.death_link_send => {
+                Ok(LocalDeathPoll::ObservedSendDisabled)
+            }
+            Some(LocalDeathEdge::Local) => Ok(LocalDeathPoll::Decided(
+                self.record_qualifying_local_death()?,
+            )),
+        }
+    }
+
     /// Record one qualifying *local* death and persist the decision before it
     /// can be reported or broadcast. Incoming DeathLinks never call this
     /// method and therefore cannot consume local amnesty.
@@ -388,8 +572,16 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             return Ok(DeathLinkAmnestyDecision::Disabled);
         }
         let allowance = self.config.death_link_amnesty;
+        let grace = self.config.death_link_first_death_grace;
         let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
-        let decision = if slot.death_link_amnesty_used < allowance {
+        // bb-archipelago#383. The grace is checked before the amnesty branch
+        // and returns without touching the counter either way: a graced death
+        // is not a forgiven one, so the amnesty cycle still starts fresh at the
+        // player's next death.
+        let decision = if grace && !slot.death_link_first_death_graced {
+            slot.death_link_first_death_graced = true;
+            DeathLinkAmnestyDecision::Graced
+        } else if slot.death_link_amnesty_used < allowance {
             slot.death_link_amnesty_used += 1;
             DeathLinkAmnestyDecision::Forgiven {
                 used: slot.death_link_amnesty_used,
@@ -409,7 +601,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         if !self.config.death_link {
             return Ok(false);
         }
-        self.backend.death_link_kill()
+        let killed = self.backend.death_link_kill()?;
+        if killed {
+            // The kill zeroes the same HP cell the detector polls, so without
+            // this latch our own write would read back as the player dying and
+            // bounce straight back out: the DeathLink echo loop.
+            self.death_observer.expect_incoming_kill();
+        }
+        Ok(killed)
     }
 
     /// The AP seed this runtime (and every ledger row it touches) is bound to.
@@ -2300,6 +2499,8 @@ mod tests {
             auto_upgrade: false,
             auto_equip: false,
             death_link: false,
+            death_link_send: false,
+            death_link_first_death_grace: false,
             pickup_notification_probe: false,
             boss_flag_census: false,
             rune_capture: false,
@@ -2807,6 +3008,10 @@ mod tests {
 
         fn death_link_kill(&mut self) -> Result<bool> {
             self.inner.death_link_kill()
+        }
+
+        fn observe_player_hp(&mut self) -> Result<Option<u32>> {
+            self.inner.observe_player_hp()
         }
 
         fn withdraw_unwitnessed_grant(&mut self, tag: &str) -> Result<bool> {
@@ -6417,6 +6622,302 @@ mod tests {
             DeathLinkAmnestyDecision::Disabled
         );
         assert!(!ledger_path.exists());
+    }
+
+    /// Drive the detector's HP polls without a game. Returns what each poll
+    /// decided, so a test can assert on the whole trajectory rather than on a
+    /// single sample.
+    fn drive_deaths(
+        client: &mut ClientLoop<MockBackend>,
+        readings: &[Option<u32>],
+    ) -> Vec<LocalDeathPoll> {
+        readings
+            .iter()
+            .map(|hp| {
+                client.backend_mut().player_hp = *hp;
+                client.poll_local_death().unwrap()
+            })
+            .collect()
+    }
+
+    fn death_link_config(send: bool) -> RuntimeConfig {
+        let mut cfg = config();
+        cfg.death_link = true;
+        cfg.death_link_send = send;
+        cfg
+    }
+
+    /// A live alive->dead edge fires exactly once, after the debounce, and the
+    /// player staying dead does not fire again.
+    #[test]
+    fn local_death_fires_once_per_transition_and_debounces() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            death_link_config(true),
+        );
+        let seen = drive_deaths(
+            &mut client,
+            &[
+                // Arm alive (two polls), then one lone zero -- a torn read --
+                // which must NOT fire, then a confirmed death, then the death
+                // screen persisting.
+                Some(500),
+                Some(500),
+                Some(0),
+                Some(480),
+                Some(480),
+                Some(0),
+                Some(0),
+                Some(0),
+            ],
+        );
+        assert_eq!(
+            seen,
+            vec![
+                LocalDeathPoll::Idle,
+                LocalDeathPoll::Idle,
+                LocalDeathPoll::Idle,
+                LocalDeathPoll::Idle,
+                LocalDeathPoll::Idle,
+                LocalDeathPoll::Idle,
+                LocalDeathPoll::Decided(DeathLinkAmnestyDecision::Send),
+                LocalDeathPoll::Idle,
+            ]
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// A load, a quit-to-title and any other unobservable stretch is not a
+    /// death, and neither is loading straight into a save that reads zero.
+    #[test]
+    fn loads_and_out_of_world_polls_are_never_deaths() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            death_link_config(true),
+        );
+        let seen = drive_deaths(
+            &mut client,
+            &[
+                // Quit to title from alive, then load back in on a save whose
+                // first observations read zero, then come alive.
+                Some(500),
+                Some(500),
+                None,
+                None,
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(500),
+                Some(500),
+            ],
+        );
+        assert!(
+            seen.iter().all(|poll| *poll == LocalDeathPoll::Idle),
+            "{seen:?}"
+        );
+        // Nothing was decided, so nothing was persisted either.
+        assert!(!ledger_path.exists());
+    }
+
+    /// The gate: DeathLink on, send off. The detector still reports, so the
+    /// signal can be validated live, but no durable state moves.
+    #[test]
+    fn send_gated_off_observes_without_touching_durable_state() {
+        let ledger_path = path();
+        let mut cfg = death_link_config(false);
+        cfg.death_link_amnesty = 2;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+        let seen = drive_deaths(&mut client, &[Some(500), Some(500), Some(0), Some(0)]);
+        assert_eq!(seen.last(), Some(&LocalDeathPoll::ObservedSendDisabled));
+        assert!(!ledger_path.exists(), "no decision, so no ledger write");
+    }
+
+    /// DeathLink off entirely: the backend is never even asked.
+    #[test]
+    fn death_link_off_never_observes_the_player() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
+        let seen = drive_deaths(&mut client, &[Some(500), Some(500), Some(0), Some(0)]);
+        assert!(seen.iter().all(|poll| *poll == LocalDeathPoll::Idle));
+        assert!(!ledger_path.exists());
+    }
+
+    /// bb-archipelago#383: the first death is graced, the second is not, and
+    /// grace does not spend amnesty.
+    #[test]
+    fn first_death_grace_covers_one_death_then_amnesty_resumes() {
+        let ledger_path = path();
+        let mut cfg = death_link_config(true);
+        cfg.death_link_first_death_grace = true;
+        cfg.death_link_amnesty = 1;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Graced
+        );
+        // The graced death neither incremented nor reset the cycle: the next
+        // death is still the first amnesty-counted one.
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Forgiven {
+                used: 1,
+                allowance: 1
+            }
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Send
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// Without the option the grace never triggers, so an existing seed's
+    /// cadence is byte for byte what it was.
+    #[test]
+    fn first_death_grace_is_off_unless_the_seed_asked_for_it() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            death_link_config(true),
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Send
+        );
+        assert!(!client.death_link_first_death_graced());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// A relaunch must not hand the player a second "first" death.
+    #[test]
+    fn first_death_grace_survives_a_reconnect_through_the_ledger() {
+        let ledger_path = path();
+        let mut cfg = death_link_config(true);
+        cfg.death_link_first_death_grace = true;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg.clone(),
+        );
+        assert_eq!(
+            client.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Graced
+        );
+
+        let persisted = ReceiveLedger::load(&ledger_path).unwrap();
+        assert!(
+            persisted
+                .slot("seed", "slot")
+                .unwrap()
+                .death_link_first_death_graced
+        );
+        let mut reloaded = loop_with(MockBackend::default(), persisted, ledger_path.clone(), cfg);
+        assert!(reloaded.death_link_first_death_graced());
+        assert_eq!(
+            reloaded.record_qualifying_local_death().unwrap(),
+            DeathLinkAmnestyDecision::Send
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// A ledger written before #383 has no such field; it loads as unspent,
+    /// which is the pre-#383 behaviour when the option is off and the correct
+    /// starting point when it is on.
+    #[test]
+    fn a_pre_383_ledger_loads_with_the_grace_unspent() {
+        let slot: crate::ledger::SlotLedger = json::from_str(
+            r#"{"highest_processed_index": null, "acknowledged": {}, "death_link_amnesty_used": 2}"#,
+        )
+        .unwrap();
+        assert_eq!(slot.death_link_amnesty_used, 2);
+        assert!(!slot.death_link_first_death_graced);
+    }
+
+    /// The echo: this client's own kill must not be reported outbound, and
+    /// must not spend the player's one free death.
+    #[test]
+    fn an_incoming_death_link_kill_is_suppressed_and_spends_no_grace() {
+        let ledger_path = path();
+        let mut cfg = death_link_config(true);
+        cfg.death_link_first_death_grace = true;
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+        // Alive and armed.
+        assert_eq!(
+            drive_deaths(&mut client, &[Some(500), Some(500)]),
+            vec![LocalDeathPoll::Idle, LocalDeathPoll::Idle]
+        );
+        // The incoming link kills us: the mock zeroes the same HP cell the
+        // detector polls, exactly as the native write does.
+        assert!(client.receive_death_link().unwrap());
+        let seen = drive_deaths(&mut client, &[Some(0), Some(0)]);
+        assert_eq!(seen.last(), Some(&LocalDeathPoll::SuppressedEcho));
+        assert!(
+            !client.death_link_first_death_graced(),
+            "an incoming DeathLink must never spend the first-death grace"
+        );
+        assert!(!ledger_path.exists(), "nothing durable moved");
+
+        // ...and the very next real death is still graced.
+        assert_eq!(
+            drive_deaths(&mut client, &[Some(500), Some(500), Some(0), Some(0)]).last(),
+            Some(&LocalDeathPoll::Decided(DeathLinkAmnestyDecision::Graced))
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// The echo latch is not a permanent mute: if the kill write never
+    /// produced a death, coming back alive clears it and the next genuine
+    /// death is reported.
+    #[test]
+    fn a_stale_echo_latch_is_cleared_by_coming_back_alive() {
+        let ledger_path = path();
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            death_link_config(true),
+        );
+        drive_deaths(&mut client, &[Some(500), Some(500)]);
+        assert!(client.receive_death_link().unwrap());
+        // The write missed: the player is alive well past the suppression
+        // window, and then dies for real.
+        let mut readings = vec![Some(500); usize::from(ECHO_SUPPRESSION_POLLS) + 1];
+        readings.extend([Some(0), Some(0)]);
+        let seen = drive_deaths(&mut client, &readings);
+        assert_eq!(
+            seen.last(),
+            Some(&LocalDeathPoll::Decided(DeathLinkAmnestyDecision::Send))
+        );
+        std::fs::remove_file(ledger_path).unwrap();
     }
 
     #[test]
