@@ -2,6 +2,19 @@
 
 ### Fixed
 
+* **A delta delivery whose read-back stays short is no longer acknowledged as
+  delivered.** A prior rule completed a delta grant on execution evidence
+  alone, even when the held stack came in under the expected total, folding a
+  genuine concurrent spend and a capped stack silently overflowing into
+  storage into one "delivered anyway" verdict. That was justified by a
+  storage-routing bug that has since been fixed, and it caused real loss: a
+  Third Umbilical Cord (max held 1) delivered while one was already held was
+  executed and discarded by the game, and the client marked it delivered
+  anyway. The client now parks a short delta as `failed`, shows it in
+  `blocked`, and `retry INDEX CONFIRM` re-queues it once the stack has room. A
+  genuine concurrent spend in that same window now parks too -- the
+  fail-closed trade for never again reporting a dropped item as delivered.
+
 * **A reinforced Loch Shield or Wooden Shield plan left by an older client
   no longer stalls every later item.** Earlier builds auto-upgraded both
   shields to rows the binder does not have (only `+0` exists), and the plan

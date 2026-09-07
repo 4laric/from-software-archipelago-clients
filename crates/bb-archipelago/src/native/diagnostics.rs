@@ -27,9 +27,10 @@
 //! * **Never a new failure mode.** A write failure is swallowed after one
 //!   warning. Diagnostics that can park a grant are worse than no diagnostics.
 //! * **Inferred is inferred except where play validated the exact shape.**
-//!   The client cannot read Bloodborne's storage box, so `storage_suspected`
-//!   remains a hypothesis. `storage` is reserved for the insert deficit that a
-//!   player subsequently confirmed in the storage box (clients#445).
+//!   The client cannot read Bloodborne's storage box, so an executed delta
+//!   deficit is `unknown` rather than a guess. `storage` is reserved for the
+//!   insert deficit that a player subsequently confirmed in the storage box
+//!   (clients#445).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -130,13 +131,12 @@ pub struct DeliveryRecord {
 /// * `"storage"` -- an insert completed but never appeared in held inventory.
 ///   Oz's clients#445 capture confirmed that exact shape in the Hunter's Dream
 ///   storage box, so this one outcome is player-validated rather than inferred.
-/// * `"storage_suspected"` -- a delta cave provably executed (clients#443's
-///   evidence predicate) and the held stack still came in *under*
-///   `expected_after`. A capped pouch overflowing into storage produces exactly
-///   this shape. So does a concurrent spend in the same window; the client
-///   cannot separate them, which is why the value says *suspected*.
-/// * `"unknown"` -- anything else: a parked grant, a grant with no execution
-///   evidence, or no usable read-back.
+/// * `"unknown"` -- anything else: a parked grant, a delta cave that provably
+///   executed (clients#443's evidence predicate) but the held stack still
+///   came in *under* `expected_after`, a grant with no execution evidence, or
+///   no usable read-back. A delta deficit is never completed any more (a
+///   short read-back after an executed delta is not proof of delivery), so it
+///   always parks and always reads `unknown` here.
 ///
 /// The client has no read of Bloodborne's storage box. This function is
 /// arithmetic over numbers the machine already had, and its output must never
@@ -152,8 +152,6 @@ pub fn infer_destination(is_success: bool, trace: &GrantTrace) -> &'static str {
         "held"
     } else if trace.lane == Some("insert") && trace.execution_evidence {
         "storage"
-    } else if trace.execution_evidence {
-        "storage_suspected"
     } else {
         "unknown"
     }
@@ -410,10 +408,10 @@ mod tests {
     }
 
     #[test]
-    fn an_executed_deficit_is_inferred_storage_suspected() {
+    fn an_executed_deficit_is_inferred_unknown() {
         let mut trace = trace_with(&[Some(5)], Some(7), true);
         trace.lane = Some("delta");
-        assert_eq!(infer_destination(true, &trace), "storage_suspected");
+        assert_eq!(infer_destination(true, &trace), "unknown");
         assert_eq!(trace.readback_surplus(), Some(-2));
     }
 
@@ -458,7 +456,7 @@ mod tests {
         assert!(!line.contains('\n'), "one record is exactly one line");
         let decoded: DeliveryRecord = json::from_str(&line).expect("deserialise");
         assert_eq!(decoded, record);
-        assert_eq!(decoded.inferred_destination, "storage_suspected");
+        assert_eq!(decoded.inferred_destination, "unknown");
         assert_eq!(decoded.readbacks, vec![None, Some(5)]);
         assert_eq!(decoded.gameplay_ready_at_submit, Some(true));
         assert_eq!(decoded.gameplay_ready_at_terminal, Some(false));
@@ -484,7 +482,7 @@ mod tests {
         let mut sink = DiagnosticSink::new(Box::new(CapturingWriter(lines.clone())));
         let first = DeliveryRecord {
             unix_millis: 1_000,
-            inferred_destination: "storage_suspected".into(),
+            inferred_destination: "unknown".into(),
             ..DeliveryRecord::default()
         };
         let second = DeliveryRecord {
@@ -503,7 +501,7 @@ mod tests {
         assert_eq!(second.milliseconds_since_previous_terminal, Some(275));
         assert_eq!(
             second.previous_inferred_destination.as_deref(),
-            Some("storage_suspected")
+            Some("unknown")
         );
     }
 
