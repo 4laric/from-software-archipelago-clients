@@ -1407,6 +1407,42 @@ impl shared::Core for Core {
                 // `gate_warn` below -- compute in the closure, surface after it.
                 let feature_warn = missing;
 
+                // ---- PROFILE SELECTION (world#1463) -----------------------------------------
+                // Which contract does this seed speak? Read it; do not sniff for it. The seed
+                // declares `profile`, and the declaration is CHECKED against the keys it actually
+                // carries -- a bedrock seed with no `locationIdsToKeys`, or a greenfield seed
+                // carrying one, is an error that NAMES the key instead of a branch taken by
+                // accident. Seeds rolled before the key existed take the old sniff with one
+                // warning; that bridge is what keeps this a fixpack (AGENTS.md V.R.M.F rule 1).
+                let seed_profile = match crate::profile::select(sd) {
+                    Ok(sel) => {
+                        if let Some(w) = &sel.bridge_warning {
+                            log::warn!("{w}");
+                        } else {
+                            log::info!(
+                                "PROFILE: seed declares '{}' -- location resolution via {}",
+                                sel.profile.as_str(),
+                                if sel.profile.uses_key_resolver() {
+                                    "the matt slot-key table (locationIdsToKeys)"
+                                } else {
+                                    "the greenfield locationFlags table"
+                                }
+                            );
+                        }
+                        sel.profile
+                    }
+                    Err(e) => {
+                        // Loud, then the least-destructive branch: the seed NAMED a profile, so
+                        // honour the name rather than sniffing our way to a second wrong answer.
+                        log::error!("{e}");
+                        if sd.get("profile").and_then(|v| v.as_str()) == Some("bedrock") {
+                            crate::profile::Profile::Bedrock
+                        } else {
+                            crate::profile::Profile::Greenfield
+                        }
+                    }
+                };
+
                 // Two-sided contract validation: warn (not reject) on any slot_data mismatch
                 // so a partially-compatible seed still boots but every problem is visible.
                 let contract_problems = crate::contract_gen::validate(sd);
@@ -1585,14 +1621,13 @@ impl shared::Core for Core {
 
                 // Shop system (SHOP-SYSTEM-HANDOFF.md §3): configure from slot_data, build the scout.
                 // KEY-TABLE MIGRATION (locationIdsToKeys): token 1 of a matt slot key is the
-                // acquisition flag; prefer it, fall back to legacy `locationFlags` for old seeds.
-                let loc_flags = {
-                    let from_keys = crate::key_resolver::location_flags_from_keys(sd);
-                    if from_keys.is_empty() {
-                        i64_to_u32_map(sd.get("locationFlags"))
-                    } else {
-                        from_keys
-                    }
+                // acquisition flag. WHICH TABLE we read is now the PROFILE's answer (world#1463),
+                // not "whichever one parsed non-empty" -- an empty matt table used to fall through
+                // to `locationFlags` silently, which is a bedrock seed quietly resolving nothing.
+                let loc_flags = if seed_profile.uses_key_resolver() {
+                    crate::key_resolver::location_flags_from_keys(sd)
+                } else {
+                    i64_to_u32_map(sd.get("locationFlags"))
                 };
                 // SHOP KEY RESOLUTION: shop slots (token1==0) carry ShopLineupParam rows in token3;
                 // resolve row -> eventFlag_forStock via shipped shoplineup_flags.json and fold into
@@ -1607,7 +1642,7 @@ impl shared::Core for Core {
                     // this seed" without this line. Announce armed/inert once, but only on the
                     // matt-key (foreign) path -- greenfield seeds carry no locationIdsToKeys and
                     // resolve shops from slot_data, so the table is legitimately irrelevant there.
-                    let foreign_keys = sd.get("locationIdsToKeys").is_some();
+                    let foreign_keys = seed_profile.uses_key_resolver();
                     if !shop_table.is_empty() {
                         let resolved = crate::key_resolver::shop_flags_from_keys(sd, &shop_table);
                         if foreign_keys {

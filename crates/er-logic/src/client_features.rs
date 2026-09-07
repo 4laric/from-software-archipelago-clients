@@ -196,12 +196,27 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
 /// `lockHintPlacements`. Its absence selects the existing `!hint` fallback, so a
 /// v0.5.5 seed is likewise a safe subset of the current contract.
 ///
+/// THE `ffc0f1b5` LINE (world#1463) is the bridge that makes the profile declaration a
+/// FIXPACK rather than an M bump (AGENTS.md V.R.M.F rule 1). v0.6.0 through v0.6.0.3
+/// all shipped contract `ffc0f1b5`; the 0.6.0.3 client moves the hash by adding the
+/// required-but-new `profile` key and by retagging the always-empty `dungeonSweeps` as
+/// bedrock-only. Neither strands a rolled seed: a seed with no `profile` takes
+/// [`crate::client_features`]' sibling bridge in `profile::select` (the legacy
+/// key-presence sniff, announced once), and a `dungeonSweeps: {}` that an 0.6.0 seed
+/// still carries parsed to an empty map before and does so now. Listed per version
+/// because a shared hash alone is not evidence of an audit.
+///
 /// Match version and hash together: hashes can be shared across releases, and
 /// compatibility has not been audited for every release that shared one.
 pub fn is_legacy_contract_compatible(versions: &str) -> bool {
     let has = |wanted: &str| versions.split_whitespace().any(|token| token == wanted);
     (has("apworld/0.4.13") && has("contract/dc0dc687"))
         || (has("apworld/0.5.5") && has("contract/8397a952"))
+        || (has("contract/ffc0f1b5")
+            && (has("apworld/0.6.0")
+                || has("apworld/0.6.0.1")
+                || has("apworld/0.6.0.2")
+                || has("apworld/0.6.0.3")))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -608,6 +623,16 @@ mod tests {
         ));
         assert!(!is_legacy_contract_compatible(
             "apworld/0.5.5 contract/ffc0f1b5 data/new"
+        ));
+        // world#1463: every 0.6.0-line seed predates `profile`, and the client bridges them.
+        for v in ["0.6.0", "0.6.0.1", "0.6.0.2", "0.6.0.3"] {
+            assert!(
+                is_legacy_contract_compatible(&format!("apworld/{v} contract/ffc0f1b5 data/x")),
+                "{v} is on the audited 0.6.0 line"
+            );
+        }
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.6.1 contract/ffc0f1b5 data/x"
         ));
     }
 }
