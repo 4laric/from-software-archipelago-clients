@@ -169,6 +169,13 @@ pub struct Core {
     flag_poll_baseline: HashSet<u32>,
     /// Whether flag_poll_baseline has been captured (once, on the first in-world poll).
     flag_poll_baseline_done: bool,
+    /// KEY-ITEM POLL GUARD (er_logic::keyitem_poll): the checks in THIS seed whose poll flag is
+    /// also an obtained/restored flag `keyitems` sets on a receive (Rold 400001 -> 7770556, the
+    /// Bell/Knife/Kit, Drawing-Room 400072, a polled restore flag 191-196). Computed once at
+    /// configure. Membership alone suppresses nothing: the poll skips such a check only while
+    /// `keyitems::client_written_flags()` says the CLIENT is the one that set the flag, so a
+    /// genuine ESD/shop acquisition of the same item still reports.
+    keyitem_poll_collisions: HashMap<i64, u32>,
     /// Start-of-run grants (items / graces / map reveal).
     start: Option<crate::startgrants::StartConfig>,
     start_flags_done: bool,
@@ -869,6 +876,7 @@ impl shared::Core for Core {
             poll_counter: 0,
             flag_poll_baseline: HashSet::new(),
             flag_poll_baseline_done: false,
+            keyitem_poll_collisions: HashMap::new(),
             start: None,
             start_flags_done: false,
             unique_grants_ok: HashSet::new(),
@@ -2319,6 +2327,19 @@ impl shared::Core for Core {
                     );
                 }
                 crate::whetblade_lots::configure(whet_rewrites);
+                // KEY-ITEM POLL GUARD, the whetblade split's sibling for the checks that CANNOT be
+                // repointed (no lot getItemFlagId: ESD/EMEVD grants and echo-dedup-exempt shop
+                // rows). Computed on the SAME merged, already-repointed table, so a whetblade
+                // never appears here. Named once, at configure, because the guard is otherwise
+                // invisible until the day it suppresses something.
+                let keyitem_collisions = er_logic::keyitem_poll::colliding_checks(
+                    &fp.location_flags,
+                    &crate::keyitems::all_acquire_flags().collect(),
+                );
+                if let Some(line) = er_logic::keyitem_poll::configure_line(&keyitem_collisions) {
+                    log::info!("{line}");
+                }
+                self.keyitem_poll_collisions = keyitem_collisions.into_iter().collect();
                 log::info!(
                     "flag-poll table: {} location flags ({} sweep groups)",
                     fp.location_flags.len(),
@@ -3553,10 +3574,22 @@ impl shared::Core for Core {
                 // 10007452, Black Knifeprint 400357). flag_poll_baseline (captured on the first
                 // in-world poll) holds them so we never false-check them; the genuine pickup
                 // still registers via the AddItemFunc detour.
+                //
+                // KEY-ITEM POLL GUARD (2026-09-07 Rold false collect): the baseline covers a flag
+                // set BEFORE this session; `keyitem_poll` covers one the client sets DURING it.
+                // A boss sweep delivered the Rold Medallion, keyitems set 400001 so the Grand Lift
+                // would work, and this loop read that write back as a pickup of loc 7770556.
+                let client_written = crate::keyitems::client_written_flags();
                 for (&loc, &flag) in &fp.location_flags {
                     if self.valid_locations.contains(&loc)
                         && !client.is_local_location_checked(loc)
                         && !self.flag_poll_baseline.contains(&flag)
+                        && !er_logic::keyitem_poll::poll_suppressed(
+                            loc,
+                            flag,
+                            &self.keyitem_poll_collisions,
+                            &client_written,
+                        )
                         && crate::flags::get_event_flag(flag)
                     {
                         to_check.push(loc);
@@ -5315,6 +5348,7 @@ impl Core {
         self.poll_counter = 0;
         self.flag_poll_baseline.clear();
         self.flag_poll_baseline_done = false;
+        self.keyitem_poll_collisions.clear();
         self.start = None;
         self.start_flags_done = false;
         self.unique_grants_ok.clear();
