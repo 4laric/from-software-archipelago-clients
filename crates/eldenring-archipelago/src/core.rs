@@ -7249,12 +7249,14 @@ mod tests {
     /// deliberately, not by letting this rot again.
     #[test]
     fn client_version_matches_the_apworld_it_was_built_against() {
+        // V.R.M.F: Cargo spells the fixpack as `+f<N>` build metadata, the apworld as a fourth
+        // dotted part (AGENTS.md "Version numbers"). Compare in the apworld's spelling.
         assert_eq!(
-            env!("CARGO_PKG_VERSION"),
+            er_logic::version::release_form(env!("CARGO_PKG_VERSION")),
             crate::contract_gen::APWORLD_VERSION_EXPECTED,
             "client crate version and APWORLD_VERSION (via generated contract_gen.rs) have drifted. \
-             Bump crates/eldenring-archipelago/Cargo.toml to match, or the apworld's \
-             contract.py APWORLD_VERSION if the client is the one that is right."
+             Bump crates/eldenring-archipelago/Cargo.toml to match (0.6.0+f1 for apworld 0.6.0.1), \
+             or the apworld's contract.py APWORLD_VERSION if the client is the one that is right."
         );
     }
 
