@@ -111,7 +111,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "pool_builder_juice_pct", shape: Shape::Any, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "locationIdsToKeys", shape: Shape::Any, required: true, greenfield: false, bedrock: true },
     ContractKey { name: "itemCounts", shape: Shape::Any, required: false, greenfield: true, bedrock: true },
-    ContractKey { name: "naturalKeyTriggers", shape: Shape::Any, required: false, greenfield: false, bedrock: true },
+    ContractKey { name: "naturalKeyTriggers", shape: Shape::Any, required: false, greenfield: true, bedrock: true },
     ContractKey { name: "lockGrantItems", shape: Shape::Any, required: false, greenfield: false, bedrock: true },
     ContractKey { name: "randomStartDoneFlag", shape: Shape::Any, required: false, greenfield: false, bedrock: true },
     ContractKey { name: "randomStartWarpFlag", shape: Shape::Any, required: false, greenfield: false, bedrock: true },
@@ -243,7 +243,7 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "f6250382";
+pub const CONTRACT_HASH: &str = "613fb438";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.6.0.3";
 
 #[cfg(test)]
