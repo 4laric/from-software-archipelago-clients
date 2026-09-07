@@ -9,7 +9,7 @@ use crate::backend::{
     OperationProgress, StackObservation,
 };
 use crate::client_eprintln;
-use crate::config::RuntimeConfig;
+use crate::config::{RuntimeConfig, RuntimeItemBinding};
 use crate::feed::{EquipTarget, ReceivedFact, equip_decisions};
 use crate::ledger::{
     AcknowledgedItem, FixedCauseRequeue, OperatorAction, PendingItem, ReceiveLedger, SlotLedger,
@@ -152,6 +152,16 @@ fn is_non_upgradable_shield(normalized_item_id: u32, reinforcement_level: Option
         .is_some_and(|base| matches!(base, 19_000_000 | 19_100_000))
 }
 
+/// The auto-upgrade level a plan may be made at (clients#654).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpgradeTarget {
+    /// Plan at this target; `None` keeps the received reinforcement level.
+    Level(Option<u8>),
+    /// The inventory census cannot answer yet. Planning now would persist the
+    /// received level forever, so no plan is made this poll.
+    Hold,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletedItem {
     pub index: u64,
@@ -245,6 +255,7 @@ pub struct ClientLoop<B> {
     watermark_notice: Option<WatermarkOutcome>,
     sustain_pending_polls: Option<(i64, u32)>,
     sustain_notice: Option<SustainPollResult>,
+    upgrade_notice: Option<String>,
 }
 
 impl<B: BloodborneBackend> ClientLoop<B> {
@@ -277,7 +288,15 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             watermark_notice: None,
             sustain_pending_polls: None,
             sustain_notice: None,
+            upgrade_notice: None,
         }
+    }
+
+    /// One-line auto-upgrade reports for the operator surface (clients#654):
+    /// a durable plan re-derived upward, or a plan held because the inventory
+    /// census could not run yet. `main` drains this every loop.
+    pub fn take_upgrade_notice(&mut self) -> Option<String> {
+        self.upgrade_notice.take()
     }
 
     pub fn take_sustain_notice(&mut self) -> Option<SustainPollResult> {
@@ -1571,25 +1590,104 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(decision.map(|decision| decision.target))
     }
 
+    /// The auto-upgrade level this item should be planned at, or
+    /// [`UpgradeTarget::Hold`] when no plan may be made this poll
+    /// (clients#654).
+    fn upgrade_target(&mut self, binding: &RuntimeItemBinding) -> Result<UpgradeTarget> {
+        if !self.config.auto_upgrade || binding.reinforcement_level.is_none() {
+            return Ok(UpgradeTarget::Level(None));
+        }
+        if is_non_upgradable_shield(binding.normalized_item_id, binding.reinforcement_level) {
+            return Ok(UpgradeTarget::Level(Some(0)));
+        }
+        let target = self.backend.target_weapon_level()?;
+        // `None` from a census that never ran means "unknown", not "no
+        // weapons": planning on it ships the item at its received level
+        // permanently. `None` from a census that DID run is an honest empty
+        // scan, and the received level is then the right answer.
+        if target.is_none() && !self.backend.upgrade_scan_ready()? {
+            return Ok(UpgradeTarget::Hold);
+        }
+        Ok(UpgradeTarget::Level(target))
+    }
+
+    /// Re-derive the auto-upgrade target of a durable plan whose grant command
+    /// has not been published yet, and raise the plan if the player has
+    /// reinforced further since it was made (clients#654).
+    ///
+    /// `observed_before.is_none()` is the freeze predicate: the baseline is
+    /// recorded durably immediately BEFORE the grant command is published, and
+    /// it is cleared again only when a command is proven withdrawn unexecuted.
+    /// So while it is `None`, no command carrying the old descriptor exists
+    /// and the plan is still ours to change. This never lowers a plan, and it
+    /// leaves the non-upgradable-shield clamp alone.
+    fn refresh_pending_upgrade(&mut self, pending: &mut PendingItem) -> Result<()> {
+        if pending.grant_complete || pending.observed_before.is_some() {
+            return Ok(());
+        }
+        let Some(binding) = self.config.items.get(&pending.ap_item_id).cloned() else {
+            return Ok(());
+        };
+        let Some(received) = binding.reinforcement_level else {
+            return Ok(());
+        };
+        let UpgradeTarget::Level(target) = self.upgrade_target(&binding)? else {
+            // The census cannot answer right now. The existing plan stands: it
+            // was made against a reading that could, and re-holding a plan
+            // already on the books would stall the stream.
+            return Ok(());
+        };
+        let raised = auto_upgrade_level(self.config.auto_upgrade, received, target);
+        let current = pending.reinforcement_level.unwrap_or(received);
+        if raised <= current {
+            return Ok(());
+        }
+        let (raw_descriptor, normalized_item_id) = reinforced_descriptor_pair(
+            binding.raw_descriptor,
+            binding.normalized_item_id,
+            received,
+            raised,
+        )
+        .context("weapon reinforcement descriptor overflow or downgrade")?;
+        self.ledger
+            .slot_mut(&self.seed_name, &self.slot_name)
+            .raise_pending_upgrade(target, raw_descriptor, normalized_item_id, raised)?;
+        self.ledger.save(&self.ledger_path)?;
+        pending.upgrade_target_level = target;
+        pending.reinforcement_level = Some(raised);
+        pending.raw_descriptor = raw_descriptor;
+        pending.normalized_item_id = normalized_item_id;
+        self.upgrade_notice = Some(format!(
+            "Auto-upgrade: held AP item {} at index {} re-derived from +{current} to +{raised} before delivery.",
+            pending.ap_item_id, pending.index
+        ));
+        Ok(())
+    }
+
+    /// `Ok(None)` holds this poll instead of planning (clients#654).
     fn plan_item(
         &mut self,
         item: IncomingItem,
         indexed: &BTreeMap<u64, i64>,
-    ) -> Result<PendingItem> {
+    ) -> Result<Option<PendingItem>> {
         let binding = self
             .config
             .items
             .get(&item.ap_item_id)
             .with_context(|| format!("AP item {} has no Bloodborne binding", item.ap_item_id))?
             .clone();
-        let target_level = if self.config.auto_upgrade && binding.reinforcement_level.is_some() {
-            if is_non_upgradable_shield(binding.normalized_item_id, binding.reinforcement_level) {
-                Some(0)
-            } else {
-                self.backend.target_weapon_level()?
+        let target_level = match self.upgrade_target(&binding)? {
+            UpgradeTarget::Level(level) => level,
+            // clients#654 path (b): the census could not read inventory, so
+            // planning now would freeze this item at its received level for
+            // good. Hold; the plan is made on a later poll.
+            UpgradeTarget::Hold => {
+                self.upgrade_notice = Some(format!(
+                    "Auto-upgrade: holding AP item {} at index {} until the inventory census can read the held weapon levels.",
+                    item.ap_item_id, item.index
+                ));
+                return Ok(None);
             }
-        } else {
-            None
         };
         let delivered_level = binding
             .reinforcement_level
@@ -1605,7 +1703,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 .context("weapon reinforcement descriptor overflow or downgrade")?,
                 _ => (binding.raw_descriptor, binding.normalized_item_id),
             };
-        Ok(PendingItem {
+        Ok(Some(PendingItem {
             index: item.index,
             ap_item_id: item.ap_item_id,
             raw_descriptor,
@@ -1619,7 +1717,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             equip_complete: false,
             observed_before: None,
             token_routed_to_storage: false,
-        })
+        }))
     }
 
     /// Startup reconciliation (clients#296): withdraw a grant command left over
@@ -1844,10 +1942,19 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     existing.index == item.index && existing.ap_item_id == item.ap_item_id,
                     "received item does not match the durable pending plan"
                 );
+                // clients#654: a plan persisted while this item could not be
+                // granted (offline, or queued behind another item) was priced
+                // at the target level of that moment. Re-derive it before the
+                // grant command is published, so an item that waited while the
+                // player reinforced further still arrives at their level.
+                let mut existing = existing;
+                self.refresh_pending_upgrade(&mut existing)?;
                 existing
             }
             None => {
-                let planned = self.plan_item(item, &indexed)?;
+                let Some(planned) = self.plan_item(item, &indexed)? else {
+                    return Ok(ItemPollResult::Held);
+                };
                 self.ledger
                     .slot_mut(&self.seed_name, &self.slot_name)
                     .begin(planned.clone())?;
@@ -2782,6 +2889,10 @@ mod tests {
                 .iter()
                 .filter_map(|id| crate::native::guest::weapon_reinforcement_level(*id))
                 .max())
+        }
+
+        fn upgrade_scan_ready(&mut self) -> Result<bool> {
+            self.inner.upgrade_scan_ready()
         }
 
         fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
@@ -6477,6 +6588,325 @@ mod tests {
         );
         client.record_victory(make(1)).unwrap();
         assert!(client.record_victory(make(2)).is_err());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    // ---- clients#654: the auto-upgrade level of a HELD plan ----------------
+    //
+    // Reported by jcc: with auto-upgrade on, weapons received live arrived at
+    // the player's current level, but items that had been queued while they
+    // were offline arrived unreinforced or at the level the player was at when
+    // the plan was first made. Both are the same bug in two shapes -- a plan is
+    // durable, and it used to be priced exactly once.
+
+    const SAW_CLEAVER_RAW: u32 = 0x807B_98A0;
+    const SAW_CLEAVER_ID: u32 = 8_100_000;
+
+    fn weapon_config() -> RuntimeConfig {
+        let mut cfg = config();
+        cfg.auto_upgrade = true;
+        cfg.items.insert(
+            3000,
+            RuntimeItemBinding {
+                raw_descriptor: SAW_CLEAVER_RAW,
+                normalized_item_id: SAW_CLEAVER_ID,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
+                quantity: 1,
+                reinforcement_level: Some(0),
+                feed_effect: FeedEffectBinding::NotEquippable,
+            },
+        );
+        cfg
+    }
+
+    /// A durable plan for AP item 3000 priced at `+level`, as an earlier poll
+    /// would have persisted it. `observed_before` decides whether the grant
+    /// command has been published yet.
+    fn planned_weapon_ledger(level: u8, observed_before: Option<u32>) -> ReceiveLedger {
+        let mut ledger = ReceiveLedger::default();
+        let delta = u32::from(level) * 100;
+        ledger
+            .slot_mut("seed", "slot")
+            .begin(PendingItem {
+                index: 0,
+                ap_item_id: 3000,
+                raw_descriptor: SAW_CLEAVER_RAW + delta,
+                normalized_item_id: SAW_CLEAVER_ID + delta,
+                item_category: 0,
+                quantity: 1,
+                upgrade_target_level: Some(level),
+                reinforcement_level: Some(level),
+                equip_target: None,
+                grant_complete: false,
+                equip_complete: false,
+                observed_before,
+                token_routed_to_storage: false,
+            })
+            .unwrap();
+        ledger
+    }
+
+    #[test]
+    fn held_pending_plan_is_re_derived_upward_before_the_grant_is_issued() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.upgrade_target_level = Some(5);
+        let mut client = loop_with(
+            backend,
+            planned_weapon_ledger(2, None),
+            ledger_path.clone(),
+            weapon_config(),
+        );
+
+        let result = client
+            .poll_items(&[IncomingItem {
+                index: 0,
+                ap_item_id: 3000,
+            }])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            ItemPollResult::Completed(CompletedItem {
+                index: 0,
+                ap_item_id: 3000,
+                received_level: Some(0),
+                target_level: Some(5),
+                delivered_level: Some(5),
+                equip_target: None,
+            })
+        );
+        assert_eq!(client.backend().grants[0].reinforcement_level, Some(5));
+        assert_eq!(
+            client.backend().grants[0].normalized_item_id,
+            SAW_CLEAVER_ID + 500
+        );
+        assert_eq!(
+            client.backend().grants[0].raw_descriptor,
+            SAW_CLEAVER_RAW + 500
+        );
+        assert!(
+            client
+                .take_upgrade_notice()
+                .is_some_and(|notice| notice.contains("+2 to +5"))
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn a_plan_whose_grant_command_was_already_issued_is_frozen() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.upgrade_target_level = Some(5);
+        // The baseline is recorded immediately before the command is published,
+        // so a plan carrying one is already represented by a command in the
+        // harness and must not be re-priced under it.
+        let mut client = loop_with(
+            backend,
+            planned_weapon_ledger(2, Some(0)),
+            ledger_path.clone(),
+            weapon_config(),
+        );
+
+        let result = client
+            .poll_items(&[IncomingItem {
+                index: 0,
+                ap_item_id: 3000,
+            }])
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ItemPollResult::Completed(CompletedItem {
+                delivered_level: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(client.backend().grants[0].reinforcement_level, Some(2));
+        assert!(client.take_upgrade_notice().is_none());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn a_pending_plan_is_never_re_derived_downward() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        // The census sees a lower level than the plan already promises -- the
+        // player put the +5 weapon in storage, say. The plan stands.
+        backend.upgrade_target_level = Some(1);
+        let mut client = loop_with(
+            backend,
+            planned_weapon_ledger(2, None),
+            ledger_path.clone(),
+            weapon_config(),
+        );
+
+        let result = client
+            .poll_items(&[IncomingItem {
+                index: 0,
+                ap_item_id: 3000,
+            }])
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ItemPollResult::Completed(CompletedItem {
+                delivered_level: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(client.backend().grants[0].reinforcement_level, Some(2));
+        assert!(client.take_upgrade_notice().is_none());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn auto_upgrade_holds_planning_until_the_inventory_census_can_read() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        // Reconnect: geometry is not hydrated, so the census answers `None`
+        // because it could not look. Planning here is what shipped jcc's
+        // Uncanny Rakuyo at +0.
+        backend.upgrade_scan_ready = false;
+        backend.upgrade_target_level = None;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            weapon_config(),
+        );
+        let received = [IncomingItem {
+            index: 0,
+            ap_item_id: 3000,
+        }];
+
+        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Held);
+        assert!(client.backend().grants.is_empty());
+        assert!(
+            client
+                .take_upgrade_notice()
+                .is_some_and(|notice| notice.contains("holding AP item 3000"))
+        );
+
+        client.backend_mut().upgrade_scan_ready = true;
+        client.backend_mut().upgrade_target_level = Some(5);
+        assert!(matches!(
+            client.poll_items(&received).unwrap(),
+            ItemPollResult::Completed(CompletedItem {
+                delivered_level: Some(5),
+                ..
+            })
+        ));
+        assert_eq!(client.backend().grants[0].reinforcement_level, Some(5));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn a_readable_census_that_finds_no_weapons_still_delivers_at_the_base_level() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.upgrade_scan_ready = true;
+        backend.upgrade_target_level = None;
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            weapon_config(),
+        );
+
+        assert!(matches!(
+            client
+                .poll_items(&[IncomingItem {
+                    index: 0,
+                    ap_item_id: 3000,
+                }])
+                .unwrap(),
+            ItemPollResult::Completed(CompletedItem {
+                delivered_level: Some(0),
+                ..
+            })
+        ));
+        assert_eq!(client.backend().grants[0].reinforcement_level, Some(0));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn auto_upgrade_off_neither_holds_nor_re_derives() {
+        let ledger_path = path();
+        let mut runtime_config = weapon_config();
+        runtime_config.auto_upgrade = false;
+        let mut backend = MockBackend::default();
+        backend.upgrade_scan_ready = false;
+        backend.upgrade_target_level = Some(5);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            runtime_config,
+        );
+
+        assert!(matches!(
+            client
+                .poll_items(&[IncomingItem {
+                    index: 0,
+                    ap_item_id: 3000,
+                }])
+                .unwrap(),
+            ItemPollResult::Completed(CompletedItem {
+                delivered_level: Some(0),
+                target_level: None,
+                ..
+            })
+        ));
+        assert_eq!(client.backend().grants[0].reinforcement_level, Some(0));
+        assert!(client.take_upgrade_notice().is_none());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn a_non_upgradable_shield_never_holds_and_stays_at_its_base_row() {
+        let ledger_path = path();
+        let mut runtime_config = config();
+        runtime_config.auto_upgrade = true;
+        runtime_config.items.insert(
+            3000,
+            RuntimeItemBinding {
+                raw_descriptor: 0x8000_0000 | 19_000_000,
+                normalized_item_id: 19_000_000,
+                item_category: 0,
+                descriptor_evidence: DescriptorEvidence::LiveGrantInventoryUi,
+                quantity: 1,
+                reinforcement_level: Some(0),
+                feed_effect: FeedEffectBinding::LeftHandWeapon,
+            },
+        );
+        let mut backend = MockBackend::default();
+        // The clamp is decided before the census is consulted at all, so an
+        // unreadable inventory cannot hold a shield either.
+        backend.upgrade_scan_ready = false;
+        backend.upgrade_target_level = Some(7);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            runtime_config,
+        );
+
+        assert!(matches!(
+            client
+                .poll_items(&[IncomingItem {
+                    index: 0,
+                    ap_item_id: 3000,
+                }])
+                .unwrap(),
+            ItemPollResult::Completed(CompletedItem {
+                delivered_level: Some(0),
+                target_level: Some(0),
+                ..
+            })
+        ));
+        assert_eq!(client.backend().grants[0].normalized_item_id, 19_000_000);
         std::fs::remove_file(ledger_path).unwrap();
     }
 }

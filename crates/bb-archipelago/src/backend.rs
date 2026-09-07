@@ -106,6 +106,18 @@ pub trait BloodborneBackend {
     }
     /// `None` preserves the received reinforcement level.
     fn target_weapon_level(&mut self) -> Result<Option<u8>>;
+    /// Whether [`Self::target_weapon_level`] is answering from a readable
+    /// inventory (clients#654). `false` means the census could not run at all
+    /// -- the geometry is not hydrated -- so its `None` says "unknown", not
+    /// "the player owns no reinforced weapon", and the auto-upgrade planner
+    /// must hold rather than plan at the received level.
+    ///
+    /// Required rather than defaulted for the reason spelled out on
+    /// `observe_stack_quantity`: the shipped binary dispatches through a
+    /// `Backend` enum, and a defaulted method it forgets to forward would
+    /// silently swallow the implementation beneath it. A backend with no
+    /// inventory census answers `true`, which keeps its existing behaviour.
+    fn upgrade_scan_ready(&mut self) -> Result<bool>;
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress>;
     /// The live quantity of a stack, for the fresh-grant baseline
     /// (clients#427).
@@ -203,6 +215,11 @@ pub struct MockBackend {
     pub set_flags: HashSet<u32>,
     pub location_context: Option<LocationContext>,
     pub upgrade_target_level: Option<u8>,
+    /// clients#654: whether the mock models an inventory the upgrade census
+    /// could actually read. On by default, so every existing fixture keeps
+    /// planning from `upgrade_target_level` exactly as before; off models the
+    /// native geometry that has not hydrated yet.
+    pub upgrade_scan_ready: bool,
     pub inventory: HashMap<(u32, Option<u8>), u32>,
     pub grants: Vec<ItemGrant>,
     pub equips: Vec<EquipRequest>,
@@ -265,6 +282,7 @@ impl Default for MockBackend {
                 gameplay_ready: true,
             }),
             upgrade_target_level: None,
+            upgrade_scan_ready: true,
             inventory: HashMap::new(),
             grants: Vec::new(),
             equips: Vec::new(),
@@ -377,6 +395,10 @@ impl BloodborneBackend for MockBackend {
 
     fn target_weapon_level(&mut self) -> Result<Option<u8>> {
         Ok(self.upgrade_target_level)
+    }
+
+    fn upgrade_scan_ready(&mut self) -> Result<bool> {
+        Ok(self.upgrade_scan_ready)
     }
 
     fn death_link_kill(&mut self) -> Result<bool> {

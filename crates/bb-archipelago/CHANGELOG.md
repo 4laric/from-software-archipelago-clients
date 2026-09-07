@@ -2,6 +2,30 @@
 
 ### Fixed
 
+* **Auto-upgrade no longer prices a held item at a stale level.** Reported by
+  jcc: a player upgraded to +2, went offline, reinforced the Saw Cleaver to
+  +5, and on reconnect the items that had been queued while they were away
+  arrived unreinforced, while a weapon found live afterwards arrived +5 --
+  "it's just the ones on hold". A delivery plan is durable, and it used to be
+  priced exactly once, which broke in two ways. (a) A plan persisted while the
+  item could not yet be granted kept the target level of the moment it was
+  made, so an item that waited through an upgrade session arrived at the old
+  level; the client now re-derives the target every poll until the grant
+  command is actually published, and raises the plan (never lowers it) when
+  the player has reinforced further. (b) On reconnect the weapon-level census
+  can run before the inventory geometry is readable, where it answered "no
+  reinforced weapon" rather than "cannot tell yet", and the item was planned
+  at its base level for good; planning now holds that poll and is made once
+  the inventory is readable. A census that genuinely runs and finds no
+  reinforced weapon still delivers at the received level, and the
+  non-upgradable-shield clamp (Loch Shield, Wooden Shield) is unchanged. Each
+  re-derivation or hold prints one line.
+
+  *Behavior parity note:* a plan persisted by an older client is re-derived
+  upward on the next launch, so a weapon that was sitting in the ledger at a
+  stale level arrives at the player's current level rather than the old one.
+  No ledger edit, no schema change, and no seed is affected.
+
 * **A delta delivery whose read-back stays short is no longer acknowledged as
   delivered.** A prior rule completed a delta grant on execution evidence
   alone, even when the held stack came in under the expected total, folding a

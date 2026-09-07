@@ -315,6 +315,13 @@ impl BloodborneBackend for Backend {
         }
     }
 
+    fn upgrade_scan_ready(&mut self) -> Result<bool> {
+        match self {
+            Self::Mock(backend) => backend.upgrade_scan_ready(),
+            Self::Native(backend) => backend.upgrade_scan_ready(),
+        }
+    }
+
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
         match self {
             Self::Mock(backend) => backend.grant_item(grant),
@@ -1746,6 +1753,11 @@ fn run() -> Result<()> {
             #[cfg(windows)]
             if let Some(scouts) = placement_scouts.as_mut() {
                 scouts.pump(client);
+            }
+            while let Some(notice) = runtime.take_upgrade_notice() {
+                // clients#654: one line when a held plan is re-priced upward,
+                // or when planning waits for the inventory census.
+                client_eprintln!("{notice}");
             }
             while let Some(outcome) = runtime.take_watermark_notice() {
                 // docs/SAVE-RECONCILIATION.md §8: every non-resume comparison
