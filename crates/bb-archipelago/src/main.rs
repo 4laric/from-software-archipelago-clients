@@ -1462,7 +1462,9 @@ fn run() -> Result<()> {
                     Some(runtime) => format!(
                         "DeathLink receive: on. Outbound send: {} (slot data death_link_send). \
                          First-death grace: {} ({}). Amnesty allowance: {}. \
-                         The local-death signal is inferred from player HP and is NOT validated live.",
+                         The local-death signal is read from player HP: an ordinary death was \
+                         observed being detected and sent on 2026-09-08, but the false-positive \
+                         cases (cutscene, fake death, quit-to-title, load) are still unverified.",
                         if runtime.death_link_send_enabled() { "ON (experimental)" } else { "off" },
                         if runtime.death_link_first_death_grace_enabled() { "on" } else { "off" },
                         if runtime.death_link_first_death_graced() { "already spent" } else { "unspent" },
@@ -1770,8 +1772,11 @@ fn run() -> Result<()> {
                     .is_some_and(ClientLoop::death_link_first_death_grace_enabled);
                 client_eprintln!(
                     "DeathLink receive is enabled, and this seed also enabled EXPERIMENTAL outbound sending \
-                     (slot data death_link_send). The local-death signal is inferred from player HP and has \
-                     not been validated live: amnesty {}, first-death grace {}. Watch for 'DeathLink probe:' \
+                     (slot data death_link_send). The local-death signal is read from player HP. An \
+                     ordinary death was observed being detected and sent on 2026-09-08; what is still \
+                     unverified is whether anything else fires it (cutscene, fake death, quit-to-title, \
+                     load), so a death you did not die may still be broadcast. Amnesty {}, first-death \
+                     grace {}. Watch for 'DeathLink probe:' \
                      lines and see docs/DEATHLINK-SEND-PROBE.md.",
                     runtime.as_ref().map_or(0, ClientLoop::death_link_amnesty),
                     if grace { "on" } else { "off" }

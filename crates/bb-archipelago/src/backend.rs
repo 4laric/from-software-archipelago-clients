@@ -200,14 +200,16 @@ pub trait BloodborneBackend {
     /// `None` as "forget what you knew", which is what keeps a load or a
     /// quit-to-title from looking like a death.
     ///
-    /// INFERRED, and unvalidated live. `docs/SESSION-death-signal.md` fixes
+    /// PARTLY OBSERVED live. `docs/SESSION-death-signal.md` fixes
     /// three candidate classes for Bloodborne's death signal and rules out an
     /// event flag entirely; this is candidate class 1, "HP at zero", chosen
     /// because the cell it reads is the same one `death_link_kill` already
     /// writes through and is therefore the only player-state read this client
     /// has ever exercised in game. Whether an alive->dead HP edge is exactly
-    /// "the player died" -- as opposed to a fake-death SpEffect window, a
-    /// cutscene, or a torn read -- is what the probe runbook exists to
+    /// "the player died" is settled in one direction only: an ordinary death
+    /// was observed producing the edge on 2026-09-08. Whether a fake-death
+    /// SpEffect window, a cutscene, a quit-to-title or a torn read also
+    /// produces one is still open, and is what the probe runbook exists to
     /// settle. Required rather than defaulted for the same reason as
     /// [`Self::observe_stack_quantity`]: the shipped binary dispatches
     /// through a `Backend` enum, and a default here would be silently
