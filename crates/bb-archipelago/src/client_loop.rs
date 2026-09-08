@@ -7360,6 +7360,50 @@ mod tests {
         std::fs::remove_file(ledger_path).unwrap();
     }
 
+    /// Fixpack bb-0.1.0.1. When shadPS4 refuses the HP-cell write the kill
+    /// surfaces as `Err`, and main.rs leaves the link at the front of
+    /// `pending_death_links` (it only pops on `Ok(true)`), so the retry on the
+    /// next poll must still land. Nothing about the failure may poison the
+    /// runtime or arm the incoming-echo latch on a death that never happened.
+    #[test]
+    fn a_refused_kill_write_keeps_the_link_pending_and_the_retry_lands() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.death_link_kill_error = Some(
+            "could not write the player HP cell at 0x224edd2a8; shadPS4 refused the write".into(),
+        );
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            death_link_config(true),
+        );
+        drive_deaths(&mut client, &[Some(500), Some(500)]);
+
+        // Three polls, three refusals -- exactly the session in the bug
+        // report. The link is never consumed.
+        for _ in 0..3 {
+            let error = client.receive_death_link().unwrap_err();
+            assert!(
+                format!("{error:#}").contains("shadPS4 refused the write"),
+                "the actionable message reaches the console"
+            );
+        }
+        // The player never died, so no echo was latched and a genuine local
+        // death would still be reported.
+        assert_eq!(
+            drive_deaths(&mut client, &[Some(500), Some(0), Some(0)]).last(),
+            Some(&LocalDeathPoll::Decided(DeathLinkAmnestyDecision::Send))
+        );
+
+        // shadPS4 accepts the write on a later poll: the same queued link
+        // still kills, so the death was deferred and not lost.
+        client.backend_mut().death_link_kill_error = None;
+        client.backend_mut().player_hp = Some(500);
+        assert!(client.receive_death_link().unwrap());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
     /// The echo latch is not a permanent mute: if the kill write never
     /// produced a death, coming back alive clears it and the next genuine
     /// death is reported.

@@ -1803,9 +1803,15 @@ fn run() -> Result<()> {
                 }
                 Ok(false) => {}
                 Err(error) => {
+                    // The link stays at the front of `pending_death_links`, so
+                    // a transient refusal costs nothing: the next poll retries
+                    // it. Only the repeated console line is suppressed.
                     let message = format!("{error:#}");
                     if last_death_link_error.as_deref() != Some(&message) {
-                        client_eprintln!("DeathLink kill unavailable: {message}");
+                        client_eprintln!(
+                            "DeathLink kill failed: {message} (the death stays queued and is \
+                             retried on the next poll)"
+                        );
                         last_death_link_error = Some(message);
                     }
                 }
