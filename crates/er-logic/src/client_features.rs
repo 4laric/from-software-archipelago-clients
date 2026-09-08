@@ -206,6 +206,16 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
 /// still carries parsed to an empty map before and does so now. Listed per version
 /// because a shared hash alone is not evidence of an audit.
 ///
+/// THE 0.5.7 / 0.5.8 HOTFIX (2026-09-08). Elden Ring 2.7.1.0 landed while players were mid-run
+/// on v0.5.7 seeds. Their 0.5.7 client refuses the new executable at the version gate, and the
+/// only client that accepts 2.7.1.0 is on the 0.6.0 line -- which, until this entry, refused
+/// their seed. 0.5.7 and 0.5.8 shipped the SAME `ffc0f1b5` contract the 0.6.0..0.6.0.3 bridge
+/// above already carries, so the WIRE SHAPE is the audited one: no `profile` (the sniff
+/// fallback fires and announces itself), no key this client cannot parse. What this entry
+/// does NOT claim: that the 0.6 check corpus, region-lock and sweep tables this client carries
+/// were audited against a 0.5.7 server's location set. Scoped on purpose to a stranded run;
+/// a fresh 0.5.7 seed should still be rolled on a 0.6.0-line apworld.
+///
 /// Match version and hash together: hashes can be shared across releases, and
 /// compatibility has not been audited for every release that shared one.
 pub fn is_legacy_contract_compatible(versions: &str) -> bool {
@@ -213,7 +223,9 @@ pub fn is_legacy_contract_compatible(versions: &str) -> bool {
     (has("apworld/0.4.13") && has("contract/dc0dc687"))
         || (has("apworld/0.5.5") && has("contract/8397a952"))
         || (has("contract/ffc0f1b5")
-            && (has("apworld/0.6.0")
+            && (has("apworld/0.5.7")
+                || has("apworld/0.5.8")
+                || has("apworld/0.6.0")
                 || has("apworld/0.6.0.1")
                 || has("apworld/0.6.0.2")
                 || has("apworld/0.6.0.3")))
@@ -633,6 +645,26 @@ mod tests {
         }
         assert!(!is_legacy_contract_compatible(
             "apworld/0.6.1 contract/ffc0f1b5 data/x"
+        ));
+    }
+
+    /// 2026-09-08 hotfix: a v0.5.7 run stranded by Elden Ring 2.7.1.0 can finish on this
+    /// client. Same `ffc0f1b5` wire shape as the 0.6.0 line; 0.5.6 and earlier carried a
+    /// different hash and stay refused, and the hash alone still buys nothing.
+    #[test]
+    fn a_stranded_0_5_7_run_is_bridged_but_only_on_its_own_contract() {
+        for v in ["0.5.7", "0.5.8"] {
+            assert!(
+                is_legacy_contract_compatible(&format!("apworld/{v} contract/ffc0f1b5 data/x")),
+                "{v} shipped ffc0f1b5 and is bridged for the 2.7.1.0 strand"
+            );
+            assert!(
+                !is_legacy_contract_compatible(&format!("apworld/{v} contract/8397a952 data/x")),
+                "{v} with the wrong hash is not a pair anyone audited"
+            );
+        }
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.5.6 contract/ffc0f1b5 data/x"
         ));
     }
 }
