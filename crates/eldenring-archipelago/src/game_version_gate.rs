@@ -43,6 +43,11 @@ pub enum Supported {
     /// upstream's GENERATED 1.17.0 table (vswarte PR #320); the client's own eight are still
     /// derived CANDIDATES. See `crate::rva_table`.
     Ww270,
+    /// The 2026-09-08 patch, Worldwide (exe 2.7.1.0, Steam build 25080141). The crate's 107
+    /// RVAs are GENERATED with upstream's own `tools/binary-mapper` in the 4laric fork
+    /// (`rva_ww_2710.rs`; five moved from 2.7.0.0, all by +0x70). The client's own eight are
+    /// re-located candidates -- see `crate::rva_table::WW2710`. No JP 2.7.1.x exe seen yet.
+    Ww2710,
     /// Pre-Tarnished, Japanese (exe 2.6.2.1). Same fork-restored provenance as [`Self::Ww262`].
     Jp2621,
     /// Tarnished Edition, Japanese (exe 2.7.0.1). Covered by upstream's generated `rva_jp`
@@ -60,6 +65,8 @@ impl GameVersion for Supported {
             Some(Self::Ww262)
         } else if lang_id == LANG_ID_EN && version == game_version::REQUIRED_WW_TARNISHED {
             Some(Self::Ww270)
+        } else if lang_id == LANG_ID_EN && version == game_version::REQUIRED_WW_2710 {
+            Some(Self::Ww2710)
         } else if lang_id == LANG_ID_JP && version == game_version::REQUIRED_JP {
             Some(Self::Jp2621)
         } else if lang_id == LANG_ID_JP && version == game_version::REQUIRED_JP_TARNISHED {
@@ -122,6 +129,15 @@ pub fn check() -> Result<(), String> {
                      (candidate table 2026-08-27); the crate's 93 are upstream-generated"
                 );
             }
+            if matches!(*version, Supported::Ww2710) {
+                // Same honesty for the 2026-09-08 patch: the crate's table is mapper-generated
+                // against the real exe; the client's eight were re-located by prologue and
+                // dataref scan on 2026-09-08 and have NOT yet executed in a game.
+                log::warn!(
+                    "Elden Ring 2.7.1.0: the client's own 8 RVAs are RE-LOCATED, UNVERIFIED \
+                     (candidate table 2026-09-08); the crate's 107 are mapper-generated"
+                );
+            }
             Ok(())
         }
         Ok(Err(rejection)) => Err(game_version::explain(rejection)),
@@ -157,6 +173,7 @@ pub fn measured_clause() -> String {
     let result = match detect_once() {
         Ok(Ok(Supported::Ww262)) => Ok((game_version::REQUIRED_WW, LANG_ID_EN)),
         Ok(Ok(Supported::Ww270)) => Ok((game_version::REQUIRED_WW_TARNISHED, LANG_ID_EN)),
+        Ok(Ok(Supported::Ww2710)) => Ok((game_version::REQUIRED_WW_2710, LANG_ID_EN)),
         Ok(Ok(Supported::Jp2621)) => Ok((game_version::REQUIRED_JP, LANG_ID_JP)),
         Ok(Ok(Supported::Jp2701)) => Ok((game_version::REQUIRED_JP_TARNISHED, LANG_ID_JP)),
         Ok(Err(rejection)) => Err(rejection.clone()),

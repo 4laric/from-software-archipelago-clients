@@ -86,7 +86,12 @@ const VANILLA_MULTI_SLOT_ROWS_WW270: u32 = 105;
 /// executable we have no table for.
 fn expected_for(version: Option<Supported>) -> u32 {
     match version {
-        Some(Supported::Ww270) | Some(Supported::Jp2701) => VANILLA_MULTI_SLOT_ROWS_WW270,
+        // 2.7.1.0 inherits the 2.7.0.0 figure UNMEASURED: its regulation.bin changed with the
+        // exe (same mtime) and no 2.7.1.0 smoke run has printed the probe line yet. If a vanilla
+        // 2.7.1.0 run is reported as modded, this is the number to re-measure first.
+        Some(Supported::Ww270) | Some(Supported::Jp2701) | Some(Supported::Ww2710) => {
+            VANILLA_MULTI_SLOT_ROWS_WW270
+        }
         Some(Supported::Ww262) | Some(Supported::Jp2621) | None => VANILLA_MULTI_SLOT_ROWS_WW262,
     }
 }

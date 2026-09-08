@@ -56,7 +56,11 @@ archipelago_rs.workspace = true        # ensure the workspace is on 3.0.1 (try-a
 # RETIRE THIS PIN when upstream re-adds pre-Tarnished support, or when this project drops 2.6.2.x:
 # at that point both entries move straight back to vswarte/fromsoftware-rs and this note goes.
 # Bump the rev deliberately, in its own PR, and keep game_version_gate.rs's arms in lockstep.
-fromsoftware-shared = { git = "https://github.com/4laric/fromsoftware-rs", rev = "8c0afd1bbf7b7fea8ddd93a3ada2a8556b0d5a13" }
+# 2026-09-08: bumped to the fork's `tarnished-2710` tip = the 8c0afd1b tree plus ONE commit adding
+# the Worldwide 2.7.1.0 arm (`rva_ww_2710.rs`, generated with upstream's own binary-mapper against
+# the real Steam build 25080141 exe; five RVAs moved from 2.7.0.0, all +0x70). Upstream still has
+# no 2.7.1.0 table; when it ships one, that is the moment to re-evaluate this whole pin.
+fromsoftware-shared = { git = "https://github.com/4laric/fromsoftware-rs", rev = "af8f38c656bb90aa40d7b81df79483ac94088dfd" }
 hudhook.workspace = true
 # Item-tracker overlay window (shared::Core render_overlay_* hooks take &imgui::Ui). Same spec as
 # crates/shared so the workspace [patch.crates-io] git pin resolves both to ONE imgui instance.
@@ -79,7 +83,7 @@ oneshot = { version = "0.2.1", features = ["std"] }   # scout_proof: archipelago
 # Must track the SAME ref as fromsoftware-shared above so
 # they're ONE source instance (one fss copy → SharedTaskImp/SharedTaskImpExt resolve). Isolated from
 # the workspace's 0.13 by being a different git ref than the framework's default-branch source.
-eldenring = { git = "https://github.com/4laric/fromsoftware-rs", rev = "8c0afd1bbf7b7fea8ddd93a3ada2a8556b0d5a13" }
+eldenring = { git = "https://github.com/4laric/fromsoftware-rs", rev = "af8f38c656bb90aa40d7b81df79483ac94088dfd" }
 # ER pure-logic crates (host-tested).
 er-codec = { path = "../er-codec" }
 er-logic = { path = "../er-logic" }
