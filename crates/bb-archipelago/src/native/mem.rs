@@ -6,6 +6,12 @@
 //! while the real accessor lives behind `#[cfg(windows)]`, exactly as
 //! `event_flags.rs` splits its live reads.
 //!
+//! Writes go through [`write_with_protect_fallback`]: plain
+//! `WriteProcessMemory` first, and `VirtualProtectEx(PAGE_EXECUTE_READWRITE)`
+//! only as a retry. The unconditional protect the Python path used is wrong on
+//! shadPS4's guest heap, where the pages are already writable but their
+//! protection cannot be changed.
+//!
 //! [`require_validated_image`] is the port of the Python `require_validated_image`:
 //! every image assert in the contract must match before anything is written.
 //! CUSA00900 and every other serial or app version land here and are refused --
@@ -151,6 +157,111 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // -------------------------------------------------------------------------
+// The write strategy, split out from the Windows syscalls so it is testable
+// on any host. See `WinProcessMemory::write`.
+// -------------------------------------------------------------------------
+
+/// Which of the two attempts actually landed the bytes. Diagnostics only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritePath {
+    /// `WriteProcessMemory` succeeded with the page's existing protection.
+    Direct,
+    /// The direct write failed and the `VirtualProtectEx` dance was needed.
+    ViaProtect,
+}
+
+/// The three raw calls [`write_with_protect_fallback`] sequences. Implemented
+/// over the real Win32 entry points on Windows and over a recording fake in
+/// the tests, the same way `FakeMemory` stands in for `WinProcessMemory`.
+pub trait RawWriteSyscalls {
+    /// `WriteProcessMemory`, returning the byte count it reported.
+    fn write_process_memory(&mut self, address: u64, len: usize) -> Result<usize>;
+    /// `VirtualProtectEx(PAGE_EXECUTE_READWRITE)`, remembering the old flags.
+    fn protect_rwx(&mut self, address: u64, len: usize) -> Result<()>;
+    /// Restore whatever [`Self::protect_rwx`] replaced. Best effort.
+    fn restore_protect(&mut self, address: u64, len: usize);
+}
+
+/// Write `len` bytes at `address`, trying the plain `WriteProcessMemory`
+/// first and only reaching for `VirtualProtectEx` when it fails.
+///
+/// Fixpack bb-0.1.0.1: the old order was protect-then-write
+/// unconditionally, which broke incoming DeathLink on shadPS4 0.18.0. The
+/// guest-heap page holding the player HP cell is a mapped/placeholder section
+/// whose protection cannot be moved to execute-read-write, so
+/// `VirtualProtectEx` returned ERROR_INVALID_PARAMETER and the HP write never
+/// ran -- even though the page was plainly writable and the same address read
+/// back fine. The protect dance is still required for the eboot code pages the
+/// native payload install patches, so it stays as the fallback rather than
+/// being deleted.
+pub fn write_with_protect_fallback<S: RawWriteSyscalls>(
+    syscalls: &mut S,
+    address: u64,
+    len: usize,
+) -> Result<WritePath> {
+    let direct = syscalls.write_process_memory(address, len);
+    let direct_failure = match direct {
+        Ok(written) if written == len => return Ok(WritePath::Direct),
+        Ok(written) => {
+            format!("WriteProcessMemory({address:#x}) wrote {written} of {len} bytes")
+        }
+        Err(error) => format!("WriteProcessMemory({address:#x}): {error:#}"),
+    };
+
+    if let Err(protect_error) = syscalls.protect_rwx(address, len) {
+        bail!(
+            "{direct_failure}; VirtualProtectEx({address:#x}, {len}) also failed: {protect_error:#}"
+        );
+    }
+    let retry = syscalls.write_process_memory(address, len);
+    syscalls.restore_protect(address, len);
+    match retry {
+        Ok(written) if written == len => Ok(WritePath::ViaProtect),
+        Ok(written) => bail!(
+            "{direct_failure}; after VirtualProtectEx, short write at {address:#x}: \
+             {written} of {len} bytes"
+        ),
+        Err(error) => bail!(
+            "{direct_failure}; after VirtualProtectEx, WriteProcessMemory({address:#x}): {error:#}"
+        ),
+    }
+}
+
+/// How many writes took each path since the process started. The crate has no
+/// logging framework, so diagnostics read these counters instead of a
+/// debug-level line; nothing is printed at info level.
+pub mod write_path_counters {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::WritePath;
+
+    static DIRECT: AtomicU64 = AtomicU64::new(0);
+    static VIA_PROTECT: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn record(path: WritePath) {
+        match path {
+            WritePath::Direct => &DIRECT,
+            WritePath::ViaProtect => &VIA_PROTECT,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(direct, via_protect)` write counts.
+    pub fn counts() -> (u64, u64) {
+        (
+            DIRECT.load(Ordering::Relaxed),
+            VIA_PROTECT.load(Ordering::Relaxed),
+        )
+    }
+
+    /// A one-line summary for diagnostics and failure contexts.
+    pub fn summary() -> String {
+        let (direct, via_protect) = counts();
+        format!("writes: {direct} direct, {via_protect} via VirtualProtectEx")
+    }
+}
+
+// -------------------------------------------------------------------------
 // A host-side fake, available on every platform so the logic tests run
 // anywhere.
 // -------------------------------------------------------------------------
@@ -229,7 +340,60 @@ mod windows_impl {
         PROCESS_VM_WRITE,
     };
 
-    use super::ProcessMemory;
+    use super::{
+        ProcessMemory, RawWriteSyscalls, write_path_counters, write_with_protect_fallback,
+    };
+
+    /// The Win32 side of [`RawWriteSyscalls`], holding the source bytes and the
+    /// protection flags a fallback has to put back.
+    struct WinWriteSyscalls<'a> {
+        handle: HANDLE,
+        data: &'a [u8],
+        old: PAGE_PROTECTION_FLAGS,
+    }
+
+    impl RawWriteSyscalls for WinWriteSyscalls<'_> {
+        fn write_process_memory(&mut self, address: u64, len: usize) -> Result<usize> {
+            debug_assert_eq!(len, self.data.len());
+            let mut written = 0usize;
+            unsafe {
+                WriteProcessMemory(
+                    self.handle,
+                    address as *const c_void,
+                    self.data.as_ptr().cast(),
+                    len,
+                    Some(&mut written),
+                )
+            }?;
+            Ok(written)
+        }
+
+        fn protect_rwx(&mut self, address: u64, len: usize) -> Result<()> {
+            unsafe {
+                VirtualProtectEx(
+                    self.handle,
+                    address as *const c_void,
+                    len,
+                    PAGE_EXECUTE_READWRITE,
+                    &mut self.old,
+                )
+            }?;
+            Ok(())
+        }
+
+        fn restore_protect(&mut self, address: u64, len: usize) {
+            let mut restore = PAGE_PROTECTION_FLAGS(0);
+            let _ = unsafe {
+                VirtualProtectEx(
+                    self.handle,
+                    address as *const c_void,
+                    len,
+                    self.old,
+                    &mut restore,
+                )
+            };
+        }
+    }
 
     /// A writable handle to shadPS4.exe.
     pub struct WinProcessMemory {
@@ -343,45 +507,15 @@ mod windows_impl {
         }
 
         fn write(&self, address: u64, data: &[u8]) -> Result<()> {
-            // Match the Python path: temporarily make the page RWX, write, then
-            // restore the previous protection.
-            let mut old = PAGE_PROTECTION_FLAGS(0);
-            unsafe {
-                VirtualProtectEx(
-                    self.handle,
-                    address as *const c_void,
-                    data.len(),
-                    PAGE_EXECUTE_READWRITE,
-                    &mut old,
-                )
-            }
-            .with_context(|| format!("VirtualProtectEx({address:#x}, {})", data.len()))?;
-            let mut written = 0usize;
-            let write_result = unsafe {
-                WriteProcessMemory(
-                    self.handle,
-                    address as *const c_void,
-                    data.as_ptr().cast(),
-                    data.len(),
-                    Some(&mut written),
-                )
+            // Write first; only fall back to the RWX dance if that fails. See
+            // `write_with_protect_fallback` for why the order was inverted.
+            let mut syscalls = WinWriteSyscalls {
+                handle: self.handle,
+                data,
+                old: PAGE_PROTECTION_FLAGS(0),
             };
-            let mut restore = PAGE_PROTECTION_FLAGS(0);
-            let _ = unsafe {
-                VirtualProtectEx(
-                    self.handle,
-                    address as *const c_void,
-                    data.len(),
-                    old,
-                    &mut restore,
-                )
-            };
-            write_result.with_context(|| format!("WriteProcessMemory({address:#x})"))?;
-            ensure!(
-                written == data.len(),
-                "short write at {address:#x}: {written} of {} bytes",
-                data.len()
-            );
+            let path = write_with_protect_fallback(&mut syscalls, address, data.len())?;
+            write_path_counters::record(path);
             Ok(())
         }
     }
@@ -511,5 +645,114 @@ Loading module eboot.bin
         assert!(memory.read(0x1000, 4).is_err());
         memory.write_u32(0x1000, 0xDEAD_BEEF).unwrap();
         assert_eq!(memory.read_u32(0x1000).unwrap(), 0xDEAD_BEEF);
+    }
+
+    // ---------------------------------------------------------------------
+    // The write strategy. `RecordingSyscalls` stands in for the three Win32
+    // calls so the ordering is asserted on every host, not just Windows.
+    // ---------------------------------------------------------------------
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Call {
+        Write,
+        Protect,
+        Restore,
+    }
+
+    struct RecordingSyscalls {
+        /// One entry per `write_process_memory` call, in order.
+        writes: Vec<Result<usize, String>>,
+        protect: Result<(), String>,
+        calls: Vec<Call>,
+    }
+
+    impl RecordingSyscalls {
+        fn new(writes: Vec<Result<usize, String>>, protect: Result<(), String>) -> Self {
+            Self {
+                writes,
+                protect,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl RawWriteSyscalls for RecordingSyscalls {
+        fn write_process_memory(&mut self, _address: u64, _len: usize) -> Result<usize> {
+            self.calls.push(Call::Write);
+            match self.writes.remove(0) {
+                Ok(written) => Ok(written),
+                Err(message) => bail!("{message}"),
+            }
+        }
+
+        fn protect_rwx(&mut self, _address: u64, _len: usize) -> Result<()> {
+            self.calls.push(Call::Protect);
+            match &self.protect {
+                Ok(()) => Ok(()),
+                Err(message) => bail!("{message}"),
+            }
+        }
+
+        fn restore_protect(&mut self, _address: u64, _len: usize) {
+            self.calls.push(Call::Restore);
+        }
+    }
+
+    #[test]
+    fn a_direct_write_never_touches_virtualprotectex() {
+        // The shadPS4 guest heap case: the page is writable as it stands, and
+        // asking to make it RWX is what used to fail.
+        let mut syscalls = RecordingSyscalls::new(vec![Ok(4)], Err("must not be called".into()));
+        let path = write_with_protect_fallback(&mut syscalls, 0x224e_dd2a8, 4).unwrap();
+        assert_eq!(path, WritePath::Direct);
+        assert_eq!(syscalls.calls, vec![Call::Write]);
+    }
+
+    #[test]
+    fn a_refused_direct_write_falls_back_to_the_protect_dance() {
+        // The eboot code-page case the payload install depends on.
+        let mut syscalls =
+            RecordingSyscalls::new(vec![Err("ERROR_NOACCESS".into()), Ok(8)], Ok(()));
+        let path = write_with_protect_fallback(&mut syscalls, 0x5660_0000, 8).unwrap();
+        assert_eq!(path, WritePath::ViaProtect);
+        assert_eq!(
+            syscalls.calls,
+            vec![Call::Write, Call::Protect, Call::Write, Call::Restore]
+        );
+    }
+
+    #[test]
+    fn a_partial_direct_write_also_falls_back() {
+        let mut syscalls = RecordingSyscalls::new(vec![Ok(2), Ok(4)], Ok(()));
+        let path = write_with_protect_fallback(&mut syscalls, 0x1000, 4).unwrap();
+        assert_eq!(path, WritePath::ViaProtect);
+        assert_eq!(
+            syscalls.calls,
+            vec![Call::Write, Call::Protect, Call::Write, Call::Restore]
+        );
+    }
+
+    #[test]
+    fn both_failing_reports_the_write_and_the_protect_error_together() {
+        let mut syscalls = RecordingSyscalls::new(
+            vec![Err("ERROR_NOACCESS".into())],
+            Err("The parameter is incorrect. (0x80070057)".into()),
+        );
+        let error = write_with_protect_fallback(&mut syscalls, 0x224e_dd2a8, 4).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("ERROR_NOACCESS"), "{text}");
+        assert!(text.contains("0x80070057"), "{text}");
+        assert!(text.contains("VirtualProtectEx(0x224edd2a8, 4)"), "{text}");
+        // No retry write, and nothing to restore.
+        assert_eq!(syscalls.calls, vec![Call::Write, Call::Protect]);
+    }
+
+    #[test]
+    fn a_short_write_after_the_fallback_is_still_an_error() {
+        let mut syscalls = RecordingSyscalls::new(vec![Ok(0), Ok(2)], Ok(()));
+        let error = write_with_protect_fallback(&mut syscalls, 0x1000, 4).unwrap_err();
+        assert!(format!("{error:#}").contains("short write at 0x1000: 2 of 4 bytes"));
+        // The protection is put back even on the failing path.
+        assert_eq!(syscalls.calls.last(), Some(&Call::Restore));
     }
 }

@@ -306,6 +306,10 @@ pub struct MockBackend {
     /// uncaptured pointer -- and is the default, so every fixture written
     /// before the local-death detector existed observes nothing at all.
     pub player_hp: Option<u32>,
+    /// When set, `death_link_kill` fails with this message instead of killing.
+    /// Models shadPS4 refusing the HP-cell write (fixpack bb-0.1.0.1): the
+    /// caller must keep the link queued and retry, not drop it.
+    pub death_link_kill_error: Option<String>,
     grant_delays: HashMap<String, u8>,
     pending_grants: HashSet<String>,
     equip_delays: HashMap<String, u8>,
@@ -338,6 +342,7 @@ impl Default for MockBackend {
             retained_unwitnessed: HashSet::new(),
             storage_routed: HashSet::new(),
             player_hp: None,
+            death_link_kill_error: None,
             grant_delays: HashMap::new(),
             pending_grants: HashSet::new(),
             equip_delays: HashMap::new(),
@@ -444,6 +449,9 @@ impl BloodborneBackend for MockBackend {
     }
 
     fn death_link_kill(&mut self) -> Result<bool> {
+        if let Some(message) = &self.death_link_kill_error {
+            anyhow::bail!("{message}");
+        }
         let killed = self
             .location_context
             .as_ref()

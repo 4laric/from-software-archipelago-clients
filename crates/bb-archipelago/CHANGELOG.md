@@ -64,6 +64,24 @@
 
 ### Fixed
 
+* **Incoming DeathLink kills again on shadPS4 0.18.0** (fixpack bb-0.1.0.1
+  material). Reported by oz: three DeathLinks from a Balatro co-player each
+  printed `DeathLink kill unavailable: VirtualProtectEx(0x224edd2a8, 4): The
+  parameter is incorrect. (0x80070057)` and the player never died, while
+  outbound `death_observed` sends and item delivery worked throughout. The
+  write primitive in `native/mem.rs` unconditionally flipped the target page to
+  `PAGE_EXECUTE_READWRITE` before every `WriteProcessMemory` and restored it
+  afterwards -- a habit inherited from the Python client. Newer shadPS4 builds
+  map the guest heap as a section whose protection cannot be changed, so the
+  call failed and the HP write never ran, even though the same address read
+  back fine and the page was already writable. Writes now try
+  `WriteProcessMemory` first and only reach for `VirtualProtectEx` when it
+  fails, which the eboot code pages the native payload patches still need; when
+  both fail the error names both. Behavior for every other caller is unchanged
+  -- the staging cells live in the eboot image and the `VirtualAllocEx` caves,
+  and the event-flag path never used the protect dance at all. A refused kill
+  keeps the death queued for the next poll, as before, and now says so.
+
 * **Auto-upgrade no longer prices a held item at a stale level.** Reported by
   jcc: a player upgraded to +2, went offline, reinforced the Saw Cleaver to
   +5, and on reconnect the items that had been queued while they were away

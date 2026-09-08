@@ -172,7 +172,19 @@ impl<P: ProcessMemory> GuestRuntime<P> {
             // Keep later links queued until the player has actually respawned.
             return Ok(false);
         }
-        self.memory.write_u32(status + PLAYER_CURRENT_HP, 0)?;
+        let cell = status + PLAYER_CURRENT_HP;
+        self.memory.write_u32(cell, 0).map_err(|error| {
+            // The HP cell lives on the shadPS4 guest heap, not in the eboot
+            // image, so a refusal here is a memory-mapping problem and not a
+            // wrong address -- the read two lines up used the same pointer.
+            // main.rs keeps the link queued and retries, so say what failed
+            // rather than leaving a bare syscall name in the console.
+            anyhow::anyhow!(
+                "could not write the player HP cell at {cell:#x}; shadPS4 refused the write \
+                 ({error:#}) [{}]",
+                crate::native::mem::write_path_counters::summary()
+            )
+        })?;
         Ok(true)
     }
 

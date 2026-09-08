@@ -182,7 +182,11 @@ The native code lives in `src/native/`:
   hand-copied number, and a unit test refuses to arm if the vendored copy drifts
   from the crate's `RUNTIME_BUILD`/`HARNESS_VERSION`/`BRIDGE_PROTOCOL`.
 - `mem.rs` puts `ReadProcessMemory`/`WriteProcessMemory`/`VirtualProtectEx`
-  behind a `ProcessMemory` trait with a host `FakeMemory`, and implements
+  behind a `ProcessMemory` trait with a host `FakeMemory`. Writes go through
+  `write_with_protect_fallback`: plain `WriteProcessMemory` first, and the
+  `PAGE_EXECUTE_READWRITE` dance only as a retry, because shadPS4's guest heap
+  is writable but refuses to have its protection changed — that is what broke
+  incoming DeathLink. It implements
   `require_validated_image` — every image assert must match before anything is
   written; CUSA00900 and every other build are refused, not guessed.
 - `install.rs` writes the payload with a thread-suspend atomicity protocol:
