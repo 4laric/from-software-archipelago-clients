@@ -2,6 +2,15 @@
 
 ### Added
 
+* **The Windows version resource accepts a `V.R.M.F` release version.** The
+  launcher's release workflow passes the tag it is building in
+  `BB_RELEASE_VERSION`, and the first player release under the
+  Version.Release.Modification.Fixpack scheme is `v0.1.0.0`, which the build
+  script refused with `release version has too many numeric components`. A
+  four-part version now sets the fourth Windows field from the fixpack and is
+  not flagged prerelease; `V.R.M-suffix.N` behaves exactly as before, and a
+  version carrying both a fixpack and a prerelease suffix is refused.
+
 * **`rescue moon-presence CONFIRM`, a client-side repair for the shared
   umbilical cord** (bb-archipelago "distinct umbilical cords"). Every seed
   shipped so far binds all four "Third Umbilical Cord #N" AP items to the same

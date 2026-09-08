@@ -5,6 +5,13 @@ const PRODUCT_NAME: &str = "Bloodborne Archipelago";
 const PUBLISHER: &str = "4laric";
 const COPYRIGHT: &str = "Copyright (c) 2026 4laric";
 
+/// Accepts both release tag spellings the launcher can push.
+///
+/// * `V.R.M.F` -- Version.Release.Modification.Fixpack, a player release
+///   (`0.1.0.0`, tagged `bb-0.1.0.0`). `F` is the fixpack and becomes the
+///   fourth Windows version field. Not a prerelease.
+/// * `V.R.M[-suffix.N]` -- a stable or prerelease build, where `N` becomes the
+///   fourth field.
 fn release_versions(raw: &str) -> io::Result<(String, String, u64, bool)> {
     let product = raw.trim().strip_prefix('v').unwrap_or(raw.trim());
     let (base, suffix) = product.split_once('-').unwrap_or((product, ""));
@@ -18,10 +25,20 @@ fn release_versions(raw: &str) -> io::Result<(String, String, u64, bool)> {
             .parse()
             .map_err(|_| io::Error::other("release version components must be 0..65535"))?;
     }
-    if base_parts.next().is_some() {
-        return Err(io::Error::other(
-            "release version has too many numeric components",
-        ));
+    if let Some(fixpack) = base_parts.next() {
+        if !suffix.is_empty() {
+            return Err(io::Error::other(
+                "a V.R.M.F release version may not also carry a prerelease suffix",
+            ));
+        }
+        numeric[3] = fixpack
+            .parse()
+            .map_err(|_| io::Error::other("the fixpack must be a 0..65535 number"))?;
+        if base_parts.next().is_some() {
+            return Err(io::Error::other(
+                "release version has too many numeric components",
+            ));
+        }
     }
     if !suffix.is_empty() {
         numeric[3] = suffix
@@ -83,6 +100,30 @@ mod tests {
         assert_eq!(file, "0.1.0.35");
         assert_eq!(encoded, (1_u64 << 32) | 35);
         assert!(prerelease);
+    }
+
+    #[test]
+    fn four_part_vrmf_version_is_a_player_release() {
+        // Version.Release.Modification.Fixpack: bb-0.1.0.0 is fixpack 0 of the
+        // 0.1.0 seed-compatibility line, and is not a prerelease.
+        let (product, file, encoded, prerelease) = release_versions("v0.1.0.0").unwrap();
+        assert_eq!(product, "0.1.0.0");
+        assert_eq!(file, "0.1.0.0");
+        assert_eq!(encoded, 1_u64 << 32);
+        assert!(!prerelease);
+
+        let (product, file, encoded, prerelease) = release_versions("0.1.0.7").unwrap();
+        assert_eq!(product, "0.1.0.7");
+        assert_eq!(file, "0.1.0.7");
+        assert_eq!(encoded, (1_u64 << 32) | 7);
+        assert!(!prerelease);
+    }
+
+    #[test]
+    fn malformed_versions_are_refused() {
+        for raw in ["v0.1.0.0.1", "v0.1.0.0-beta.1", "v0.1.0.x", "v0.1"] {
+            assert!(release_versions(raw).is_err(), "{raw} should be refused");
+        }
     }
 
     #[test]
