@@ -182,10 +182,15 @@ impl<P: ProcessMemory> GuestRuntime<P> {
     /// detector (bb-archipelago#78) is built on the one player-state read this
     /// client has already exercised in game rather than on a new resolver.
     ///
-    /// INFERRED: that HP reaching zero *is* a death is candidate class 1 of
-    /// `docs/SESSION-death-signal.md` and has not been validated live. The
-    /// caller owns the debounce, the load/menu handling and the incoming-kill
-    /// echo suppression; this returns the raw number and nothing else.
+    /// PARTLY OBSERVED: that HP reaching zero *is* a death is candidate class
+    /// 1 of `docs/SESSION-death-signal.md`. On 2026-09-08 an ordinary player
+    /// death was observed producing the alive->dead edge on this cell in a
+    /// live session, so the read is real and the positive case holds. The
+    /// converse -- that nothing *else* zeroes it -- is still inferred: fake
+    /// death SpEffect windows, cutscenes, quit-to-title and loads have not
+    /// been exercised against it. The caller owns the debounce, the load/menu
+    /// handling and the incoming-kill echo suppression; this returns the raw
+    /// number and nothing else.
     pub fn player_current_hp(&self) -> anyhow::Result<Option<u32>> {
         let status = self.memory.read_u64(self.cells.player_status)?;
         if status == 0 {

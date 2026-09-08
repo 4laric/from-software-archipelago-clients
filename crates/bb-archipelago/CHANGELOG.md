@@ -1,5 +1,20 @@
 ## Unreleased
 
+### Changed
+
+* **The outbound DeathLink signal has been seen working live, and the client
+  now says so precisely.** On 2026-09-08 (launcher `v0.1.0.1`, client
+  `bb-0.1.0.0`) an ordinary player death was detected by the HP-edge detector
+  and broadcast to the multiworld, where another player saw it arrive. The
+  startup banner and the `deathlink` console command no longer call the signal
+  "NOT validated live"; they now state that the ordinary-death edge was
+  observed on that date while the cases that would make it fire *without* a
+  death -- cutscenes, fake-death SpEffects, quit-to-title, loading -- remain
+  unverified, so a death you did not die may still be broadcast. Sending stays
+  seed-gated and off by default, and the doc comments on the HP read, the
+  backend trait and the amnesty state machine are corrected to match. Wording
+  only: no behavior, contract, or persisted state changes.
+
 ### Added
 
 * **The Windows version resource accepts a `V.R.M.F` release version.** The

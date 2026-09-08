@@ -277,8 +277,10 @@ pub enum SustainPollResult {
 }
 
 /// Seed-owned outbound DeathLink policy decision. Detection stays separate
-/// from this durable state machine: the machine is exact and unit-tested, the
-/// detector below it is inferred and gated off by default.
+/// from this durable state machine: the machine is exact and unit-tested,
+/// while the detector below it is only partly observed live (an ordinary
+/// death was seen firing it on 2026-09-08; the false-positive cases were not
+/// exercised) and stays gated off by default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeathLinkAmnestyDecision {
     Disabled,
@@ -604,7 +606,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .is_some_and(|slot| slot.death_link_first_death_graced)
     }
 
-    /// Poll the inferred local-death signal once (bb-archipelago#78).
+    /// Poll the partly-observed local-death signal once (bb-archipelago#78).
     ///
     /// Runs only while DeathLink is on at all, so a session without it never
     /// pays for a read and never changes behaviour. When DeathLink is on but

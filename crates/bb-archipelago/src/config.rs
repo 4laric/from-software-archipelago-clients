@@ -349,11 +349,14 @@ pub struct RuntimeConfig {
     /// Seed-owned opt-in for the *outbound* half (bb-archipelago#78).
     /// Default false, and false whenever an older seed omits the key, so a
     /// seed rolled before this client existed keeps its receive-only
-    /// behaviour byte for byte. INFERRED SIGNAL: the local-death detector
-    /// behind this gate reads current HP and fires on an alive->dead edge
-    /// (docs/SESSION-death-signal.md candidate class 1). That signal has not
-    /// been live-validated, which is exactly why sending is a separate key
-    /// rather than a consequence of `death_link`.
+    /// behaviour byte for byte. PARTLY OBSERVED SIGNAL: the local-death
+    /// detector behind this gate reads current HP and fires on an alive->dead
+    /// edge (docs/SESSION-death-signal.md candidate class 1). An ordinary
+    /// death was observed firing it and reaching the multiworld on
+    /// 2026-09-08; the cases that would make it fire without a death --
+    /// cutscenes, fake-death SpEffects, quit-to-title, loads -- remain
+    /// unverified, which is exactly why sending is a separate key rather than
+    /// a consequence of `death_link`.
     #[serde(default)]
     pub death_link_send: bool,
     /// Seed-owned opt-in: forgive this slot's very first qualifying local
