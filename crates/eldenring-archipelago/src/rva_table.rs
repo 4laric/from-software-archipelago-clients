@@ -81,6 +81,36 @@ pub const WW270: ClientRvas = ClientRvas {
     chr_asm_commit: 0x0024_5C00,
 };
 
+/// Elden Ring 2.7.1.0 Worldwide (the 2026-09-08 patch, Steam build 25080141). CANDIDATE --
+/// re-located 2026-09-08, never executed.
+///
+/// Method, against the real 2.7.1.0 `eldenring.exe` (sha256 `1a354710...597891`): the four code
+/// addresses were checked with the very `_SIG` prologue bytes the call sites guard on
+/// (`ADD_ITEM_FUNC_SIG`, `LUA_WARP_FUNC_SIG`, `SEARCH_SIG`, `CHR_ASM_COMMIT_SIG`) -- three match
+/// at their 2.7.0.0 address and `SEARCH_SIG` matches exactly once in the whole `.text`, at
+/// +0x70. The four `.data` slots were checked by counting rip-relative `mov`/`lea` references
+/// to the 2.7.0.0 address in the new `.text`: 133 / 264 / 30 / 236 hits respectively, so the
+/// slots did not move. The +0x70 agrees with the crate's own mapper-generated table, where the
+/// only five moved entries (all above `0xc71d90`) moved by exactly +0x70.
+pub const WW2710: ClientRvas = ClientRvas {
+    // SIG match at the 2.7.0.0 address; 187 hits of this generic prologue in `.text`, this one
+    // the only hit within +-0x1000.
+    add_item_func: 0x0056_1400,
+    // 133 rip-relative references at the 2.7.0.0 address.
+    inventory_ptrloc: 0x03D6_BAC0,
+    // SIG match at the 2.7.0.0 address; unique in `.text`.
+    lua_warp_func: 0x0059_AA60,
+    // 264 / 30 rip-relative references at the 2.7.0.0 addresses.
+    cslem_candidates: [0x03D6_BEB8, 0x03D5_F040],
+    // 236 rip-relative references at the 2.7.0.0 address -- a far stronger vote than the 2/20
+    // that put the 2.7.0.0 value here in the first place.
+    fmg_repo: 0x03D8_1568,
+    // delta +0x70: `SEARCH_SIG` matches exactly once in `.text`, here.
+    fmg_search: 0x0266_FC40,
+    // UNCHANGED again -- low `.text` did not shift in this patch either.
+    chr_asm_commit: 0x0024_5C00,
+};
+
 /// The table for the executable we are actually running in.
 ///
 /// Falls back to [`WW262`] when detection fails. That arm is not reachable in a normal session:
@@ -89,12 +119,13 @@ pub const WW270: ClientRvas = ClientRvas {
 /// fallback picks the VERIFIED column rather than the candidate one on principle.
 ///
 /// JP maps to the WORLDWIDE column of its own generation: JP 2.6.2.1 to [`WW262`], JP 2.7.0.1 to
-/// [`WW270`]. That is not a claim these eight addresses are correct on the Japanese executable -- they were never derived for it. It preserves exactly what the
+/// [`WW270`]. Worldwide 2.7.1.0 gets [`WW2710`]. That is not a claim these eight addresses are correct on the Japanese executable -- they were never derived for it. It preserves exactly what the
 /// client did before this module existed (one baked Worldwide constant for every build), and the
 /// per-call-site `_SIG` prologue guards are what actually keep it honest there.
 pub fn current() -> &'static ClientRvas {
     match detected() {
         Some(Supported::Ww270) | Some(Supported::Jp2701) => &WW270,
+        Some(Supported::Ww2710) => &WW2710,
         Some(Supported::Ww262) | Some(Supported::Jp2621) | None => &WW262,
     }
 }
@@ -121,5 +152,19 @@ mod tests {
         assert_ne!(WW262.cslem_candidates, WW270.cslem_candidates);
         assert_ne!(WW262.fmg_repo, WW270.fmg_repo);
         assert_ne!(WW262.fmg_search, WW270.fmg_search);
+    }
+
+    /// 2.7.1.0 is 2.7.0.0 with exactly one client-private move (`fmg_search`, +0x70). A column
+    /// that copied 2.7.0.0 wholesale, or one that applied the delta everywhere, would both be
+    /// wrong -- so pin the one difference and the seven identities.
+    #[test]
+    fn the_2710_column_moves_only_fmg_search_and_by_0x70() {
+        assert_eq!(WW2710.fmg_search, WW270.fmg_search + 0x70);
+        assert_eq!(WW2710.add_item_func, WW270.add_item_func);
+        assert_eq!(WW2710.inventory_ptrloc, WW270.inventory_ptrloc);
+        assert_eq!(WW2710.lua_warp_func, WW270.lua_warp_func);
+        assert_eq!(WW2710.cslem_candidates, WW270.cslem_candidates);
+        assert_eq!(WW2710.fmg_repo, WW270.fmg_repo);
+        assert_eq!(WW2710.chr_asm_commit, WW270.chr_asm_commit);
     }
 }

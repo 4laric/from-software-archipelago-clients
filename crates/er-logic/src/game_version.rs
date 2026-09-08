@@ -35,6 +35,14 @@ pub const REQUIRED_WW: &str = "2.6.2.0";
 /// All four arms coexist: the `eldenring` crate dispatches per version and keeps every table, so
 /// accepting Tarnished takes nothing away from 2.6.2.x.
 pub const REQUIRED_WW_TARNISHED: &str = "2.7.0.0";
+/// The Worldwide executable of the 2026-09-08 patch to Tarnished Edition (Steam build
+/// 25080141). Its 107 crate RVAs were GENERATED with upstream's own `tools/binary-mapper` in
+/// the 4laric fork (`rva_ww_2710.rs`): only five moved from 2.7.0.0, each by +0x70. The
+/// client's own eight (`eldenring_archipelago::rva_table::WW2710`) were re-located by their
+/// shipped `_SIG` prologues and rip-relative reference counts against that exe -- seven are
+/// unchanged, `fmg_search` moved by the same +0x70. No Japanese 2.7.1.x executable has been
+/// seen, so there is no JP arm for this patch yet.
+pub const REQUIRED_WW_2710: &str = "2.7.1.0";
 /// The Japanese executable version this build's RVA table was compiled against.
 pub const REQUIRED_JP: &str = "2.6.2.1";
 /// The Japanese **Tarnished Edition** executable this build ALSO carries a table for.
@@ -76,7 +84,7 @@ pub fn explain(rejection: &Rejection) -> String {
             "Elden Ring Archipelago cannot start: unsupported game version.\n\
              \n\
              Your Elden Ring:  {detected}\n\
-             This build needs: {REQUIRED_WW} or {REQUIRED_WW_TARNISHED} (Worldwide)\n\
+             This build needs: {REQUIRED_WW}, {REQUIRED_WW_TARNISHED} or {REQUIRED_WW_2710} (Worldwide)\n\
              \x20                 {REQUIRED_JP} or {REQUIRED_JP_TARNISHED} (Japanese)\n\
              \n\
              There are two ways to land here.\n\
@@ -120,7 +128,8 @@ pub fn explain(rejection: &Rejection) -> String {
             "Elden Ring Archipelago cannot start: the executable carries no {missing} information,\n\
              so we cannot tell which build of Elden Ring this is.\n\
              \n\
-             This build needs {REQUIRED_WW} or {REQUIRED_WW_TARNISHED} (Worldwide), or\n\
+             This build needs {REQUIRED_WW}, {REQUIRED_WW_TARNISHED} or {REQUIRED_WW_2710}\n\
+             (Worldwide), or\n\
              {REQUIRED_JP} or {REQUIRED_JP_TARNISHED} (Japanese). An executable\n\
              with its version resource stripped is usually a repack or a cracked copy; the mod\n\
              cannot support those, because every memory address it uses is keyed to a known build.\n\
@@ -197,6 +206,7 @@ mod tests {
         for required in [
             REQUIRED_WW,
             REQUIRED_WW_TARNISHED,
+            REQUIRED_WW_2710,
             REQUIRED_JP,
             REQUIRED_JP_TARNISHED,
         ] {
@@ -231,7 +241,7 @@ mod tests {
         let msg = explain(&Rejection::Version {
             detected: "2.2.0.0".into(),
         });
-        for required in ["2.6.2.0", "2.6.2.1", "2.7.0.0", "2.7.0.1"] {
+        for required in ["2.6.2.0", "2.6.2.1", "2.7.0.0", "2.7.0.1", "2.7.1.0"] {
             assert!(msg.contains(required), "dropped {required}: {msg}");
         }
     }
@@ -244,6 +254,7 @@ mod tests {
         for required in [
             REQUIRED_WW,
             REQUIRED_WW_TARNISHED,
+            REQUIRED_WW_2710,
             REQUIRED_JP,
             REQUIRED_JP_TARNISHED,
         ] {
