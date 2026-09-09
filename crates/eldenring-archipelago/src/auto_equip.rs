@@ -487,6 +487,9 @@ pub fn enqueue_spell(full_id: i32, pos: Option<er_logic::spell_equip::SpellPos>)
 /// self-corrects. A spell written this way displays in the Memorize screen, casts with no menu or
 /// grace round-trip, and survives a reload.
 pub fn tick_spells() {
+    if crate::respec::busy() {
+        return;
+    }
     if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
         return;
     }
@@ -626,6 +629,9 @@ pub fn set_spell_backfill(list: Vec<BackfillEntry>) {
 /// visible, non-destructive, and it overwrites nothing. Reading the bag here would mean a second
 /// inventory walk; worth doing if that case is ever observed.
 pub fn tick_spell_backfill() {
+    if crate::respec::busy() {
+        return;
+    }
     if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
         return;
     }
@@ -917,6 +923,9 @@ pub fn normalize_starting_left_slots() -> Option<usize> {
 /// Per-tick until the pending queue drains. An item not yet in the bag stays queued for a later
 /// tick -- the grant and the receive are not ordered with respect to each other.
 pub fn tick() {
+    if crate::respec::busy() {
+        return;
+    }
     if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
         return;
     }

@@ -621,6 +621,9 @@ fn parse_natural_keys(v: Option<&Value>) -> HashMap<String, Vec<NkClause>> {
 /// that module's MOTIVATING CASE note for why the message names the region and, for the three
 /// vanilla-gated regions, the vanilla key.
 pub fn tick_kick(cfg: &RegionConfig) -> Option<String> {
+    if crate::respec::busy() {
+        return None;
+    }
     let pr = flags::play_region_id()?;
     let kick = er_logic::region_lock::kick_decision(
         pr,

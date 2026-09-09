@@ -152,6 +152,10 @@ pub fn last_dispatch() -> Option<(i32, i32, [i32; 4])> {
 /// Whether received-item inventory work is safe this frame. Flags deliberately do not use this:
 /// they have no inventory pointer and remain self-healing while a conversation is open.
 pub fn inventory_grants_safe() -> bool {
+    !crate::respec::busy() && talk_is_quiet()
+}
+
+pub fn talk_is_quiet() -> bool {
     er_logic::esd_probe::inventory_quiet(
         talk_clock_ms(),
         LAST_TALK_ACTIVITY_MS.load(Ordering::Relaxed),

@@ -324,6 +324,11 @@ impl<G: Game> Overlay<G> {
     }
 
     pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
+        if core.native_menu_active() {
+            self.keyboard_surface_active = false;
+            self.cursor_capture_active = false;
+            return;
+        }
         // Push at frame scope so the shared windows and game-owned windows (ER tracker and toasts)
         // consume one palette. Games without a theme push nothing and retain imgui's defaults.
         let theme = G::OVERLAY_THEME;

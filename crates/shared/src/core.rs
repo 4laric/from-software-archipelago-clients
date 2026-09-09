@@ -601,6 +601,11 @@ pub trait Core: Send + Sized {
     /// Lets a game add its own items to the overlay menu bar. Default: nothing.
     fn render_overlay_menu_items(&mut self, _ui: &imgui::Ui) {}
 
+    /// A game-owned native menu temporarily needs all input and the full screen.
+    fn native_menu_active(&self) -> bool {
+        false
+    }
+
     /// Lets a game render its own overlay windows each frame (called at frame scope,
     /// not nested inside another window). Default: nothing.
     fn render_overlay_windows(&mut self, _ui: &imgui::Ui) {}

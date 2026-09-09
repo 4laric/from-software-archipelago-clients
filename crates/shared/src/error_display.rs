@@ -28,6 +28,8 @@ pub(crate) struct ErrorDisplay<G: Game> {
 
     /// Whether to display the full error information or just the summary.
     show_full_error: bool,
+    /// Ignore stale imgui capture flags while the game owns a native menu.
+    native_menu_active: bool,
 }
 
 impl<G: Game> ErrorDisplay<G> {
@@ -40,6 +42,7 @@ impl<G: Game> ErrorDisplay<G> {
                 core: Some(core),
                 error: None,
                 show_full_error: false,
+                native_menu_active: false,
             },
             Err(error) => Self {
                 input_blocker,
@@ -47,6 +50,7 @@ impl<G: Game> ErrorDisplay<G> {
                 core: None,
                 error: Some(error),
                 show_full_error: false,
+                native_menu_active: false,
             },
         }
     }
@@ -139,8 +143,10 @@ fn window_message_filter(inputs: InputFlags) -> MessageFilter {
 
 impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
     fn render(&mut self, ui: &mut Ui) {
+        self.native_menu_active = false;
         if let Some(core) = &mut self.core {
             let mut core = core.lock().unwrap();
+            self.native_menu_active = core.native_menu_active();
             if let Some(overlay) = &mut self.overlay {
                 overlay.render(ui, &mut core);
             }
@@ -151,6 +157,11 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
         }
 
         self.render_error(ui);
+
+        if self.native_menu_active && self.error.is_none() {
+            self.input_blocker.block_only(InputFlags::empty());
+            return;
+        }
 
         // ---- INPUT BLOCKING, and it runs AFTER the frame's windows are submitted ----------------
         //
@@ -221,6 +232,9 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
     }
 
     fn message_filter(&self, io: &Io) -> MessageFilter {
+        if self.native_menu_active && self.error.is_none() {
+            return window_message_filter(InputFlags::empty());
+        }
         let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
         let mouse_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
         window_message_filter(input_flags(
