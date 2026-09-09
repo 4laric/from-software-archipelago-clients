@@ -99,7 +99,7 @@ fn report(message: impl Into<String>) {
 fn player_identity() -> Option<(FieldInsHandle, usize)> {
     let wcm = unsafe { WorldChrMan::instance() }.ok()?;
     let p = wcm.main_player.as_ref()?;
-    Some((p.chr_ins.field_ins_handle, p as *const _ as usize))
+    Some((p.chr_ins.field_ins_handle, p.as_ref() as *const _ as usize))
 }
 
 /// All these reads precede creating/invoking the synthetic talk script.
@@ -206,10 +206,8 @@ impl Runtime {
             self.stable_since = now;
         }
         let requested = REQUESTED.swap(false, Ordering::AcqRel);
-        if requested {
-            if let Err(e) = self.open(now) {
-                report(e);
-            }
+        if requested && let Err(e) = self.open(now) {
+            report(e);
         }
         if self.state != State::Idle {
             self.owner_lost |= identity.is_none()
