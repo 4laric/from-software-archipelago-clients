@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use eldenring::cs::{
-    BlockId, CSMenuManImp, CSSessionManager, FieldInsHandle, GameDataMan, GameMan, LobbyState,
-    MenuType, ProtocolState, TalkScript, WorldChrMan,
+    BlockId, CSSessionManager, FieldInsHandle, GameDataMan, GameMan, LobbyState, MenuType,
+    ProtocolState, TalkScript, WorldChrMan,
 };
 use eldenring::ez_state::EzStateValue;
 use er_logic::respec::{Notice, Observation, State};
@@ -122,15 +122,9 @@ fn ready() -> Result<(FieldInsHandle, usize), &'static str> {
     if session.lobby_state != LobbyState::None || session.protocol_state != ProtocolState::None {
         return Err("Respec is unavailable during game multiplayer.");
     }
-    let menu = unsafe { CSMenuManImp::instance() }.map_err(|_| "Menu state unavailable.")?;
-    if menu
-        .player_menu_ctrl
-        .chr_menu_flags
-        .flags
-        .pause_menu_state()
-    {
-        return Err("Wait until the game allows menus again.");
-    }
+    // ChrMenuFlags::pause_menu_state is not a verified native-menu veto:
+    // using it here rejected ordinary play in the live smoke test while
+    // allowing respec at a grace. Check existing menus below via env 25.
     if crate::flags::boss_healthbar_npc_param_id() != Some(0) {
         return Err("Respec is unavailable during a boss fight.");
     }

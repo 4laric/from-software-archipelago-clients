@@ -5,11 +5,19 @@ Console. The native rebirth screen owns input while open; the overlay returns
 after it closes. No new seed, option field, or world regeneration is required.
 Use a disposable character or a backed-up save for the first live acceptance run.
 
-This is a prototype, not a claim of in-game verification. Its target is free
+This remains a prototype. Its target is free
 rebirth anywhere, before Rennala, without spending either kind of Larval Tear.
 The implementation invokes native talk event 113 directly. It never changes
 attributes itself, supplies/refunds consumables, or changes progression flags.
 Whether this direct path needs any further cost bypass remains a live-test gate.
+
+The initial build passed the user's smoke test at a grace. Away from grace,
+it refused with "Wait until the game allows menus again." That identifies our
+`ChrMenuFlags::pause_menu_state` guard as the blocker, not event 113. The guard
+has been removed: its meaning as a native-menu veto was not verified. Existing
+menu queries and the other refusal checks remain. The revised build still needs
+an away-from-grace test; the initial smoke report does not establish tear counts
+or save/reload behaviour.
 
 ## Implementation and provenance
 
