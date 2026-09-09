@@ -107,7 +107,7 @@ fn ready() -> Result<(FieldInsHandle, usize), &'static str> {
     let identity = player_identity().ok_or("Load a character before respeccing.")?;
     let wcm = unsafe { WorldChrMan::instance() }.map_err(|_| "Player unavailable.")?;
     let p = wcm.main_player.as_ref().ok_or("Player unavailable.")?;
-    if p.chr_ins.modules.data.hp <= 0 {
+    if er_logic::death_guard::lists_unsafe_to_touch(p.chr_ins.modules.data.hp) {
         return Err("Wait until you are alive before respeccing.");
     }
     if p.chr_ins.modules.ride.is_mounted || p.chr_ins.modules.ride.is_mounting {
@@ -213,7 +213,8 @@ impl Runtime {
             self.owner_lost |= identity.is_none()
                 || identity != self.owner
                 || transitioning
-                || crate::deathlink::read_local_hp().is_none_or(|hp| hp <= 0);
+                || crate::deathlink::read_local_hp()
+                    .is_none_or(er_logic::death_guard::lists_unsafe_to_touch);
             let observation = if self.owner_lost {
                 Observation::OwnerLost
             } else if let Some(script) = self.script.as_mut() {
