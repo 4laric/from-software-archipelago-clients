@@ -119,6 +119,10 @@ impl State {
                 };
                 None
             }
+            (Self::Faulted { .. }, Observation::Open | Observation::Pending) => {
+                *self = Self::Faulted { hold_effects: true };
+                None
+            }
             _ => None,
         }
     }
@@ -191,5 +195,22 @@ mod tests {
         assert!(state.holds_effects());
         state.observe(5_000, Observation::Closed);
         assert_eq!(state, State::Idle);
+    }
+
+    #[test]
+    fn failed_close_releases_input_but_holds_effects_until_retirement() {
+        let mut state = State::Open;
+        state.observe(100, Observation::Pending);
+        assert_eq!(
+            state.observe(100 + OPEN_TIMEOUT_MS, Observation::Pending),
+            Some(Notice::FailedToClose)
+        );
+        assert!(!state.owns_input());
+        assert!(state.holds_effects());
+        state.observe(6_000, Observation::Closed);
+        assert!(!state.holds_effects());
+        state.observe(7_000, Observation::Open);
+        assert!(state.holds_effects());
+        assert!(!state.request(8_000));
     }
 }

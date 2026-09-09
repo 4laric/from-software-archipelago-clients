@@ -39,6 +39,9 @@ struct Runtime {
     clock: Option<Instant>,
     owner: Option<(FieldInsHandle, usize)>,
     before: Option<Stats>,
+    stable_player: Option<(FieldInsHandle, usize)>,
+    stable_since: u64,
+    owner_lost: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +160,11 @@ impl Runtime {
             );
         }
         let identity = ready()?;
+        if self.stable_player != Some(identity)
+            || now.saturating_sub(self.stable_since) < er_logic::respec::SETTLE_MS
+        {
+            return Err("Wait for the character to finish loading, then try again.".into());
+        }
         let script = self.script.get_or_insert_with(|| {
             Box::leak(Box::new(TalkScript::new(BlockId::none(), 1000, identity.0)))
         });
@@ -189,6 +197,14 @@ impl Runtime {
             .get_or_insert_with(Instant::now)
             .elapsed()
             .as_millis() as u64;
+        let identity = player_identity();
+        let transitioning = unsafe { GameMan::instance() }
+            .map(|gm| gm.warp_requested)
+            .unwrap_or(true);
+        if identity != self.stable_player || transitioning {
+            self.stable_player = identity;
+            self.stable_since = now;
+        }
         let requested = REQUESTED.swap(false, Ordering::AcqRel);
         if requested {
             if let Err(e) = self.open(now) {
@@ -196,8 +212,11 @@ impl Runtime {
             }
         }
         if self.state != State::Idle {
-            let identity = player_identity();
-            let observation = if identity.is_none() || identity != self.owner {
+            self.owner_lost |= identity.is_none()
+                || identity != self.owner
+                || transitioning
+                || crate::deathlink::read_local_hp().is_none_or(|hp| hp <= 0);
+            let observation = if self.owner_lost {
                 Observation::OwnerLost
             } else if let Some(script) = self.script.as_mut() {
                 if matches!(self.state, State::Faulted { .. }) {
