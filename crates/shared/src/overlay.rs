@@ -222,6 +222,12 @@ fn next_cursor_capture(
 /// path added cannot reintroduce this. It restores the invariant [`next_main_window_visible`]
 /// already states -- "Hiding must stay cosmetic ... Nothing may be gated on this flag except
 /// drawing."
+/// The mouse half of the blocker's question, pure so it is testable off Windows.
+/// See [`Overlay::blocks_mouse`] for why a keyboard surface claims the mouse too.
+fn blocks_mouse_from(cursor_capture_active: bool, keyboard_surface_active: bool) -> bool {
+    cursor_capture_active || keyboard_surface_active
+}
+
 fn effective_focus(main_window_visible: bool, was_window_focused: bool) -> bool {
     main_window_visible && was_window_focused
 }
@@ -300,9 +306,21 @@ impl<G: Game> Overlay<G> {
         self.keyboard_surface_active || self.cursor_capture_active
     }
 
-    /// Whether the explicit cursor-navigation mode owns mouse input this frame.
+    /// Whether the game must stop seeing the mouse this frame.
+    ///
+    /// TWO TERMS: the explicit cursor-navigation mode, **or** one of our keyboard surfaces being
+    /// up. A typing surface owns BOTH classes regardless of where the cursor happens to sit.
+    ///
+    /// 🛑 THE MOUSE TERM IS NOT COSMETIC (2026-09-09). The ER blocker cannot always tell a
+    /// DirectInput keyboard from a mouse: a device created outside our `DirectInput8Create` detour
+    /// (a proxy `dinput8.dll` from another mod, a device made before we installed, or a second
+    /// `IDirectInput8`) is never tagged, and the buffered `GetDeviceData` path has no state-buffer
+    /// size to fall back on. Such a device is blocked only if BOTH classes are blocked -- so with
+    /// the connect modal up and the cursor drifted off it, keystrokes reached the game's menu and
+    /// navigated/closed it. Claiming the mouse alongside the keyboard closes that, and separately
+    /// stops stray clicks landing on the game behind the modal.
     pub fn blocks_mouse(&self) -> bool {
-        self.cursor_capture_active
+        blocks_mouse_from(self.cursor_capture_active, self.keyboard_surface_active)
     }
 
     pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
@@ -1065,7 +1083,9 @@ fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8, core: &impl Core, 
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_focus, next_cursor_capture, next_main_window_visible};
+    use super::{
+        blocks_mouse_from, effective_focus, next_cursor_capture, next_main_window_visible,
+    };
 
     #[test]
     fn item_text_uses_ut_classification_including_combined_flags() {
@@ -1135,5 +1155,21 @@ mod tests {
     fn hidden_overlay_cannot_retain_or_start_cursor_capture() {
         assert!(!next_cursor_capture(true, false, false, false));
         assert!(!next_cursor_capture(false, true, false, false));
+    }
+
+    /// 🛑 A TYPING SURFACE OWNS THE MOUSE TOO (2026-09-09). The connect modal is up; the cursor is
+    /// nowhere near it. The ER blocker must still claim Mouse, because an UNTAGGED DirectInput
+    /// device -- one created outside our `DirectInput8Create` detour -- is only blocked when both
+    /// classes are, and buffered keystrokes were otherwise reaching the game's menu.
+    #[test]
+    fn a_keyboard_surface_claims_the_mouse_even_with_the_cursor_away() {
+        assert!(blocks_mouse_from(false, true));
+    }
+
+    /// The old term still stands on its own, and an idle overlay still claims nothing.
+    #[test]
+    fn cursor_capture_alone_still_blocks_and_idle_blocks_nothing() {
+        assert!(blocks_mouse_from(true, false));
+        assert!(!blocks_mouse_from(false, false));
     }
 }

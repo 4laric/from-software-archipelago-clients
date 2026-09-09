@@ -181,15 +181,23 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
         // `ui.is_key_pressed`, i.e. from imgui's io, which hudhook fills from WM_KEYDOWN -- a path
         // this blocker does not touch. It only changes what the GAME sees.
         //
+        // ⭐ THE MOUSE FOLLOWS THE KEYBOARD TOO (2026-09-09). `blocks_mouse()` is now true while a
+        // keyboard surface is up, not only in cursor-capture mode. Partly so a stray click does
+        // not land on the game behind the modal -- but mainly because ER's DirectInput hook cannot
+        // always tell a keyboard from a mouse: an untagged device (proxy `dinput8.dll`, a device
+        // made before our detour, a second `IDirectInput8`) is blocked only when BOTH classes are,
+        // so with the modal up and the cursor away, buffered keystrokes drove the GAME's menu.
+        // See `eldenring_archipelago::input::device_blocked`.
+        //
         // The block is computed here rather than at the top of the frame so both terms describe
         // THIS frame. `keyboard_surface_active` is zeroed at the top of `Overlay::render` and
         // re-asserted by whichever surface drew, so unlike #202's flag it cannot outlive its
         // window.
         let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
-        let cursor_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
+        let mouse_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
         let io = ui.io();
         self.input_blocker.block_only(input_flags(
-            io.want_capture_mouse || cursor_capture_active,
+            io.want_capture_mouse || mouse_capture_active,
             io.want_capture_keyboard,
             keyboard_surface_active,
         ));
@@ -214,9 +222,9 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
 
     fn message_filter(&self, io: &Io) -> MessageFilter {
         let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
-        let cursor_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
+        let mouse_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
         window_message_filter(input_flags(
-            io.want_capture_mouse || cursor_capture_active,
+            io.want_capture_mouse || mouse_capture_active,
             io.want_capture_keyboard,
             keyboard_surface_active,
         ))
