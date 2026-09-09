@@ -15,7 +15,7 @@
 /// Under enemy randomisation someone else is standing there, and the row will not match the
 /// health bar on screen. That is a known and accepted mismatch: a name that is sometimes
 /// wrong about the occupant beats a bare flag number that is never right about anything.
-pub const SWEEP_BOSS_NAMES: [(u32, &str); 245] = [
+pub const SWEEP_BOSS_NAMES: [(u32, &str); 240] = [
     (10000800, "Godrick the Grafted"),
     (10000850, "Margit, the Fell Omen"),
     (10010800, "Grafted Scion"),
@@ -87,7 +87,6 @@ pub const SWEEP_BOSS_NAMES: [(u32, &str); 245] = [
     (30120800, "Misbegotten Warrior"),
     (30120801, "Perfumer Tricia"),
     (30130800, "Grave Warden Duelist"),
-    (30130810, "Auriza Side Tomb boss"),
     (30140800, "Erdtree Burial Watchdog (Sword)"),
     (30140801, "Erdtree Burial Watchdog (Scepter)"),
     (30150800, "Cemetery Shade"),
@@ -136,13 +135,10 @@ pub const SWEEP_BOSS_NAMES: [(u32, &str); 245] = [
     (32070800, "Magma Wyrm"),
     (32080800, "Fallingstar Beast"),
     (32110800, "Astel, Stars of Darkness"),
-    (34100800, "Divine Tower of Limgrave boss"),
-    (34110800, "Divine Tower of Liurnia boss"),
     (34120800, "Onyx Lord"),
     (34130800, "Godskin Apostle"),
     (34140850, "Fell Twin"),
     (34140851, "Fell Twin"),
-    (34150800, "Isolated Divine Tower boss"),
     (35000800, "Mohg, the Omen"),
     (35000850, "Esgar, Priest of Blood"),
     (39200800, "Magma Wyrm Makar"),
@@ -184,7 +180,6 @@ pub const SWEEP_BOSS_NAMES: [(u32, &str); 245] = [
     (1039540800, "Elemer of the Briar"),
     (1040520800, "Black Knife Assassin"),
     (1040530800, "Sanguine Noble"),
-    (1041330800, "Fourth Church of Marika boss"),
     (1041500800, "Fallingstar Beast"),
     (1041510800, "Tree Sentinel"),
     (1041520800, "Ancient Dragon Lansseax"),
