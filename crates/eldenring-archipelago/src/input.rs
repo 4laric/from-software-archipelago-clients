@@ -20,6 +20,17 @@
 //! so the game sees "nothing pressed" while the overlay owns the keyboard/mouse/pad. Nothing here is
 //! version-pinned (unlike our RVA-pinned param/detour hooks) — it survives ER patches.
 //!
+//! # Devices we cannot identify
+//!
+//! Keyboard vs mouse is resolved by TAGGING each device pointer in our `CreateDevice` wrap. That
+//! wrap does not always run — a proxy `dinput8.dll` from another mod, devices created before our
+//! detour was installed, or a second `IDirectInput8` (only the first is patched) all produce
+//! UNTAGGED devices, and the buffered `GetDeviceData` path has no state-buffer size to fall back
+//! on. Such a device is blocked when EITHER Keyboard OR Mouse is blocked (see `device_blocked`);
+//! guessing `Mouse` instead let keystrokes through to the game's menu whenever the cursor was not
+//! over an imgui window. A one-time `log::warn!` names the pointer so affected setups are visible
+//! in the log.
+//!
 //! `error_display.rs` already drives this: every frame it turns imgui's `want_capture_*` into
 //! `InputFlags` and calls [`InputBlocker::block_only`]. This type just stores the flags and lets the
 //! hooks read them.
@@ -233,19 +244,55 @@ static DEVICE_VT_HOOKED: AtomicBool = AtomicBool::new(false);
 static KB_DEVICE: AtomicUsize = AtomicUsize::new(0);
 static MOUSE_DEVICE: AtomicUsize = AtomicUsize::new(0);
 
-/// Which input class a DirectInput device belongs to. Prefers the pointer tagged at CreateDevice;
-/// falls back to the `GetDeviceState` buffer size (256 = keyboard) when only that is available.
-fn device_flag(this: *mut c_void, cb: Option<u32>) -> InputFlags {
+/// Which input class a DirectInput device belongs to, when we can tell. `None` means UNTAGGED and
+/// unresolvable: the pointer was never seen at CreateDevice and no `GetDeviceState` buffer size
+/// identifies it. Prefers the tagged pointer; falls back to the buffer size (256 = keyboard).
+fn device_flag(this: *mut c_void, cb: Option<u32>) -> Option<InputFlags> {
     let p = this as usize;
     if p != 0 && p == KB_DEVICE.load(Ordering::Relaxed) {
-        return InputFlags::Keyboard;
+        return Some(InputFlags::Keyboard);
     }
     if p != 0 && p == MOUSE_DEVICE.load(Ordering::Relaxed) {
-        return InputFlags::Mouse;
+        return Some(InputFlags::Mouse);
     }
     match cb {
-        Some(n) if n == DIKEYBOARD_STATE_BYTES => InputFlags::Keyboard,
-        _ => InputFlags::Mouse,
+        // 256 bytes is the DirectInput keyboard state buffer, and nothing else asks for it.
+        // Any OTHER size on an untagged device is a guess we refuse to make -- it used to be
+        // guessed as `Mouse`, which is the weaker block. Unknown, handled by `device_blocked`.
+        Some(n) if n == DIKEYBOARD_STATE_BYTES => Some(InputFlags::Keyboard),
+        _ => None,
+    }
+}
+
+/// Fires once, the first time an untagged device reaches a hook, so a player's log says which
+/// setups are on the fallback path.
+static WARNED_UNTAGGED: AtomicBool = AtomicBool::new(false);
+
+/// Should this device's input be withheld from the game right now?
+///
+/// 🛑 THE UNTAGGED CASE IS THE BUG (2026-09-09). Tagging happens in `create_device_hook`, and it
+/// does not always run: a proxy `dinput8.dll` from another mod, devices created before our detour
+/// went in, or a SECOND `IDirectInput8` (only the first has its CreateDevice patched) all yield
+/// devices we never saw. The buffered `GetDeviceData` path passes `cb: None`, so it has no buffer
+/// size to fall back on either -- and the old code resolved that to `Mouse`, which is only blocked
+/// while the cursor sits on an imgui window. Typing into the connect modal with the cursor drifted
+/// off it therefore drove the GAME's menu. An unknown device is now blocked if EITHER class is,
+/// which is the conservative direction: the only cost is that an exotic unrecognised device goes
+/// quiet while an overlay surface is up, which is exactly what the player asked for anyway.
+///
+/// Tagged devices are unaffected: they answer for their own class only.
+fn device_blocked(this: *mut c_void, cb: Option<u32>) -> bool {
+    match device_flag(this, cb) {
+        Some(flag) => is_blocked(flag),
+        None => {
+            if !WARNED_UNTAGGED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "input: DirectInput device {:#x} was not tagged at CreateDevice; blocking it                      under keyboard|mouse",
+                    this as usize
+                );
+            }
+            is_blocked(InputFlags::Keyboard) || is_blocked(InputFlags::Mouse)
+        }
     }
 }
 
@@ -352,7 +399,7 @@ unsafe extern "system" fn get_device_state_hook(
 ) -> i32 {
     let orig: GetDeviceStateFn = mem::transmute(ORIG_GET_DEVICE_STATE.load(Ordering::Relaxed));
     let hr = orig(this, cb, data);
-    if hr >= 0 && !data.is_null() && is_blocked(device_flag(this, Some(cb))) {
+    if hr >= 0 && !data.is_null() && device_blocked(this, Some(cb)) {
         std::ptr::write_bytes(data as *mut u8, 0, cb as usize); // nothing pressed / no delta
     }
     hr
@@ -369,7 +416,7 @@ unsafe extern "system" fn get_device_data_hook(
 ) -> i32 {
     let orig: GetDeviceDataFn = mem::transmute(ORIG_GET_DEVICE_DATA.load(Ordering::Relaxed));
     let hr = orig(this, cb_object_data, rgdod, pdw_in_out, flags);
-    if hr >= 0 && !pdw_in_out.is_null() && is_blocked(device_flag(this, None)) {
+    if hr >= 0 && !pdw_in_out.is_null() && device_blocked(this, None) {
         *pdw_in_out = 0; // events drained by `orig`; caller sees none
     }
     hr
@@ -500,5 +547,80 @@ mod tests {
         assert!(!is_overlay_modifier(0x1_0000));
         assert!(!is_overlay_modifier(i32::MIN));
         assert!(!is_overlay_modifier(i32::MAX));
+    }
+
+    /// The device-resolution statics and `BLOCKED` are process-global, so these tests serialise.
+    static DEVICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set the block state and the device tags, run `f`, then put everything back.
+    fn with_devices(blocked: InputFlags, kb: usize, mouse: usize, f: impl FnOnce()) {
+        let _guard = DEVICE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        BLOCKED.store(blocked.bits(), Ordering::Relaxed);
+        KB_DEVICE.store(kb, Ordering::Relaxed);
+        MOUSE_DEVICE.store(mouse, Ordering::Relaxed);
+        f();
+        BLOCKED.store(0, Ordering::Relaxed);
+        KB_DEVICE.store(0, Ordering::Relaxed);
+        MOUSE_DEVICE.store(0, Ordering::Relaxed);
+    }
+
+    /// 🛑 THE MOTIVATING CASE (2026-09-09). Player types into the connect modal, the cursor is not
+    /// over it, and ER's own menu navigates and closes. The keystrokes arrive on the BUFFERED path
+    /// (`GetDeviceData`, hence `cb: None`) from a device our `CreateDevice` wrap never tagged --
+    /// a proxy `dinput8.dll`, a pre-hook device, or a second `IDirectInput8`. That device used to
+    /// resolve to `Mouse`, which is unblocked the moment the cursor leaves an imgui window. An
+    /// unknown device must be blocked when the KEYBOARD is blocked.
+    #[test]
+    fn an_untagged_device_is_blocked_when_only_the_keyboard_is() {
+        with_devices(InputFlags::Keyboard, 0x1000, 0x2000, || {
+            assert!(device_blocked(0xdead_beef_usize as *mut c_void, None));
+        });
+    }
+
+    /// The other direction, so the fallback is genuinely "either", not "keyboard" with extra steps:
+    /// cursor-capture mode alone must also silence a device we cannot identify.
+    #[test]
+    fn an_untagged_device_is_blocked_when_only_the_mouse_is() {
+        with_devices(InputFlags::Mouse, 0x1000, 0x2000, || {
+            assert!(device_blocked(0xdead_beef_usize as *mut c_void, None));
+            // ...and with NOTHING blocked it still passes input through, or the client would
+            // simply deafen these setups.
+        });
+        with_devices(InputFlags::empty(), 0x1000, 0x2000, || {
+            assert!(!device_blocked(0xdead_beef_usize as *mut c_void, None));
+        });
+    }
+
+    /// 🛑 AND TAGGED DEVICES ARE UNCHANGED. The widened rule is for UNKNOWN devices only: a device
+    /// we positively identified as the keyboard must keep its own class's answer, or hovering the
+    /// overlay would cost the player their movement keys -- the #196 regression, reintroduced.
+    #[test]
+    fn a_tagged_keyboard_ignores_the_mouse_block() {
+        with_devices(InputFlags::Mouse, 0x1000, 0x2000, || {
+            assert!(!device_blocked(0x1000_usize as *mut c_void, None));
+            assert!(device_blocked(0x2000_usize as *mut c_void, None));
+        });
+        with_devices(InputFlags::Keyboard, 0x1000, 0x2000, || {
+            assert!(device_blocked(0x1000_usize as *mut c_void, None));
+            assert!(!device_blocked(0x2000_usize as *mut c_void, None));
+        });
+    }
+
+    /// The immediate path keeps its buffer-size fallback: 256 bytes is the keyboard state struct,
+    /// so an untagged device asking for it is still resolved rather than widened.
+    #[test]
+    fn the_keyboard_state_size_still_identifies_an_untagged_device() {
+        with_devices(InputFlags::Mouse, 0, 0, || {
+            assert!(!device_blocked(
+                0xdead_beef_usize as *mut c_void,
+                Some(DIKEYBOARD_STATE_BYTES)
+            ));
+        });
+        with_devices(InputFlags::Keyboard, 0, 0, || {
+            assert!(device_blocked(
+                0xdead_beef_usize as *mut c_void,
+                Some(DIKEYBOARD_STATE_BYTES)
+            ));
+        });
     }
 }
