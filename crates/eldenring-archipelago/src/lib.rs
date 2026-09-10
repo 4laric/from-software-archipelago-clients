@@ -58,6 +58,7 @@ mod radahn_festival;
 mod reconcile_io;
 mod region;
 mod region_sync;
+mod respec;
 mod rune_rewards;
 mod runes;
 mod rva_table;

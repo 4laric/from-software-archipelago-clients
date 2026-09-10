@@ -28,6 +28,8 @@ pub(crate) struct ErrorDisplay<G: Game> {
 
     /// Whether to display the full error information or just the summary.
     show_full_error: bool,
+    /// Ignore stale imgui capture flags while the game owns a native menu.
+    native_menu_active: bool,
 }
 
 impl<G: Game> ErrorDisplay<G> {
@@ -40,6 +42,7 @@ impl<G: Game> ErrorDisplay<G> {
                 core: Some(core),
                 error: None,
                 show_full_error: false,
+                native_menu_active: false,
             },
             Err(error) => Self {
                 input_blocker,
@@ -47,6 +50,7 @@ impl<G: Game> ErrorDisplay<G> {
                 core: None,
                 error: Some(error),
                 show_full_error: false,
+                native_menu_active: false,
             },
         }
     }
@@ -116,6 +120,14 @@ fn input_flags(want_mouse: bool, want_keyboard: bool, keyboard_surface_active: b
     flag
 }
 
+fn native_menu_input(native_menu: bool, fatal_error: bool, overlay: InputFlags) -> InputFlags {
+    if native_menu && !fatal_error {
+        InputFlags::empty()
+    } else {
+        overlay
+    }
+}
+
 /// Window messages the game must not receive while an imgui surface owns input.
 ///
 /// The per-game [`InputBlocker`] remains the primary path for polled input. This is the other half:
@@ -139,8 +151,10 @@ fn window_message_filter(inputs: InputFlags) -> MessageFilter {
 
 impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
     fn render(&mut self, ui: &mut Ui) {
+        self.native_menu_active = false;
         if let Some(core) = &mut self.core {
             let mut core = core.lock().unwrap();
+            self.native_menu_active = core.native_menu_active();
             if let Some(overlay) = &mut self.overlay {
                 overlay.render(ui, &mut core);
             }
@@ -196,10 +210,14 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
         let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
         let mouse_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
         let io = ui.io();
-        self.input_blocker.block_only(input_flags(
-            io.want_capture_mouse || mouse_capture_active,
-            io.want_capture_keyboard,
-            keyboard_surface_active,
+        self.input_blocker.block_only(native_menu_input(
+            self.native_menu_active,
+            self.error.is_some(),
+            input_flags(
+                io.want_capture_mouse || mouse_capture_active,
+                io.want_capture_keyboard,
+                keyboard_surface_active,
+            ),
         ));
     }
 
@@ -223,10 +241,14 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
     fn message_filter(&self, io: &Io) -> MessageFilter {
         let keyboard_surface_active = self.overlay.as_ref().is_some_and(|o| o.blocks_keyboard());
         let mouse_capture_active = self.overlay.as_ref().is_some_and(|o| o.blocks_mouse());
-        window_message_filter(input_flags(
-            io.want_capture_mouse || mouse_capture_active,
-            io.want_capture_keyboard,
-            keyboard_surface_active,
+        window_message_filter(native_menu_input(
+            self.native_menu_active,
+            self.error.is_some(),
+            input_flags(
+                io.want_capture_mouse || mouse_capture_active,
+                io.want_capture_keyboard,
+                keyboard_surface_active,
+            ),
         ))
     }
 }
@@ -234,6 +256,25 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_menu_releases_stale_console_capture_then_restores_it() {
+        let captured = || input_flags(true, true, true);
+        assert!(native_menu_input(true, false, captured()).is_empty());
+        assert!(window_message_filter(native_menu_input(true, false, captured())).is_empty());
+        assert_eq!(
+            native_menu_input(false, false, captured()).bits(),
+            captured().bits()
+        );
+    }
+
+    #[test]
+    fn fatal_error_keeps_input_even_over_a_native_menu() {
+        let captured = input_flags(true, true, true);
+        let flags = native_menu_input(true, true, captured);
+        assert!(flags.contains(InputFlags::Keyboard | InputFlags::Mouse | InputFlags::GamePad));
+        assert!(!window_message_filter(flags).is_empty());
+    }
 
     /// RULE 11 MOTIVATING CASE, RESTATED 2026-08-14. The 2026-08-13 report behind #196 was "input
     /// still bleeds through to the game even when client has focus", and it was answered with "the

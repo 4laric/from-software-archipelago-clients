@@ -147,6 +147,9 @@ pub(crate) fn warp_fn(base: usize) -> Option<LuaWarpFn> {
 /// Hold). Game-thread only. Returns Err with a loggable reason instead of silently no-oping
 /// (CONTRIBUTING "runtime visibility": every degrade says so).
 pub fn warp_to_grace(grace_entity_id: u32) -> Result<(), &'static str> {
+    if crate::respec::busy() {
+        return Err("close the respec menu before warping");
+    }
     if !crate::flags::in_world() {
         return Err("not in world (menu/load) -- warp needs a placed player");
     }

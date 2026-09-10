@@ -89,6 +89,7 @@ console_commands! {
     SeamlessProbe => "!seamlessprobe" => "!seamlessprobe [start|stop]",
     Ability => "!ability" => "!ability [lock|unlock <name|all>]",
     Help => "!help" => "!help",
+    Respec => "!respec" => "!respec (experimental native rebirth)",
 }
 
 /// Parsed `regionAttunement` entry (attunement_gate, SPEC-gf-boss-lock-tracker). Absent/empty
@@ -450,6 +451,14 @@ impl shared::Core for Core {
             return false;
         };
         match command {
+            ConsoleCommand::Respec => {
+                if arg.is_some_and(|a| !a.trim().is_empty()) {
+                    self.log(ap::Print::message("usage: !respec".to_string()));
+                } else {
+                    crate::respec::request();
+                }
+                true
+            }
             ConsoleCommand::Flag => {
                 match arg.and_then(|a| a.trim().parse::<u32>().ok()) {
                     Some(f) => {
@@ -987,6 +996,9 @@ impl shared::Core for Core {
     /// only in this file: it was in no README, no guide and no menu label, so the one feature that
     /// answers "how do I get this off my screen" was undiscoverable by design.
     fn render_overlay_menu_items(&mut self, ui: &imgui::Ui) {
+        if ui.menu_item("Respec (experimental)") {
+            crate::respec::request();
+        }
         if self.slot_data_parsed {
             let configured = crate::deathlink::is_enabled();
             let effective = self.death_link_enabled().unwrap_or(configured);
@@ -1055,9 +1067,18 @@ impl shared::Core for Core {
         }
     }
 
+    fn native_menu_active(&self) -> bool {
+        crate::respec::owns_input()
+    }
+
     /// Overlay frame hook: hotkey toggle + hint accumulation every frame (cheap -- the watermark
     /// skips already-scanned log entries), then the tracker window itself when visible.
     fn render_overlay_windows(&mut self, ui: &imgui::Ui) {
+        if let Some(line) = crate::respec::take_message() {
+            let now = self.toast_clock.elapsed().as_millis() as u64;
+            self.toasts.push(line.clone(), now);
+            self.log(ap::Print::message(line));
+        }
         if let Some(line) = self.base.take_death_link_tag_failure() {
             let now = self.toast_clock.elapsed().as_millis() as u64;
             self.toasts.push(line.clone(), now);
@@ -2554,6 +2575,7 @@ impl shared::Core for Core {
             // resets on quit-to-menu, so menu-time start grants would write through a stale one.
             // I3 FIX (a): a refused save must not receive start grants either (see `can_grant`).
             let has_inv = crate::detour::has_inventory()
+                && !crate::respec::busy()
                 && crate::flags::in_world()
                 && !crate::reconcile_io::is_refused();
             // Start-ITEMS clobber guard (patch_greenfield_start_item_clobber.py): the static
@@ -2847,6 +2869,7 @@ impl shared::Core for Core {
         // touch. Holding the cursor here is also the right H3 behaviour: reconnect the correct save
         // and the whole stream replays.
         let can_grant = crate::detour::has_inventory()
+            && !crate::respec::busy()
             && crate::flags::in_world()
             && self.receive_cursor_slot.is_some()
             && !crate::reconcile_io::is_refused();

@@ -185,6 +185,9 @@ pub fn enqueue_by_link_name(name: &str, source: &str, now_ms: u64) -> bool {
 /// rather than being consumed, which is the whole point of the queue.
 pub fn poll_pending(now_ms: u64) -> Option<Cow<'static, str>> {
     tick_blackout();
+    if crate::respec::busy() {
+        return None;
+    }
     // 🛑 THE BURST GOES FIRST, and it returns. A spawn that is still arriving owns this tick's
     // request slot; letting a queued trap fire underneath it would put a second write on the same
     // `init_data` before the creator drained the first -- which is the exact collapse #206 is
@@ -239,6 +242,9 @@ pub fn enabled() -> bool {
 /// `Cow` rather than `&'static str` because a parameterised spawn's line is minted from the ids in
 /// its item name -- there is no static to borrow. Every caller already `to_string`s it.
 pub fn fire(trap: Trap) -> Option<Cow<'static, str>> {
+    if crate::respec::busy() {
+        return None;
+    }
     if !crate::flags::in_world() {
         log::info!("trap {}: not in world -- skipped", trap.key());
         return None;

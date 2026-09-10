@@ -118,7 +118,7 @@ pub fn drive_kill(effective_enabled: bool) {
     // used to hold runes; we replicate it by snapshotting rune_count BEFORE the kill and zeroing it
     // right after, so the (late -- observed "way after YOU DIED") bloodstain bank sees 0 and drops
     // nothing. The restore leg above pays the snapshot back on respawn.
-    if KILL_PENDING.load(Ordering::Relaxed) && crate::flags::in_world() {
+    if KILL_PENDING.load(Ordering::Relaxed) && crate::flags::in_world() && !crate::respec::busy() {
         let snapshot = crate::runes::read(); // BEFORE the kill; None if GameDataMan is down -> vanilla drop
         if kill_local_player() {
             if let Some(runes) = snapshot {
