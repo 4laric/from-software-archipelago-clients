@@ -216,20 +216,24 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
 /// were audited against a 0.5.7 server's location set. Scoped on purpose to a stranded run;
 /// a fresh 0.5.7 seed should still be rolled on a 0.6.0-line apworld.
 ///
-/// The 0.5.1 and 0.5.3 bridges are checked against two generated legacy fixtures. Existing wire
+/// All nine 0.5.x versions are checked against independently generated legacy fixtures. Existing wire
 /// shapes are unchanged; absent profile uses the legacy selector, and newer optional
 /// settings retain their defaults. Location IDs and sweep membership come from the
-/// seed, not the current world's corpus. See tests/fixtures/legacy_051/README.md and
-/// tests/fixtures/legacy_053/README.md.
+/// seed, not the current world's corpus. See tests/fixtures/legacy_05/README.md.
 ///
 /// Match version and hash together: hashes can be shared across releases, and
 /// compatibility has not been audited for every release that shared one.
 pub fn is_legacy_contract_compatible(versions: &str) -> bool {
     let has = |wanted: &str| versions.split_whitespace().any(|token| token == wanted);
-    (has("apworld/0.5.1") && has("contract/13db0b3a"))
-        || (has("apworld/0.5.3") && has("contract/13db0b3a"))
-        || (has("apworld/0.4.13") && has("contract/dc0dc687"))
-        || (has("apworld/0.5.5") && has("contract/8397a952"))
+    (has("apworld/0.4.13") && has("contract/dc0dc687"))
+        || (has("contract/13db0b3a")
+            && ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4"]
+                .iter()
+                .any(|v| has(&format!("apworld/{v}"))))
+        || (has("contract/8397a952")
+            && ["0.5.5", "0.5.6"]
+                .iter()
+                .any(|v| has(&format!("apworld/{v}"))))
         || (has("contract/ffc0f1b5")
             && (has("apworld/0.5.7")
                 || has("apworld/0.5.8")
@@ -657,6 +661,26 @@ mod tests {
     }
 
     #[test]
+    fn all_audited_05_versions_require_their_own_hash() {
+        for minor in 0..=8 {
+            let expected = match minor {
+                0..=4 => "13db0b3a",
+                5..=6 => "8397a952",
+                _ => "ffc0f1b5",
+            };
+            for hash in ["13db0b3a", "8397a952", "ffc0f1b5", "unknown"] {
+                assert_eq!(
+                    is_legacy_contract_compatible(&format!("apworld/0.5.{minor} contract/{hash}")),
+                    hash == expected
+                );
+            }
+        }
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.5.9 contract/ffc0f1b5"
+        ));
+    }
+
+    #[test]
     fn legacy_051_requires_its_exact_audited_contract() {
         assert!(is_legacy_contract_compatible(
             "apworld/0.5.1 contract/13db0b3a data/old"
@@ -664,8 +688,8 @@ mod tests {
         for versions in [
             "apworld/0.5.1",
             "apworld/0.5.1 contract/ffc0f1b5",
-            "apworld/0.5.0 contract/13db0b3a",
-            "apworld/0.5.2 contract/13db0b3a",
+            "apworld/0.5.9 contract/13db0b3a",
+            "apworld/0.5.10 contract/13db0b3a",
         ] {
             assert!(!is_legacy_contract_compatible(versions), "{versions}");
         }
@@ -679,8 +703,8 @@ mod tests {
         for versions in [
             "apworld/0.5.3",
             "apworld/0.5.3 contract/ffc0f1b5",
-            "apworld/0.5.2 contract/13db0b3a",
-            "apworld/0.5.4 contract/13db0b3a",
+            "apworld/0.5.10 contract/13db0b3a",
+            "apworld/0.6.0 contract/13db0b3a",
         ] {
             assert!(!is_legacy_contract_compatible(versions), "{versions}");
         }
