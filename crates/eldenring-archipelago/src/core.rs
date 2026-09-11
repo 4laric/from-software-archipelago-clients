@@ -142,6 +142,8 @@ pub struct Core {
     receive_cursors: BTreeMap<i32, er_logic::receive_cursor::CursorEntry>,
     /// Pre-#322 cursor waiting for one positively returning character to adopt it.
     legacy_received_index: i64,
+    /// Consumptive traps belong to the AP slot, independently of character recovery.
+    traps_received_through: i64,
     /// ER save slot whose cursor is active this in-world session. `None` holds receive mutations
     /// until save-slot + play-time identity can be read without guessing.
     receive_cursor_slot: Option<i32>,
@@ -875,6 +877,7 @@ impl shared::Core for Core {
             last_persisted_index: -1,
             receive_cursors: BTreeMap::new(),
             legacy_received_index: 0,
+            traps_received_through: 0,
             receive_cursor_slot: None,
             receive_cursor_ahead: er_logic::receive_cursor::AheadGuard::default(),
             valid_locations: HashSet::new(),
@@ -2513,6 +2516,7 @@ impl shared::Core for Core {
                 // live ER character identity is known. Hold at zero; `bind_receive_cursor` selects
                 // this save slot's stamped entry (or safely migrates the legacy value) below.
                 self.received_through = 0;
+                self.traps_received_through = st.traps_received_through;
                 self.receive_cursors = st.received_cursors;
                 self.legacy_received_index = st.last_received_index.max(0);
                 self.receive_cursor_slot = None;
@@ -3052,6 +3056,7 @@ impl shared::Core for Core {
         let mut unlocked: Vec<String> = Vec::new();
         let trap_link_enabled = self.trap_link_enabled() == Some(true);
         let mut trap_link_outbound: Vec<String> = Vec::new();
+        let traps_before = self.traps_received_through;
         if can_grant && !snapshot.is_empty() {
             let empty_map = HashMap::new();
             let item_map = self.item_map.as_ref().unwrap_or(&empty_map);
@@ -3159,6 +3164,17 @@ impl shared::Core for Core {
                             // the receive loop, which can land while the player is in a menu, and a
                             // trap dropped there is GONE (the item is already marked received and
                             // the server will never resend it). traps::poll_pending delivers it.
+                            if !er_logic::receive_cursor::claim_trap(
+                                &mut self.traps_received_through,
+                                ri.index,
+                            ) {
+                                log::debug!(
+                                    "trap replay skipped: index {} ({})",
+                                    ri.index,
+                                    ri.name
+                                );
+                                continue;
+                            }
                             let queued = crate::traps::enqueue_by_item_name(
                                 &ri.name,
                                 self.toast_clock.elapsed().as_millis() as u64,
@@ -3352,7 +3368,9 @@ impl shared::Core for Core {
         }
 
         // 4c. Persist on watermark advance.
-        if self.received_through as i64 != self.last_persisted_index {
+        if self.received_through as i64 != self.last_persisted_index
+            || self.traps_received_through != traps_before
+        {
             self.write_save();
             self.last_persisted_index = self.received_through as i64;
         }
@@ -5358,6 +5376,7 @@ impl Core {
         crate::reconcile_io::reset_fresh_character_verdict();
         self.last_persisted_index = -1;
         self.receive_cursors.clear();
+        self.traps_received_through = 0;
         self.legacy_received_index = 0;
         self.receive_cursor_slot = None;
         self.receive_cursor_ahead.reset();
@@ -7030,6 +7049,7 @@ impl Core {
         let st = SaveState {
             last_received_index: self.legacy_received_index,
             received_cursors: self.receive_cursors.clone(),
+            traps_received_through: self.traps_received_through,
             flag_poll_baseline: self.flag_poll_baseline.iter().copied().collect(),
             notify_granted: Default::default(),
             starting_left_slots_normalized: self.starting_left_slots_normalized,

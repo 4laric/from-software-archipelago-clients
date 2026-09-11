@@ -18,6 +18,8 @@ pub struct SaveState {
     /// Positive ReceivedItems frontiers keyed by Elden Ring save-slot index. The play-time stamp
     /// distinguishes delete-and-recreate reuse of the same numeric slot.
     pub received_cursors: BTreeMap<i32, CursorEntry>,
+    /// Room/slot-scoped trap frontier; never rewound by character or stream recovery.
+    pub traps_received_through: i64,
     pub notify_granted: BTreeSet<i32>,
     /// Fresh-save flag-poll baseline (gf-flagpoll-baseline-persist): the guarding acquisition
     /// flags that already read SET on the FIRST in-world poll of a genuinely fresh save. Persisted
@@ -60,6 +62,7 @@ impl SaveState {
             .collect();
         serde_json::json!({
             "last_received_index":    self.last_received_index,
+            "traps_received_through": self.traps_received_through,
             "received_cursors":       serde_json::Value::Object(received_cursors),
             "notify_granted":         notify,
             "flag_poll_baseline":     flag_poll_baseline,
@@ -102,7 +105,7 @@ impl SaveState {
                     .collect()
             })
             .unwrap_or_default();
-        let received_cursors = v
+        let received_cursors: BTreeMap<i32, CursorEntry> = v
             .get("received_cursors")
             .and_then(|x| x.as_object())
             .map(|o| {
@@ -119,7 +122,22 @@ impl SaveState {
                     .collect()
             })
             .unwrap_or_default();
+        let traps_received_through = v
+            .get("traps_received_through")
+            .and_then(|x| x.as_i64())
+            .unwrap_or_else(|| {
+                // Older clients consumed traps through the ordinary receive frontier.
+                // Preserve that evidence before a character binding can reset it.
+                received_cursors
+                    .values()
+                    .map(|entry| entry.index)
+                    .chain(v.get("last_received_index").and_then(|x| x.as_i64()))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .max(0);
         SaveState {
+            traps_received_through,
             last_received_index: v
                 .get("last_received_index")
                 .and_then(|x| x.as_i64())
@@ -152,6 +170,7 @@ impl Default for SaveState {
     fn default() -> Self {
         SaveState {
             last_received_index: 0,
+            traps_received_through: 0,
             received_cursors: std::collections::BTreeMap::new(),
             notify_granted: std::collections::BTreeSet::new(),
             flag_poll_baseline: std::collections::BTreeSet::new(),
@@ -182,6 +201,7 @@ mod tests {
 
         let before = SaveState {
             last_received_index: 17,
+            traps_received_through: 12,
             received_cursors: BTreeMap::from([
                 (
                     0,
