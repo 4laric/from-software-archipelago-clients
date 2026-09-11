@@ -25,6 +25,16 @@ pub enum Binding {
     Migrate(i64),
 }
 
+/// GameMan can exist in the main menu with save_slot=-1. Never use that sentinel
+/// (or loading-time coordinates) to select and latch a character's receive cursor.
+pub fn loaded_coordinates(
+    in_world: bool,
+    inventory_ready: bool,
+    coordinates: Option<(i32, u32)>,
+) -> Option<(i32, u32)> {
+    coordinates.filter(|(slot, _)| in_world && inventory_ready && (0..10).contains(slot))
+}
+
 /// Bind one live character to its positive receive frontier.
 ///
 /// `marker_fresh` is the save-embedded marker verdict when available. It wins over a save-slot
@@ -113,6 +123,39 @@ pub fn claim_trap(frontier: &mut i64, index: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poppy_menu_cursor_cannot_hide_the_loaded_characters_backlog() {
+        let saved = crate::save_state::SaveState::from_json(
+            r#"{
+            "last_received_index":0,
+            "received_cursors":{
+                "-1":{"index":1081,"play_time_ms":0},
+                "1":{"index":803,"play_time_ms":38069991}
+            }
+        }"#,
+        );
+        assert_eq!(loaded_coordinates(false, false, Some((-1, 0))), None);
+        assert_eq!(loaded_coordinates(true, true, Some((-1, 0))), None);
+        assert_eq!(loaded_coordinates(false, true, Some((1, 38077764))), None);
+        assert_eq!(loaded_coordinates(true, false, Some((1, 38077764))), None);
+        let (slot, time) = loaded_coordinates(true, true, Some((1, 38077764))).unwrap();
+        assert_eq!(
+            bind(
+                saved.received_cursors.get(&slot).copied(),
+                saved.last_received_index,
+                time,
+                Some(false)
+            ),
+            Binding::Resume(803)
+        );
+        // Invalid legacy entries remain readable but never select a character or need deletion.
+        assert_eq!(saved.received_cursors[&-1].index, 1081);
+        assert_eq!(loaded_coordinates(true, true, Some((0, 0))), Some((0, 0)));
+        assert_eq!(loaded_coordinates(true, true, Some((9, 1))), Some((9, 1)));
+        assert_eq!(loaded_coordinates(true, true, Some((10, 1))), None);
+        assert_eq!(loaded_coordinates(true, true, None), None);
+    }
 
     fn entry(index: i64, play_time_ms: u32) -> CursorEntry {
         CursorEntry {
