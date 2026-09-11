@@ -249,6 +249,8 @@ pub struct Core {
     progression_surface: HashSet<u64>,
     map_progression_targets: HashSet<i64>,
     map_boss_checks: HashMap<u32, Vec<i64>>,
+    /// Seed acquisition identities captured before runtime poll-flag rewrites.
+    map_location_flags: HashMap<i64, u32>,
     /// Coarse region name -> its lock item name, `"<coarse> Lock"` (absent = never locked).
     coarse_lock_items: HashMap<String, String>,
     /// Lock item name -> post-fill placement coordinates. Optional for backwards compatibility;
@@ -914,6 +916,7 @@ impl shared::Core for Core {
             progression_surface: HashSet::new(),
             map_progression_targets: HashSet::new(),
             map_boss_checks: HashMap::new(),
+            map_location_flags: HashMap::new(),
             coarse_lock_items: HashMap::new(),
             lock_hint_placements: HashMap::new(),
             lock_hint_hud: None,
@@ -2330,6 +2333,7 @@ impl shared::Core for Core {
                 for (loc, flag) in loc_flags {
                     fp.location_flags.insert(loc, flag);
                 }
+                self.map_location_flags = fp.location_flags.clone();
                 // greenfield flag-keyed dungeon sweeps (dungeonSweepFlags, parsed above into
                 // sweeps.2): merge into the same sweep_flags table the legacy apconfig used, so the
                 // existing poll loop fires them on boss kill. slot_data wins per flag.
@@ -5415,6 +5419,7 @@ impl Core {
         self.progression_surface = HashSet::new();
         self.map_progression_targets.clear();
         self.map_boss_checks.clear();
+        self.map_location_flags.clear();
         self.region_table = HashMap::new();
         self.coarse_table = HashMap::new();
         self.coarse_lock_items = HashMap::new();
@@ -5814,7 +5819,12 @@ impl Core {
             .filter(|&id| er_logic::mfg_match::known_in_logic(id as u64, &self.coarse_table, &open))
             .collect();
         let surface = &self.map_progression_targets;
-        let mut states = er_logic::mfg_match::check_states(&names, surface, &in_logic);
+        let mut states = er_logic::mfg_match::seed_check_states(
+            &self.map_location_flags,
+            &names,
+            surface,
+            &in_logic,
+        );
         states.extend(er_logic::mfg_targets::boss_check_states(
             &self.map_boss_checks,
             &names,

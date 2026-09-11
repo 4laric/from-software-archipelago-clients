@@ -235,6 +235,47 @@ pub fn check_states(
     output
 }
 
+/// Join stable acquisition flags to THIS seed's AP IDs. Baked AP IDs and display
+/// names can shift between compatible world releases and must not determine
+/// the region/progression state of a current-seed check.
+pub fn seed_check_states(
+    location_flags: &std::collections::HashMap<i64, u32>,
+    seed_names: &std::collections::HashMap<i64, String>,
+    progression: &std::collections::HashSet<i64>,
+    in_logic: &std::collections::HashSet<i64>,
+) -> Vec<LotCheckState> {
+    let mut by_flag = std::collections::HashMap::<u32, u32>::new();
+    for (&id, &flag) in location_flags {
+        if flag == 0 || !seed_names.contains_key(&id) {
+            continue;
+        }
+        let mut state = CHECK;
+        if progression.contains(&id) {
+            state |= PROGRESSION;
+        }
+        if in_logic.contains(&id) {
+            state |= IN_LOGIC;
+        }
+        if progression.contains(&id) && in_logic.contains(&id) {
+            state |= PROGRESSION_IN_LOGIC;
+        }
+        *by_flag.entry(flag).or_default() |= state;
+    }
+    let mut lots = std::collections::BTreeMap::<(u32, u32), u32>::new();
+    for &(table, row, flag, _) in data::LOTS {
+        if let Some(&state) = by_flag.get(&flag) {
+            *lots.entry((table, row)).or_default() |= state;
+        }
+    }
+    lots.into_iter()
+        .map(|((lot_table, lot_row), flags)| LotCheckState {
+            lot_table,
+            lot_row,
+            flags,
+        })
+        .collect()
+}
+
 /// The local tracker uses coarse region access. Missing mapping is unknown for
 /// map filtering, not an affirmative reachable claim. Empty means known ungated.
 pub fn known_in_logic(
@@ -250,6 +291,80 @@ pub fn known_in_logic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn farum_seed_id_shift_preserves_region_logic() {
+        // Current world tables/data.py: f13007000 is 7771400; the older
+        // mfg_match_data catalogue calls it 7771401 (now a different check).
+        let names = [(7771400, "Farum seed check".to_string())]
+            .into_iter()
+            .collect();
+        let flags = [(7771400, 13007000)].into_iter().collect();
+        let coarse = [(7771400, "Farum Azula".to_string())].into_iter().collect();
+        let open = ["Farum Azula".to_string()].into_iter().collect();
+        let reachable = [7771400]
+            .into_iter()
+            .filter(|&id| known_in_logic(id as u64, &coarse, &open))
+            .collect();
+        let none = std::collections::HashSet::new();
+        assert!(!check_states(&names, &none, &reachable)
+            .iter()
+            .any(|s| s.lot_table == 1 && s.lot_row == 13000000));
+        let states = seed_check_states(&flags, &names, &none, &reachable);
+        assert_eq!(
+            states
+                .iter()
+                .find(|s| s.lot_table == 1 && s.lot_row == 13000000)
+                .unwrap()
+                .flags,
+            CHECK | IN_LOGIC
+        );
+        let closed = seed_check_states(&flags, &names, &none, &none);
+        assert_eq!(
+            closed
+                .iter()
+                .find(|s| s.lot_table == 1 && s.lot_row == 13000000)
+                .unwrap()
+                .flags,
+            CHECK
+        );
+        assert!(
+            seed_check_states(&flags, &std::collections::HashMap::new(), &none, &reachable)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn seed_flag_join_keeps_split_witnesses_and_ignores_reused_baked_id() {
+        let names = [
+            (1, "a".into()),
+            (2, "b".into()),
+            (7771401, "unrelated".into()),
+        ]
+        .into_iter()
+        .collect();
+        let flags = [(1, 13007000), (2, 13007000), (7771401, 0)]
+            .into_iter()
+            .collect();
+        let states = seed_check_states(
+            &flags,
+            &names,
+            &[1].into_iter().collect(),
+            &[2, 7771401].into_iter().collect(),
+        );
+        let row = states
+            .iter()
+            .find(|s| s.lot_table == 1 && s.lot_row == 13000000)
+            .unwrap();
+        assert_eq!(row.flags, CHECK | PROGRESSION | IN_LOGIC);
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| s.lot_table == 1 && s.lot_row == 13000000)
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn check_state_shared_lot_conjunction_needs_same_witness() {
