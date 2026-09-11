@@ -38,6 +38,8 @@ mod input;
 mod inventory;
 mod key_resolver;
 mod keyitems;
+#[cfg(test)]
+mod legacy_053_test;
 mod lock_hints;
 mod merchant_bells;
 mod mfg_colors;

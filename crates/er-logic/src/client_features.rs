@@ -216,11 +216,17 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
 /// were audited against a 0.5.7 server's location set. Scoped on purpose to a stranded run;
 /// a fresh 0.5.7 seed should still be rolled on a 0.6.0-line apworld.
 ///
+/// The 0.5.3 bridge is checked against two generated legacy fixtures. Existing wire
+/// shapes are unchanged; absent profile uses the legacy selector, and newer optional
+/// settings retain their defaults. Location IDs and sweep membership come from the
+/// seed, not the current world's corpus. See tests/fixtures/legacy_053/README.md.
+///
 /// Match version and hash together: hashes can be shared across releases, and
 /// compatibility has not been audited for every release that shared one.
 pub fn is_legacy_contract_compatible(versions: &str) -> bool {
     let has = |wanted: &str| versions.split_whitespace().any(|token| token == wanted);
-    (has("apworld/0.4.13") && has("contract/dc0dc687"))
+    (has("apworld/0.5.3") && has("contract/13db0b3a"))
+        || (has("apworld/0.4.13") && has("contract/dc0dc687"))
         || (has("apworld/0.5.5") && has("contract/8397a952"))
         || (has("contract/ffc0f1b5")
             && (has("apworld/0.5.7")
@@ -646,6 +652,21 @@ mod tests {
         assert!(!is_legacy_contract_compatible(
             "apworld/0.6.1 contract/ffc0f1b5 data/x"
         ));
+    }
+
+    #[test]
+    fn legacy_053_requires_its_exact_audited_contract() {
+        assert!(is_legacy_contract_compatible(
+            "apworld/0.5.3 contract/13db0b3a data/old"
+        ));
+        for versions in [
+            "apworld/0.5.3",
+            "apworld/0.5.3 contract/ffc0f1b5",
+            "apworld/0.5.2 contract/13db0b3a",
+            "apworld/0.5.4 contract/13db0b3a",
+        ] {
+            assert!(!is_legacy_contract_compatible(versions), "{versions}");
+        }
     }
 
     /// 2026-09-08 hotfix: a v0.5.7 run stranded by Elden Ring 2.7.1.0 can finish on this
