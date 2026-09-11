@@ -1,0 +1,191 @@
+[
+  {
+    "version": "0.5.0",
+    "ref": "v0.5.0",
+    "commit": "3320d231e9eb4db0d3335a80b8061ead67ea6f3a",
+    "fixtures": [
+      {
+        "file": "0.5.0_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.0 contract/13db0b3a data/9570c20dc311a547",
+        "locations": 5048,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.0_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.0 contract/13db0b3a data/9570c20dc311a547",
+        "locations": 5048,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  },
+  {
+    "version": "0.5.1",
+    "ref": "v0.5.1",
+    "commit": "1aad90c3ed687a72851ee75397476e8af3a7fb1f",
+    "fixtures": [
+      {
+        "file": "0.5.1_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.1 contract/13db0b3a data/4af4b64578245315",
+        "locations": 4948,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.1_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.1 contract/13db0b3a data/4af4b64578245315",
+        "locations": 4948,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  },
+  {
+    "version": "0.5.2",
+    "ref": "v0.5.2",
+    "commit": "31c69b64ad7c71284bdd793544412454228df5ea",
+    "fixtures": [
+      {
+        "file": "0.5.2_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.2 contract/13db0b3a data/b5e394537a41d2eb",
+        "locations": 4915,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.2_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.2 contract/13db0b3a data/b5e394537a41d2eb",
+        "locations": 4915,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  },
+  {
+    "version": "0.5.3",
+    "ref": "v0.5.3",
+    "commit": "fd011f3be9ff2b558187216612ea0b2250bd4fdb",
+    "fixtures": [
+      {
+        "file": "0.5.3_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.3 contract/13db0b3a data/12c1972930dae69b",
+        "locations": 4909,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.3_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.3 contract/13db0b3a data/12c1972930dae69b",
+        "locations": 4909,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  },
+  {
+    "version": "0.5.4",
+    "ref": "b6bc8ef0^",
+    "commit": "1651f2dcd2166204558a9367bd628e51ee1f6f80",
+    "fixtures": [
+      {
+        "file": "0.5.4_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.4 contract/13db0b3a data/d8a2657706f02e93",
+        "locations": 4909,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.4_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.4 contract/13db0b3a data/d8a2657706f02e93",
+        "locations": 4909,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  },
+  {
+    "version": "0.5.5",
+    "ref": "v0.5.5",
+    "commit": "8d0fd377a6a3d9840be44a27977e2116556ef16e",
+    "fixtures": [
+      {
+        "file": "0.5.5_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.5 contract/8397a952 data/b5b9336e1d94595a",
+        "locations": 4909,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.5_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.5 contract/8397a952 data/b5b9336e1d94595a",
+        "locations": 4909,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  },
+  {
+    "version": "0.5.6",
+    "ref": "390eeb45^",
+    "commit": "44d42d1bf2f842c10230f01c0b56dc1d95f32665",
+    "fixtures": [
+      {
+        "file": "0.5.6_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.6 contract/8397a952 data/a16f94825d2861d7",
+        "locations": 4909,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.6_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.6 contract/8397a952 data/a16f94825d2861d7",
+        "locations": 4909,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  },
+  {
+    "version": "0.5.7",
+    "ref": "v0.5.7",
+    "commit": "52bf6f8c0df98bd05fafa9b14a69392b6beae1aa",
+    "fixtures": [
+      {
+        "file": "0.5.7_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.7 contract/ffc0f1b5 data/33a5cb5b5533b9ad",
+        "locations": 4911,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.7_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.7 contract/ffc0f1b5 data/33a5cb5b5533b9ad",
+        "locations": 4911,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  },
+  {
+    "version": "0.5.8",
+    "ref": "e50c8971^",
+    "commit": "4f39a69e9fdd3243d707117508fbf129c6352b43",
+    "fixtures": [
+      {
+        "file": "0.5.8_SlotDataFixtureDefault.json",
+        "versions": "apworld/0.5.8 contract/ffc0f1b5 data/33a5cb5b5533b9ad",
+        "locations": 4911,
+        "locks": 29,
+        "areas": 116
+      },
+      {
+        "file": "0.5.8_SlotDataFixtureRich.json",
+        "versions": "apworld/0.5.8 contract/ffc0f1b5 data/33a5cb5b5533b9ad",
+        "locations": 4911,
+        "locks": 29,
+        "areas": 116
+      }
+    ]
+  }
+]
