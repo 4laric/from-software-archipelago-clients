@@ -99,6 +99,17 @@ impl AheadGuard {
     }
 }
 
+/// Claim an ordered AP trap delivery once per room/slot. This frontier is independent
+/// of character item recovery; a replay must neither queue the effect nor emit TrapLink.
+/// Negative indices are starting inventory, not new network trap deliveries.
+pub fn claim_trap(frontier: &mut i64, index: i64) -> bool {
+    if index < 0 || index < *frontier {
+        return false;
+    }
+    *frontier = index.saturating_add(1);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,15 +166,4 @@ mod tests {
             "the next item is no longer skipped"
         );
     }
-}
-
-/// Claim an ordered AP trap delivery once per room/slot. This frontier is independent
-/// of character item recovery; a replay must neither queue the effect nor emit TrapLink.
-/// Negative indices are starting inventory, not new network trap deliveries.
-pub fn claim_trap(frontier: &mut i64, index: i64) -> bool {
-    if index < 0 || index < *frontier {
-        return false;
-    }
-    *frontier = index.saturating_add(1);
-    true
 }
