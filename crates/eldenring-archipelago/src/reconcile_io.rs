@@ -981,7 +981,11 @@ fn read_play_time_ms() -> Option<u32> {
 /// delete-and-recreate that reuses that slot. Kept in this module so every client ledger reads the
 /// exact same game fields and identity doctrine.
 pub fn live_character_coordinates() -> Option<(i32, u32)> {
-    Some((read_save_slot()?, read_play_time_ms()?))
+    er_logic::receive_cursor::loaded_coordinates(
+        crate::flags::in_world(),
+        crate::detour::has_inventory(),
+        Some((read_save_slot()?, read_play_time_ms()?)),
+    )
 }
 
 /// On-disk mirror of `CharLedger` (er-logic has no serde dep; convert at the boundary).
