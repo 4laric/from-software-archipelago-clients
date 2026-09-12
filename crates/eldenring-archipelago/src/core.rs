@@ -3667,7 +3667,8 @@ impl shared::Core for Core {
                     // "armed and waiting" was unreadable and a 2m45s delay looked like a broken
                     // sweep (bobler, 2026-08-07). Read once here and reused by the fire test below,
                     // so this costs no extra flag read on the firing path.
-                    let flag_set = crate::flags::get_event_flag(flag);
+                    let flag_set =
+                        crate::flags::get_event_flag(er_logic::sweep_gate::completion_flag(flag));
                     sweep_obs.push((flag, locs.len(), flag_set));
                     // Draft B: hold a gated group's sweep until its boss-lock item is in the
                     // cumulative received set. sweepLockGates is FLAG-keyed, so look it up by this
