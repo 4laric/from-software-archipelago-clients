@@ -16,9 +16,19 @@ pub fn gate_open<F: Fn(&str) -> bool>(gate: Option<&str>, received: F) -> bool {
     }
 }
 
+/// Translate legacy health-bar proxy keys only when reading a sweep's completion flag.
+/// Keep seed group identities and lock gates intact. Scadutree Avatar's final defeat
+/// event explicitly sets 2050480800; its three proxy entities do not reliably do so.
+pub fn completion_flag(trigger: u32) -> u32 {
+    match trigger {
+        2050480810..=2050480812 => 2050480800,
+        _ => trigger,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::gate_open;
+    use super::{completion_flag, gate_open};
     use std::collections::HashSet;
 
     fn set(names: &[&str]) -> HashSet<String> {
@@ -29,6 +39,24 @@ mod tests {
     fn ungated_group_always_fires() {
         let r = set(&[]);
         assert!(gate_open(None, |n| r.contains(n)));
+    }
+
+    #[test]
+    fn avatar_legacy_groups_wait_for_final_defeat_and_keep_their_gates() {
+        let proxies = [2050480810, 2050480811, 2050480812];
+        for trigger in proxies {
+            // Neither a phase death nor manually setting the old proxy flag completes it.
+            for set_flag in [2050480801, 2050480802, trigger] {
+                assert_ne!(completion_flag(trigger), set_flag);
+            }
+            assert_eq!(completion_flag(trigger), 2050480800);
+            assert!(!gate_open(Some("Avatar Lock"), |_| false));
+            assert!(gate_open(Some("Avatar Lock"), |_| true));
+        }
+        // Current seeds and unrelated bosses retain their existing completion flags.
+        for trigger in [2050480800, 21010800, 31220801, 31000800] {
+            assert_eq!(completion_flag(trigger), trigger);
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@
 /// Under enemy randomisation someone else is standing there, and the row will not match the
 /// health bar on screen. That is a known and accepted mismatch: a name that is sometimes
 /// wrong about the occupant beats a bare flag number that is never right about anything.
-pub const SWEEP_BOSS_NAMES: [(u32, &str); 240] = [
+pub const SWEEP_BOSS_NAMES: [(u32, &str); 241] = [
     (10000800, "Godrick the Grafted"),
     (10000850, "Margit, the Fell Omen"),
     (10010800, "Grafted Scion"),
@@ -247,6 +247,7 @@ pub const SWEEP_BOSS_NAMES: [(u32, &str); 240] = [
     (2049480800, "Commander Gaius"),
     (2050430800, "Dryleaf Dane"),
     (2050470800, "Tree Sentinel"),
+    (2050480800, "Scadutree Avatar"),
     (2050480810, "Scadutree Avatar"),
     (2050480811, "Scadutree Avatar"),
     (2050480812, "Scadutree Avatar"),
