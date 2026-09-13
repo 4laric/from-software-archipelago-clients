@@ -247,6 +247,11 @@ pub struct Core {
     coarse_table: HashMap<u64, String>,
     /// The PROGRESSION SURFACE: location ids this world's own progression may occupy (starred).
     progression_surface: HashSet<u64>,
+    /// Location ids THIS seed can never award (slot_data `unobtainableLocations`, per seed, via
+    /// er_logic::tracker_tables). The tracker hides these from its region groups and counts and
+    /// prints the hidden total. Empty = nothing sent (older apworld) or nothing to hide; the
+    /// arming log says which. NOT a filter on what gets SENT: a flag that fires still reports.
+    unobtainable_table: HashSet<u64>,
     map_progression_targets: HashSet<i64>,
     map_boss_checks: HashMap<u32, Vec<i64>>,
     /// Seed acquisition identities captured before runtime poll-flag rewrites.
@@ -916,6 +921,7 @@ impl shared::Core for Core {
             // DEFAULT seed's regions and was wrong for every num_regions seed. Filled by the
             // slot_data parse, which logs armed-or-why-not.
             region_table: HashMap::new(),
+            unobtainable_table: HashSet::new(),
             coarse_table: HashMap::new(),
             progression_surface: HashSet::new(),
             map_progression_targets: HashSet::new(),
@@ -2250,6 +2256,10 @@ impl shared::Core for Core {
                     er_logic::tracker_tables::build_tracker_tables(
                         sd.get("locationRegions"),
                         sd.get("regionCoarseKeys"),
+                        // Per-seed unobtainable checks (Ace's Haligtree 116/123, 2026-09-13).
+                        // Optional; absent on an apworld older than v0.6.0.11 and the status
+                        // line says so.
+                        sd.get("unobtainableLocations"),
                     );
                 match &tracker_status {
                     er_logic::tracker_tables::TablesStatus::Armed { .. } => {
@@ -2427,6 +2437,7 @@ impl shared::Core for Core {
                 self.region_table = tracker_tables.region;
                 self.coarse_table = tracker_tables.coarse;
                 self.coarse_lock_items = tracker_tables.lock_items;
+                self.unobtainable_table = tracker_tables.unobtainable;
                 self.lock_hint_placements = lock_hint_placements;
                 self.slot_data_parsed = true;
                 // Remember which seed this parse was for, so a later reconnect to a DIFFERENT seed
@@ -5500,6 +5511,7 @@ impl Core {
         self.region_table = HashMap::new();
         self.coarse_table = HashMap::new();
         self.coarse_lock_items = HashMap::new();
+        self.unobtainable_table = HashSet::new();
         self.lock_hint_placements = HashMap::new();
         // The hint ledger is keyed per SLOT, not per seed, so a new seed must not inherit the old
         // seed's purchases -- and its location ids would be meaningless here anyway. Re-read from
@@ -6111,6 +6123,7 @@ impl Core {
             &self.progression_surface,
             &open_coarse,
             &self.hints,
+            &self.unobtainable_table,
         );
         let mut hint_list: Vec<HintEntry> = self.hints.iter().cloned().collect();
         hint_list.sort_by(|a, b| a.item_name.cmp(&b.item_name));
@@ -6317,6 +6330,13 @@ impl Core {
         // drifts costs width, never correctness, because the floor only ever grows the window.
         let mut measured: Vec<(String, bool)> = vec![
             (format!("checks: {}/{}", model.done, model.total), false),
+            (
+                format!(
+                    "hidden: {} unobtainable in this seed",
+                    model.hidden_unobtainable
+                ),
+                false,
+            ),
             (region_roster_header.clone(), false),
             (
                 format!(
@@ -6418,6 +6438,16 @@ impl Core {
                     ui.separator();
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
+                if model.hidden_unobtainable > 0 {
+                    // Ace, 2026-09-13: Haligtree 116/123 with nothing left to find. The four
+                    // were Millicent's rewards and her quest starts in a region the seed had
+                    // dropped. They are hidden above; this line is why the total is smaller
+                    // than the server's.
+                    ui.text_disabled(format!(
+                        "hidden: {} unobtainable in this seed (quest starts in a dropped region)",
+                        model.hidden_unobtainable
+                    ));
+                }
                 if ui.collapsing_header("Map integration", imgui::TreeNodeFlags::empty()) {
                     ui.checkbox("Share check states (this session)", &mut map_filters);
                     ui.text_wrapped("Check sharing and colors start automatically. Press F10 for optional map filters. Sharing also stays active while colors or follow-pins are enabled. In-logic filtering uses tracker region access; extra quest/puzzle conditions are not evaluated. Unknown regions are excluded.");

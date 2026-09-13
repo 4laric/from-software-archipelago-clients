@@ -221,6 +221,16 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
 /// settings retain their defaults. Location IDs and sweep membership come from the
 /// seed, not the current world's corpus. See tests/fixtures/legacy_05/README.md.
 ///
+/// THE 0.6.0.11 MOVE (2026-09-13). `unobtainableLocations` -- the per-seed set of checks an
+/// NPC-questline route makes unreachable under `num_regions` (Ace's Haligtree 116/123) -- is an
+/// OPTIONAL top-level key, and a top-level key moves `CONTRACT_HASH`: `613fb438` -> `2aa64f43`.
+/// Every v0.6.0.3 .. v0.6.0.10 seed carries `613fb438`, and each of those windows' ledger rows
+/// records the contract as unmoved since v0.6.0.3 (the version stamp was the whole client half),
+/// so the wire shape this client audited at v0.6.0.3 is the one every one of them sends. The only
+/// absent field is the new key, which `tracker_tables::build_tracker_tables` reads as
+/// `unobtainable: None` -- nothing hidden, the exact v0.6.0.10 tracker -- and announces in its
+/// arming line. Listed per version, as every bridge above is.
+///
 /// Match version and hash together: hashes can be shared across releases, and
 /// compatibility has not been audited for every release that shared one.
 pub fn is_legacy_contract_compatible(versions: &str) -> bool {
@@ -241,6 +251,13 @@ pub fn is_legacy_contract_compatible(versions: &str) -> bool {
                 || has("apworld/0.6.0.1")
                 || has("apworld/0.6.0.2")
                 || has("apworld/0.6.0.3")))
+        || (has("contract/613fb438")
+            && [
+                "0.6.0.3", "0.6.0.4", "0.6.0.5", "0.6.0.6", "0.6.0.7", "0.6.0.8", "0.6.0.9",
+                "0.6.0.10",
+            ]
+            .iter()
+            .any(|v| has(&format!("apworld/{v}"))))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -727,6 +744,33 @@ mod tests {
         }
         assert!(!is_legacy_contract_compatible(
             "apworld/0.5.6 contract/ffc0f1b5 data/x"
+        ));
+    }
+
+    /// 2026-09-13: `unobtainableLocations` moved the hash off `613fb438`. Every 0.6.0-line seed
+    /// that shipped that hash (v0.6.0.3 .. v0.6.0.10) is bridged, per version; the hash alone,
+    /// or a version that never carried it, still buys nothing.
+    #[test]
+    fn every_613fb438_window_is_bridged_by_version_not_by_hash() {
+        for v in [
+            "0.6.0.3", "0.6.0.4", "0.6.0.5", "0.6.0.6", "0.6.0.7", "0.6.0.8", "0.6.0.9", "0.6.0.10",
+        ] {
+            assert!(
+                is_legacy_contract_compatible(&format!("apworld/{v} contract/613fb438 data/x")),
+                "{v} shipped 613fb438 and is a strict subset of the 2aa64f43 contract"
+            );
+            assert!(
+                !is_legacy_contract_compatible(&format!("apworld/{v} contract/2aa64f43 data/x")),
+                "{v} never shipped 2aa64f43; a mismatched pair is not audited"
+            );
+        }
+        // The window that MADE the move is not a legacy pair: a 0.6.0.11 seed either matches
+        // this client's hash outright or was rolled on a pre-move 0.6.0.11 build nobody audited.
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.6.0.11 contract/613fb438 data/x"
+        ));
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.6.0.2 contract/613fb438 data/x"
         ));
     }
 }

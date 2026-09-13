@@ -47,6 +47,7 @@ fn every_05_seed_contract_parses_without_losing_regions() {
             let (tables, status) = er_logic::tracker_tables::build_tracker_tables(
                 sd.get("locationRegions"),
                 sd.get("regionCoarseKeys"),
+                sd.get("unobtainableLocations"),
             );
             assert!(matches!(
                 status,

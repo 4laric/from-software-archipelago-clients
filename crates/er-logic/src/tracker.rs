@@ -170,6 +170,12 @@ pub struct TrackerModel {
     /// Progression-surface checks: `done` out of `total`.
     pub surface_done: usize,
     pub surface_total: usize,
+    /// Unchecked locations HIDDEN from every rollup and count above because the seed cannot
+    /// award them (slot_data `unobtainableLocations`: an NPC-questline route through a region
+    /// `num_regions` dropped). Rendered as one line under the checks total so the shortfall
+    /// against the server's location count is never a mystery. A CHECKED id in that set is not
+    /// hidden -- it fired, so it was obtainable after all, and it counts like any other.
+    pub hidden_unobtainable: usize,
     /// Cumulative received item names, sorted for a stable items-held panel. The progressive-tier
     /// reduction stays in [`crate::progressive`]; this is the raw feed for it.
     pub received_items: Vec<String>,
@@ -187,6 +193,10 @@ pub struct TrackerModel {
 ///  - `surface` — the progression-surface location ids (starred in the tracker).
 ///  - `open_coarse_regions` — coarse regions the client currently has open (from region-lock state).
 ///  - `hints` — the standing [`HintSet`]; unchecked locations it names come back `hinted: true`.
+///  - `unobtainable` — location ids this seed can never award
+///    ([`crate::tracker_tables::TrackerTables::unobtainable`]). Unchecked ids in it are left out
+///    of every rollup and count and tallied in [`TrackerModel::hidden_unobtainable`]; checked ids
+///    in it count normally.
 #[allow(clippy::too_many_arguments)]
 pub fn build_tracker_model(
     checked_locations: &[u64],
@@ -197,6 +207,7 @@ pub fn build_tracker_model(
     surface: &HashSet<u64>,
     open_coarse_regions: &HashSet<RegionId>,
     hints: &HintSet,
+    unobtainable: &HashSet<u64>,
 ) -> TrackerModel {
     // BTreeMap keyed by region name => rollups come out name-sorted for free.
     fn rollup<'a>(
@@ -222,6 +233,7 @@ pub fn build_tracker_model(
     let mut per_region: BTreeMap<RegionId, RegionRollup> = BTreeMap::new();
     let (mut in_logic_done, mut in_logic_total) = (0usize, 0usize);
     let (mut surface_done, mut surface_total) = (0usize, 0usize);
+    let mut hidden_unobtainable = 0usize;
 
     for &id in checked_locations {
         let reachable = location_in_logic(id, coarse_of, open_coarse_regions);
@@ -240,6 +252,13 @@ pub fn build_tracker_model(
         r.accessible = reachable;
     }
     for &id in unchecked_locations {
+        if unobtainable.contains(&id) {
+            // Alaric, 2026-09-13: "we shouldn't be displaying those checks in the tracker if
+            // they're not obtainable in seed." Hidden, not moved to a bucket -- and COUNTED, so
+            // the line under the checks total explains the gap against the server's number.
+            hidden_unobtainable += 1;
+            continue;
+        }
         let reachable = location_in_logic(id, coarse_of, open_coarse_regions);
         let prominent = surface.contains(&id);
         if reachable {
@@ -269,11 +288,12 @@ pub fn build_tracker_model(
 
     TrackerModel {
         done: checked_locations.len(),
-        total: checked_locations.len() + unchecked_locations.len(),
+        total: checked_locations.len() + unchecked_locations.len() - hidden_unobtainable,
         in_logic_done,
         in_logic_total,
         surface_done,
         surface_total,
+        hidden_unobtainable,
         regions,
         received_items,
     }
@@ -418,6 +438,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HintSet::new(),
+            &HashSet::new(),
         );
 
         assert_eq!((m.done, m.total), (3, 5));
@@ -455,6 +476,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HintSet::new(),
+            &HashSet::new(),
         );
 
         assert_eq!((m.done, m.total), (0, 3));
@@ -491,6 +513,7 @@ mod tests {
             &HashSet::new(),
             &open,
             &HintSet::new(),
+            &HashSet::new(),
         );
 
         // 1 (checked, Limgrave-open) + 2 (unchecked, Limgrave-open) are in-logic; 3 (Mountaintops
@@ -522,6 +545,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HintSet::new(),
+            &HashSet::new(),
         );
         assert_eq!((m.in_logic_done, m.in_logic_total), (0, 1));
         assert!(m.regions[0].accessible);
@@ -541,6 +565,7 @@ mod tests {
             &big,
             &HashSet::new(),
             &HintSet::new(),
+            &HashSet::new(),
         );
         // id 1 (checked) + id 3 (unchecked) are on the surface => total 2, done 1.
         assert_eq!((m.surface_done, m.surface_total), (1, 2));
@@ -569,6 +594,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &hints,
+            &HashSet::new(),
         );
         let limgrave = &m.regions[0];
         assert_eq!(
@@ -633,6 +659,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HintSet::new(),
+            &HashSet::new(),
         );
         assert_eq!((m.done, m.total), (0, 0));
         assert!(m.regions.is_empty());
@@ -644,5 +671,100 @@ mod tests {
                 "Scadutree Fragment"
             ]
         );
+    }
+
+    /// THE ACE CASE (2026-09-13). Millicent's four Prayer Room rewards are in the seed, unchecked,
+    /// and unobtainable because Caelid was not kept. They leave Haligtree's rollup and every
+    /// count, and the model says how many it hid -- 119/119 is the honest Haligtree, not 116/123.
+    #[test]
+    fn unobtainable_unchecked_locations_are_hidden_and_counted() {
+        let region_of = region_table(&[
+            (7770599, "Haligtree"),
+            (7770600, "Haligtree"),
+            (7770601, "Haligtree"),
+            (7770602, "Haligtree"),
+            (7770610, "Haligtree"),
+            (7770011, "Limgrave"),
+        ]);
+        let unobtainable: HashSet<u64> = [7770599u64, 7770600, 7770601, 7770602]
+            .into_iter()
+            .collect();
+        let surface: HashSet<u64> = [7770602u64].into_iter().collect();
+        let m = build_tracker_model(
+            &[7770610, 7770011],
+            &[7770599, 7770600, 7770601, 7770602],
+            &HashSet::new(),
+            &region_of,
+            &HashMap::new(),
+            &surface,
+            &HashSet::new(),
+            &HintSet::new(),
+            &unobtainable,
+        );
+        assert_eq!(m.hidden_unobtainable, 4);
+        assert_eq!(
+            (m.done, m.total),
+            (2, 2),
+            "hidden ids leave the total, not just the list"
+        );
+        assert_eq!(
+            (m.surface_done, m.surface_total),
+            (0, 0),
+            "a hidden surface check is not starred"
+        );
+        assert_eq!((m.in_logic_done, m.in_logic_total), (2, 2));
+        let h = m.regions.iter().find(|r| r.region == "Haligtree").unwrap();
+        assert_eq!((h.done, h.total), (1, 1));
+        assert!(
+            h.unchecked.is_empty(),
+            "nothing left to list under Haligtree"
+        );
+        assert!(
+            h.complete(),
+            "the region reads COMPLETE once its obtainable checks are done"
+        );
+    }
+
+    /// A CHECKED id in the unobtainable set fired, so it was obtainable after all (a `!collect`,
+    /// a route the table under-approximates). It counts like any other check and is not hidden.
+    #[test]
+    fn a_checked_unobtainable_location_still_counts() {
+        let region_of = region_table(&[(7770602, "Haligtree"), (7770610, "Haligtree")]);
+        let unobtainable: HashSet<u64> = [7770602u64].into_iter().collect();
+        let m = build_tracker_model(
+            &[7770602],
+            &[7770610],
+            &HashSet::new(),
+            &region_of,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HintSet::new(),
+            &unobtainable,
+        );
+        assert_eq!(m.hidden_unobtainable, 0);
+        assert_eq!((m.done, m.total), (1, 2));
+        let h = &m.regions[0];
+        assert_eq!((h.done, h.total), (1, 2));
+    }
+
+    /// An empty set is the OLD behaviour exactly: nothing hidden, nothing counted.
+    #[test]
+    fn an_empty_unobtainable_set_changes_nothing() {
+        let region_of = region_table(&[(10, "Limgrave"), (11, "Limgrave")]);
+        let m = build_tracker_model(
+            &[10],
+            &[11],
+            &HashSet::new(),
+            &region_of,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HintSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(m.hidden_unobtainable, 0);
+        assert_eq!((m.done, m.total), (1, 2));
+        assert_eq!(m.regions[0].unchecked.len(), 1);
     }
 }

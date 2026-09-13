@@ -47,6 +47,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "lockHintPlacements", shape: Shape::LockPlacements, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "locationRegions", shape: Shape::ListvalIntMap, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "regionCoarseKeys", shape: Shape::StrMap, required: false, greenfield: true, bedrock: false },
+    ContractKey { name: "unobtainableLocations", shape: Shape::IntList, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "options", shape: Shape::OptionsDict, required: true, greenfield: true, bedrock: false },
     ContractKey { name: "regionSphereTargets", shape: Shape::ScalarIntMap, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "regionSphereTargetRanges", shape: Shape::TripleList, required: false, greenfield: true, bedrock: false },
@@ -249,7 +250,7 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "613fb438";
+pub const CONTRACT_HASH: &str = "2aa64f43";
 pub const APWORLD_VERSION_EXPECTED: &str = "0.6.0.11";
 
 #[cfg(test)]

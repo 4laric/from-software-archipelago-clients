@@ -23,6 +23,14 @@
 //!   an emitted-but-unconsumed half-feature. It is not replaced by a slot_data key; when a consumer
 //!   exists, add the key then. Shipping the wire for a feature that does not exist is how the
 //!   contract ledger fills up with things nobody can delete.
+//!
+//!   That consumer arrived 2026-09-13, and it is NOT `missable`. `unobtainableLocations` is the
+//!   per-seed set of checks an NPC-questline route makes unreachable under `num_regions` (Ace's
+//!   Haligtree 116/123: Millicent's Prayer Room rewards listed while Gowry's Caelid was not kept).
+//!   Missable means "can be lost"; unobtainable means "this seed cannot award it at all". The
+//!   world sends the ids (`features/unobtainable_locations.py`, a reviewed route table), this
+//!   module keeps them as [`TrackerTables::unobtainable`], and `tracker::build_tracker_model`
+//!   hides them from the region groups and counts while reporting how many it hid.
 //! * **`on_surface`.** Already sent as `progressionSurfaceLocations`, and the client already
 //!   prefers it; the baked copy was only a constructor default.
 //! * **The lock ITEM name.** Derived as `"<coarse> Lock"`, which is the key format `regionOpenFlags`
@@ -36,7 +44,7 @@
 //! how `progressionSurfaceLocations` is already handled, and CONTRIBUTING's rule that a tolerant
 //! path must announce its status.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -52,6 +60,11 @@ pub struct TrackerTables {
     pub coarse: HashMap<u64, RegionId>,
     /// Coarse key -> its region-lock ITEM name, `"<coarse> Lock"`. Never contains `""`.
     pub lock_items: HashMap<RegionId, String>,
+    /// AP location ids THIS seed can never award (slot_data `unobtainableLocations`): an
+    /// NPC-questline route through a region the seed did not keep. Always a subset of `region`
+    /// -- an id the seed does not place is dropped here rather than hidden from nothing. Empty
+    /// when the key is absent (older apworld); [`TablesStatus::Armed`] says which.
+    pub unobtainable: HashSet<u64>,
 }
 
 impl TrackerTables {
@@ -122,6 +135,10 @@ pub enum TablesStatus {
         locations: usize,
         regions: usize,
         coarse_defaulted: bool,
+        /// `Some(n)` = `unobtainableLocations` was sent and n of its ids are placed in this seed
+        /// (hidden by the tracker). `None` = the key is ABSENT: an apworld older than v0.6.0.11,
+        /// so nothing is hidden and the log says so rather than reporting "0 hidden".
+        unobtainable: Option<usize>,
     },
     /// `locationRegions` absent or unusable: an older apworld, or a foreign one. Tables are empty
     /// and the tracker groups nothing -- which is visible, unlike wrong grouping.
@@ -136,13 +153,23 @@ impl TablesStatus {
                 locations,
                 regions,
                 coarse_defaulted,
+                unobtainable,
             } => format!(
                 "tracker regions ARMED from slot_data: {locations} location(s) across {regions} \
-                 region(s){}",
+                 region(s){}{}",
                 if *coarse_defaulted {
                     " -- regionCoarseKeys ABSENT,each region treated as its own lock key"
                 } else {
                     ""
+                },
+                match unobtainable {
+                    Some(n) => format!(
+                        "; {n} unobtainable-in-this-seed check(s) HIDDEN from the tracker \
+                         (unobtainableLocations)"
+                    ),
+                    None => " -- unobtainableLocations ABSENT (apworld older than v0.6.0.11): \
+                             nothing hidden, quest checks a dropped region strands stay listed"
+                        .to_string(),
                 }
             ),
             TablesStatus::NoRegions => "tracker regions INERT: slot_data has no locationRegions \
@@ -159,6 +186,11 @@ impl TablesStatus {
 /// `locationRegions` is `{fine region: [ap id, ...]}` (`LISTVAL_INT_MAP`) and `regionCoarseKeys` is
 /// `{fine region: coarse key}` (`STR_MAP`), both per the contract.
 ///
+/// `unobtainable_locations` is `[ap id, ...]` (`INT_LIST`), optional: absent means an older
+/// apworld and the status reports it as `unobtainable: None`; present means exactly those ids
+/// that the seed also places are hidden. An id outside `locationRegions` is dropped, because
+/// hiding a check the seed does not contain hides nothing and would inflate the reported count.
+///
 /// When `regionCoarseKeys` is absent, each region becomes its OWN coarse key rather than being
 /// treated as always-open. That is the conservative direction and it is also harmless for a region
 /// that genuinely has no lock: the caller looks the key up in `regionOpenFlags`, finds nothing, and
@@ -171,6 +203,7 @@ impl TablesStatus {
 pub fn build_tracker_tables(
     location_regions: Option<&Value>,
     region_coarse_keys: Option<&Value>,
+    unobtainable_locations: Option<&Value>,
 ) -> (TrackerTables, TablesStatus) {
     let Some(regions) = location_regions.and_then(Value::as_object) else {
         return (TrackerTables::default(), TablesStatus::NoRegions);
@@ -205,12 +238,21 @@ pub fn build_tracker_tables(
     }
     let region_count = regions.len();
     let locations = out.region.len();
+    let unobtainable = unobtainable_locations.and_then(Value::as_array).map(|ids| {
+        out.unobtainable = ids
+            .iter()
+            .filter_map(Value::as_u64)
+            .filter(|id| out.region.contains_key(id))
+            .collect();
+        out.unobtainable.len()
+    });
     (
         out,
         TablesStatus::Armed {
             locations,
             regions: region_count,
             coarse_defaulted,
+            unobtainable,
         },
     )
 }
@@ -305,7 +347,8 @@ mod tests {
     #[test]
     fn builds_fine_and_coarse_tables_from_slot_data() {
         let s = seed();
-        let (t, st) = build_tracker_tables(s.get("locationRegions"), s.get("regionCoarseKeys"));
+        let (t, st) =
+            build_tracker_tables(s.get("locationRegions"), s.get("regionCoarseKeys"), None);
         assert_eq!(t.region.get(&7770011), Some(&"Limgrave".to_string()));
         assert_eq!(t.coarse.get(&7770011), Some(&"Limgrave".to_string()));
         assert_eq!(t.region.len(), 6);
@@ -314,7 +357,8 @@ mod tests {
             TablesStatus::Armed {
                 locations: 6,
                 regions: 3,
-                coarse_defaulted: false
+                coarse_defaulted: false,
+                unobtainable: None
             }
         ));
     }
@@ -325,7 +369,8 @@ mod tests {
         // hub look like a region whose lock we failed to find -- same answer today, different
         // reason, and the difference matters the moment a lookup failure becomes an error.
         let s = seed();
-        let (t, _) = build_tracker_tables(s.get("locationRegions"), s.get("regionCoarseKeys"));
+        let (t, _) =
+            build_tracker_tables(s.get("locationRegions"), s.get("regionCoarseKeys"), None);
         assert_eq!(t.coarse.get(&7770017), Some(&String::new()));
         assert!(
             !t.lock_items.contains_key(""),
@@ -339,7 +384,8 @@ mod tests {
         // If this regressed to keying off itself, the client would look for an "Enir Ilim Lock",
         // find none, and call the finale permanently OPEN.
         let s = seed();
-        let (t, _) = build_tracker_tables(s.get("locationRegions"), s.get("regionCoarseKeys"));
+        let (t, _) =
+            build_tracker_tables(s.get("locationRegions"), s.get("regionCoarseKeys"), None);
         assert_eq!(t.coarse.get(&7770900), Some(&"Leyndell".to_string()));
         assert_eq!(
             t.lock_items.get("Leyndell"),
@@ -351,7 +397,8 @@ mod tests {
     #[test]
     fn lock_item_names_match_the_region_open_flags_key_format() {
         let s = seed();
-        let (t, _) = build_tracker_tables(s.get("locationRegions"), s.get("regionCoarseKeys"));
+        let (t, _) =
+            build_tracker_tables(s.get("locationRegions"), s.get("regionCoarseKeys"), None);
         assert_eq!(
             t.lock_items.get("Limgrave"),
             Some(&"Limgrave Lock".to_string())
@@ -361,7 +408,7 @@ mod tests {
     #[test]
     fn absent_location_regions_is_inert_and_says_so() {
         // The whole point of deleting the baked table: no stale fallback. Empty and LOUD.
-        let (t, st) = build_tracker_tables(None, None);
+        let (t, st) = build_tracker_tables(None, None, None);
         assert!(t.region.is_empty() && t.coarse.is_empty() && t.lock_items.is_empty());
         assert_eq!(st, TablesStatus::NoRegions);
         assert!(st.describe().contains("INERT"), "{}", st.describe());
@@ -371,14 +418,14 @@ mod tests {
     fn an_empty_region_map_is_inert_not_armed_with_zero() {
         // "0 locations, armed" is the shape of a green run over nothing.
         let empty = json!({});
-        let (_t, st) = build_tracker_tables(Some(&empty), None);
+        let (_t, st) = build_tracker_tables(Some(&empty), None, None);
         assert_eq!(st, TablesStatus::NoRegions);
     }
 
     #[test]
     fn missing_coarse_keys_default_to_the_region_itself_and_report_it() {
         let r = json!({"Caelid": [1u64, 2u64]});
-        let (t, st) = build_tracker_tables(Some(&r), None);
+        let (t, st) = build_tracker_tables(Some(&r), None, None);
         assert_eq!(t.coarse.get(&1), Some(&"Caelid".to_string()));
         assert_eq!(t.lock_items.get("Caelid"), Some(&"Caelid Lock".to_string()));
         match st {
@@ -399,7 +446,7 @@ mod tests {
         // it always described the full default seed.
         let r = json!({"Limgrave": [7770011u64]});
         let c = json!({"Limgrave": "Limgrave"});
-        let (t, st) = build_tracker_tables(Some(&r), Some(&c));
+        let (t, st) = build_tracker_tables(Some(&r), Some(&c), None);
         assert_eq!(t.region.len(), 1);
         assert!(
             !t.region.contains_key(&7770900),
@@ -411,8 +458,105 @@ mod tests {
     #[test]
     fn junk_values_are_skipped_without_taking_the_table_down() {
         let r = json!({"Limgrave": [1u64, "not-an-id", -4], "Bad": 7});
-        let (t, _) = build_tracker_tables(Some(&r), None);
+        let (t, _) = build_tracker_tables(Some(&r), None, None);
         assert_eq!(t.region.len(), 1);
         assert_eq!(t.region.get(&1), Some(&"Limgrave".to_string()));
+    }
+
+    /// THE CONSUMER (Ace's Haligtree 116/123, 2026-09-13). Ids the seed places AND the world
+    /// names unobtainable are kept for the tracker to hide, and the status says how many.
+    #[test]
+    fn unobtainable_ids_are_kept_and_counted() {
+        let mut s = seed();
+        s["unobtainableLocations"] = json!([7770011u64, 7770013u64]);
+        let (t, st) = build_tracker_tables(
+            s.get("locationRegions"),
+            s.get("regionCoarseKeys"),
+            s.get("unobtainableLocations"),
+        );
+        assert_eq!(
+            t.unobtainable,
+            [7770011u64, 7770013u64].into_iter().collect::<HashSet<_>>()
+        );
+        assert!(
+            t.region.contains_key(&7770011),
+            "hidden ids stay REGIONED: the seed still contains them"
+        );
+        assert!(matches!(
+            st,
+            TablesStatus::Armed {
+                unobtainable: Some(2),
+                ..
+            }
+        ));
+        assert!(
+            st.describe().contains("2 unobtainable"),
+            "{}",
+            st.describe()
+        );
+    }
+
+    /// An absent key is an OLDER apworld, and that is reported as absent -- not as "0 hidden",
+    /// which would read as a checked-and-clean seed.
+    #[test]
+    fn absent_unobtainable_key_is_reported_as_absent_not_zero() {
+        let s = seed();
+        let (t, st) = build_tracker_tables(
+            s.get("locationRegions"),
+            s.get("regionCoarseKeys"),
+            s.get("unobtainableLocations"),
+        );
+        assert!(t.unobtainable.is_empty());
+        assert!(matches!(
+            st,
+            TablesStatus::Armed {
+                unobtainable: None,
+                ..
+            }
+        ));
+        assert!(st.describe().contains("ABSENT"), "{}", st.describe());
+    }
+
+    /// An empty list is a checked seed with nothing to hide -- `Some(0)`, distinct from absent.
+    #[test]
+    fn empty_unobtainable_list_is_armed_with_zero() {
+        let mut s = seed();
+        s["unobtainableLocations"] = json!([]);
+        let (_t, st) = build_tracker_tables(
+            s.get("locationRegions"),
+            s.get("regionCoarseKeys"),
+            s.get("unobtainableLocations"),
+        );
+        assert!(matches!(
+            st,
+            TablesStatus::Armed {
+                unobtainable: Some(0),
+                ..
+            }
+        ));
+    }
+
+    /// An id the seed does not place cannot be hidden from anything: dropped, and NOT counted,
+    /// so the log's hidden total is the number the player will actually see missing.
+    #[test]
+    fn unobtainable_ids_outside_this_seed_are_dropped_and_junk_is_skipped() {
+        let mut s = seed();
+        s["unobtainableLocations"] = json!([7770011u64, 4242u64, "junk", -1]);
+        let (t, st) = build_tracker_tables(
+            s.get("locationRegions"),
+            s.get("regionCoarseKeys"),
+            s.get("unobtainableLocations"),
+        );
+        assert_eq!(
+            t.unobtainable,
+            [7770011u64].into_iter().collect::<HashSet<_>>()
+        );
+        assert!(matches!(
+            st,
+            TablesStatus::Armed {
+                unobtainable: Some(1),
+                ..
+            }
+        ));
     }
 }
