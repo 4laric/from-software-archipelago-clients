@@ -24,7 +24,7 @@
 //! so a Divine Tower shows no prompt for an AP rune by construction (#316's "no prompt").
 
 use crate::flags;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
     Mutex,
     atomic::{AtomicU32, Ordering},
@@ -99,6 +99,60 @@ const KEY_ITEM_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Malenia's Great Rune", &[196]),
 ];
 
+/// Vanilla's Great Rune POSSESSION flags, the 170-179 band that every rune-count gate reads.
+///
+/// The reported bug (2026-09-13, player Zelda): six AP-delivered Great Runes, and thefifthmatt's
+/// randomizer rune gates ("4 runes for Leyndell, 3 to finish", message 20003) stayed shut. Vanilla
+/// counts runes with `CountEventFlags(EventFlag, 170, 179) >= N` (common.emevd $Event(730), line
+/// ~1110) and matt's gates reuse that pattern with their own thresholds. These flags are the
+/// `getItemFlagId` of the boss-drop rune lots (greenfield/flag_lots.tsv): 171 -> lot 10010 goods
+/// 8148, 172 -> 10301/8149, 173 -> 10041/8150, 174 -> 10221/8151, 175 -> 10121/8152, 176 ->
+/// 10201/8153; 177 is the Great Rune of the Unborn, which vanilla derives from flag 197 in
+/// common.emevd $Event(6905) (~line 3123, the event that sets 171-177 from the boss/197 flags).
+/// Nothing in an AP delivery runs 6905 or trips a lot, so the whole band read ZERO.
+///
+/// The restore flags 191-196 above are a DIFFERENT thing and do not substitute: they make a
+/// received rune usable at a Divine Altar without the tower trip. Only 171-177 are counted.
+/// `LEYNDELL_TWO_RUNES_FLAGS` writes the vanilla seal's RESULT flags 182/105 directly, which fixes
+/// that ONE seal and leaves every other consumer of the band reading zero -- hence this table.
+///
+/// WHY THIS IS NOT IN [`entries`], AND IS SEED-AWARE. On current seeds 171-176 wear THREE hats:
+/// the counted possession flag, the `getItemFlagId` of the boss-drop rune lot, and the DETECTION
+/// flag of that boss-rune location (greenfield/eldenring/tables/data.py: `Stormveil :: Godrick's
+/// Great Rune - Godrick [f171]` = loc 7770001 ... `Haligtree :: Malenia's ... [f176]` = 7770006).
+/// Setting one on RECEIPT, before the boss dies, marks the lot collected: the kill then awards
+/// nothing, the flag never transitions unset -> set, and the location can never be sent -- and the
+/// per-tick re-assert makes that permanent. The #659 `keyitem_poll` guard does NOT rescue it: that
+/// guard only stops the phantom-check direction, it cannot resurrect a kill whose sole witness flag
+/// was pre-set. So the band cannot ride the unconditional [`entries`] path the Rold Medallion /
+/// Bell / Knife / Kit take.
+///
+/// Instead the decision is made per rune, per seed, by `er_logic::great_rune_possession`
+/// ([`configure_great_rune_possession`], [`tick_great_rune_possession_flags`]): a flag no location
+/// in this seed detects is set unconditionally (always 177; all seven once the world-side repoint
+/// moves the six locations onto the shardbearer defeat flags 510010/510300/510040/510220/510120/
+/// 510200), and a flag that IS detected is set only once the check is banked. The flags still reach
+/// [`all_acquire_flags`], so the poll guard and the shop echo-dedup exemption cover the writes the
+/// unconditional path makes.
+///
+/// LEYNDELL HoldClosed INTERACTION. While the synthetic AP region wall is armed and the player has
+/// fewer AP runes than `leyndell_runes_required`, vanilla event 730 can now DERIVE flag 182 from
+/// these possession flags (its own threshold is 2) on the same tick `tick_leyndell_gate_flags`
+/// clears it. We deliberately keep the possession flags TRUTHFUL and keep clearing 182: withholding
+/// them would re-break matt's gates, which is the bug being fixed, and 182 is a derived result flag
+/// that only the physical vanilla seal reads. Both writes are idempotent single flag writes, so the
+/// steady state is a cheap clear per tick, not a correctness problem; the only real hazard was log
+/// flood, and the HoldClosed branch's success line is now latched to once per session the same way
+/// its warn already was.
+///
+/// Band-detected runes in THIS seed: possession flag -> the location id(s) detected on it.
+///
+/// `None` means NOT YET CLASSIFIED (pre-connect, or after a seed switch), and the writers treat
+/// that as "touch nothing". An empty map is a real answer -- a repointed seed where every rune is
+/// unconditional -- so the two states must not be conflated: defaulting an unclassified seed to
+/// "no collisions" is exactly the pre-set that loses the check.
+static GREAT_RUNE_BAND_DETECTED: Mutex<Option<BTreeMap<u32, Vec<i64>>>> = Mutex::new(None);
+
 const GREAT_RUNE_NAMES: &[&str] = &[
     "Godrick's Great Rune",
     "Radahn's Great Rune",
@@ -167,16 +221,25 @@ pub fn tick_leyndell_gate_flags(received: &HashSet<String>, runes_required: usiz
                     }
                 } else {
                     LEYNDELL_GATE_WARNED.fetch_and(!(1 << 2), Ordering::Relaxed);
-                    log::info!(
-                        "great runes: {rune_count}/{runes_required} AP-received -- held vanilla \
-                         Leyndell flag 182 closed"
-                    );
+                    // Since the possession flags 171-177 became truthful, vanilla event 730 can
+                    // re-derive 182 (threshold 2) on EVERY tick while the AP wall holds a higher
+                    // `leyndell_runes_required`. The clear stays -- it is idempotent and it is the
+                    // only thing keeping the physical seal shut -- but the success line is latched
+                    // to once per HoldClosed spell (bit 3) so a per-frame write fight cannot flood
+                    // the log. The bit clears when the gate leaves HoldClosed.
+                    if LEYNDELL_GATE_WARNED.fetch_or(1 << 3, Ordering::Relaxed) & (1 << 3) == 0 {
+                        log::info!(
+                            "great runes: {rune_count}/{runes_required} AP-received -- held \
+                             vanilla Leyndell flag 182 closed (re-derived from possession flags \
+                             171-177 by vanilla event 730; clearing every tick, logging once)"
+                        );
+                    }
                 }
             }
             return;
         }
         er_logic::region_lock::LeyndellGateFlagAction::Open => {
-            LEYNDELL_GATE_WARNED.fetch_and(!(1 << 2), Ordering::Relaxed);
+            LEYNDELL_GATE_WARNED.fetch_and(!((1 << 2) | (1 << 3)), Ordering::Relaxed);
         }
     }
     let mut applied = Vec::new();
@@ -255,6 +318,9 @@ pub fn reset_seed_great_runes() {
     // The poll guard is seed-scoped too: a different room has a different locationFlags table, and
     // the collision set core.rs holds is rebuilt at its configure.
     CLIENT_WRITTEN_FLAGS.lock().unwrap().clear();
+    // Back to UNCLASSIFIED, not to "no collisions": a different room has a different locationFlags
+    // table, and until it is parsed no possession flag may be written.
+    *GREAT_RUNE_BAND_DETECTED.lock().unwrap() = None;
 }
 
 /// Disarm vanilla's altar awards before the matching AP rune arrives. The event flag is the latch;
@@ -269,6 +335,118 @@ pub fn tick_seed_great_rune_altars() {
     }
     if applied > 0 {
         log::info!("great-rune altars: {applied} restore flag(s) applied before vanilla award");
+    }
+}
+
+/// Classify the Great Rune possession band for THIS seed, once, at slot_data parse.
+///
+/// `location_flags` is the merged, already whetblade-repointed poll table core.rs is about to
+/// install, i.e. exactly what the flag poll will read. Any of 171-177 appearing in it means a
+/// location is detected on that flag and the client must not pre-set it; see the
+/// `er_logic::great_rune_possession` module doc for the lost-check mechanism.
+pub fn configure_great_rune_possession(location_flags: &HashMap<i64, u32>) {
+    let detected = er_logic::great_rune_possession::band_detected(location_flags);
+    log::info!(
+        "{}",
+        er_logic::great_rune_possession::classification_line(&detected)
+    );
+    *GREAT_RUNE_BAND_DETECTED.lock().unwrap() = Some(detected);
+}
+
+/// The boss-rune location ids this seed still detects on a possession flag, sorted.
+///
+/// core.rs asks for these so it can resolve just those few ids against the server checked set each
+/// tick instead of materialising the whole set. Empty on a repointed seed and before configure.
+pub fn great_rune_band_locations() -> Vec<i64> {
+    let guard = GREAT_RUNE_BAND_DETECTED.lock().unwrap();
+    let mut out: Vec<i64> = guard
+        .iter()
+        .flat_map(|d| d.values())
+        .flatten()
+        .copied()
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Set the possession flags a RECEIPT may set immediately — i.e. only runes in unconditional mode.
+///
+/// A band-detected rune is deliberately skipped here and left to
+/// [`tick_great_rune_possession_flags`], which re-evaluates every tick and sets it the moment its
+/// check is banked. Called from the receive dispatch beside [`set_acquire_flags`].
+pub fn set_great_rune_possession_flag(name: &str) {
+    let Some(flag) = er_logic::great_rune_possession::possession_flag(name) else {
+        return;
+    };
+    let guard = GREAT_RUNE_BAND_DETECTED.lock().unwrap();
+    let Some(detected) = guard.as_ref() else {
+        return; // not classified yet: the tick will handle it once slot_data has been parsed
+    };
+    let already = flags::get_event_flag(flag);
+    if already {
+        return;
+    }
+    if !er_logic::great_rune_possession::may_set(flag, detected, already, |_| false) {
+        return;
+    }
+    drop(guard);
+    flags::set_event_flag(flag, true);
+    CLIENT_WRITTEN_FLAGS.lock().unwrap().record(flag);
+}
+
+/// Per-tick reconciler for the counted Great Rune possession band (vanilla 171-177).
+///
+/// Re-evaluated every settled tick precisely so a LATER event can flip a rune from held-back to
+/// settable: the player kills the shardbearer (the game sets the flag itself, and the poll sends the
+/// location), or the location is otherwise checked on the server. `checked` is the subset of this
+/// seed's band-detected location ids the server already considers checked.
+///
+/// BY DESIGN THIS UNDERCOUNTS. On a current (un-repointed) seed a Great Rune received before its
+/// boss dies does NOT raise vanilla's `CountEventFlags(EventFlag, 170, 179)` until that boss is
+/// killed, so a rune gate can stay shut while the player's AP inventory says otherwise. That is the
+/// deliberate trade: the flag is the boss lot's `getItemFlagId`, so pre-setting it marks the lot
+/// collected, the kill awards nothing, the flag never transitions, and the location can never be
+/// sent -- an unrecoverable dead check versus a temporarily shut gate that the next kill opens. The
+/// world-side repoint (moving the six locations' detection onto the shardbearer defeat flags
+/// 510010/510300/510040/510220/510120/510200) removes the collision and puts new seeds on the
+/// unconditional path, where there is nothing left to undercount.
+pub fn tick_great_rune_possession_flags(
+    received: &HashSet<String>,
+    checked: &std::collections::HashSet<i64>,
+) {
+    let guard = GREAT_RUNE_BAND_DETECTED.lock().unwrap();
+    let Some(detected) = guard.as_ref().cloned() else {
+        return;
+    };
+    drop(guard);
+    let mut applied: Vec<u32> = Vec::new();
+    for &(name, flag) in er_logic::great_rune_possession::POSSESSION_FLAGS {
+        if !received.contains(name) {
+            continue;
+        }
+        // The flag is its own latch, exactly like `tick_keyitem_flags`: already set means either we
+        // set it earlier or the player earned it, and either way there is nothing to write.
+        if flags::get_event_flag(flag) {
+            continue;
+        }
+        if !er_logic::great_rune_possession::may_set(flag, &detected, false, |loc| {
+            checked.contains(&loc)
+        }) {
+            continue;
+        }
+        if flags::try_set_event_flag(flag, true) {
+            applied.push(flag);
+            // Same record as the other writers: this write is OURS, so the poll must not read it
+            // back as a pickup of the boss-rune check that shares the flag (keyitem_poll, #659).
+            CLIENT_WRITTEN_FLAGS.lock().unwrap().record(flag);
+        }
+    }
+    if !applied.is_empty() {
+        log::info!(
+            "great-rune possession: vanilla flag(s) {applied:?} applied (counted by \
+             CountEventFlags 170-179)"
+        );
     }
 }
 
@@ -292,7 +470,13 @@ pub fn acquire_flags(name: &str) -> Vec<u32> {
 /// set (er_logic::shop_echo): a check detected by one of these flags must never be echo-armed,
 /// because flag-set does not prove a native sale (START-GRANT collision, 2026-07-24).
 pub fn all_acquire_flags() -> impl Iterator<Item = u32> {
-    entries().flat_map(|(_, fs)| fs.iter().copied())
+    entries()
+        .flat_map(|(_, fs)| fs.iter().copied())
+        // The Great Rune possession band is NOT part of `entries()` (its writes are seed-gated, see
+        // `GREAT_RUNE_BAND_DETECTED`), but the client does write it on the unconditional path, so it
+        // still belongs in the poll-guard collision set and the shop echo-dedup exemption. Harmless
+        // on a seed where no location carries these flags: `colliding_checks` finds nothing.
+        .chain(er_logic::great_rune_possession::all_possession_flags())
 }
 
 /// Obtained/restored flags the client itself has flipped unset -> set THIS SESSION.
@@ -384,15 +568,113 @@ mod tests {
         assert_eq!(received_great_rune_count(&received), 2);
     }
 
+    /// The possession band is SEED-GATED and therefore must NOT ride the unconditional
+    /// [`entries`] mapping: `acquire_flags` feeds the reconciler's desired-state path, which has no
+    /// idea whether this seed still detects a boss-rune location on 171-176. The gated writers
+    /// (`set_great_rune_possession_flag` / `tick_great_rune_possession_flags`) own that band.
     #[test]
-    fn leyndell_fix_never_adds_location_flags_to_receive_mapping() {
+    fn the_receive_mapping_never_carries_a_possession_flag() {
         for &name in GREAT_RUNE_NAMES {
-            let flags = acquire_flags(name);
             assert!(
-                flags.iter().all(|f| !(171..=177).contains(f)),
-                "{name}: possession/location flag leaked into receive mapping"
+                acquire_flags(name).iter().all(|f| !(171..=177).contains(f)),
+                "{name}: the counted 170-179 band must not enter the unconditional receive mapping"
             );
         }
+        // The six boss runes still map their RESTORE flag, which is a different thing (Divine
+        // Altar state) and carries no lot.
+        assert_eq!(acquire_flags("Godrick's Great Rune"), vec![191]);
+        // The Unborn rune has no restore flag and no boss lot at all.
+        assert!(acquire_flags("Great Rune of the Unborn").is_empty());
+        assert!(acquire_flags("Rune Arc").is_empty());
+    }
+
+    /// The seed classification core.rs installs at connect, and the location ids it hands back to
+    /// the tick. Current world data keys the six boss-rune locations on 171-176; 177 never carries
+    /// one (7770007 is Rennala's Remembrance on flag 197).
+    #[test]
+    fn connect_classifies_the_band_from_the_seed_location_table() {
+        // Unclassified is not "no collisions": nothing may be written before slot_data is parsed.
+        reset_seed_great_runes();
+        assert!(great_rune_band_locations().is_empty());
+        assert!(GREAT_RUNE_BAND_DETECTED.lock().unwrap().is_none());
+
+        configure_great_rune_possession(&HashMap::from([
+            (7_770_001i64, 171u32),
+            (7_770_002, 172),
+            (7_770_003, 173),
+            (7_770_004, 174),
+            (7_770_005, 175),
+            (7_770_006, 176),
+            (7_770_007, 197), // Rennala's Remembrance -- flag 197, not 177
+            (7_770_099, 510_800),
+        ]));
+        assert_eq!(
+            great_rune_band_locations(),
+            vec![
+                7_770_001, 7_770_002, 7_770_003, 7_770_004, 7_770_005, 7_770_006
+            ]
+        );
+        let detected = GREAT_RUNE_BAND_DETECTED.lock().unwrap().clone().unwrap();
+        assert!(!detected.contains_key(&177), "177 carries no location");
+
+        // A post-repoint seed: the six locations detect the shardbearer DEFEAT flags instead, so
+        // every rune goes unconditional and the tick has nothing to wait for.
+        configure_great_rune_possession(&HashMap::from([
+            (7_770_001i64, 510_010u32),
+            (7_770_002, 510_300),
+            (7_770_006, 510_200),
+        ]));
+        assert!(great_rune_band_locations().is_empty());
+        assert!(
+            GREAT_RUNE_BAND_DETECTED
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(BTreeMap::is_empty)
+        );
+        reset_seed_great_runes();
+    }
+
+    /// The safety half: because 171-176 double as this seed's boss-rune check flags (locs
+    /// 7770001-7770006 in greenfield data.py), they MUST reach the client-written guard set, or a
+    /// receipt on the unconditional path becomes a phantom check of the boss location.
+    #[test]
+    fn possession_flags_reach_the_client_written_poll_guard() {
+        let settable: HashSet<u32> = all_acquire_flags().collect();
+        for flag in 171..=177u32 {
+            assert!(
+                settable.contains(&flag),
+                "possession flag {flag} must be in all_acquire_flags() for the #659 poll guard"
+            );
+        }
+        let poll = std::collections::HashMap::from([
+            (7770001i64, 171u32), // Stormveil :: Godrick's Great Rune - Godrick [f171]
+            (7770006, 176),       // Haligtree :: Malenia's Great Rune - Malenia [f176]
+            (7770099, 510800),    // an ordinary check -- must never be guarded
+        ]);
+        let collisions = er_logic::keyitem_poll::colliding_checks(&poll, &settable);
+        assert_eq!(collisions, vec![(7770001, 171), (7770006, 176)]);
+        let collisions: std::collections::HashMap<i64, u32> = collisions.into_iter().collect();
+        let written = std::collections::BTreeSet::from([171u32]);
+        assert!(
+            er_logic::keyitem_poll::poll_suppressed(7770001, 171, &collisions, &written),
+            "a client-written possession flag must not report as a pickup"
+        );
+        assert!(
+            !er_logic::keyitem_poll::poll_suppressed(7770006, 176, &collisions, &written),
+            "a rune the PLAYER looted must still report its check"
+        );
+    }
+
+    /// Possession flags are not restore flags: the altar pre-arm set stays 191-196 only, so
+    /// arming a seed cannot silently pre-set a boss-rune CHECK flag before any receipt.
+    #[test]
+    fn seed_altar_prearm_never_touches_the_possession_band() {
+        let names: Vec<String> = GREAT_RUNE_NAMES.iter().map(|n| (*n).to_string()).collect();
+        assert_eq!(
+            seed_great_rune_flags(&names),
+            vec![191, 192, 193, 194, 195, 196]
+        );
     }
 
     #[test]

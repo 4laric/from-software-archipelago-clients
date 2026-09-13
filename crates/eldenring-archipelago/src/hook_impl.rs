@@ -76,6 +76,11 @@ impl NetHook for ReceiveDispatch<'_> {
     /// self-heal a write lost to a not-ready flag holder.
     fn on_item_received(&mut self, name: &str) {
         crate::keyitems::set_acquire_flags(name);
+        // Great Rune possession band (vanilla 171-177). A SEPARATE call because it is SEED-GATED:
+        // on a seed where the flag still detects the boss-rune location, setting it here would mark
+        // that lot collected and lose the check, so only unconditional runes are set on receipt and
+        // the rest wait for `keyitems::tick_great_rune_possession_flags`.
+        crate::keyitems::set_great_rune_possession_flag(name);
         if let Some(cfg) = self.region {
             // lockGrantItems rider (SPEC-region-spine-surgery.md SS3.5): physically grant this
             // lock's rider items (unpooled medallions) on its FIRST open. Checked BEFORE
