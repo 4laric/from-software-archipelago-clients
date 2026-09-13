@@ -54,6 +54,7 @@ pub mod goal_text;
 pub mod grace;
 pub mod grace_flush_replay;
 pub mod grants;
+pub mod great_rune_possession;
 pub mod great_runes;
 pub mod hint_explain;
 pub mod hint_toasts;

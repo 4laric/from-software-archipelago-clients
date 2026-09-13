@@ -2368,6 +2368,13 @@ impl shared::Core for Core {
                     log::info!("{line}");
                 }
                 self.keyitem_poll_collisions = keyitem_collisions.into_iter().collect();
+                // GREAT RUNE POSSESSION BAND (171-177), the seed-aware sibling of the guard above.
+                // Same merged, already-repointed table: whether a rune's counted possession flag
+                // still carries a LOCATION in this seed decides whether the client may set it on
+                // receipt or must wait for that check to be banked, because on current seeds the
+                // flag is also the boss-rune lot's getItemFlagId and pre-setting it loses the lot
+                // (er_logic::great_rune_possession).
+                crate::keyitems::configure_great_rune_possession(&fp.location_flags);
                 log::info!(
                     "flag-poll table: {} location flags ({} sweep groups)",
                     fp.location_flags.len(),
@@ -4064,7 +4071,38 @@ impl shared::Core for Core {
         // Player-facing overlay messages from the region ticks (warp requested / arrival /
         // kick) -- collected here because cfg borrows self, logged after the borrow ends.
         let mut region_msgs: Vec<String> = Vec::new();
+        // Which of this seed's boss-rune locations are already banked on the server. Resolved
+        // BEFORE the `can_grant` block because it needs `self.client_mut()` and the block below
+        // borrows `self` through `self.region`. Only the handful of ids this seed still detects on
+        // a possession flag are asked about (none at all on a repointed seed), and each is filtered
+        // through `valid_locations` first -- a datapackage-unknown id panics inside
+        // `is_local_location_checked`, which aborts in the no-unwind FFI frame.
+        let great_rune_band_checked: HashSet<i64> = {
+            let ids: Vec<i64> = crate::keyitems::great_rune_band_locations()
+                .into_iter()
+                .filter(|l| self.valid_locations.contains(l))
+                .collect();
+            if ids.is_empty() {
+                HashSet::new()
+            } else {
+                self.client_mut()
+                    .map(|client| {
+                        ids.into_iter()
+                            .filter(|&l| client.is_local_location_checked(l))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        };
         if can_grant {
+            // Vanilla's counted Great Rune band (171-177): set what this seed allows to be set.
+            // Outside the reconciler ownership switch on purpose -- the decision is seed state plus
+            // the server checked set, which `DesiredInputs` cannot represent, and the write must be
+            // re-evaluated every tick so a boss kill (or a late check) flips a held-back rune.
+            crate::keyitems::tick_great_rune_possession_flags(
+                &received_all,
+                &great_rune_band_checked,
+            );
             // Unlike received-key flags, these are deliberately armed from the SEED roster,
             // before receipt, so a Divine Tower cannot mint a duplicate vanilla Great Rune.
             // Keep this outside the reconciler ownership branch: DesiredInputs only contains
