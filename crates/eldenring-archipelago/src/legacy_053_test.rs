@@ -32,6 +32,7 @@ fn legacy_053_generated_profiles() {
         let (_, status) = er_logic::tracker_tables::build_tracker_tables(
             sd.get("locationRegions"),
             sd.get("regionCoarseKeys"),
+            sd.get("unobtainableLocations"),
         );
         println!("tracker: {}", status.describe());
         assert!(matches!(
