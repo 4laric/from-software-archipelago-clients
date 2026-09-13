@@ -99,6 +99,56 @@ const KEY_ITEM_ACQUIRE_FLAGS: &[(&str, &[u32])] = &[
     ("Malenia's Great Rune", &[196]),
 ];
 
+/// Vanilla's Great Rune POSSESSION flags, the 170-179 band that every rune-count gate reads.
+///
+/// The reported bug (2026-09-13, player Zelda): six AP-delivered Great Runes, and thefifthmatt's
+/// randomizer rune gates ("4 runes for Leyndell, 3 to finish", message 20003) stayed shut. Vanilla
+/// counts runes with `CountEventFlags(EventFlag, 170, 179) >= N` (common.emevd $Event(730), line
+/// ~1110) and matt's gates reuse that pattern with their own thresholds. These flags are the
+/// `getItemFlagId` of the boss-drop rune lots (greenfield/flag_lots.tsv): 171 -> lot 10010 goods
+/// 8148, 172 -> 10301/8149, 173 -> 10041/8150, 174 -> 10221/8151, 175 -> 10121/8152, 176 ->
+/// 10201/8153; 177 is the Great Rune of the Unborn, which vanilla derives from flag 197 in
+/// common.emevd $Event(6905) (~line 3123, the event that sets 171-177 from the boss/197 flags).
+/// Nothing in an AP delivery runs 6905 or trips a lot, so the whole band read ZERO.
+///
+/// The restore flags 191-196 above are a DIFFERENT thing and do not substitute: they make a
+/// received rune usable at a Divine Altar without the tower trip. Only 171-177 are counted.
+/// `LEYNDELL_TWO_RUNES_FLAGS` writes the vanilla seal's RESULT flags 182/105 directly, which fixes
+/// that ONE seal and leaves every other consumer of the band reading zero -- hence this table.
+///
+/// CHECK-FLAG COLLISION, and why it is safe. 171-176 are ALSO this seed's poll flags for the six
+/// boss-rune locations (greenfield/eldenring/tables/data.py: `Stormveil :: Godrick's Great Rune -
+/// Godrick [f171]` = loc 7770001, ... `Haligtree :: Malenia's ... [f176]` = 7770006). 177 is not a
+/// check. That is exactly the Rold-Medallion / Bell / Knife / Kit shape, and it takes the SAME
+/// answer, not a repoint: these flags are what vanilla's counter reads, so they cannot be moved.
+/// Going through the shared [`entries`] path means every write is latched on the flag reading
+/// UNSET and is recorded in `CLIENT_WRITTEN_FLAGS`, so `er_logic::keyitem_poll::poll_suppressed`
+/// can never turn a client-written possession flag into a phantom check, while a player who
+/// genuinely killed the boss first set the flag themselves and still reports normally.
+///
+/// This reverses the earlier "never map a location flag on receive" stance (the old
+/// `leyndell_fix_never_adds_location_flags_to_receive_mapping` test): that stance predates the #659
+/// poll guard, and with the guard in place the correct trade is truthful possession flags.
+///
+/// LEYNDELL HoldClosed INTERACTION. While the synthetic AP region wall is armed and the player has
+/// fewer AP runes than `leyndell_runes_required`, vanilla event 730 can now DERIVE flag 182 from
+/// these possession flags (its own threshold is 2) on the same tick `tick_leyndell_gate_flags`
+/// clears it. We deliberately keep the possession flags TRUTHFUL and keep clearing 182: withholding
+/// them would re-break matt's gates, which is the bug being fixed, and 182 is a derived result flag
+/// that only the physical vanilla seal reads. Both writes are idempotent single flag writes, so the
+/// steady state is a cheap clear per tick, not a correctness problem; the only real hazard was log
+/// flood, and the HoldClosed branch's success line is now latched to once per session the same way
+/// its warn already was.
+const GREAT_RUNE_POSSESSION_FLAGS: &[(&str, &[u32])] = &[
+    ("Godrick's Great Rune", &[171]),
+    ("Radahn's Great Rune", &[172]),
+    ("Morgott's Great Rune", &[173]),
+    ("Rykard's Great Rune", &[174]),
+    ("Mohg's Great Rune", &[175]),
+    ("Malenia's Great Rune", &[176]),
+    ("Great Rune of the Unborn", &[177]),
+];
+
 const GREAT_RUNE_NAMES: &[&str] = &[
     "Godrick's Great Rune",
     "Radahn's Great Rune",
@@ -167,16 +217,25 @@ pub fn tick_leyndell_gate_flags(received: &HashSet<String>, runes_required: usiz
                     }
                 } else {
                     LEYNDELL_GATE_WARNED.fetch_and(!(1 << 2), Ordering::Relaxed);
-                    log::info!(
-                        "great runes: {rune_count}/{runes_required} AP-received -- held vanilla \
-                         Leyndell flag 182 closed"
-                    );
+                    // Since the possession flags 171-177 became truthful, vanilla event 730 can
+                    // re-derive 182 (threshold 2) on EVERY tick while the AP wall holds a higher
+                    // `leyndell_runes_required`. The clear stays -- it is idempotent and it is the
+                    // only thing keeping the physical seal shut -- but the success line is latched
+                    // to once per HoldClosed spell (bit 3) so a per-frame write fight cannot flood
+                    // the log. The bit clears when the gate leaves HoldClosed.
+                    if LEYNDELL_GATE_WARNED.fetch_or(1 << 3, Ordering::Relaxed) & (1 << 3) == 0 {
+                        log::info!(
+                            "great runes: {rune_count}/{runes_required} AP-received -- held \
+                             vanilla Leyndell flag 182 closed (re-derived from possession flags \
+                             171-177 by vanilla event 730; clearing every tick, logging once)"
+                        );
+                    }
                 }
             }
             return;
         }
         er_logic::region_lock::LeyndellGateFlagAction::Open => {
-            LEYNDELL_GATE_WARNED.fetch_and(!(1 << 2), Ordering::Relaxed);
+            LEYNDELL_GATE_WARNED.fetch_and(!((1 << 2) | (1 << 3)), Ordering::Relaxed);
         }
     }
     let mut applied = Vec::new();
@@ -219,6 +278,7 @@ fn entries() -> impl Iterator<Item = (&'static str, &'static [u32])> {
     COMPANION_ACQUIRE_FLAGS
         .iter()
         .chain(KEY_ITEM_ACQUIRE_FLAGS)
+        .chain(GREAT_RUNE_POSSESSION_FLAGS)
         .copied()
         .chain(
             er_logic::whetblade::WHETBLADES
@@ -384,15 +444,86 @@ mod tests {
         assert_eq!(received_great_rune_count(&received), 2);
     }
 
+    /// The motivating case (rule 11), 2026-09-13: every Great Rune receipt must set its vanilla
+    /// POSSESSION flag, because that band -- not the restore flags -- is what
+    /// `CountEventFlags(EventFlag, 170, 179)` reads in common.emevd $Event(730) and in matt's
+    /// randomizer rune gates. This supersedes the old
+    /// `leyndell_fix_never_adds_location_flags_to_receive_mapping`, which asserted the exact
+    /// opposite before the #659 poll guard existed to make it safe.
     #[test]
-    fn leyndell_fix_never_adds_location_flags_to_receive_mapping() {
-        for &name in GREAT_RUNE_NAMES {
-            let flags = acquire_flags(name);
+    fn every_great_rune_receipt_sets_its_vanilla_possession_flag() {
+        let expect: &[(&str, u32)] = &[
+            ("Godrick's Great Rune", 171),
+            ("Radahn's Great Rune", 172),
+            ("Morgott's Great Rune", 173),
+            ("Rykard's Great Rune", 174),
+            ("Mohg's Great Rune", 175),
+            ("Malenia's Great Rune", 176),
+            ("Great Rune of the Unborn", 177),
+        ];
+        for &(name, flag) in expect {
             assert!(
-                flags.iter().all(|f| !(171..=177).contains(f)),
-                "{name}: possession/location flag leaked into receive mapping"
+                acquire_flags(name).contains(&flag),
+                "{name}: possession flag {flag} missing from the receive mapping"
             );
         }
+        // The Unborn rune has no restore flag and no boss lot: 177 is its ONLY mapping.
+        assert_eq!(acquire_flags("Great Rune of the Unborn"), vec![177]);
+        // The six boss runes keep their restore flag alongside the new possession flag.
+        assert_eq!(acquire_flags("Godrick's Great Rune"), vec![191, 171]);
+    }
+
+    #[test]
+    fn non_rune_items_get_no_possession_flag() {
+        for name in ["Rune Arc", "Talisman Pouch", "", "Great Rune"] {
+            assert!(
+                acquire_flags(name).iter().all(|f| !(171..=177).contains(f)),
+                "{name}: must not map into the counted 170-179 band"
+            );
+        }
+        assert!(acquire_flags("Rune Arc").is_empty());
+    }
+
+    /// The safety half: because 171-176 double as this seed's boss-rune check flags (locs
+    /// 7770001-7770006 in greenfield data.py), they MUST reach the client-written guard set, or a
+    /// receipt becomes a phantom check of the boss location.
+    #[test]
+    fn possession_flags_reach_the_client_written_poll_guard() {
+        let settable: HashSet<u32> = all_acquire_flags().collect();
+        for flag in 171..=177u32 {
+            assert!(
+                settable.contains(&flag),
+                "possession flag {flag} must be in all_acquire_flags() for the #659 poll guard"
+            );
+        }
+        let poll = std::collections::HashMap::from([
+            (7770001i64, 171u32), // Stormveil :: Godrick's Great Rune - Godrick [f171]
+            (7770006, 176),       // Haligtree :: Malenia's Great Rune - Malenia [f176]
+            (7770099, 510800),    // an ordinary check -- must never be guarded
+        ]);
+        let collisions = er_logic::keyitem_poll::colliding_checks(&poll, &settable);
+        assert_eq!(collisions, vec![(7770001, 171), (7770006, 176)]);
+        let collisions: std::collections::HashMap<i64, u32> = collisions.into_iter().collect();
+        let written = std::collections::BTreeSet::from([171u32]);
+        assert!(
+            er_logic::keyitem_poll::poll_suppressed(7770001, 171, &collisions, &written),
+            "a client-written possession flag must not report as a pickup"
+        );
+        assert!(
+            !er_logic::keyitem_poll::poll_suppressed(7770006, 176, &collisions, &written),
+            "a rune the PLAYER looted must still report its check"
+        );
+    }
+
+    /// Possession flags are not restore flags: the altar pre-arm set stays 191-196 only, so
+    /// arming a seed cannot silently pre-set a boss-rune CHECK flag before any receipt.
+    #[test]
+    fn seed_altar_prearm_never_touches_the_possession_band() {
+        let names: Vec<String> = GREAT_RUNE_NAMES.iter().map(|n| (*n).to_string()).collect();
+        assert_eq!(
+            seed_great_rune_flags(&names),
+            vec![191, 192, 193, 194, 195, 196]
+        );
     }
 
     #[test]
