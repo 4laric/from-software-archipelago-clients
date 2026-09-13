@@ -308,6 +308,10 @@ pub struct Core {
     /// imgui present thread, which must not. The poll already computes exactly this for
     /// `sweep_watch`, so the row costs no extra read.
     sweep_flag_state: HashMap<u32, bool>,
+    /// Groups already reported as firing on an IMPLIED terminal flag, so that line is logged once
+    /// per group per session rather than every poll. Cleared on seed change beside the other
+    /// sweep tables.
+    sweep_implied_logged: HashSet<u32>,
     log_seed_epoch: std::time::Instant,
     log_sweep_members: HashSet<i64>,
     log_sweep_submitted: HashSet<i64>,
@@ -938,6 +942,7 @@ impl shared::Core for Core {
             boss_flag_prev: HashSet::new(),
             sweep_bannered: HashSet::new(),
             sweep_flag_state: HashMap::new(),
+            sweep_implied_logged: HashSet::new(),
             log_seed_epoch: std::time::Instant::now(),
             log_sweep_members: HashSet::new(),
             log_sweep_submitted: HashSet::new(),
@@ -3592,6 +3597,11 @@ impl shared::Core for Core {
             // groups included. Collected in the immutable borrow and reported after it, exactly
             // like `sweep_fired`.
             let mut sweep_obs: Vec<er_logic::sweep_watch::GroupObservation> = Vec::new();
+            // The same groups' EFFECTIVE fired state (own flag OR an implied terminal flag) --
+            // what the F6 tracker row shows. Split from `sweep_obs` so the census stays honest.
+            let mut sweep_effective: Vec<(u32, bool)> = Vec::new();
+            // (group flag, witness flag) for every group firing on an IMPLIED terminal flag.
+            let mut sweep_implied: Vec<(u32, u32)> = Vec::new();
             // (location, detection flag) for every member this poll actually granted -- the input
             // to the sweep flag flush below (er_logic::sweep_flush::flags_to_assert).
             let mut swept_members: Vec<(i64, u32)> = Vec::new();
@@ -3667,9 +3677,21 @@ impl shared::Core for Core {
                     // "armed and waiting" was unreadable and a 2m45s delay looked like a broken
                     // sweep (bobler, 2026-08-07). Read once here and reused by the fire test below,
                     // so this costs no extra flag read on the firing path.
-                    let flag_set =
-                        crate::flags::get_event_flag(er_logic::sweep_gate::completion_flag(flag));
-                    sweep_obs.push((flag, locs.len(), flag_set));
+                    let completion = er_logic::sweep_gate::completion_flag(flag);
+                    // IMPLIED TERMINAL FLAGS (2026-09-13, colombius): some groups' own trigger can
+                    // never land -- Leda's 48-member Enir-Ilim group waits on a five-way AND that
+                    // short rosters never complete -- so a later boss on the far side of the
+                    // encounter stands witness. See er_logic::sweep_implied.
+                    let witness = er_logic::sweep_implied::sweep_trigger_fired(completion, |f| {
+                        crate::flags::get_event_flag(f)
+                    });
+                    let flag_set = witness.is_some();
+                    // 🛑 THE CENSUS REPORTS THE GROUP'S OWN FLAG, NOT THE IMPLIED RESULT. The
+                    // sweep-watch line is the diagnostic that found this bug; if it started
+                    // claiming 20010850 was set we would lose the evidence that it never is.
+                    sweep_obs.push((flag, locs.len(), witness == Some(completion)));
+                    // ...but the tracker row must show the group as fired, since it did pay out.
+                    sweep_effective.push((flag, flag_set));
                     // Draft B: hold a gated group's sweep until its boss-lock item is in the
                     // cumulative received set. sweepLockGates is FLAG-keyed, so look it up by this
                     // sweep's boss-defeat flag; poll-driven, so a lock received AFTER the kill fires
@@ -3681,6 +3703,15 @@ impl shared::Core for Core {
                         continue;
                     }
                     if flag_set {
+                        if let Some(w) = witness
+                            && w != completion
+                        {
+                            // Logged after the immutable borrow of `fp`/`client` ends, like
+                            // `sweep_fired`; latched there so it says this once per session.
+                            // Pushed BELOW the gate, so a group still held by its lock gate does
+                            // not announce a fire it has not made.
+                            sweep_implied.push((flag, w));
+                        }
                         let mut granted = 0usize;
                         let mut sample_loc = 0i64;
                         for &loc in locs {
@@ -3710,9 +3741,16 @@ impl shared::Core for Core {
             if !sweep_obs.is_empty() {
                 // Same observation feeds the tracker's Boss sweeps section (read on the tick, not
                 // in the render -- see `sweep_flag_state`).
-                self.sweep_flag_state = sweep_obs.iter().map(|&(f, _, set)| (f, set)).collect();
+                self.sweep_flag_state = sweep_effective.iter().copied().collect();
                 for line in self.sweep_watch.observe(&sweep_obs) {
                     log::info!("{line}");
+                }
+            }
+            for (flag, witness) in sweep_implied {
+                if self.sweep_implied_logged.insert(flag) {
+                    log::info!(
+                        "sweep: group {flag} fired on implied terminal flag {witness} (the group's own flag never landed)"
+                    );
                 }
             }
             // SWEEP VISIBILITY banners (latched once per group per session via sweep_bannered;
@@ -5444,6 +5482,7 @@ impl Core {
         self.boss_flag_prev.clear();
         // SWEEP VISIBILITY: re-arm the per-group sweep banner for the new seed.
         self.sweep_bannered.clear();
+        self.sweep_implied_logged.clear();
         self.log_sweep_submitted.clear();
         self.log_sweep_acknowledged.clear();
         self.sweep_watch.reset();

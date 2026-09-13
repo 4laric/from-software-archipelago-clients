@@ -119,6 +119,7 @@ pub mod sweep_boss_names;
 pub mod sweep_clause;
 pub mod sweep_flush;
 pub mod sweep_gate;
+pub mod sweep_implied;
 pub mod sweep_view;
 pub mod sweep_watch;
 pub mod toast;
