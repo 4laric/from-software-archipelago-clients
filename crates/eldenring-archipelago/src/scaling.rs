@@ -11,7 +11,7 @@
 //! idempotent and re-scales correctly when the player changes region or an enemy reloads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
@@ -63,6 +63,22 @@ static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
 /// Ticks at the last sweep -- the repeat throttle. `None` = never swept, so the first allowed tick
 /// sweeps immediately instead of waiting for a modulo phase.
 static LAST_SWEEP_TICK: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Current repeat interval, in ticks. Starts at `THROTTLE` and backs off (P1, world-perf#1)
+/// while a region is converged -- a converged region's sweep changes nothing, so re-walking the
+/// whole ~3000-entry chr set at the fixed 2 Hz throttle forever is pure cost. Reset to `THROTTLE`
+/// on any real transition and on any sweep that actually changed something, so a fresh spawn or a
+/// region change is never scaled later than it is today; only the STEADY, unchanging case backs off.
+static SWEEP_INTERVAL: AtomicU32 = AtomicU32::new(THROTTLE);
+/// Ceiling for `SWEEP_INTERVAL`. A correctness bound, not a feel knob: it is the longest a
+/// population change that the fingerprint alone cannot see (an effect-list mutation with no
+/// spawn/despawn/status change) can go unnoticed. ~4s @60fps.
+const MAX_INTERVAL: u32 = 240;
+/// Cheap population fingerprint (folded via `fold_fingerprint` in `tick`) from the sweep BEFORE
+/// this one, so a change can be detected without waiting for `SWEEP_INTERVAL` to elapse. 0 = none
+/// taken yet, which is indistinguishable from a real all-zero fingerprint only on a chr set with
+/// zero entries -- there is nothing to scale there either way.
+static LAST_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
 /// Everything about a sweep that does NOT vary per enemy, in one place.
 ///
 /// Introduced 2026-08-08 because adding the per-entity `chr_load_status` pushed `scale_one` and
@@ -331,6 +347,37 @@ where
         }
         None
     })
+}
+
+/// Fold one chr set's entries into a running fingerprint, reading ONLY the entry slot -- the
+/// pointer BITS and the load status -- never dereferencing `chr_ins`. Same safety basis as
+/// `sweepable_characters_with_status`'s "read the ENTRY, never the ChrIns behind it": a half-
+/// constructed `ChrIns` is a native crash, but its address and the entry's own status byte are
+/// always valid to read.
+///
+/// Deliberately does NOT touch `STATUS_HIST` -- this walk is a cheap probe to decide whether a
+/// full sweep is worth running, not a sweep itself, and folding it into the release histogram
+/// would double-count entries on ticks where no sweep happens.
+fn fold_fingerprint<T>(set: &ChrSet<T>, hash: &mut u64, count: &mut u64)
+where
+    T: Subclass<ChrIns> + 'static,
+{
+    let mut current = set.entries;
+    let end = unsafe { current.add(set.capacity as usize) };
+    while current != end {
+        let entry = unsafe { current.as_ref() };
+        if let Some(chr_ins) = entry.chr_ins {
+            let bits = chr_ins.as_ptr() as u64;
+            let status = entry.chr_load_status as u64;
+            // FxHash-style mix: cheap, and collisions only cost an extra sweep, never a missed one
+            // (a missed change would be the correctness bug; a spurious sweep is merely the cost
+            // this fix exists to reduce).
+            *hash = hash.wrapping_mul(0x517c_c1b7_2722_0a95) ^ bits;
+            *hash = hash.wrapping_mul(0x517c_c1b7_2722_0a95) ^ status;
+            *count += 1;
+        }
+        current = unsafe { current.add(1) };
+    }
 }
 
 /// Short per-entity label for the SAMPLE line. Deliberately terse -- the sample tuple is already
@@ -865,26 +912,62 @@ pub fn tick() -> Option<String> {
     // the PRIMARY crash guard once more: the chr_load_status filter that briefly replaced it
     // rejected every enemy in the game and was reverted the same day (see sweepable_characters).
     let now = now_ms();
-    let (allowed, diag) = {
+    let (allowed, diag, region_changed) = {
         let Ok(mut gate) = GATE.lock() else {
             return None;
         };
-        gate.on_region(region, now, &SETTLE); // EVERY tick, before any throttle
-        (gate.sweep_allowed(now, &SETTLE), gate.release_diag(now))
+        let region_changed = gate.on_region(region, now, &SETTLE); // EVERY tick, before any throttle
+        (
+            gate.sweep_allowed(now, &SETTLE),
+            gate.release_diag(now),
+            region_changed,
+        )
     };
     if !allowed {
         return None;
     }
-    // Repeat-sweep throttle, measured from the LAST SWEEP rather than a modulo phase, so the first
-    // allowed sweep after a transition runs on this tick instead of waiting up to 30 more frames.
+    if region_changed {
+        // A real region change is exactly the case a converged-region backoff must not delay --
+        // drop straight back to the fast repeat rate so a fresh area's first few sweeps behave
+        // exactly as they did before this fix.
+        SWEEP_INTERVAL.store(THROTTLE, Ordering::Relaxed);
+    }
+    // Adaptive repeat interval (P1, world-perf#1): measured from the LAST SWEEP rather than a
+    // modulo phase, so the first allowed sweep after a transition runs on this tick instead of
+    // waiting up to `SWEEP_INTERVAL` more frames. Once `THROTTLE` ticks have passed, a full sweep
+    // still runs early if the cheap population fingerprint moved -- so a spawn/despawn/load-status
+    // change is never scaled later than the old fixed-throttle code scaled it; only a STEADY
+    // population (fingerprint unchanged) is allowed to wait out the (possibly backed-off) interval.
+    // Fold the same two chr-set walks pass one/pass two use below into a cheap fingerprint --
+    // entry pointer + load status only, never a ChrIns dereference (see `fold_fingerprint`).
+    let fp = {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut count: u64 = 0;
+        fold_fingerprint(&wcm.open_field_chr_set.base, &mut hash, &mut count);
+        for slot in wcm.chr_sets.iter().flatten() {
+            fold_fingerprint(slot, &mut hash, &mut count);
+        }
+        hash ^ count
+    };
     {
         let Ok(mut last) = LAST_SWEEP_TICK.lock() else {
             return None;
         };
-        match *last {
-            Some(t) if tick_no.wrapping_sub(t) < THROTTLE => return None,
-            _ => *last = Some(tick_no),
+        let interval = SWEEP_INTERVAL.load(Ordering::Relaxed).max(THROTTLE);
+        let due = match *last {
+            Some(t) => tick_no.wrapping_sub(t) >= interval,
+            None => true,
+        };
+        if !due {
+            let throttle_elapsed = match *last {
+                Some(t) => tick_no.wrapping_sub(t) >= THROTTLE,
+                None => true,
+            };
+            if !throttle_elapsed || fp == LAST_FINGERPRINT.load(Ordering::Relaxed) {
+                return None;
+            }
         }
+        *last = Some(tick_no);
     }
     for h in &STATUS_HIST {
         h.store(0, Ordering::Relaxed);
@@ -1317,6 +1400,33 @@ pub fn tick() -> Option<String> {
                 }
             }
         }
+    }
+
+    // Adaptive repeat interval, part two: decide the NEXT interval from what THIS sweep did.
+    // A sweep that wrote nothing (no upward scale, no down-scale, no down-clear) and saw the same
+    // population it saw last time is a converged region -- back off. Anything else (a write, or a
+    // fingerprint change this sweep is only now catching up to) drops straight back to `THROTTLE`.
+    let converged = tally.scaled == 0
+        && tally.scaled_down == 0
+        && tally.cleared_down == 0
+        && fp == LAST_FINGERPRINT.load(Ordering::Relaxed);
+    LAST_FINGERPRINT.store(fp, Ordering::Relaxed);
+    let prev_interval = SWEEP_INTERVAL.load(Ordering::Relaxed);
+    let next_interval = if converged {
+        (prev_interval.saturating_mul(2)).min(MAX_INTERVAL)
+    } else {
+        THROTTLE
+    };
+    if next_interval != prev_interval {
+        SWEEP_INTERVAL.store(next_interval, Ordering::Relaxed);
+        log::info!(
+            "enemy-scaling: repeat interval {prev_interval} -> {next_interval} ticks ({})",
+            if next_interval > prev_interval {
+                "converged"
+            } else {
+                "changed"
+            }
+        );
     }
 
     entry_toast
