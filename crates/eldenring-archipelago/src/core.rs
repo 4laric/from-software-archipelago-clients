@@ -2628,7 +2628,7 @@ impl shared::Core for Core {
                 // value, one deref, and the row can never disagree with the gate about where the
                 // player is. BUCKET, not the raw id -- `play_region` is 6200000 where the scaling
                 // wire and `region_name_for_bucket` both speak 62000.
-                self.scaling_here_bucket = pr.map(|r| r / 100);
+                self.scaling_here_bucket = pr.map(er_logic::region_lock::play_region_bucket);
                 if pr.is_some() && pr != self.grant_gate_last_play_region {
                     if self.grant_gate_last_play_region.is_some() {
                         self.in_world_since = None;

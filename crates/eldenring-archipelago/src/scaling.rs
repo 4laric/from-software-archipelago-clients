@@ -855,9 +855,9 @@ pub fn tick() -> Option<String> {
     if sweep_blocked_by_death(player.chr_ins.modules.data.hp) {
         return None;
     }
-    // SCALING_WIRE: resolve in play_region/100 sub-id space -- the same bucket the
-    // region-lock kick uses and the space regionSphereTargetRanges is emitted in.
-    let region = (player.play_region_id / 100) as i32;
+    // SCALING_WIRE: use the same raw seam resolution as the kick and tracker, then
+    // look up the bucket in regionSphereTargetRanges.
+    let region = er_logic::region_lock::play_region_bucket(player.play_region_id as i32);
     let player_handle = player.field_ins_handle; // skip the player itself in the sweep
     let player_team = player.chr_ins.team_type; // hostiles (invader/NPC phantoms) carry a different team
 
