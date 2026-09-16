@@ -91,12 +91,72 @@ mod leyndell_gate_status_tests {
     }
 }
 
+/// Resolve runtime geometry without discarding adjudicated sub-area boundaries.
+/// Margit's raw arena row and ordinary Stormhill share a /100 bucket but different owners.
+/// The generated exceptions retain that distinction, including for existing seeds whose
+/// areaLockFlags contain only coarse buckets. They do not add locks absent from the seed.
+pub fn play_region_bucket(pr: i32) -> i32 {
+    crate::region_locks::RAW_PLAY_REGION_BUCKETS
+        .iter()
+        .find_map(|&(raw, bucket)| (raw == pr).then_some(bucket))
+        .unwrap_or(if pr >= 1_000_000 { pr / 100 } else { pr })
+}
+
+#[cfg(test)]
+mod raw_seam_tests {
+    use super::*;
+
+    #[test]
+    fn margit_arena_to_castle_transition_preserves_the_lock_and_start_guard() {
+        // Historical raw transition after Margit's death, not inferred from his grace map:
+        // world#523, issuecomment-5258517666 (August 11, 2026).
+        let stormveil = crate::region_locks::by_lock_item("Stormveil Lock").unwrap();
+        let limgrave = crate::region_locks::by_lock_item("Limgrave Lock").unwrap();
+        let stormveil_flag = stormveil.open_flag.unwrap();
+        let limgrave_flag = limgrave.open_flag.unwrap();
+        let ranges = [
+            [10000, 10000, stormveil_flag as i32],
+            [61010, 61010, limgrave_flag as i32],
+        ];
+        for stormveil_open in [false, true] {
+            for limgrave_open in [false, true] {
+                for start_done in [false, true] {
+                    // Synthetic guard flag: this is an input to the decision, not a game ID.
+                    let guard = 42;
+                    let flags = |f| match f {
+                        f if f == stormveil_flag => stormveil_open,
+                        f if f == limgrave_flag => limgrave_open,
+                        42 => start_done,
+                        _ => false,
+                    };
+                    for raw in [6101010, 1000001] {
+                        assert_eq!(
+                            kick_decision(raw, &ranges, guard, &flags),
+                            !stormveil_open && start_done
+                        );
+                    }
+                    assert_eq!(
+                        kick_decision(6101000, &ranges, guard, &flags),
+                        !limgrave_open && start_done
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_exception_does_not_invent_a_lock_absent_from_an_existing_seed() {
+        // An old seed can lock Limgrave while Stormveil is not gated at all.
+        let ranges = [[61010, 61010, 123]];
+        assert!(!kick_decision(6101010, &ranges, 0, &|_| false));
+        assert!(kick_decision(6101000, &ranges, 0, &|_| false));
+    }
+}
+
 /// Decide whether the player should be KICKED this tick: the current region is in a locked range
 /// AND the random-start guard allows it (non-random seed, or the random-start warp already done).
 ///
-///  - `pr` — raw `play_region_id`. Overworld sub-areas report a 7-digit id (`subregion * 100`); the
-///    major area reports the 5-digit subregion. We reduce a 7-digit id to its 5-digit subregion
-///    (matches `features.rs`: `if pr >= 1_000_000 { pr / 100 }`).
+///  - `pr` — raw `play_region_id`, resolved by [`play_region_bucket`] before range lookup.
 ///  - `area_lock_flags` — `[lo, hi, open_flag]` inclusive 5-digit subregion ranges; a range is
 ///    locked when its open flag is off.
 ///  - `random_start_done_flag` — `0` means non-random (no guard); else the kick waits until set.
@@ -106,7 +166,7 @@ pub fn kick_decision(
     random_start_done_flag: u32,
     get_flag: &dyn Fn(u32) -> bool,
 ) -> bool {
-    let sub = if pr >= 1_000_000 { pr / 100 } else { pr };
+    let sub = play_region_bucket(pr);
     let locked = area_lock_flags
         .iter()
         .any(|e| sub >= e[0] && sub <= e[1] && !get_flag(e[2] as u32));
@@ -284,7 +344,7 @@ pub fn region_of_lock_item(lock_item: &str) -> &str {
 ///     flag has no name), the GENERATED `region_locks` table maps a play_region id to its
 ///     region. Static game geometry, the same source the fallback derive already uses.
 ///
-/// `pr` is the RAW play_region id; a 7-digit interior id is folded to its 5-digit bucket by the
+/// `pr` is the RAW play_region id; [`play_region_bucket`] applies the
 /// SAME rule [`kick_decision`] applies, so the message and the gate can never disagree about
 /// which range covered the tick.
 pub fn sealed_lock_item<'a>(
@@ -292,7 +352,7 @@ pub fn sealed_lock_item<'a>(
     area_lock_flags: &[[i32; 3]],
     region_open_flags: &'a HashMap<String, u32>,
 ) -> Option<&'a str> {
-    let sub = if pr >= 1_000_000 { pr / 100 } else { pr };
+    let sub = play_region_bucket(pr);
     if let Some(e) = area_lock_flags.iter().find(|e| sub >= e[0] && sub <= e[1]) {
         // `.min()` only to stay deterministic if a seed ever gives two locks one open flag;
         // normally the filter yields exactly one name.

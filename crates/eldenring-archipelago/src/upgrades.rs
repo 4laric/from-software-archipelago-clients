@@ -81,7 +81,7 @@ fn dlc_blessing_floor_here() -> i32 {
     let Some(pr) = crate::flags::play_region_id() else {
         return 0;
     };
-    let bucket = pr / 100;
+    let bucket = er_logic::region_lock::play_region_bucket(pr);
     match DLC_SCADU_FLOORS.lock() {
         Ok(g) => er_logic::scaling::blessing_floor_for_region(&g, bucket).unwrap_or(0),
         Err(_) => 0,

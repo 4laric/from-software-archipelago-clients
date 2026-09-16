@@ -165,11 +165,7 @@ fn int_list(v: &Value) -> Option<Vec<i32>> {
 /// 7-digit interior play_region ids (`bucket * 100 + sub`) reduce to their 5-digit bucket —
 /// the SAME rule `region_lock::kick_decision` applies.
 fn bucket_of_play_region(pr: i32) -> i32 {
-    if pr >= 1_000_000 {
-        pr / 100
-    } else {
-        pr
-    }
+    crate::region_lock::play_region_bucket(pr)
 }
 
 /// Per-tick latch: what the reversible capital state must be while STANDING at `play_region`.

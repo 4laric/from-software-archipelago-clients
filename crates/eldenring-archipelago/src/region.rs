@@ -165,7 +165,7 @@ pub fn tick_goal_approach(
         return None; // not resolved -> absent, never stuck
     }
     let pr = flags::play_region_id()?;
-    let sub = if pr >= 1_000_000 { pr / 100 } else { pr };
+    let sub = er_logic::region_lock::play_region_bucket(pr);
     // The same covering-range lookup kick-watch does; the arena is "the buckets whose lock range
     // names the goal region's open flag".
     let in_arena = cfg
@@ -637,7 +637,8 @@ pub fn tick_kick(cfg: &RegionConfig) -> Option<String> {
     {
         let last = KICK_WATCH_LAST_PR.swap(pr, Ordering::Relaxed);
         if last != pr {
-            let sub = if pr >= 1_000_000 { pr / 100 } else { pr };
+            let sub = er_logic::region_lock::play_region_bucket(pr);
+            let folded = if pr >= 1_000_000 { pr / 100 } else { pr };
             let hit = cfg
                 .area_lock_flags
                 .iter()
@@ -646,14 +647,14 @@ pub fn tick_kick(cfg: &RegionConfig) -> Option<String> {
                 || flags::get_event_flag(cfg.random_start_done_flag);
             match hit {
                 Some(e) => log::info!(
-                    "kick-watch: play_region {last} -> {pr} (sub {sub}); range [{},{}] flag {} = {} | start-gate open = {gate_open} | kick = {kick}",
+                    "kick-watch: play_region {last} -> {pr} (sub {sub}); folded {folded}; range [{},{}] flag {} = {} | start-gate open = {gate_open} | kick = {kick}",
                     e[0],
                     e[1],
                     e[2],
                     flags::get_event_flag(e[2] as u32)
                 ),
                 None => log::info!(
-                    "kick-watch: play_region {last} -> {pr} (sub {sub}); NO lock range covers it ({} ranges) | start-gate open = {gate_open}",
+                    "kick-watch: play_region {last} -> {pr} (sub {sub}); folded {folded}; NO lock range covers it ({} ranges) | start-gate open = {gate_open}",
                     cfg.area_lock_flags.len()
                 ),
             }
@@ -738,7 +739,7 @@ pub fn tick_random_start_warp(cfg: &RegionConfig) -> Option<String> {
     let pr = flags::play_region_id()?;
     // Interior play regions are 7-digit (bucket*100 + sub) -- normalize to the 5-digit bucket
     // slot_data speaks, the SAME rule kick_decision applies.
-    let pr = if pr >= 1_000_000 { pr / 100 } else { pr };
+    let pr = er_logic::region_lock::play_region_bucket(pr);
 
     // Settle window: don't trust the play region until in_world has been continuously true for
     // WARP_SETTLE_SECS (stale pr right after a load). Resets on every menu/load.
