@@ -917,7 +917,11 @@ pub fn tick() -> Option<String> {
             return None;
         };
         let region_changed = gate.on_region(region, now, &SETTLE); // EVERY tick, before any throttle
-        (gate.sweep_allowed(now, &SETTLE), gate.release_diag(now), region_changed)
+        (
+            gate.sweep_allowed(now, &SETTLE),
+            gate.release_diag(now),
+            region_changed,
+        )
     };
     if !allowed {
         return None;
