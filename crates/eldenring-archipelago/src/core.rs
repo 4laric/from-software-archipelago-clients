@@ -1007,30 +1007,6 @@ impl shared::Core for Core {
         self.slot_data_parsed.then(crate::region_sync::is_enabled)
     }
 
-    /// Bounce one `RegionSync` open per region to the link group. Its own tag, so only opted-in
-    /// ER slots receive it; the server echoes a tagged Bounce back to the sender too, which
-    /// `region_sync::parse_open` drops by source name.
-    fn broadcast_region_sync(&mut self, regions: Vec<String>) {
-        for region in regions {
-            let source = self
-                .my_name
-                .clone()
-                .unwrap_or_else(|| crate::contract_gen::GAME.to_string());
-            let time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_secs_f64());
-            let data = er_logic::region_sync::encode_open(&source, &region, time);
-            if let Some(client) = self.client_mut()
-                && let Err(e) = client.bounce(
-                    data,
-                    ap::BounceOptions::new().tags([er_logic::region_sync::TAG]),
-                )
-            {
-                log::warn!("RegionSync: broadcast failed: {e}");
-            }
-        }
-    }
-
     /// Overlay menu-bar hook (SPEC-item-tracker.md): a "Tracker" item that toggles the window.
     ///
     /// The label carries its hotkey (as the shared overlay's "Hide (F5)" does) because F6 lived
@@ -5150,6 +5126,30 @@ impl shared::Core for Core {
 }
 
 impl Core {
+    /// Bounce one `RegionSync` open per region to the link group. Its own tag, so only opted-in
+    /// ER slots receive it; the server echoes a tagged Bounce back to the sender too, which
+    /// `region_sync::parse_open` drops by source name.
+    fn broadcast_region_sync(&mut self, regions: Vec<String>) {
+        for region in regions {
+            let source = self
+                .my_name
+                .clone()
+                .unwrap_or_else(|| crate::contract_gen::GAME.to_string());
+            let time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64());
+            let data = er_logic::region_sync::encode_open(&source, &region, time);
+            if let Some(client) = self.client_mut()
+                && let Err(e) = client.bounce(
+                    data,
+                    ap::BounceOptions::new().tags([er_logic::region_sync::TAG]),
+                )
+            {
+                log::warn!("RegionSync: broadcast failed: {e}");
+            }
+        }
+    }
+
     /// Remember checks before touching the socket. The old callers drained or discarded their
     /// one-tick vectors before `mark_checked`; a death/load edge in that window left the check
     /// waiting for some unrelated later pickup to rebuild the vector (world#720).
