@@ -3329,24 +3329,7 @@ impl shared::Core for Core {
         // REGION SYNC broadcast (#1005). Its own tag, so only opted-in ER slots in this session
         // receive it; the server echoes a tagged Bounce back to the sender too, which
         // `region_sync::parse_open` drops by source name.
-        for region in region_sync_outbound {
-            let source = self
-                .my_name
-                .clone()
-                .unwrap_or_else(|| crate::contract_gen::GAME.to_string());
-            let time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_secs_f64());
-            let data = er_logic::region_sync::encode_open(&source, &region, time);
-            if let Some(client) = self.client_mut()
-                && let Err(e) = client.bounce(
-                    data,
-                    ap::BounceOptions::new().tags([er_logic::region_sync::TAG]),
-                )
-            {
-                log::warn!("RegionSync: broadcast failed: {e}");
-            }
-        }
+        self.broadcast_region_sync(region_sync_outbound);
         // BOSS_LOCKS_PATCH: overlay line on boss-lock receipt -- the lock item is otherwise
         // invisible in the console (no region apparatus, so "Region unlocked" never fires for
         // it). Mirrors that line's semantics, including the reconnect replay (name-dispatch
@@ -4120,6 +4103,7 @@ impl shared::Core for Core {
         // Player-facing overlay messages from the region ticks (warp requested / arrival /
         // kick) -- collected here because cfg borrows self, logged after the borrow ends.
         let mut region_msgs: Vec<String> = Vec::new();
+        let mut region_sync_snapshot: Vec<String> = Vec::new();
         // Which of this seed's boss-rune locations are already banked on the server. Resolved
         // BEFORE the `can_grant` block because it needs `self.client_mut()` and the block below
         // borrows `self` through `self.region`. Only the handful of ids this seed still detects on
@@ -4208,6 +4192,9 @@ impl shared::Core for Core {
                 // applies. Idempotent: an entry survives until its open flag reads back set.
                 if crate::region_sync::is_enabled() {
                     region_msgs.extend(crate::region_sync::apply_pending(cfg));
+                    // Standing opens (start regions, anything opened while a peer was offline)
+                    // never raise the live-receive edge, so they are re-announced from the flag.
+                    region_sync_snapshot = crate::region_sync::open_snapshot_due(cfg);
                 }
                 // STRANGLER (flags): the reconciler owns region-open/grace-bundle flags (RegionFlags)
                 // and key-item/great-rune obtained flags (KeyItem) and self-heals them every stable
@@ -4499,6 +4486,7 @@ impl shared::Core for Core {
         for g in graces_lit {
             self.log(ap::Print::message(format!("{g} unlocked")));
         }
+        self.broadcast_region_sync(region_sync_snapshot);
         for m in region_msgs {
             self.log(ap::Print::message(m));
         }
@@ -5138,6 +5126,30 @@ impl shared::Core for Core {
 }
 
 impl Core {
+    /// Bounce one `RegionSync` open per region to the link group. Its own tag, so only opted-in
+    /// ER slots receive it; the server echoes a tagged Bounce back to the sender too, which
+    /// `region_sync::parse_open` drops by source name.
+    fn broadcast_region_sync(&mut self, regions: Vec<String>) {
+        for region in regions {
+            let source = self
+                .my_name
+                .clone()
+                .unwrap_or_else(|| crate::contract_gen::GAME.to_string());
+            let time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64());
+            let data = er_logic::region_sync::encode_open(&source, &region, time);
+            if let Some(client) = self.client_mut()
+                && let Err(e) = client.bounce(
+                    data,
+                    ap::BounceOptions::new().tags([er_logic::region_sync::TAG]),
+                )
+            {
+                log::warn!("RegionSync: broadcast failed: {e}");
+            }
+        }
+    }
+
     /// Remember checks before touching the socket. The old callers drained or discarded their
     /// one-tick vectors before `mark_checked`; a death/load edge in that window left the check
     /// waiting for some unrelated later pickup to rebuild the vector (world#720).

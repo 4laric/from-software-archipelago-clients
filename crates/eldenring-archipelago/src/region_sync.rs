@@ -48,6 +48,48 @@ pub fn enqueue(inbound: Inbound) {
     }
 }
 
+/// How often the standing-open snapshot is re-sent. A Bounce is fire-and-forget (the server does
+/// not hold it for a peer that is offline or not yet connected), so a one-shot broadcast can never
+/// reach a late joiner; a slow repeat does, and every receiver skips an already-open region.
+const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+static LAST_SNAPSHOT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Regions this slot has open right now that the link did not open for it, due for (re)broadcast.
+///
+/// WHY THIS EXISTS: the edge broadcast in `core.rs` only fires for a Lock received live. A start
+/// region (its Lock and open flag are written by the reconciler before the receive path sees an
+/// edge) and anything opened while the peer was offline never produced one, so the peer was
+/// region-kicked out of a region its partner was standing in (Collins/Vowed, 2026-09-17).
+/// Reads the open flag itself, so it covers every way a region can come to be open here.
+///
+/// Empty until `SNAPSHOT_INTERVAL` has passed since the last non-empty answer. The caller gates on
+/// a loaded world, because an unloaded flag reads clear and would send nothing useful.
+pub fn open_snapshot_due(cfg: &crate::region::RegionConfig) -> Vec<String> {
+    if !is_enabled() {
+        return Vec::new();
+    }
+    let now = std::time::Instant::now();
+    let Ok(mut last) = LAST_SNAPSHOT.lock() else {
+        return Vec::new();
+    };
+    if last.is_some_and(|t| now.duration_since(t) < SNAPSHOT_INTERVAL) {
+        return Vec::new();
+    }
+    let mut open: Vec<String> = cfg
+        .region_open_flags
+        .iter()
+        .filter(|(_, flag)| crate::flags::get_event_flag(**flag))
+        .filter_map(|(name, _)| name.strip_suffix(" Lock").map(str::to_string))
+        .collect();
+    open.sort();
+    let out = er_logic::region_sync::outbound(true, &open, &applied_snapshot());
+    if !out.is_empty() {
+        *last = Some(now);
+    }
+    out
+}
+
 /// Regions the link has opened here this session.
 pub fn applied_snapshot() -> HashSet<String> {
     match APPLIED.lock() {
@@ -71,6 +113,9 @@ pub fn reset() {
     }
     if let Ok(mut g) = APPLIED.lock() {
         *g = None;
+    }
+    if let Ok(mut t) = LAST_SNAPSHOT.lock() {
+        *t = None;
     }
 }
 
