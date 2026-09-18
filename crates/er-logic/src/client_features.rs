@@ -231,6 +231,12 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
 /// `unobtainable: None` -- nothing hidden, the exact v0.6.0.10 tracker -- and announces in its
 /// arming line. Listed per version, as every bridge above is.
 ///
+/// THE 0.6.1 STAMP (2026-09-18). The version moved to 0.6.1 and the contract did NOT: it is still
+/// `2aa64f43`. So no pair is added here, on purpose. A v0.6.0.11 or v0.6.0.12 seed carries
+/// `contract/2aa64f43`, equals this client's hash and never reaches this function (`VERSION: OK`);
+/// every older 0.4.13 .. 0.6.0.10 seed is listed above and still takes the audited-compatible path.
+/// Nothing about a run generated on an older apworld needs to be regenerated to play on 0.6.1.
+///
 /// Match version and hash together: hashes can be shared across releases, and
 /// compatibility has not been audited for every release that shared one.
 pub fn is_legacy_contract_compatible(versions: &str) -> bool {
