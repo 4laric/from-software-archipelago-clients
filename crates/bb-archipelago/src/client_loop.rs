@@ -1097,10 +1097,9 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         )
     }
 
-    /// Release the durable character binding so the next validated gameplay
-    /// observation binds afresh. Only permitted while the slot's ledger is
-    /// pristine: nothing delivered, nothing pending, no operator grants. Once
-    /// an item has reached a character, that character is the seed's.
+    /// Release the character binding so the next validated gameplay
+    /// observation binds afresh. Always permitted: the client follows the
+    /// character the player loads rather than policing it.
     pub fn rescue_rebind(&mut self) -> Result<String> {
         let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
         let Some(previous) = slot.bound_save_identity.clone() else {
@@ -1108,10 +1107,6 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 "No character is bound yet; the next validated gameplay observation binds.".into(),
             );
         };
-        anyhow::ensure!(
-            slot_is_pristine(slot),
-            "rebind refused: items have already been delivered to {previous}; a seed follows the character that received its first item"
-        );
         slot.bound_save_identity = None;
         slot.operator_actions.push(OperatorAction {
             timestamp_ms: rescue_timestamp_ms(),
@@ -1649,18 +1644,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .and_then(|slot| slot.bound_save_identity.as_deref());
         if let Some(bound) = bound {
             if bound != context.save_identity {
-                // A fresh shadPS4 profile writes several userdata slots while
-                // it initialises save data, and a player may load the wrong
-                // character first. Until something has actually reached a
-                // character the binding is provisional and follows the game.
+                // shadPS4's save slot reporting is flaky (fresh profiles write
+                // several userdata slots, and permission errors shuffle the
+                // number), so the client does not police which character the
+                // player loads. The binding follows whatever they chose; the
+                // receive ledger carries over unchanged.
                 let previous = bound.to_owned();
                 let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
-                anyhow::ensure!(
-                    slot_is_pristine(slot),
-                    "{operation} refused save identity {:?}; AP slot is durably bound to {:?}",
-                    context.save_identity,
-                    previous
-                );
+                let delivered = !slot_is_pristine(slot);
                 slot.bound_save_identity = Some(context.save_identity.clone());
                 slot.operator_actions.push(OperatorAction {
                     timestamp_ms: rescue_timestamp_ms(),
@@ -1669,11 +1660,19 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     resolved_name: format!("{previous} -> {}", context.save_identity),
                 });
                 self.ledger.save(&self.ledger_path)?;
-                client_eprintln!(
-                    "Rebound AP slot {:?} from {previous} to loaded Bloodborne character {}: nothing had been delivered yet.",
-                    self.slot_name,
-                    context.save_identity
-                );
+                if delivered {
+                    client_eprintln!(
+                        "AP slot {:?} now follows loaded Bloodborne character {} (was {previous}). Items already delivered to {previous} are not re-sent.",
+                        self.slot_name,
+                        context.save_identity
+                    );
+                } else {
+                    client_eprintln!(
+                        "Rebound AP slot {:?} from {previous} to loaded Bloodborne character {}: nothing had been delivered yet.",
+                        self.slot_name,
+                        context.save_identity
+                    );
+                }
             }
         } else {
             self.ledger
@@ -4010,7 +4009,8 @@ mod tests {
         assert_eq!(slot.operator_actions.len(), 1);
         assert_eq!(slot.operator_actions[0].command, "rebind-auto");
 
-        // Once an item has reached this character, a switch is refused.
+        // Even once an item has reached this character, a switch is followed
+        // rather than refused.
         client.ledger.slot_mut("seed", "slot").acknowledged.insert(
             0,
             AcknowledgedItem {
@@ -4028,8 +4028,7 @@ mod tests {
             save_identity: "shad-save-slot:0003".into(),
             gameplay_ready: true,
         });
-        let refused = client.rescue_read_flag(TEST_PEBBLE_EVENT_FLAG).unwrap_err();
-        assert!(format!("{refused:#}").contains("durably bound"));
+        client.rescue_read_flag(TEST_PEBBLE_EVENT_FLAG).unwrap();
         assert_eq!(
             client
                 .ledger
@@ -4037,13 +4036,13 @@ mod tests {
                 .unwrap()
                 .bound_save_identity
                 .as_deref(),
-            Some("shad-save-slot:0000")
+            Some("shad-save-slot:0003")
         );
         let _ = std::fs::remove_file(ledger_path);
     }
 
     #[test]
-    fn rescue_rebind_releases_a_pristine_binding_and_refuses_after_delivery() {
+    fn rescue_rebind_releases_the_binding_before_and_after_delivery() {
         let ledger_path = path();
         let mut backend = ready_backend();
         backend.location_context = Some(LocationContext {
@@ -4105,7 +4104,7 @@ mod tests {
             .collect();
         assert_eq!(actions, ["rebind"]);
 
-        // Once something has been delivered the binding is final.
+        // Rebind stays available after delivery too.
         client.ledger.slot_mut("seed", "slot").acknowledged.insert(
             0,
             AcknowledgedItem {
@@ -4119,16 +4118,14 @@ mod tests {
                 blocked: None,
             },
         );
-        let refused = client.rescue_rebind().unwrap_err();
-        assert!(format!("{refused:#}").contains("already been delivered"));
-        assert_eq!(
+        client.rescue_rebind().unwrap();
+        assert!(
             client
                 .ledger
                 .slot("seed", "slot")
                 .unwrap()
                 .bound_save_identity
-                .as_deref(),
-            Some("shad-save-slot:0000")
+                .is_none()
         );
         let _ = std::fs::remove_file(ledger_path);
     }
@@ -5564,26 +5561,31 @@ mod tests {
     }
 
     #[test]
-    fn durable_slot_binding_cannot_be_changed_by_config() {
+    fn loaded_character_wins_over_a_stale_binding_even_after_delivery() {
         let ledger_path = path();
         let mut ledger = ReceiveLedger::default();
         ledger.slot_mut("seed", "slot").bound_save_identity = Some("first-save".into());
-        // A completed per-check bonus means something reached "first-save":
-        // the binding is final, and neither config nor the loaded character
-        // can move it.
         ledger
             .slot_mut("seed", "slot")
             .completed_sustain
             .insert(1000);
         let mut client = loop_with(MockBackend::default(), ledger, ledger_path, config());
-        let error = client
+        client
             .poll_items(&[IncomingItem {
                 index: 0,
                 ap_item_id: 2000,
             }])
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("durably bound"));
-        assert!(client.backend().grants.is_empty());
+            .unwrap();
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .as_deref(),
+            Some("mock-save")
+        );
+        assert!(!client.backend().grants.is_empty());
     }
 
     #[test]
@@ -5625,7 +5627,7 @@ mod tests {
     }
 
     #[test]
-    fn first_verified_live_slot_is_trusted_once_then_the_ledger_refuses_switches() {
+    fn binding_follows_the_loaded_slot_when_it_changes() {
         let ledger_path = path();
         let mut cfg = config();
         cfg.expected_save_identity = None;
@@ -5657,8 +5659,16 @@ mod tests {
             save_identity: "shad-save-slot:0005".into(),
             gameplay_ready: true,
         });
-        let error = client.poll_locations(&HashSet::new()).unwrap_err();
-        assert!(format!("{error:#}").contains("durably bound"));
+        client.poll_locations(&HashSet::new()).unwrap();
+        assert_eq!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .bound_save_identity
+                .as_deref(),
+            Some("shad-save-slot:0005")
+        );
         std::fs::remove_file(ledger_path).unwrap();
     }
 
