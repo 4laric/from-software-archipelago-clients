@@ -210,6 +210,12 @@ pub fn reset() {
     *UNLOCK_MAP.write().unwrap() = None;
 }
 
+/// World-load edge: the game drops SpEffects, so force the heal lock to re-apply on the next tick.
+pub fn rearm_heal() {
+    LAST_HEAL_APPLY_MS.store(0, Ordering::Relaxed);
+    LAST_HEAL_ATTEMPT_MS.store(0, Ordering::Relaxed);
+}
+
 /// Per-frame: make the player's `disabled_action_inputs` agree with (MANAGED, LIVE). Call from the
 /// overlay frame hook. Fail-open -- if the player/module is not up this frame it does nothing.
 pub fn enforce() {

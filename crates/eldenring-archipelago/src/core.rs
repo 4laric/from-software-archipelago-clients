@@ -4484,7 +4484,9 @@ impl shared::Core for Core {
             crate::auto_equip::weapons_paused(),
         ));
         for g in graces_lit {
-            self.log(ap::Print::message(format!("{g} unlocked")));
+            if crate::region::announce_once(&g) {
+                self.log(ap::Print::message(format!("{g} unlocked")));
+            }
         }
         self.broadcast_region_sync(region_sync_snapshot);
         for m in region_msgs {
@@ -4771,6 +4773,9 @@ impl shared::Core for Core {
             // map load reverts flag writes -- so its convergence latch must drop here or it will
             // believe it already succeeded and never re-apply (#200's shape).
             crate::region::reset();
+            // The finite No Flask SpEffect is dropped by the same load, so re-apply next tick
+            // instead of trusting the 15s timer while the flask heals unlocked.
+            crate::ability_lock::rearm_heal();
             crate::check_lots::reset();
             // Same stream-in revert, same re-arm: the whetblade getItemFlagId repoints are
             // ItemLotParam writes too, and a reverted one flips a whetblade check back onto the
@@ -5465,6 +5470,7 @@ impl Core {
         self.item_counts.clear();
         self.armor_bundles.clear();
         crate::ability_lock::reset();
+        crate::region::reset_announced_graces();
         // Region Sync (#1005): both the inbound queue and the anti-echo set are keyed by the OLD
         // seed's region names. A stale anti-echo entry would silence a genuine open on the new
         // seed, which is the failure that is invisible in game.
