@@ -858,6 +858,23 @@ pub fn tick_grace_items(cfg: &RegionConfig, received: &HashSet<String>) -> Vec<S
     lit
 }
 
+static ANNOUNCED_GRACES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// True the first time `name` is announced this seed. A grace flag the game clears again is
+/// re-lit by the ticks above every time, so the write-success latch alone re-announces forever.
+pub fn announce_once(name: &str) -> bool {
+    ANNOUNCED_GRACES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashSet::new)
+        .insert(name.to_string())
+}
+
+/// Seed change only: NOT on a world-load edge, which is exactly when the game reverts the flags.
+pub fn reset_announced_graces() {
+    *ANNOUNCED_GRACES.lock().unwrap() = None;
+}
+
 /// One region's grace-attunement gate. `members` are the grace flags that COUNT toward attunement
 /// (the region's graces minus the anchor it was already given); `bloom` are the ones lit once the
 /// threshold is met.
