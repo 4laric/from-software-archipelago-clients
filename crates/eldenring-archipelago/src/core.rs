@@ -88,6 +88,7 @@ console_commands! {
     Give => "!give" => "!give <fullId> [qty]",
     SeamlessProbe => "!seamlessprobe" => "!seamlessprobe [start|stop]",
     Ability => "!ability" => "!ability [lock|unlock <name|all>]",
+    Scaling => "!scaling" => "!scaling [seed|off|0..19]",
     Help => "!help" => "!help",
     Respec => "!respec" => "!respec (experimental native rebirth)",
 }
@@ -846,6 +847,12 @@ impl shared::Core for Core {
                     }
                     _ => "usage: !ability [lock|unlock <name|all>]".to_string(),
                 };
+                self.log(ap::Print::message(msg));
+                true
+            }
+            ConsoleCommand::Scaling => {
+                let msg = crate::scaling::runtime_override_command(arg);
+                log::warn!("{msg}");
                 self.log(ap::Print::message(msg));
                 true
             }

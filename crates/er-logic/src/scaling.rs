@@ -39,6 +39,28 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeScalingOverride {
+    Seed,
+    Off,
+    Tier(usize),
+}
+
+pub fn parse_runtime_scaling_override(input: &str) -> Option<RuntimeScalingOverride> {
+    let input = input.trim();
+    if input.eq_ignore_ascii_case("seed") || input.eq_ignore_ascii_case("auto") {
+        return Some(RuntimeScalingOverride::Seed);
+    }
+    if input.eq_ignore_ascii_case("off") || input.eq_ignore_ascii_case("pause") {
+        return Some(RuntimeScalingOverride::Off);
+    }
+    input
+        .parse::<usize>()
+        .ok()
+        .filter(|&tier| tier < NUM_TIERS)
+        .map(RuntimeScalingOverride::Tier)
+}
+
 /// Which basis the apworld chose (`completionScalingBasis`). The mapping is basis-agnostic (it consumes
 /// a per-region target); the client keeps the basis for logging / option gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1650,6 +1672,29 @@ impl Default for RegionToastLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_override_accepts_named_modes_and_bounded_tiers() {
+        assert_eq!(
+            parse_runtime_scaling_override(" seed "),
+            Some(RuntimeScalingOverride::Seed)
+        );
+        assert_eq!(
+            parse_runtime_scaling_override("AUTO"),
+            Some(RuntimeScalingOverride::Seed)
+        );
+        assert_eq!(
+            parse_runtime_scaling_override("pause"),
+            Some(RuntimeScalingOverride::Off)
+        );
+        assert_eq!(
+            parse_runtime_scaling_override("19"),
+            Some(RuntimeScalingOverride::Tier(19))
+        );
+        assert_eq!(parse_runtime_scaling_override("20"), None);
+        assert_eq!(parse_runtime_scaling_override("-1"), None);
+        assert_eq!(parse_runtime_scaling_override("hard"), None);
+    }
 
     #[test]
     fn coop_bump_is_a_noop_when_solo_or_disabled() {
