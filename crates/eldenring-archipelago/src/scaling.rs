@@ -305,6 +305,52 @@ where
     sweepable_characters_with_status(set).map(|(_status, chr)| chr)
 }
 
+/// Characters whose backing `ChrIns` is stable enough for the scaling sweep to dereference.
+///
+/// The 2.7.1.0 crash corpus (2026-09-20) repeatedly died in the engine 6-7 seconds after world
+/// entry with a null child object (`eldenring.exe+0x26627cd`, read at `0x28`). Every affected
+/// session's first scaling pass had just dereferenced and mutated a large population whose entry
+/// state was `Unloaded`. A non-null slot pointer is not evidence that the pointed-to `ChrIns` is
+/// fully constructed: the entry owns the lifetime signal, so honor it before producing `&mut T`.
+///
+/// This is deliberately an emergency safety boundary rather than a claim that unloaded enemies do
+/// not need scaling. Active and ready entries retain normal scaling; the others remain vanilla
+/// until a later sweep observes them in a stable state. Incomplete scaling is recoverable. Native
+/// memory corruption is not.
+fn scaling_characters_with_status<T>(
+    set: &ChrSet<T>,
+) -> impl Iterator<Item = (ChrLoadStatus, &mut T)>
+where
+    T: Subclass<ChrIns> + 'static,
+{
+    let mut current = set.entries;
+    let end = unsafe { current.add(set.capacity as usize) };
+    std::iter::from_fn(move || {
+        while current != end {
+            // The entry is the lifetime owner. Read its status and pointer, advance the flat slot,
+            // and reject unstable states BEFORE converting the pointer into a Rust reference.
+            let entry = unsafe { current.as_ref() };
+            let (chr_ins, status) = (entry.chr_ins, entry.chr_load_status);
+            current = unsafe { current.add(1) };
+            if chr_ins.is_some() {
+                // Keep the release histogram truthful even though unsafe states are now skipped.
+                STATUS_HIST[status_slot(status)].fetch_add(1, Ordering::Relaxed);
+            }
+            if !matches!(
+                status,
+                ChrLoadStatus::Active | ChrLoadStatus::ReadyForActivation
+            ) {
+                continue;
+            }
+            let Some(mut chr_ins) = chr_ins else {
+                continue;
+            };
+            return Some((status, unsafe { chr_ins.as_mut() }));
+        }
+        None
+    })
+}
+
 /// The same walk, yielding each entry's `chr_load_status` alongside the character.
 ///
 /// ⭐⭐⭐ ADDED 2026-08-08 TO ANSWER A QUESTION A HISTOGRAM CANNOT. boblerrr's Enir Ilim log showed
@@ -908,9 +954,9 @@ pub fn tick() -> Option<String> {
     let player_handle = player.field_ins_handle; // skip the player itself in the sweep
     let player_team = player.chr_ins.team_type; // hostiles (invader/NPC phantoms) carry a different team
 
-    // Time-based backstop (er_logic::scaling_settle). Not the primary CTD defence any more -- that is
-    // the PRIMARY crash guard once more: the chr_load_status filter that briefly replaced it
-    // rejected every enemy in the game and was reverted the same day (see sweepable_characters).
+    // Time-based backstop (er_logic::scaling_settle). The primary memory-safety boundary is now the
+    // stable-state filter inside `scaling_characters_with_status`; unlike the old Active-only guard,
+    // it also admits ReadyForActivation and filters before constructing a reference to `ChrIns`.
     let now = now_ms();
     let (allowed, diag, region_changed) = {
         let Ok(mut gate) = GATE.lock() else {
@@ -1058,11 +1104,11 @@ pub fn tick() -> Option<String> {
 
     // PASS ONE -- read the region before deciding anything about it. Mutates nothing; the whole
     // point is that every enemy in pass two is judged against the SAME, COMPLETE area reading.
-    for chr in sweepable_characters(&wcm.open_field_chr_set.base) {
+    for (_status, chr) in scaling_characters_with_status(&wcm.open_field_chr_set.base) {
         area_sample_one(chr, &player_handle, &mut tally);
     }
     for slot in wcm.chr_sets.iter().flatten() {
-        for chr in sweepable_characters(slot) {
+        for (_status, chr) in scaling_characters_with_status(slot) {
             area_sample_one(chr, &player_handle, &mut tally);
         }
     }
@@ -1090,7 +1136,8 @@ pub fn tick() -> Option<String> {
         resolve_area_tier(baked_area_tier(region), fresh_area_tier, latched_area_tier);
 
     // PASS TWO -- decide and apply. Uses the status-carrying walk so the SAMPLE line can state each
-    // enemy's load state PER ROW; nothing is filtered on it (see `sweepable_characters_with_status`).
+    // enemy's load state PER ROW. Transitional/unloaded entries are filtered before their `ChrIns`
+    // pointer is dereferenced (see `scaling_characters_with_status`).
     let ctx = SweepCtx {
         target,
         target_tier,
@@ -1098,11 +1145,11 @@ pub fn tick() -> Option<String> {
         sample_on,
         area_tier,
     };
-    for (status, chr) in sweepable_characters_with_status(&wcm.open_field_chr_set.base) {
+    for (status, chr) in scaling_characters_with_status(&wcm.open_field_chr_set.base) {
         scale_one(chr, status, &ctx, &mut tally);
     }
     for slot in wcm.chr_sets.iter().flatten() {
-        for (status, chr) in sweepable_characters_with_status(slot) {
+        for (status, chr) in scaling_characters_with_status(slot) {
             scale_one(chr, status, &ctx, &mut tally);
         }
     }
@@ -1148,10 +1195,10 @@ pub fn tick() -> Option<String> {
     // chr_type, so the set an invader lands in no longer matters and no friendly is ever touched.
     // (ghost_chr_set is cosmetic bloodstain/message/replay playback -- non-interactive, left alone;
     // the census still watches it in case that assumption is ever wrong.)
-    for (status, p) in sweepable_characters_with_status(&wcm.player_chr_set) {
+    for (status, p) in scaling_characters_with_status(&wcm.player_chr_set) {
         scale_hostile_phantom(&mut p.chr_ins, status, &ctx, &mut tally);
     }
-    for (status, c) in sweepable_characters_with_status(&wcm.summon_buddy_chr_set) {
+    for (status, c) in scaling_characters_with_status(&wcm.summon_buddy_chr_set) {
         scale_hostile_phantom(c, status, &ctx, &mut tally);
     }
 
@@ -1162,9 +1209,9 @@ pub fn tick() -> Option<String> {
     // constant into a measured one:
     //   +Xms       how long the player actually spent unscaled after the load
     //   flaps N    how many transient play_region values fired (each cost a full 2500ms before)
-    //   inactive K entries skipped as chr_load_status != Active. K > 0 HERE, after the settle
-    //              window expired, is direct evidence the timer alone never sufficed -- the exact
-    //              claim the old design could not check.
+    //   status histogram  how many populated slots were stable versus transitional/unloaded. A
+    //                     nonzero unsafe-state count after the settle window is evidence that the
+    //                     timer alone is not a sufficient memory-safety boundary.
     if let Ok(mut logged) = RELEASE_LOGGED.lock()
         && !*logged
     {
@@ -1575,20 +1622,14 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
     // followed. Unconditional on `sample_on`: the verdict is the measurement four issues are
     // waiting on, and it is at most one line per write.
     //
-    // 🛑 `Unloaded` is the only status treated as not-loaded. #188's pair contrasts `ready` with
-    // `unloaded`, and `ready` recomputed -- so anything that is not explicitly unloaded counts as
-    // loaded here, which is what makes a StaleLoaded verdict the anomaly rather than a definition.
+    // This function now receives only Active or ReadyForActivation entries. #188's pair contrasts
+    // `ready` with `unloaded`, and `ready` recomputed, so both admitted states count as loaded here.
     // Bobler's 2026-08-17 playtest closed both branches: loading rebuilds HP from a rung written
     // while unloaded, while three remove/re-apply cycles on `ready` entities changed nothing.
     // Observe the result; do not churn the same write as though it were a recompute primitive.
     match RESCALE_WATCH.lock() {
         Err(_) => {}
-        Ok(mut w) => match w.poll(
-            instance_key(chr),
-            chr.modules.data.max_hp,
-            !matches!(status, ChrLoadStatus::Unloaded),
-            now_ms(),
-        ) {
+        Ok(mut w) => match w.poll(instance_key(chr), chr.modules.data.max_hp, true, now_ms()) {
             er_logic::rescale_watch::Action::Wait => {}
             er_logic::rescale_watch::Action::Report(v) => {
                 // 🛑 COUNT THE SUCCESSES. A `Recomputed` verdict used to be dropped on the floor --
@@ -1784,12 +1825,9 @@ fn scale_one(chr: &mut ChrIns, status: ChrLoadStatus, ctx: &SweepCtx<'_>, tally:
     let max_hp_before = chr.modules.data.max_hp;
     chr.apply_speffect(target, false);
     tally.scaled += 1;
-    // 🛑 THE WRITE IS NOT THE RESULT (client#188). An `unloaded` chr accepts the speffect and keeps
-    // the old tier's `max_hp`; 7/7 loaded followed the rung in #188's pair and 0/6 unloaded did. So
-    // the count is split, and the write is remembered so the next sample can say which happened.
-    if matches!(status, ChrLoadStatus::Unloaded) {
-        tally.scaled_unloaded += 1;
-    }
+    // 🛑 THE WRITE IS NOT THE RESULT (client#188). The write is remembered so the next sample
+    // can say whether max HP followed. Unloaded entries never reach this point after the 2.7.1.0
+    // safety boundary, so `scaled_unloaded` remains a release-telemetry compatibility field.
     if let Ok(mut w) = RESCALE_WATCH.lock() {
         w.note_applied(instance_key(chr), chr.npc_param_id, max_hp_before, now_ms());
     }
