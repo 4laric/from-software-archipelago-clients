@@ -89,6 +89,11 @@ pub struct Overlay<G: Game> {
     /// We use this to determine when to auto-scroll the log window.
     frames_since_new_logs: u64,
 
+    /// Whether the optional game-specific explanation above the log is visible. The legend is
+    /// useful once and expensive forever: ER's text wraps across the first two lines of a compact
+    /// overlay. Session-local on purpose; Settings can restore it after an accidental dismissal.
+    log_legend_visible: bool,
+
     /// The current font scale for the overlay UI.
     font_scale: f32,
 
@@ -256,6 +261,7 @@ impl<G: Game> Overlay<G> {
             log_last_pin: 0.0,
             last_log_emitted: Instant::now(),
             frames_since_new_logs: 0,
+            log_legend_visible: true,
             settings_window_visible: false,
             console_window_visible: false,
             keyboard_surface_active: false,
@@ -781,6 +787,8 @@ impl<G: Game> Overlay<G> {
                     .build(&mut opacity_percent);
                 self.unfocused_window_opacity = (opacity_percent as f32) / 100.0;
 
+                ui.checkbox("Show log legend", &mut self.log_legend_visible);
+
                 if ui.button("Ok") {
                     self.settings_window_visible = false;
                 }
@@ -832,7 +840,16 @@ impl<G: Game> Overlay<G> {
             0.0
         };
 
-        if let Some(legend) = core.log_presentation_legend() {
+        if self.log_legend_visible
+            && let Some(legend) = core.log_presentation_legend()
+        {
+            if ui.small_button("x##dismiss-log-legend") {
+                self.log_legend_visible = false;
+            }
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Hide this legend (restore it in Settings)");
+            }
+            ui.same_line();
             ui.text_wrapped(legend);
         }
         ui.child_window("#log")
