@@ -5784,6 +5784,33 @@ impl Core {
                 open.insert(coarse.clone());
             }
         }
+        // A legacy capital Lock only disables the kick: it does not open the
+        // physical seal or provide a grace warp. Share this access correction
+        // between the tracker, map in-logic snapshot, and lock-hint economy.
+        if let Some(cfg) = &self.region
+            && open.contains("Leyndell")
+            && cfg.leyndell_tracker_gate != er_logic::region_lock::LeyndellTrackerGate::LockOnly
+        {
+            let received: HashSet<String> = self
+                .client()
+                .map(|client| {
+                    client
+                        .received_items()
+                        .iter()
+                        .map(|ri| ri.item().name().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let altus_open =
+                !self.coarse_lock_items.contains_key("Altus") || open.contains("Altus");
+            if !cfg.leyndell_tracker_gate.accessible(
+                altus_open,
+                crate::keyitems::received_great_rune_count(&received),
+                crate::flags::get_event_flag(105) && crate::flags::get_event_flag(182),
+            ) {
+                open.remove("Leyndell");
+            }
+        }
         open
     }
 
