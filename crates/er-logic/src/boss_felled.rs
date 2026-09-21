@@ -28,6 +28,23 @@
 
 use std::collections::BTreeMap;
 
+/// Repair legacy `bossLockItems` keys borrowed from Great Rune acquisition rows.
+/// Those keys are possession flags, which AP delivery may set before the boss dies.
+/// Source: world's `features/great_runes.py::GREAT_RUNE_DETECT_FLAGS` and
+/// `tables/boss_data.py::REGION_BOSSES`. Radahn uses the persistent festival alias.
+/// Apply only to boss metadata; possession flags remain valid for rune counting.
+pub fn normalize_rune_boss_flag(flag: u32) -> u32 {
+    match flag {
+        171 => 10000800,
+        172 => 1252380800,
+        173 => 11000800,
+        174 => 16000800,
+        175 => 12050800,
+        176 => 15000800,
+        _ => flag,
+    }
+}
+
 /// Render state of a single boss in the tracker's "Bosses" group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BossState {

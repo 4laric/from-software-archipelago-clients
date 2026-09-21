@@ -7338,7 +7338,7 @@ fn parse_boss_lock_items(v: Option<&Value>) -> Vec<er_logic::boss_felled::BossDe
             continue;
         };
         out.push(er_logic::boss_felled::BossDef {
-            flag,
+            flag: er_logic::boss_felled::normalize_rune_boss_flag(flag),
             name: e
                 .get("name")
                 .and_then(|x| x.as_str())
@@ -7449,6 +7449,48 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{CONSOLE_COMMAND_USAGES, ConsoleCommand};
+
+    #[test]
+    fn rune_receipt_is_not_a_boss_kill_in_legacy_or_corrected_slot_data() {
+        use er_logic::boss_felled::{BossState, build_boss_group};
+        // Old boss metadata remained keyed on possession even after locationFlags
+        // moved to defeat flags. Exercise the actual parser and tracker together.
+        for (possession, defeat) in [
+            (171, 10000800),
+            (172, 1252380800),
+            (173, 11000800),
+            (174, 16000800),
+            (175, 12050800),
+            (176, 15000800),
+        ] {
+            for wire_flag in [possession, defeat] {
+                let wire = serde_json::json!({wire_flag.to_string(): {
+                    "name": "Felled: boss", "region": "arena", "boss_ap_id": 7770006,
+                    "gate": "Boss Key: boss", "display_key": "key"
+                }});
+                let defs = super::parse_boss_lock_items(Some(&wire));
+                let alive = build_boss_group(&defs, |f| f == possession, |_| true);
+                assert_eq!(alive.defeated(), 0);
+                assert_eq!(alive.rows[0].state, BossState::Locked);
+                let killed = build_boss_group(&defs, |f| f == defeat, |_| false);
+                assert_eq!(killed.defeated(), 1);
+                assert_eq!(killed.rows[0].state, BossState::Felled);
+                assert_eq!(killed.rows[0].display_key.as_deref(), Some("key"));
+                assert_eq!(
+                    build_boss_group(&defs, |f| f == defeat, |_| true).released,
+                    1
+                );
+            }
+        }
+        assert_eq!(
+            er_logic::boss_felled::normalize_rune_boss_flag(14000800),
+            14000800
+        );
+        assert_eq!(
+            er_logic::boss_felled::normalize_rune_boss_flag(510150),
+            510150
+        );
+    }
 
     #[test]
     fn console_registry_has_one_unique_usage_for_every_command() {
