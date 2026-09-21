@@ -6,6 +6,47 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// Additional tracker access, not a new gameplay gate. Older Greenfield seeds
+/// withheld capital graces but did not transmit their configured rune count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LeyndellTrackerGate {
+    #[default]
+    LockOnly,
+    RuneCount(usize),
+    LegacySeal,
+}
+
+impl LeyndellTrackerGate {
+    pub fn accessible(self, altus_open: bool, runes: usize, seal_open: bool) -> bool {
+        match self {
+            Self::LockOnly => true,
+            Self::RuneCount(required) => altus_open && runes >= required,
+            Self::LegacySeal => altus_open && seal_open,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tracker_gate_tests {
+    use super::LeyndellTrackerGate::*;
+
+    #[test]
+    fn legacy_requires_route_and_seal_but_lock_only_does_not() {
+        for altus in [false, true] {
+            for seal in [false, true] {
+                assert_eq!(LegacySeal.accessible(altus, 7, seal), altus && seal);
+                assert!(LockOnly.accessible(altus, 0, seal));
+                for runes in 0..=7 {
+                    assert_eq!(
+                        RuneCount(4).accessible(altus, runes, seal),
+                        altus && runes >= 4
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// What the client owes the vanilla Leyndell two-rune flag while an AP count gate is armed.
 ///
 /// Flag 182 is also derived by vanilla from local shardbearer progress. That derivation is not

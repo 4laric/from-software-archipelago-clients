@@ -400,6 +400,7 @@ pub struct RegionConfig {
     /// AP Great Rune receipts required by the synthetic Leyndell wall. Zero means the wall is
     /// disarmed (including vanilla placement) and the client must not manage vanilla flag 182.
     pub leyndell_runes_required: usize,
+    pub leyndell_tracker_gate: er_logic::region_lock::LeyndellTrackerGate,
     /// lock item name -> packed FullIDs to physically grant in-game on that lock's FIRST open
     /// (slot_data `lockGrantItems`). Currently the unpooled medallions riding their locks
     /// (Rold -> Mountaintops Lock; both Secret Medallion halves -> Snowfield Lock), so the Grand
@@ -452,6 +453,30 @@ pub fn parse(sd: &Value) -> RegionConfig {
         .map(|clause| clause.count)
         .max()
         .unwrap_or(0);
+    // The old logic-only rune option was never serialized. Recognize only the
+    // explicit Greenfield withheld-grace shape; do not invent a rune count or
+    // impose a gate on foreign worlds/new lock-only seeds.
+    let leyndell_tracker_gate = if leyndell_runes_required > 0 {
+        er_logic::region_lock::LeyndellTrackerGate::RuneCount(leyndell_runes_required)
+    } else if sd.get("profile").and_then(Value::as_str) == Some("greenfield")
+        && region_open_flags.contains_key("Leyndell Lock")
+        && sd
+            .get("regionGraces")
+            .and_then(|v| v.get("Leyndell Lock"))
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        && !sd
+            .get("lockRevealFlags")
+            .and_then(|v| v.get("Leyndell Lock"))
+            .and_then(Value::as_array)
+            .is_some_and(|flags| {
+                flags.contains(&Value::from(105)) && flags.contains(&Value::from(182))
+            })
+    {
+        er_logic::region_lock::LeyndellTrackerGate::LegacySeal
+    } else {
+        er_logic::region_lock::LeyndellTrackerGate::LockOnly
+    };
     RegionConfig {
         area_lock_flags,
         random_start_done_flag: sd
@@ -477,6 +502,7 @@ pub fn parse(sd: &Value) -> RegionConfig {
         grace_attunement: parse_grace_attunement(sd.get("graceAttunement")),
         natural_key_triggers,
         leyndell_runes_required,
+        leyndell_tracker_gate,
         lock_grant_items: str_to_i32vec(sd.get("lockGrantItems")),
         baked_fallback: None,
     }
@@ -1462,6 +1488,10 @@ mod foreign_apworld_degrade {
             }
         }));
         assert_eq!(armed.leyndell_runes_required, 2);
+        assert_eq!(
+            armed.leyndell_tracker_gate,
+            er_logic::region_lock::LeyndellTrackerGate::RuneCount(2)
+        );
 
         let disarmed = parse(&json!({
             "naturalKeyTriggers": {
@@ -1472,6 +1502,31 @@ mod foreign_apworld_degrade {
             disarmed.leyndell_runes_required, 0,
             "the always-open fallback must retain vanilla flag behaviour"
         );
+    }
+
+    #[test]
+    fn leyndell_tracker_recognizes_withheld_graces_without_guessing_a_count() {
+        use er_logic::region_lock::LeyndellTrackerGate::{LegacySeal, LockOnly};
+        let mut sd = json!({
+            "profile": "greenfield",
+            "regionOpenFlags": {"Leyndell Lock": 76980},
+            "regionGraces": {"Leyndell Lock": []},
+            "lockRevealFlags": {"Ashen Capital Lock": [300, 301, 71300, 118]}
+        });
+        let legacy = parse(&sd);
+        assert_eq!(legacy.leyndell_tracker_gate, LegacySeal);
+        assert_eq!(legacy.leyndell_runes_required, 0); // never arm a guessed gameplay threshold
+        sd["lockRevealFlags"]["Leyndell Lock"] = json!([105, 182]);
+        assert_eq!(parse(&sd).leyndell_tracker_gate, LockOnly);
+        sd["lockRevealFlags"] = json!({});
+        sd["regionGraces"]["Leyndell Lock"] = json!([71101]);
+        assert_eq!(parse(&sd).leyndell_tracker_gate, LockOnly);
+        sd["regionGraces"] = json!({});
+        assert_eq!(parse(&sd).leyndell_tracker_gate, LockOnly);
+        sd["regionGraces"]["Leyndell Lock"] = json!([]);
+        sd["profile"] = json!("foreign");
+        assert_eq!(parse(&sd).leyndell_tracker_gate, LockOnly);
+        assert_eq!(parse(&json!({})).leyndell_tracker_gate, LockOnly);
     }
 
     #[test]
