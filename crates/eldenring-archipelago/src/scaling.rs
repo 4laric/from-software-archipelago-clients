@@ -11,7 +11,7 @@
 //! idempotent and re-scales correctly when the player changes region or an enemy reloads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use eldenring::cs::{ChrIns, ChrInsExt, ChrLoadStatus, ChrSet, ChrType, WorldChrMan};
@@ -31,6 +31,9 @@ use serde_json::Value;
 
 static CONFIG: Mutex<Option<ScalingConfig>> = Mutex::new(None);
 static TICK: AtomicU32 = AtomicU32::new(0);
+const OVERRIDE_SEED: i32 = -2;
+const OVERRIDE_OFF: i32 = -1;
+static RUNTIME_OVERRIDE: AtomicI32 = AtomicI32::new(OVERRIDE_SEED);
 
 /// #993 co-op difficulty: extra sphere tiers added per co-op partner. Set once at `configure` from
 /// `options.coop_difficulty`; `0` (the default) makes the whole feature inert. Read on every sweep.
@@ -464,6 +467,18 @@ pub fn notify_transition() {
 /// nothing else. The BUCKET is cached by core's tick rather than read here -- `play_region_id()`
 /// dereferences `WorldChrMan`, which is game memory this thread has no business reading.
 pub fn describe_region(bucket: i32) -> Option<String> {
+    match RUNTIME_OVERRIDE.load(Ordering::Relaxed) {
+        OVERRIDE_OFF => return Some("Enemy scaling PAUSED by runtime override".to_string()),
+        tier if tier >= 0 => {
+            let tier = tier as usize;
+            let rates = tier_rates(tier);
+            return Some(format!(
+                "Enemy scaling FORCED to tier {tier} ({:.2}x HP / {:.2}x atk)",
+                rates.hp, rates.attack
+            ));
+        }
+        _ => {}
+    }
     let guard = CONFIG.lock().ok()?;
     let cfg = guard.as_ref()?;
     let scaling = region_scaling(
@@ -478,6 +493,47 @@ pub fn describe_region(bucket: i32) -> Option<String> {
         cfg.floor_tier,
         cfg.ceiling_tier,
     ))
+}
+
+/// Apply or report the session-only `!scaling` operator override.
+pub fn runtime_override_command(arg: Option<&str>) -> String {
+    let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
+        return runtime_override_status();
+    };
+    let Some(next) = er_logic::scaling::parse_runtime_scaling_override(arg) else {
+        return format!("usage: !scaling [seed|off|0..{}]", NUM_TIERS - 1);
+    };
+    let encoded = match next {
+        er_logic::scaling::RuntimeScalingOverride::Seed => OVERRIDE_SEED,
+        er_logic::scaling::RuntimeScalingOverride::Off => OVERRIDE_OFF,
+        er_logic::scaling::RuntimeScalingOverride::Tier(tier) => tier as i32,
+    };
+    RUNTIME_OVERRIDE.store(encoded, Ordering::Relaxed);
+    if let Ok(mut last) = LAST_SWEEP_TICK.lock() {
+        *last = None;
+    }
+    if let Ok(mut ledger) = TOAST_LEDGER.lock() {
+        ledger.reset();
+    }
+    runtime_override_status()
+}
+
+fn runtime_override_status() -> String {
+    match RUNTIME_OVERRIDE.load(Ordering::Relaxed) {
+        OVERRIDE_OFF => "enemy-scaling runtime override: PAUSED; existing enemy effects are left intact until reload or another sweep".to_string(),
+        tier if tier >= 0 => {
+            let tier = tier as usize;
+            let rates = tier_rates(tier);
+            format!(
+                "enemy-scaling runtime override: FORCED tier {tier}/{} (speffect {}, {:.2}x HP / {:.2}x atk)",
+                NUM_TIERS - 1,
+                speffect_id_for_tier(tier),
+                rates.hp,
+                rates.attack
+            )
+        }
+        _ => "enemy-scaling runtime override: SEED (normal region targets)".to_string(),
+    }
 }
 
 /// Let the region-entry toast speak again -- called from the LuaWarp hook on a grace warp.
@@ -518,6 +574,7 @@ pub fn ceiling_is_capped() -> bool {
 /// empty/missing `regionSphereTargets` — lives in `er_logic::scaling::parse_scaling_config`
 /// (host-tested); this wrapper only owns the logging and the CONFIG swap.
 pub fn configure(sd: &Value) {
+    RUNTIME_OVERRIDE.store(OVERRIDE_SEED, Ordering::Relaxed);
     let requested = er_logic::options::parse_bool_option(sd, "completion_scaling");
     let cfg = er_logic::scaling::parse_scaling_config(sd);
     COOP_DIFFICULTY.store(
@@ -872,9 +929,13 @@ struct RegionScaleDbg {
 /// deduped by `RegionToastLedger` -- once per distinct announcement per session. The caller
 /// (core.rs) owns the toast deck; this function owns no I/O beyond the sweep itself.
 pub fn tick() -> Option<String> {
+    let runtime_override = RUNTIME_OVERRIDE.load(Ordering::Relaxed);
+    if runtime_override == OVERRIDE_OFF {
+        return None;
+    }
     {
         let guard = CONFIG.lock().unwrap();
-        if guard.is_none() {
+        if guard.is_none() && runtime_override < 0 {
             return None;
         }
     }
@@ -979,72 +1040,89 @@ pub fn tick() -> Option<String> {
     // floor" -- the exact ambiguity the fable consult flagged, 2026-07-15.)
     let (target, dbg, entry_toast) = {
         let guard = CONFIG.lock().unwrap();
-        let cfg = guard.as_ref()?;
-        // 🛑 AN UNMAPPED REGION IS NOT A DIFFICULTY STATEMENT, SO WE DO NOT MAKE ONE. This used to
-        // resolve to the floor tier and sweep anyway; the 2026-08-06 log swept 198 enemies in
-        // `sub 0` (nothing resolved yet, at connect) and 42 in `sub 10010` (Chapel, not in the
-        // wire), applying rungs and 1b down-states in regions we could not name. `scale_action`
-        // already refuses to place an ENEMY it cannot identify; this is the same refusal one level
-        // up. ⭐ Enemies already carrying our state keep it -- we stop touching the region, we do
-        // not undo it.
-        let Some(tier) = tier_for_region(cfg, region) else {
-            drop(guard);
-            note_unmapped(region);
-            return None;
-        };
-        // #993 CO-OP DIFFICULTY. Seamless co-op raises enemy HP but leaves enemy DAMAGE at the
-        // host default, so a partner halves incoming threat without the enemies hitting harder.
-        // Bump the applied sphere tier by `coop_difficulty` rungs per partner in the world -- a
-        // higher rung carries both HP and attack, restoring the missing threat. Each client counts
-        // its own census and applies this identically (every player is on its own AP slot reading
-        // the same world), so no host arbitration is needed. Knob 0 (default) -> `coop_extra`
-        // irrelevant -> tier unchanged. The count discriminator is provisional (see
-        // the apply-site count / `COOP_PARTNER_NPC_ID`); the feature is inert until opted into.
-        let coop_knob = COOP_DIFFICULTY.load(Ordering::Relaxed);
-        // Count live co-op partners exactly the way the diagnostic census does (same set, same
-        // field), filtered to the co-op marker so Spirit Ashes -- which share this set -- do not
-        // inflate it. Walked only when the knob is on.
-        let coop_extra = if coop_knob > 0 {
-            sweepable_characters(&wcm.summon_buddy_chr_set)
-                .filter(|c| c.npc_id == COOP_PARTNER_NPC_ID)
-                .count()
+        if runtime_override >= 0 {
+            let tier = runtime_override as usize;
+            let rates = tier_rates(tier);
+            (
+                speffect_id_for_tier(tier),
+                RegionScaleDbg {
+                    tier,
+                    raw_target: None,
+                    max_target: 0,
+                    dlc_region: false,
+                    hp: rates.hp,
+                    attack: rates.attack,
+                },
+                None,
+            )
         } else {
-            0
-        };
-        let tier = er_logic::scaling::coop_tier_bump(tier, coop_extra, coop_knob, NUM_TIERS);
-        if coop_knob > 0 && LAST_COOP_EXTRA.swap(coop_extra, Ordering::Relaxed) != coop_extra {
-            if coop_extra > 0 {
-                log::info!(
-                    "enemy-scaling: co-op difficulty engaged -- {} partner(s) x +{} tier(s) each -> region tier bumped to {}",
-                    coop_extra,
-                    coop_knob,
-                    tier
-                );
+            let cfg = guard.as_ref()?;
+            // 🛑 AN UNMAPPED REGION IS NOT A DIFFICULTY STATEMENT, SO WE DO NOT MAKE ONE. This used to
+            // resolve to the floor tier and sweep anyway; the 2026-08-06 log swept 198 enemies in
+            // `sub 0` (nothing resolved yet, at connect) and 42 in `sub 10010` (Chapel, not in the
+            // wire), applying rungs and 1b down-states in regions we could not name. `scale_action`
+            // already refuses to place an ENEMY it cannot identify; this is the same refusal one level
+            // up. ⭐ Enemies already carrying our state keep it -- we stop touching the region, we do
+            // not undo it.
+            let Some(tier) = tier_for_region(cfg, region) else {
+                drop(guard);
+                note_unmapped(region);
+                return None;
+            };
+            // #993 CO-OP DIFFICULTY. Seamless co-op raises enemy HP but leaves enemy DAMAGE at the
+            // host default, so a partner halves incoming threat without the enemies hitting harder.
+            // Bump the applied sphere tier by `coop_difficulty` rungs per partner in the world -- a
+            // higher rung carries both HP and attack, restoring the missing threat. Each client counts
+            // its own census and applies this identically (every player is on its own AP slot reading
+            // the same world), so no host arbitration is needed. Knob 0 (default) -> `coop_extra`
+            // irrelevant -> tier unchanged. The count discriminator is provisional (see
+            // the apply-site count / `COOP_PARTNER_NPC_ID`); the feature is inert until opted into.
+            let coop_knob = COOP_DIFFICULTY.load(Ordering::Relaxed);
+            // Count live co-op partners exactly the way the diagnostic census does (same set, same
+            // field), filtered to the co-op marker so Spirit Ashes -- which share this set -- do not
+            // inflate it. Walked only when the knob is on.
+            let coop_extra = if coop_knob > 0 {
+                sweepable_characters(&wcm.summon_buddy_chr_set)
+                    .filter(|c| c.npc_id == COOP_PARTNER_NPC_ID)
+                    .count()
             } else {
-                log::info!(
-                    "enemy-scaling: co-op difficulty armed but no partners in world -- vanilla region tier this sweep"
-                );
+                0
+            };
+            let tier = er_logic::scaling::coop_tier_bump(tier, coop_extra, coop_knob, NUM_TIERS);
+            if coop_knob > 0 && LAST_COOP_EXTRA.swap(coop_extra, Ordering::Relaxed) != coop_extra {
+                if coop_extra > 0 {
+                    log::info!(
+                        "enemy-scaling: co-op difficulty engaged -- {} partner(s) x +{} tier(s) each -> region tier bumped to {}",
+                        coop_extra,
+                        coop_knob,
+                        tier
+                    );
+                } else {
+                    log::info!(
+                        "enemy-scaling: co-op difficulty armed but no partners in world -- vanilla region tier this sweep"
+                    );
+                }
             }
+            let rates = tier_rates(tier);
+            let dbg = RegionScaleDbg {
+                tier,
+                // Always `Some` by the time we get here -- an unmapped region returns above.
+                raw_target: raw_target_for_region(cfg, region),
+                max_target: cfg.max_target,
+                dlc_region: is_dlc_bucket(cfg, region),
+                hp: rates.hp,
+                attack: rates.attack,
+            };
+            // Region-entry announcement: decided while the config is in hand, deduped per-session by
+            // the ledger (message-keyed -- see er_logic::scaling::RegionToastLedger). Named buckets
+            // only: the baked geometry (region_locks.rs) names exactly the buckets the wire can
+            // target, so hub/tutorial buckets stay silent instead of guessing.
+            let entry_toast = TOAST_LEDGER
+                .lock()
+                .ok()
+                .and_then(|mut l| l.on_region(cfg, region, region_name_for_bucket(region)));
+            (speffect_id_for_tier(tier), dbg, entry_toast)
         }
-        let rates = tier_rates(tier);
-        let dbg = RegionScaleDbg {
-            tier,
-            // Always `Some` by the time we get here -- an unmapped region returns above.
-            raw_target: raw_target_for_region(cfg, region),
-            max_target: cfg.max_target,
-            dlc_region: is_dlc_bucket(cfg, region),
-            hp: rates.hp,
-            attack: rates.attack,
-        };
-        // Region-entry announcement: decided while the config is in hand, deduped per-session by
-        // the ledger (message-keyed -- see er_logic::scaling::RegionToastLedger). Named buckets
-        // only: the baked geometry (region_locks.rs) names exactly the buckets the wire can
-        // target, so hub/tutorial buckets stay silent instead of guessing.
-        let entry_toast = TOAST_LEDGER
-            .lock()
-            .ok()
-            .and_then(|mut l| l.on_region(cfg, region, region_name_for_bucket(region)));
-        (speffect_id_for_tier(tier), dbg, entry_toast)
     };
     let target_tier = dbg.tier;
 
