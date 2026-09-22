@@ -27,6 +27,11 @@ no external command-file transport or table dependency. A terminal harness
 failure blocks that AP item with a bounded diagnostic while location polling
 and the server connection continue.
 
+After a cold game load, the client waits for held inventory to become readable
+before submitting a received-item grant. Queued items remain retained and retry
+automatically when the game exposes inventory; initialization can take time
+while a load is in progress.
+
 Item-ID mappings and location checks are deliberately not hard-coded here. The
 local rows are only a migration/test fallback. On connect, the apworld's
 `runtime_locations` and `runtime_items` slot-data tables replace them. Every

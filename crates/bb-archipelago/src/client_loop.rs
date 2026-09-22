@@ -1075,16 +1075,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 && !has_baseline
                 && !self.backend.inventory_readable(normalized_item_id)
             {
-                // clients#427 follow-up: the fresh-grant baseline never
-                // resolved, so no command was ever submitted -- the native
-                // contract caches the inventory cell only on the first
-                // consumable use after launch. "Restart the client" is exactly
-                // the wrong advice here; restarting re-enters the same wait.
+                // The fresh-grant baseline never resolved, so no command was
+                // submitted. The game-thread heartbeat will populate the
+                // held-inventory cache once the game has a readable player;
+                // restarting the client only re-enters the same wait.
                 format!(
-                    "{head}: the game has not exposed its inventory to the client yet (it is \
-                 cached the first time a consumable is used after launch). Use one Blood Vial \
-                 or fire one Quicksilver Bullet and delivery resumes on its own; restarting \
-                 the client will not help"
+                    "{head}: waiting for the game inventory to initialize. The queued item is \
+                 retained and will retry automatically when the game exposes held inventory; \
+                 this can take time while a load is in progress"
                 )
             } else if !grant_complete {
                 format!(
@@ -1095,6 +1093,29 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                 format!("{head}: waiting for its equip or acknowledgement step")
             },
         )
+    }
+
+    /// Whether the current pending item is still waiting for the native
+    /// backend to expose held inventory. The UI uses this to distinguish a
+    /// normal automatic initialization wait from a grant that has actually
+    /// stalled. This read is side-effect free: unlike stack observation, it
+    /// does not advance the absent-stack hydration grace.
+    pub fn pending_waits_for_inventory(&mut self) -> bool {
+        let Some((grant_complete, has_baseline, normalized_item_id)) = self
+            .ledger
+            .slot(&self.seed_name, &self.slot_name)
+            .and_then(|slot| slot.pending.as_ref())
+            .map(|pending| {
+                (
+                    pending.grant_complete,
+                    pending.observed_before.is_some(),
+                    pending.normalized_item_id,
+                )
+            })
+        else {
+            return false;
+        };
+        !grant_complete && !has_baseline && !self.backend.inventory_readable(normalized_item_id)
     }
 
     /// Release the character binding so the next validated gameplay
@@ -2782,6 +2803,7 @@ mod tests {
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,
+            external_activation: None,
             suppression: crate::config::SuppressionRequirement::default(),
             location_check_debounce: 3,
             mock_set_flags: vec![],
@@ -4852,15 +4874,20 @@ mod tests {
             client.poll_items(&received).unwrap(),
             ItemPollResult::Pending
         );
+        assert!(client.pending_waits_for_inventory());
 
         let diagnosis = client.pending_diagnosis().unwrap();
         assert!(
-            diagnosis.contains("has not exposed its inventory"),
-            "expected the unhydrated-inventory case, got: {diagnosis}"
+            diagnosis.contains("waiting for the game inventory to initialize"),
+            "expected the initialization wait, got: {diagnosis}"
         );
         assert!(
-            diagnosis.contains("Quicksilver Bullet"),
-            "expected the actionable remedy, got: {diagnosis}"
+            diagnosis.contains("will retry automatically"),
+            "expected automatic retry guidance, got: {diagnosis}"
+        );
+        assert!(
+            !diagnosis.contains("Quicksilver Bullet"),
+            "must not prescribe a consumable, got: {diagnosis}"
         );
         assert!(
             !diagnosis.contains("the native grant has not completed"),
@@ -4875,6 +4902,7 @@ mod tests {
             client.poll_items(&received).unwrap(),
             ItemPollResult::Pending
         );
+        assert!(!client.pending_waits_for_inventory());
         let diagnosis = client.pending_diagnosis().unwrap();
         assert!(
             diagnosis.contains("the native grant has not completed"),

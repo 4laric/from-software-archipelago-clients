@@ -708,7 +708,7 @@ impl<R: Runtime> GrantSession<R> {
         if !self.runtime.inventory_ready() {
             return self.set(
                 "awaiting_inventory",
-                "Command retained; use one bullet once".into(),
+                "Command retained; waiting for the game inventory to initialize and retry automatically".into(),
             );
         }
         let Some(stack) = self.runtime.find_stack(command.normalized_id) else {
@@ -1722,6 +1722,21 @@ mod tests {
         // completes on the following poll (the fake applies it).
         assert_eq!(session.poll(), "executing");
         assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
+    }
+
+    #[test]
+    fn unreadable_inventory_waits_for_automatic_initialization() {
+        let mut session = session(FakeRuntime::default());
+        session
+            .submit(goods_command(0x4CE, 1, "recv_initializing", Some(0)), false)
+            .unwrap();
+
+        assert_eq!(session.poll(), "awaiting_inventory");
+        assert_eq!(
+            session.state().detail,
+            "Command retained; waiting for the game inventory to initialize and retry automatically"
+        );
+        assert!(session.runtime_mut().queued.is_none());
     }
 
     #[test]

@@ -79,16 +79,20 @@ fn parse_latest_eboot_base(log: &str) -> Result<u64> {
 mod platform {
     use std::ffi::c_void;
     use std::mem::{MaybeUninit, size_of};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result, bail, ensure};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-    use windows::Win32::System::ProcessStatus::{EnumProcesses, GetModuleBaseNameW};
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
-        PROCESS_VM_WRITE,
+    use windows::Win32::System::ProcessStatus::{
+        EnumProcesses, GetModuleBaseNameW, GetModuleFileNameExW,
     };
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+        PROCESS_VM_READ, PROCESS_VM_WRITE,
+    };
+
+    use crate::external_activation::{ExternalActivation, sha256_file};
 
     use super::{
         AttachmentInfo, EventFlagManagerNotInitialized, GROUP_DIVISOR_OFFSET, GROUP_TREE_OFFSET,
@@ -173,7 +177,25 @@ mod platform {
         (length > 0).then(|| String::from_utf16_lossy(&buffer[..length]))
     }
 
-    fn open_shad() -> Result<(u32, ProcessHandle)> {
+    fn open_shad(external: Option<&ExternalActivation>) -> Result<(u32, ProcessHandle)> {
+        if let Some(activation) = external {
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_INFORMATION
+                        | PROCESS_VM_READ
+                        | PROCESS_VM_WRITE
+                        | PROCESS_VM_OPERATION,
+                    false,
+                    activation.pid,
+                )
+            }
+            .with_context(|| format!("opening pinned shadPS4 pid {}", activation.pid))?;
+            if let Err(error) = validate_external_process(handle, activation) {
+                let _ = unsafe { CloseHandle(handle) };
+                return Err(error);
+            }
+            return Ok((activation.pid, ProcessHandle(handle)));
+        }
         let mut process_ids = vec![0u32; 4096];
         let mut bytes_needed = 0u32;
         unsafe {
@@ -224,6 +246,7 @@ mod platform {
         process: ProcessHandle,
         eboot_base: u64,
         shad_log: std::path::PathBuf,
+        external_activation: Option<ExternalActivation>,
     }
 
     impl LiveEventFlags {
@@ -239,7 +262,7 @@ mod platform {
                 anyhow::Error::new(error).context(action)
             })?;
             let eboot_base = parse_latest_eboot_base(&log)?;
-            Self::attach_at_base(shad_log, eboot_base)
+            Self::attach_at_base_with_activation(shad_log, eboot_base, None)
         }
 
         /// Attach at a base the caller has *already* confirmed against live
@@ -253,7 +276,15 @@ mod platform {
         /// manager checks below still gate the attach, so a wrong base is
         /// refused here as before.
         pub fn attach_at_base(shad_log: &Path, eboot_base: u64) -> Result<Self> {
-            let (process_id, process) = open_shad()?;
+            Self::attach_at_base_with_activation(shad_log, eboot_base, None)
+        }
+
+        pub fn attach_at_base_with_activation(
+            shad_log: &Path,
+            eboot_base: u64,
+            external_activation: Option<&ExternalActivation>,
+        ) -> Result<Self> {
+            let (process_id, process) = open_shad(external_activation)?;
             let mut signature = [0u8; SETTER_WRITE_SIGNATURE.len()];
             process.read_bytes(eboot_base + SETTER_WRITE_RVA, &mut signature)?;
             ensure!(
@@ -273,6 +304,7 @@ mod platform {
                 process,
                 eboot_base,
                 shad_log: shad_log.to_owned(),
+                external_activation: external_activation.cloned(),
             })
         }
 
@@ -397,7 +429,11 @@ mod platform {
             match self.probe_manager() {
                 Ok(()) => Ok(()),
                 Err(read_error) => {
-                    let replacement = Self::attach(&self.shad_log).with_context(|| {
+                    let replacement = Self::reattach(
+                        &self.shad_log,
+                        self.external_activation.as_ref(),
+                    )
+                    .with_context(|| {
                         format!(
                             "reattaching to shadPS4 after gameplay probe failed: {read_error:#}"
                         )
@@ -413,7 +449,11 @@ mod platform {
             match self.read(event_flag) {
                 Ok(value) => Ok(value),
                 Err(read_error) => {
-                    let replacement = Self::attach(&self.shad_log).with_context(|| {
+                    let replacement = Self::reattach(
+                        &self.shad_log,
+                        self.external_activation.as_ref(),
+                    )
+                    .with_context(|| {
                         format!(
                             "reattaching to shadPS4 after event-flag read failed: {read_error:#}"
                         )
@@ -429,7 +469,11 @@ mod platform {
             match self.write(event_flag, enabled) {
                 Ok(()) => Ok(()),
                 Err(write_error) => {
-                    let replacement = Self::attach(&self.shad_log).with_context(|| {
+                    let replacement = Self::reattach(
+                        &self.shad_log,
+                        self.external_activation.as_ref(),
+                    )
+                    .with_context(|| {
                         format!(
                             "reattaching to shadPS4 after event-flag write failed: {write_error:#}"
                         )
@@ -440,6 +484,46 @@ mod platform {
                 }
             }
         }
+
+        fn reattach(shad_log: &Path, activation: Option<&ExternalActivation>) -> Result<Self> {
+            let log = std::fs::read_to_string(shad_log)?;
+            let eboot_base = parse_latest_eboot_base(&log)?;
+            Self::attach_at_base_with_activation(shad_log, eboot_base, activation)
+        }
+    }
+
+    fn validate_external_process(handle: HANDLE, activation: &ExternalActivation) -> Result<()> {
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .context("reading pinned shadPS4 creation time")?;
+        let creation =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        ensure!(
+            creation == activation.process_creation_time,
+            "pinned shadPS4 pid {} no longer has creation FILETIME {}",
+            activation.pid,
+            activation.process_creation_time
+        );
+        let mut buffer = vec![0u16; 32768];
+        let length = unsafe { GetModuleFileNameExW(Some(handle), None, &mut buffer) } as usize;
+        ensure!(length > 0, "could not read pinned shadPS4 executable path");
+        let actual =
+            std::fs::canonicalize(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))?;
+        let expected = std::fs::canonicalize(&activation.executable.path)?;
+        ensure!(
+            actual
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.to_string_lossy()),
+            "pinned shadPS4 executable changed"
+        );
+        ensure!(
+            sha256_file(&actual)? == activation.executable.sha256,
+            "pinned shadPS4 executable hash changed"
+        );
+        Ok(())
     }
 }
 
@@ -447,6 +531,7 @@ mod platform {
 mod platform {
     use std::path::Path;
 
+    use crate::external_activation::ExternalActivation;
     use anyhow::{Result, bail};
 
     use super::AttachmentInfo;
@@ -459,6 +544,14 @@ mod platform {
         }
 
         pub fn attach_at_base(_shad_log: &Path, _eboot_base: u64) -> Result<Self> {
+            bail!("live Bloodborne event-flag reads require Windows")
+        }
+
+        pub fn attach_at_base_with_activation(
+            _shad_log: &Path,
+            _eboot_base: u64,
+            _external_activation: Option<&ExternalActivation>,
+        ) -> Result<Self> {
             bail!("live Bloodborne event-flag reads require Windows")
         }
 

@@ -34,6 +34,10 @@ pub enum DeliveryState {
     #[default]
     NotArmed,
     WaitingForGameplay,
+    /// The native backend is attached but has not yet captured the held-inventory
+    /// pointer it needs to begin a grant. This is a normal startup wait, not a
+    /// failed delivery.
+    InitializingInventory,
     Ready,
     CommandPending,
     /// The item at the front of the queue has not moved past its budget. Nothing behind it
@@ -399,6 +403,11 @@ pub fn delivery_headline(snapshot: &ClientSnapshot) -> (Severity, String) {
         DeliveryState::WaitingForGameplay => (
             Severity::Warn,
             "Waiting for you to gain control in-game...".to_owned(),
+        ),
+        DeliveryState::InitializingInventory => (
+            Severity::Warn,
+            "Waiting for the game inventory; queued items are retained and will retry automatically."
+                .to_owned(),
         ),
         DeliveryState::Ready => (Severity::Ok, "Delivering normally.".to_owned()),
         DeliveryState::CommandPending => (Severity::Warn, "Command in flight...".to_owned()),
@@ -784,6 +793,14 @@ mod tests {
             (
                 Severity::Warn,
                 "Waiting for you to gain control in-game...".to_owned()
+            )
+        );
+        assert_eq!(
+            headline(DeliveryState::InitializingInventory, None),
+            (
+                Severity::Warn,
+                "Waiting for the game inventory; queued items are retained and will retry automatically."
+                    .to_owned()
             )
         );
         assert_eq!(

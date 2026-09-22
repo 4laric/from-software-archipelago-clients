@@ -21,6 +21,7 @@ pub mod backend;
 pub mod client_loop;
 pub mod config;
 pub mod event_flags;
+pub mod external_activation;
 pub mod feed;
 pub mod health;
 pub mod ledger;

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::RUNTIME_BUILD;
+use crate::external_activation::ExternalActivation;
 use crate::feed::{AttireSlot, EquipClass, FeedEffect};
 
 pub const TEST_PEBBLE_EVENT_FLAG: u32 = 52_100_000;
@@ -392,6 +393,11 @@ pub struct RuntimeConfig {
     /// The binder actually loaded by the game, not the separate build output.
     #[serde(default)]
     pub installed_gameparam: Option<PathBuf>,
+    /// Exact process and file activation produced by an external BBLauncher.
+    /// Optional for compatibility with launcher-owned activation configs; the
+    /// capability CLI flag makes it mandatory for the external handoff mode.
+    #[serde(default)]
+    pub external_activation: Option<ExternalActivation>,
     /// Seed-owned requirement. Local configuration cannot weaken this value.
     #[serde(default)]
     pub suppression: SuppressionRequirement,
@@ -430,6 +436,9 @@ impl RuntimeConfig {
         let mut config: Self = json::from_slice(&bytes)
             .with_context(|| format!("parsing runtime config {}", path.display()))?;
         config.validate_items()?;
+        if let Some(activation) = &config.external_activation {
+            activation.validate()?;
+        }
         Ok(config)
     }
 
@@ -829,6 +838,7 @@ mod tests {
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,
+            external_activation: None,
             suppression: SuppressionRequirement::default(),
             location_check_debounce: 3,
             mock_set_flags: vec![],
