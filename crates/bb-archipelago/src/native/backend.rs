@@ -27,6 +27,7 @@ use crate::backend::{
 };
 use crate::client_eprintln;
 use crate::event_flags::LiveEventFlags;
+use crate::external_activation::{ExternalActivation, ExternalMutationGuard};
 
 use super::diagnostics::{DiagnosticSink, GrantContext, JsonlFile, diagnostics_path_for_ledger};
 use super::engine::{GrantStep, NativeDelivery, NativeGrantRequest};
@@ -112,6 +113,7 @@ pub struct NativeBackend {
     category8_last_generated: Option<(u32, u32)>,
     category8_inserted: std::collections::HashSet<u32>,
     process_id: u32,
+    external_guard: Option<ExternalMutationGuard>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -123,6 +125,12 @@ pub struct ProbeOptions {
 }
 
 impl NativeBackend {
+    fn verify_before_mutation(&mut self) -> Result<()> {
+        match self.external_guard.as_mut() {
+            Some(guard) => guard.verify_before_mutation(),
+            None => Ok(()),
+        }
+    }
     /// The verified eboot base the payload was installed at.
     pub fn base(&self) -> u64 {
         self.base
@@ -228,6 +236,7 @@ impl NativeBackend {
 
     #[cfg(windows)]
     fn install_gem_alloc_probe(&mut self, ledger: &std::path::Path) -> Result<()> {
+        self.verify_before_mutation()?;
         use super::threads::WindowsThreadController;
         let state = self
             .delivery
@@ -255,6 +264,7 @@ impl NativeBackend {
 
     #[cfg(windows)]
     fn install_pickup_presentation_probe(&mut self) -> Result<()> {
+        self.verify_before_mutation()?;
         use super::pickup_presentation_probe;
         use super::threads::WindowsThreadController;
 
@@ -361,8 +371,12 @@ impl NativeBackend {
         }
         let shad_log = self.shad_log.clone();
         let base = self.base;
+        let activation = self
+            .external_guard
+            .as_ref()
+            .map(|guard| guard.activation().clone());
         self.event_flags.poll(
-            || LiveEventFlags::attach_at_base(&shad_log, base),
+            || LiveEventFlags::attach_at_base_with_activation(&shad_log, base, activation.as_ref()),
             &mut |line: &str| client_eprintln!("{line}"),
         )
     }
@@ -383,11 +397,35 @@ impl NativeBackend {
         )
     }
 
+    /// Attach to the exact externally verified process and activation. Unlike
+    /// the legacy attach this entry point never enumerates by executable name.
+    pub fn attach_external(
+        shad_log: &std::path::Path,
+        assumed_identity: Option<String>,
+        activation: ExternalActivation,
+    ) -> Result<Self> {
+        Self::attach_with_policy_and_activation(
+            shad_log,
+            assumed_identity,
+            super::attach_wait::WaitPolicy::default(),
+            Some(activation),
+        )
+    }
+
     /// [`NativeBackend::attach`] with an explicit fresh-base wait policy.
     pub fn attach_with_policy(
         shad_log: &std::path::Path,
         assumed_identity: Option<String>,
         policy: super::attach_wait::WaitPolicy,
+    ) -> Result<Self> {
+        Self::attach_with_policy_and_activation(shad_log, assumed_identity, policy, None)
+    }
+
+    fn attach_with_policy_and_activation(
+        shad_log: &std::path::Path,
+        assumed_identity: Option<String>,
+        policy: super::attach_wait::WaitPolicy,
+        activation: Option<ExternalActivation>,
     ) -> Result<Self> {
         use super::attach_wait::{BaseCheck, SystemAttachClock, wait_for_verified_base};
         use super::contract::contract;
@@ -397,7 +435,18 @@ impl NativeBackend {
         use super::threads::WindowsThreadController;
 
         let contract = contract();
-        let memory = NativeMemory::open_shad()?;
+        // Prove the pinned PID + creation FILETIME before the guard may retire
+        // an invalidation marker belonging to an older boot. Opening the
+        // process performs no guest mutation.
+        let (memory, mut external_guard) = match activation {
+            Some(activation) => {
+                activation.validate()?;
+                let memory = NativeMemory::open_external(&activation)?;
+                let guard = ExternalMutationGuard::arm(activation)?;
+                (memory, Some(guard))
+            }
+            None => (NativeMemory::open_shad()?, None),
+        };
         let process_id = memory.process_id();
 
         let log = std::fs::read_to_string(shad_log).map_err(|error| {
@@ -431,6 +480,11 @@ impl NativeBackend {
         )
         .map_err(anyhow::Error::new)?;
 
+        // Base discovery can wait while the game loads. Recheck immediately
+        // before the first write rather than relying on the proof at attach.
+        if let Some(guard) = external_guard.as_mut() {
+            guard.verify_before_mutation()?;
+        }
         let mut threads = WindowsThreadController::new(process_id);
         install::install(
             &memory,
@@ -440,6 +494,9 @@ impl NativeBackend {
             InstallConfig::default(),
             std::thread::sleep,
         )?;
+        if let Some(guard) = external_guard.as_mut() {
+            guard.verify_before_mutation()?;
+        }
         let item_grant_probe_state = match memory.allocate(item_grant_probe::PROBE_STATE_SIZE) {
             Ok(state_address) => {
                 match item_grant_probe::install(&memory, base, state_address, &mut threads) {
@@ -473,7 +530,14 @@ impl NativeBackend {
         // gameplay anyway. So a not-initialized manager leaves the flag gate
         // pending (one notice) and the client loop arms it; anything else
         // (signature mismatch, process gone) is still terminal here.
-        let event_flags = match LiveEventFlags::attach_at_base(shad_log, base) {
+        let external_activation = external_guard
+            .as_ref()
+            .map(ExternalMutationGuard::activation);
+        let event_flags = match LiveEventFlags::attach_at_base_with_activation(
+            shad_log,
+            base,
+            external_activation,
+        ) {
             Ok(flags) => FlagGate::armed(flags),
             Err(error) if crate::event_flags::is_manager_not_initialized(&error) => {
                 FlagGate::pending(&mut |line: &str| client_eprintln!("{line}"))
@@ -508,6 +572,7 @@ impl NativeBackend {
             category8_last_generated: None,
             category8_inserted: std::collections::HashSet::new(),
             process_id,
+            external_guard,
         })
     }
 }
@@ -515,6 +580,7 @@ impl NativeBackend {
 impl BloodborneBackend for NativeBackend {
     #[allow(clippy::chunks_exact_to_as_chunks)]
     fn category8_generate(&mut self, gem_gen_param: u32) -> Result<String> {
+        self.verify_before_mutation()?;
         anyhow::ensure!(
             matches!(gem_gen_param, 102_901 | 123_000 | 90_040),
             "GemGenParam {gem_gen_param} is outside the #214 experiment allowlist"
@@ -602,6 +668,7 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn category8_insert(&mut self, variant: u8) -> Result<String> {
+        self.verify_before_mutation()?;
         anyhow::ensure!(variant <= 2, "variant must be 0, 1, or 2");
         let (id, handle) = self
             .category8_last_generated
@@ -786,6 +853,7 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn write_event_flag(&mut self, event_flag: u32, enabled: bool) -> Result<()> {
+        self.verify_before_mutation()?;
         self.arm_event_flags()?;
         self.event_flags
             .armed_mut()
@@ -841,6 +909,7 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn grant_item(&mut self, grant: &ItemGrant) -> Result<OperationProgress> {
+        self.verify_before_mutation()?;
         if let Some(capture) = &mut self.pickup_notification_capture {
             capture.grant_state(grant, "submitted");
         }
@@ -902,6 +971,7 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress> {
+        self.verify_before_mutation()?;
         bail!(
             "native auto-equip is not armed for {:?}; item {} remains durably pending",
             request.target,
@@ -910,6 +980,7 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn death_link_kill(&mut self) -> Result<bool> {
+        self.verify_before_mutation()?;
         // Use the same gameplay/save gate as every other mutation. A stale HP
         // pointer during a load is never permission to write.
         if !self
@@ -938,6 +1009,7 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn withdraw_unwitnessed_grant(&mut self, _tag: &str) -> Result<bool> {
+        self.verify_before_mutation()?;
         // The native request cell lives in guest memory; a leftover arm from a
         // previous process is cleared best-effort. The durable plan stays in the
         // ledger and re-publishes under a validated context.
@@ -945,6 +1017,7 @@ impl BloodborneBackend for NativeBackend {
     }
 
     fn retire_grant(&mut self, tag: &str, reason: &str) -> Result<bool> {
+        self.verify_before_mutation()?;
         Ok(self.delivery.retire_current(tag, reason))
     }
 }

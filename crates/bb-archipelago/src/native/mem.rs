@@ -326,19 +326,24 @@ pub use fake::FakeMemory;
 #[cfg(windows)]
 mod windows_impl {
     use std::ffi::c_void;
+    use std::path::PathBuf;
 
     use anyhow::{Context, Result, bail, ensure};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
     use windows::Win32::System::Memory::{
         MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
         VirtualAllocEx, VirtualProtectEx,
     };
-    use windows::Win32::System::ProcessStatus::{EnumProcesses, GetModuleBaseNameW};
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
-        PROCESS_VM_WRITE,
+    use windows::Win32::System::ProcessStatus::{
+        EnumProcesses, GetModuleBaseNameW, GetModuleFileNameExW,
     };
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+        PROCESS_VM_READ, PROCESS_VM_WRITE,
+    };
+
+    use crate::external_activation::{ExternalActivation, sha256_file};
 
     use super::{
         ProcessMemory, RawWriteSyscalls, write_path_counters, write_with_protect_fallback,
@@ -458,6 +463,30 @@ mod windows_impl {
             }
         }
 
+        /// Open only the process named by an external activation handoff. PID
+        /// reuse is refused by the creation FILETIME check before any write.
+        pub fn open_external(activation: &ExternalActivation) -> Result<Self> {
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_INFORMATION
+                        | PROCESS_VM_READ
+                        | PROCESS_VM_WRITE
+                        | PROCESS_VM_OPERATION,
+                    false,
+                    activation.pid,
+                )
+            }
+            .with_context(|| format!("opening pinned shadPS4 pid {}", activation.pid))?;
+            let result = validate_external_process(handle, activation).map(|()| Self {
+                process_id: activation.pid,
+                handle,
+            });
+            if result.is_err() {
+                let _ = unsafe { CloseHandle(handle) };
+            }
+            result
+        }
+
         pub fn raw_handle(&self) -> HANDLE {
             self.handle
         }
@@ -483,6 +512,54 @@ mod windows_impl {
         let mut buffer = [0u16; 260];
         let length = unsafe { GetModuleBaseNameW(handle, None, &mut buffer) } as usize;
         (length > 0).then(|| String::from_utf16_lossy(&buffer[..length]))
+    }
+
+    fn validate_external_process(handle: HANDLE, activation: &ExternalActivation) -> Result<()> {
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .context("reading pinned shadPS4 creation time")?;
+        let creation =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        ensure!(
+            creation == activation.process_creation_time,
+            "pinned shadPS4 pid {} was reused: expected creation FILETIME {}, found {}",
+            activation.pid,
+            activation.process_creation_time,
+            creation
+        );
+        let mut buffer = vec![0u16; 32768];
+        let length = unsafe { GetModuleFileNameExW(Some(handle), None, &mut buffer) } as usize;
+        ensure!(length > 0, "could not read pinned shadPS4 executable path");
+        let actual_path = PathBuf::from(String::from_utf16_lossy(&buffer[..length]));
+        let actual_canonical = std::fs::canonicalize(&actual_path)
+            .with_context(|| format!("resolving pinned executable {}", actual_path.display()))?;
+        let expected_canonical =
+            std::fs::canonicalize(&activation.executable.path).with_context(|| {
+                format!(
+                    "resolving configured executable {}",
+                    activation.executable.path.display()
+                )
+            })?;
+        ensure!(
+            actual_canonical
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected_canonical.to_string_lossy()),
+            "pinned shadPS4 executable mismatch: expected {}, found {}",
+            expected_canonical.display(),
+            actual_canonical.display()
+        );
+        let actual_hash = sha256_file(&actual_canonical)?;
+        ensure!(
+            actual_hash == activation.executable.sha256,
+            "pinned shadPS4 executable hash mismatch: expected {}, found {} at {}",
+            activation.executable.sha256,
+            actual_hash,
+            actual_canonical.display()
+        );
+        Ok(())
     }
 
     impl ProcessMemory for WinProcessMemory {

@@ -19,6 +19,7 @@ use bb_archipelago::client_loop::{
 };
 use bb_archipelago::config::RuntimeConfig;
 use bb_archipelago::event_flags::is_manager_not_initialized;
+use bb_archipelago::external_activation::ExternalActivation;
 use bb_archipelago::health::{HealthReporter, ReadinessState};
 use bb_archipelago::ledger::{ReceiveLedger, VictoryRecord, WatermarkOutcome};
 use bb_archipelago::logging;
@@ -506,6 +507,10 @@ struct Arguments {
     /// collects live-session acceptance; it is not a supported configuration
     /// beyond that, and the flag goes when the Win32 shell does.
     legacy_window: bool,
+    /// Capability assertion emitted only by the external BBLauncher handoff.
+    /// Repeated twice because an older client consumes one unknown option as
+    /// its optional PASSWORD; the second makes that client fail closed.
+    external_activation_capability_count: u8,
 }
 
 const DEFAULT_WINDOW_OPACITY: u8 = 70;
@@ -651,6 +656,7 @@ const LIVE_ATTACH_TIMEOUT: Duration = Duration::from_secs(600);
 fn attach_native_backend(
     shad_log: &Path,
     assumed_identity: Option<String>,
+    external_activation: Option<ExternalActivation>,
     health: &mut HealthReporter,
 ) -> Result<NativeBackend> {
     let deadline = Instant::now() + LIVE_ATTACH_TIMEOUT;
@@ -662,10 +668,22 @@ fn attach_native_backend(
             false,
             "Waiting for shadPS4; delivery is not armed yet",
         );
-        match NativeBackend::attach(shad_log, assumed_identity.clone()) {
+        let attach = match &external_activation {
+            Some(activation) => NativeBackend::attach_external(
+                shad_log,
+                assumed_identity.clone(),
+                activation.clone(),
+            ),
+            None => NativeBackend::attach(shad_log, assumed_identity.clone()),
+        };
+        match attach {
             Ok(backend) => return Ok(backend),
             Err(error) => {
-                let waiting_for_process = format!("{error:#}").contains("is not running");
+                // The external handoff names an already-running exact process.
+                // Never recreate its guard inside this client process: any
+                // refusal requires a new verified handoff and a new client.
+                let waiting_for_process = external_activation.is_none()
+                    && format!("{error:#}").contains("is not running");
                 if !waiting_for_process {
                     // Image mismatch, base verification failure, uncleared detour
                     // window: fail closed, do not retry.
@@ -693,6 +711,7 @@ fn attach_native_backend(
 fn attach_native_backend(
     _shad_log: &Path,
     _assumed_identity: Option<String>,
+    _external_activation: Option<ExternalActivation>,
     _health: &mut HealthReporter,
 ) -> Result<NativeBackend> {
     bail!("native Bloodborne delivery requires Windows")
@@ -705,7 +724,7 @@ fn arguments() -> Result<Arguments> {
 fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let Some(server) = args.next() else {
         bail!(
-            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native] [--log-file PATH] [--window-opacity 35-100] [--legacy-window] (native delivery is required; client window opacity defaults to 70)"
+            "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native] [--require-external-activation-v1] [--log-file PATH] [--window-opacity 35-100] [--legacy-window] (native delivery is required; client window opacity defaults to 70)"
         )
     };
     let slot = args.next().context("missing SLOT")?;
@@ -721,6 +740,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
     let mut log_file = None;
     let mut window_opacity = DEFAULT_WINDOW_OPACITY;
     let mut legacy_window = false;
+    let mut external_activation_capability_count = 0_u8;
     while let Some(argument) = args.next() {
         if argument == "--legacy-window" {
             legacy_window = true;
@@ -728,6 +748,9 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
             mock = true;
         } else if argument == "--assume-correct-save" {
             assume_correct_save = true;
+        } else if argument == "--require-external-activation-v1" {
+            external_activation_capability_count =
+                external_activation_capability_count.saturating_add(1);
         } else if let Some(mode) = argument.strip_prefix("--delivery=") {
             match mode {
                 "native" => delivery_explicit = true,
@@ -768,6 +791,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
         log_file,
         window_opacity,
         legacy_window,
+        external_activation_capability_count,
     })
 }
 
@@ -1111,6 +1135,20 @@ fn run() -> Result<()> {
         "--mock and --assume-correct-save cannot be combined"
     );
     let mut config = RuntimeConfig::load(&args.config)?;
+    if config.external_activation.is_some() || args.external_activation_capability_count > 0 {
+        anyhow::ensure!(
+            !args.mock,
+            "--require-external-activation-v1 cannot be combined with --mock"
+        );
+        anyhow::ensure!(
+            args.external_activation_capability_count >= 2,
+            "external activation requires --require-external-activation-v1 twice so older clients fail closed"
+        );
+        anyhow::ensure!(
+            config.external_activation.is_some(),
+            "--require-external-activation-v1 requires external_activation in the runtime config"
+        );
+    }
     config.apply_probe_env_overrides();
     if config.readiness_durations {
         health.enable_readiness_durations();
@@ -1145,7 +1183,12 @@ fn run() -> Result<()> {
         let assumed_identity = args
             .assume_correct_save
             .then(|| ASSUMED_IDENTITY.to_string());
-        match attach_native_backend(shad_log, assumed_identity, &mut health) {
+        match attach_native_backend(
+            shad_log,
+            assumed_identity,
+            config.external_activation.clone(),
+            &mut health,
+        ) {
             Ok(mut backend) => {
                 // clients#445: passive per-grant forensics beside the ledger.
                 // Armed unconditionally on the native path -- it costs one
@@ -2595,6 +2638,20 @@ mod tests {
     fn explicit_native_selects_native_and_is_explicit() {
         let args = parse_args(base_args(&["--delivery=native"]).into_iter()).expect("parse");
         assert!(args.delivery_explicit);
+    }
+
+    #[test]
+    fn external_activation_capability_flag_is_explicit() {
+        let args = parse_args(
+            base_args(&[
+                "--require-external-activation-v1",
+                "--require-external-activation-v1",
+            ])
+            .into_iter(),
+        )
+        .expect("parse");
+        assert_eq!(args.external_activation_capability_count, 2);
+        assert!(args.password.is_none());
     }
 
     /// The two-token form the launcher's generated plan emits

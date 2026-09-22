@@ -2803,6 +2803,7 @@ mod tests {
             expected_save_identity: Some("mock-save".into()),
             suppression_manifest: None,
             installed_gameparam: None,
+            external_activation: None,
             suppression: crate::config::SuppressionRequirement::default(),
             location_check_debounce: 3,
             mock_set_flags: vec![],
