@@ -36,7 +36,7 @@
       "original_bytes": "48 81 C4 E8 07 00 00",
       "return_rva": 29354121,
       "provenance": "validated",
-      "note": "runs every frame; drives a zero-delta update on the Bullet stack so the consume hook fires without player input. Its patch window is the atomicity hazard."
+      "note": "runs every frame; calls quantity_delta with slot FFFFFFFF and zero delta, which takes the pre-record bounds exit into the consume hook without requiring an item stack. Its patch window is the atomicity hazard."
     },
     {
       "name": "hp_capture",
@@ -162,7 +162,7 @@
         "name": "inventory",
         "rva": 84786704,
         "width": 8,
-        "note": "cached by the consume hook from r13; zero until one consumable is used"
+        "note": "refreshed every idle heartbeat from read64(read64(eboot+0x553B130)+8)+0x328 or cached from R13 by the consume hook; storage and invalid geometry are rejected"
       },
       {
         "name": "overflow",
@@ -184,7 +184,7 @@
         "name": "heartbeat_descriptor",
         "rva": 84786752,
         "width": 12,
-        "note": "Bullets: raw B0000384, normalized 40000384, delta arg at +0xC"
+        "note": "legacy seeded Bullet descriptor; the sentinel-slot heartbeat no longer reads it"
       },
       {
         "name": "manual_trigger",
@@ -216,6 +216,27 @@
     "record_quantity": 8,
     "provenance": "observed"
   },
+  "inventory_bootstrap": {
+    "strategy": "idle-heartbeat root refresh",
+    "root_rva": 89370928,
+    "pointer_chain": [
+      "read64(root_rva)",
+      "read64(root + 8)",
+      "player + 0x328"
+    ],
+    "validators": [
+      "root and player are non-null",
+      "inventory mode byte at +0x8C is zero (held, not storage)",
+      "last slot at +0x88 is below 4096",
+      "both inventory banks at +0x58 and +0x48 are non-null"
+    ],
+    "static_reference_rva": 24951074,
+    "static_reference_bytes": "48 8D 05 07 F8 D6 03 48 8B 00 48 8B 58 08",
+    "offset_reference_rva": 24951640,
+    "offset_reference_bytes": "48 8D BB 28 03 00 00",
+    "provenance": "validated",
+    "note": "validated live 2026-09-22 in a fresh no-consume session: the chain resolved held inventory, automatically reacquired a deliberately cleared cache, drove a zero-delta Bullet heartbeat with no count change, and completed an absent-stack Pebble grant. After a full emulator restart at a different eboot base, the item persisted and an existing-stack Pebble grant completed without consumption. Death and character-switch validation remain pending"
+  },
   "asserts": [
     {
       "name": "consume_hook",
@@ -237,6 +258,20 @@
       "bytes": "8B 97 F8 00 00 00",
       "provenance": "published",
       "note": "instruction observed by the validated HP capture table; install fails closed until it matches the live image"
+    },
+    {
+      "name": "inventory_root_reference",
+      "rva": 24951074,
+      "bytes": "48 8D 05 07 F8 D6 03 48 8B 00 48 8B 58 08",
+      "provenance": "validated",
+      "note": "static instruction witness for the inventory-root pointer chain"
+    },
+    {
+      "name": "inventory_offset_reference",
+      "rva": 24951640,
+      "bytes": "48 8D BB 28 03 00 00",
+      "provenance": "validated",
+      "note": "static instruction witness for the inventory-root pointer chain"
     },
     {
       "name": "consume_cave",
@@ -277,9 +312,9 @@
   "payload": {
     "assembled_at_base": 0,
     "source": "tools/bb_native_delivery/payload.py",
-    "source_of_truth": "tables/Bloodborne-native-item-grant-auto-v2.CT autoAssemble template",
+    "source_of_truth": "historical Cheat Engine autoAssemble template plus native-only inventory-root heartbeat extension",
     "provenance": "validated",
-    "note": "VALIDATED 2026-08-24 against a live shadPS4 process. The CE table was loaded and armed, both caves read back with tools/compare_ce_payload.py, and the only differences were MR-form vs RM-form encodings of three reg-to-reg movs (mov rdi,r13 x2; mov rsi,rsp; mov esi,eax) -- semantically identical instructions. The assembler was switched to CE's RM-form encoding, so the shipped blob is now byte-identical to what CE emits. Owner checklist item 1 is complete.",
+    "note": "VALIDATED 2026-08-24 against a live shadPS4 process. The CE table was loaded and armed, both caves read back with tools/compare_ce_payload.py, and the only differences were MR-form vs RM-form encodings of three reg-to-reg movs (mov rdi,r13 x2; mov rsi,rsp; mov esi,eax) -- semantically identical instructions. The assembler was switched to CE's RM-form encoding, so the historical grant core remains byte-identical to what CE emits. The heartbeat now adds a hash-guarded static root refresh and sentinel-slot call. Its exact SELF path and assembled guards pass Unicorn; on 2026-09-22 the exact 190-byte heartbeat reacquired inventory without consumption, completed a no-change Bullet heartbeat, and delivered one absent-stack Pebble.",
     "blobs": [
       {
         "name": "state_region",
@@ -338,22 +373,17 @@
       {
         "name": "heartbeat_cave",
         "rva": 84786176,
-        "size": 130,
-        "bytes": "833D49020000000F8569000000833DEC010000000F845C00000048833DEE010000000F844E000000488B3DE101000080BF8C000000000F853A000000488D35FD01000048B8C0A24D0100000000FFD083F8FF0F841E000000488B3DB10100008BF031D2488D0DE201000048B8A0944D0100000000FFD04881C4E8070000E9072CB2FC",
+        "size": 190,
+        "bytes": "833D49020000000F85A500000050488B051BF545004885C00F8488000000488B40084885C00F847B00000048052803000080B88C000000000F856800000081B888000000001000000F83580000004883B858000000000F844A0000004883B848000000000F843C0000004889059F01000058833D87010000000F8433000000488B3D8A010000BEFFFFFFFF31D231C94531C04531C948B8A0944D0100000000FFD0E90C00000048C7055F01000000000000584881C4E8070000E9CB2BB2FC",
         "relocations": [
           {
-            "offset": 69,
-            "width": 8,
-            "target_rva": 21865152
-          },
-          {
-            "offset": 108,
+            "offset": 151,
             "width": 8,
             "target_rva": 21861536
           }
         ],
         "provenance": "validated",
-        "note": "idle-heartbeat detour cave"
+        "note": "idle root refresh and sentinel-slot heartbeat cave"
       },
       {
         "name": "hp_cave",

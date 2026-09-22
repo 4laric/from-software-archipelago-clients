@@ -198,6 +198,7 @@ pub fn pills(snapshot: &ClientSnapshot) -> [Pill; 3] {
     let (delivery_value, delivery_tone) = match snapshot.delivery {
         DeliveryState::Ready => ("Ready", Tone::Ok),
         DeliveryState::WaitingForGameplay => ("Waiting", Tone::Warn),
+        DeliveryState::InitializingInventory => ("Initializing", Tone::Warn),
         DeliveryState::CommandPending => ("Working", Tone::Warn),
         DeliveryState::NotArmed => ("Not armed", Tone::Bad),
         DeliveryState::Blocked => ("Stalled", Tone::Bad),
@@ -577,6 +578,7 @@ mod tests {
         for delivery in [
             DeliveryState::NotArmed,
             DeliveryState::WaitingForGameplay,
+            DeliveryState::InitializingInventory,
             DeliveryState::Ready,
             DeliveryState::CommandPending,
             DeliveryState::Blocked,

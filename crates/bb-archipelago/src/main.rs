@@ -87,6 +87,37 @@ impl ItemErrorReporter {
     }
 }
 
+/// Advance the pending-delivery stall clock. An unhydrated held inventory has
+/// not submitted a native request, so it is initialization rather than time
+/// spent waiting for a grant; the first readable poll starts a fresh budget.
+fn pending_is_stalled(
+    index: Option<u64>,
+    initializing_inventory: bool,
+    now: Instant,
+    pending_since: &mut Option<(u64, Instant)>,
+    stall_reported_for: &mut Option<u64>,
+    stall_after: Duration,
+) -> bool {
+    if initializing_inventory {
+        *pending_since = None;
+        *stall_reported_for = None;
+        return false;
+    }
+    match (index, *pending_since) {
+        (Some(index), Some((since_index, since))) if since_index == index => {
+            now.duration_since(since) >= stall_after
+        }
+        (Some(index), _) => {
+            *pending_since = Some((index, now));
+            false
+        }
+        (None, _) => {
+            *pending_since = None;
+            false
+        }
+    }
+}
+
 /// How the client answers a `Disconnected` connection state (clients#423).
 ///
 /// `Disconnected` is terminal *for a `Connection` object* -- that is the
@@ -2183,21 +2214,21 @@ fn run() -> Result<()> {
                     true
                 }
                 Ok(ItemPollResult::Pending) => {
-                    let now = Instant::now();
-                    let stalled = match (runtime.pending_index(), pending_since) {
-                        (Some(index), Some((since_index, since))) if since_index == index => {
-                            now.duration_since(since) >= STALL_AFTER
+                    let waiting_for_inventory = runtime.pending_waits_for_inventory();
+                    let stalled = pending_is_stalled(
+                        runtime.pending_index(),
+                        waiting_for_inventory,
+                        Instant::now(),
+                        &mut pending_since,
+                        &mut stall_reported_for,
+                        STALL_AFTER,
+                    );
+                    if waiting_for_inventory {
+                        #[cfg(windows)]
+                        {
+                            ui_delivery = client_ui::DeliveryState::InitializingInventory;
                         }
-                        (Some(index), _) => {
-                            pending_since = Some((index, now));
-                            false
-                        }
-                        (None, _) => {
-                            pending_since = None;
-                            false
-                        }
-                    };
-                    if stalled {
+                    } else if stalled {
                         let diagnosis = runtime.pending_diagnosis().unwrap_or_else(|| {
                             "the item at the front of the queue has not moved".to_owned()
                         });
@@ -2391,6 +2422,44 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_initialization_does_not_spend_a_grants_stall_budget() {
+        let start = Instant::now();
+        let mut pending_since = Some((42, start));
+        let mut stall_reported_for = Some(42);
+        let budget = Duration::from_secs(60);
+
+        assert!(!pending_is_stalled(
+            Some(42),
+            true,
+            start + Duration::from_secs(120),
+            &mut pending_since,
+            &mut stall_reported_for,
+            budget,
+        ));
+        assert_eq!(pending_since, None);
+        assert_eq!(stall_reported_for, None);
+
+        // Once the pointer is available, this is the first real wait and it
+        // gets the entire budget before a genuine delivery is called stalled.
+        assert!(!pending_is_stalled(
+            Some(42),
+            false,
+            start + Duration::from_secs(120),
+            &mut pending_since,
+            &mut stall_reported_for,
+            budget,
+        ));
+        assert!(pending_is_stalled(
+            Some(42),
+            false,
+            start + Duration::from_secs(180),
+            &mut pending_since,
+            &mut stall_reported_for,
+            budget,
+        ));
+    }
 
     #[cfg(windows)]
     #[test]
