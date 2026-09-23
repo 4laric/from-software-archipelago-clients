@@ -163,6 +163,9 @@ bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD]                 # native
 bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] --delivery=native
 ```
 
+`PASSWORD` remains supported. If it is omitted, the client uses
+`BB_AP_PASSWORD` when that environment variable is set.
+
 Defaulting to native is safe because native **fails closed** on any image it
 cannot validate: `require_validated_image` refuses CUSA00900 and every other
 serial/build, so a recognised-and-validated image gets native and nothing else

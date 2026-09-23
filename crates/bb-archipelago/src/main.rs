@@ -718,10 +718,18 @@ fn attach_native_backend(
 }
 
 fn arguments() -> Result<Arguments> {
-    parse_args(env::args().skip(1))
+    parse_args_with_password_env(env::args().skip(1), env::var("BB_AP_PASSWORD").ok())
 }
 
-fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
+#[cfg(test)]
+fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Arguments> {
+    parse_args_with_password_env(args, None)
+}
+
+fn parse_args_with_password_env<I: Iterator<Item = String>>(
+    mut args: I,
+    env_password: Option<String>,
+) -> Result<Arguments> {
     let Some(server) = args.next() else {
         bail!(
             "usage: bb-ap-client SERVER SLOT CONFIG LEDGER [PASSWORD] [--mock] [--assume-correct-save] [--delivery=native] [--require-external-activation-v1] [--log-file PATH] [--window-opacity 35-100] [--legacy-window] (native delivery is required; client window opacity defaults to 70)"
@@ -779,6 +787,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Arguments> {
             bail!("only one password may be supplied");
         }
     }
+    let password = password.or_else(|| env_password.filter(|value| !value.is_empty()));
     Ok(Arguments {
         server,
         slot,
@@ -2618,6 +2627,32 @@ mod tests {
         ];
         v.extend(extra.iter().map(|s| s.to_string()));
         v
+    }
+
+    #[test]
+    fn password_uses_environment_fallback_only_when_positional_is_absent() {
+        let fallback = parse_args_with_password_env(
+            base_args(&[]).into_iter(),
+            Some("env-secret".to_string()),
+        )
+        .expect("parse with environment password");
+        assert_eq!(fallback.password.as_deref(), Some("env-secret"));
+
+        let explicit = parse_args_with_password_env(
+            base_args(&["cli-secret"]).into_iter(),
+            Some("env-secret".to_string()),
+        )
+        .expect("parse with explicit password");
+        assert_eq!(explicit.password.as_deref(), Some("cli-secret"));
+
+        let absent = parse_args_with_password_env(base_args(&[]).into_iter(), None)
+            .expect("parse without password");
+        assert!(absent.password.is_none());
+
+        let empty_environment =
+            parse_args_with_password_env(base_args(&[]).into_iter(), Some(String::new()))
+                .expect("empty environment value is equivalent to absent");
+        assert!(empty_environment.password.is_none());
     }
 
     #[test]
