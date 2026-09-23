@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -418,6 +418,11 @@ pub struct RuntimeConfig {
     /// Quicksilver Bullet constant.
     #[serde(default)]
     pub sustain_item: Option<RuntimeItemBinding>,
+    /// Preferred bundle form. New Bloodborne seeds publish one Blood Vial and
+    /// one Quicksilver Bullet; the singular field remains a compatibility
+    /// fallback for older contracts.
+    #[serde(default)]
+    pub sustain_items: Vec<RuntimeItemBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -634,6 +639,36 @@ impl RuntimeConfig {
             );
             self.sustain_item = Some(row);
         }
+        if let Some(value) = slot_data.get("sustain_items") {
+            let rows: Vec<RuntimeItemBinding> =
+                json::from_value(value.clone()).context("parsing slot_data.sustain_items")?;
+            anyhow::ensure!(
+                rows.len() == 2,
+                "slot_data.sustain_items must contain the vial and bullet pair"
+            );
+            for row in &rows {
+                anyhow::ensure!(
+                    row.item_category == 4
+                        && row.quantity == 1
+                        && row.reinforcement_level.is_none()
+                        && row.descriptor_evidence == DescriptorEvidence::GoodsFormulaObserved
+                        && row.normalized_item_id & 0xF000_0000 == 0x4000_0000
+                        && row.raw_descriptor & 0xF000_0000 == 0xB000_0000
+                        && (row.normalized_item_id & 0x0FFF_FFFF)
+                            == (row.raw_descriptor & 0x0FFF_FFFF),
+                    "slot_data.sustain_items must contain observed category-4 goods"
+                );
+            }
+            anyhow::ensure!(
+                rows.iter()
+                    .map(|row| row.normalized_item_id)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == rows.len(),
+                "slot_data.sustain_items must be distinct"
+            );
+            self.sustain_items = rows;
+        }
         let claims_suppression = self
             .locations
             .iter()
@@ -845,6 +880,7 @@ mod tests {
             goal_location: None,
             goal: None,
             sustain_item: None,
+            sustain_items: Vec::new(),
         }
     }
 
@@ -888,6 +924,45 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn slot_data_sustain_bundle_requires_two_distinct_single_goods() {
+        let row = |normalized_item_id: u32, raw_descriptor: u32| {
+            json!({
+                "normalized_item_id": normalized_item_id,
+                "raw_descriptor": raw_descriptor,
+                "item_category": 4,
+                "descriptor_evidence": "goods_formula_observed",
+                "quantity": 1
+            })
+        };
+        let config = local()
+            .apply_slot_data(&json!({
+                "sustain_items": [
+                    row(0x4000_03E8, 0xB000_03E8),
+                    row(0x4000_0384, 0xB000_0384)
+                ]
+            }))
+            .unwrap();
+        assert_eq!(config.sustain_items.len(), 2);
+        assert_eq!(config.sustain_items[0].normalized_item_id, 0x4000_03E8);
+
+        let duplicate = row(0x4000_03E8, 0xB000_03E8);
+        assert!(
+            local()
+                .apply_slot_data(&json!({
+                    "sustain_items": [duplicate.clone(), duplicate]
+                }))
+                .is_err()
+        );
+        assert!(
+            local()
+                .apply_slot_data(&json!({
+                    "sustain_items": [row(0x4000_03E8, 0xB000_03E8)]
+                }))
+                .is_err()
+        );
     }
 
     #[test]
