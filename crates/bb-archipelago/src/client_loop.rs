@@ -527,7 +527,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         self.ledger.save(&self.ledger_path)?;
         self.sustain_pending_polls = None;
         let result = SustainPollResult::Retired {
-            location,
+            location: location.abs(),
             command_withdrawn,
             reason,
         };
@@ -1713,7 +1713,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         self.location_retries.clear();
     }
 
-    /// Queue the anti-farm bullet for newly sent randomized fixed checks.
+    /// Queue the anti-farm vial and bullet for newly sent randomized checks.
     /// Historical server checks never enter this method: callers pass only
     /// transitions returned by `poll_locations`. It is persisted before the
     /// network send, closing the crash window between sending a check and
@@ -1732,10 +1732,24 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
         let mut queued = Vec::new();
         for location in eligible {
-            if !slot.completed_sustain.contains(&location)
-                && !slot.pending_sustain.contains_key(&location)
-            {
-                slot.pending_sustain.insert(location, None);
+            let keys = if self.config.sustain_items.is_empty() {
+                vec![location]
+            } else {
+                // Positive keys preserve the historical bullet receipt. The
+                // negative companion is the restored vial and makes the
+                // ledger upgrade backward-compatible without a schema bump.
+                vec![-location, location]
+            };
+            let mut added = false;
+            for key in keys {
+                if !slot.completed_sustain.contains(&key)
+                    && !slot.pending_sustain.contains_key(&key)
+                {
+                    slot.pending_sustain.insert(key, None);
+                    added = true;
+                }
+            }
+            if added {
                 queued.push(location);
             }
         }
@@ -1748,8 +1762,13 @@ impl<B: BloodborneBackend> ClientLoop<B> {
     /// The per-check bonus good as (raw descriptor, normalized id): the seed's
     /// published `sustain_item` when the contract carries one, else the
     /// Quicksilver Bullet constant for older contracts.
-    fn sustain_descriptor(&self) -> (u32, u32) {
-        match &self.config.sustain_item {
+    fn sustain_descriptor(&self, ledger_key: i64) -> (u32, u32) {
+        let bundled = if ledger_key < 0 {
+            self.config.sustain_items.first()
+        } else {
+            self.config.sustain_items.last()
+        };
+        match bundled.or(self.config.sustain_item.as_ref()) {
             Some(item) => (item.raw_descriptor, item.normalized_item_id),
             None => (
                 QUICKSILVER_BULLET_RAW_DESCRIPTOR,
@@ -1765,7 +1784,12 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         let Some((location, recorded_before)) = self.next_sustain() else {
             return Ok(SustainPollResult::Idle);
         };
-        let tag = format!("sustain_{location}");
+        let public_location = location.abs();
+        let tag = if location < 0 {
+            format!("sustain_vial_{public_location}")
+        } else {
+            format!("sustain_{public_location}")
+        };
         match self.require_runtime_context("pickup sustain delivery") {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -1784,7 +1808,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             return Ok(SustainPollResult::Pending);
         }
 
-        let (raw_descriptor, normalized) = self.sustain_descriptor();
+        let (raw_descriptor, normalized) = self.sustain_descriptor(location);
         let baseline_is_binding = match recorded_before {
             Some(_) => self.backend.grant_may_have_applied(&tag)?,
             None => false,
@@ -1841,7 +1865,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         slot.completed_sustain.insert(location);
         self.ledger.save(&self.ledger_path)?;
         self.sustain_pending_polls = None;
-        Ok(SustainPollResult::Completed(location))
+        Ok(SustainPollResult::Completed(public_location))
     }
 
     pub fn poll_locations(&mut self, server_checked: &HashSet<i64>) -> Result<Vec<i64>> {
@@ -2810,6 +2834,7 @@ mod tests {
             goal_location: None,
             goal: None,
             sustain_item: None,
+            sustain_items: Vec::new(),
         }
     }
 
@@ -5125,6 +5150,51 @@ mod tests {
         assert_eq!(grant.raw_descriptor, goods().raw_descriptor);
         assert_eq!(grant.normalized_item_id, goods().normalized_item_id);
         assert_eq!(grant.quantity, 1);
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn sustain_bundle_grants_vial_then_bullet_once_each() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        let mut vial = goods();
+        vial.raw_descriptor = 0xB000_03E8;
+        vial.normalized_item_id = 0x4000_03E8;
+        let mut bullet = goods();
+        bullet.raw_descriptor = QUICKSILVER_BULLET_RAW_DESCRIPTOR;
+        bullet.normalized_item_id = GOODS_NORMALIZED_PREFIX | QUICKSILVER_BULLET_GOODS_ID;
+        cfg.sustain_items = vec![vial.clone(), bullet.clone()];
+        let mut client = loop_with(
+            MockBackend::default(),
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg,
+        );
+
+        assert_eq!(
+            client.queue_sustain_for_checks(&[1000]).unwrap(),
+            vec![1000]
+        );
+        assert_eq!(
+            client.poll_sustain().unwrap(),
+            SustainPollResult::Completed(1000)
+        );
+        assert_eq!(
+            client.poll_sustain().unwrap(),
+            SustainPollResult::Completed(1000)
+        );
+        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Idle);
+        assert_eq!(
+            client
+                .backend()
+                .grants
+                .iter()
+                .map(|grant| grant.normalized_item_id)
+                .collect::<Vec<_>>(),
+            vec![vial.normalized_item_id, bullet.normalized_item_id]
+        );
+        assert!(client.queue_sustain_for_checks(&[1000]).unwrap().is_empty());
         std::fs::remove_file(ledger_path).unwrap();
     }
 
