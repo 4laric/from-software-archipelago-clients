@@ -17,6 +17,12 @@
 
 ### Added
 
+* **The optional Archipelago password can come from `BB_AP_PASSWORD` when the
+  positional password is omitted.** The explicit positional value still takes
+  precedence, so existing launch commands keep their behavior while launchers
+  can keep the password out of the process command line. No password is logged
+  or persisted, and no seed or runtime contract changed.
+
 * **The Windows version resource accepts a `V.R.M.F` release version.** The
   launcher's release workflow passes the tag it is building in
   `BB_RELEASE_VERSION`, and the first player release under the
