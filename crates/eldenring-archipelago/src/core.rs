@@ -1925,7 +1925,10 @@ impl shared::Core for Core {
                         // vanilla pickup". Ours is the path that skipped it. Fails toward today's
                         // behaviour: a lot the table cannot place is KEPT, never dropped.
                         let sl = load_static_lots();
-                        let seed_flags: Vec<u32> = loc_flags.values().copied().collect();
+                        // Detection flags PLUS the boss-rune lot flags: those six locations detect on
+                        // defeat flags since world v0.6.0.11 while their lots stay keyed on 171-176.
+                        let seed_flags =
+                            er_logic::great_rune_possession::lot_scope_flags(&loc_flags);
                         let goods = er_logic::static_lots::scope_sent_lots(
                             &sl,
                             &seed_flags,

@@ -139,6 +139,36 @@ pub enum Mode {
     Conservative(Vec<i64>),
 }
 
+/// Boss-rune location id -> the `getItemFlagId` of its vanilla boss lot (`greenfield/flag_lots.tsv`:
+/// 171 -> lot 10010 ... 176 -> lot 10201).
+///
+/// Since world `55fa937e` (v0.6.0.11) these six locations DETECT on the shardbearer defeat flags,
+/// but their lots are still keyed on 171-176. `static_lots::scope_sent_lots` matches lots by the
+/// seed's detection flags, so on a repointed seed it could no longer place the rune lots, dropped
+/// them from the rewrite, and the kill handed out the vanilla boss rune alongside the AP item
+/// (Radahn, 2026-09-24 report). Keyed by LOCATION id, not by defeat flag: a defeat flag can also
+/// detect unrelated checks (`Felled:`), and only the rune location's presence says its lot is ours.
+pub const RUNE_LOCATION_LOT_FLAGS: &[(i64, u32)] = &[
+    (7_770_001, 171),
+    (7_770_002, 172),
+    (7_770_003, 173),
+    (7_770_004, 174),
+    (7_770_005, 175),
+    (7_770_006, 176),
+];
+
+/// The flags to scope check lots by: every detection flag in `location_flags`, plus the lot flag
+/// of each boss-rune location this seed carries, whatever flag it is detected on.
+pub fn lot_scope_flags(location_flags: &HashMap<i64, u32>) -> Vec<u32> {
+    let mut out: Vec<u32> = location_flags.values().copied().collect();
+    for &(loc, lot_flag) in RUNE_LOCATION_LOT_FLAGS {
+        if location_flags.contains_key(&loc) && !out.contains(&lot_flag) {
+            out.push(lot_flag);
+        }
+    }
+    out
+}
+
 /// Classify one flag against the connect-time table.
 pub fn mode(flag: u32, detected: &BTreeMap<u32, Vec<i64>>) -> Mode {
     match detected.get(&flag) {
@@ -308,5 +338,40 @@ mod tests {
         );
         assert!(!may_set(171, &detected, false, |loc| loc == 7_770_001));
         assert!(may_set(171, &detected, false, |_| true));
+    }
+
+    /// 2026-09-24 report: Radahn's check detected on defeat flag 1252380800, lot 10301 keyed on 172.
+    /// Scoping by detection flags alone dropped the lot, so the kill paid out the vanilla rune.
+    #[test]
+    fn a_repointed_rune_location_keeps_its_boss_lot_in_scope() {
+        use crate::static_lots::{scope_sent_lots, LotSlots, StaticLots};
+        let seed = HashMap::from([(7_770_002_i64, 1_252_380_800_u32), (7_770_099, 510_800)]);
+        let lots = StaticLots {
+            map: HashMap::from([
+                (172, (10301, vec![1])),
+                (510_800, (10800, vec![1])),
+                (173, (10041, vec![1])),
+            ]),
+            ..Default::default()
+        };
+        let sent = || -> LotSlots {
+            HashMap::from([(10301, vec![1]), (10800, vec![1]), (10041, vec![1])])
+        };
+
+        let old: Vec<u32> = seed.values().copied().collect();
+        let before = scope_sent_lots(&lots, &old, sent(), LotSlots::new());
+        assert!(!before.map.contains_key(&10301), "reproduces the leak");
+
+        let after = scope_sent_lots(&lots, &lot_scope_flags(&seed), sent(), LotSlots::new());
+        assert!(
+            after.map.contains_key(&10301),
+            "Radahn's rune lot must be rewritten"
+        );
+        assert!(after.map.contains_key(&10800));
+        assert!(
+            !after.map.contains_key(&10041),
+            "Morgott's location is not in this seed: its lot stays vanilla"
+        );
+        assert_eq!(after.dropped, 1);
     }
 }
