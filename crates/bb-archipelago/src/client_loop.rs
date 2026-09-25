@@ -1917,10 +1917,10 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         // slot) used to strand the seed: the flag was never read again, and
         // `rescue goal` rewrote a flag nothing looked at. Re-reporting the
         // location is harmless -- LocationChecks and sustain are idempotent.
-        let pending_goal = self
-            .config
-            .goal_location
-            .filter(|goal| self.victory().is_none_or(|record| record.goal_location != *goal));
+        let pending_goal = self.config.goal_location.filter(|goal| {
+            self.victory()
+                .is_none_or(|record| record.goal_location != *goal)
+        });
         let mut newly_checked = Vec::new();
         for binding in &self.config.locations {
             if server_checked.contains(&binding.ap_location_id)
@@ -5145,9 +5145,19 @@ mod tests {
         let ledger_path = path();
         let mut backend = MockBackend::default();
         backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
-        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), config());
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            config(),
+        );
         for _ in 0..4 {
-            assert!(client.poll_locations(&HashSet::from([1000])).unwrap().is_empty());
+            assert!(
+                client
+                    .poll_locations(&HashSet::from([1000]))
+                    .unwrap()
+                    .is_empty()
+            );
         }
         let _ = std::fs::remove_file(ledger_path);
     }
