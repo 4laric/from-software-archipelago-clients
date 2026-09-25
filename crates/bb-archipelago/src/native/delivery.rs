@@ -44,6 +44,58 @@ pub const EMPTY_SLOT: u32 = 0xFFFF_FFFF;
 /// Goods id of the Blood Vial; the absent-insert of this id is refused.
 pub const BLOOD_VIAL_GOODS_ID: u32 = 0x3E8;
 
+/// Held-stack caps (`EquipParamGoods.maxNum`) for the stackable consumables a
+/// seed can deliver, by goods id. Mirrors bb-archipelago's
+/// `CONSUMABLE_STACK_CAPS`, which is checked against the bundled param.
+///
+/// Bloodborne sends whatever does not fit in a capped held stack to the Hunter's Dream
+/// storage box. The client cannot read that box, so without this table a delta that fills the
+/// stack to its cap reads back short and parks forever: YouFailMe's vials at 20, bullets at 20
+/// and Molotovs at 10 did exactly that. A stack that stops at its own cap is a fill, not a loss.
+/// Key items such as the Third Umbilical Cord are deliberately absent -- the game discards a
+/// duplicate of those, so their deficit must still park.
+const CONSUMABLE_HOLD_CAPS: &[(u32, u32)] = &[
+    (0x384, 20), // quicksilver_bullets
+    (0x3E8, 20), // blood_vial
+    (0x44C, 10), // antidote
+    (0x44D, 10), // sedatives
+    (0x456, 10), // beast_blood_pellet
+    (0x460, 10), // blue_elixir
+    (0x4B0, 10), // molotov_cocktails
+    (0x4B1, 10), // delayed_molotov_cocktails
+    (0x4BA, 20), // poison_knife
+    (0x4C4, 10), // oil_urn
+    (0x4CE, 20), // pebbles
+    (0x4D8, 20), // throwing_knife
+    (0x4E2, 10), // rope_molotov_cocktails
+    (0x4E3, 10), // delayed_rope_molotov_cocktails
+    (0x4EC, 10), // pungent_blood_cocktail
+    (0x4F6, 10), // numbing_mist
+    (0x514, 10), // fire_paper
+    (0x528, 10), // bolt_paper
+    (0x532, 10), // bone_marrow_ash
+    (0x578, 99), // bold_hunters_mark
+    (0x582, 99), // shining_coins
+    (0x5DC, 99), // madmans_knowledge
+    (0x5DD, 99), // great_ones_wisdom
+    (0x5E6, 99), // coldblood_dew_1
+    (0x5E7, 99), // coldblood_dew_2
+    (0x5E8, 99), // coldblood_dew
+    (0x5E9, 99), // thick_coldblood_4
+    (0x5EA, 99), // thick_coldblood_5
+    (0x5EB, 99), // thick_coldblood
+    (0x5EC, 99), // frenzied_coldblood_7
+    (0x5ED, 99), // frenzied_coldblood
+    (0x5EE, 99), // frenzied_coldblood_9
+    (0x5EF, 99), // kin_coldblood_10
+    (0x636, 99), // kin_coldblood
+    (0x637, 99), // kin_coldblood_12
+    (0x638, 99), // great_one_coldblood
+    (0x639, 99), // old_great_one_coldblood
+    (0x7EE, 3),  // lead_elixir
+    (0x82A, 3),  // shaman_bone_blade
+];
+
 /// A grant the machine is asked to deliver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GrantCommand {
@@ -378,6 +430,14 @@ impl<R: Runtime> GrantSession<R> {
         self.formula.goods_normalized_prefix | BLOOD_VIAL_GOODS_ID
     }
 
+    /// The held-stack cap of a consumable goods id, if it has one.
+    fn hold_cap(&self, normalized_id: u32) -> Option<u32> {
+        CONSUMABLE_HOLD_CAPS
+            .iter()
+            .find(|(goods, _)| self.formula.goods_normalized_prefix | goods == normalized_id)
+            .map(|(_, cap)| *cap)
+    }
+
     fn set(&mut self, status: &str, detail: String) -> String {
         let tag = self
             .command
@@ -600,6 +660,19 @@ impl<R: Runtime> GrantSession<R> {
                     format!(
                         "tag={} expected_after={wanted} actual={actual:?} attempt={}/{budget}",
                         command.tag, self.verify_polls
+                    ),
+                );
+            }
+            if delta_execution_evidence
+                && let Some(cap) = self.hold_cap(command.normalized_id)
+                && actual == Some(cap)
+                && wanted > cap
+            {
+                return self.finish(
+                    "completed",
+                    format!(
+                        "tag={} completed at hold cap: expected_after={wanted} actual={cap} native_result={native_result}; the overflow went to the Hunter's Dream storage box",
+                        command.tag
                     ),
                 );
             }
@@ -1504,6 +1577,69 @@ mod tests {
         assert_eq!(session.state().expected_after, Some(7));
         assert!(!session.state().is_success());
         assert!(session.runtime_mut().writes.is_empty());
+    }
+
+    /// YouFailMe 2026-09: Quicksilver Bullets x3 into a stack of 19. The game
+    /// fills the held stack to its cap of 20 and sends the rest to storage, so
+    /// the read-back sits at the cap, not at 22. That is a fill, not a loss,
+    /// and must complete instead of parking forever.
+    #[test]
+    fn a_delta_that_fills_a_consumable_to_its_hold_cap_completes() {
+        for (before, qty) in [(19, 3), (20, 1)] {
+            let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+            let mut runtime = FakeRuntime::default().with_stack(
+                normalized,
+                StackView {
+                    quantity: 20,
+                    exists: true,
+                    slot: Some(3),
+                    quantity_address: Some(0x1000),
+                },
+            );
+            runtime.complete_without_applying = true;
+            let mut session = session(runtime);
+            session
+                .submit(goods_command(0x384, qty, "ap_cap", Some(before)), false)
+                .unwrap();
+            assert_eq!(session.poll(), "executing");
+            let mut last = String::new();
+            for _ in 0..contract().policy.verify_polls {
+                last = session.poll();
+                if last == "completed" {
+                    break;
+                }
+            }
+            assert_eq!(last, "completed", "state: {:?}", session.state());
+            assert!(session.state().detail.contains("completed at hold cap"));
+            assert!(session.state().is_success());
+        }
+    }
+
+    /// A goods id with no hold-cap entry (a key item such as the Third
+    /// Umbilical Cord, whose duplicate the game discards) still parks.
+    #[test]
+    fn a_deficit_on_an_uncapped_goods_id_still_parks() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x10E0;
+        let mut runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 1,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        runtime.complete_without_applying = true;
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x10E0, 1, "ap_key", Some(1)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        let mut last = String::new();
+        for _ in 0..contract().policy.verify_polls {
+            last = session.poll();
+        }
+        assert_eq!(last, "failed", "state: {:?}", session.state());
     }
 
     /// clients#443: the modelled inverse of the concurrent pickup. The delta
