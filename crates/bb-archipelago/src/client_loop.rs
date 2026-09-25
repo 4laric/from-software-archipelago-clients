@@ -1910,9 +1910,22 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             return Ok(Vec::new());
         }
 
+        // The goal location stays polled after the server has it until this
+        // slot records a victory. `ClientStatus::Goal` is only sent when the
+        // goal flag is witnessed, so a server check that landed without it (a
+        // goal send lost to a disconnect, a check from another client on the
+        // slot) used to strand the seed: the flag was never read again, and
+        // `rescue goal` rewrote a flag nothing looked at. Re-reporting the
+        // location is harmless -- LocationChecks and sustain are idempotent.
+        let pending_goal = self
+            .config
+            .goal_location
+            .filter(|goal| self.victory().is_none_or(|record| record.goal_location != *goal));
         let mut newly_checked = Vec::new();
         for binding in &self.config.locations {
-            if server_checked.contains(&binding.ap_location_id) {
+            if server_checked.contains(&binding.ap_location_id)
+                && pending_goal != Some(binding.ap_location_id)
+            {
                 self.location_true_streaks.remove(&binding.ap_location_id);
                 self.location_retries.remove(&binding.ap_location_id);
                 continue;
@@ -5086,6 +5099,57 @@ mod tests {
         let error = client.poll_locations(&HashSet::new()).unwrap_err();
         assert!(format!("{error:#}").contains("refused save identity"));
         std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// WolfQuake 2026-09: Moon Presence died, the server had the goal
+    /// location, but goal status was never sent -- and `rescue goal` could not
+    /// help, because a server-checked location was never read again. The goal
+    /// location now stays polled until a victory is recorded; every other
+    /// server-checked location stays silent.
+    #[test]
+    fn a_server_checked_goal_is_still_witnessed_until_victory_is_recorded() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.goal_location = Some(1000);
+        let mut backend = MockBackend::default();
+        backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
+        let server_checked = HashSet::from([1000]);
+        assert!(client.poll_locations(&server_checked).unwrap().is_empty());
+        assert!(client.poll_locations(&server_checked).unwrap().is_empty());
+        assert_eq!(client.poll_locations(&server_checked).unwrap(), vec![1000]);
+
+        client
+            .record_victory(VictoryRecord {
+                goal_location: 1000,
+                goal_name: "goal".into(),
+                completed_at_ms: 0,
+                elapsed_seconds: None,
+                checks_completed: None,
+                checks_total: None,
+                received_items: None,
+                sent_items: None,
+                deaths: None,
+                death_links: None,
+            })
+            .unwrap();
+        for _ in 0..4 {
+            assert!(client.poll_locations(&server_checked).unwrap().is_empty());
+        }
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    /// Without a goal, a server-checked location is never read again.
+    #[test]
+    fn a_server_checked_non_goal_location_stays_silent() {
+        let ledger_path = path();
+        let mut backend = MockBackend::default();
+        backend.set_flags.insert(TEST_PEBBLE_EVENT_FLAG);
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), config());
+        for _ in 0..4 {
+            assert!(client.poll_locations(&HashSet::from([1000])).unwrap().is_empty());
+        }
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     #[test]
