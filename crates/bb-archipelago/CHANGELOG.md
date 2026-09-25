@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed
+
+* **Consumables that fill to their hold cap now deliver instead of parking.**
+  A Blood Vial into a stack of 20, or Molotov Cocktails x2 into 10, filled the
+  held stack to its cap and sent the rest to the storage box, but the client
+  read the short held stack as a failed delivery and parked it until `retry`.
+  A delta that leaves a consumable exactly at its `maxNum` cap now completes.
+  Key items such as the Third Umbilical Cord are not in the cap table, so their
+  deficit still parks.
+
 ### Changed
 
 * **The outbound DeathLink signal has been seen working live, and the client
