@@ -286,6 +286,9 @@ pub struct Core {
     mfg_colors: crate::mfg_colors::Colors,
     tracker_map_filters: bool,
     mfg_states: crate::mfg_states::States,
+    /// Last "map pins:" summary line written to the log, so the snapshot is logged when it
+    /// CHANGES and not every 3 s (clients#718: two maps on one slot disagreed and no log said why).
+    mfg_last_summary: String,
     mfg_capture: crate::mfg_probe::HoverCapture,
     mfg_follow: er_logic::mfg_bridge::Follow,
     /// Seed-owned spoiler preference (#1184). False for old seeds and by default: sweep groups in
@@ -948,6 +951,7 @@ impl shared::Core for Core {
             mfg_colors: Default::default(),
             tracker_map_filters: true,
             mfg_states: Default::default(),
+            mfg_last_summary: String::new(),
             mfg_capture: Default::default(),
             mfg_follow: Default::default(),
             reveal_sweep_boss_names: false,
@@ -5773,12 +5777,29 @@ impl Core {
         self.lock_hint_affordable_prev = Some(affordable);
     }
 
-    /// Coarse regions currently accessible: a coarse region is open iff its lock item's physical
-    /// open flag is set -- OR it has no lock at all / the lock isn't part of this seed's pool.
+    /// Coarse regions currently accessible: a coarse region is open iff its Lock item has been
+    /// RECEIVED from the server, or its physical open flag is set on this save -- OR it has no
+    /// lock at all / the lock isn't part of this seed's pool.
     /// ("" coarse names are the always-open bucket; er-logic treats those as in-logic itself.)
+    ///
+    /// Server first (clients#718). This used to read only the local event flag, so two players on
+    /// ONE slot saw different "in logic" pins whenever their saves lagged each other on a Lock:
+    /// a fresh character replaying its receive ledger showed a region locked that the room had
+    /// opened hours ago. The received-items stream is the room's truth and is identical for every
+    /// client on the slot; the local flag is kept as the OR so a region the game itself opened
+    /// (natural progression, a lock outside the pool) still counts.
     fn open_coarse_regions(&self) -> HashSet<String> {
         let mut open = HashSet::new();
         let region_open = self.region.as_ref().map(|c| &c.region_open_flags);
+        let received: HashSet<String> = self
+            .client()
+            .map(|c| {
+                c.received_items()
+                    .iter()
+                    .map(|ri| ri.item().name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         for coarse in self.coarse_table.values() {
             if coarse.is_empty() || open.contains(coarse) {
                 continue; // always-open bucket / already decided
@@ -5787,7 +5808,7 @@ impl Core {
                 None => true, // no lock mapping -> open
                 Some(lock) => match region_open.and_then(|m| m.get(lock)) {
                     None => true, // lock absent this seed -> unlocked
-                    Some(&flag) => crate::flags::get_event_flag(flag),
+                    Some(&flag) => received.contains(lock) || crate::flags::get_event_flag(flag),
                 },
             };
             if accessible {
@@ -5944,12 +5965,18 @@ impl Core {
         if !self.was_in_world || self.client().is_none() || !self.mfg_states.due(now) {
             return;
         }
+        // Only UNCHECKED locations enter the snapshot (clients#718). The map engine hides a pin
+        // whose lot carries no CHECK bit under its default `ap_checks_only`, and a location the
+        // ROOM has already checked -- by this player or by anyone else sharing the slot -- is not
+        // an outstanding check. Before this the checked set was published too, so the pin only
+        // vanished once THIS save's pickup flag was set, and two players on one slot saw each
+        // other's finished checks as live pins. `checked_locations()` is the server's list, so
+        // every client on the slot now agrees.
         let mut names = HashMap::new();
         let mut remaining = HashSet::new();
+        let mut checked_n = 0usize;
         if let Some(client) = self.client() {
-            for loc in client.checked_locations() {
-                names.insert(loc.id(), loc.name().to_string());
-            }
+            checked_n = client.checked_locations().count();
             for loc in client.unchecked_locations() {
                 if self.valid_locations.contains(&loc.id()) {
                     remaining.insert(loc.id());
@@ -5992,6 +6019,30 @@ impl Core {
             );
         }
         self.mfg_states.send(&states);
+        // One line per CHANGE of the published snapshot, never per refresh. This is the line
+        // that answers "why do our maps differ" from a single log: it names the server-side
+        // counts and the region set the in-logic filter was computed from.
+        let mut open_sorted: Vec<&String> = open.iter().filter(|r| !r.is_empty()).collect();
+        open_sorted.sort();
+        let summary = format!(
+            "map pins: published {} lot state(s) from {} unchecked location(s) ({} checked on the \
+             server, excluded); {} in logic; open regions ({}): {}; engine: {}",
+            states.len(),
+            names.len(),
+            checked_n,
+            in_logic.len(),
+            open_sorted.len(),
+            open_sorted
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.mfg_states.status(),
+        );
+        if summary != self.mfg_last_summary {
+            log::info!("{summary}");
+            self.mfg_last_summary = summary;
+        }
     }
 
     /// Build the per-frame tracker snapshot and draw the window (SPEC-item-tracker.md Phase 1).
