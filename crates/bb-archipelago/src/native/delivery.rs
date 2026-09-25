@@ -1590,13 +1590,15 @@ mod tests {
             let mut runtime = FakeRuntime::default().with_stack(
                 normalized,
                 StackView {
-                    quantity: 20,
+                    quantity: before,
                     exists: true,
                     slot: Some(3),
                     quantity_address: Some(0x1000),
                 },
             );
-            runtime.complete_without_applying = true;
+            // The delta lands and the overflow past the cap leaves the held
+            // stack for storage.
+            runtime.concurrent_spend = before + qty - 20;
             let mut session = session(runtime);
             session
                 .submit(goods_command(0x384, qty, "ap_cap", Some(before)), false)
