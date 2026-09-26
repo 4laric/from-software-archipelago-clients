@@ -2,13 +2,15 @@
 
 ### Fixed
 
-* **Consumables that fill to their hold cap now deliver instead of parking.**
-  A Blood Vial into a stack of 20, or Molotov Cocktails x2 into 10, filled the
-  held stack to its cap and sent the rest to the storage box, but the client
-  read the short held stack as a failed delivery and parked it until `retry`.
-  A delta that leaves a consumable exactly at its `maxNum` cap now completes.
-  Key items such as the Third Umbilical Cord are not in the cap table, so their
-  deficit still parks.
+* **Consumables that overflow their hold cap now go to the storage box.**
+  A Blood Vial into a stack of 20, or Molotov Cocktails x2 into 10, ran on the
+  existing-stack delta, which clamps at the cap and drops the rest, then parked
+  the grant as failed. A grant that would take a capped consumable past its
+  `maxNum` now runs through the game's own ItemGrant, which fills the held stack
+  and sends the surplus to the Hunter's Dream storage box; the console says so.
+  If the game refuses that insert, the grant parks as not delivered instead of
+  falling back to the clamping delta. Key items such as the Third Umbilical Cord
+  are not in the cap table, so their deficit still parks.
 
 ### Changed
 

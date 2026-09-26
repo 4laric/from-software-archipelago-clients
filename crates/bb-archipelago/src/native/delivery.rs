@@ -48,10 +48,11 @@ pub const BLOOD_VIAL_GOODS_ID: u32 = 0x3E8;
 /// seed can deliver, by goods id. Mirrors bb-archipelago's
 /// `CONSUMABLE_STACK_CAPS`, which is checked against the bundled param.
 ///
-/// Bloodborne sends whatever does not fit in a capped held stack to the Hunter's Dream
-/// storage box. The client cannot read that box, so without this table a delta that fills the
-/// stack to its cap reads back short and parks forever: YouFailMe's vials at 20, bullets at 20
-/// and Molotovs at 10 did exactly that. A stack that stops at its own cap is a fill, not a loss.
+/// The existing-stack delta clamps at the cap and drops the surplus: its result is the held
+/// count, never the storage `1`, and Megaborne's 2026-09-24 session parked ~130 grants that way.
+/// The game's own ItemGrant fills the held stack and routes the rest to the Hunter's Dream
+/// storage box (oz, 2026-08-29), so a grant that would overflow one of these caps takes the
+/// insert lane instead of the delta.
 /// Key items such as the Third Umbilical Cord are deliberately absent -- the game discards a
 /// duplicate of those, so their deficit must still park.
 const CONSUMABLE_HOLD_CAPS: &[(u32, u32)] = &[
@@ -353,6 +354,10 @@ pub struct GrantSession<R: Runtime> {
     /// (insert refused, stack present). A second refusal parks; the re-plan
     /// is not a retry loop.
     replanned: bool,
+    /// The grant would overflow a capped held stack, so it runs on the insert
+    /// lane: the game's own grant routine fills the held stack and routes the
+    /// rest to the Hunter's Dream storage box. The delta lane would clamp it.
+    storage_route: bool,
     /// Passive forensics for the current grant (clients#445). Written on every
     /// transition, read by nothing inside this module.
     trace: GrantTrace,
@@ -388,6 +393,7 @@ impl<R: Runtime> GrantSession<R> {
             delta_lane: false,
             instance_insert: false,
             replanned: false,
+            storage_route: false,
             trace: GrantTrace::default(),
         }
     }
@@ -482,6 +488,7 @@ impl<R: Runtime> GrantSession<R> {
         self.delta_lane = false;
         self.instance_insert = false;
         self.replanned = false;
+        self.storage_route = false;
         self.expected_before = command.expected_before;
         let detail = format!("tag={}", command.tag);
         self.trace = GrantTrace::begin(&command);
@@ -572,6 +579,7 @@ impl<R: Runtime> GrantSession<R> {
             // a real failure and parks with the full detail.
             if !self.delta_lane
                 && !self.replanned
+                && !self.storage_route
                 && native_result == EMPTY_SLOT
                 && let Some(live) = stack
                 && live.exists
@@ -595,6 +603,19 @@ impl<R: Runtime> GrantSession<R> {
                     format!(
                         "tag={} insert refused by the game (native_result={native_result}) while a stack of {} now exists; re-planning as a delta against it",
                         command.tag, live.quantity
+                    ),
+                );
+            }
+            // A storage-routed insert the game refused did not apply. Re-planning
+            // it as a delta would clamp at the cap and lose the surplus, so it
+            // parks as a refusal instead; the sentinel makes it a requeue
+            // candidate, not a delivered item.
+            if self.storage_route && native_result == EMPTY_SLOT {
+                return self.finish(
+                    "failed",
+                    format!(
+                        "tag={} storage-overflow insert refused by the game: expected_after={wanted} actual={actual:?} native_result={native_result}; nothing was delivered",
+                        command.tag
                     ),
                 );
             }
@@ -660,19 +681,6 @@ impl<R: Runtime> GrantSession<R> {
                     format!(
                         "tag={} expected_after={wanted} actual={actual:?} attempt={}/{budget}",
                         command.tag, self.verify_polls
-                    ),
-                );
-            }
-            if delta_execution_evidence
-                && let Some(cap) = self.hold_cap(command.normalized_id)
-                && actual == Some(cap)
-                && wanted > cap
-            {
-                return self.finish(
-                    "completed",
-                    format!(
-                        "tag={} completed at hold cap: expected_after={wanted} actual={cap} native_result={native_result}; the overflow went to the Hunter's Dream storage box",
-                        command.tag
                     ),
                 );
             }
@@ -817,7 +825,7 @@ impl<R: Runtime> GrantSession<R> {
         // second INSTANCE; the only correct lane for it is insert.
         let descriptor = ItemGrantDescriptor::new(command.raw_id, command.normalized_id);
         let stackable = descriptor.is_stackable_category(&self.formula);
-        let delta = stack.exists && stackable;
+        let mut delta = stack.exists && stackable;
 
         if stackable {
             self.trace.stack_present_at_dequeue = Some(stack.exists);
@@ -848,6 +856,19 @@ impl<R: Runtime> GrantSession<R> {
         }
         let expected_before = self.expected_before.unwrap();
         let wanted = expected_before.saturating_add(command.quantity);
+        // A delta onto a capped consumable clamps at the cap and the surplus is
+        // lost (native_result is the held count, never the storage `1`). The
+        // game's own ItemGrant fills the held stack and sends the rest to the
+        // storage box (oz, 2026-08-29), so an overflowing grant takes the insert
+        // lane instead.
+        if delta
+            && self
+                .hold_cap(command.normalized_id)
+                .is_some_and(|cap| wanted > cap)
+        {
+            delta = false;
+            self.storage_route = true;
+        }
         if stackable {
             self.trace.observed_before = Some(expected_before);
             self.trace.expected_after = Some(wanted);
@@ -1343,10 +1364,12 @@ mod tests {
     /// clients#613, THE motivating case: the dequeue-time scan finds no stack,
     /// the insert lane is taken with a zero baseline, the game REFUSES the
     /// insert (`done` with the result cell still the sentinel), and the
-    /// read-back finds a stack of ten -- Jennifer's parked `ap_43`, an
-    /// Antidote pouch at its cap. The grant provably did not apply, and a
-    /// stack exists now, so the only correct lane is the delta: the machine
-    /// re-plans onto it and the item lands.
+    /// read-back finds a stack -- Jennifer's parked `ap_43`. The grant
+    /// provably did not apply, and a stack exists now, so the machine re-plans
+    /// onto the delta and the item lands. Her live stack was the Antidote cap
+    /// of ten, which now re-plans as a storage-overflow insert instead (see
+    /// `a_refused_storage_overflow_insert_parks_without_replanning`), so this
+    /// fixture holds five.
     #[test]
     fn an_insert_refused_while_a_stack_exists_replans_as_a_delta() {
         let normalized = contract().descriptor.goods_normalized_prefix | 0x44C;
@@ -1355,7 +1378,7 @@ mod tests {
             complete_without_applying: true,
             report_no_result: true,
             stack_appears: Some(StackView {
-                quantity: 10,
+                quantity: 5,
                 exists: true,
                 slot: Some(3),
                 quantity_address: Some(0x1000),
@@ -1383,11 +1406,11 @@ mod tests {
         );
         assert_eq!(session.trace().stack_present_at_dequeue, Some(false));
 
-        // The refusal: done, sentinel result, and a stack of ten now present.
+        // The refusal: done, sentinel result, and a stack of five now present.
         assert_eq!(session.poll(), "replanning", "state: {:?}", session.state());
         let detail = session.state().detail.clone();
         assert!(detail.contains("native_result=4294967295"), "{detail}");
-        assert!(detail.contains("stack of 10 now exists"), "{detail}");
+        assert!(detail.contains("stack of 5 now exists"), "{detail}");
         assert!(session.trace().replanned_to_delta);
         assert!(!session.trace().execution_evidence);
 
@@ -1400,7 +1423,7 @@ mod tests {
             session
                 .state()
                 .detail
-                .contains("lane=delta source=in_frame expected_after=12"),
+                .contains("lane=delta source=in_frame expected_after=7"),
             "{}",
             session.state().detail
         );
@@ -1408,7 +1431,7 @@ mod tests {
         let queued = session.runtime_mut().queued.expect("the delta queues");
         assert_eq!((queued.1, queued.2, queued.3), (2, Some(3), Some(0x1000)));
         assert_eq!(session.poll(), "completed", "state: {:?}", session.state());
-        assert_eq!(session.runtime_mut().stacks[&normalized].quantity, 12);
+        assert_eq!(session.runtime_mut().stacks[&normalized].quantity, 7);
         assert!(
             session.runtime_mut().writes.is_empty(),
             "the re-plan must not fall back to an external write"
@@ -1425,7 +1448,7 @@ mod tests {
             complete_without_applying: true,
             report_no_result: true,
             stack_appears: Some(StackView {
-                quantity: 10,
+                quantity: 5,
                 exists: true,
                 slot: Some(3),
                 quantity_address: Some(0x1000),
@@ -1579,15 +1602,16 @@ mod tests {
         assert!(session.runtime_mut().writes.is_empty());
     }
 
-    /// YouFailMe 2026-09: Quicksilver Bullets x3 into a stack of 19. The game
-    /// fills the held stack to its cap of 20 and sends the rest to storage, so
-    /// the read-back sits at the cap, not at 22. That is a fill, not a loss,
-    /// and must complete instead of parking forever.
+    /// YouFailMe / Megaborne 2026-09: a grant that would overflow a capped
+    /// consumable (19+3 and 20+1 against cap 20, and a stack already past the
+    /// cap at 23+1) takes the insert lane, where the game's own ItemGrant fills
+    /// the held stack and routes the surplus to storage. The delta lane would
+    /// clamp at the cap and drop it.
     #[test]
-    fn a_delta_that_fills_a_consumable_to_its_hold_cap_completes() {
-        for (before, qty) in [(19, 3), (20, 1)] {
+    fn a_grant_that_would_overflow_a_capped_consumable_routes_through_insert() {
+        for (before, qty) in [(19, 3), (20, 1), (23, 1)] {
             let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
-            let mut runtime = FakeRuntime::default().with_stack(
+            let runtime = FakeRuntime::default().with_stack(
                 normalized,
                 StackView {
                     quantity: before,
@@ -1596,14 +1620,14 @@ mod tests {
                     quantity_address: Some(0x1000),
                 },
             );
-            // The delta lands and the overflow past the cap leaves the held
-            // stack for storage.
-            runtime.concurrent_spend = before + qty - 20;
             let mut session = session(runtime);
             session
                 .submit(goods_command(0x384, qty, "ap_cap", Some(before)), false)
                 .unwrap();
             assert_eq!(session.poll(), "executing");
+            assert_eq!(session.trace().lane, Some("insert"));
+            let (_, _, slot, address) = session.runtime_mut().queued.unwrap();
+            assert_eq!((slot, address), (None, None));
             let mut last = String::new();
             for _ in 0..contract().policy.verify_polls {
                 last = session.poll();
@@ -1612,9 +1636,60 @@ mod tests {
                 }
             }
             assert_eq!(last, "completed", "state: {:?}", session.state());
-            assert!(session.state().detail.contains("completed at hold cap"));
-            assert!(session.state().is_success());
+            assert!(session.runtime_mut().writes.is_empty());
         }
+    }
+
+    /// A grant that fits under the cap stays on the delta lane.
+    #[test]
+    fn a_grant_that_fits_under_the_cap_stays_on_the_delta_lane() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 17,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 3, "ap_fit", Some(17)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        assert_eq!(session.trace().lane, Some("delta"));
+    }
+
+    /// A storage-routed insert the game refuses parks with the sentinel; it is
+    /// never re-planned as a delta, which would clamp and lose the surplus.
+    #[test]
+    fn a_refused_storage_overflow_insert_parks_without_replanning() {
+        let normalized = contract().descriptor.goods_normalized_prefix | 0x384;
+        let mut runtime = FakeRuntime::default().with_stack(
+            normalized,
+            StackView {
+                quantity: 20,
+                exists: true,
+                slot: Some(3),
+                quantity_address: Some(0x1000),
+            },
+        );
+        runtime.complete_without_applying = true;
+        runtime.report_no_result = true;
+        let mut session = session(runtime);
+        session
+            .submit(goods_command(0x384, 1, "ap_refused", Some(20)), false)
+            .unwrap();
+        assert_eq!(session.poll(), "executing");
+        assert_eq!(session.poll(), "failed", "state: {:?}", session.state());
+        assert!(
+            session
+                .state()
+                .detail
+                .contains("storage-overflow insert refused")
+        );
+        assert!(!session.trace().replanned_to_delta);
     }
 
     /// A goods id with no hold-cap entry (a key item such as the Third
