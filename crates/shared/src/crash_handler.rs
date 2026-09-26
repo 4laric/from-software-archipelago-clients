@@ -43,8 +43,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, LPTOP_LEVEL_EXCEPTION_FILTER,
-    RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY,
+    LPTOP_LEVEL_EXCEPTION_FILTER, RtlLookupFunctionEntry, RtlVirtualUnwind,
+    SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -156,14 +157,122 @@ unsafe extern "system" fn first_chance_handler(info: *mut EXCEPTION_POINTERS) ->
     };
     if let Some(code) = code
         && classify(code) == CrashClass::Fatal
-        && take_first_chance_budget()
     {
-        report(
-            info as usize,
-            "first-chance — a handler may still absorb it",
-        );
+        if guarded_probe_fault(info) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if take_first_chance_budget() {
+            report(
+                info as usize,
+                "first-chance — a handler may still absorb it",
+            );
+        }
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// How many "absorbed by design" one-liners a session may write before going silent (the count
+/// keeps climbing either way; the last line says so).
+const GUARDED_LINES: usize = 3;
+static GUARDED_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// An access violation raised INSIDE a function that registers its own SEH handler is that
+/// function's design, not a crash: `__try { memcpy(out, p, n); } __except { return false; }`
+/// compiles to exactly the two-instruction probe whose fault we were reporting five times a
+/// session as `NATIVE CRASH ... MapForGoblins.upstream.dll+0x91425` (2026-09-25, two logs, ten
+/// reports, every one absorbed, every one spending the first-chance budget a real CTD needs).
+///
+/// The test is the function's own unwind info: x64 SEH is table-driven, so a function with a
+/// `__try` carries `UNW_FLAG_EHANDLER` in its `UNWIND_INFO` header, and a function WITHOUT one
+/// does not -- static check against the pinned renderer, 2026-09-25: both probe stubs
+/// (`0x91400`, `0x91420`) declare it, none of their six callers do. Only the faulting frame is
+/// consulted: a handler two frames up is still a real fault as far as this frame knows, and
+/// reporting it is the conservative side.
+///
+/// Returns true when the record was downgraded (logged as info under its own small cap, budget
+/// untouched). Never claims the exception; never touches dispatch.
+fn guarded_probe_fault(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the OS hands a valid EXCEPTION_POINTERS for the duration of the call; read-only,
+    // every pointer null-checked.
+    let (code, rip, target) = unsafe {
+        let Some(i) = info.as_ref() else {
+            return false;
+        };
+        let Some(rec) = i.ExceptionRecord.as_ref() else {
+            return false;
+        };
+        let rip = i.ContextRecord.as_ref().map(|c| c.Rip).unwrap_or(0);
+        let target = if rec.NumberParameters >= 2 {
+            rec.ExceptionInformation[1]
+        } else {
+            0
+        };
+        (rec.ExceptionCode.0 as u32, rip, target)
+    };
+    if code != 0xC000_0005 || rip == 0 || !function_declares_seh_handler(rip) {
+        return false;
+    }
+    let n = GUARDED_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= GUARDED_LINES {
+        let tail = if n == GUARDED_LINES {
+            " Further faults of this class are counted silently."
+        } else {
+            ""
+        };
+        log::info!(
+            "first-chance ACCESS_VIOLATION at {} (target {target:#x}) absorbed by design: the \
+             faulting function declares its own SEH handler (UNW_FLAG_EHANDLER), so this is a \
+             guarded probe read, not a crash. Not reported; first-chance budget untouched.{tail}",
+            format_addr(rip as usize)
+        );
+    }
+    true
+}
+
+/// Does the function containing `rip` declare an SEH exception handler in its unwind info?
+/// Follows `UNW_FLAG_CHAININFO` to the primary entry (a chained entry describes a fragment;
+/// the handler flag lives on the function it belongs to), bounded so corrupt tables cannot loop.
+fn function_declares_seh_handler(rip: u64) -> bool {
+    let mut image_base = 0u64;
+    // SAFETY: read-only lookup over the loader's function tables; null means no unwind info.
+    let mut entry = unsafe { RtlLookupFunctionEntry(rip, &raw mut image_base, None) };
+    for _ in 0..4 {
+        if entry.is_null() || image_base == 0 {
+            return false;
+        }
+        // SAFETY: `entry` points into the image's .pdata, which the loader keeps mapped for the
+        // module's lifetime; the union's two names alias the same u32.
+        let unwind_rva = unsafe { (*entry).Anonymous.UnwindInfoAddress } as u64;
+        let header = (image_base + unwind_rva) as *const u8;
+        if !readable(header as usize) {
+            return false;
+        }
+        // SAFETY: readable() verified the page; UNWIND_INFO is at least 4 bytes.
+        let (first, count_of_codes) = unsafe { (*header, *header.add(2)) };
+        let flags = unwind_header_flags(first);
+        if flags & UNW_FLAG_EHANDLER_BIT != 0 {
+            return true;
+        }
+        if flags & UNW_FLAG_CHAININFO_BIT == 0 {
+            return false;
+        }
+        // Chained: the primary RUNTIME_FUNCTION follows the (even-padded) unwind-code array.
+        let codes = (count_of_codes as usize).div_ceil(2) * 2;
+        let chained =
+            (image_base + unwind_rva + 4 + 2 * codes as u64) as *mut IMAGE_RUNTIME_FUNCTION_ENTRY;
+        if !readable(chained as usize) {
+            return false;
+        }
+        entry = chained;
+    }
+    false
+}
+
+/// `UNWIND_INFO` byte 0 is `Version:3 | Flags:5`; the flags are the high five bits.
+const UNW_FLAG_EHANDLER_BIT: u8 = 1;
+const UNW_FLAG_CHAININFO_BIT: u8 = 4;
+fn unwind_header_flags(first_byte: u8) -> u8 {
+    first_byte >> 3
 }
 
 /// How an exception code should be REPORTED. Classification only — it never affects dispatch;
@@ -695,6 +804,30 @@ mod tests {
             assert!(report.contains(name), "missing {name}: {report}");
         }
         assert!(report.contains("0x0000000000000004"), "rdx value missing");
+    }
+
+    /// The pinned MapForGoblins 2.1.3 renderer, read with pefile on 2026-09-25: the two probe
+    /// stubs' UNWIND_INFO headers are `0x09` (version 1, EHANDLER); a plain caller's is `0x01`
+    /// (version 1, no flags); a chained fragment's is `0x21` (version 1, CHAININFO).
+    #[test]
+    fn unwind_header_flags_are_the_high_five_bits() {
+        assert_eq!(unwind_header_flags(0x09), 0b1, "EHANDLER");
+        assert_eq!(unwind_header_flags(0x01), 0b0, "no handler");
+        assert_eq!(unwind_header_flags(0x21), 0b100, "CHAININFO");
+        assert_eq!(unwind_header_flags(0x09) & UNW_FLAG_EHANDLER_BIT, 1);
+        assert_eq!(unwind_header_flags(0x21) & UNW_FLAG_CHAININFO_BIT, 4);
+        assert_eq!(
+            unwind_header_flags(0x01) & (UNW_FLAG_EHANDLER_BIT | UNW_FLAG_CHAININFO_BIT),
+            0
+        );
+    }
+
+    /// Rule 8 guard: a rip nothing describes (no module, no unwind info) is NOT a guarded probe.
+    /// Silencing must never reach a fault we cannot even attribute to a function.
+    #[test]
+    fn a_rip_with_no_unwind_info_is_not_guarded() {
+        assert!(!function_declares_seh_handler(0));
+        assert!(!function_declares_seh_handler(0x10));
     }
 
     /// The 2026-07-31 case, by name and by number. Elden Ring's Alt-F4 teardown executes an
