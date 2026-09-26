@@ -41,6 +41,10 @@ struct Sink {
     /// in a buffer and asserts on both halves of the split.
     #[cfg(test)]
     console: Option<Vec<u8>>,
+    /// Parallel tests may emit ordinary diagnostics while a logging test is
+    /// capturing. Only the test that armed the buffer owns its assertions.
+    #[cfg(test)]
+    capture_thread: Option<std::thread::ThreadId>,
 }
 
 fn sink() -> MutexGuard<'static, Sink> {
@@ -127,8 +131,12 @@ pub fn emit(arguments: Arguments<'_>) {
     let mut sink = sink();
     #[cfg(test)]
     {
-        if let Some(console) = sink.console.as_mut() {
-            let _ = console.write_all(line.as_bytes());
+        if sink.capture_thread == Some(std::thread::current().id()) {
+            if let Some(console) = sink.console.as_mut() {
+                let _ = console.write_all(line.as_bytes());
+            } else {
+                let _ = io::stderr().write_all(line.as_bytes());
+            }
         } else {
             let _ = io::stderr().write_all(line.as_bytes());
         }
@@ -219,10 +227,12 @@ mod tests {
         let mut sink = sink();
         sink.file = None;
         sink.console = Some(Vec::new());
+        sink.capture_thread = Some(std::thread::current().id());
     }
 
     fn captured_console() -> String {
         let mut sink = sink();
+        sink.capture_thread = None;
         String::from_utf8(sink.console.take().unwrap_or_default()).expect("console is UTF-8")
     }
 

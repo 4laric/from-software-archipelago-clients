@@ -2778,16 +2778,19 @@ mod tests {
         Category8AwardBinding, DescriptorEvidence, FeedEffectBinding, LocationBinding,
         RuntimeItemBinding, TEST_PEBBLE_EVENT_FLAG,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn path() -> PathBuf {
+        static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "bb-loop-{}-{}.json",
+            "bb-loop-{}-{}-{}.json",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
