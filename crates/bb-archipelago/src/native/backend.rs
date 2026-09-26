@@ -970,6 +970,10 @@ impl BloodborneBackend for NativeBackend {
         }
     }
 
+    fn release_preexecution_vial_refusal(&mut self, tag: &str) -> Result<bool> {
+        Ok(self.delivery.release_preexecution_vial_refusal(tag))
+    }
+
     fn equip_item(&mut self, request: &EquipRequest) -> Result<OperationProgress> {
         self.verify_before_mutation()?;
         bail!(

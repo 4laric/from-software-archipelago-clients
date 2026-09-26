@@ -75,7 +75,22 @@ impl std::fmt::Display for GrantTerminalFailure {
 
 impl std::error::Error for GrantTerminalFailure {}
 
+/// Exact refusal emitted before an absent Blood Vial is submitted to the game.
+pub fn is_absent_vial_refusal(tag: &str, status: &str, detail: &str) -> bool {
+    status == "failed"
+        && detail
+            == format!(
+                "tag={tag} absent Blood Vial insertion is disabled after the live invalid-record reproduction; acquire one Vial before delivery"
+            )
+}
+
 pub trait BloodborneBackend {
+    /// Release only a proven pre-execution vial refusal cached by this process.
+    /// Callers must independently establish durable refusal evidence before retrying.
+    fn release_preexecution_vial_refusal(&mut self, _tag: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Gated category-8 construction experiment used to close bb-archipelago#214.
     /// Implementations must run on the validated game-thread lane and must not
     /// insert the constructed instance into inventory.
@@ -318,6 +333,7 @@ pub struct MockBackend {
     completed_grants: HashSet<String>,
     completed_equips: HashSet<String>,
     terminal_failures: HashMap<String, String>,
+    terminal_failure_details: HashMap<String, String>,
 }
 
 impl Default for MockBackend {
@@ -351,6 +367,7 @@ impl Default for MockBackend {
             completed_grants: HashSet::new(),
             completed_equips: HashSet::new(),
             terminal_failures: HashMap::new(),
+            terminal_failure_details: HashMap::new(),
         }
     }
 }
@@ -377,6 +394,14 @@ impl MockBackend {
         status: impl Into<String>,
     ) {
         self.terminal_failures.insert(tag.into(), status.into());
+    }
+
+    pub fn refuse_absent_vial(&mut self, tag: impl Into<String>) {
+        let tag = tag.into();
+        self.terminal_failures.insert(tag.clone(), "failed".into());
+        self.terminal_failure_details.insert(tag.clone(), format!(
+            "tag={tag} absent Blood Vial insertion is disabled after the live invalid-record reproduction; acquire one Vial before delivery"
+        ));
     }
 
     pub fn delay_equip(&mut self, tag: impl Into<String>, polls: u8) {
@@ -419,6 +444,22 @@ impl MockBackend {
 }
 
 impl BloodborneBackend for MockBackend {
+    fn release_preexecution_vial_refusal(&mut self, tag: &str) -> Result<bool> {
+        let Some(status) = self.terminal_failures.get(tag) else {
+            return Ok(true);
+        };
+        let detail = self
+            .terminal_failure_details
+            .get(tag)
+            .map(String::as_str)
+            .unwrap_or("mock terminal harness failure");
+        if !is_absent_vial_refusal(tag, status, detail) {
+            return Ok(false);
+        }
+        self.terminal_failures.remove(tag);
+        self.terminal_failure_details.remove(tag);
+        Ok(true)
+    }
     fn location_context(&mut self) -> Result<Option<LocationContext>> {
         Ok(self.location_context.clone())
     }
@@ -539,7 +580,11 @@ impl BloodborneBackend for MockBackend {
             return Err(GrantTerminalFailure {
                 tag: grant.tag.clone(),
                 status: status.clone(),
-                detail: "mock terminal harness failure".into(),
+                detail: self
+                    .terminal_failure_details
+                    .get(&grant.tag)
+                    .cloned()
+                    .unwrap_or_else(|| "mock terminal harness failure".into()),
             }
             .into());
         }

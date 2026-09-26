@@ -39,6 +39,11 @@ pub struct SlotLedger {
     /// ledgers have no such field and load with it empty.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub redeliver: BTreeSet<u64>,
+    /// AP Vial grants refused before native execution. They remain parked so
+    /// later AP indices can progress, then re-enter the ordered queue only
+    /// after a Vial stack is observed and the native refusal is released.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub deferred_vial_ap: BTreeSet<u64>,
     /// Randomized fixed pickups whose one-bullet sustain award has been
     /// queued but not yet witnessed in game (clients#511). The AP location id
     /// is the idempotency key; the optional quantity is recorded before the
@@ -46,6 +51,18 @@ pub struct SlotLedger {
     /// without duplicating it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pending_sustain: BTreeMap<i64, Option<u32>>,
+    /// Pre-execution refused Vial bonuses still owed. Kept separate from
+    /// pending_sustain so they do not occupy the native lane or starve bullets.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub deferred_sustain_vials: BTreeSet<i64>,
+    /// Sustain Vials or Bullets observed at their held cap before publication.
+    /// They are owed, but publishing at cap can fail or lose the bonus.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub deferred_sustain_capacity: BTreeSet<i64>,
+    /// A legacy retired Vial bonus is imported from diagnostics at most once.
+    /// Its old refusal record must not resurrect a later completed delivery.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub recovered_historical_sustain_vials: BTreeSet<i64>,
     /// Sustain awards whose native grant completed. Kept independently from
     /// received-item acknowledgement because checking a location must never
     /// block or duplicate its randomized AP item.
@@ -688,6 +705,7 @@ impl SlotLedger {
         );
         anyhow::ensure!(self.pending.is_none(), "a delivery is already pending");
         self.acknowledged.remove(&index);
+        self.deferred_vial_ap.remove(&index);
         self.redeliver.insert(index);
         Ok(())
     }
