@@ -17,7 +17,7 @@
 //! raw/normalized descriptor pairing is validated here before anything is
 //! queued, matching `FileBackend::grant_item` and `config.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
 
@@ -101,6 +101,7 @@ pub struct NativeDelivery<R: Runtime> {
     formula: DescriptorFormula,
     current_tag: Option<String>,
     finished: HashMap<String, GrantStep>,
+    preexecution_vial_refusals: HashSet<String>,
     manual_trigger: bool,
     /// clients#445. Disabled unless the client arms it; when armed, exactly one
     /// line per terminal grant. Nothing below ever branches on it.
@@ -118,6 +119,7 @@ impl<R: Runtime> NativeDelivery<R> {
             formula,
             current_tag: None,
             finished: HashMap::new(),
+            preexecution_vial_refusals: HashSet::new(),
             manual_trigger: false,
             diagnostics: DiagnosticSink::disabled(),
             context: GrantContext::default(),
@@ -139,6 +141,7 @@ impl<R: Runtime> NativeDelivery<R> {
             formula,
             current_tag: None,
             finished: HashMap::new(),
+            preexecution_vial_refusals: HashSet::new(),
             manual_trigger: false,
             diagnostics: DiagnosticSink::disabled(),
             context: GrantContext::default(),
@@ -247,6 +250,23 @@ impl<R: Runtime> NativeDelivery<R> {
             )
     }
 
+    /// Forget a terminal refusal only when this engine witnessed that no native
+    /// request was published. Unknown tags have no local cache to clear; their
+    /// durable proof remains the caller's responsibility.
+    pub fn release_preexecution_vial_refusal(&mut self, tag: &str) -> bool {
+        if self.current_tag.is_some() {
+            return false;
+        }
+        if !self.finished.contains_key(tag) {
+            return true;
+        }
+        if !self.preexecution_vial_refusals.remove(tag) {
+            return false;
+        }
+        self.finished.remove(tag);
+        true
+    }
+
     /// Advance the delivery of one request by one poll.
     pub fn grant(&mut self, request: NativeGrantRequest) -> Result<GrantStep> {
         self.grant_with_warning(request, &mut |_: &str| {})
@@ -279,6 +299,16 @@ impl<R: Runtime> NativeDelivery<R> {
         let step = classify(&status, self.session.state());
         if !matches!(step, GrantStep::Pending) {
             self.emit_diagnostic(&status, matches!(step, GrantStep::Complete), warn);
+            let trace = self.session.trace();
+            if matches!(&step, GrantStep::Failed { status, detail }
+                if crate::backend::is_absent_vial_refusal(&tag, status, detail))
+                && !trace.execution_evidence
+                && trace.lane.is_none()
+                && trace.native_result.is_none()
+                && trace.readbacks.is_empty()
+            {
+                self.preexecution_vial_refusals.insert(tag.clone());
+            }
             self.finished.insert(tag, step.clone());
             self.current_tag = None;
         }
@@ -504,6 +534,55 @@ mod tests {
                 .map(|stack| stack.quantity),
             Some(4)
         );
+    }
+
+    #[test]
+    fn only_preexecution_vial_refusals_can_be_released_for_retry() {
+        let runtime = FakeRuntime {
+            ready: true,
+            ..Default::default()
+        };
+        let mut engine = NativeDelivery::new(runtime, contract().descriptor, contract().policy);
+        let refused = drain(&mut engine, goods_request(1000, 1, "ap_vial", Some(0))).unwrap();
+        assert!(matches!(refused, GrantStep::Failed { .. }));
+        assert!(engine.runtime_mut().queued.is_none());
+        // Other grants may finish while the vial waits. Proof must be per tag,
+        // not inferred from whichever trace happens to be current.
+        assert_eq!(
+            drain(&mut engine, goods_request(900, 1, "ap_other", Some(0))).unwrap(),
+            GrantStep::Complete
+        );
+        assert!(!engine.release_preexecution_vial_refusal("ap_other"));
+        let vial = contract().descriptor.goods_normalized_prefix | 1000;
+        engine.runtime_mut().stacks.insert(
+            vial,
+            StackView {
+                exists: true,
+                quantity: 1,
+                slot: Some(2),
+                quantity_address: Some(0x2000),
+            },
+        );
+        assert_eq!(
+            engine
+                .grant(goods_request(1000, 1, "ap_vial", Some(1)))
+                .unwrap(),
+            refused
+        );
+        assert!(engine.release_preexecution_vial_refusal("ap_vial"));
+        assert_eq!(
+            drain(&mut engine, goods_request(1000, 1, "ap_vial", Some(1))).unwrap(),
+            GrantStep::Complete
+        );
+        assert_eq!(engine.runtime_mut().stacks[&vial].quantity, 2);
+        assert!(!engine.release_preexecution_vial_refusal("ap_vial"));
+        assert_eq!(
+            engine
+                .grant(goods_request(1000, 1, "ap_vial", Some(1)))
+                .unwrap(),
+            GrantStep::Complete
+        );
+        assert_eq!(engine.runtime_mut().stacks[&vial].quantity, 2);
     }
 
     /// clients#443: a surplus completion is a COMPLETION at the engine seam.

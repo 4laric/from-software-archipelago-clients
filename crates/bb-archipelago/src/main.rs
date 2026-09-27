@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use archipelago_rs::{ClientStatus, Connection, ConnectionOptions, Event, ItemHandling};
 use bb_archipelago::backend::{
     BloodborneBackend, EquipRequest, ItemGrant, LocationContext, MockBackend, OperationProgress,
-    StackObservation,
+    StackObservation, is_absent_vial_refusal,
 };
 use bb_archipelago::client_loop::{
     ClientLoop, DeathLinkAmnestyDecision, IncomingItem, ItemPollResult, LocalDeathPoll,
@@ -361,6 +361,13 @@ impl BloodborneBackend for Backend {
         match self {
             Self::Mock(backend) => backend.grant_item(grant),
             Self::Native(backend) => backend.grant_item(grant),
+        }
+    }
+
+    fn release_preexecution_vial_refusal(&mut self, tag: &str) -> Result<bool> {
+        match self {
+            Self::Mock(backend) => backend.release_preexecution_vial_refusal(tag),
+            Self::Native(backend) => backend.release_preexecution_vial_refusal(tag),
         }
     }
 
@@ -2218,17 +2225,27 @@ fn run() -> Result<()> {
                     false
                 }
                 Ok(ItemPollResult::Blocked(blocked)) => {
+                    let automatic_retry = blocked.status == "vial_capacity"
+                        || is_absent_vial_refusal(
+                            &format!("ap_{}", blocked.index),
+                            &blocked.status,
+                            &blocked.detail,
+                        );
                     #[cfg(windows)]
                     {
                         // A park never holds up the queue; say so, and keep the
                         // stall state for an item that actually is not moving.
                         ui_delivery = client_ui::DeliveryState::Parked;
-                        ui_delivery_detail = Some(format!(
-                            "{} parked, latest {} ({}); type `blocked` to inspect",
-                            runtime.parked_count(),
-                            item_label(client.this_game(), blocked.ap_item_id),
-                            blocked.status
-                        ));
+                        ui_delivery_detail = Some(if automatic_retry {
+                            "Blood Vial reward retained; waiting for a vial stack and pouch space, then retrying automatically".to_owned()
+                        } else {
+                            format!(
+                                "{} parked, latest {} ({}); type `blocked` to inspect",
+                                runtime.parked_count(),
+                                item_label(client.this_game(), blocked.ap_item_id),
+                                blocked.status
+                            )
+                        });
                         ui_reducer.activity(
                             client_ui::ActivityKind::ParkedDelivery,
                             format!(
@@ -2242,18 +2259,26 @@ fn run() -> Result<()> {
                     if let Some(line) = item_errors.recovered() {
                         client_eprintln!("{line}");
                     }
-                    client_eprintln!(
-                        "PARKED AP item index {} id {}: the grant terminally failed in the harness ({}: {}). \
-                         The item is recorded as blocked and later items keep delivering. \
-                         Inspect and resolve it with: bb-blocked {} \"{}\" \"{}\"",
-                        blocked.index,
-                        blocked.ap_item_id,
-                        blocked.status,
-                        blocked.detail,
-                        args.ledger.display(),
-                        client.seed_name(),
-                        args.slot,
-                    );
+                    if automatic_retry {
+                        client_eprintln!(
+                            "WAITING AP item index {} id {}: reward retained; waiting for a Blood Vial stack and pouch space. It will retry automatically; later items keep delivering.",
+                            blocked.index,
+                            blocked.ap_item_id,
+                        );
+                    } else {
+                        client_eprintln!(
+                            "PARKED AP item index {} id {}: the grant terminally failed in the harness ({}: {}). \
+                             The item is recorded as blocked and later items keep delivering. \
+                             Inspect and resolve it with: bb-blocked {} \"{}\" \"{}\"",
+                            blocked.index,
+                            blocked.ap_item_id,
+                            blocked.status,
+                            blocked.detail,
+                            args.ledger.display(),
+                            client.seed_name(),
+                            args.slot,
+                        );
+                    }
                     false
                 }
                 Ok(ItemPollResult::Idle) => {
