@@ -60,6 +60,24 @@ pub fn inventory_quiet(now_ms: u64, last_activity_ms: u64, quiet_ms: u64) -> boo
     last_activity_ms == 0 || now_ms.saturating_sub(last_activity_ms) >= quiet_ms
 }
 
+/// The periodic idle poll an NPC's talk script fires for as long as the NPC is loaded.
+///
+/// Observed 2026-09-29 (Winzi's log, enemy randomizer on): `cmd 119 args [2000, 0, 0, 0]` from
+/// Gatekeeper Gostoc (`302001000`), Brother Corhyn (`351001110`) and others, at 130-230 dispatches
+/// per second, for 96-147 s at a stretch. Counting it as talk activity held the goods gate shut
+/// the whole time, so received items landed in one burst when the player finally left the NPC.
+/// It is a poll, not a conversation: nothing in it opens a menu or moves the key list.
+pub const IDLE_POLL_CMD: i32 = 119;
+/// First argument that marks [`IDLE_POLL_CMD`] as the idle poll.
+pub const IDLE_POLL_ARG0: i32 = 2_000;
+
+/// Whether a dispatch is the idle poll and so must NOT refresh the inventory-quiet window.
+/// Deliberately narrow: the command AND its first argument, so a `119` with other arguments (or
+/// any other command) still counts as activity and keeps the gate closed.
+pub fn is_idle_poll(event_id: i32, arg0: Option<i32>) -> bool {
+    event_id == IDLE_POLL_CMD && arg0 == Some(IDLE_POLL_ARG0)
+}
+
 /// Commands that log on EVERY dispatch rather than once. Rare by nature; never suppressed, not
 /// even by [`DISTINCT_PAIR_CAP`].
 pub const WATCHED: [i32; 2] = [OPEN_REGULAR_SHOP, OPEN_SELL_SHOP];
@@ -319,5 +337,16 @@ mod tests {
         assert!(inventory_quiet(11_999, 9_999, 2_000));
         // A defensive saturating subtraction keeps a clock anomaly fail-closed.
         assert!(!inventory_quiet(9_998, 9_999, 2_000));
+    }
+
+    #[test]
+    fn the_idle_poll_is_recognised_by_command_and_first_argument() {
+        assert!(is_idle_poll(119, Some(2_000)));
+        // Narrow on purpose: a different argument, a different command or a missing argument all
+        // still count as talk activity.
+        assert!(!is_idle_poll(119, Some(0)));
+        assert!(!is_idle_poll(119, None));
+        assert!(!is_idle_poll(OPEN_REGULAR_SHOP, Some(2_000)));
+        assert!(!is_idle_poll(103, Some(2_000)));
     }
 }
