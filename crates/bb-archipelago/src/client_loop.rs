@@ -31,6 +31,7 @@ fn slot_is_pristine(slot: &SlotLedger) -> bool {
         && slot.deferred_vial_ap.is_empty()
         && slot.deferred_sustain_vials.is_empty()
         && slot.deferred_sustain_capacity.is_empty()
+        && slot.blocked_sustain_storage.is_empty()
 }
 
 /// One step of a rescue recipe. Every variant maps onto exactly one audited
@@ -537,6 +538,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     baseline.is_some()
                         && !slot.deferred_sustain_vials.contains(key)
                         && !slot.deferred_sustain_capacity.contains(key)
+                        && !slot.blocked_sustain_storage.contains_key(key)
                 })
             })
     }
@@ -551,12 +553,14 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .filter(|(key, _)| {
                 !slot.deferred_sustain_vials.contains(key)
                     && !slot.deferred_sustain_capacity.contains(key)
+                    && !slot.blocked_sustain_storage.contains_key(key)
             })
             .find(|(_, baseline)| baseline.is_some())
             .or_else(|| {
                 slot.pending_sustain.iter().find(|(key, _)| {
                     !slot.deferred_sustain_vials.contains(key)
                         && !slot.deferred_sustain_capacity.contains(key)
+                        && !slot.blocked_sustain_storage.contains_key(key)
                 })
             })
             .map(|(&location, &baseline)| (location, baseline))
@@ -648,10 +652,8 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         Ok(())
     }
 
-    /// Release at most one owed reward per poll. A live stack must also have
-    /// room for that reward: releasing an entire backlog against 19 Vials
-    /// would let the first award fill the pouch and send the rest into the
-    /// game's refused overflow path.
+    /// Release at most one owed reward per poll once a Vial record exists.
+    /// Full pouches use native storage overflow instead of waiting for a spend.
     fn retry_deferred_vials_if_ready(&mut self) -> Result<()> {
         self.recover_historical_vial_refusals()?;
         let Some(slot) = self.ledger.slot(&self.seed_name, &self.slot_name) else {
@@ -680,12 +682,8 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .ledger
             .slot(&self.seed_name, &self.slot_name)
             .expect("deferred slot remains present");
-        if slot.pending.is_none() && (1..20).contains(&vial_quantity) {
-            let candidate = slot.deferred_vial_ap.iter().copied().find(|index| {
-                slot.acknowledged
-                    .get(index)
-                    .is_some_and(|item| item.quantity <= 20 - vial_quantity)
-            });
+        if slot.pending.is_none() && vial_quantity > 0 {
+            let candidate = slot.deferred_vial_ap.iter().next().copied();
             if let Some(index) = candidate {
                 let tag = grant_tag(index);
                 let capacity_park = self
@@ -708,7 +706,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
         if slot.pending.is_some() || self.next_sustain().is_some() {
             return Ok(());
         }
-        if (1..20).contains(&vial_quantity) {
+        if vial_quantity > 0 {
             let candidate = slot.deferred_sustain_vials.iter().next().copied();
             if let Some(key) = candidate {
                 let tag = format!("sustain_vial_{}", key.abs());
@@ -737,7 +735,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     _ => continue,
                 }
             };
-            if quantity < 20 && (normalized != BLOOD_VIAL_NORMALIZED_ID || quantity > 0) {
+            if normalized != BLOOD_VIAL_NORMALIZED_ID || quantity > 0 {
                 self.ledger
                     .slot_mut(&self.seed_name, &self.slot_name)
                     .deferred_sustain_capacity
@@ -1077,7 +1075,7 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             .slot(&self.seed_name, &self.slot_name)
             .is_some_and(|slot| slot.deferred_vial_ap.contains(&index))
         {
-            return "Waiting for a Blood Vial stack with room in held inventory; reward retained and will retry automatically.".into();
+            return "Waiting for a Blood Vial record; reward retained and will retry automatically, using storage overflow if the pouch is full.".into();
         }
         let historical = item.blocked.as_deref().unwrap_or("unknown");
         let was_unknown = historical.starts_with("unreviewed_attire ")
@@ -2067,21 +2065,6 @@ impl<B: BloodborneBackend> ClientLoop<B> {
             Some(value) => value,
             None => match self.backend.observe_stack_quantity(normalized, None)? {
                 StackObservation::Quantity(value) => {
-                    // This is a live observation before any native command is
-                    // published. Do not persist a binding baseline at cap:
-                    // a crash in that gap would make replay ambiguous.
-                    if value >= 20
-                        && (normalized == BLOOD_VIAL_NORMALIZED_ID
-                            || normalized
-                                == (GOODS_NORMALIZED_PREFIX | QUICKSILVER_BULLET_GOODS_ID))
-                    {
-                        let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
-                        slot.pending_sustain.insert(location, None);
-                        slot.deferred_sustain_capacity.insert(location);
-                        self.ledger.save(&self.ledger_path)?;
-                        self.sustain_pending_polls = None;
-                        return Ok(SustainPollResult::Pending);
-                    }
                     self.ledger
                         .slot_mut(&self.seed_name, &self.slot_name)
                         .pending_sustain
@@ -2131,6 +2114,21 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                     self.sustain_pending_polls = None;
                     client_eprintln!(
                         "Vial sustain for location {public_location} deferred until one Vial is owned; AP items and other sustain awards continue."
+                    );
+                    return Ok(SustainPollResult::Pending);
+                }
+                if let Some(failure) = error.downcast_ref::<GrantTerminalFailure>()
+                    && failure.detail.contains("storage_retry_exhausted")
+                {
+                    let slot = self.ledger.slot_mut(&self.seed_name, &self.slot_name);
+                    slot.pending_sustain.insert(location, None);
+                    slot.blocked_sustain_storage
+                        .insert(location, failure.detail.clone());
+                    self.ledger.save(&self.ledger_path)?;
+                    self.sustain_pending_polls = None;
+                    client_eprintln!(
+                        "Storage delivery for sustain location {public_location} exhausted 3 retries; reward retained for manual recovery: {}",
+                        failure.detail
                     );
                     return Ok(SustainPollResult::Pending);
                 }
@@ -2773,22 +2771,6 @@ impl<B: BloodborneBackend> ClientLoop<B> {
                         pending.reinforcement_level,
                     )? {
                         StackObservation::Quantity(observed) => {
-                            if pending.item_category == 4
-                                && pending.normalized_item_id == BLOOD_VIAL_NORMALIZED_ID
-                                && observed > 0
-                                && observed.saturating_add(pending.quantity) > 20
-                            {
-                                let tag = grant_tag(item.index);
-                                return self.park_terminal_grant(
-                                    item,
-                                    &pending,
-                                    GrantTerminalFailure {
-                                        tag: tag.clone(),
-                                        status: "vial_capacity".into(),
-                                        detail: vial_capacity_detail(&tag),
-                                    },
-                                );
-                            }
                             self.ledger
                                 .slot_mut(&self.seed_name, &self.slot_name)
                                 .record_observed_before(observed)?;
@@ -5678,7 +5660,7 @@ mod tests {
     }
 
     #[test]
-    fn full_pouch_keeps_vial_and_bullet_sustain_owed_until_each_has_room() {
+    fn full_pouch_sends_vial_and_bullet_sustain_to_storage() {
         let ledger_path = path();
         let mut cfg = config();
         cfg.locations[0].vanilla_award_suppressed = true;
@@ -5688,18 +5670,46 @@ mod tests {
         bullet.normalized_item_id = bullet_id;
         cfg.sustain_items = vec![vial(), bullet];
         let mut backend = MockBackend::default();
+        backend.route_grant_to_storage("sustain_vial_1000");
+        backend.route_grant_to_storage("sustain_1000");
         backend
             .inventory
             .insert((BLOOD_VIAL_NORMALIZED_ID, None), 20);
         backend.inventory.insert((bullet_id, None), 20);
         let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
         client.queue_sustain_for_checks(&[1000]).unwrap();
-        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Pending);
-        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Pending);
+        assert_eq!(
+            client.poll_sustain().unwrap(),
+            SustainPollResult::Completed(1000)
+        );
+        assert_eq!(
+            client.poll_sustain().unwrap(),
+            SustainPollResult::Completed(1000)
+        );
         assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Idle);
+        assert_eq!(
+            client.backend().inventory[&(BLOOD_VIAL_NORMALIZED_ID, None)],
+            20
+        );
+        assert_eq!(client.backend().inventory[&(bullet_id, None)], 20);
         let slot = client.ledger().slot("seed", "slot").unwrap();
-        assert_eq!(slot.deferred_sustain_capacity.len(), 2);
-        assert!(slot.completed_sustain.is_empty());
+        assert!(slot.deferred_sustain_capacity.is_empty());
+        assert!(slot.completed_sustain.contains(&-1000));
+        assert!(slot.completed_sustain.contains(&1000));
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn a_new_vial_grant_at_cap_reaches_storage_without_a_capacity_park() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.items.insert(2000, vial());
+        let mut backend = MockBackend::default();
+        backend
+            .inventory
+            .insert((BLOOD_VIAL_NORMALIZED_ID, None), 20);
+        backend.route_grant_to_storage("ap_0");
+        let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
         assert!(matches!(
             client
                 .poll_items(&[IncomingItem {
@@ -5709,11 +5719,50 @@ mod tests {
                 .unwrap(),
             ItemPollResult::Completed(_)
         ));
+        assert_eq!(
+            client.backend().inventory[&(BLOOD_VIAL_NORMALIZED_ID, None)],
+            20
+        );
+        assert_eq!(
+            client.backend().storage[&(BLOOD_VIAL_NORMALIZED_ID, None)],
+            1
+        );
+        assert!(
+            client
+                .ledger()
+                .slot("seed", "slot")
+                .unwrap()
+                .deferred_vial_ap
+                .is_empty()
+        );
+        std::fs::remove_file(ledger_path).unwrap();
+    }
 
-        client
-            .backend_mut()
+    #[test]
+    fn legacy_capacity_queue_drains_at_cap_after_upgrade() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        cfg.sustain_items = vec![vial()];
+        let mut backend = MockBackend::default();
+        backend
             .inventory
-            .insert((BLOOD_VIAL_NORMALIZED_ID, None), 19);
+            .insert((BLOOD_VIAL_NORMALIZED_ID, None), 20);
+        backend.route_grant_to_storage("sustain_vial_1000");
+        let mut ledger = ReceiveLedger::default();
+        let slot = ledger.slot_mut("seed", "slot");
+        slot.pending_sustain.insert(-1000, None);
+        slot.deferred_sustain_capacity.insert(-1000);
+        // Previous releases have no blocked_sustain_storage field.
+        ledger.save(&ledger_path).unwrap();
+        let old_json = std::fs::read_to_string(&ledger_path).unwrap();
+        assert!(!old_json.contains("blocked_sustain_storage"));
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::load(&ledger_path).unwrap(),
+            ledger_path.clone(),
+            cfg,
+        );
         assert_eq!(
             client.poll_sustain().unwrap(),
             SustainPollResult::Completed(1000)
@@ -5722,17 +5771,47 @@ mod tests {
             client.backend().inventory[&(BLOOD_VIAL_NORMALIZED_ID, None)],
             20
         );
-        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Idle);
-        client.backend_mut().inventory.insert((bullet_id, None), 19);
-        assert_eq!(
-            client.poll_sustain().unwrap(),
-            SustainPollResult::Completed(1000)
-        );
-        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Idle);
         let slot = client.ledger().slot("seed", "slot").unwrap();
         assert!(slot.deferred_sustain_capacity.is_empty());
-        assert!(slot.completed_sustain.contains(&-1000));
-        assert!(slot.completed_sustain.contains(&1000));
+        assert!(slot.blocked_sustain_storage.is_empty());
+        std::fs::remove_file(ledger_path).unwrap();
+    }
+
+    #[test]
+    fn exhausted_sustain_storage_is_retained_across_restart() {
+        let ledger_path = path();
+        let mut cfg = config();
+        cfg.locations[0].vanilla_award_suppressed = true;
+        cfg.sustain_items = vec![vial()];
+        let mut backend = MockBackend::default();
+        backend.exhaust_storage_retries("sustain_vial_1000");
+        backend
+            .inventory
+            .insert((BLOOD_VIAL_NORMALIZED_ID, None), 20);
+        let mut client = loop_with(
+            backend,
+            ReceiveLedger::default(),
+            ledger_path.clone(),
+            cfg.clone(),
+        );
+        client.queue_sustain_for_checks(&[1000]).unwrap();
+        assert_eq!(client.poll_sustain().unwrap(), SustainPollResult::Pending);
+        let mut restarted = loop_with(
+            client.backend().clone(),
+            ReceiveLedger::load(&ledger_path).unwrap(),
+            ledger_path.clone(),
+            cfg,
+        );
+        // The other bonus can still flow while the failed storage reward is retained.
+        assert_eq!(
+            restarted.poll_sustain().unwrap(),
+            SustainPollResult::Completed(1000)
+        );
+        assert_eq!(restarted.poll_sustain().unwrap(), SustainPollResult::Idle);
+        let slot = restarted.ledger().slot("seed", "slot").unwrap();
+        assert!(slot.pending_sustain.contains_key(&-1000));
+        assert!(slot.blocked_sustain_storage.contains_key(&-1000));
+        assert!(!slot.completed_sustain.contains(&-1000));
         std::fs::remove_file(ledger_path).unwrap();
     }
 
@@ -5814,13 +5893,15 @@ mod tests {
     }
 
     #[test]
-    fn vial_backlog_releases_one_award_per_available_pouch_space() {
+    fn vial_backlog_releases_into_storage_without_waiting_for_a_spend() {
         let ledger_path = path();
         let mut cfg = config();
         cfg.items.insert(2000, vial());
         cfg.items.insert(2001, vial());
         cfg.items.insert(2002, goods());
         let mut backend = MockBackend::default();
+        backend.route_grant_to_storage("ap_0");
+        backend.route_grant_to_storage("ap_1");
         backend.refuse_absent_vial("ap_0");
         backend.refuse_absent_vial("ap_1");
         let mut client = loop_with(backend, ReceiveLedger::default(), ledger_path.clone(), cfg);
@@ -5854,21 +5935,6 @@ mod tests {
             .backend_mut()
             .inventory
             .insert((BLOOD_VIAL_NORMALIZED_ID, None), 20);
-        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Idle);
-        assert_eq!(
-            client
-                .ledger()
-                .slot("seed", "slot")
-                .unwrap()
-                .deferred_vial_ap
-                .len(),
-            2
-        );
-
-        client
-            .backend_mut()
-            .inventory
-            .insert((BLOOD_VIAL_NORMALIZED_ID, None), 19);
         assert!(matches!(
             client.poll_items(&received).unwrap(),
             ItemPollResult::Completed(CompletedItem { index: 0, .. })
@@ -5886,11 +5952,6 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(client.poll_items(&received).unwrap(), ItemPollResult::Idle);
-        client
-            .backend_mut()
-            .inventory
-            .insert((BLOOD_VIAL_NORMALIZED_ID, None), 19);
         assert!(matches!(
             client.poll_items(&received).unwrap(),
             ItemPollResult::Completed(CompletedItem { index: 1, .. })

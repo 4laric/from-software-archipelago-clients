@@ -396,6 +396,13 @@ impl MockBackend {
         self.terminal_failures.insert(tag.into(), status.into());
     }
 
+    pub fn exhaust_storage_retries(&mut self, tag: impl Into<String>) {
+        let tag = tag.into();
+        self.terminal_failures.insert(tag.clone(), "failed".into());
+        self.terminal_failure_details
+            .insert(tag, "storage_retry_exhausted".into());
+    }
+
     pub fn refuse_absent_vial(&mut self, tag: impl Into<String>) {
         let tag = tag.into();
         self.terminal_failures.insert(tag.clone(), "failed".into());
@@ -608,8 +615,13 @@ impl BloodborneBackend for MockBackend {
             grant.expected_before,
             current
         );
-        self.inventory
-            .insert(key, current.saturating_add(grant.quantity));
+        if self.storage_routed.contains(&grant.tag) {
+            let stored = self.storage.entry(key).or_default();
+            *stored = stored.saturating_add(grant.quantity);
+        } else {
+            self.inventory
+                .insert(key, current.saturating_add(grant.quantity));
+        }
         self.grants.push(grant.clone());
         self.completed_grants.insert(grant.tag.clone());
         Ok(OperationProgress::Complete)

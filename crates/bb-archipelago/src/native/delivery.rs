@@ -36,11 +36,15 @@
 //! with the Python reference and so a native backend and the file bridge speak
 //! one status vocabulary.
 
+use std::time::{Duration, Instant};
+
 use super::contract::{DescriptorFormula, Policy};
 use super::descriptor::ItemGrantDescriptor;
 
 /// `0xFFFFFFFF`: the empty/none slot sentinel the cave and cells use.
 pub const EMPTY_SLOT: u32 = 0xFFFF_FFFF;
+/// Three additional attempts, after 1, 2 and 4 seconds.
+const STORAGE_RETRY_LIMIT: u32 = 3;
 /// Goods id of the Blood Vial; the absent-insert of this id is refused.
 pub const BLOOD_VIAL_GOODS_ID: u32 = 0x3E8;
 
@@ -358,6 +362,8 @@ pub struct GrantSession<R: Runtime> {
     /// lane: the game's own grant routine fills the held stack and routes the
     /// rest to the Hunter's Dream storage box. The delta lane would clamp it.
     storage_route: bool,
+    storage_retries: u32,
+    storage_retry_at: Option<Instant>,
     /// Passive forensics for the current grant (clients#445). Written on every
     /// transition, read by nothing inside this module.
     trace: GrantTrace,
@@ -394,6 +400,8 @@ impl<R: Runtime> GrantSession<R> {
             instance_insert: false,
             replanned: false,
             storage_route: false,
+            storage_retries: 0,
+            storage_retry_at: None,
             trace: GrantTrace::default(),
         }
     }
@@ -489,6 +497,8 @@ impl<R: Runtime> GrantSession<R> {
         self.instance_insert = false;
         self.replanned = false;
         self.storage_route = false;
+        self.storage_retries = 0;
+        self.storage_retry_at = None;
         self.expected_before = command.expected_before;
         let detail = format!("tag={}", command.tag);
         self.trace = GrantTrace::begin(&command);
@@ -500,8 +510,12 @@ impl<R: Runtime> GrantSession<R> {
 
     /// Advance the machine one poll and return the new status.
     pub fn poll(&mut self) -> String {
+        self.poll_at(Instant::now())
+    }
+
+    fn poll_at(&mut self, now: Instant) -> String {
         if self.active {
-            return self.poll_active();
+            return self.poll_active(now);
         }
         if self.command.is_none() {
             return self.state.status.clone();
@@ -509,10 +523,16 @@ impl<R: Runtime> GrantSession<R> {
         if self.state.is_terminal() {
             return self.state.status.clone();
         }
+        if let Some(deadline) = self.storage_retry_at {
+            if now < deadline {
+                return self.state.status.clone();
+            }
+            self.storage_retry_at = None;
+        }
         self.poll_pending()
     }
 
-    fn poll_active(&mut self) -> String {
+    fn poll_active(&mut self, now: Instant) -> String {
         let command = self.command.clone().expect("active implies a command");
         if !self.runtime.native_done() {
             return self.set(
@@ -558,7 +578,9 @@ impl<R: Runtime> GrantSession<R> {
             || (!self.delta_lane
                 && record.normalized_id == Some(command.normalized_id)
                 && record.quantity.is_some_and(|q| q >= command.quantity));
-        if !slot_verified && actual != Some(wanted) {
+        if !slot_verified
+            && (actual != Some(wanted) || (self.storage_route && native_result == EMPTY_SLOT))
+        {
             // clients#613: an INSERT the game refused (`done`, result cell
             // still the sentinel) while a stack of this id exists NOW. Jennifer's
             // live park, verbatim:
@@ -607,14 +629,35 @@ impl<R: Runtime> GrantSession<R> {
                 );
             }
             // A storage-routed insert the game refused did not apply. Re-planning
-            // it as a delta would clamp at the cap and lose the surplus, so it
-            // parks as a refusal instead; the sentinel makes it a requeue
-            // candidate, not a delivered item.
+            // it as a delta would clamp at the cap and lose the surplus. Retry
+            // only this witnessed refusal, on the same insert lane, with bounded
+            // backoff. Exhaustion is a manual-recovery park, not startup work.
             if self.storage_route && native_result == EMPTY_SLOT {
+                if self.storage_retries < STORAGE_RETRY_LIMIT {
+                    let delay = Duration::from_secs(1 << self.storage_retries);
+                    self.storage_retries += 1;
+                    self.storage_retry_at = Some(now + delay);
+                    self.runtime.clear_request();
+                    self.active = false;
+                    // The refused call did not apply. Sample a fresh baseline on
+                    // retry, but keep the storage-capable insert lane latched.
+                    self.expected_before = None;
+                    self.command.as_mut().unwrap().expected_before = None;
+                    return self.set(
+                        "storage_retry_wait",
+                        format!(
+                            "tag={} storage insert refused; retry {}/{} in {}s",
+                            command.tag,
+                            self.storage_retries,
+                            STORAGE_RETRY_LIMIT,
+                            delay.as_secs()
+                        ),
+                    );
+                }
                 return self.finish(
                     "failed",
                     format!(
-                        "tag={} storage-overflow insert refused by the game: expected_after={wanted} actual={actual:?} native_result={native_result}; nothing was delivered",
+                        "tag={} storage-overflow insert refused by the game; storage_retry_exhausted after {STORAGE_RETRY_LIMIT} retries: expected_after={wanted} actual={actual:?} native_result={native_result}; nothing was delivered",
                         command.tag
                     ),
                 );
@@ -861,10 +904,11 @@ impl<R: Runtime> GrantSession<R> {
         // game's own ItemGrant fills the held stack and sends the rest to the
         // storage box (oz, 2026-08-29), so an overflowing grant takes the insert
         // lane instead.
-        if delta
-            && self
-                .hold_cap(command.normalized_id)
-                .is_some_and(|cap| wanted > cap)
+        if self.storage_route
+            || (delta
+                && self
+                    .hold_cap(command.normalized_id)
+                    .is_some_and(|cap| wanted > cap))
         {
             delta = false;
             self.storage_route = true;
@@ -1681,15 +1725,61 @@ mod tests {
         session
             .submit(goods_command(0x384, 1, "ap_refused", Some(20)), false)
             .unwrap();
-        assert_eq!(session.poll(), "executing");
-        assert_eq!(session.poll(), "failed", "state: {:?}", session.state());
-        assert!(
-            session
-                .state()
-                .detail
-                .contains("storage-overflow insert refused")
-        );
+        let mut now = Instant::now();
+        assert_eq!(session.poll_at(now), "executing");
+        for seconds in [1, 2, 4] {
+            assert_eq!(session.poll_at(now), "storage_retry_wait");
+            assert_eq!(
+                session.poll_at(now + Duration::from_millis(seconds * 1000 - 1)),
+                "storage_retry_wait"
+            );
+            assert!(session.runtime_mut().queued.is_none());
+            now += Duration::from_secs(seconds);
+            assert_eq!(session.poll_at(now), "executing");
+            let queued = session.runtime_mut().queued.unwrap();
+            assert_eq!((queued.2, queued.3), (None, None));
+        }
+        assert_eq!(session.poll_at(now), "failed");
+        assert!(session.state().detail.contains("storage_retry_exhausted"));
+        assert_eq!(session.poll_at(now + Duration::from_secs(100)), "failed");
+        assert!(session.runtime_mut().queued.is_none());
         assert!(!session.trace().replanned_to_delta);
+    }
+
+    #[test]
+    fn a_refused_vial_insert_can_succeed_in_storage_on_retry() {
+        let normalized = contract().descriptor.goods_normalized_prefix | BLOOD_VIAL_GOODS_ID;
+        let runtime = FakeRuntime {
+            complete_without_applying: true,
+            report_no_result: true,
+            ..FakeRuntime::default().with_stack(
+                normalized,
+                StackView {
+                    quantity: 20,
+                    exists: true,
+                    slot: Some(3),
+                    quantity_address: Some(0x1000),
+                },
+            )
+        };
+        let mut session = session(runtime);
+        session
+            .submit(
+                goods_command(BLOOD_VIAL_GOODS_ID, 1, "ap_vial", Some(20)),
+                false,
+            )
+            .unwrap();
+        let now = Instant::now();
+        assert_eq!(session.poll_at(now), "executing");
+        assert_eq!(session.poll_at(now), "storage_retry_wait");
+        session.runtime_mut().report_no_result = false;
+        assert_eq!(session.poll_at(now + Duration::from_secs(1)), "executing");
+        assert_eq!(session.trace().lane, Some("insert"));
+        assert_eq!(session.poll_at(now + Duration::from_secs(1)), "completed");
+        assert_eq!(session.runtime_mut().stacks[&normalized].quantity, 20);
+        assert_eq!(session.storage_retries, 1);
+        assert_eq!(session.poll_at(now + Duration::from_secs(100)), "completed");
+        assert!(session.runtime_mut().queued.is_none());
     }
 
     /// A goods id with no hold-cap entry (a key item such as the Third
