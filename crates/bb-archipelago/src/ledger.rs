@@ -42,6 +42,7 @@ pub struct SlotLedger {
     /// AP Vial grants refused before native execution. They remain parked so
     /// later AP indices can progress, then re-enter the ordered queue only
     /// after a Vial stack is observed and the native refusal is released.
+    /// The stack need not have room: native insert handles storage overflow.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub deferred_vial_ap: BTreeSet<u64>,
     /// Randomized fixed pickups whose one-bullet sustain award has been
@@ -56,9 +57,13 @@ pub struct SlotLedger {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub deferred_sustain_vials: BTreeSet<i64>,
     /// Sustain Vials or Bullets observed at their held cap before publication.
-    /// They are owed, but publishing at cap can fail or lose the bonus.
+    /// Legacy queue, drained through native storage overflow on upgrade.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub deferred_sustain_capacity: BTreeSet<i64>,
+    /// Storage insert exhausted its bounded retries. Keep the reward owed,
+    /// with its diagnostic, without restarting automatic delivery on launch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub blocked_sustain_storage: BTreeMap<i64, String>,
     /// A legacy retired Vial bonus is imported from diagnostics at most once.
     /// Its old refusal record must not resurrect a later completed delivery.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -605,7 +610,9 @@ impl SlotLedger {
                 Self::park_detail(item).is_some_and(|d| d.ends_with("quantity write failed"))
             }
             Some("failed") => Self::park_detail(item).is_some_and(|d| {
-                d.contains("expected_after=") && d.contains("native_result=4294967295")
+                d.contains("expected_after=")
+                    && d.contains("native_result=4294967295")
+                    && !d.contains("storage_retry_exhausted")
             }),
             _ => false,
         }
@@ -1223,6 +1230,22 @@ mod tests {
         let recovered = slot.requeue_now_compatible_parks(|_| true);
         assert_eq!(recovered.requeued, vec![0]);
         assert_eq!(slot.next_index(), 0);
+    }
+
+    #[test]
+    fn exhausted_storage_retries_stay_parked_after_serialization() {
+        let mut slot = SlotLedger::default();
+        park_with(
+            &mut slot,
+            0,
+            "failed",
+            "tag=ap_0 storage_retry_exhausted expected_after=21 native_result=4294967295",
+        );
+        let mut loaded: SlotLedger = json::from_str(&json::to_string(&slot).unwrap()).unwrap();
+        assert!(loaded.requeue_fixed_cause_parks().requeued.is_empty());
+        assert_eq!(loaded.blocked_entries().count(), 1);
+        loaded.requeue_blocked(0).unwrap();
+        assert_eq!(loaded.next_index(), 0);
     }
 
     /// clients#613: a goods-lane `failed` with the result cell still the

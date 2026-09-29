@@ -2,6 +2,15 @@
 
 ### Fixed
 
+* Deferred Blood Vials and full-pouch pickup bonuses now use native storage
+  overflow without waiting for the player to consume an item. Existing capacity
+  deferrals drain after upgrade. A refused storage insert gets three automatic
+  retries with 1, 2, and 4 second backoff, using the insert lane throughout.
+  Exhausted AP grants stay parked for manual retry; exhausted pickup bonuses
+  stay recorded as owed instead of being retired as completed. Absent Vial
+  records still wait for one owned Vial because the absent-insert path remains
+  unvalidated. Native storage acceptance still needs a live-game check.
+
 * **Consumables that overflow their hold cap now go to the storage box.**
   A Blood Vial into a stack of 20, or Molotov Cocktails x2 into 10, ran on the
   existing-stack delta, which clamps at the cap and drops the rest, then parked
