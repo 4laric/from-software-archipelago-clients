@@ -279,10 +279,6 @@ unsafe extern "C" fn esd_invoke_detour(this: *mut c_void, event: *const EzStateE
         if this.is_null() || event.is_null() {
             return;
         }
-        // Record EVERY valid talk dispatch before interpreting it. This is the inventory-stability
-        // seam; it covers the Twin Maiden hand-in commands as well as the shop-open command whose
-        // id we understand.
-        LAST_TALK_ACTIVITY_MS.store(talk_clock_ms(), Ordering::Relaxed);
         // SAFETY: non-null checked; both pointers are the game's own live objects for this call,
         // read-only, and not retained past this frame.
         let (talk_id, event_ref) = unsafe {
@@ -290,17 +286,24 @@ unsafe extern "C" fn esd_invoke_detour(this: *mut c_void, event: *const EzStateE
             (talk_id, &*event)
         };
         let event_id = event_ref.id();
-        // Remember it (2026-09-06): the reconciler's key-list delta line names this command.
-        // Bounded on `args.len()`, never on `arg()`'s own answer (see the shop-hints note below).
-        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut args = [0i32; 4];
-            let n = event_ref.args.len().min(4);
-            for (i, slot) in args.iter_mut().enumerate().take(n) {
-                if let Some(v) = event_ref.arg(i as u32) {
-                    *slot = i32::from(v);
-                }
+        let mut args = [0i32; 4];
+        let n = event_ref.args.len().min(4);
+        for (i, slot) in args.iter_mut().enumerate().take(n) {
+            // Bounded on `args.len()`, never on `arg()`'s own answer (see the shop-hints note below).
+            if let Some(v) = event_ref.arg(i as u32) {
+                *slot = i32::from(v);
             }
+        }
+        // Record every valid talk dispatch EXCEPT the idle poll. This is the inventory-stability
+        // seam; it covers the Twin Maiden hand-in commands as well as the shop-open command whose
+        // id we understand. The idle poll fires for as long as an NPC is loaded and would hold the
+        // goods gate shut for minutes (see `er_logic::esd_probe::is_idle_poll`), so it neither
+        // refreshes the quiet window nor overwrites the last-dispatch record that names a close.
+        let idle = er_logic::esd_probe::is_idle_poll(event_id, (n > 0).then_some(args[0]));
+        if !idle {
+            LAST_TALK_ACTIVITY_MS.store(talk_clock_ms(), Ordering::Relaxed);
+            // Remember it (2026-09-06): the reconciler's key-list delta line names this command.
+            DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut g) = LAST_DISPATCH.lock() {
                 *g = Some((talk_id, event_id, args));
             }
