@@ -89,6 +89,7 @@ console_commands! {
     SeamlessProbe => "!seamlessprobe" => "!seamlessprobe [start|stop]",
     Ability => "!ability" => "!ability [lock|unlock <name|all>]",
     Scaling => "!scaling" => "!scaling [seed|off|0..19]",
+    AutoEquip => "!autoequip" => "!autoequip [off|seed]",
     Help => "!help" => "!help",
     Respec => "!respec" => "!respec (experimental native rebirth)",
 }
@@ -855,6 +856,12 @@ impl shared::Core for Core {
             }
             ConsoleCommand::Scaling => {
                 let msg = crate::scaling::runtime_override_command(arg);
+                log::warn!("{msg}");
+                self.log(ap::Print::message(msg));
+                true
+            }
+            ConsoleCommand::AutoEquip => {
+                let msg = crate::auto_equip::runtime_override_command(arg);
                 log::warn!("{msg}");
                 self.log(ap::Print::message(msg));
                 true

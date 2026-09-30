@@ -1,5 +1,5 @@
 //! auto_equip -- when `options.auto_equip` is on, equip a received WEAPON, PROTECTOR or TALISMAN
-//! immediately.
+//! through a paced queue (at most one equipment/mixture change per 500ms).
 //!
 //! ## How equipping actually works on 2.6.2.0
 //!
@@ -84,14 +84,16 @@
 //! [flask potency]: crate::flask
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use eldenring::cs::{
     ChrAsm, ChrAsmEquipEntries, EquipGameData, EquipParamAccessory, EquipParamGoods,
     EquipParamProtector, EquipParamWeapon, GaitemHandle, GameDataMan, SoloParamRepository,
 };
 use er_logic::auto_equip::Equipable;
+use er_logic::equip_queue::{Attempt, Pacer, Recovery};
 use fromsoftware_shared::FromStatic;
 
 /// `ChrAsm::operator=` -- the refcounted commit. Per-version; see [`crate::rva_table`]. (The
@@ -180,6 +182,54 @@ fn is_physick_tear(full_id: i32) -> bool {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static RECOVERY: Mutex<Recovery> = Mutex::new(Recovery::Seed);
+static EQUIP_PACER: Mutex<Pacer> = Mutex::new(Pacer::new());
+
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn runtime_enabled() -> bool {
+    RECOVERY.lock().is_ok_and(|mode| mode.enabled(is_armed()))
+}
+
+/// Recovery is session-local and deliberately survives slot-data parsing/reconnect.
+/// Discard equip intentions, never inventory items or receive bookkeeping.
+pub fn runtime_override_command(arg: Option<&str>) -> String {
+    if let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) {
+        let Some(next) = Recovery::parse(arg) else {
+            return "usage: !autoequip [off|seed]".to_string();
+        };
+        let Ok(mut recovery) = RECOVERY.lock() else {
+            return "auto_equip: recovery state unavailable; automatic equips disabled".to_string();
+        };
+        *recovery = next;
+        if next == Recovery::Off {
+            if let Ok(mut q) = PENDING.lock() {
+                q.clear();
+            }
+            if let Ok(mut q) = PENDING_SPELLS.lock() {
+                q.clear();
+            }
+        }
+    }
+    runtime_override_status()
+}
+
+fn runtime_override_status() -> String {
+    if RECOVERY.lock().is_ok_and(|mode| *mode == Recovery::Seed) {
+        format!(
+            "auto_equip: SEED (seed enabled={}); equipment changes paced at {}ms",
+            is_armed(),
+            er_logic::equip_queue::INTERVAL_MS
+        )
+    } else {
+        "auto_equip: OFF for this game session, including reconnects; items still arrive, \
+         queued and new auto-equips are skipped. Use !autoequip seed to restore the seed setting"
+            .to_string()
+    }
+}
 
 /// Hold WEAPON equips only, without touching `ENABLED`.
 ///
@@ -279,7 +329,7 @@ pub fn set_enabled(on: bool) {
         );
         q.clear();
     }
-    if on {
+    if on && runtime_enabled() {
         // 🛑 THIS SENTENCE WAS FALSE FOR A DAY AND IT COST A BUG REPORT. It read "spells are NOT
         // covered" -- written before #440 -- and stayed put when #148 shipped the memory-slot
         // write. It is the ONLY thing the log says about spells, so a player whose spell did not
@@ -300,10 +350,11 @@ pub fn set_enabled(on: bool) {
              was on, or under a build that could not place it, stays where it is."
         );
     }
+    log::info!("{}", runtime_override_status());
 }
 
-/// Is the equip path live? Read back from the flag the queue drain actually gates on, so the
-/// answer cannot drift from the behaviour. See `feature_handshake`.
+/// Is the seed feature armed? Recovery suppresses execution separately: it must not make the
+/// feature handshake reject an otherwise supported seed just because the operator disabled equips.
 pub fn is_armed() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
@@ -452,7 +503,7 @@ static PENDING_SPELLS: Mutex<Vec<(i32, er_logic::spell_equip::SpellPos)>> = Mute
 /// Queue a received spell for its memory slot. Self-gates on the option, like [`enqueue`].
 /// `pos` is `None` for anything that is not a spell.
 pub fn enqueue_spell(full_id: i32, pos: Option<er_logic::spell_equip::SpellPos>) {
-    if !ENABLED.load(Ordering::Relaxed) {
+    if !runtime_enabled() {
         return;
     }
     let (Some(pos), Some(row)) = (pos, er_logic::physick::goods_row(full_id)) else {
@@ -490,7 +541,7 @@ pub fn tick_spells() {
     if crate::respec::busy() {
         return;
     }
-    if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
+    if !runtime_enabled() || !crate::flags::in_world() {
         return;
     }
     let pending: Vec<(i32, er_logic::spell_equip::SpellPos)> = match PENDING_SPELLS.lock() {
@@ -632,7 +683,7 @@ pub fn tick_spell_backfill() {
     if crate::respec::busy() {
         return;
     }
-    if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
+    if !runtime_enabled() || !crate::flags::in_world() {
         return;
     }
     let pending: Vec<BackfillEntry> = match SPELL_BACKFILL.lock() {
@@ -786,6 +837,11 @@ fn enqueue_inner(full_id: i32, talisman: Option<er_logic::auto_equip::TalismanPo
             }
         }
     };
+    // Consume tear ordinals even while recovery suppresses writes, so returning to SEED does
+    // not renumber later tears. Talisman/spell positions already come from the received stream.
+    if !runtime_enabled() {
+        return;
+    }
     let full_id = match raise {
         Raise::ToAutoUpgradeTarget => crate::upgrades::enqueue_upgrade_id(full_id),
         Raise::Never => full_id,
@@ -830,7 +886,11 @@ fn commit_fn(base: usize) -> Option<ChrAsmCommit> {
 /// existed, or the read-back disagreed. The caller persists success per seed so this never touches
 /// a returning player's manually curated loadout.
 pub fn normalize_starting_left_slots() -> Option<usize> {
-    if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
+    if !runtime_enabled() || !crate::flags::in_world() {
+        return None;
+    }
+    let mut pacer = EQUIP_PACER.lock().ok()?;
+    if !pacer.ready(now_ms()) {
         return None;
     }
     let commit = commit_fn(current_module_base()?)?;
@@ -902,6 +962,7 @@ pub fn normalize_starting_left_slots() -> Option<usize> {
     // SAFETY: signature-verified game copy-assignment, same call contract as the ordinary equip
     // path. It releases the outgoing handles and acquires the copied unarmed handle.
     unsafe { commit(live, &raw const src) };
+    pacer.record_change(now_ms());
 
     let settled = plan.clear_slots.iter().all(|&slot| {
         equipment.chr_asm.equipment_param_ids[slot as usize]
@@ -920,13 +981,21 @@ pub fn normalize_starting_left_slots() -> Option<usize> {
     Some(plan.clear_slots.len())
 }
 
-/// Per-tick until the pending queue drains. An item not yet in the bag stays queued for a later
-/// tick -- the grant and the receive are not ordered with respect to each other.
+/// Drain with a separate equip budget. An item not yet in the bag stays queued for a later
+/// tick -- the grant and the receive are not ordered with respect to each other. Long loads and
+/// reconnects cannot bank equip credit, even when all queued items are already in the bag.
 pub fn tick() {
     if crate::respec::busy() {
         return;
     }
-    if !ENABLED.load(Ordering::Relaxed) || !crate::flags::in_world() {
+    if !runtime_enabled() || !crate::flags::in_world() {
+        return;
+    }
+    let Ok(mut pacer) = EQUIP_PACER.lock() else {
+        return;
+    };
+    let now = now_ms();
+    if !pacer.ready(now) {
         return;
     }
     let pending: Vec<(i32, u64, u8)> = match PENDING.lock() {
@@ -1010,8 +1079,7 @@ pub fn tick() {
         )
         .collect();
 
-    let mut still_pending: Vec<(i32, u64, u8)> = Vec::new();
-    for (fid, ordinal, pouches) in pending {
+    let still_pending = pacer.drain(pending, now, |&(fid, ordinal, pouches)| {
         // WEAPONS HELD (#413): while a boss we armed for is on screen, a weapon arriving from
         // another world must not tear that tool out of the player's hands. The entry is HELD, not
         // dropped -- pushed straight back the same way an ungranted item is -- so it equips the
@@ -1025,13 +1093,11 @@ pub fn tick() {
                 Some(er_logic::auto_equip::Equipable::Weapon)
             )
         {
-            still_pending.push((fid, ordinal, pouches));
-            continue;
+            return Attempt::Retry;
         }
         let full = fid as u32;
         let Some(&(handle, inv_index)) = owned.get(&full) else {
-            still_pending.push((fid, ordinal, pouches)); // not granted yet -- retry next tick
-            continue;
+            return Attempt::Retry; // not granted yet -- retry next tick
         };
         let param_id = full & 0x0FFF_FFFF;
 
@@ -1040,7 +1106,7 @@ pub fn tick() {
         // `[OptionalItemId; 2]` and a dword store is the entire write.
         if er_logic::auto_equip::equipable(fid).is_none() {
             if !is_physick_tear(fid) {
-                continue; // `enqueue` gates this; belt and braces
+                return Attempt::Done; // `enqueue` gates this; belt and braces
             }
             let equipment = &mut pgd.equipment;
             let mixture = physick_mixture(equipment);
@@ -1048,7 +1114,7 @@ pub fn tick() {
                 // Already mixed. Idempotent on purpose -- the reconciler replays the whole received
                 // set on reconnect, and a slot rotation per replay would be a feature that eats
                 // itself.
-                continue;
+                return Attempt::Done;
             };
             let before = mixture[slot];
             write_physick_slot(equipment, slot, full);
@@ -1057,7 +1123,7 @@ pub fn tick() {
                  {slot} (was {before:#010x}, mixture now {:#010x?})",
                 physick_mixture(equipment)
             );
-            continue;
+            return Attempt::Changed;
         }
 
         let slot = match er_logic::auto_equip::equipable(fid) {
@@ -1082,7 +1148,7 @@ pub fn tick() {
                                 "auto_equip: weapon {full:#010x} wepType={t} is ammunition -- \
                                  delivered to the bag, not equipped (no verified quiver slot)"
                             );
-                            continue;
+                            return Attempt::Done;
                         };
                         slot
                     }
@@ -1107,7 +1173,7 @@ pub fn tick() {
                         "auto_equip: accessory {full:#010x} has no EquipParamAccessory row -- \
                          skipped"
                     );
-                    continue;
+                    return Attempt::Done;
                 }
 
                 // What is in the four talisman slots RIGHT NOW. A slot counts as empty when its
@@ -1134,7 +1200,7 @@ pub fn tick() {
                 else {
                     // Already worn. ER refuses duplicate talismans, so equipping a second copy
                     // would build a loadout the menu cannot produce.
-                    continue;
+                    return Attempt::Done;
                 };
                 // BOTH counts, every time. `pouches` is what decided the slot; `raw` is the game's
                 // own number and decides nothing. They should agree once the pouch grant has
@@ -1178,25 +1244,25 @@ pub fn tick() {
                 )
                 .map(|p| p.protector_category()) else {
                     log::debug!("auto_equip: protector {full:#010x} has no param row -- skipped");
-                    continue;
+                    return Attempt::Done;
                 };
                 let Some(slot) = er_logic::auto_equip::slot_for_protector_category(cat) else {
                     log::debug!(
                         "auto_equip: protector {full:#010x} protectorCategory={cat} is not an \
                          equippable slot -- skipped"
                     );
-                    continue;
+                    return Attempt::Done;
                 };
                 slot
             }
-            None => continue, // queue() gates this, belt and braces
+            None => return Attempt::Done, // queue() gates this, belt and braces
         };
         let idx = slot as usize;
 
         let equipment = &mut pgd.equipment;
         // Already in that slot -- nothing to do, and re-committing would churn refcounts.
         if equipment.chr_asm.equipment_param_ids[idx] == param_id as i32 {
-            continue;
+            return Attempt::Done;
         }
 
         // (3) the FullID array: plain ItemIds, no refcounting, indexed by ChrAsmSlot.
@@ -1236,9 +1302,47 @@ pub fn tick() {
             "auto_equip: slot {slot} <- {full:#010x} (param {param_id}, handle {handle:?}, \
              inv_index {inv_index})"
         );
-    }
+        Attempt::Changed
+    });
 
     if let Ok(mut q) = PENDING.lock() {
         *q = still_pending;
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn console_off_before_connect_survives_reconnect_and_clears_equip_intentions() {
+        set_enabled(false);
+        PENDING.lock().unwrap().push((0x10002710, 7, 2));
+        PENDING_SPELLS.lock().unwrap().push((
+            4000,
+            er_logic::spell_equip::SpellPos {
+                ordinal: 7,
+                stones: 2,
+            },
+        ));
+        assert!(runtime_override_command(Some("off")).contains("OFF"));
+        assert!(PENDING.lock().unwrap().is_empty());
+        assert!(PENDING_SPELLS.lock().unwrap().is_empty());
+        assert!(!runtime_enabled());
+        for seed in [true, false, true] {
+            set_enabled(seed);
+            assert_eq!(
+                is_armed(),
+                seed,
+                "recovery must not fail the feature handshake"
+            );
+            assert!(!runtime_enabled());
+        }
+        assert!(runtime_override_command(Some("off typo")).starts_with("usage:"));
+        assert!(runtime_override_command(None).contains("OFF"));
+        assert!(runtime_override_command(Some("seed")).contains("SEED"));
+        assert!(runtime_enabled());
+        set_enabled(false);
+        assert!(!runtime_enabled());
     }
 }
