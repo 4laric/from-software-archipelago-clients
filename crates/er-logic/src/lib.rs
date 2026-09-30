@@ -40,6 +40,7 @@ pub mod deathlink_gate_replay;
 pub mod downstate_watch;
 pub mod enemy_drop_watch;
 pub mod equip_load;
+pub mod equip_queue;
 pub mod esd_probe;
 pub mod fast_travel;
 pub mod fast_travel_replay;
