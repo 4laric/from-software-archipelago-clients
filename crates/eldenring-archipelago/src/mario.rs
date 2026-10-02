@@ -1,5 +1,8 @@
 //! Thin dynamic ABI adapter. Never loads a DLL or calls SM64 from the AP thread.
-use er_logic::mario::{ABI_VERSION, Config, Fludd, FluddState, Session, Stats, StatsState};
+use er_logic::mario::{
+    ABI_VERSION, Addon, AddonConfig, AddonState, Config, Fludd, FluddState, Session, Stats,
+    StatsState,
+};
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleExA, GetProcAddress};
 use windows::core::s;
@@ -9,6 +12,26 @@ type Version = unsafe extern "C" fn() -> u32;
 type Set = unsafe extern "C" fn(u32, u32) -> u32;
 type Get = unsafe extern "C" fn(*mut State) -> u32;
 type GetStats = unsafe extern "C" fn(*mut StatsState) -> u32;
+type GetAddon = unsafe extern "C" fn(*mut AddonState) -> u32;
+struct AddonBridge {
+    set: Set,
+    get: GetAddon,
+}
+impl AddonBridge {
+    fn state(&self) -> Result<AddonState, String> {
+        let mut state = AddonState::default();
+        if unsafe { (self.get)(&mut state) } != 1 || state.abi_version != ABI_VERSION {
+            return Err("Mario progression paused: addon state read-back failed".into());
+        }
+        Ok(state)
+    }
+    fn set(&self, expected: AddonConfig) -> Result<(), String> {
+        if unsafe { (self.set)(u32::from(expected.enabled), expected.unlocked) } != 1 {
+            return Err("Mario progression paused: addon update was rejected".into());
+        }
+        Ok(())
+    }
+}
 type SetFludd = unsafe extern "C" fn(u32, u32, u32) -> u32;
 type GetFludd = unsafe extern "C" fn(*mut FluddState) -> u32;
 struct FluddBridge {
@@ -69,6 +92,7 @@ struct Bridge {
     get: Get,
     stats: Option<StatsBridge>,
     fludd: Option<FluddBridge>,
+    addons: [Option<AddonBridge>; 2],
 }
 impl Bridge {
     fn discover() -> Result<Self, String> {
@@ -121,12 +145,38 @@ impl Bridge {
             }),
             _ => None,
         };
+        let addons = [
+            (
+                s!("er_mario_ap_set_cappy"),
+                s!("er_mario_ap_get_cappy_state"),
+            ),
+            (
+                s!("er_mario_ap_set_sonic"),
+                s!("er_mario_ap_get_sonic_state"),
+            ),
+        ]
+        .map(|(set_name, get_name)| {
+            match (unsafe { GetProcAddress(module.0, set_name) }, unsafe {
+                GetProcAddress(module.0, get_name)
+            }) {
+                (Some(set), Some(get)) => Some(AddonBridge {
+                    set: unsafe {
+                        std::mem::transmute::<unsafe extern "system" fn() -> isize, Set>(set)
+                    },
+                    get: unsafe {
+                        std::mem::transmute::<unsafe extern "system" fn() -> isize, GetAddon>(get)
+                    },
+                }),
+                _ => None,
+            }
+        });
         Ok(Self {
             _module: module,
             set,
             get,
             stats,
             fludd,
+            addons,
         })
     }
     fn state(&self) -> Result<State, String> {
@@ -147,6 +197,8 @@ pub struct Runtime {
     acknowledged_stats: Option<Stats>,
     last_fludd_acknowledgment: Option<Fludd>,
     acknowledged_fludd: Option<Fludd>,
+    acknowledged_addons: [Option<AddonConfig>; 2],
+    last_addon_acknowledgment: [Option<AddonConfig>; 2],
     warning: Option<String>,
     warning_shown_at_ms: u64,
 }
@@ -158,6 +210,9 @@ impl Runtime {
             config.validate_bridge_features(&bridge.state()?)?;
             config.validate_stats_exports(bridge.stats.is_some())?;
             config.validate_fludd_exports(bridge.fludd.is_some())?;
+            for addon in Addon::ALL {
+                config.validate_addon_exports(addon, bridge.addons[addon.index()].is_some())?;
+            }
         } else if let Ok(bridge) = Bridge::discover() {
             // Vanilla progression never depends on an optional Mario bridge. Queue the normal
             // baseline once at connection, so a previously active stat seed cannot leak its caps.
@@ -173,6 +228,16 @@ impl Runtime {
                     "Could not disable optional Mario FLUDD for vanilla connection: {error}"
                 );
             }
+            for addon in Addon::ALL {
+                if let Some(bridge) = &bridge.addons[addon.index()]
+                    && let Err(error) = bridge.set(AddonConfig::default())
+                {
+                    log::warn!(
+                        "Could not disable optional {} for vanilla connection: {error}",
+                        addon.feature()
+                    );
+                }
+            }
         }
         if self.session.identity.as_ref() != Some(&identity) || self.session.config != config {
             self.applied = false;
@@ -181,6 +246,8 @@ impl Runtime {
             self.acknowledged_stats = None;
             self.last_fludd_acknowledgment = None;
             self.acknowledged_fludd = None;
+            self.acknowledged_addons = [None; 2];
+            self.last_addon_acknowledgment = [None; 2];
         }
         self.session.configure(identity, config);
         Ok(())
@@ -221,11 +288,21 @@ impl Runtime {
                 .is_some_and(|c| c.fludd_items.is_some())
             && self.acknowledged_fludd == Some(self.session.expected_fludd())
     }
+    pub fn addon_armed(&self, addon: Addon) -> bool {
+        self.armed()
+            && self
+                .session
+                .config
+                .as_ref()
+                .is_some_and(|c| c.addon_enabled(addon))
+            && self.acknowledged_addons[addon.index()] == Some(self.session.expected_addon(addon))
+    }
     pub fn refresh(&mut self) -> Result<(), String> {
         let result = self.refresh_bridge();
         if result.is_err() {
             self.last_acknowledgment = None;
             self.last_fludd_acknowledgment = None;
+            self.last_addon_acknowledgment = [None; 2];
         } else if let Some(config) = &self.session.config {
             let masks = (
                 config.managed,
@@ -261,6 +338,18 @@ impl Runtime {
                 );
                 self.last_fludd_acknowledgment = Some(expected);
             }
+            for addon in Addon::ALL {
+                let expected = self.acknowledged_addons[addon.index()];
+                if expected.is_some() && self.last_addon_acknowledgment[addon.index()] != expected {
+                    log::info!(
+                        "Mario {} worker acknowledged: identity={:?}, configuration={:?}",
+                        addon.feature(),
+                        self.session.identity,
+                        expected
+                    );
+                    self.last_addon_acknowledgment[addon.index()] = expected;
+                }
+            }
         }
         result
     }
@@ -281,6 +370,9 @@ impl Runtime {
         config.validate_bridge_features(&state)?;
         config.validate_stats_exports(bridge.stats.is_some())?;
         config.validate_fludd_exports(bridge.fludd.is_some())?;
+        for addon in Addon::ALL {
+            config.validate_addon_exports(addon, bridge.addons[addon.index()].is_some())?;
+        }
         let expected = self.session.unlocked;
         // Setter queues only on changed state. Waiting for worker acknowledgment is intentional:
         // seeing exports alone does not prove the actual action gate is enforcing the seed.
@@ -313,9 +405,25 @@ impl Runtime {
                 .set(self.session.expected_fludd())?;
             pending = true;
         }
+        let mut addon_acknowledged = true;
+        let mut addon_snapshots = [None; 2];
+        for addon in Addon::ALL {
+            let expected = self.session.expected_addon(addon);
+            if let Some(bridge) = &bridge.addons[addon.index()] {
+                let state = bridge.state()?;
+                if !state.matches(expected) {
+                    bridge.set(expected)?;
+                    pending = true;
+                }
+                addon_acknowledged &= state.acknowledged(expected);
+                addon_snapshots[addon.index()] = Some(expected);
+            } else {
+                addon_acknowledged &= !config.addon_enabled(addon);
+            }
+        }
         if pending {
             return Err(
-                "Mario progression paused: waiting for capability/stat/FLUDD worker acknowledgment"
+                "Mario progression paused: waiting for capability/stat/FLUDD/addon worker acknowledgment"
                     .into(),
             );
         }
@@ -324,10 +432,12 @@ impl Runtime {
             stats.as_ref(),
             expected,
             self.session.expected_stats(),
-        ) || !match fludd {
-            Some(state) => state.acknowledged(self.session.expected_fludd()),
-            None => config.fludd_items.is_none(),
-        } {
+        ) || !addon_acknowledged
+            || !match fludd {
+                Some(state) => state.acknowledged(self.session.expected_fludd()),
+                None => config.fludd_items.is_none(),
+            }
+        {
             return Err(
                 "Mario progression paused: capability/stat/FLUDD worker is not ready and enabled"
                     .into(),
@@ -336,6 +446,7 @@ impl Runtime {
         self.applied = true;
         self.acknowledged_stats = stats.map(|_| self.session.expected_stats());
         self.acknowledged_fludd = fludd.map(|_| self.session.expected_fludd());
+        self.acknowledged_addons = addon_snapshots;
         Ok(())
     }
     pub fn warning_due(&mut self, warning: &str, now_ms: u64) -> bool {
@@ -365,6 +476,9 @@ impl Runtime {
             if let Some(fludd) = bridge.fludd {
                 let _ = fludd.set(Fludd::default());
             }
+            for bridge in bridge.addons.into_iter().flatten() {
+                let _ = bridge.set(AddonConfig::default());
+            }
         }
         *self = Self::default();
     }
@@ -372,6 +486,48 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn addon_probes_read_current_configuration_and_combined_live_ack() {
+        let mut runtime = Runtime::default();
+        runtime.session.configure(
+            "seed:1".into(),
+            Some(Config {
+                managed: 1023,
+                unlock_items: Default::default(),
+                requires_regression: false,
+                stat_items: None,
+                fludd_items: None,
+                addon_items: [(400, (Addon::Cappy, 1)), (410, (Addon::Sonic, 1))]
+                    .into_iter()
+                    .collect(),
+            }),
+        );
+        for addon in Addon::ALL {
+            assert!(!runtime.addon_armed(addon));
+            runtime.acknowledged_addons[addon.index()] =
+                Some(runtime.session.expected_addon(addon));
+        }
+        runtime.applied = true;
+        for addon in Addon::ALL {
+            assert!(runtime.addon_armed(addon));
+        }
+        runtime.receive_history(vec![(0, 400), (1, 410)]);
+        for addon in Addon::ALL {
+            assert!(!runtime.addon_armed(addon));
+            runtime.acknowledged_addons[addon.index()] =
+                Some(runtime.session.expected_addon(addon));
+            assert!(runtime.addon_armed(addon));
+        }
+        runtime.applied = false;
+        for addon in Addon::ALL {
+            assert!(!runtime.addon_armed(addon));
+        }
+        runtime.session.configure("vanilla:1".into(), None);
+        runtime.applied = true;
+        for addon in Addon::ALL {
+            assert!(!runtime.addon_armed(addon));
+        }
+    }
     #[test]
     fn fludd_probe_requires_current_exact_worker_ack_and_declared_feature() {
         let mut runtime = Runtime::default();
@@ -383,6 +539,7 @@ mod tests {
                 requires_regression: false,
                 stat_items: None,
                 fludd_items: Some([300, 301, 302, 303]),
+                addon_items: Default::default(),
             }),
         );
         assert!(!runtime.fludd_armed());
@@ -411,6 +568,7 @@ mod tests {
                 requires_regression: true,
                 stat_items: None,
                 fludd_items: None,
+                addon_items: Default::default(),
             }),
         );
         assert!(!runtime.regression_armed());
@@ -435,6 +593,7 @@ mod tests {
                     power: 201,
                 }),
                 fludd_items: None,
+                addon_items: Default::default(),
             }),
         );
         assert!(!runtime.stats_armed());
@@ -505,6 +664,7 @@ mod tests {
                 requires_regression: false,
                 stat_items: None,
                 fludd_items: None,
+                addon_items: Default::default(),
             }),
         );
         assert!(runtime.history_due(1));
