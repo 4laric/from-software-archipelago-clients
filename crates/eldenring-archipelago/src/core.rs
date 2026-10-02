@@ -1327,7 +1327,7 @@ impl shared::Core for Core {
             crate::reconcile_io::disarm_if_identity_moved(&current_room_seed);
             self.reset_for_new_seed();
         }
-        // Mario's worker must acknowledge the exact seed/slot capability snapshot before any
+        // Mario's worker must acknowledge the exact seed/slot capability and stat snapshots before any
         // delivery, checks, goal sends, or region enforcement runs. Network loss preserves locks.
         let mario_input = self.client().map(|client| {
             let identity = format!("{}:{}", client.seed_name(), client.this_player().slot());
@@ -2551,6 +2551,7 @@ impl shared::Core for Core {
                         reveal_sweep_boss_names: self.reveal_sweep_boss_names,
                         mario_capabilities: self.mario.armed(),
                         mario_regression: self.mario.regression_armed(),
+                        mario_stats: self.mario.stats_armed(),
                     },
                 );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A
@@ -3266,10 +3267,7 @@ impl shared::Core for Core {
                             .map(|c| c.region_open_flags.contains_key(&ri.name))
                             .unwrap_or(false);
                         if self.mario.session.is_unlock(ap_item_id) {
-                            log::debug!(
-                                "Mario unlock {} applied through capability worker",
-                                ri.name
-                            );
+                            log::debug!("Mario unlock {} applied through Mario worker", ri.name);
                         } else if self.armor_bundles.contains_key(&ap_item_id) {
                             log::debug!(
                                 "armour bundle '{}' (ap id {ap_item_id}) -> reconciler member grants",
