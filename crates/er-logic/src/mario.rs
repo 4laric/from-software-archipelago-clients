@@ -8,6 +8,46 @@ pub const REGRESSION_FEATURE: &str = "mario_regression_v1";
 pub const REGRESSION_INTERACT_FLAG: u32 = 8;
 pub const STATS_FEATURE: &str = "mario_stats_v1";
 pub const SUPPORTS_STATS_FLAG: u32 = 16;
+pub const FLUDD_FEATURE: &str = "mario_fludd_v1";
+pub const SUPPORTS_FLUDD_FLAG: u32 = 32;
+pub const FLUDD_KEYS: &[&str] = &[
+    "fludd_hover",
+    "fludd_rocket",
+    "fludd_turbo",
+    "progressive_fludd_tank",
+];
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fludd {
+    pub enabled: bool,
+    pub nozzles: u32,
+    pub tank_level: u32,
+}
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct FluddState {
+    pub abi_version: u32,
+    pub flags: u32,
+    pub unlocked_nozzles: u32,
+    pub tank_level: u32,
+    pub selected_nozzle: u32,
+    pub water_units: u32,
+    pub capacity_units: u32,
+}
+impl FluddState {
+    pub fn matches(&self, expected: Fludd) -> bool {
+        self.abi_version == ABI_VERSION
+            && self.flags & 4 != 0
+            && (self.flags & 2 != 0) == expected.enabled
+            && self.unlocked_nozzles == expected.nozzles
+            && self.tank_level == expected.tank_level
+            && self.capacity_units == 60 + 20 * expected.tank_level
+    }
+    pub fn acknowledged(&self, expected: Fludd) -> bool {
+        self.matches(expected) && self.flags & 1 != 0
+    }
+}
+const _: () = assert!(size_of::<FluddState>() == 28);
 pub const CAPABILITIES: &[(&str, u32)] = &[
     ("progressive_jump", 129),
     ("backflip", 256),
@@ -86,6 +126,7 @@ pub struct Config {
     pub unlock_items: BTreeMap<i64, u32>,
     pub requires_regression: bool,
     pub stat_items: Option<StatItems>,
+    pub fludd_items: Option<[i64; 4]>,
 }
 impl Config {
     pub fn validate_bridge_features(&self, state: &BridgeState) -> Result<(), String> {
@@ -94,6 +135,17 @@ impl Config {
         }
         if self.stat_items.is_some() && state.flags & SUPPORTS_STATS_FLAG == 0 {
             return Err("Mario stat seed refused: update er_mario.dll for mario_stats_v1".into());
+        }
+        if self.fludd_items.is_some() && state.flags & SUPPORTS_FLUDD_FLAG == 0 {
+            return Err("Mario FLUDD seed refused: update er_mario.dll for mario_fludd_v1".into());
+        }
+        Ok(())
+    }
+    pub fn validate_fludd_exports(&self, available: bool) -> Result<(), String> {
+        if self.fludd_items.is_some() && !available {
+            return Err(
+                "Mario FLUDD seed refused: er_mario.dll is missing FLUDD ABI exports".into(),
+            );
         }
         Ok(())
     }
@@ -158,6 +210,25 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
         .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(STATS_FEATURE)));
     let enabled = option(sd, "mario_mode")?;
     let stats_enabled = option(sd, "mario_stat_upgrades")?;
+    let fludd_enabled = option(sd, "mario_fludd")?;
+    let fludd_required = sd
+        .get("requiresClientFeatures")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(FLUDD_FEATURE)));
+    if fludd_enabled != fludd_required {
+        return Err("Mario FLUDD and mario_fludd_v1 handshake must both be enabled".into());
+    }
+    if !fludd_enabled
+        && sd
+            .get("abilityUnlockItems")
+            .and_then(Value::as_object)
+            .is_some_and(|map| {
+                map.values()
+                    .any(|key| key.as_str().is_some_and(|key| FLUDD_KEYS.contains(&key)))
+            })
+    {
+        return Err("Mario FLUDD items declared while mario_fludd is off".into());
+    }
     if stats_enabled != stats_required {
         return Err("Mario stat upgrades and mario_stats_v1 handshake must both be enabled".into());
     }
@@ -177,7 +248,7 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
         return Err("Mario stat items declared while mario_stat_upgrades is off".into());
     }
     if !enabled {
-        return if required || requires_regression || stats_enabled {
+        return if required || requires_regression || stats_enabled || fludd_enabled {
             Err("Mario capability feature declared but mario_mode is off".into())
         } else {
             Ok(None)
@@ -195,6 +266,7 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
     let mut mapped = BTreeSet::new();
     let mut health = None;
     let mut power = None;
+    let mut fludd = [None; 4];
     for (id, key) in map {
         let ap_id: i64 = id
             .parse()
@@ -212,6 +284,16 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
         let key = key
             .as_str()
             .ok_or("Mario unlockItems values must be strings")?;
+        if let Some(index) = FLUDD_KEYS
+            .iter()
+            .position(|name| *name == key)
+            .filter(|_| fludd_enabled)
+        {
+            if fludd[index].replace(ap_id).is_some() {
+                return Err("Mario unlockItems must map each FLUDD family exactly once".into());
+            }
+            continue;
+        }
         let stat_id = match key {
             "progressive_health" if stats_enabled => Some(&mut health),
             "progressive_power" if stats_enabled => Some(&mut power),
@@ -245,6 +327,18 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
         unlock_items,
         requires_regression,
         stat_items,
+        fludd_items: if fludd_enabled {
+            Some(
+                fludd
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or("Mario unlockItems is missing a FLUDD family")?
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            None
+        },
     }))
 }
 
@@ -255,6 +349,8 @@ pub struct Session {
     pub unlocked: u32,
     pub health_receipts: u32,
     pub power_receipts: u32,
+    pub fludd_nozzles: u32,
+    pub tank_receipts: u32,
 }
 impl Session {
     pub fn configure(&mut self, identity: String, config: Option<Config>) {
@@ -262,6 +358,8 @@ impl Session {
             self.unlocked = 0;
             self.health_receipts = 0;
             self.power_receipts = 0;
+            self.fludd_nozzles = 0;
+            self.tank_receipts = 0;
         }
         self.identity = Some(identity);
         self.config = config;
@@ -275,9 +373,21 @@ impl Session {
             let mut jumps = 0;
             let mut health = 0_u32;
             let mut power = 0_u32;
+            let mut nozzles = 0;
+            let mut tanks = 0_u32;
             for (index, id) in items {
                 if !seen.insert(index) {
                     continue;
+                }
+                if let Some(ids) = config.fludd_items {
+                    for (i, nozzle_id) in ids[..3].iter().enumerate() {
+                        if id == *nozzle_id {
+                            nozzles |= 1 << i;
+                        }
+                    }
+                    if id == ids[3] {
+                        tanks = (tanks + 1).min(3);
+                    }
                 }
                 if let Some(stats) = &config.stat_items {
                     if id == stats.health {
@@ -304,16 +414,34 @@ impl Session {
             self.unlocked |= bits;
             self.health_receipts = self.health_receipts.max(health);
             self.power_receipts = self.power_receipts.max(power);
+            self.fludd_nozzles |= nozzles;
+            self.tank_receipts = self.tank_receipts.max(tanks);
         }
     }
     pub fn is_unlock(&self, id: i64) -> bool {
         self.config.as_ref().is_some_and(|config| {
             config.unlock_items.contains_key(&id)
+                || config.fludd_items.is_some_and(|ids| ids.contains(&id))
                 || config
                     .stat_items
                     .as_ref()
                     .is_some_and(|stats| id == stats.health || id == stats.power)
         })
+    }
+    pub fn expected_fludd(&self) -> Fludd {
+        if self
+            .config
+            .as_ref()
+            .is_some_and(|c| c.fludd_items.is_some())
+        {
+            Fludd {
+                enabled: true,
+                nozzles: self.fludd_nozzles,
+                tank_level: self.tank_receipts.min(3),
+            }
+        } else {
+            Fludd::default()
+        }
     }
     pub fn expected_stats(&self) -> Stats {
         if self.config.as_ref().is_some_and(|c| c.stat_items.is_some()) {
@@ -343,6 +471,168 @@ mod tests {
         sd["abilityUnlockItems"]["200"] = json!("progressive_health");
         sd["abilityUnlockItems"]["201"] = json!("progressive_power");
         sd
+    }
+    fn fludd_seed() -> Value {
+        let mut sd = stat_seed();
+        sd["requiresClientFeatures"] = json!([FEATURE, STATS_FEATURE, FLUDD_FEATURE]);
+        sd["options"]["mario_fludd"] = json!(1);
+        for (i, key) in FLUDD_KEYS.iter().enumerate() {
+            sd["abilityUnlockItems"][(300 + i).to_string()] = json!(key);
+        }
+        sd
+    }
+    #[test]
+    fn fludd_contract_requires_complete_families_feature_and_mario_mode() {
+        let config = parse(&fludd_seed()).unwrap().unwrap();
+        assert_eq!(config.fludd_items, Some([300, 301, 302, 303]));
+        assert!(config.validate_fludd_exports(false).is_err());
+        assert!(config
+            .validate_bridge_features(&BridgeState {
+                flags: 16,
+                ..Default::default()
+            })
+            .is_err());
+        assert!(config
+            .validate_bridge_features(&BridgeState {
+                flags: 48,
+                ..Default::default()
+            })
+            .is_ok());
+        assert!(parse(&seed())
+            .unwrap()
+            .unwrap()
+            .validate_fludd_exports(false)
+            .is_ok());
+        for option in [
+            json!(2),
+            json!(-1),
+            json!(1.0),
+            json!("true"),
+            Value::Null,
+            json!(false),
+        ] {
+            let mut sd = fludd_seed();
+            sd["options"]["mario_fludd"] = option;
+            assert!(parse(&sd).is_err());
+        }
+        for key in FLUDD_KEYS {
+            let mut sd = fludd_seed();
+            sd["abilityUnlockItems"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, v| v != key);
+            assert!(parse(&sd).is_err());
+        }
+        let mut sd = fludd_seed();
+        sd["requiresClientFeatures"] = json!([FEATURE, STATS_FEATURE]);
+        assert!(parse(&sd).is_err());
+        let mut sd = fludd_seed();
+        sd["options"]["mario_mode"] = json!(0);
+        assert!(parse(&sd).is_err());
+        let mut sd = seed();
+        sd["abilityUnlockItems"]["303"] = json!("progressive_fludd_tank");
+        assert!(parse(&sd).is_err());
+        let mut sd = fludd_seed();
+        sd["abilityUnlockItems"]["304"] = json!("fludd_hover");
+        assert!(parse(&sd).is_err());
+        let mut sd = fludd_seed();
+        sd["apIdsToItemIds"] = json!({"300":123});
+        assert!(parse(&sd).is_err());
+    }
+    #[test]
+    fn fludd_fold_deduplicates_indices_preserves_reconnect_and_resets_new_identity() {
+        let config = parse(&fludd_seed()).unwrap();
+        let mut session = Session::default();
+        session.configure("a".into(), config.clone());
+        let history = vec![
+            (0, 300),
+            (1, 301),
+            (2, 302),
+            (3, 303),
+            (3, 303),
+            (4, 303),
+            (5, 303),
+            (6, 303),
+            (7, 200),
+        ];
+        session.receive_history(history.clone());
+        assert_eq!(
+            session.expected_fludd(),
+            Fludd {
+                enabled: true,
+                nozzles: 7,
+                tank_level: 3
+            }
+        );
+        assert_eq!(session.expected_stats().max_wedges, 5);
+        assert!(session.is_unlock(303));
+        session.configure("a".into(), config.clone());
+        session.receive_history(vec![(0, 300)]);
+        assert_eq!(session.expected_fludd().tank_level, 3);
+        session.receive_history(history);
+        assert_eq!(session.expected_fludd().tank_level, 3);
+        session.configure("b".into(), config);
+        assert_eq!(
+            session.expected_fludd(),
+            Fludd {
+                enabled: true,
+                ..Default::default()
+            }
+        );
+        session.receive_history(vec![(0, 303), (0, 303)]);
+        assert_eq!(session.expected_fludd().tank_level, 1);
+        session.configure("old".into(), parse(&seed()).unwrap());
+        assert_eq!(session.expected_fludd(), Fludd::default());
+    }
+    #[test]
+    fn fludd_ack_requires_exact_configuration_and_live_worker_but_ignores_consumables() {
+        let expected = Fludd {
+            enabled: true,
+            nozzles: 3,
+            tank_level: 2,
+        };
+        let state = FluddState {
+            abi_version: 1,
+            flags: 7,
+            unlocked_nozzles: 3,
+            tank_level: 2,
+            selected_nozzle: 2,
+            water_units: 1,
+            capacity_units: 100,
+        };
+        assert!(state.acknowledged(expected));
+        for flags in [0, 3, 5, 6] {
+            assert!(!FluddState { flags, ..state }.acknowledged(expected));
+        }
+        assert!(!FluddState {
+            unlocked_nozzles: 1,
+            ..state
+        }
+        .acknowledged(expected));
+        assert!(!FluddState {
+            tank_level: 1,
+            ..state
+        }
+        .acknowledged(expected));
+        assert!(!FluddState {
+            capacity_units: 80,
+            ..state
+        }
+        .acknowledged(expected));
+        assert!(FluddState {
+            abi_version: 1,
+            flags: 5,
+            capacity_units: 60,
+            ..Default::default()
+        }
+        .acknowledged(Fludd::default()));
+        assert!(!FluddState {
+            abi_version: 1,
+            flags: 7,
+            capacity_units: 60,
+            ..Default::default()
+        }
+        .acknowledged(Fludd::default()));
     }
     #[test]
     fn stats_option_and_handshake_are_strict_and_default_off() {

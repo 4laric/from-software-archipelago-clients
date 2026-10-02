@@ -2552,6 +2552,7 @@ impl shared::Core for Core {
                         mario_capabilities: self.mario.armed(),
                         mario_regression: self.mario.regression_armed(),
                         mario_stats: self.mario.stats_armed(),
+                        mario_fludd: self.mario.fludd_armed(),
                     },
                 );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A
