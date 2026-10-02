@@ -113,6 +113,12 @@ pub const ALL: [FeelEffect; 3] = [
 ];
 
 impl FeelEffect {
+    /// Mario owns F9 whenever its DLL is loaded, even before an AP connection.
+    /// This governs probe input only; existing effect restoration keeps ticking.
+    pub fn hotkey_available(self, mario_loaded: bool) -> bool {
+        self != Self::Nightfall || !mario_loaded
+    }
+
     /// Stable lower_snake identifier. Log-facing, never localised.
     pub fn key(self) -> &'static str {
         match self {
@@ -255,6 +261,25 @@ impl ProbeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mario_reserves_only_nightfall_input_and_does_not_cancel_blackout_restoration() {
+        for (effect, without_mario, with_mario) in [
+            (FeelEffect::Nightfall, true, false),
+            (FeelEffect::Blackout, true, true),
+            (FeelEffect::StaminaHalved, true, true),
+        ] {
+            assert_eq!(effect.hotkey_available(false), without_mario);
+            assert_eq!(effect.hotkey_available(true), with_mario);
+        }
+        // Loading Mario while a probe is active cannot strand its pending fade-in.
+        let mut state = ProbeState::new();
+        assert!(state.arm(FeelEffect::Blackout, 0));
+        assert!(!FeelEffect::Nightfall.hotkey_available(true));
+        assert!(!state.idle());
+        assert!(state.blackout.take_if_elapsed(BLACKOUT_MS));
+        assert!(state.idle());
+    }
 
     /// THE MOTIVATING CASE (CONTRIBUTING rule 11): bobler presses the blackout key, the screen goes
     /// dark, and it comes back on its own without him touching anything.
