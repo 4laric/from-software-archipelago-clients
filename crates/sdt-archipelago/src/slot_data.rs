@@ -37,6 +37,20 @@ impl FromStr for I64Key {
     }
 }
 
+/// A deserializable wrapper over [ItemId].
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "u32")]
+#[repr(transparent)]
+pub struct DeserializableItemId(pub ItemId);
+
+impl TryFrom<u32> for DeserializableItemId {
+    type Error = <ItemId as TryFrom<u32>>::Error;
+
+    fn try_from(value: u32) -> Result<DeserializableItemId, Self::Error> {
+        Ok(DeserializableItemId(value.try_into()?))
+    }
+}
+
 #[cfg(test)]
 mod key_tests {
     use super::*;
@@ -60,19 +74,5 @@ mod key_tests {
             assert_eq!(I64Key::try_from(value), expected);
             assert_eq!(value.parse::<I64Key>(), expected);
         }
-    }
-}
-
-/// A deserializable wrapper over [ItemId].
-#[derive(Debug, Deserialize)]
-#[serde(try_from = "u32")]
-#[repr(transparent)]
-pub struct DeserializableItemId(pub ItemId);
-
-impl TryFrom<u32> for DeserializableItemId {
-    type Error = <ItemId as TryFrom<u32>>::Error;
-
-    fn try_from(value: u32) -> Result<DeserializableItemId, Self::Error> {
-        Ok(DeserializableItemId(value.try_into()?))
     }
 }
