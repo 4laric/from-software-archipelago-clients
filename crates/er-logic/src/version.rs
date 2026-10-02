@@ -33,6 +33,7 @@ mod tests {
     fn release_form_maps_the_cargo_spelling_to_the_apworld_one() {
         assert_eq!(release_form("0.6.0+f1"), "0.6.0.1");
         assert_eq!(release_form("0.6.0"), "0.6.0");
+        assert_eq!(release_form("0.6.4"), "0.6.4");
         assert_eq!(release_form("0.6.0.1"), "0.6.0.1");
         assert_eq!(release_form("not-a-version"), "not-a-version");
     }
