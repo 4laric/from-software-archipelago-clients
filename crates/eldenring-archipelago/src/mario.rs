@@ -1,5 +1,5 @@
 //! Thin dynamic ABI adapter. Never loads a DLL or calls SM64 from the AP thread.
-use er_logic::mario::{ABI_VERSION, Config, Session, Stats, StatsState};
+use er_logic::mario::{ABI_VERSION, Config, Fludd, FluddState, Session, Stats, StatsState};
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleExA, GetProcAddress};
 use windows::core::s;
@@ -9,6 +9,34 @@ type Version = unsafe extern "C" fn() -> u32;
 type Set = unsafe extern "C" fn(u32, u32) -> u32;
 type Get = unsafe extern "C" fn(*mut State) -> u32;
 type GetStats = unsafe extern "C" fn(*mut StatsState) -> u32;
+type SetFludd = unsafe extern "C" fn(u32, u32, u32) -> u32;
+type GetFludd = unsafe extern "C" fn(*mut FluddState) -> u32;
+struct FluddBridge {
+    set: SetFludd,
+    get: GetFludd,
+}
+impl FluddBridge {
+    fn state(&self) -> Result<FluddState, String> {
+        let mut state = FluddState::default();
+        if unsafe { (self.get)(&mut state) } != 1 || state.abi_version != ABI_VERSION {
+            return Err("Mario progression paused: FLUDD state read-back failed".into());
+        }
+        Ok(state)
+    }
+    fn set(&self, expected: Fludd) -> Result<(), String> {
+        if unsafe {
+            (self.set)(
+                u32::from(expected.enabled),
+                expected.nozzles,
+                expected.tank_level,
+            )
+        } != 1
+        {
+            return Err("Mario progression paused: FLUDD update was rejected".into());
+        }
+        Ok(())
+    }
+}
 struct StatsBridge {
     set: Set,
     get: GetStats,
@@ -40,6 +68,7 @@ struct Bridge {
     set: Set,
     get: Get,
     stats: Option<StatsBridge>,
+    fludd: Option<FluddBridge>,
 }
 impl Bridge {
     fn discover() -> Result<Self, String> {
@@ -79,11 +108,25 @@ impl Bridge {
             }),
             _ => None,
         };
+        let fludd_set = unsafe { GetProcAddress(module.0, s!("er_mario_ap_set_fludd")) };
+        let fludd_get = unsafe { GetProcAddress(module.0, s!("er_mario_ap_get_fludd_state")) };
+        let fludd = match (fludd_set, fludd_get) {
+            (Some(set), Some(get)) => Some(FluddBridge {
+                set: unsafe {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, SetFludd>(set)
+                },
+                get: unsafe {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, GetFludd>(get)
+                },
+            }),
+            _ => None,
+        };
         Ok(Self {
             _module: module,
             set,
             get,
             stats,
+            fludd,
         })
     }
     fn state(&self) -> Result<State, String> {
@@ -102,6 +145,8 @@ pub struct Runtime {
     history_len: Option<usize>,
     last_acknowledgment: Option<(u32, u32, Option<Stats>)>,
     acknowledged_stats: Option<Stats>,
+    last_fludd_acknowledgment: Option<Fludd>,
+    acknowledged_fludd: Option<Fludd>,
     warning: Option<String>,
     warning_shown_at_ms: u64,
 }
@@ -112,13 +157,21 @@ impl Runtime {
             let bridge = Bridge::discover()?;
             config.validate_bridge_features(&bridge.state()?)?;
             config.validate_stats_exports(bridge.stats.is_some())?;
-        } else if let Ok(bridge) = Bridge::discover()
-            && let Some(stats) = bridge.stats
-        {
+            config.validate_fludd_exports(bridge.fludd.is_some())?;
+        } else if let Ok(bridge) = Bridge::discover() {
             // Vanilla progression never depends on an optional Mario bridge. Queue the normal
             // baseline once at connection, so a previously active stat seed cannot leak its caps.
-            if let Err(error) = stats.set(Stats::default()) {
+            if let Some(stats) = bridge.stats
+                && let Err(error) = stats.set(Stats::default())
+            {
                 log::warn!("Could not reset optional Mario stats for vanilla connection: {error}");
+            }
+            if let Some(fludd) = bridge.fludd
+                && let Err(error) = fludd.set(Fludd::default())
+            {
+                log::warn!(
+                    "Could not disable optional Mario FLUDD for vanilla connection: {error}"
+                );
             }
         }
         if self.session.identity.as_ref() != Some(&identity) || self.session.config != config {
@@ -126,6 +179,8 @@ impl Runtime {
             self.history_len = None;
             self.last_acknowledgment = None;
             self.acknowledged_stats = None;
+            self.last_fludd_acknowledgment = None;
+            self.acknowledged_fludd = None;
         }
         self.session.configure(identity, config);
         Ok(())
@@ -157,10 +212,20 @@ impl Runtime {
                 .is_some_and(|c| c.stat_items.is_some())
             && self.acknowledged_stats == Some(self.session.expected_stats())
     }
+    pub fn fludd_armed(&self) -> bool {
+        self.armed()
+            && self
+                .session
+                .config
+                .as_ref()
+                .is_some_and(|c| c.fludd_items.is_some())
+            && self.acknowledged_fludd == Some(self.session.expected_fludd())
+    }
     pub fn refresh(&mut self) -> Result<(), String> {
         let result = self.refresh_bridge();
         if result.is_err() {
             self.last_acknowledgment = None;
+            self.last_fludd_acknowledgment = None;
         } else if let Some(config) = &self.session.config {
             let masks = (
                 config.managed,
@@ -183,6 +248,19 @@ impl Runtime {
                     );
                 }
             }
+            if self.acknowledged_fludd.is_some()
+                && self.last_fludd_acknowledgment != Some(self.session.expected_fludd())
+            {
+                let expected = self.session.expected_fludd();
+                log::info!(
+                    "Mario FLUDD worker acknowledged: identity={:?}, enabled={}, nozzles={:#x}, tank_level={}",
+                    self.session.identity,
+                    expected.enabled,
+                    expected.nozzles,
+                    expected.tank_level
+                );
+                self.last_fludd_acknowledgment = Some(expected);
+            }
         }
         result
     }
@@ -202,6 +280,7 @@ impl Runtime {
         let state = bridge.state()?;
         config.validate_bridge_features(&state)?;
         config.validate_stats_exports(bridge.stats.is_some())?;
+        config.validate_fludd_exports(bridge.fludd.is_some())?;
         let expected = self.session.unlocked;
         // Setter queues only on changed state. Waiting for worker acknowledgment is intentional:
         // seeing exports alone does not prove the actual action gate is enforcing the seed.
@@ -223,9 +302,20 @@ impl Runtime {
                 .set(self.session.expected_stats())?;
             pending = true;
         }
+        let fludd = bridge.fludd.as_ref().map(FluddBridge::state).transpose()?;
+        if let Some(fludd) = fludd
+            && !fludd.matches(self.session.expected_fludd())
+        {
+            bridge
+                .fludd
+                .as_ref()
+                .unwrap()
+                .set(self.session.expected_fludd())?;
+            pending = true;
+        }
         if pending {
             return Err(
-                "Mario progression paused: waiting for capability/stat worker acknowledgment"
+                "Mario progression paused: waiting for capability/stat/FLUDD worker acknowledgment"
                     .into(),
             );
         }
@@ -234,13 +324,18 @@ impl Runtime {
             stats.as_ref(),
             expected,
             self.session.expected_stats(),
-        ) {
+        ) || !match fludd {
+            Some(state) => state.acknowledged(self.session.expected_fludd()),
+            None => config.fludd_items.is_none(),
+        } {
             return Err(
-                "Mario progression paused: capability/stat worker is not ready and enabled".into(),
+                "Mario progression paused: capability/stat/FLUDD worker is not ready and enabled"
+                    .into(),
             );
         }
         self.applied = true;
         self.acknowledged_stats = stats.map(|_| self.session.expected_stats());
+        self.acknowledged_fludd = fludd.map(|_| self.session.expected_fludd());
         Ok(())
     }
     pub fn warning_due(&mut self, warning: &str, now_ms: u64) -> bool {
@@ -267,6 +362,9 @@ impl Runtime {
             if let Some(stats) = bridge.stats {
                 let _ = stats.set(Stats::default());
             }
+            if let Some(fludd) = bridge.fludd {
+                let _ = fludd.set(Fludd::default());
+            }
         }
         *self = Self::default();
     }
@@ -274,6 +372,34 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fludd_probe_requires_current_exact_worker_ack_and_declared_feature() {
+        let mut runtime = Runtime::default();
+        runtime.session.configure(
+            "seed:1".into(),
+            Some(Config {
+                managed: 1023,
+                unlock_items: Default::default(),
+                requires_regression: false,
+                stat_items: None,
+                fludd_items: Some([300, 301, 302, 303]),
+            }),
+        );
+        assert!(!runtime.fludd_armed());
+        runtime.applied = true;
+        assert!(!runtime.fludd_armed());
+        runtime.acknowledged_fludd = Some(runtime.session.expected_fludd());
+        assert!(runtime.fludd_armed());
+        runtime.receive_history(vec![(0, 300)]);
+        assert!(!runtime.fludd_armed());
+        runtime.acknowledged_fludd = Some(runtime.session.expected_fludd());
+        assert!(runtime.fludd_armed());
+        runtime.applied = false;
+        assert!(!runtime.fludd_armed());
+        runtime.session.configure("vanilla:1".into(), None);
+        runtime.applied = true;
+        assert!(!runtime.fludd_armed());
+    }
     #[test]
     fn regression_probe_requires_declared_feature_and_live_acknowledgment() {
         let mut runtime = Runtime::default();
@@ -284,6 +410,7 @@ mod tests {
                 unlock_items: [(1, 129)].into_iter().collect(),
                 requires_regression: true,
                 stat_items: None,
+                fludd_items: None,
             }),
         );
         assert!(!runtime.regression_armed());
@@ -307,6 +434,7 @@ mod tests {
                     health: 200,
                     power: 201,
                 }),
+                fludd_items: None,
             }),
         );
         assert!(!runtime.stats_armed());
@@ -376,6 +504,7 @@ mod tests {
                 unlock_items: [(1, 129)].into_iter().collect(),
                 requires_regression: false,
                 stat_items: None,
+                fludd_items: None,
             }),
         );
         assert!(runtime.history_due(1));

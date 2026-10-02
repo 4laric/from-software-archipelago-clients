@@ -541,8 +541,8 @@ mod tests {
 
     #[test]
     fn mario_keyboard_controls_follow_keyboard_capture_only() {
-        // Mario movement, jump, crouch and dive (OEM comma).
-        for vkey in [0x57, 0x41, 0x53, 0x44, 0x4c, 0x4b, 0xbc] {
+        // Mario movement, jump, crouch, dive (OEM comma), FLUDD activate J and cycle I.
+        for vkey in [0x57, 0x41, 0x53, 0x44, 0x4c, 0x4b, 0xbc, 0x4a, 0x49] {
             assert_eq!(
                 read_async_key_state(vkey, InputFlags::Keyboard, || panic!("blocked query")),
                 0

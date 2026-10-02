@@ -64,6 +64,7 @@ pub struct ProbeCtx<'a> {
     pub mario_capabilities: bool,
     pub mario_regression: bool,
     pub mario_stats: bool,
+    pub mario_fludd: bool,
 }
 
 /// A tag paired with the read-back that decides whether it is live.
@@ -158,6 +159,7 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("mario_capabilities_v1", |c| c.mario_capabilities),
     ("mario_regression_v1", |c| c.mario_regression),
     ("mario_stats_v1", |c| c.mario_stats),
+    ("mario_fludd_v1", |c| c.mario_fludd),
 ];
 
 /// Build the `(tag, live)` table this connect.
@@ -270,6 +272,7 @@ mod tests {
             mario_capabilities: false,
             mario_regression: false,
             mario_stats: false,
+            mario_fludd: false,
         };
         for (_tag, p) in PROBES {
             let _ = p(&ctx);
@@ -295,6 +298,7 @@ mod tests {
                 mario_capabilities: false,
                 mario_regression: false,
                 mario_stats: false,
+                mario_fludd: false,
             }),
             "no config -> not armed"
         );
@@ -309,6 +313,7 @@ mod tests {
                 mario_capabilities: false,
                 mario_regression: false,
                 mario_stats: false,
+                mario_fludd: false,
             }),
             "a seed that gates no region must not report the feature armed"
         );
@@ -325,6 +330,7 @@ mod tests {
                 mario_capabilities: false,
                 mario_regression: false,
                 mario_stats: false,
+                mario_fludd: false,
             }),
             "one gated region is what the apworld declares the tag for"
         );
