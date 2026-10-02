@@ -123,6 +123,7 @@ pub struct Core {
     fogwall: Option<crate::fogwall::FogWallConfig>,
     progressive: ProgressiveState,
     slot_data_parsed: bool,
+    mario: crate::mario::Runtime,
     /// The room `seed_name` the current slot_data was parsed for. Guards the one-shot parse against
     /// a mid-session SEED CHANGE (reconnect to a DIFFERENT seed without an ER reload): when the
     /// room's seed differs from this, every per-seed table is rebuilt via [`Self::reset_for_new_seed`]
@@ -896,6 +897,7 @@ impl shared::Core for Core {
             fogwall: None,
             progressive: ProgressiveState::new(HashMap::new()),
             slot_data_parsed: false,
+            mario: Default::default(),
             parsed_seed: None,
             my_name: None,
             save_path: None,
@@ -1325,6 +1327,72 @@ impl shared::Core for Core {
             crate::reconcile_io::disarm_if_identity_moved(&current_room_seed);
             self.reset_for_new_seed();
         }
+        // Mario's worker must acknowledge the exact seed/slot capability snapshot before any
+        // delivery, checks, goal sends, or region enforcement runs. Network loss preserves locks.
+        let mario_input = self.client().map(|client| {
+            let identity = format!("{}:{}", client.seed_name(), client.this_player().slot());
+            let changing = self.mario.session.identity.as_ref() != Some(&identity);
+            let config = changing.then(|| er_logic::mario::parse(client.slot_data()));
+            let active = if let Some(config) = &config {
+                matches!(config, Ok(Some(_)))
+            } else {
+                self.mario.session.config.is_some()
+            };
+            // The received stream is cumulative. Fold the whole indexed history when its length
+            // changes, never allocate a Mario receive snapshot for a normal Elden Ring seed.
+            let len = client.received_items().len();
+            let received = (active && (changing || self.mario.history_due(len))).then(|| {
+                client
+                    .received_items()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ri)| (index as i64, ri.item().id()))
+                    .collect::<Vec<_>>()
+            });
+            (identity, config, received)
+        });
+        if let Some((identity, config, received)) = mario_input {
+            // Slot changes within one room must reset just as a seed change does.
+            if self
+                .mario
+                .session
+                .identity
+                .as_ref()
+                .is_some_and(|old| old != &identity)
+            {
+                self.reset_for_new_seed();
+            }
+            let configured = match config {
+                Some(config) => config.and_then(|config| self.mario.configure(identity, config)),
+                None => Ok(()),
+            };
+            if let Err(error) = configured {
+                if self
+                    .mario
+                    .warning_due(&error, self.toast_clock.elapsed().as_millis() as u64)
+                {
+                    log::error!("{error}");
+                    self.toasts
+                        .push(error, self.toast_clock.elapsed().as_millis() as u64);
+                }
+                return Ok(());
+            }
+            if let Some(received) = received {
+                self.mario.receive_history(received);
+            }
+        }
+        if let Err(error) = self.mario.refresh() {
+            if self
+                .mario
+                .warning_due(&error, self.toast_clock.elapsed().as_millis() as u64)
+            {
+                log::error!("{error}");
+                self.toasts
+                    .push(error, self.toast_clock.elapsed().as_millis() as u64);
+            }
+            return Ok(());
+        }
+        self.mario.clear_warning();
         if !self.slot_data_parsed {
             let parsed = self.client().map(|client| {
                 let sd = client.slot_data();
@@ -2481,6 +2549,7 @@ impl shared::Core for Core {
                         region_completion_goal_gate:
                             crate::region::goal_gate_uses_region_completion(),
                         reveal_sweep_boss_names: self.reveal_sweep_boss_names,
+                        mario_capabilities: self.mario.armed(),
                     },
                 );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A
@@ -3195,7 +3264,12 @@ impl shared::Core for Core {
                             .region
                             .map(|c| c.region_open_flags.contains_key(&ri.name))
                             .unwrap_or(false);
-                        if self.armor_bundles.contains_key(&ap_item_id) {
+                        if self.mario.session.is_unlock(ap_item_id) {
+                            log::debug!(
+                                "Mario unlock {} applied through capability worker",
+                                ri.name
+                            );
+                        } else if self.armor_bundles.contains_key(&ap_item_id) {
                             log::debug!(
                                 "armour bundle '{}' (ap id {ap_item_id}) -> reconciler member grants",
                                 ri.name
@@ -5491,6 +5565,7 @@ impl Core {
         self.item_counts.clear();
         self.armor_bundles.clear();
         crate::ability_lock::reset();
+        self.mario.reset();
         crate::region::reset_announced_graces();
         // Region Sync (#1005): both the inbound queue and the anti-echo set are keyed by the OLD
         // seed's region names. A stale anti-echo entry would silence a genuine open on the new
