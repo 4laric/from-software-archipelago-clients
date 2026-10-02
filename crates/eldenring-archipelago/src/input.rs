@@ -15,6 +15,7 @@
 //!     (`[this+0x7E0]`). Reached by wrapping `DirectInput8Create` -> `IDirectInput8::CreateDevice`
 //!     (slot 3, `+0x18`) -> the returned device's shared vtable (patched once; all devices share it).
 //!   * **Menu/text** — `GetKeyboardState` / `GetKeyState` (user32), which ER also reads.
+//!   * **Mario controls** — `GetAsyncKeyState` (user32), read directly by ER Mario.
 //!
 //! Each hook, when its [`InputFlags`] bit is set, zeroes the state it returns instead of the real read,
 //! so the game sees "nothing pressed" while the overlay owns the keyboard/mouse/pad. Nothing here is
@@ -105,6 +106,7 @@ struct XInputGamepad {
 static XINPUT_HOOK: OnceLock<GenericDetour<XInputGetStateFn>> = OnceLock::new();
 static GETKEYBOARDSTATE_HOOK: OnceLock<GenericDetour<GetKeyboardStateFn>> = OnceLock::new();
 static GETKEYSTATE_HOOK: OnceLock<GenericDetour<GetKeyStateFn>> = OnceLock::new();
+static GETASYNCKEYSTATE_HOOK: OnceLock<GenericDetour<GetKeyStateFn>> = OnceLock::new();
 static DINPUT8CREATE_HOOK: OnceLock<GenericDetour<DirectInput8CreateFn>> = OnceLock::new();
 
 unsafe extern "system" fn xinput_get_state_hook(user: u32, state: *mut XInputState) -> u32 {
@@ -210,6 +212,29 @@ unsafe extern "system" fn get_key_state_hook(vkey: i32) -> i16 {
         return 0; // key up, not toggled
     }
     GETKEYSTATE_HOOK.get().unwrap().call(vkey)
+}
+
+/// Async mouse-button queries belong to Mouse, even though their API calls them virtual keys.
+/// Other keys belong to Keyboard; preserve the same overlay modifier exemption as GetKeyState.
+fn read_async_key_state(vkey: i32, blocked: InputFlags, read: impl FnOnce() -> i16) -> i16 {
+    let class = if matches!(vkey, 1 | 2 | 4 | 5 | 6) {
+        InputFlags::Mouse
+    } else {
+        InputFlags::Keyboard
+    };
+    if blocked.contains(class) && !is_overlay_modifier(vkey) {
+        0
+    } else {
+        read()
+    }
+}
+
+unsafe extern "system" fn get_async_key_state_hook(vkey: i32) -> i16 {
+    read_async_key_state(
+        vkey,
+        InputFlags::from_bits_truncate(BLOCKED.load(Ordering::Relaxed)),
+        || GETASYNCKEYSTATE_HOOK.get().unwrap().call(vkey),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -469,6 +494,32 @@ pub unsafe fn install() {
         let _ = GETKEYSTATE_HOOK.set(d);
     }
 
+    match resolve::<GetKeyStateFn>(s!("user32.dll"), s!("GetAsyncKeyState")) {
+        Some(target) => match GenericDetour::new(target, get_async_key_state_hook) {
+            Ok(detour) => {
+                // Publish the trampoline before enabling: another thread can query immediately.
+                if GETASYNCKEYSTATE_HOOK.set(detour).is_err() {
+                    log::error!("input: GetAsyncKeyState hook installation attempted twice");
+                } else {
+                    match GETASYNCKEYSTATE_HOOK.get().unwrap().enable() {
+                        Ok(()) => log::info!(
+                            "input: GetAsyncKeyState hooked (Mario keyboard/mouse block)"
+                        ),
+                        Err(error) => log::error!(
+                            "input: GetAsyncKeyState enable failed: {error}; Mario controls may leak through the overlay"
+                        ),
+                    }
+                }
+            }
+            Err(error) => log::error!(
+                "input: GetAsyncKeyState hook failed: {error}; Mario controls may leak through the overlay"
+            ),
+        },
+        None => log::error!(
+            "input: GetAsyncKeyState not found; Mario controls may leak through the overlay"
+        ),
+    }
+
     match resolve::<DirectInput8CreateFn>(s!("dinput8.dll"), s!("DirectInput8Create")) {
         Some(target) => match GenericDetour::new(target, direct_input8_create_hook) {
             Ok(d) => match d.enable() {
@@ -487,6 +538,51 @@ pub unsafe fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mario_keyboard_controls_follow_keyboard_capture_only() {
+        // Mario movement, jump, crouch and dive (OEM comma).
+        for vkey in [0x57, 0x41, 0x53, 0x44, 0x4c, 0x4b, 0xbc] {
+            assert_eq!(
+                read_async_key_state(vkey, InputFlags::Keyboard, || panic!("blocked query")),
+                0
+            );
+            assert_eq!(
+                read_async_key_state(vkey, InputFlags::Mouse, || -32767),
+                -32767
+            );
+            assert_eq!(read_async_key_state(vkey, InputFlags::empty(), || 1), 1);
+        }
+    }
+
+    #[test]
+    fn mario_mouse_buttons_follow_mouse_capture_only() {
+        for vkey in [1, 2, 4, 5, 6] {
+            assert_eq!(
+                read_async_key_state(vkey, InputFlags::Mouse, || panic!("blocked query")),
+                0
+            );
+            assert_eq!(
+                read_async_key_state(vkey, InputFlags::Keyboard, || -32768),
+                -32768
+            );
+            assert_eq!(read_async_key_state(vkey, InputFlags::empty(), || 1), 1);
+        }
+    }
+
+    #[test]
+    fn async_overlay_modifiers_preserve_original_bits_while_capture_is_active() {
+        for vkey in OVERLAY_MODIFIER_VKS {
+            assert_eq!(
+                read_async_key_state(
+                    i32::from(vkey),
+                    InputFlags::Keyboard | InputFlags::Mouse,
+                    || -32767
+                ),
+                -32767
+            );
+        }
+    }
 
     /// RULE 11 MOTIVATING CASE. Ctrl+V did nothing in the overlay's text fields because
     /// `get_key_state_hook` answered 0 for VK_CONTROL while the keyboard was blocked -- which is
