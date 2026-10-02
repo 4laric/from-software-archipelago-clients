@@ -2553,6 +2553,8 @@ impl shared::Core for Core {
                         mario_regression: self.mario.regression_armed(),
                         mario_stats: self.mario.stats_armed(),
                         mario_fludd: self.mario.fludd_armed(),
+                        mario_cappy: self.mario.addon_armed(er_logic::mario::Addon::Cappy),
+                        mario_sonic: self.mario.addon_armed(er_logic::mario::Addon::Sonic),
                     },
                 );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A

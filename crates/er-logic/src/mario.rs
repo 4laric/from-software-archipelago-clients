@@ -10,6 +10,69 @@ pub const STATS_FEATURE: &str = "mario_stats_v1";
 pub const SUPPORTS_STATS_FLAG: u32 = 16;
 pub const FLUDD_FEATURE: &str = "mario_fludd_v1";
 pub const SUPPORTS_FLUDD_FLAG: u32 = 32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Addon {
+    Cappy,
+    Sonic,
+}
+impl Addon {
+    pub const ALL: [Self; 2] = [Self::Cappy, Self::Sonic];
+    pub fn index(self) -> usize {
+        match self {
+            Self::Cappy => 0,
+            Self::Sonic => 1,
+        }
+    }
+    pub fn option(self) -> &'static str {
+        match self {
+            Self::Cappy => "mario_cappy",
+            Self::Sonic => "mario_sonic_movement",
+        }
+    }
+    pub fn feature(self) -> &'static str {
+        match self {
+            Self::Cappy => "mario_cappy_v1",
+            Self::Sonic => "mario_sonic_movement_v1",
+        }
+    }
+    pub fn support_flag(self) -> u32 {
+        match self {
+            Self::Cappy => 64,
+            Self::Sonic => 128,
+        }
+    }
+    pub fn keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Cappy => &["cap_throw", "cap_bounce"],
+            Self::Sonic => &["spin_dash", "drop_dash", "air_dash"],
+        }
+    }
+}
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddonConfig {
+    pub enabled: bool,
+    pub unlocked: u32,
+}
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct AddonState {
+    pub abi_version: u32,
+    pub flags: u32,
+    pub unlocked: u32,
+    pub runtime_state: u32,
+}
+impl AddonState {
+    pub fn matches(&self, expected: AddonConfig) -> bool {
+        self.abi_version == ABI_VERSION
+            && self.flags & 4 != 0
+            && (self.flags & 2 != 0) == expected.enabled
+            && self.unlocked == expected.unlocked
+    }
+    pub fn acknowledged(&self, expected: AddonConfig) -> bool {
+        self.matches(expected) && self.flags & 1 != 0
+    }
+}
+const _: () = assert!(size_of::<AddonState>() == 16);
 pub const FLUDD_KEYS: &[&str] = &[
     "fludd_hover",
     "fludd_rocket",
@@ -127,8 +190,21 @@ pub struct Config {
     pub requires_regression: bool,
     pub stat_items: Option<StatItems>,
     pub fludd_items: Option<[i64; 4]>,
+    pub addon_items: BTreeMap<i64, (Addon, u32)>,
 }
 impl Config {
+    pub fn addon_enabled(&self, addon: Addon) -> bool {
+        self.addon_items.values().any(|(a, _)| *a == addon)
+    }
+    pub fn validate_addon_exports(&self, addon: Addon, available: bool) -> Result<(), String> {
+        if self.addon_enabled(addon) && !available {
+            return Err(format!(
+                "Mario seed refused: er_mario.dll is missing {} ABI exports",
+                addon.feature()
+            ));
+        }
+        Ok(())
+    }
     pub fn validate_bridge_features(&self, state: &BridgeState) -> Result<(), String> {
         if self.requires_regression && state.flags & REGRESSION_INTERACT_FLAG == 0 {
             return Err("Mario seed refused: update er_mario.dll for the Law of Regression statue interaction".into());
@@ -138,6 +214,14 @@ impl Config {
         }
         if self.fludd_items.is_some() && state.flags & SUPPORTS_FLUDD_FLAG == 0 {
             return Err("Mario FLUDD seed refused: update er_mario.dll for mario_fludd_v1".into());
+        }
+        for addon in Addon::ALL {
+            if self.addon_enabled(addon) && state.flags & addon.support_flag() == 0 {
+                return Err(format!(
+                    "Mario seed refused: update er_mario.dll for {}",
+                    addon.feature()
+                ));
+            }
         }
         Ok(())
     }
@@ -211,6 +295,36 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
     let enabled = option(sd, "mario_mode")?;
     let stats_enabled = option(sd, "mario_stat_upgrades")?;
     let fludd_enabled = option(sd, "mario_fludd")?;
+    let mut addons_enabled = [false; 2];
+    for addon in Addon::ALL {
+        let enabled = option(sd, addon.option())?;
+        let required = sd
+            .get("requiresClientFeatures")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(addon.feature())));
+        if enabled != required {
+            return Err(format!(
+                "{} and {} handshake must both be enabled",
+                addon.option(),
+                addon.feature()
+            ));
+        }
+        if !enabled
+            && sd
+                .get("abilityUnlockItems")
+                .and_then(Value::as_object)
+                .is_some_and(|map| {
+                    map.values()
+                        .any(|key| key.as_str().is_some_and(|key| addon.keys().contains(&key)))
+                })
+        {
+            return Err(format!(
+                "Mario addon items declared while {} is off",
+                addon.option()
+            ));
+        }
+        addons_enabled[addon.index()] = enabled;
+    }
     let fludd_required = sd
         .get("requiresClientFeatures")
         .and_then(Value::as_array)
@@ -248,7 +362,12 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
         return Err("Mario stat items declared while mario_stat_upgrades is off".into());
     }
     if !enabled {
-        return if required || requires_regression || stats_enabled || fludd_enabled {
+        return if required
+            || requires_regression
+            || stats_enabled
+            || fludd_enabled
+            || addons_enabled.iter().any(|enabled| *enabled)
+        {
             Err("Mario capability feature declared but mario_mode is off".into())
         } else {
             Ok(None)
@@ -267,6 +386,8 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
     let mut health = None;
     let mut power = None;
     let mut fludd = [None; 4];
+    let mut addon_items = BTreeMap::new();
+    let mut addon_mapped = [0; 2];
     for (id, key) in map {
         let ap_id: i64 = id
             .parse()
@@ -284,6 +405,23 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
         let key = key
             .as_str()
             .ok_or("Mario unlockItems values must be strings")?;
+        if let Some((addon, index)) = Addon::ALL.into_iter().find_map(|addon| {
+            addon
+                .keys()
+                .iter()
+                .position(|name| *name == key)
+                .map(|i| (addon, i))
+        }) {
+            let mask = 1 << index;
+            if !addons_enabled[addon.index()] || addon_mapped[addon.index()] & mask != 0 {
+                return Err(
+                    "Mario unlockItems must map each enabled addon family exactly once".into(),
+                );
+            }
+            addon_mapped[addon.index()] |= mask;
+            addon_items.insert(ap_id, (addon, mask));
+            continue;
+        }
         if let Some(index) = FLUDD_KEYS
             .iter()
             .position(|name| *name == key)
@@ -322,11 +460,22 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
     if mapped.iter().copied().fold(0, |a, b| a | b) != managed {
         return Err("Mario unlockItems is missing a locked move".into());
     }
+    for addon in Addon::ALL {
+        if addons_enabled[addon.index()]
+            && addon_mapped[addon.index()] != (1 << addon.keys().len()) - 1
+        {
+            return Err(format!(
+                "Mario unlockItems is missing a {} family",
+                addon.feature()
+            ));
+        }
+    }
     Ok(Some(Config {
         managed,
         unlock_items,
         requires_regression,
         stat_items,
+        addon_items,
         fludd_items: if fludd_enabled {
             Some(
                 fludd
@@ -351,6 +500,7 @@ pub struct Session {
     pub power_receipts: u32,
     pub fludd_nozzles: u32,
     pub tank_receipts: u32,
+    pub addon_unlocks: [u32; 2],
 }
 impl Session {
     pub fn configure(&mut self, identity: String, config: Option<Config>) {
@@ -360,6 +510,7 @@ impl Session {
             self.power_receipts = 0;
             self.fludd_nozzles = 0;
             self.tank_receipts = 0;
+            self.addon_unlocks = [0; 2];
         }
         self.identity = Some(identity);
         self.config = config;
@@ -378,6 +529,9 @@ impl Session {
             for (index, id) in items {
                 if !seen.insert(index) {
                     continue;
+                }
+                if let Some(&(addon, mask)) = config.addon_items.get(&id) {
+                    self.addon_unlocks[addon.index()] |= mask;
                 }
                 if let Some(ids) = config.fludd_items {
                     for (i, nozzle_id) in ids[..3].iter().enumerate() {
@@ -421,6 +575,7 @@ impl Session {
     pub fn is_unlock(&self, id: i64) -> bool {
         self.config.as_ref().is_some_and(|config| {
             config.unlock_items.contains_key(&id)
+                || config.addon_items.contains_key(&id)
                 || config.fludd_items.is_some_and(|ids| ids.contains(&id))
                 || config
                     .stat_items
@@ -441,6 +596,16 @@ impl Session {
             }
         } else {
             Fludd::default()
+        }
+    }
+    pub fn expected_addon(&self, addon: Addon) -> AddonConfig {
+        if self.config.as_ref().is_some_and(|c| c.addon_enabled(addon)) {
+            AddonConfig {
+                enabled: true,
+                unlocked: self.addon_unlocks[addon.index()],
+            }
+        } else {
+            AddonConfig::default()
         }
     }
     pub fn expected_stats(&self) -> Stats {
@@ -480,6 +645,223 @@ mod tests {
             sd["abilityUnlockItems"][(300 + i).to_string()] = json!(key);
         }
         sd
+    }
+    fn addon_seed() -> Value {
+        let mut sd = fludd_seed();
+        for addon in Addon::ALL {
+            sd["options"][addon.option()] = json!(1);
+            sd["requiresClientFeatures"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(addon.feature()));
+            for (i, key) in addon.keys().iter().enumerate() {
+                sd["abilityUnlockItems"][(400 + addon.index() * 10 + i).to_string()] = json!(key);
+            }
+        }
+        sd
+    }
+    #[test]
+    fn addon_contract_is_strict_complete_optional_and_independent() {
+        let config = parse(&addon_seed()).unwrap().unwrap();
+        assert_eq!(config.managed, 1023);
+        assert_eq!(config.addon_items.len(), 5);
+        for addon in Addon::ALL {
+            assert!(config.addon_enabled(addon));
+            assert!(config.validate_addon_exports(addon, false).is_err());
+            for bad in [
+                json!(2),
+                json!(-1),
+                json!(1.0),
+                json!("true"),
+                Value::Null,
+                json!(false),
+            ] {
+                let mut sd = addon_seed();
+                sd["options"][addon.option()] = bad;
+                assert!(parse(&sd).is_err());
+            }
+            for key in addon.keys() {
+                let mut sd = addon_seed();
+                sd["abilityUnlockItems"]
+                    .as_object_mut()
+                    .unwrap()
+                    .retain(|_, v| v != key);
+                assert!(parse(&sd).is_err());
+            }
+            let mut sd = addon_seed();
+            sd["requiresClientFeatures"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|t| t != addon.feature());
+            assert!(parse(&sd).is_err());
+            let mut sd = addon_seed();
+            sd["options"]["mario_mode"] = json!(0);
+            assert!(parse(&sd).is_err());
+            let mut sd = seed();
+            sd["abilityUnlockItems"]["999"] = json!(addon.keys()[0]);
+            assert!(parse(&sd).is_err());
+            let mut sd = addon_seed();
+            sd["abilityUnlockItems"]["999"] = json!(addon.keys()[0]);
+            assert!(parse(&sd).is_err());
+            let mut sd = addon_seed();
+            sd["options"][addon.option()] = json!(true);
+            assert_eq!(parse(&sd).unwrap().unwrap(), config);
+            // Disable only this addon, preserving every other configured family.
+            sd["options"][addon.option()] = json!(0);
+            sd["requiresClientFeatures"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|t| t != addon.feature());
+            sd["abilityUnlockItems"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, v| !addon.keys().contains(&v.as_str().unwrap()));
+            let other = parse(&sd).unwrap().unwrap();
+            assert!(!other.addon_enabled(addon));
+            assert!(other.validate_addon_exports(addon, false).is_ok());
+        }
+        assert!(config
+            .validate_bridge_features(&BridgeState {
+                flags: 48,
+                ..Default::default()
+            })
+            .is_err());
+        assert!(config
+            .validate_bridge_features(&BridgeState {
+                flags: 240,
+                ..Default::default()
+            })
+            .is_ok());
+        for sd in [seed(), stat_seed(), fludd_seed()] {
+            assert!(parse(&sd).unwrap().unwrap().addon_items.is_empty());
+        }
+        let mut sd = addon_seed();
+        sd["apIdsToItemIds"] = json!({"400":123});
+        assert!(parse(&sd).is_err());
+        let mut sd = addon_seed();
+        sd["abilityUnlockItems"]["400"] = json!("unknown_cap");
+        assert!(parse(&sd).is_err());
+    }
+    #[test]
+    fn all_previous_mario_family_counts_keep_addons_off() {
+        let mut fludd_only = fludd_seed();
+        fludd_only["options"]["mario_stat_upgrades"] = json!(0);
+        fludd_only["requiresClientFeatures"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|tag| tag != STATS_FEATURE);
+        fludd_only["abilityUnlockItems"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|_, v| v != "progressive_health" && v != "progressive_power");
+        for (count, sd) in [
+            (9, seed()),
+            (11, stat_seed()),
+            (13, fludd_only),
+            (15, fludd_seed()),
+        ] {
+            assert_eq!(sd["abilityUnlockItems"].as_object().unwrap().len(), count);
+            let config = parse(&sd).unwrap().unwrap();
+            let mut session = Session::default();
+            session.configure("legacy".into(), Some(config.clone()));
+            for addon in Addon::ALL {
+                assert!(!config.addon_enabled(addon));
+                assert!(config.validate_addon_exports(addon, false).is_ok());
+                assert_eq!(session.expected_addon(addon), AddonConfig::default());
+            }
+        }
+    }
+    #[test]
+    fn addon_receipts_are_synthetic_indexed_reconnect_safe_and_identity_scoped() {
+        let config = parse(&addon_seed()).unwrap();
+        let mut session = Session::default();
+        session.configure("a".into(), config.clone());
+        let history = [
+            (0, 400),
+            (1, 401),
+            (2, 410),
+            (3, 411),
+            (4, 412),
+            (4, 412),
+            (5, 412),
+            (6, 100),
+            (7, 100),
+            (8, 303),
+            (9, 200),
+        ];
+        session.receive_history(history);
+        assert_eq!(
+            session.expected_addon(Addon::Cappy),
+            AddonConfig {
+                enabled: true,
+                unlocked: 3
+            }
+        );
+        assert_eq!(
+            session.expected_addon(Addon::Sonic),
+            AddonConfig {
+                enabled: true,
+                unlocked: 7
+            }
+        );
+        assert_eq!(session.unlocked, 129);
+        assert_eq!(session.tank_receipts, 1);
+        assert_eq!(session.health_receipts, 1);
+        for id in [400, 401, 410, 411, 412] {
+            assert!(session.is_unlock(id));
+        }
+        session.configure("a".into(), config.clone());
+        session.receive_history([]);
+        session.receive_history(history);
+        assert_eq!(session.expected_addon(Addon::Sonic).unlocked, 7);
+        session.configure("b".into(), config);
+        assert_eq!(session.expected_addon(Addon::Sonic).unlocked, 0);
+        session.receive_history([(0, 410), (0, 411)]);
+        assert_eq!(session.expected_addon(Addon::Sonic).unlocked, 1);
+        session.configure("old".into(), parse(&seed()).unwrap());
+        for addon in Addon::ALL {
+            assert_eq!(session.expected_addon(addon), AddonConfig::default());
+        }
+    }
+    #[test]
+    fn addon_acknowledgment_requires_live_exact_configuration_not_runtime_action() {
+        let expected = AddonConfig {
+            enabled: true,
+            unlocked: 3,
+        };
+        let state = AddonState {
+            abi_version: 1,
+            flags: 7,
+            unlocked: 3,
+            runtime_state: 999,
+        };
+        assert!(state.acknowledged(expected));
+        for flags in [0, 3, 5, 6] {
+            assert!(!AddonState { flags, ..state }.acknowledged(expected));
+        }
+        assert!(!AddonState {
+            unlocked: 1,
+            ..state
+        }
+        .acknowledged(expected));
+        assert!(!AddonState {
+            abi_version: 2,
+            ..state
+        }
+        .acknowledged(expected));
+        assert!(AddonState {
+            abi_version: 1,
+            flags: 5,
+            runtime_state: 999,
+            ..Default::default()
+        }
+        .acknowledged(AddonConfig::default()));
+        assert!(!AddonState {
+            abi_version: 1,
+            flags: 7,
+            ..Default::default()
+        }
+        .acknowledged(AddonConfig::default()));
     }
     #[test]
     fn fludd_contract_requires_complete_families_feature_and_mario_mode() {
