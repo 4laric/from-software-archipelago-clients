@@ -43,6 +43,7 @@ mod legacy_053_test;
 #[cfg(test)]
 mod legacy_05_test;
 mod lock_hints;
+mod mario;
 mod merchant_bells;
 mod mfg_colors;
 mod mfg_probe;

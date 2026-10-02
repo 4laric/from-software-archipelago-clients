@@ -130,6 +130,7 @@ pub const CONTRACT: &[ContractKey] = &[
 
 /// Declared sub-keys of the top-level `options` echo (validated when `options` is present).
 pub const OPTIONS_SUBKEYS: &[ContractKey] = &[
+    ContractKey { name: "mario_mode", shape: Shape::BoolOrInt, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "death_link", shape: Shape::BoolOrInt, required: true, greenfield: true, bedrock: false },
     ContractKey { name: "death_link_amnesty_inbound", shape: Shape::Int, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "death_link_amnesty_outbound", shape: Shape::Int, required: false, greenfield: true, bedrock: false },
@@ -251,7 +252,7 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
 pub const CONTRACT_HASH: &str = "2aa64f43";
-pub const APWORLD_VERSION_EXPECTED: &str = "0.6.1.7";
+pub const APWORLD_VERSION_EXPECTED: &str = "0.6.4";
 
 #[cfg(test)]
 mod nested_grants_tests {

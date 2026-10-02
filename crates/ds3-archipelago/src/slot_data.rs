@@ -99,6 +99,14 @@ impl TryFrom<&str> for I64Key {
     type Error = <i64 as FromStr>::Err;
 
     fn try_from(value: &str) -> Result<I64Key, Self::Error> {
+        value.parse()
+    }
+}
+
+impl FromStr for I64Key {
+    type Err = <i64 as FromStr>::Err;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(I64Key(i64::from_str(value)?))
     }
 }
@@ -114,5 +122,31 @@ impl TryFrom<u32> for DeserializableItemId {
 
     fn try_from(value: u32) -> Result<DeserializableItemId, Self::Error> {
         Ok(DeserializableItemId(value.try_into()?))
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn old_map_keys_and_try_from_keep_the_same_integer_parser() {
+        let old: HashMap<I64Key, u32> =
+            json::from_str(r#"{"-9223372036854775808":1,"9223372036854775807":2}"#).unwrap();
+        assert_eq!(old.get(&I64Key(i64::MIN)), Some(&1));
+        assert_eq!(old.get(&I64Key(i64::MAX)), Some(&2));
+        for value in [
+            "0",
+            "-1",
+            "+42",
+            "9223372036854775807",
+            "",
+            " 1",
+            "9223372036854775808",
+        ] {
+            let expected = value.parse::<i64>().map(I64Key);
+            assert_eq!(I64Key::try_from(value), expected);
+            assert_eq!(value.parse::<I64Key>(), expected);
+        }
     }
 }

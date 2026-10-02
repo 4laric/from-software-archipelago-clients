@@ -30,6 +30,7 @@ pub(crate) struct ErrorDisplay<G: Game> {
     show_full_error: bool,
     /// Ignore stale imgui capture flags while the game owns a native menu.
     native_menu_active: bool,
+    first_frame_logged: bool,
 }
 
 impl<G: Game> ErrorDisplay<G> {
@@ -43,6 +44,7 @@ impl<G: Game> ErrorDisplay<G> {
                 error: None,
                 show_full_error: false,
                 native_menu_active: false,
+                first_frame_logged: false,
             },
             Err(error) => Self {
                 input_blocker,
@@ -51,6 +53,7 @@ impl<G: Game> ErrorDisplay<G> {
                 error: Some(error),
                 show_full_error: false,
                 native_menu_active: false,
+                first_frame_logged: false,
             },
         }
     }
@@ -151,6 +154,14 @@ fn window_message_filter(inputs: InputFlags) -> MessageFilter {
 
 impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
     fn render(&mut self, ui: &mut Ui) {
+        if !self.first_frame_logged {
+            log::info!(
+                "AP overlay first render callback: display_size={:?}, framebuffer_scale={:?}",
+                ui.io().display_size,
+                ui.io().display_framebuffer_scale
+            );
+            self.first_frame_logged = true;
+        }
         self.native_menu_active = false;
         if let Some(core) = &mut self.core {
             let mut core = core.lock().unwrap();
@@ -222,6 +233,7 @@ impl<G: Game> ImguiRenderLoop for ErrorDisplay<G> {
     }
 
     fn initialize<'a>(&'a mut self, ctx: &mut Context, _render_context: &'a mut dyn RenderContext) {
+        log::info!("AP overlay render context initialized.");
         ctx.set_clipboard_backend(crate::clipboard::WindowsClipboardBackend {});
     }
 

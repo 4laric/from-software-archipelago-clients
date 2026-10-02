@@ -19,6 +19,7 @@ pub mod crash_tallies;
 mod error_display;
 pub mod foreign_blocks;
 mod game;
+mod hook_install;
 mod input_blocker;
 pub mod log_collapse;
 pub mod mod_stack;
@@ -235,6 +236,11 @@ where
 
         info!("Game system initialized.");
 
+        info!("AP overlay graphics hook installation starting.");
+        // Independent DLLs carry independent MinHook registries. Creating both sets before
+        // either enables them loses a detour; serialize the complete create/enable transaction.
+        let installation_guard = hook_install::Guard::acquire()
+            .unwrap_or_else(|error| panic!("AP overlay hook installation refused: {error}"));
         if let Err(e) = Hudhook::builder()
             .with::<G::GraphicsHooks>(ErrorDisplay::<G>::new(core, blocker))
             .build()
@@ -242,5 +248,7 @@ where
         {
             panic!("Couldn't apply hooks: {e:?}");
         }
+        drop(installation_guard);
+        info!("AP overlay graphics hooks installed.");
     });
 }
