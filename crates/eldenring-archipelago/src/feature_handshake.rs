@@ -62,6 +62,7 @@ pub struct ProbeCtx<'a> {
     pub region_completion_goal_gate: bool,
     pub reveal_sweep_boss_names: bool,
     pub mario_capabilities: bool,
+    pub mario_regression: bool,
 }
 
 /// A tag paired with the read-back that decides whether it is live.
@@ -154,6 +155,7 @@ pub const PROBES: &[(&str, Probe)] = &[
     // state an opted-in seed declares.
     ("reveal_sweep_boss_names", |c| c.reveal_sweep_boss_names),
     ("mario_capabilities_v1", |c| c.mario_capabilities),
+    ("mario_regression_v1", |c| c.mario_regression),
 ];
 
 /// Build the `(tag, live)` table this connect.
@@ -264,6 +266,7 @@ mod tests {
             region_completion_goal_gate: false,
             reveal_sweep_boss_names: false,
             mario_capabilities: false,
+            mario_regression: false,
         };
         for (_tag, p) in PROBES {
             let _ = p(&ctx);
@@ -287,6 +290,7 @@ mod tests {
                 region_completion_goal_gate: false,
                 reveal_sweep_boss_names: false,
                 mario_capabilities: false,
+                mario_regression: false,
             }),
             "no config -> not armed"
         );
@@ -299,6 +303,7 @@ mod tests {
                 region_completion_goal_gate: false,
                 reveal_sweep_boss_names: false,
                 mario_capabilities: false,
+                mario_regression: false,
             }),
             "a seed that gates no region must not report the feature armed"
         );
@@ -313,6 +318,7 @@ mod tests {
                 region_completion_goal_gate: false,
                 reveal_sweep_boss_names: false,
                 mario_capabilities: false,
+                mario_regression: false,
             }),
             "one gated region is what the apworld declares the tag for"
         );

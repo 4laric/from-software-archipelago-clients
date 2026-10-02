@@ -125,6 +125,7 @@ pub const SUPPORTED: &[&str] = &[
     // while continuing to conceal their region and pending payout (#1184).
     "reveal_sweep_boss_names",
     "mario_capabilities_v1",
+    "mario_regression_v1",
 ];
 
 /// Feature tags the seed requires that this build does not know.

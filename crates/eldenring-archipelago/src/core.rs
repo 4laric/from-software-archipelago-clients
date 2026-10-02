@@ -2550,6 +2550,7 @@ impl shared::Core for Core {
                             crate::region::goal_gate_uses_region_completion(),
                         reveal_sweep_boss_names: self.reveal_sweep_boss_names,
                         mario_capabilities: self.mario.armed(),
+                        mario_regression: self.mario.regression_armed(),
                     },
                 );
                 // A seed that needs a client feature this build lacks: say so ON SCREEN too. A

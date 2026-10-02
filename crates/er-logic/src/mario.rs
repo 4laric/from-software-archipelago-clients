@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const ABI_VERSION: u32 = 1;
 pub const FEATURE: &str = "mario_capabilities_v1";
+pub const REGRESSION_FEATURE: &str = "mario_regression_v1";
+pub const REGRESSION_INTERACT_FLAG: u32 = 8;
 pub const CAPABILITIES: &[(&str, u32)] = &[
     ("progressive_jump", 129),
     ("backflip", 256),
@@ -38,6 +40,15 @@ const _: () = assert!(size_of::<BridgeState>() == 16);
 pub struct Config {
     pub managed: u32,
     pub unlock_items: BTreeMap<i64, u32>,
+    pub requires_regression: bool,
+}
+impl Config {
+    pub fn validate_bridge_features(&self, state: &BridgeState) -> Result<(), String> {
+        if self.requires_regression && state.flags & REGRESSION_INTERACT_FLAG == 0 {
+            return Err("Mario seed refused: update er_mario.dll for the Law of Regression statue interaction".into());
+        }
+        Ok(())
+    }
 }
 
 fn bit(key: &str) -> Result<u32, String> {
@@ -54,6 +65,13 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
         .get("requiresClientFeatures")
         .and_then(Value::as_array)
         .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(FEATURE)));
+    let requires_regression = sd
+        .get("requiresClientFeatures")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| tag.as_str() == Some(REGRESSION_FEATURE))
+        });
     let enabled = match sd.get("options").and_then(|o| o.get("mario_mode")) {
         None | Some(Value::Bool(false)) => false,
         Some(Value::Bool(true)) => true,
@@ -62,7 +80,7 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
         _ => return Err("options.mario_mode must be boolean or 0/1".into()),
     };
     if !enabled {
-        return if required {
+        return if required || requires_regression {
             Err("Mario capability feature declared but mario_mode is off".into())
         } else {
             Ok(None)
@@ -106,6 +124,7 @@ pub fn parse(sd: &Value) -> Result<Option<Config>, String> {
     Ok(Some(Config {
         managed,
         unlock_items,
+        requires_regression,
     }))
 }
 
@@ -171,6 +190,41 @@ mod tests {
     fn old_seed_defaults_off() {
         assert_eq!(parse(&json!({})), Ok(None));
         assert_eq!(parse(&json!({"options":{"mario_mode":0}})), Ok(None));
+    }
+    #[test]
+    fn regression_feature_refuses_old_bridge_without_breaking_legacy_seeds() {
+        let legacy = parse(&seed()).unwrap().unwrap();
+        let old_bridge = BridgeState {
+            abi_version: ABI_VERSION,
+            flags: 7,
+            managed: 1023,
+            unlocked: 0,
+        };
+        assert!(!legacy.requires_regression);
+        assert!(legacy.validate_bridge_features(&old_bridge).is_ok());
+        let mut sd = seed();
+        sd["requiresClientFeatures"] = json!([FEATURE, REGRESSION_FEATURE]);
+        let current = parse(&sd).unwrap().unwrap();
+        assert!(current.requires_regression);
+        assert!(current.validate_bridge_features(&old_bridge).is_err());
+        assert!(current
+            .validate_bridge_features(&BridgeState {
+                flags: 15,
+                ..old_bridge
+            })
+            .is_ok());
+        // Capability discovery is allowed before a live Mario exists; readiness remains a separate gate.
+        let initializing = BridgeState {
+            flags: REGRESSION_INTERACT_FLAG,
+            ..old_bridge
+        };
+        assert!(current.validate_bridge_features(&initializing).is_ok());
+        assert!(!initializing.acknowledged(1023, 0));
+        sd["options"]["mario_mode"] = json!(0);
+        assert!(parse(&sd).is_err());
+        sd["options"]["mario_mode"] = json!(1);
+        sd["requiresClientFeatures"] = json!([REGRESSION_FEATURE]);
+        assert!(parse(&sd).is_err());
     }
     #[test]
     fn replay_disconnect_reconnect_and_slot_change() {

@@ -72,8 +72,8 @@ pub struct Runtime {
 impl Runtime {
     /// Validate exports before any slot configuration or progression is applied.
     pub fn configure(&mut self, identity: String, config: Option<Config>) -> Result<(), String> {
-        if config.is_some() {
-            Bridge::discover()?.state()?;
+        if let Some(config) = &config {
+            config.validate_bridge_features(&Bridge::discover()?.state()?)?;
         }
         if self.session.identity.as_ref() != Some(&identity) || self.session.config != config {
             self.applied = false;
@@ -92,6 +92,14 @@ impl Runtime {
     }
     pub fn armed(&self) -> bool {
         self.session.config.is_some() && self.applied
+    }
+    pub fn regression_armed(&self) -> bool {
+        self.armed()
+            && self
+                .session
+                .config
+                .as_ref()
+                .is_some_and(|c| c.requires_regression)
     }
     pub fn refresh(&mut self) -> Result<(), String> {
         let result = self.refresh_bridge();
@@ -124,6 +132,7 @@ impl Runtime {
         self.applied = false;
         let bridge = Bridge::discover()?;
         let state = bridge.state()?;
+        config.validate_bridge_features(&state)?;
         let expected = self.session.unlocked;
         // Setter queues only on changed state. Waiting for worker acknowledgment is intentional:
         // seeing exports alone does not prove the actual action gate is enforcing the seed.
@@ -170,6 +179,25 @@ impl Runtime {
 mod tests {
     use super::*;
     #[test]
+    fn regression_probe_requires_declared_feature_and_live_acknowledgment() {
+        let mut runtime = Runtime::default();
+        runtime.session.configure(
+            "seed:1".into(),
+            Some(Config {
+                managed: 1023,
+                unlock_items: [(1, 129)].into_iter().collect(),
+                requires_regression: true,
+            }),
+        );
+        assert!(!runtime.regression_armed());
+        runtime.applied = true;
+        assert!(runtime.regression_armed());
+        runtime.session.config.as_mut().unwrap().requires_regression = false;
+        assert!(!runtime.regression_armed());
+        runtime.session.configure("vanilla:1".into(), None);
+        assert!(!runtime.regression_armed());
+    }
+    #[test]
     fn acknowledgment_logs_first_arm_changed_masks_and_recovery_only() {
         let mut runtime = Runtime::default();
         assert!(runtime.acknowledgment_due((1023, 0)));
@@ -205,6 +233,7 @@ mod tests {
             Some(Config {
                 managed: 1023,
                 unlock_items: [(1, 129)].into_iter().collect(),
+                requires_regression: false,
             }),
         );
         assert!(runtime.history_due(1));
