@@ -65,6 +65,7 @@ pub struct Runtime {
     pub session: Session,
     applied: bool,
     history_len: Option<usize>,
+    last_acknowledgment: Option<(u32, u32)>,
     warning: Option<String>,
     warning_shown_at_ms: u64,
 }
@@ -77,6 +78,7 @@ impl Runtime {
         if self.session.identity.as_ref() != Some(&identity) || self.session.config != config {
             self.applied = false;
             self.history_len = None;
+            self.last_acknowledgment = None;
         }
         self.session.configure(identity, config);
         Ok(())
@@ -92,6 +94,30 @@ impl Runtime {
         self.session.config.is_some() && self.applied
     }
     pub fn refresh(&mut self) -> Result<(), String> {
+        let result = self.refresh_bridge();
+        if result.is_err() {
+            self.last_acknowledgment = None;
+        } else if let Some(config) = &self.session.config {
+            let masks = (config.managed, self.session.unlocked);
+            if self.acknowledgment_due(masks) {
+                log::info!(
+                    "Mario capability worker acknowledged: identity={:?}, managed={:#010x}, unlocked={:#010x}",
+                    self.session.identity,
+                    masks.0,
+                    masks.1
+                );
+            }
+        }
+        result
+    }
+    fn acknowledgment_due(&mut self, masks: (u32, u32)) -> bool {
+        if self.last_acknowledgment == Some(masks) {
+            return false;
+        }
+        self.last_acknowledgment = Some(masks);
+        true
+    }
+    fn refresh_bridge(&mut self) -> Result<(), String> {
         let Some(config) = &self.session.config else {
             return Ok(());
         };
@@ -143,6 +169,19 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn acknowledgment_logs_first_arm_changed_masks_and_recovery_only() {
+        let mut runtime = Runtime::default();
+        assert!(runtime.acknowledgment_due((1023, 0)));
+        assert!(!runtime.acknowledgment_due((1023, 0)));
+        assert!(runtime.acknowledgment_due((1023, 1)));
+        assert!(!runtime.acknowledgment_due((1023, 1)));
+        runtime.last_acknowledgment = None;
+        assert!(runtime.acknowledgment_due((1023, 1)));
+        assert!(!runtime.acknowledgment_due((1023, 1)));
+        runtime.reset();
+        assert!(runtime.acknowledgment_due((1023, 1)));
+    }
     #[test]
     fn unchanged_failure_is_renewed_without_frame_spam_and_success_clears_it() {
         let mut runtime = Runtime::default();
