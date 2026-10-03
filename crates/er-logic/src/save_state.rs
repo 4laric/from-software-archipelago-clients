@@ -35,6 +35,7 @@ pub struct SaveState {
     pub starting_left_slots_pending: bool,
     pub progressive_counter: BTreeMap<String, i32>,
     pub progressive_high_index: i64,
+    pub bingo_earned: BTreeMap<String, BTreeSet<i64>>,
 }
 
 impl SaveState {
@@ -70,6 +71,7 @@ impl SaveState {
             "starting_left_slots_pending": self.starting_left_slots_pending,
             "progressive_counter":    serde_json::Value::Object(counter),
             "progressive_high_index": self.progressive_high_index,
+            "bingo_earned": self.bingo_earned,
         })
         .to_string()
     }
@@ -137,6 +139,10 @@ impl SaveState {
             })
             .max(0);
         SaveState {
+            bingo_earned: v
+                .get("bingo_earned")
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .unwrap_or_default(),
             traps_received_through,
             last_received_index: v
                 .get("last_received_index")
@@ -169,6 +175,7 @@ impl Default for SaveState {
     /// Fresh save: nothing granted, high-index sentinel -1 (matches `from_json`'s absent-key default).
     fn default() -> Self {
         SaveState {
+            bingo_earned: Default::default(),
             last_received_index: 0,
             traps_received_through: 0,
             received_cursors: std::collections::BTreeMap::new(),
@@ -200,6 +207,7 @@ mod tests {
         flag_poll_baseline.insert(400357u32); // Black Knifeprint -- high id, must survive serde
 
         let before = SaveState {
+            bingo_earned: BTreeMap::from([("board:0".into(), BTreeSet::from([100, 101]))]),
             last_received_index: 17,
             traps_received_through: 12,
             received_cursors: BTreeMap::from([

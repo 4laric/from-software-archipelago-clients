@@ -131,7 +131,6 @@ pub const CONTRACT: &[ContractKey] = &[
 
 /// Declared sub-keys of the top-level `options` echo (validated when `options` is present).
 pub const OPTIONS_SUBKEYS: &[ContractKey] = &[
-    ContractKey { name: "required_boss_flags", shape: Shape::IntList, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "mario_cappy", shape: Shape::BoolOrInt, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "mario_sonic_movement", shape: Shape::BoolOrInt, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "mario_fludd", shape: Shape::BoolOrInt, required: false, greenfield: true, bedrock: false },

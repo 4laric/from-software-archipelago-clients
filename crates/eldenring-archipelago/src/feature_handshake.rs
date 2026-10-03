@@ -79,6 +79,10 @@ type Probe = fn(&ProbeCtx) -> bool;
 /// ⭐ ORDER IS THE ORDER OF `SUPPORTED`, so the two lists diff by eye as well as by test.
 pub const PROBES: &[(&str, Probe)] = &[
     ("bingo_v1", |c| c.bingo),
+    ("bingo_e1_v1", |c| {
+        c.goal
+            .is_some_and(|g| g.bingo.as_ref().is_some_and(|b| b.version == 2))
+    }),
     // A ceiling is only DECLARED by a seed that actually caps, so ARMED must mean the same thing --
     // configured, and capping below the top rung.
     ("scaling_ceiling", |_| crate::scaling::ceiling_is_capped()),
@@ -273,6 +277,7 @@ mod tests {
             );
             let ctx = ProbeCtx {
                 goal: Some(&goal),
+                bingo: false,
                 region: None,
                 armor_bundles: false,
                 region_completion_goal_gate: false,

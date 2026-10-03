@@ -31,6 +31,9 @@ pub fn set_event_flag(flag_id: u32, enabled: bool) {
 
 /// Set an event flag, returning whether the holder was ready (false = retry later).
 pub fn try_set_event_flag(flag_id: u32, enabled: bool) -> bool {
+    if crate::bingo_state::protected(flag_id) {
+        return false;
+    }
     match unsafe { CSEventFlagMan::instance_mut() } {
         Ok(m) => {
             m.virtual_memory_flag.set_flag(flag_id, enabled);

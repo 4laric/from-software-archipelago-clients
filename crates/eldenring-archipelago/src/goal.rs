@@ -74,6 +74,7 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
     if let Some(value) = sd.get("bingoBoard") {
         return GoalConfig {
             bingo: er_logic::bingo::Board::parse(value).ok(),
+            required_boss_flags: Vec::new(),
             flag_goals: Vec::new(),
             checked_goals: Vec::new(),
             item_goals: Vec::new(),
@@ -281,8 +282,19 @@ pub fn log_goal(sd: &Value, resolve: impl Fn(i64) -> Option<String>) {
 /// checked goals via `is_checked` (server-truth checked set; caller pre-filters against
 /// `valid_locations` -- `is_local_location_checked` panics on datapackage-unknown ids).
 /// An empty config is never met.
+#[cfg(test)]
 pub fn is_met(
     cfg: &GoalConfig,
+    flag_read: impl Fn(u32) -> bool,
+    is_checked: impl Fn(i64) -> bool,
+    has_item: impl Fn(&str) -> bool,
+) -> bool {
+    is_met_with_earned(cfg, &Default::default(), flag_read, is_checked, has_item)
+}
+
+pub fn is_met_with_earned(
+    cfg: &GoalConfig,
+    earned: &std::collections::BTreeSet<i64>,
     flag_read: impl Fn(u32) -> bool,
     is_checked: impl Fn(i64) -> bool,
     has_item: impl Fn(&str) -> bool,
@@ -293,7 +305,7 @@ pub fn is_met(
                 && board
                     .cells
                     .iter()
-                    .any(|cell| cell.location == id && flag_read(cell.flag))
+                    .any(|cell| cell.location == id && cell.earned(&flag_read, earned))
         });
     }
     if cfg.is_empty() {
