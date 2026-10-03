@@ -82,6 +82,7 @@ pub mod ownership;
 pub mod physick;
 pub mod player_review;
 pub mod pot_cap_tally;
+pub mod power_caps;
 pub mod progressive;
 pub mod radahn_festival;
 pub mod receive;

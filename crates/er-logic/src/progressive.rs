@@ -12,6 +12,16 @@ pub const GOODS_FULLID: i32 = 0x4000_0000u32 as i32;
 /// Lord's Rune goods row, granted once per overflow copy past the last tier.
 pub const LORDS_RUNE_GOODS: u32 = 2919;
 
+/// Legacy goods row IDs receive the goods nibble. Already packed IDs retain
+/// their category, including progressive talismans (accessory category 2).
+pub fn grant_full_id(id: u32) -> i32 {
+    if id & 0xf000_0000 == 0 {
+        (id as i32) | GOODS_FULLID
+    } else {
+        id as i32
+    }
+}
+
 /// One progressive tier: the goods to grant and the flags to set when this tier lands.
 ///
 /// `consumed` marks the tier's goods as SPENT by the player (the flask-upgrade ladder's Golden
@@ -103,7 +113,7 @@ impl ProgressiveState {
             let tier = &tiers[k as usize];
             eff.flags.extend(tier.flags.iter().copied());
             eff.grants
-                .extend(tier.goods.iter().map(|&g| (g as i32) | GOODS_FULLID));
+                .extend(tier.goods.iter().map(|&g| grant_full_id(g)));
         } else {
             eff.grants.push((LORDS_RUNE_GOODS as i32) | GOODS_FULLID);
         }
@@ -115,6 +125,33 @@ impl ProgressiveState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn talisman_receipts_preserve_accessory_category_and_replay_does_not_advance() {
+        let id = 536_874_943u32; // vanilla Boltdrake Talisman +1; +2 is the next row
+        let config = parse(&serde_json::json!({"progressiveGrants": {
+            "Progressive Talisman": [{"goods": id, "flags": [], "consumed": true},
+                                    {"goods": id + 1, "flags": [], "consumed": true}]
+        }}));
+        let mut state = ProgressiveState::new(config);
+        assert_eq!(
+            state.on_item_received("Progressive Talisman", 0).grants,
+            vec![id as i32]
+        );
+        assert!(state
+            .on_item_received("Progressive Talisman", 0)
+            .grants
+            .is_empty());
+        assert_eq!(
+            state.on_item_received("Progressive Talisman", 1).grants,
+            vec![(id + 1) as i32]
+        );
+        assert_eq!(grant_full_id(10020), GOODS_FULLID | 10020);
+        assert_eq!(
+            grant_full_id(GOODS_FULLID as u32 | 10020),
+            GOODS_FULLID | 10020
+        );
+    }
 
     fn bell() -> HashMap<String, Vec<ProgTier>> {
         let mut m = HashMap::new();

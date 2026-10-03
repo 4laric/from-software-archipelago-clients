@@ -5471,7 +5471,7 @@ impl Core {
                     goods: t
                         .goods
                         .iter()
-                        .map(|&g| (g as i32) | er_logic::progressive::GOODS_FULLID)
+                        .map(|&g| er_logic::progressive::grant_full_id(g))
                         .collect(),
                     flags: t.flags.clone(),
                     consumed: t.consumed,

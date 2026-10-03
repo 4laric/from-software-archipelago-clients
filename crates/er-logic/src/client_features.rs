@@ -37,6 +37,7 @@
 /// Feature tags THIS build understands. Add a tag here in the same change that adds the behaviour,
 /// never before it — the whole value of this list is that it cannot claim support it does not have.
 pub const SUPPORTED: &[&str] = &[
+    "progressive_talismans_v1",
     // options.completion_scaling_ceiling -> er_logic::scaling::ceiling_tier (2026-07-27).
     "scaling_ceiling",
     // options.auto_equip -> er_logic::auto_equip (routing) + eldenring_archipelago::auto_equip

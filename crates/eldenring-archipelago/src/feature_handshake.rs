@@ -77,6 +77,10 @@ type Probe = fn(&ProbeCtx) -> bool;
 ///
 /// ⭐ ORDER IS THE ORDER OF `SUPPORTED`, so the two lists diff by eye as well as by test.
 pub const PROBES: &[(&str, Probe)] = &[
+    // Format capability: the grant mapper must preserve this real accessory ID.
+    ("progressive_talismans_v1", |_| {
+        er_logic::progressive::grant_full_id(536_874_943) == 536_874_943
+    }),
     // A ceiling is only DECLARED by a seed that actually caps, so ARMED must mean the same thing --
     // configured, and capping below the top rung.
     ("scaling_ceiling", |_| crate::scaling::ceiling_is_capped()),
