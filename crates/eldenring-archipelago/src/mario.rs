@@ -4,10 +4,18 @@ use er_logic::mario::{
     StatsState,
 };
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleExA, GetProcAddress};
-use windows::core::s;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleExA, GetModuleHandleW, GetProcAddress};
+use windows::core::{s, w};
 
 use er_logic::mario::BridgeState as State;
+
+/// Input ownership follows the loaded mod, including standalone Mario before
+/// AP connects. This only queries the loader; it does not load/retain a DLL or
+/// require capability exports from the installed ER-Mario version.
+pub fn is_loaded() -> bool {
+    unsafe { GetModuleHandleW(w!("er_mario.dll")) }.is_ok()
+}
+
 type Version = unsafe extern "C" fn() -> u32;
 type Set = unsafe extern "C" fn(u32, u32) -> u32;
 type Get = unsafe extern "C" fn(*mut State) -> u32;

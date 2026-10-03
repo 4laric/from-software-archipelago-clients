@@ -99,12 +99,23 @@ pub struct FluddState {
 }
 impl FluddState {
     pub fn matches(&self, expected: Fludd) -> bool {
+        // Older ER-Mario workers use 60+20/tier; the larger-tank workers use
+        // 300+100/tier. Both retain the same ABI and exact receipt identity.
+        let legacy_capacity = expected
+            .tank_level
+            .checked_mul(20)
+            .and_then(|n| n.checked_add(60));
+        let larger_capacity = expected
+            .tank_level
+            .checked_mul(100)
+            .and_then(|n| n.checked_add(300));
         self.abi_version == ABI_VERSION
             && self.flags & 4 != 0
             && (self.flags & 2 != 0) == expected.enabled
             && self.unlocked_nozzles == expected.nozzles
             && self.tank_level == expected.tank_level
-            && self.capacity_units == 60 + 20 * expected.tank_level
+            && (Some(self.capacity_units) == legacy_capacity
+                || Some(self.capacity_units) == larger_capacity)
     }
     pub fn acknowledged(&self, expected: Fludd) -> bool {
         self.matches(expected) && self.flags & 1 != 0
@@ -1015,6 +1026,98 @@ mod tests {
             ..Default::default()
         }
         .acknowledged(Fludd::default()));
+    }
+    #[test]
+    fn fludd_ack_accepts_both_capacity_schemes_at_every_received_tier() {
+        for tank_level in 0..=3 {
+            let expected = Fludd {
+                enabled: true,
+                nozzles: 7,
+                tank_level,
+            };
+            for capacity_units in [60 + 20 * tank_level, 300 + 100 * tank_level] {
+                let state = FluddState {
+                    abi_version: ABI_VERSION,
+                    flags: 7,
+                    unlocked_nozzles: 7,
+                    tank_level,
+                    selected_nozzle: 1,
+                    water_units: capacity_units,
+                    capacity_units,
+                };
+                assert!(state.acknowledged(expected));
+                // Ack records unlock receipts, not water consumption or nozzle selection.
+                for water_units in [0, 1, capacity_units / 2, capacity_units, capacity_units + 1] {
+                    assert!(FluddState {
+                        water_units,
+                        ..state
+                    }
+                    .acknowledged(expected));
+                }
+                assert!(!FluddState {
+                    capacity_units: capacity_units + 1,
+                    ..state
+                }
+                .acknowledged(expected));
+                for flags in [0, 3, 5, 6] {
+                    assert!(!FluddState { flags, ..state }.acknowledged(expected));
+                }
+                assert!(!FluddState {
+                    abi_version: 2,
+                    ..state
+                }
+                .acknowledged(expected));
+                assert!(!FluddState {
+                    unlocked_nozzles: 1,
+                    ..state
+                }
+                .acknowledged(expected));
+                assert!(!FluddState {
+                    tank_level: (tank_level + 1) % 4,
+                    ..state
+                }
+                .acknowledged(expected));
+            }
+            // An otherwise valid capacity from a different tier cannot acknowledge this one.
+            let other_tier = (tank_level + 1) % 4;
+            for capacity_units in [60 + 20 * other_tier, 300 + 100 * other_tier] {
+                assert!(!FluddState {
+                    abi_version: ABI_VERSION,
+                    flags: 7,
+                    unlocked_nozzles: 7,
+                    tank_level,
+                    capacity_units,
+                    ..Default::default()
+                }
+                .acknowledged(expected));
+            }
+        }
+        for capacity_units in [60, 300] {
+            assert!(FluddState {
+                abi_version: ABI_VERSION,
+                flags: 5,
+                capacity_units,
+                ..Default::default()
+            }
+            .acknowledged(Fludd::default()));
+        }
+    }
+    #[test]
+    fn fludd_capacity_overflow_is_a_refusal_instead_of_a_panic() {
+        let expected = Fludd {
+            enabled: true,
+            nozzles: 7,
+            tank_level: u32::MAX,
+        };
+        assert!(!FluddState {
+            abi_version: ABI_VERSION,
+            flags: 7,
+            unlocked_nozzles: 7,
+            tank_level: u32::MAX,
+            capacity_units: 40,
+            ..Default::default()
+        }
+        .acknowledged(expected));
     }
     #[test]
     fn stats_option_and_handshake_are_strict_and_default_off() {

@@ -1200,7 +1200,8 @@ impl shared::Core for Core {
         }
 
         // TRAP FEEL PROBE (trap_feel_probe.rs) -- ON by default, unlike the F7/F8 block above.
-        // F9 nightfall, F11 blackout. F10 is reserved for map settings. Both probes are non-destructive and
+        // F9 nightfall unless ER-Mario is loaded (its camera owns F9), F11 blackout.
+        // F10 is reserved for map settings. Both probes are non-destructive and
         // self-restoring, which is the whole argument for defaulting them on; it is written out in
         // the module note. Function keys for the same reason F6 and F7 are: a letter fights the say
         // input.
@@ -1215,6 +1216,9 @@ impl shared::Core for Core {
                 (imgui::Key::F11, er_logic::trap_probe::FeelEffect::Blackout),
             ] {
                 if !ui.is_key_pressed(key) {
+                    continue;
+                }
+                if !effect.hotkey_available(crate::mario::is_loaded()) {
                     continue;
                 }
                 // `fire` returns None when it could not act this tick (not in world, singleton
