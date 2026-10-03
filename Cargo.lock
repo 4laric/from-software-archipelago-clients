@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "eldenring-archipelago"
-version = "0.6.4+f2"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "archipelago_rs",
@@ -1173,6 +1173,7 @@ version = "0.1.0"
 dependencies = [
  "er-codec",
  "er-semver",
+ "serde",
  "serde_json",
 ]
 

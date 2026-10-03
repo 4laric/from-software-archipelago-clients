@@ -150,6 +150,7 @@ pub struct Core {
     /// ER save slot whose cursor is active this in-world session. `None` holds receive mutations
     /// until save-slot + play-time identity can be read without guessing.
     receive_cursor_slot: Option<i32>,
+    bingo_earned: BTreeMap<String, std::collections::BTreeSet<i64>>,
     /// Delays cursor-ahead repair until a shorter re-hosted stream has stopped growing.
     receive_cursor_ahead: er_logic::receive_cursor::AheadGuard,
     valid_locations: HashSet<i64>,
@@ -909,6 +910,7 @@ impl shared::Core for Core {
             legacy_received_index: 0,
             traps_received_through: 0,
             receive_cursor_slot: None,
+            bingo_earned: Default::default(),
             receive_cursor_ahead: er_logic::receive_cursor::AheadGuard::default(),
             valid_locations: HashSet::new(),
             locations_loaded: false,
@@ -1398,6 +1400,20 @@ impl shared::Core for Core {
         }
         self.mario.clear_warning();
         if !self.slot_data_parsed {
+            let bingo_error = self.client().and_then(|client| {
+                client
+                    .slot_data()
+                    .get("bingoBoard")
+                    .and_then(|value| er_logic::bingo::Board::parse(value).err())
+            });
+            if let Some(error) = bingo_error {
+                let message = format!("Bingo seed refused: {error}");
+                if self.version_warn.as_deref() != Some(message.as_str()) {
+                    log::error!("{message}");
+                }
+                self.version_warn = Some(message);
+                return Ok(());
+            }
             let parsed = self.client().map(|client| {
                 let sd = client.slot_data();
                 // client#351: a fresh seed means the crash reporter's id registry must forget the
@@ -2503,6 +2519,7 @@ impl shared::Core for Core {
                 // (E0500). This is the first point after that closure where the goal config exists
                 // and `self` is free.
                 let goal_banner = crate::goal::describe_required_items(&goal_cfg);
+                crate::bingo_state::protect(goal_cfg.bingo.as_ref());
                 self.goal = Some(goal_cfg);
                 if let Some(line) = goal_banner {
                     self.log(ap::Print::message(line));
@@ -2549,6 +2566,7 @@ impl shared::Core for Core {
                     &required_features,
                     &crate::feature_handshake::ProbeCtx {
                         goal: self.goal.as_ref(),
+                        bingo: self.goal.as_ref().is_some_and(|g| g.bingo.is_some()),
                         region: self.region.as_ref(),
                         armor_bundles: !self.armor_bundles.is_empty(),
                         region_completion_goal_gate:
@@ -2645,6 +2663,7 @@ impl shared::Core for Core {
                 self.received_through = 0;
                 self.traps_received_through = st.traps_received_through;
                 self.receive_cursors = st.received_cursors;
+                self.bingo_earned = st.bingo_earned;
                 self.legacy_received_index = st.last_received_index.max(0);
                 self.receive_cursor_slot = None;
                 self.receive_cursor_ahead.reset();
@@ -3909,6 +3928,10 @@ impl shared::Core for Core {
                         Some((std::time::Instant::now(), self.sweep_flag_pending.len(), 0));
                 }
             }
+            if let Some(board) = self.goal.as_ref().and_then(|g| g.bingo.as_ref()) {
+                self.sweep_flag_pending
+                    .retain(|flag| !board.protects_flag(*flag));
+            }
             if !self.sweep_flag_pending.is_empty() && crate::flags::in_world() {
                 let owed_before = self.sweep_flag_pending.len();
                 // #1006: time the shared-flag WRITE loop -- under seamless co-op each try_set
@@ -4155,19 +4178,85 @@ impl shared::Core for Core {
             }
         }
 
+        // Bingo rewards use the same persistent retry queue as pickups. Defeat flags are game
+        // observations; swept/collected native AP checks never count as encounter evidence.
+        if can_grant && self.locations_loaded && self.poll_counter.is_multiple_of(15) {
+            if let (Some(key), Some(board), Some(values)) = (
+                self.bingo_ledger_key(),
+                self.goal.as_ref().and_then(|g| g.bingo.as_ref()),
+                self.goal
+                    .as_ref()
+                    .and_then(|g| g.bingo.as_ref())
+                    .filter(|b| b.cells.iter().any(|c| c.state.is_some()))
+                    .and_then(|_| crate::bingo_state::observe()),
+            ) {
+                let earned = self.bingo_earned.entry(key).or_default();
+                let before = earned.len();
+                board.observe_states(&values, earned);
+                if earned.len() != before {
+                    self.write_save();
+                }
+            }
+            let (checks, bonus): (Vec<i64>, Vec<i64>) = self
+                .goal
+                .as_ref()
+                .and_then(|g| g.bingo.as_ref())
+                .map(|board| {
+                    let done: [bool; 25] = std::array::from_fn(|i| {
+                        board.cells[i]
+                            .earned(crate::flags::get_event_flag, &self.bingo_completed_states())
+                    });
+                    let bonus = if er_logic::bingo::Board::has_line(&done) {
+                        board.line_sweep.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        board.pending_earned(
+                            crate::flags::get_event_flag,
+                            |id| {
+                                self.client()
+                                    .is_some_and(|client| client.is_local_location_checked(id))
+                            },
+                            &self.bingo_completed_states(),
+                        ),
+                        bonus,
+                    )
+                })
+                .unwrap_or_default();
+            if let Some(fp) = self.flag_poll.as_ref() {
+                // Reconstruct owed pickup flags even when AP acknowledged the bonus before a
+                // reconnect. These are acquisition flags; square defeat flags never enter here.
+                let members: Vec<_> = bonus
+                    .iter()
+                    .filter_map(|&id| fp.location_flags.get(&id).map(|&flag| (id, flag)))
+                    .collect();
+                self.sweep_flag_pending
+                    .extend(er_logic::sweep_flush::flags_to_assert(
+                        &members,
+                        crate::flags::get_event_flag,
+                    ));
+            }
+            self.check_report_pending.extend(checks);
+            self.flush_check_reports();
+        }
+
         // 5c. Goal-send (SPEC-goal-send-20260701.md): once EVERY goalLocations entry is done —
         //     local DefeatFlag first (immune to another slot's !collect), checked-set fallback
         //     for detection-table stragglers — send ClientStatus::Goal. Same throttle as the
         //     flag poll; gated on a loaded world so flags are never read during a load screen.
         //     Session latch only: a re-send after reconnect is idempotent server-side.
         if !self.sent_goal
+            && (self.goal.as_ref().is_none_or(|g| g.bingo.is_none())
+                || (self.check_report_pending.is_empty() && self.sweep_flag_pending.is_empty()))
             && can_grant
             && self.locations_loaded
             && self.poll_counter.is_multiple_of(15)
         {
             let met = match (self.goal.as_ref(), self.client()) {
-                (Some(cfg), Some(client)) => crate::goal::is_met(
+                (Some(cfg), Some(client)) => crate::goal::is_met_with_earned(
                     cfg,
+                    &self.bingo_completed_states(),
                     crate::flags::get_event_flag,
                     // Pre-filter against valid_locations (kept correct per-seed by reset_for_new_seed)
                     // so no datapackage-unknown id reaches is_local_location_checked.
@@ -5443,8 +5532,9 @@ impl Core {
                     .iter()
                     .map(|ri| ri.item().name().to_string())
                     .collect();
-                crate::goal::is_met(
+                crate::goal::is_met_with_earned(
                     cfg,
+                    &self.bingo_completed_states(),
                     crate::flags::get_event_flag,
                     |l| self.valid_locations.contains(&l) && client.is_local_location_checked(l),
                     |n| held.contains(n),
@@ -5612,6 +5702,8 @@ impl Core {
         self.grant_gate_last_play_region = None;
         self.scout = None;
         self.goal = None;
+        crate::bingo_state::protect(None);
+        self.bingo_earned.clear();
         self.sent_goal = false;
         self.hints = HintSet::new();
         self.foreign_hints = HashSet::new();
@@ -6105,6 +6197,14 @@ impl Core {
                 &remaining,
                 &raw_surface,
                 &in_logic,
+            );
+        }
+        if let Some(board) = self.goal.as_ref().and_then(|goal| goal.bingo.as_ref()) {
+            board.overlay_map_states(
+                &mut states,
+                &self.valid_locations,
+                &open,
+                crate::flags::get_event_flag,
             );
         }
         self.mfg_states.send(&states);
@@ -6631,6 +6731,19 @@ impl Core {
                         mismatch_acknowledged = true;
                     }
                     ui.separator();
+                }
+                if let Some(board) = self.goal.as_ref().and_then(|g| g.bingo.as_ref()) {
+                    ui.text(format!("Bingo: {} (experimental board)", board.goal));
+                    ui.columns(5, "bingo-board", true);
+                    for (i, cell) in board.cells.iter().enumerate() {
+                        let checked = cell.earned(crate::flags::get_event_flag, &self.bingo_completed_states())
+                            && self.client().is_some_and(|c| c.is_local_location_checked(cell.location));
+                        ui.text_wrapped(format!("{} {:02}: {}", if checked { "[x]" } else { "[ ]" }, i + 1, cell.label));
+                        ui.next_column();
+                    }
+                    ui.columns(1, "bingo-board-end", false);
+                    ui.text(format!("First-line bonus: {} checks (already collected members reduce payout)", board.line_sweep.len()));
+                    ui.text_wrapped("Map for Goblins: F10 -> Progression items only shows bingo objectives. Turn off In-logic only to see locked objectives too. Defeated objectives disappear. Stat and upgrade squares are shown here in F6.");
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 if model.hidden_unobtainable > 0 {
@@ -7264,6 +7377,20 @@ impl Core {
     /// The save-slot number separates coexisting characters; the play-time stamp detects a
     /// delete-and-recreate in the same slot; the save-embedded marker's Fresh verdict is the final
     /// override for very young characters whose play times could otherwise overlap.
+    fn bingo_ledger_key(&self) -> Option<String> {
+        Some(format!(
+            "{}:{}",
+            self.goal.as_ref()?.bingo.as_ref()?.hash,
+            self.receive_cursor_slot?
+        ))
+    }
+
+    fn bingo_completed_states(&self) -> std::collections::BTreeSet<i64> {
+        self.bingo_ledger_key()
+            .and_then(|key| self.bingo_earned.get(&key).cloned())
+            .unwrap_or_default()
+    }
+
     fn bind_receive_cursor(&mut self) {
         if self.receive_cursor_slot.is_some() || !self.save_loaded {
             return;
@@ -7298,6 +7425,10 @@ impl Core {
         self.dispatched_through = 0;
         self.last_persisted_index = cursor as i64;
         self.receive_cursor_slot = Some(save_slot);
+        if matches!(decision, er_logic::receive_cursor::Binding::Fresh) {
+            self.bingo_earned
+                .retain(|key, _| !key.ends_with(&format!(":{save_slot}")));
+        }
         self.receive_cursors.insert(
             save_slot,
             er_logic::receive_cursor::CursorEntry {
@@ -7360,6 +7491,7 @@ impl Core {
         }
         let (counter, high) = self.progressive.snapshot();
         let st = SaveState {
+            bingo_earned: self.bingo_earned.clone(),
             last_received_index: self.legacy_received_index,
             received_cursors: self.receive_cursors.clone(),
             traps_received_through: self.traps_received_through,

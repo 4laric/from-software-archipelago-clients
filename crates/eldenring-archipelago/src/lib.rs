@@ -11,6 +11,7 @@ mod ability_probe;
 mod auto_equip;
 #[cfg(test)]
 mod bedrock_fixture_test;
+mod bingo_state;
 mod boss_fight_probe;
 mod check_lots;
 mod config_watch;
