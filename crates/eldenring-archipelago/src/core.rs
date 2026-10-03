@@ -2548,6 +2548,7 @@ impl shared::Core for Core {
                 let dark_features = crate::feature_handshake::log_and_report(
                     &required_features,
                     &crate::feature_handshake::ProbeCtx {
+                        goal: self.goal.as_ref(),
                         region: self.region.as_ref(),
                         armor_bundles: !self.armor_bundles.is_empty(),
                         region_completion_goal_gate:

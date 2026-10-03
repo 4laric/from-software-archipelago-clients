@@ -23,6 +23,8 @@ use serde_json::Value;
 pub struct GoalConfig {
     /// Guarding vanilla event flags (from `locationFlags`) for flag-detectable goal locations.
     pub flag_goals: Vec<u32>,
+    /// Extra local boss defeats, independent of the primary finale's access rules.
+    pub required_boss_flags: Vec<u32>,
     /// Goal location ids with no detection-flag entry: done when the checked set has them.
     pub checked_goals: Vec<i64>,
     /// `goalRequiredItems` -- item NAMES the player must HOLD before Goal can fire.
@@ -170,8 +172,29 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
             checked_goals.len()
         );
     }
+    // Extras never rescue a missing finale. Zero prevents malformed requirements
+    // from dropping out and sending Goal early; is_met never reads flag zero.
+    let mut required_boss_flags = Vec::new();
+    if !flag_goals.is_empty() || !checked_goals.is_empty() {
+        match er_logic::required_bosses::parse(sd) {
+            Ok(flags) => {
+                for flag in flags {
+                    log::info!(
+                        "goal: also defeat {} locally",
+                        er_logic::required_bosses::label(flag)
+                    );
+                    required_boss_flags.push(flag);
+                }
+            }
+            Err(error) => {
+                log::error!("goal: {error}; completion disabled until slot data is corrected");
+                required_boss_flags.push(0);
+            }
+        }
+    }
     GoalConfig {
         flag_goals,
+        required_boss_flags,
         checked_goals,
         item_goals,
         rune_goals,
@@ -254,7 +277,8 @@ pub fn is_met(
     if cfg.is_empty() {
         return false;
     }
-    cfg.flag_goals.iter().all(|&f| flag_read(f))
+    er_logic::required_bosses::all_defeated(&cfg.flag_goals, &flag_read)
+        && er_logic::required_bosses::all_defeated(&cfg.required_boss_flags, flag_read)
         && cfg.checked_goals.iter().all(|&l| is_checked(l))
         && cfg.item_goals.iter().all(|n| has_item(n))
         && cfg.rune_goals.iter().filter(|n| has_item(n)).count() >= cfg.runes_required
@@ -276,6 +300,35 @@ mod tests {
 
     pub(super) fn lf(pairs: &[(i64, u32)]) -> HashMap<i64, u32> {
         pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn finale_and_radahn_are_required_in_either_order_even_when_collected() {
+        let sd = json!({"goalLocations": [10], "options": {"required_boss_flags": [1252380800]}});
+        let cfg = parse(&sd, &lf(&[(10, 19000800)]));
+        assert_eq!(cfg.flag_goals, vec![19000800]);
+        assert_eq!(cfg.required_boss_flags, vec![1252380800]);
+        for first in [19000800, 1252380800] {
+            assert!(!is_met(&cfg, |f| f == first, |_| true, |_| true));
+        }
+        assert!(is_met(&cfg, |_| true, |_| false, |_| true));
+        // Reparse/reconnect still reads the persisted local defeats.
+        assert!(!is_met(
+            &parse(&sd, &lf(&[(10, 19000800)])),
+            |_| false,
+            |_| true,
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn extras_do_not_replace_a_missing_finale_or_hide_malformed_flags() {
+        let sd = json!({"options": {"required_boss_flags": [20010800]}});
+        assert!(parse(&sd, &lf(&[])).is_empty());
+        let sd =
+            json!({"goalLocations": [10], "options": {"required_boss_flags": [20010800, "oops"]}});
+        let cfg = parse(&sd, &lf(&[(10, 19000800)]));
+        assert!(!is_met(&cfg, |_| true, |_| true, |_| true));
     }
 
     #[test]
