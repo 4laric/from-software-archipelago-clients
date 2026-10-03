@@ -57,6 +57,7 @@ use crate::region::RegionConfig;
 /// ignore this; `grace_attunement` lives on the per-connect [`RegionConfig`], which is owned by
 /// `core` and cannot be a static.
 pub struct ProbeCtx<'a> {
+    pub goal: Option<&'a crate::goal::GoalConfig>,
     pub region: Option<&'a RegionConfig>,
     pub armor_bundles: bool,
     pub region_completion_goal_gate: bool,
@@ -164,6 +165,11 @@ pub const PROBES: &[(&str, Probe)] = &[
     ("mario_fludd_v1", |c| c.mario_fludd),
     ("mario_cappy_v1", |c| c.mario_cappy),
     ("mario_sonic_movement_v1", |c| c.mario_sonic),
+    ("required_bosses_v1", |c| {
+        c.goal.is_some_and(|g| {
+            !g.required_boss_flags.is_empty() && !g.required_boss_flags.contains(&0)
+        })
+    }),
 ];
 
 /// Build the `(tag, live)` table this connect.
@@ -246,6 +252,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extra_boss_probe_reads_the_config_used_by_completion() {
+        let probe = PROBES
+            .iter()
+            .find(|(tag, _)| *tag == "required_bosses_v1")
+            .unwrap()
+            .1;
+        for (raw, expected) in [
+            (serde_json::json!([20010800]), true),
+            (serde_json::json!([]), false),
+            (serde_json::json!(["oops"]), false),
+        ] {
+            let goal = crate::goal::parse(
+                &serde_json::json!({"goalLocations": [10],
+                "options": {"required_boss_flags": raw}}),
+                &[(10, 19000800)].into(),
+            );
+            let ctx = ProbeCtx {
+                goal: Some(&goal),
+                region: None,
+                armor_bundles: false,
+                region_completion_goal_gate: false,
+                reveal_sweep_boss_names: false,
+                mario_capabilities: false,
+                mario_regression: false,
+                mario_stats: false,
+                mario_fludd: false,
+                mario_cappy: false,
+                mario_sonic: false,
+            };
+            assert_eq!(probe(&ctx), expected);
+        }
+    }
+
     /// The probe table must not carry duplicates: `reconcile`'s `any(live)` would then let one
     /// stale `true` mask a real `false`.
     #[test]
@@ -269,6 +309,7 @@ mod tests {
     #[test]
     fn probes_are_host_safe() {
         let ctx = ProbeCtx {
+            goal: None,
             region: None,
             armor_bundles: false,
             region_completion_goal_gate: false,
@@ -297,6 +338,7 @@ mod tests {
             .1;
         assert!(
             !probe(&ProbeCtx {
+                goal: None,
                 region: None,
                 armor_bundles: false,
                 region_completion_goal_gate: false,
@@ -314,6 +356,7 @@ mod tests {
         let mut cfg = RegionConfig::default();
         assert!(
             !probe(&ProbeCtx {
+                goal: None,
                 region: Some(&cfg),
                 armor_bundles: false,
                 region_completion_goal_gate: false,
@@ -333,6 +376,7 @@ mod tests {
         );
         assert!(
             probe(&ProbeCtx {
+                goal: None,
                 region: Some(&cfg),
                 armor_bundles: false,
                 region_completion_goal_gate: false,

@@ -130,6 +130,7 @@ pub const SUPPORTED: &[&str] = &[
     "mario_fludd_v1",
     "mario_cappy_v1",
     "mario_sonic_movement_v1",
+    "required_bosses_v1",
 ];
 
 /// Feature tags the seed requires that this build does not know.
