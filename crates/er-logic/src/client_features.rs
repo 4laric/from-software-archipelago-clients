@@ -130,7 +130,11 @@ pub const SUPPORTED: &[&str] = &[
     "mario_fludd_v1",
     "mario_cappy_v1",
     "mario_sonic_movement_v1",
+<<<<<<< HEAD
     "required_bosses_v1",
+=======
+    "bingo_v1",
+>>>>>>> d19585c (feat: track bingo squares and first-line rewards)
 ];
 
 /// Feature tags the seed requires that this build does not know.
@@ -248,7 +252,15 @@ pub fn version_mismatch_toast(their_versions: &str, our_apworld: &str) -> String
 /// compatibility has not been audited for every release that shared one.
 pub fn is_legacy_contract_compatible(versions: &str) -> bool {
     let has = |wanted: &str| versions.split_whitespace().any(|token| token == wanted);
-    (has("apworld/0.4.13") && has("contract/dc0dc687"))
+    // Bingo adds an optional key; pre-bingo fields and semantics remain readable.
+    (has("contract/2aa64f43")
+        && [
+            "0.6.0.11", "0.6.1", "0.6.1.1", "0.6.1.2", "0.6.1.3", "0.6.1.4", "0.6.1.5", "0.6.1.6",
+            "0.6.1.7", "0.6.1.8", "0.6.4", "0.6.4.1",
+        ]
+        .iter()
+        .any(|v| has(&format!("apworld/{v}"))))
+        || (has("apworld/0.4.13") && has("contract/dc0dc687"))
         || (has("contract/13db0b3a")
             && ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4"]
                 .iter()
@@ -784,6 +796,28 @@ mod tests {
         ));
         assert!(!is_legacy_contract_compatible(
             "apworld/0.6.0.2 contract/613fb438 data/x"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod bingo_compatibility_tests {
+    use super::*;
+    #[test]
+    fn pre_bingo_contract_is_bridged_only_for_shipped_windows() {
+        for version in [
+            "0.6.0.11", "0.6.1", "0.6.1.1", "0.6.1.2", "0.6.1.3", "0.6.1.4", "0.6.1.5", "0.6.1.6",
+            "0.6.1.7", "0.6.1.8", "0.6.4", "0.6.4.1",
+        ] {
+            assert!(is_legacy_contract_compatible(&format!(
+                "apworld/{version} contract/2aa64f43 data/x"
+            )));
+        }
+        assert!(!is_legacy_contract_compatible(
+            "apworld/0.6.5 contract/2aa64f43 data/x"
+        ));
+        assert!(!is_legacy_contract_compatible(
+            "apworld/9.9.9 contract/2aa64f43 data/x"
         ));
     }
 }

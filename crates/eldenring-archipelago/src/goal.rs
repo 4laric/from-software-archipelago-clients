@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 pub struct GoalConfig {
+    pub bingo: Option<er_logic::bingo::Board>,
     /// Guarding vanilla event flags (from `locationFlags`) for flag-detectable goal locations.
     pub flag_goals: Vec<u32>,
     /// Extra local boss defeats, independent of the primary finale's access rules.
@@ -59,7 +60,8 @@ pub struct GoalConfig {
 
 impl GoalConfig {
     pub fn is_empty(&self) -> bool {
-        self.flag_goals.is_empty()
+        self.bingo.is_none()
+            && self.flag_goals.is_empty()
             && self.checked_goals.is_empty()
             && self.item_goals.is_empty()
             && self.runes_required == 0
@@ -69,6 +71,16 @@ impl GoalConfig {
 /// Split `goalLocations` into flag-detected vs checked-fallback buckets against the
 /// already-parsed `locationFlags` map. Tolerant: missing/malformed key -> empty config.
 pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
+    if let Some(value) = sd.get("bingoBoard") {
+        return GoalConfig {
+            bingo: er_logic::bingo::Board::parse(value).ok(),
+            flag_goals: Vec::new(),
+            checked_goals: Vec::new(),
+            item_goals: Vec::new(),
+            rune_goals: Vec::new(),
+            runes_required: 0,
+        };
+    }
     let mut flag_goals = Vec::new();
     let mut checked_goals = Vec::new();
     // `great_rune_items`: item NAMES that must have been RECEIVED. It shipped for months as a
@@ -193,6 +205,7 @@ pub fn parse(sd: &Value, loc_flags: &HashMap<i64, u32>) -> GoalConfig {
         }
     }
     GoalConfig {
+        bingo: None,
         flag_goals,
         required_boss_flags,
         checked_goals,
@@ -274,6 +287,15 @@ pub fn is_met(
     is_checked: impl Fn(i64) -> bool,
     has_item: impl Fn(&str) -> bool,
 ) -> bool {
+    if let Some(board) = &cfg.bingo {
+        return board.is_complete(|id| {
+            is_checked(id)
+                && board
+                    .cells
+                    .iter()
+                    .any(|cell| cell.location == id && flag_read(cell.flag))
+        });
+    }
     if cfg.is_empty() {
         return false;
     }
@@ -637,5 +659,32 @@ mod goal_echo {
         assert!(describe_goal(&json!({}), er_names).is_none());
         assert!(describe_goal(&json!({"goalLocations": []}), er_names).is_none());
         assert!(describe_goal(&json!({"goal": [9101]}), er_names).is_none());
+    }
+}
+
+#[cfg(test)]
+mod bingo_goal_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bingo_goal_requires_local_kills_and_acknowledged_squares() {
+        let cells: Vec<_> = (0..25)
+            .map(|i| {
+                json!({
+                    "location": 7786000 + i, "flag": 100 + i,
+                    "region": "Limgrave", "label": "Boss"
+                })
+            })
+            .collect();
+        let sd = json!({"bingoBoard": {
+            "version": 1, "catalogue": "ap-boss-board-v1", "hash": "a".repeat(64),
+            "cells": cells, "goal": "line", "count": 13, "line_sweep": []
+        }});
+        let cfg = parse(&sd, &HashMap::new());
+        assert!(!cfg.is_empty());
+        assert!(!is_met(&cfg, |_| false, |_| true, |_| true));
+        assert!(!is_met(&cfg, |_| true, |_| false, |_| true));
+        assert!(is_met(&cfg, |flag| flag < 105, |_| true, |_| false));
     }
 }

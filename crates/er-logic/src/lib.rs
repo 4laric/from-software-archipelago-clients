@@ -147,4 +147,5 @@ pub mod log_location;
 pub mod mfg_targets;
 pub mod respec;
 
+pub mod bingo;
 pub mod mario;

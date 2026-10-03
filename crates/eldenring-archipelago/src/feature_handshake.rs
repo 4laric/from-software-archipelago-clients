@@ -68,6 +68,7 @@ pub struct ProbeCtx<'a> {
     pub mario_fludd: bool,
     pub mario_cappy: bool,
     pub mario_sonic: bool,
+    pub bingo: bool,
 }
 
 /// A tag paired with the read-back that decides whether it is live.
@@ -77,6 +78,7 @@ type Probe = fn(&ProbeCtx) -> bool;
 ///
 /// ⭐ ORDER IS THE ORDER OF `SUPPORTED`, so the two lists diff by eye as well as by test.
 pub const PROBES: &[(&str, Probe)] = &[
+    ("bingo_v1", |c| c.bingo),
     // A ceiling is only DECLARED by a seed that actually caps, so ARMED must mean the same thing --
     // configured, and capping below the top rung.
     ("scaling_ceiling", |_| crate::scaling::ceiling_is_capped()),
@@ -320,6 +322,7 @@ mod tests {
             mario_fludd: false,
             mario_cappy: false,
             mario_sonic: false,
+            bingo: false,
         };
         for (_tag, p) in PROBES {
             let _ = p(&ctx);
@@ -349,6 +352,7 @@ mod tests {
                 mario_fludd: false,
                 mario_cappy: false,
                 mario_sonic: false,
+                bingo: false,
             }),
             "no config -> not armed"
         );
@@ -367,6 +371,7 @@ mod tests {
                 mario_fludd: false,
                 mario_cappy: false,
                 mario_sonic: false,
+                bingo: false,
             }),
             "a seed that gates no region must not report the feature armed"
         );
@@ -387,6 +392,7 @@ mod tests {
                 mario_fludd: false,
                 mario_cappy: false,
                 mario_sonic: false,
+                bingo: false,
             }),
             "one gated region is what the apworld declares the tag for"
         );

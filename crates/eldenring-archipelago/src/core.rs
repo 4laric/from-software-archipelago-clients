@@ -1398,6 +1398,20 @@ impl shared::Core for Core {
         }
         self.mario.clear_warning();
         if !self.slot_data_parsed {
+            let bingo_error = self.client().and_then(|client| {
+                client
+                    .slot_data()
+                    .get("bingoBoard")
+                    .and_then(|value| er_logic::bingo::Board::parse(value).err())
+            });
+            if let Some(error) = bingo_error {
+                let message = format!("Bingo seed refused: {error}");
+                if self.version_warn.as_deref() != Some(message.as_str()) {
+                    log::error!("{message}");
+                }
+                self.version_warn = Some(message);
+                return Ok(());
+            }
             let parsed = self.client().map(|client| {
                 let sd = client.slot_data();
                 // client#351: a fresh seed means the crash reporter's id registry must forget the
@@ -2548,7 +2562,11 @@ impl shared::Core for Core {
                 let dark_features = crate::feature_handshake::log_and_report(
                     &required_features,
                     &crate::feature_handshake::ProbeCtx {
+<<<<<<< HEAD
                         goal: self.goal.as_ref(),
+=======
+                        bingo: self.goal.as_ref().is_some_and(|g| g.bingo.is_some()),
+>>>>>>> d19585c (feat: track bingo squares and first-line rewards)
                         region: self.region.as_ref(),
                         armor_bundles: !self.armor_bundles.is_empty(),
                         region_completion_goal_gate:
@@ -4155,12 +4173,55 @@ impl shared::Core for Core {
             }
         }
 
+        // Bingo rewards use the same persistent retry queue as pickups. Defeat flags are game
+        // observations; swept/collected native AP checks never count as encounter evidence.
+        if can_grant && self.locations_loaded && self.poll_counter.is_multiple_of(15) {
+            let (checks, bonus): (Vec<i64>, Vec<i64>) = self
+                .goal
+                .as_ref()
+                .and_then(|g| g.bingo.as_ref())
+                .map(|board| {
+                    let done: [bool; 25] =
+                        std::array::from_fn(|i| crate::flags::get_event_flag(board.cells[i].flag));
+                    let bonus = if er_logic::bingo::Board::has_line(&done) {
+                        board.line_sweep.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        board.pending_checks(crate::flags::get_event_flag, |id| {
+                            self.client()
+                                .is_some_and(|client| client.is_local_location_checked(id))
+                        }),
+                        bonus,
+                    )
+                })
+                .unwrap_or_default();
+            if let Some(fp) = self.flag_poll.as_ref() {
+                // Reconstruct owed pickup flags even when AP acknowledged the bonus before a
+                // reconnect. These are acquisition flags; square defeat flags never enter here.
+                let members: Vec<_> = bonus
+                    .iter()
+                    .filter_map(|&id| fp.location_flags.get(&id).map(|&flag| (id, flag)))
+                    .collect();
+                self.sweep_flag_pending
+                    .extend(er_logic::sweep_flush::flags_to_assert(
+                        &members,
+                        crate::flags::get_event_flag,
+                    ));
+            }
+            self.check_report_pending.extend(checks);
+            self.flush_check_reports();
+        }
+
         // 5c. Goal-send (SPEC-goal-send-20260701.md): once EVERY goalLocations entry is done —
         //     local DefeatFlag first (immune to another slot's !collect), checked-set fallback
         //     for detection-table stragglers — send ClientStatus::Goal. Same throttle as the
         //     flag poll; gated on a loaded world so flags are never read during a load screen.
         //     Session latch only: a re-send after reconnect is idempotent server-side.
         if !self.sent_goal
+            && (self.goal.as_ref().is_none_or(|g| g.bingo.is_none())
+                || (self.check_report_pending.is_empty() && self.sweep_flag_pending.is_empty()))
             && can_grant
             && self.locations_loaded
             && self.poll_counter.is_multiple_of(15)
@@ -6631,6 +6692,18 @@ impl Core {
                         mismatch_acknowledged = true;
                     }
                     ui.separator();
+                }
+                if let Some(board) = self.goal.as_ref().and_then(|g| g.bingo.as_ref()) {
+                    ui.text(format!("Bingo: {} (boss-board prototype)", board.goal));
+                    ui.columns(5, "bingo-board", true);
+                    for (i, cell) in board.cells.iter().enumerate() {
+                        let checked = crate::flags::get_event_flag(cell.flag)
+                            && self.client().is_some_and(|c| c.is_local_location_checked(cell.location));
+                        ui.text_wrapped(format!("{} {:02}: {}", if checked { "[x]" } else { "[ ]" }, i + 1, cell.label));
+                        ui.next_column();
+                    }
+                    ui.columns(1, "bingo-board-end", false);
+                    ui.text(format!("First-line bonus: {} checks (already collected members reduce payout)", board.line_sweep.len()));
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 if model.hidden_unobtainable > 0 {

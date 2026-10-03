@@ -75,6 +75,7 @@ pub const CONTRACT: &[ContractKey] = &[
     ContractKey { name: "uniqueStartGrants", shape: Shape::PairList, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "reveal_all_maps", shape: Shape::Bool, required: false, greenfield: true, bedrock: true },
     ContractKey { name: "progressionSurfaceLocations", shape: Shape::IntList, required: false, greenfield: true, bedrock: false },
+    ContractKey { name: "bingoBoard", shape: Shape::Any, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "goalLocations", shape: Shape::IntList, required: true, greenfield: true, bedrock: true },
     ContractKey { name: "goalRequiredItems", shape: Shape::StrList, required: false, greenfield: true, bedrock: false },
     ContractKey { name: "checkItemFlags", shape: Shape::ListvalIntMap, required: false, greenfield: true, bedrock: true },
@@ -256,8 +257,8 @@ pub fn validate(sd: &Value) -> Vec<String> {
 // the apworld ships off-site and the .dll ships on Nexus, so a player can mix them freely.
 // Derived from the contract itself (gen_contract.py), so it cannot go stale like a hand-bumped
 // version number would.
-pub const CONTRACT_HASH: &str = "2aa64f43";
-pub const APWORLD_VERSION_EXPECTED: &str = "0.6.4.2";
+pub const CONTRACT_HASH: &str = "189fbb37";
+pub const APWORLD_VERSION_EXPECTED: &str = "0.6.5";
 
 #[cfg(test)]
 mod nested_grants_tests {
