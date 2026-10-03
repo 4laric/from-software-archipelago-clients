@@ -81,6 +81,44 @@ impl Board {
         }
     }
 
+    /// Present the board's action targets through the existing boss-marker ABI.
+    /// Native checks and synthetic square checks share a boss marker, not an AP ID.
+    /// Only local defeat evidence removes an objective; server collection cannot.
+    pub fn overlay_map_states(
+        &self,
+        states: &mut Vec<crate::mfg_match::LotCheckState>,
+        valid: &HashSet<i64>,
+        open_regions: &HashSet<String>,
+        flag_read: impl Fn(u32) -> bool,
+    ) {
+        use crate::mfg_match::{CHECK, IN_LOGIC, PROGRESSION, PROGRESSION_IN_LOGIC};
+        let board_flags: HashSet<_> = self.cells.iter().map(|cell| cell.flag).collect();
+        // In bingo, the progression-only filter means outstanding board objectives.
+        // Ordinary check visibility remains available when that filter is disabled.
+        states.retain(|entry| entry.lot_table != 3 || !board_flags.contains(&entry.lot_row));
+        for entry in states.iter_mut() {
+            entry.flags &= !(PROGRESSION | PROGRESSION_IN_LOGIC);
+        }
+        for cell in &self.cells {
+            if !valid.contains(&cell.location) || flag_read(cell.flag) {
+                continue;
+            }
+            let reachable = open_regions.contains(&cell.region);
+            states.push(crate::mfg_match::LotCheckState {
+                lot_table: 3,
+                lot_row: cell.flag,
+                flags: CHECK
+                    | PROGRESSION
+                    | if reachable {
+                        IN_LOGIC | PROGRESSION_IN_LOGIC
+                    } else {
+                        0
+                    },
+            });
+        }
+        states.sort_unstable_by_key(|entry| (entry.lot_table, entry.lot_row));
+    }
+
     /// AP collect/sweep truth deduplicates reports; only local encounters earn credit.
     pub fn pending_checks(
         &self,
@@ -172,5 +210,59 @@ mod tests {
             board.pending_checks(|flag| flag < 205, |id| id != 301),
             vec![301]
         );
+    }
+
+    #[test]
+    fn map_objectives_join_native_markers_and_do_not_leak_other_progression() {
+        use crate::mfg_match::{LotCheckState, CHECK, IN_LOGIC, PROGRESSION};
+        let board = Board::parse(&payload()).unwrap();
+        let mut states = vec![
+            LotCheckState {
+                lot_table: 3,
+                lot_row: 200,
+                flags: 15,
+            },
+            LotCheckState {
+                lot_table: 1,
+                lot_row: 99,
+                flags: 15,
+            },
+        ];
+        board.overlay_map_states(
+            &mut states,
+            &[100, 101, 102].into_iter().collect(),
+            &["Test".to_owned()].into_iter().collect(),
+            |flag| flag == 201,
+        );
+        assert_eq!(states.len(), 3);
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| s.lot_table == 3 && s.lot_row == 200)
+                .count(),
+            1
+        );
+        assert!(states.iter().any(|s| s.lot_row == 202 && s.flags == 15));
+        assert!(!states.iter().any(|s| s.lot_row == 201));
+        assert_eq!(states[0].flags, CHECK | IN_LOGIC);
+        assert_eq!(
+            states.iter().filter(|s| s.flags & PROGRESSION != 0).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn locked_objectives_remain_visible_without_claiming_access_or_server_credit() {
+        use crate::mfg_match::{CHECK, PROGRESSION};
+        let board = Board::parse(&payload()).unwrap();
+        let valid = board.cells.iter().map(|cell| cell.location).collect();
+        let mut states = Vec::new();
+        board.overlay_map_states(&mut states, &valid, &HashSet::new(), |_| false);
+        assert_eq!(states.len(), 25);
+        assert!(states
+            .iter()
+            .all(|state| state.flags == CHECK | PROGRESSION));
+        board.overlay_map_states(&mut states, &valid, &HashSet::new(), |_| true);
+        assert!(states.is_empty());
     }
 }

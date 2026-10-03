@@ -6168,6 +6168,14 @@ impl Core {
                 &in_logic,
             );
         }
+        if let Some(board) = self.goal.as_ref().and_then(|goal| goal.bingo.as_ref()) {
+            board.overlay_map_states(
+                &mut states,
+                &self.valid_locations,
+                &open,
+                crate::flags::get_event_flag,
+            );
+        }
         self.mfg_states.send(&states);
         // One line per CHANGE of the published snapshot, never per refresh. This is the line
         // that answers "why do our maps differ" from a single log: it names the server-side
@@ -6704,6 +6712,7 @@ impl Core {
                     }
                     ui.columns(1, "bingo-board-end", false);
                     ui.text(format!("First-line bonus: {} checks (already collected members reduce payout)", board.line_sweep.len()));
+                    ui.text_wrapped("Map for Goblins: F10 -> Progression items only shows bingo objectives. Turn off In-logic only to see locked objectives too. Defeated objectives disappear.");
                 }
                 ui.text(format!("checks: {}/{}", model.done, model.total));
                 if model.hidden_unobtainable > 0 {
